@@ -1,0 +1,9 @@
+[package]
+name = "bootty-surface"
+edition.workspace = true
+
+[dependencies]
+eframe.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
