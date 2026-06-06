@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+large_types_passed_by_value = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+
+[workspace.dependencies]
+ab_glyph = "0.2"
+anyhow = "1"
+arboard = "3"
+eframe = { version = "0.34", default-features = true }
+fontdb = "0.23"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "24ea1cf3f3e829e3e66c0c211860614aa2268136", features = ["png"] }
+png = "0.18"
+pollster = "0.4"
+epaint_default_fonts = "0.34"
+portable-pty = "0.9"
+proptest = "1"
+rstest = "0.26"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", default-features = true }
+tauri-build = { version = "2", features = [] }
+ttf-parser = "0.25"
+unicode-width = "0.2"
+wgpu = "29"
+winit = "0.30"
