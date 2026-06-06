@@ -1,0 +1,20 @@
+[package]
+name = "bootty-tauri"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libghostty-vt.workspace = true
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-surface = { path = "../bootty-surface" }
+bootty-terminal = { path = "../bootty-terminal" }
+serde.workspace = true
+tauri.workspace = true
+
+[features]
+default = []
+custom-protocol = ["tauri/custom-protocol"]
