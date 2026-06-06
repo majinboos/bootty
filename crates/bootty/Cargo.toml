@@ -1,0 +1,13 @@
+[package]
+name = "bootty"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bootty-render = { path = "../bootty-render" }
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-surface = { path = "../bootty-surface" }
+bootty-terminal = { path = "../bootty-terminal" }
+
+[lints]
+workspace = true
