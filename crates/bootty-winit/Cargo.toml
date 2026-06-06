@@ -1,0 +1,19 @@
+[package]
+name = "bootty-winit"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+eframe.workspace = true
+libghostty-vt.workspace = true
+bootty-render = { path = "../bootty-render" }
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-surface = { path = "../bootty-surface" }
+bootty-terminal = { path = "../bootty-terminal" }
+pollster.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
