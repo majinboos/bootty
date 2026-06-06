@@ -16,7 +16,8 @@ function App() {
   const backendRef = useRef<TerminalBackend | null>(null);
   const resizeInFlightRef = useRef(false);
   const [status, setStatus] = useState("starting terminal");
-  const [frameCount, setFrameCount] = useState(0);
+  const fpsRef = useRef({ frames: 0, startedAt: performance.now() });
+  const [fps, setFps] = useState(0);
   const [inputCount, setInputCount] = useState(0);
 
   const focusTerminal = useCallback(() => {
@@ -78,7 +79,7 @@ function App() {
         }
         frameRef.current = frame;
         renderer.render(frame);
-        setFrameCount((count) => count + 1);
+        recordFrame(fpsRef, setFps);
       } catch (error) {
         if (!stop) {
           setStatus(String(error));
@@ -103,7 +104,7 @@ function App() {
       }
       frameRef.current = frame;
       renderer.render(frame);
-      setFrameCount((count) => count + 1);
+      recordFrame(fpsRef, setFps);
       setStatus(backend.label);
       focusTerminal();
       timeout = window.setTimeout(drawNextFrame, 33);
@@ -172,7 +173,7 @@ function App() {
       <header>
         <strong>Bootty Web Terminal</strong>
         <span>{status}</span>
-        <span>frames: {frameCount}</span>
+        <span>fps: {fps.toFixed(1)}</span>
         <span>input: {inputCount}</span>
       </header>
       <canvas
@@ -190,6 +191,19 @@ function App() {
   );
 }
 
+function recordFrame(
+  fpsRef: React.MutableRefObject<{ frames: number; startedAt: number }>,
+  setFps: React.Dispatch<React.SetStateAction<number>>,
+): void {
+  const now = performance.now();
+  const sample = fpsRef.current;
+  sample.frames += 1;
+  const elapsed = now - sample.startedAt;
+  if (elapsed >= 1000) {
+    setFps((sample.frames * 1000) / elapsed);
+    fpsRef.current = { frames: 0, startedAt: now };
+  }
+}
 function gridForCanvas(canvas: HTMLCanvasElement, frame: WebTerminalFrame): GridSize {
   return {
     cols: Math.max(1, Math.floor(canvas.clientWidth / frame.cellWidth)),
