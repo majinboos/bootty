@@ -1,0 +1,20 @@
+[package]
+name = "bootty-render"
+edition.workspace = true
+
+[dependencies]
+ab_glyph.workspace = true
+anyhow.workspace = true
+eframe.workspace = true
+fontdb.workspace = true
+libghostty-vt.workspace = true
+bootty-surface = { path = "../bootty-surface" }
+bootty-terminal = { path = "../bootty-terminal" }
+png.workspace = true
+ttf-parser.workspace = true
+unicode-width.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+epaint_default_fonts.workspace = true
+proptest.workspace = true
