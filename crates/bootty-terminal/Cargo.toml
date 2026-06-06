@@ -1,0 +1,15 @@
+[package]
+name = "bootty-terminal"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libghostty-vt.workspace = true
+bootty-surface = { path = "../bootty-surface" }
+png.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+rstest.workspace = true
+serde_json.workspace = true
+unicode-width.workspace = true
