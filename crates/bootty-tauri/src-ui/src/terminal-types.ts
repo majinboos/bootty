@@ -6,6 +6,7 @@ export type WebCell = {
   text: string;
   fg: WebColor | null;
   bg: WebColor | null;
+  osc8: string | null;
   style: {
     bold: boolean;
     italic: boolean;
@@ -34,7 +35,7 @@ export type WebImage = {
   imageHeight: number;
   source: WebRect;
   destination: WebRect;
-  rgba: number[];
+  rgba: ArrayLike<number>;
 };
 
 export type WebTerminalFrame = {

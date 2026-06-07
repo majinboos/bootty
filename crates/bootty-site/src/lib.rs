@@ -2,6 +2,10 @@ use std::io::Cursor;
 use std::sync::OnceLock;
 
 use serde::Serialize;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, Style as SyntectStyle, ThemeSet};
+use syntect::parsing::SyntaxSet;
+use tui_markdown::{Options as MarkdownOptions, StyleSheet, from_str_with_options};
 use tuirealm::command::{Cmd, CmdResult, Direction};
 use tuirealm::component::{AppComponent, Component};
 use tuirealm::event::{Event, Key, KeyEvent, KeyModifiers, NoUserEvent};
@@ -10,7 +14,7 @@ use tuirealm::ratatui::Frame;
 use tuirealm::ratatui::buffer::{Buffer, Cell};
 use tuirealm::ratatui::layout::{Constraint, Direction as LayoutDirection, Layout, Rect, Size};
 use tuirealm::ratatui::style::{Color, Modifier, Style};
-use tuirealm::ratatui::text::{Line, Span};
+use tuirealm::ratatui::text::{Line, Span, Text};
 use tuirealm::ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tuirealm::state::State;
 use tuirealm::terminal::{TerminalAdapter, TestTerminalAdapter};
@@ -23,6 +27,172 @@ const DEFAULT_ROWS: u16 = 32;
 const ICON_TEXTURE_SIZE: u32 = 96;
 const ICON_RENDER_SIZE: u32 = 48;
 const ICON_PNG: &[u8] = include_bytes!("../../bootty-tauri/src-ui/public/bootty-mascot.png");
+const GITHUB_URL: &str = "https://github.com/majinboos/bootty";
+const GITHUB_LINKS: &[SectionLink] = &[SectionLink {
+    text: "github.com/majinboos/bootty",
+    url: GITHUB_URL,
+}];
+const GETTING_STARTED_MARKDOWN: &str = r#"# Getting Started
+
+Host loop: resize the terminal, write input, extract a frame, then render it
+through the surface your app owns.
+
+## Tauri command host
+
+```rust
+tauri::generate_handler![
+    start_terminal,
+    resize_terminal,
+    write_terminal,
+    terminal_frame,
+];
+
+#[tauri::command]
+fn write_terminal(input: String, state: State<'_, AppState>) -> Result<(), String> {
+    terminal(&state)?.write_input(input.as_bytes())?;
+    Ok(())
+}
+```
+
+## Winit/WGPU host
+
+```rust
+let viewport = BareTerminalViewport::new(
+    width, height, cell_metrics, padding,
+);
+
+session.resize(viewport.geometry())?;
+let frame = session.extract_frame()?;
+let render_frame = terminal_render_frame_for_bare_host(
+    &frame, viewport, &text_config,
+);
+
+renderer.prepare_terminal_frame(
+    &device, &queue, &render_frame, scale,
+);
+```
+"#;
+
+#[derive(Clone, Copy)]
+struct BoottyMarkdownStyle;
+
+impl StyleSheet for BoottyMarkdownStyle {
+    fn heading(&self, level: u8) -> Style {
+        let color = match level {
+            1 => Color::Green,
+            2 => Color::Cyan,
+            _ => Color::Magenta,
+        };
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    }
+
+    fn code(&self) -> Style {
+        Style::default().fg(Color::Yellow).bg(Color::Black)
+    }
+
+    fn link(&self) -> Style {
+        Style::default()
+            .fg(Color::Blue)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn blockquote(&self) -> Style {
+        Style::default().fg(Color::Green)
+    }
+
+    fn heading_meta(&self) -> Style {
+        Style::default().fg(Color::DarkGray)
+    }
+
+    fn metadata_block(&self) -> Style {
+        Style::default().fg(Color::Yellow)
+    }
+}
+
+fn getting_started_text() -> Text<'static> {
+    let mut text = from_str_with_options(
+        GETTING_STARTED_MARKDOWN,
+        &MarkdownOptions::new(BoottyMarkdownStyle),
+    );
+    highlight_code_fences(&mut text.lines);
+    text
+}
+
+fn highlight_code_fences(lines: &mut [Line<'static>]) {
+    let mut highlighter = None;
+    for line in lines {
+        let content = line_text(line);
+        if let Some(fence_language) = content.strip_prefix("```") {
+            let next_highlighter = if highlighter.is_some() {
+                None
+            } else {
+                code_highlighter(fence_language)
+            };
+            *line = Line::default();
+            highlighter = next_highlighter;
+        } else if let Some(highlighter) = highlighter.as_mut() {
+            *line = highlighted_code_line(&content, highlighter);
+        }
+    }
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn code_highlighter(language: &str) -> Option<HighlightLines<'static>> {
+    let syntax = syntax_set().find_syntax_by_token(language)?;
+    let theme = theme_set().themes.get("base16-ocean.dark")?;
+    Some(HighlightLines::new(syntax, theme))
+}
+
+fn highlighted_code_line(line: &str, highlighter: &mut HighlightLines<'_>) -> Line<'static> {
+    let Ok(ranges) = highlighter.highlight_line(line, syntax_set()) else {
+        return Line::from(Span::styled(
+            line.to_owned(),
+            Style::default().fg(Color::Yellow).bg(Color::Black),
+        ));
+    };
+    Line::from(
+        ranges
+            .into_iter()
+            .map(|(style, text)| Span::styled(text.to_owned(), syntect_style(style)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn syntect_style(style: SyntectStyle) -> Style {
+    let mut ratatui_style = Style::default()
+        .fg(Color::Rgb(
+            style.foreground.r,
+            style.foreground.g,
+            style.foreground.b,
+        ))
+        .bg(Color::Black);
+    if style.font_style.contains(FontStyle::BOLD) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        ratatui_style = ratatui_style.add_modifier(Modifier::UNDERLINED);
+    }
+    ratatui_style
+}
+
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn theme_set() -> &'static ThemeSet {
+    static THEME_SET: OnceLock<ThemeSet> = OnceLock::new();
+    THEME_SET.get_or_init(ThemeSet::load_defaults)
+}
 
 impl Default for SiteBackend {
     fn default() -> Self {
@@ -58,7 +228,7 @@ impl SiteBackend {
                 self.menu.attr(Attribute::Focus, AttrValue::Flag(true));
                 self.detail.attr(Attribute::Focus, AttrValue::Flag(false));
                 if kind == "down" {
-                    self.update(Msg::Activate)?;
+                    self.update(Msg::ToggleFocus)?;
                 }
             }
             Some(HitTarget::Detail) if kind == "down" => {
@@ -164,18 +334,11 @@ impl SiteBackend {
                 self.detail
                     .attr(Attribute::Focus, AttrValue::Flag(focus == Focus::Detail));
             }
-            Msg::Activate => {
-                if let Some(url) = sections()[self.selected].action {
-                    if let Some(window) = web_sys::window() {
-                        let _ = window.open_with_url_and_target(url, "_blank");
-                    }
-                    self.notice = "opened github".to_owned();
-                } else {
-                    self.update(Msg::Focus(match self.focus {
-                        Focus::Menu => Focus::Detail,
-                        Focus::Detail => Focus::Menu,
-                    }))?;
-                }
+            Msg::ToggleFocus => {
+                self.update(Msg::Focus(match self.focus {
+                    Focus::Menu => Focus::Detail,
+                    Focus::Detail => Focus::Menu,
+                }))?;
             }
         }
         Ok(())
@@ -186,7 +349,7 @@ impl SiteBackend {
 enum Msg {
     Move(isize),
     Focus(Focus),
-    Activate,
+    ToggleFocus,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -197,12 +360,19 @@ enum Focus {
 
 #[derive(Clone, Copy)]
 struct Section {
+    icon: &'static str,
     label: &'static str,
     plain_label: &'static str,
     title: &'static str,
     accent: Color,
     lines: &'static [&'static str],
-    action: Option<&'static str>,
+    links: &'static [SectionLink],
+}
+
+#[derive(Clone, Copy)]
+struct SectionLink {
+    text: &'static str,
+    url: &'static str,
 }
 
 struct SiteViewState<'a> {
@@ -237,7 +407,12 @@ impl Component for Menu {
             .map(|(index, section)| {
                 let selected = index == self.selected;
                 Line::from(Span::styled(
-                    format!("{} {}", if selected { ">" } else { " " }, section.label),
+                    format!(
+                        "{} {} {}",
+                        if selected { ">" } else { " " },
+                        section.icon,
+                        section.label
+                    ),
                     Style::default()
                         .fg(if selected {
                             section.accent
@@ -304,7 +479,7 @@ impl AppComponent<Msg, NoUserEvent> for Menu {
             }) => Some(Msg::Focus(Focus::Detail)),
             Event::Keyboard(KeyEvent {
                 code: Key::Enter, ..
-            }) => Some(Msg::Activate),
+            }) => Some(Msg::ToggleFocus),
             _ => None,
         }
     }
@@ -329,6 +504,15 @@ impl Component for Detail {
             } else {
                 Color::Gray
             }));
+        if section.plain_label == "Getting Started" {
+            frame.render_widget(
+                Paragraph::new(getting_started_text())
+                    .block(block)
+                    .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
         let mut lines = if section.plain_label == "Shell" {
             vec![
                 Line::from(Span::styled(
@@ -411,7 +595,7 @@ impl AppComponent<Msg, NoUserEvent> for Detail {
             }) => Some(Msg::Focus(Focus::Menu)),
             Event::Keyboard(KeyEvent {
                 code: Key::Enter, ..
-            }) => Some(Msg::Activate),
+            }) => Some(Msg::ToggleFocus),
             _ => None,
         }
     }
@@ -548,6 +732,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, notice: &str, focus: Focus) {
 fn sections() -> &'static [Section] {
     &[
         Section {
+            icon: "\u{f2d0}",
             label: "Frame",
             plain_label: "Frame",
             title: "This website is a terminal frame.",
@@ -558,9 +743,33 @@ fn sections() -> &'static [Section] {
                 "The browser receives cells, colors, cursor state, and image layers.",
                 "The same frame contract can host demos, docs, and app surfaces.",
             ],
-            action: None,
+            links: &[],
         },
         Section {
+            icon: "\u{f05a9}",
+            label: "Getting Started",
+            plain_label: "Getting Started",
+            title: "Build a terminal host with Bootty.",
+            accent: Color::Green,
+            lines: &[],
+            links: &[],
+        },
+        Section {
+            icon: "\u{f0078}",
+            label: "DOOM",
+            plain_label: "DOOM",
+            title: "Doom runs inside this terminal frame.",
+            accent: Color::Red,
+            lines: &[
+                "The browser runs a doomgeneric WebAssembly engine.",
+                "Bootty receives the framebuffer as an image layer in this tab.",
+                "Focus the detail panel to play; use WASD/arrows, F, Space, and 1-7.",
+                "The rest of the website remains a normal terminal frame.",
+            ],
+            links: &[],
+        },
+        Section {
+            icon: "\u{f03a7}",
             label: "Renderer",
             plain_label: "Renderer",
             title: "Renderer seams are Bootty-owned.",
@@ -571,9 +780,10 @@ fn sections() -> &'static [Section] {
                 "The native app submits WGPU terminal commands through eframe.",
                 "This site proves the terminal frame can travel outside the desktop host.",
             ],
-            action: None,
+            links: &[],
         },
         Section {
+            icon: "\u{e795}",
             label: "Runtime",
             plain_label: "Runtime",
             title: "PTY work stays out of the UI layer.",
@@ -584,17 +794,19 @@ fn sections() -> &'static [Section] {
                 "The app consumes published frames instead of parsing shell output on the UI thread.",
                 "Status metrics make latency visible while benchmarks keep regressions concrete.",
             ],
-            action: None,
+            links: &[],
         },
         Section {
+            icon: "\u{f489}",
             label: "Shell",
             plain_label: "Shell",
             title: "Demo shell.",
             accent: Color::Yellow,
             lines: &[],
-            action: None,
+            links: &[],
         },
         Section {
+            icon: "\u{f0222}",
             label: "App",
             plain_label: "App",
             title: "Bootty is the working terminal home.",
@@ -605,15 +817,16 @@ fn sections() -> &'static [Section] {
                 "The egui-tabs example routes tabs through the shared renderer path.",
                 "Validation covers fmt, clippy, tests, benchmark builds, and paint-plan benches.",
             ],
-            action: None,
+            links: &[],
         },
         Section {
-            label: "Source",
-            plain_label: "Source",
-            title: "Read the code.",
+            icon: "\u{f09b}",
+            label: "GitHub",
+            plain_label: "GitHub",
+            title: "Read the source on GitHub.",
             accent: Color::Red,
-            lines: &["github.com/majinboos/bootty", "", "Press Enter to open it."],
-            action: Some("https://github.com/majinboos/bootty"),
+            lines: &["github.com/majinboos/bootty"],
+            links: GITHUB_LINKS,
         },
     ]
 }
@@ -657,7 +870,7 @@ fn web_frame(buffer: &Buffer) -> WebTerminalFrame {
     for y in 0..buffer.area.height {
         for x in 0..buffer.area.width {
             let cell = &buffer[(x, y)];
-            cells.push(web_cell(x, y, cell));
+            cells.push(web_cell(x, y, cell, osc8_link_at(buffer, x, y)));
         }
     }
     WebTerminalFrame {
@@ -756,13 +969,32 @@ fn rgba_from_png(bytes: &[u8], color_type: png::ColorType) -> Vec<u8> {
     }
 }
 
-fn web_cell(x: u16, y: u16, cell: &Cell) -> WebCell {
+fn osc8_link_at(buffer: &Buffer, x: u16, y: u16) -> Option<&'static str> {
+    let row = row_text(buffer, y);
+    sections()
+        .iter()
+        .flat_map(|section| section.links)
+        .find_map(|link| {
+            let start = row.find(link.text)?;
+            let end = start + link.text.len();
+            ((x as usize) >= start && (x as usize) < end).then_some(link.url)
+        })
+}
+
+fn row_text(buffer: &Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
+fn web_cell(x: u16, y: u16, cell: &Cell, osc8: Option<&str>) -> WebCell {
     WebCell {
         x,
         y,
         text: cell.symbol().to_owned(),
         fg: web_fg(cell.fg),
         bg: web_bg(cell.bg),
+        osc8: osc8.map(str::to_owned),
         style: WebCellStyle {
             bold: cell.modifier.contains(Modifier::BOLD),
             italic: cell.modifier.contains(Modifier::ITALIC),
@@ -944,6 +1176,7 @@ struct WebCell {
     text: String,
     fg: Option<WebColor>,
     bg: Option<WebColor>,
+    osc8: Option<String>,
     style: WebCellStyle,
 }
 
@@ -1133,7 +1366,7 @@ mod tests {
 
     #[test]
     fn reset_cell_colors_fall_back_to_frame_defaults() {
-        let cell = web_cell(0, 0, &Cell::new("A"));
+        let cell = web_cell(0, 0, &Cell::new("A"), None);
 
         assert_eq!(cell.fg, None);
         assert_eq!(cell.bg, None);
@@ -1144,7 +1377,7 @@ mod tests {
         let mut source = Cell::new("A");
         source.fg = Color::Green;
         source.bg = Color::Black;
-        let cell = web_cell(0, 0, &source);
+        let cell = web_cell(0, 0, &source, None);
 
         assert_eq!(
             cell.fg,
@@ -1161,6 +1394,78 @@ mod tests {
                 g: 18,
                 b: 26,
             })
+        );
+    }
+
+    #[test]
+    fn github_section_uses_nerd_font_icon_and_osc8_link() {
+        let section = sections().last().expect("github section exists");
+
+        assert_eq!(section.icon, "\u{f09b}");
+        assert_eq!(section.label, "GitHub");
+        assert_eq!(section.plain_label, "GitHub");
+        assert_eq!(section.links[0].text, "github.com/majinboos/bootty");
+        assert_eq!(section.links[0].url, GITHUB_URL);
+    }
+
+    #[test]
+    fn github_link_cells_export_osc8_url() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 1));
+        buffer.set_string(2, 0, "github.com/majinboos/bootty", Style::default());
+
+        assert_eq!(osc8_link_at(&buffer, 2, 0), Some(GITHUB_URL));
+        assert_eq!(osc8_link_at(&buffer, 28, 0), Some(GITHUB_URL));
+        assert_eq!(osc8_link_at(&buffer, 29, 0), None);
+    }
+
+    #[test]
+    fn web_cell_serializes_osc8_url() {
+        let cell = web_cell(0, 0, &Cell::new("g"), Some(GITHUB_URL));
+
+        assert_eq!(cell.osc8.as_deref(), Some(GITHUB_URL));
+    }
+
+    #[test]
+    fn getting_started_markdown_contains_both_hosts_without_fences() {
+        let text = getting_started_text();
+        let content = text
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content.contains("Tauri command host"));
+        assert!(content.contains("Winit/WGPU host"));
+        assert!(!content.contains("```"));
+    }
+
+    #[test]
+    fn getting_started_winit_section_stays_in_first_panel() {
+        let text = getting_started_text();
+        let winit_line = text
+            .lines
+            .iter()
+            .position(|line| line_text(line).contains("Winit/WGPU host"))
+            .expect("getting started text includes Winit heading");
+
+        assert!(winit_line < 24);
+    }
+
+    #[test]
+    fn getting_started_code_lines_are_syntax_highlighted() {
+        let text = getting_started_text();
+        let line = text
+            .lines
+            .iter()
+            .find(|line| line_text(line).contains("fn write_terminal"))
+            .expect("getting started text includes Tauri code");
+
+        assert!(line.spans.len() > 1);
+        assert!(
+            line.spans
+                .iter()
+                .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _))))
         );
     }
 }

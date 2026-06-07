@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import { createTerminalBackend } from "./terminal-api";
-import type { TerminalBackend } from "./terminal-api";
+import type { TerminalBackend, TerminalKey } from "./terminal-api";
 import type { WebTerminalFrame } from "./terminal-types";
 import { WebGlTerminalRenderer } from "./webgl-terminal";
 import "./style.css";
@@ -69,18 +69,55 @@ function App() {
     [draw],
   );
 
+  const sendKey = useCallback(
+    (event: KeyboardEvent, kind: TerminalKey["kind"]) => {
+      const backend = backendRef.current;
+      const frame = frameRef.current;
+      if (!backend?.key || !frame || !backend.wantsKey?.(keyboardEvent(event, kind), frame)) {
+        return false;
+      }
+      event.preventDefault();
+      backend
+        .key(keyboardEvent(event, kind))
+        .then((nextFrame) => {
+          if (!nextFrame) {
+            return;
+          }
+          frameRef.current = nextFrame;
+          rendererRef.current?.render(nextFrame);
+        })
+        .catch(reportError);
+      return true;
+    },
+    [],
+  );
+
   const sendMouse = useCallback(
     (kind: "move" | "down" | "up" | "leave", event: React.PointerEvent<HTMLCanvasElement>) => {
       const backend = backendRef.current;
       const renderer = rendererRef.current;
       const frame = frameRef.current;
       const canvas = canvasRef.current;
-      if (!backend?.mouse || !renderer || !frame || !canvas) {
+      if (!frame || !canvas) {
         return;
+      }
+      if (kind === "leave") {
+        canvas.style.cursor = "default";
       }
       const rect = canvas.getBoundingClientRect();
       const x = Math.max(0, Math.min(frame.cols - 1, Math.floor((event.clientX - rect.left) / frame.cellWidth)));
       const y = Math.max(0, Math.min(frame.rows - 1, Math.floor((event.clientY - rect.top) / frame.cellHeight)));
+      const osc8 = osc8At(frame, x, y);
+      if (kind !== "leave") {
+        canvas.style.cursor = osc8 ? "pointer" : "default";
+      }
+      if (kind === "down" && osc8) {
+        window.open(osc8, "_blank", "noopener,noreferrer");
+        return;
+      }
+      if (!backend?.mouse || !renderer) {
+        return;
+      }
       backend
         .mouse({ kind, x, y, button: event.button })
         .then((nextFrame) => {
@@ -145,12 +182,18 @@ function App() {
       draw().catch(reportError);
     };
     const onKeyDown = (event: KeyboardEvent) => {
+      if (sendKey(event, "down")) {
+        return;
+      }
       const encoded = encodeKey(event);
       if (encoded == null) {
         return;
       }
       event.preventDefault();
       sendInput(encoded);
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      sendKey(event, "up");
     };
     const onPaste = (event: ClipboardEvent) => {
       event.preventDefault();
@@ -159,13 +202,15 @@ function App() {
 
     window.addEventListener("resize", onResize);
     window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
     window.addEventListener("paste", onPaste);
     return () => {
       window.removeEventListener("resize", onResize);
       window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("paste", onPaste);
     };
-  }, [draw, sendInput]);
+  }, [draw, sendInput, sendKey]);
 
   return (
     <main className="terminal-site" aria-label="Bootty terminal website">
@@ -190,6 +235,23 @@ function App() {
       />
     </main>
   );
+}
+
+function keyboardEvent(event: KeyboardEvent, kind: TerminalKey["kind"]): TerminalKey {
+  return {
+    kind,
+    key: event.key,
+    code: event.code,
+    ctrlKey: event.ctrlKey,
+    shiftKey: event.shiftKey,
+    altKey: event.altKey,
+    metaKey: event.metaKey,
+    repeat: event.repeat,
+  };
+}
+
+function osc8At(frame: WebTerminalFrame, x: number, y: number): string | null {
+  return frame.cells.find((cell) => cell.x === x && cell.y === y)?.osc8 ?? null;
 }
 
 function gridForCanvas(canvas: HTMLCanvasElement, frame: WebTerminalFrame): GridSize {

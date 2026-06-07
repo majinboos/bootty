@@ -63,6 +63,9 @@ rstest = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 serde_json = "1"
+syntect = { version = "5.3", default-features = false, features = [
+  "default-fancy",
+] }
 tauri = { version = "2", default-features = true }
 tauri-build = { version = "2", features = [] }
 tempfile = "3"
@@ -70,9 +73,9 @@ tokio = "1.48.0"
 toml_edit = { version = "0.25", features = ["serde"] }
 ttf-parser = "0.25"
 tuirealm = { version = "4.1.0", default-features = false, features = ["derive"] }
+tui-markdown = { version = "0.3.7", default-features = false }
 unicode-width = "0.2"
 wasm-bindgen = "0.2"
-web-sys = "0.3"
 wgpu = "29"
 winit = "0.30"
 

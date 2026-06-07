@@ -66,6 +66,7 @@ struct WebCell {
     text: String,
     fg: Option<WebColor>,
     bg: Option<WebColor>,
+    osc8: Option<String>,
     style: WebCellStyle,
 }
 
@@ -270,6 +271,7 @@ fn web_cell(frame: &RenderFrame, cell: &RenderCell) -> WebCell {
         text: frame.cell_text(cell).iter().collect(),
         fg: cell.fg.map(web_color),
         bg: cell.bg.map(web_color),
+        osc8: None,
         style: web_style(cell.style),
     }
 }

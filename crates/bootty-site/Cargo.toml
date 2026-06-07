@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 png.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
+syntect.workspace = true
 tuirealm.workspace = true
+tui-markdown.workspace = true
 wasm-bindgen.workspace = true
-web-sys = { workspace = true, features = ["Window"] }
