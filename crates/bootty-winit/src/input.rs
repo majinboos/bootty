@@ -317,6 +317,7 @@ mod tests {
         })
     }
 
+    #[test]
     fn ctrl_c_is_routed_to_terminal_encoder() {
         let commands = commands_for(vec![egui::Event::Key {
             key: egui::Key::C,

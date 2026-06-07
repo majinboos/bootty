@@ -608,6 +608,8 @@ mod tests {
             ]
         );
     }
+
+    #[test]
     fn app_keybindings_route_escape_and_text_actions_to_terminal_bytes() {
         let mut bindings = AppKeyBindings::from_config(&InputConfig {
             keybind: vec![

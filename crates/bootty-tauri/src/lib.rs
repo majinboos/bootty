@@ -460,9 +460,11 @@ mod tests {
     use super::{CellMetrics, web_frame};
     #[test]
     fn web_frame_preserves_cells_text_colors_and_metrics() {
-        let mut style = CellStyle::default();
-        style.bold = true;
-        style.underline = Underline::Single;
+        let style = CellStyle {
+            bold: true,
+            underline: Underline::Single,
+            ..Default::default()
+        };
         let frame = RenderFrame {
             cols: 2,
             rows: 1,

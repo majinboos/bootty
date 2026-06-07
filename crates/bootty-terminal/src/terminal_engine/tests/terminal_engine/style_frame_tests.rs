@@ -113,7 +113,7 @@ fn terminal_scrollback_defaults_to_disabled_for_backend_attach_catchup() {
 #[test]
 fn native_terminal_scrollback_uses_tmux_sized_budget() {
     assert_eq!(NATIVE_SCROLLBACK_TARGET_ROWS, 1_000_000);
-    assert!(NATIVE_MAX_SCROLLBACK > NATIVE_SCROLLBACK_TARGET_ROWS);
+    assert_eq!(NATIVE_MAX_SCROLLBACK, 320_000_000);
 }
 
 #[test]

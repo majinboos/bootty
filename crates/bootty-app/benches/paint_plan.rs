@@ -518,13 +518,17 @@ fn bench_animated_agent_pipeline_wgpu_prepare(c: &mut Criterion) {
 }
 
 criterion_group!(
-    benches,
-    bench_paint_plan,
-    bench_extract_frame,
-    bench_extract_frame_one_row_mutate,
-    bench_render_commands,
-    bench_wgpu_prepare,
-    bench_animated_agent_pipeline,
-    bench_animated_agent_pipeline_wgpu_prepare
+    name = benches;
+    // These benches include WGPU preparation and full-frame terminal workloads that
+    // vary on developer desktops under browser/GPU scheduler load.
+    config = Criterion::default().noise_threshold(0.15);
+    targets =
+        bench_paint_plan,
+        bench_extract_frame,
+        bench_extract_frame_one_row_mutate,
+        bench_render_commands,
+        bench_wgpu_prepare,
+        bench_animated_agent_pipeline,
+        bench_animated_agent_pipeline_wgpu_prepare
 );
 criterion_main!(benches);
