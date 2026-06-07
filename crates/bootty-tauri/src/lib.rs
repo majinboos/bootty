@@ -3,7 +3,8 @@ use std::sync::Mutex;
 use bootty_runtime::terminal::{
     CellStyle, CursorSnapshot, FrameColors, RenderCell, RenderFrame, TerminalSession,
 };
-use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
+use bootty_surface::geometry::{CellMetrics, SurfaceRect, TerminalGeometry};
+use bootty_terminal::terminal_image::{KittyImageLayer, KittyImagePlacement};
 use serde::Serialize;
 use tauri::State;
 
@@ -35,6 +36,7 @@ struct WebTerminalFrame {
     colors: WebFrameColors,
     cursor: Option<WebCursor>,
     cells: Vec<WebCell>,
+    images: Vec<WebImage>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -79,6 +81,35 @@ struct WebCellStyle {
     strikethrough: bool,
     overline: bool,
     underline: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebImage {
+    key: String,
+    layer: WebImageLayer,
+    image_width: u32,
+    image_height: u32,
+    source: WebRect,
+    destination: WebRect,
+    rgba: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum WebImageLayer {
+    BelowBackground,
+    BelowText,
+    AboveText,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebRect {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -218,6 +249,12 @@ fn web_frame(
         cell_height: cell.height.ceil().max(1.0) as u32,
         colors: web_colors(frame.colors),
         cursor: frame.cursor.map(web_cursor),
+        images: frame
+            .images
+            .placements
+            .iter()
+            .filter_map(web_image)
+            .collect(),
         cells: frame
             .cells
             .iter()
@@ -245,6 +282,132 @@ fn web_colors(colors: FrameColors) -> WebFrameColors {
         cursor_text: colors.cursor_text.map(web_color),
         selection_background: colors.selection_background.map(web_color),
         selection_foreground: colors.selection_foreground.map(web_color),
+    }
+}
+
+fn web_image(image: &KittyImagePlacement) -> Option<WebImage> {
+    let rgba = rgba_image_pixels(image)?;
+    Some(WebImage {
+        key: format!("{}:{}", image.image_id, image.placement_id),
+        layer: web_image_layer(image.layer),
+        image_width: image.image_width,
+        image_height: image.image_height,
+        source: WebRect {
+            min_x: image.source.x as f32,
+            min_y: image.source.y as f32,
+            max_x: image.source.x.checked_add(image.source.width)? as f32,
+            max_y: image.source.y.checked_add(image.source.height)? as f32,
+        },
+        destination: web_rect(image.destination),
+        rgba,
+    })
+}
+
+fn rgba_image_pixels(image: &KittyImagePlacement) -> Option<Vec<u8>> {
+    let pixels = image.image_width.checked_mul(image.image_height)? as usize;
+    match image.image_format {
+        libghostty_vt::kitty::graphics::ImageFormat::Rgba => {
+            let expected = pixels.checked_mul(4)?;
+            (image.data.len() >= expected).then(|| image.data[..expected].to_vec())
+        }
+        libghostty_vt::kitty::graphics::ImageFormat::Rgb => {
+            let expected = pixels.checked_mul(3)?;
+            if image.data.len() < expected {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixels * 4);
+            for rgb in image.data[..expected].chunks_exact(3) {
+                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            Some(rgba)
+        }
+        libghostty_vt::kitty::graphics::ImageFormat::GrayAlpha => {
+            let expected = pixels.checked_mul(2)?;
+            if image.data.len() < expected {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixels * 4);
+            for gray_alpha in image.data[..expected].chunks_exact(2) {
+                rgba.extend_from_slice(&[
+                    gray_alpha[0],
+                    gray_alpha[0],
+                    gray_alpha[0],
+                    gray_alpha[1],
+                ]);
+            }
+            Some(rgba)
+        }
+        libghostty_vt::kitty::graphics::ImageFormat::Gray => {
+            if image.data.len() < pixels {
+                return None;
+            }
+            let mut rgba = Vec::with_capacity(pixels * 4);
+            for gray in &image.data[..pixels] {
+                rgba.extend_from_slice(&[*gray, *gray, *gray, 255]);
+            }
+            Some(rgba)
+        }
+        libghostty_vt::kitty::graphics::ImageFormat::Png => decode_png_rgba(image),
+        _ => None,
+    }
+}
+
+fn decode_png_rgba(image: &KittyImagePlacement) -> Option<Vec<u8>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(image.data.as_slice()));
+    decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().ok()?;
+    let mut buffer = vec![0; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buffer).ok()?;
+    if info.width != image.image_width || info.height != image.image_height {
+        return None;
+    }
+    let data = &buffer[..info.buffer_size()];
+    match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => Some(data.to_vec()),
+        (png::ColorType::Rgb, png::BitDepth::Eight) => {
+            let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
+            for rgb in data.chunks_exact(3) {
+                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+            Some(rgba)
+        }
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
+            let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
+            for gray_alpha in data.chunks_exact(2) {
+                rgba.extend_from_slice(&[
+                    gray_alpha[0],
+                    gray_alpha[0],
+                    gray_alpha[0],
+                    gray_alpha[1],
+                ]);
+            }
+            Some(rgba)
+        }
+        (png::ColorType::Grayscale, png::BitDepth::Eight) => {
+            let mut rgba = Vec::with_capacity(data.len() * 4);
+            for gray in data {
+                rgba.extend_from_slice(&[*gray, *gray, *gray, 255]);
+            }
+            Some(rgba)
+        }
+        _ => None,
+    }
+}
+
+fn web_image_layer(layer: KittyImageLayer) -> WebImageLayer {
+    match layer {
+        KittyImageLayer::BelowBackground => WebImageLayer::BelowBackground,
+        KittyImageLayer::BelowText => WebImageLayer::BelowText,
+        KittyImageLayer::AboveText => WebImageLayer::AboveText,
+    }
+}
+
+fn web_rect(rect: SurfaceRect) -> WebRect {
+    WebRect {
+        min_x: rect.min_x,
+        min_y: rect.min_y,
+        max_x: rect.max_x,
+        max_y: rect.max_y,
     }
 }
 
@@ -282,15 +445,19 @@ fn web_color(color: libghostty_vt::style::RgbColor) -> WebColor {
 
 #[cfg(test)]
 mod tests {
+
+    use std::sync::Arc;
+
     use bootty_runtime::terminal::{CellStyle, FrameColors, FrameStats, RenderCell, RenderFrame};
-    use bootty_terminal::terminal_image::KittyImageFrame;
+    use bootty_surface::geometry::SurfaceRect;
+    use bootty_terminal::terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement};
     use libghostty_vt::{
+        kitty::graphics::{ImageFormat, SourceRect},
         render::Dirty,
         style::{RgbColor, Underline},
     };
 
     use super::{CellMetrics, web_frame};
-
     #[test]
     fn web_frame_preserves_cells_text_colors_and_metrics() {
         let mut style = CellStyle::default();
@@ -320,7 +487,25 @@ mod tests {
                 style,
             }],
             text: vec!['h', 'i'],
-            images: KittyImageFrame::default(),
+            images: KittyImageFrame {
+                placements: vec![KittyImagePlacement {
+                    image_id: 7,
+                    placement_id: 9,
+                    layer: KittyImageLayer::AboveText,
+                    image_width: 1,
+                    image_height: 1,
+                    image_format: ImageFormat::Rgba,
+                    source: SourceRect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                    destination: SurfaceRect::from_min_size(2.0, 3.0, 4.0, 5.0),
+                    data: Arc::new(vec![1, 2, 3, 4]),
+                }],
+                ..KittyImageFrame::default()
+            },
             scrollbar: None,
             stats: FrameStats::default(),
         };
@@ -335,6 +520,11 @@ mod tests {
         assert!(web.cells[0].style.bold);
         assert!(web.cells[0].style.underline);
         assert_eq!(web.cells[0].fg.map(|color| color.r), Some(0xff));
+        assert_eq!(web.images.len(), 1);
+        assert_eq!(web.images[0].key, "7:9");
+        assert_eq!(web.images[0].layer, super::WebImageLayer::AboveText);
+        assert_eq!(web.images[0].rgba, [1, 2, 3, 4]);
+        assert_eq!(web.images[0].destination.min_x, 2.0);
     }
 
     fn rgb(r: u8, g: u8, b: u8) -> RgbColor {

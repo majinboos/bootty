@@ -614,6 +614,7 @@ dependencies = [
  "bootty-surface",
  "bootty-terminal",
  "libghostty-vt",
+ "png 0.18.1",
  "serde",
  "tauri",
  "tauri-build",

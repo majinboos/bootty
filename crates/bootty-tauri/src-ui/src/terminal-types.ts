@@ -18,6 +18,24 @@ export type WebCell = {
     underline: boolean;
   };
 };
+export type WebRect = {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+};
+
+export type WebImageLayer = "belowBackground" | "belowText" | "aboveText";
+
+export type WebImage = {
+  key: string;
+  layer: WebImageLayer;
+  imageWidth: number;
+  imageHeight: number;
+  source: WebRect;
+  destination: WebRect;
+  rgba: number[];
+};
 
 export type WebTerminalFrame = {
   cols: number;
@@ -31,4 +49,5 @@ export type WebTerminalFrame = {
   };
   cursor: { x: number; y: number; color: WebColor | null } | null;
   cells: WebCell[];
+  images: WebImage[];
 };

@@ -1,14 +1,32 @@
-import type { WebCell, WebColor, WebTerminalFrame } from "./terminal-types";
+import type { WebCell, WebColor, WebImage, WebImageLayer, WebTerminalFrame } from "./terminal-types";
 
 type Rgba = [number, number, number, number];
+
+type ImageTexture = {
+  texture: WebGLTexture;
+  width: number;
+  height: number;
+};
+
+type Glyph = {
+  u: number;
+  v: number;
+  w: number;
+  h: number;
+  width: number;
+  height: number;
+};
 
 export class WebGlTerminalRenderer {
   private readonly gl: WebGL2RenderingContext;
   private readonly solidProgram: WebGLProgram;
+  private readonly imageProgram: WebGLProgram;
   private readonly textProgram: WebGLProgram;
   private readonly solidBuffer: WebGLBuffer;
+  private readonly imageBuffer: WebGLBuffer;
   private readonly textBuffer: WebGLBuffer;
   private readonly atlas: GlyphAtlas;
+  private readonly imageTextures = new Map<string, ImageTexture>();
   private width = 0;
   private height = 0;
   private dpr = 1;
@@ -26,8 +44,10 @@ export class WebGlTerminalRenderer {
 
     this.gl = gl;
     this.solidProgram = createProgram(gl, SOLID_VERTEX_SHADER, SOLID_FRAGMENT_SHADER);
+    this.imageProgram = createProgram(gl, IMAGE_VERTEX_SHADER, IMAGE_FRAGMENT_SHADER);
     this.textProgram = createProgram(gl, TEXT_VERTEX_SHADER, TEXT_FRAGMENT_SHADER);
     this.solidBuffer = required(gl.createBuffer(), "create solid instance buffer");
+    this.imageBuffer = required(gl.createBuffer(), "create image vertex buffer");
     this.textBuffer = required(gl.createBuffer(), "create text instance buffer");
     this.atlas = new GlyphAtlas(gl);
   }
@@ -35,10 +55,13 @@ export class WebGlTerminalRenderer {
   render(frame: WebTerminalFrame): void {
     this.resize(frame);
 
-    const solidInstances: number[] = [];
+    const surfaceInstances: number[] = [];
+    const backgroundInstances: number[] = [];
     const textInstances: number[] = [];
+    const cursorInstances: number[] = [];
+
     pushSolidInstance(
-      solidInstances,
+      surfaceInstances,
       0,
       0,
       frame.cols * frame.cellWidth,
@@ -50,7 +73,7 @@ export class WebGlTerminalRenderer {
       const colors = resolvedCellColors(frame, cell);
       if (colors.background) {
         pushSolidInstance(
-          solidInstances,
+          backgroundInstances,
           cell.x * frame.cellWidth,
           cell.y * frame.cellHeight,
           frame.cellWidth,
@@ -78,7 +101,7 @@ export class WebGlTerminalRenderer {
       );
       if (cell.style.underline) {
         pushSolidInstance(
-          solidInstances,
+          backgroundInstances,
           cell.x * frame.cellWidth,
           cell.y * frame.cellHeight + frame.cellHeight - 2,
           frame.cellWidth,
@@ -90,7 +113,7 @@ export class WebGlTerminalRenderer {
 
     if (frame.cursor) {
       pushSolidInstance(
-        solidInstances,
+        cursorInstances,
         frame.cursor.x * frame.cellWidth,
         frame.cursor.y * frame.cellHeight,
         frame.cellWidth,
@@ -109,16 +132,28 @@ export class WebGlTerminalRenderer {
       1,
     );
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
-    this.drawSolid(solidInstances);
+
+    this.drawSolid(surfaceInstances);
+    this.drawImages(frame, "belowBackground");
+    this.drawSolid(backgroundInstances);
+    this.drawImages(frame, "belowText");
     this.drawText(textInstances);
+    this.drawImages(frame, "aboveText");
+    this.drawSolid(cursorInstances);
     this.gl.flush();
   }
 
   dispose(): void {
     this.gl.deleteBuffer(this.solidBuffer);
+    this.gl.deleteBuffer(this.imageBuffer);
     this.gl.deleteBuffer(this.textBuffer);
     this.gl.deleteProgram(this.solidProgram);
+    this.gl.deleteProgram(this.imageProgram);
     this.gl.deleteProgram(this.textProgram);
+    for (const image of this.imageTextures.values()) {
+      this.gl.deleteTexture(image.texture);
+    }
+    this.imageTextures.clear();
     this.atlas.dispose();
   }
 
@@ -157,6 +192,78 @@ export class WebGlTerminalRenderer {
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
   }
 
+  private drawImages(frame: WebTerminalFrame, layer: WebImageLayer): void {
+    const images = frame.images.filter((image) => image.layer === layer);
+    if (images.length === 0) {
+      return;
+    }
+
+    const gl = this.gl;
+    gl.useProgram(this.imageProgram);
+    gl.uniform2f(
+      required(gl.getUniformLocation(this.imageProgram, "u_resolution"), "image resolution"),
+      this.width,
+      this.height,
+    );
+    gl.uniform1i(required(gl.getUniformLocation(this.imageProgram, "u_image"), "image sampler"), 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.imageBuffer);
+    bindAttribute(gl, this.imageProgram, "a_position", 2, IMAGE_VERTEX_FLOATS, 0, false);
+    bindAttribute(gl, this.imageProgram, "a_uv", 2, IMAGE_VERTEX_FLOATS, 2, false);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    for (const image of images) {
+      const vertices = imageVertices(image);
+      if (vertices.length === 0) {
+        continue;
+      }
+      const texture = this.imageTexture(image);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texture.texture);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STREAM_DRAW);
+      gl.drawArrays(gl.TRIANGLES, 0, vertices.length / IMAGE_VERTEX_FLOATS);
+    }
+
+    gl.disable(gl.BLEND);
+  }
+
+  private imageTexture(image: WebImage): ImageTexture {
+    const cached = this.imageTextures.get(image.key);
+    if (cached && cached.width === image.imageWidth && cached.height === image.imageHeight) {
+      this.uploadImageTexture(cached.texture, image);
+      return cached;
+    }
+    if (cached) {
+      this.gl.deleteTexture(cached.texture);
+    }
+
+    const texture = required(this.gl.createTexture(), "create image texture");
+    this.uploadImageTexture(texture, image);
+    const stored = { texture, width: image.imageWidth, height: image.imageHeight };
+    this.imageTextures.set(image.key, stored);
+    return stored;
+  }
+
+  private uploadImageTexture(texture: WebGLTexture, image: WebImage): void {
+    this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
+    this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.LINEAR);
+    this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.LINEAR);
+    this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
+    this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
+    this.gl.pixelStorei(this.gl.UNPACK_ALIGNMENT, 1);
+    this.gl.texImage2D(
+      this.gl.TEXTURE_2D,
+      0,
+      this.gl.RGBA,
+      image.imageWidth,
+      image.imageHeight,
+      0,
+      this.gl.RGBA,
+      this.gl.UNSIGNED_BYTE,
+      new Uint8Array(image.rgba),
+    );
+  }
+
   private drawText(instances: number[]): void {
     const count = instances.length / TEXT_INSTANCE_FLOATS;
     if (count === 0) {
@@ -186,16 +293,8 @@ export class WebGlTerminalRenderer {
 }
 
 const SOLID_INSTANCE_FLOATS = 8;
+const IMAGE_VERTEX_FLOATS = 4;
 const TEXT_INSTANCE_FLOATS = 12;
-
-type Glyph = {
-  u: number;
-  v: number;
-  w: number;
-  h: number;
-  width: number;
-  height: number;
-};
 
 class GlyphAtlas {
   readonly texture: WebGLTexture;
@@ -290,6 +389,22 @@ function pushTextInstance(
   instances.push(x, y, width, height, glyph.u, glyph.v, glyph.w, glyph.h, ...color);
 }
 
+function imageVertices(image: WebImage): number[] {
+  if (image.source.maxX <= image.source.minX || image.source.maxY <= image.source.minY) {
+    return [];
+  }
+  const x0 = image.destination.minX;
+  const y0 = image.destination.minY;
+  const x1 = image.destination.maxX;
+  const y1 = image.destination.maxY;
+  const u0 = image.source.minX / image.imageWidth;
+  const v0 = image.source.minY / image.imageHeight;
+  const u1 = image.source.maxX / image.imageWidth;
+  const v1 = image.source.maxY / image.imageHeight;
+
+  return [x0, y0, u0, v0, x0, y1, u0, v1, x1, y1, u1, v1, x0, y0, u0, v0, x1, y1, u1, v1, x1, y0, u1, v0];
+}
+
 function bindInstancedAttribute(
   gl: WebGL2RenderingContext,
   program: WebGLProgram,
@@ -298,13 +413,25 @@ function bindInstancedAttribute(
   strideFloats: number,
   offsetFloats: number,
 ): void {
+  bindAttribute(gl, program, name, size, strideFloats, offsetFloats, true);
+}
+
+function bindAttribute(
+  gl: WebGL2RenderingContext,
+  program: WebGLProgram,
+  name: string,
+  size: number,
+  strideFloats: number,
+  offsetFloats: number,
+  instanced: boolean,
+): void {
   const location = gl.getAttribLocation(program, name);
   if (location < 0) {
     throw new Error(`missing WebGL attribute ${name}`);
   }
   gl.enableVertexAttribArray(location);
   gl.vertexAttribPointer(location, size, gl.FLOAT, false, strideFloats * 4, offsetFloats * 4);
-  gl.vertexAttribDivisor(location, 1);
+  gl.vertexAttribDivisor(location, instanced ? 1 : 0);
 }
 
 type ResolvedCellColors = {
@@ -396,6 +523,29 @@ out vec4 out_color;
 
 void main() {
   out_color = v_color;
+}`;
+
+const IMAGE_VERTEX_SHADER = `#version 300 es
+precision highp float;
+in vec2 a_position;
+in vec2 a_uv;
+uniform vec2 u_resolution;
+out vec2 v_uv;
+
+void main() {
+  vec2 clip = (a_position / u_resolution) * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_uv = a_uv;
+}`;
+
+const IMAGE_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+uniform sampler2D u_image;
+in vec2 v_uv;
+out vec4 out_color;
+
+void main() {
+  out_color = texture(u_image, v_uv);
 }`;
 
 const TEXT_VERTEX_SHADER = `#version 300 es

@@ -12,6 +12,7 @@ libghostty-vt.workspace = true
 bootty-runtime = { path = "../bootty-runtime" }
 bootty-surface = { path = "../bootty-surface" }
 bootty-terminal = { path = "../bootty-terminal" }
+png.workspace = true
 serde.workspace = true
 tauri.workspace = true
 

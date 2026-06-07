@@ -122,6 +122,7 @@ class FakeShell {
       colors: { background: BACKGROUND, foreground: FOREGROUND, cursor: FOREGROUND },
       cursor: this.editor ? this.editorCursor() : cursorFor(lines, this.cols),
       cells,
+      images: [],
     };
   }
 
