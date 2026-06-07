@@ -15,6 +15,8 @@ type Glyph = {
   h: number;
   width: number;
   height: number;
+  offsetX: number;
+  offsetY: number;
 };
 
 export class WebGlTerminalRenderer {
@@ -96,8 +98,8 @@ export class WebGlTerminalRenderer {
       const glyph = this.atlas.glyph(cell.text, frame.cellWidth, frame.cellHeight, this.dpr, cell.style);
       pushTextInstance(
         textInstances,
-        cell.x * frame.cellWidth,
-        cell.y * frame.cellHeight,
+        cell.x * frame.cellWidth + glyph.offsetX,
+        cell.y * frame.cellHeight + glyph.offsetY,
         glyph.width,
         glyph.height,
         glyph,
@@ -310,6 +312,7 @@ class GlyphAtlas {
   private static readonly size = 2048;
   private static readonly tileWidth = 128;
   private static readonly tileHeight = 96;
+  private static readonly horizontalPaddingPx = 8;
 
   constructor(private readonly gl: WebGL2RenderingContext) {
     this.texture = required(gl.createTexture(), "create glyph atlas texture");
@@ -350,9 +353,10 @@ class GlyphAtlas {
     this.tileContext.textBaseline = "top";
     this.tileContext.textAlign = "left";
     this.tileContext.font = terminalFont(cellHeight * dpr, style);
-    this.tileContext.fillText(text, 0, Math.round(1 * dpr));
+    const horizontalPadding = Math.ceil(GlyphAtlas.horizontalPaddingPx * dpr);
+    this.tileContext.fillText(text, horizontalPadding, Math.round(1 * dpr));
 
-    const glyphWidthPx = Math.min(GlyphAtlas.tileWidth, Math.ceil(cellWidth * dpr));
+    const glyphWidthPx = Math.min(GlyphAtlas.tileWidth, Math.ceil(cellWidth * dpr) + horizontalPadding * 2);
     const glyphHeightPx = Math.min(GlyphAtlas.tileHeight, Math.ceil(cellHeight * dpr));
 
     this.gl.bindTexture(this.gl.TEXTURE_2D, this.texture);
@@ -366,6 +370,8 @@ class GlyphAtlas {
       h: glyphHeightPx / GlyphAtlas.size,
       width: glyphWidthPx / dpr,
       height: glyphHeightPx / dpr,
+      offsetX: -horizontalPadding / dpr,
+      offsetY: 0,
     };
     this.glyphs.set(key, glyph);
     return glyph;

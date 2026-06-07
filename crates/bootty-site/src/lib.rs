@@ -27,9 +27,10 @@ const DEFAULT_ROWS: u16 = 32;
 const ICON_TEXTURE_SIZE: u32 = 96;
 const ICON_RENDER_SIZE: u32 = 48;
 const ICON_PNG: &[u8] = include_bytes!("../../bootty-tauri/src-ui/public/bootty-mascot.png");
+const SECTION_DETAIL_STATIC_ROWS: u16 = 4;
 const GITHUB_URL: &str = "https://github.com/majinboos/bootty";
 const GITHUB_LINKS: &[SectionLink] = &[SectionLink {
-    text: "github.com/majinboos/bootty",
+    text: "GitHub",
     url: GITHUB_URL,
 }];
 const GETTING_STARTED_MARKDOWN: &str = r#"# Getting Started
@@ -406,26 +407,24 @@ impl Component for Menu {
             .enumerate()
             .map(|(index, section)| {
                 let selected = index == self.selected;
-                Line::from(Span::styled(
-                    format!(
-                        "{} {} {}",
-                        if selected { ">" } else { " " },
-                        section.icon,
-                        section.label
-                    ),
-                    Style::default()
-                        .fg(if selected {
-                            section.accent
-                        } else {
-                            Color::Gray
-                        })
-                        .bg(if selected { Color::Black } else { Color::Reset })
-                        .add_modifier(if selected {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ))
+                let style = Style::default()
+                    .fg(if selected {
+                        section.accent
+                    } else {
+                        Color::Gray
+                    })
+                    .bg(if selected { Color::Black } else { Color::Reset })
+                    .add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
+                Line::from(vec![
+                    Span::styled(if selected { ">  " } else { "   " }, style),
+                    Span::styled(section.icon, style),
+                    Span::styled("  ", style),
+                    Span::styled(section.label, style),
+                ])
             })
             .collect::<Vec<_>>();
         frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -555,6 +554,14 @@ impl Component for Detail {
             ]));
         } else {
             lines.extend(section.lines.iter().map(|line| Line::from(*line)));
+            lines.extend(section.links.iter().map(|link| {
+                Line::from(Span::styled(
+                    link.text,
+                    Style::default()
+                        .fg(section.accent)
+                        .add_modifier(Modifier::UNDERLINED),
+                ))
+            }));
         }
         frame.render_widget(
             Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
@@ -823,9 +830,9 @@ fn sections() -> &'static [Section] {
             icon: "\u{f09b}",
             label: "GitHub",
             plain_label: "GitHub",
-            title: "Read the source on GitHub.",
+            title: "Source",
             accent: Color::Red,
-            lines: &["github.com/majinboos/bootty"],
+            lines: &["Read the source on:"],
             links: GITHUB_LINKS,
         },
     ]
@@ -865,12 +872,17 @@ fn key(code: Key) -> Event<NoUserEvent> {
     })
 }
 
-fn web_frame(buffer: &Buffer) -> WebTerminalFrame {
+fn web_frame(buffer: &Buffer, selected: usize) -> WebTerminalFrame {
     let mut cells = Vec::with_capacity(buffer.content.len());
     for y in 0..buffer.area.height {
         for x in 0..buffer.area.width {
             let cell = &buffer[(x, y)];
-            cells.push(web_cell(x, y, cell, osc8_link_at(buffer, x, y)));
+            cells.push(web_cell(
+                x,
+                y,
+                cell,
+                osc8_link_at(buffer.area.width, buffer.area.height, selected, x, y),
+            ));
         }
     }
     WebTerminalFrame {
@@ -969,22 +981,20 @@ fn rgba_from_png(bytes: &[u8], color_type: png::ColorType) -> Vec<u8> {
     }
 }
 
-fn osc8_link_at(buffer: &Buffer, x: u16, y: u16) -> Option<&'static str> {
-    let row = row_text(buffer, y);
-    sections()
-        .iter()
-        .flat_map(|section| section.links)
-        .find_map(|link| {
-            let start = row.find(link.text)?;
-            let end = start + link.text.len();
-            ((x as usize) >= start && (x as usize) < end).then_some(link.url)
-        })
-}
+fn osc8_link_at(cols: u16, rows: u16, selected: usize, x: u16, y: u16) -> Option<&'static str> {
+    let section = sections().get(selected)?;
+    let layout = site_layout(cols, rows);
+    let content = inset(layout.detail, 1, 1);
+    let link_y = content
+        .y
+        .saturating_add(SECTION_DETAIL_STATIC_ROWS)
+        .saturating_add(section.lines.len() as u16);
 
-fn row_text(buffer: &Buffer, y: u16) -> String {
-    (0..buffer.area.width)
-        .map(|x| buffer[(x, y)].symbol())
-        .collect()
+    section.links.iter().enumerate().find_map(|(index, link)| {
+        let row = link_y.saturating_add(index as u16);
+        let end_x = content.x.saturating_add(link.text.chars().count() as u16);
+        (y == row && x >= content.x && x < end_x).then_some(link.url)
+    })
 }
 
 fn web_cell(x: u16, y: u16, cell: &Cell, osc8: Option<&str>) -> WebCell {
@@ -1334,7 +1344,7 @@ impl SiteBackend {
                 );
             })
             .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        let value = serde_wasm_bindgen::to_value(&web_frame(completed.buffer))
+        let value = serde_wasm_bindgen::to_value(&web_frame(completed.buffer, selected))
             .map_err(|error| JsValue::from_str(&error.to_string()));
         self.terminal = Some(terminal);
         value
@@ -1362,6 +1372,33 @@ mod tests {
         assert_eq!(hit_target(60, 32, 2, 5), Some(HitTarget::Menu(0)));
         assert_eq!(hit_target(60, 32, 2, 10), Some(HitTarget::Menu(5)));
         assert_eq!(hit_target(60, 32, 2, 14), Some(HitTarget::Detail));
+    }
+
+    #[test]
+    fn selected_menu_row_keeps_icon_in_a_stable_column() {
+        let mut terminal =
+            TestTerminalAdapter::new(Size::new(96, 32)).expect("test terminal starts");
+        let completed = terminal
+            .draw(|frame| {
+                draw_site(
+                    frame,
+                    &mut Menu::default(),
+                    &mut Detail::default(),
+                    SiteViewState {
+                        selected: 0,
+                        focus: Focus::Menu,
+                        notice: "test",
+                        tick: 0,
+                        fps: 0.0,
+                        demo_lines: &[],
+                        demo_input: "",
+                    },
+                );
+            })
+            .expect("site draws");
+        let row = rendered_row(completed.buffer, 5);
+
+        assert!(row.contains(">  \u{f2d0}  Frame"), "{row:?}");
     }
 
     #[test]
@@ -1404,18 +1441,48 @@ mod tests {
         assert_eq!(section.icon, "\u{f09b}");
         assert_eq!(section.label, "GitHub");
         assert_eq!(section.plain_label, "GitHub");
-        assert_eq!(section.links[0].text, "github.com/majinboos/bootty");
+        assert_eq!(section.title, "Source");
+        assert_eq!(section.links[0].text, "GitHub");
         assert_eq!(section.links[0].url, GITHUB_URL);
     }
 
     #[test]
-    fn github_link_cells_export_osc8_url() {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 1));
-        buffer.set_string(2, 0, "github.com/majinboos/bootty", Style::default());
+    fn every_menu_section_has_a_nerd_font_icon() {
+        for section in sections() {
+            assert!(
+                section.icon.chars().all(|ch| {
+                    ('\u{e000}'..='\u{f8ff}').contains(&ch)
+                        || ('\u{f0000}'..='\u{ffffd}').contains(&ch)
+                }),
+                "{} icon is not a Nerd Font private-use glyph",
+                section.plain_label
+            );
+        }
+    }
 
-        assert_eq!(osc8_link_at(&buffer, 2, 0), Some(GITHUB_URL));
-        assert_eq!(osc8_link_at(&buffer, 28, 0), Some(GITHUB_URL));
-        assert_eq!(osc8_link_at(&buffer, 29, 0), None);
+    #[test]
+    fn github_link_cells_export_model_osc8_url() {
+        let github = sections()
+            .iter()
+            .position(|section| section.plain_label == "GitHub")
+            .expect("github section exists");
+        let layout = site_layout(96, 32);
+        let content = inset(layout.detail, 1, 1);
+        let link_y = content
+            .y
+            .saturating_add(SECTION_DETAIL_STATIC_ROWS)
+            .saturating_add(sections()[github].lines.len() as u16);
+
+        assert_eq!(
+            osc8_link_at(96, 32, github, content.x, link_y),
+            Some(GITHUB_URL)
+        );
+        assert_eq!(
+            osc8_link_at(96, 32, github, content.x + 5, link_y),
+            Some(GITHUB_URL)
+        );
+        assert_eq!(osc8_link_at(96, 32, github, content.x + 6, link_y), None);
+        assert_eq!(osc8_link_at(96, 32, 0, content.x, link_y), None);
     }
 
     #[test]
@@ -1467,5 +1534,11 @@ mod tests {
                 .iter()
                 .any(|span| matches!(span.style.fg, Some(Color::Rgb(_, _, _))))
         );
+    }
+
+    fn rendered_row(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
     }
 }
