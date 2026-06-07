@@ -5,6 +5,7 @@ import type { TerminalKey } from "./terminal-api";
 import type { WebCell, WebColor, WebImage, WebRect, WebTerminalFrame } from "./terminal-types";
 
 const DOOM_TICK_MS = 1000 / 35;
+const DOOM_TAB_IMAGE_KEY = "doom-tab-frame";
 
 export class DoomTabOverlay {
   private readonly engine: BrowserDoomEngine;
@@ -13,6 +14,7 @@ export class DoomTabOverlay {
   private status = "loading doomgeneric wasm";
   private lastTickAt = performance.now();
   private tickRemainder = 0;
+  private frameRevision = 0;
 
   constructor() {
     this.engine = new BrowserDoomEngine(embeddedDoomAssets(), (status) => {
@@ -23,7 +25,9 @@ export class DoomTabOverlay {
   render(frame: WebTerminalFrame): WebTerminalFrame {
     this.ensureInit();
     if (this.ready) {
-      this.tickToNow();
+      if (this.tickToNow() > 0) {
+        this.frameRevision += 1;
+      }
     }
     document.documentElement.dataset.boottyDoomStatus = this.status;
 
@@ -41,12 +45,13 @@ export class DoomTabOverlay {
       false,
     );
 
-    const images = this.ready ? [...frame.images, this.doomImage(inner)] : frame.images;
+    const baseImages = frame.images.filter((image) => image.key !== DOOM_TAB_IMAGE_KEY);
+    const images = this.ready ? [...baseImages, this.doomImage(inner)] : baseImages;
     return { ...frame, cells, images };
   }
 
   async key(event: TerminalKey, frame: WebTerminalFrame): Promise<WebTerminalFrame | null> {
-    if (!isDoomTab(frame) || !isDetailFocused(frame) || event.metaKey || event.repeat) {
+    if (!isDetailFocused(frame) || event.metaKey || event.repeat) {
       return null;
     }
     if (!this.ready) {
@@ -71,7 +76,7 @@ export class DoomTabOverlay {
       });
   }
 
-  private tickToNow(): void {
+  private tickToNow(): number {
     const now = performance.now();
     const elapsed = now - this.lastTickAt + this.tickRemainder;
     const ticks = Math.min(5, Math.floor(elapsed / DOOM_TICK_MS));
@@ -80,10 +85,11 @@ export class DoomTabOverlay {
     }
     this.tickRemainder = elapsed - ticks * DOOM_TICK_MS;
     this.lastTickAt = now;
+    return ticks;
   }
 
   private doomImage(destination: WebRect): WebImage {
-    const rgba = this.engine.getFrameRGBA();
+    const bgrx = this.engine.getFrameBGRX();
     const width = this.engine.width;
     const height = this.engine.height;
     const availableWidth = destination.maxX - destination.minX;
@@ -95,13 +101,15 @@ export class DoomTabOverlay {
     const top = destination.minY + Math.floor((availableHeight - gameHeight) / 2);
 
     return {
-      key: "doom-tab-frame",
+      key: DOOM_TAB_IMAGE_KEY,
       layer: "belowText",
       imageWidth: width,
       imageHeight: height,
       source: { minX: 0, minY: 0, maxX: width, maxY: height },
       destination: { minX: left, minY: top, maxX: left + gameWidth, maxY: top + gameHeight },
-      rgba,
+      pixelFormat: "bgrx",
+      revision: this.frameRevision,
+      rgba: bgrx,
     };
   }
 }

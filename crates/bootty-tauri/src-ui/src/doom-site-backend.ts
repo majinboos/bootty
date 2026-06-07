@@ -29,6 +29,7 @@ export function createDoomSiteBackend(search: URLSearchParams): TerminalBackend 
   let ready = false;
   let lastTickAt = performance.now();
   let tickRemainder = 0;
+  let frameRevision = 0;
 
   const ensureInit = () => {
     initPromise ??= engine
@@ -46,9 +47,19 @@ export function createDoomSiteBackend(search: URLSearchParams): TerminalBackend 
 
   const frame = () => {
     if (ready) {
-      tickToNow(engine, () => lastTickAt, (value) => (lastTickAt = value), () => tickRemainder, (value) => (tickRemainder = value));
+      if (
+        tickToNow(
+          engine,
+          () => lastTickAt,
+          (value) => (lastTickAt = value),
+          () => tickRemainder,
+          (value) => (tickRemainder = value),
+        ) > 0
+      ) {
+        frameRevision += 1;
+      }
     }
-    return renderFrame(cols, rows, engine, ready, status, renderMode, assets);
+    return renderFrame(cols, rows, engine, ready, status, renderMode, assets, frameRevision);
   };
 
   return {
@@ -108,7 +119,7 @@ function tickToNow(
   setLastTickAt: (value: number) => void,
   getRemainder: () => number,
   setRemainder: (value: number) => void,
-): void {
+): number {
   const now = performance.now();
   const elapsed = now - getLastTickAt() + getRemainder();
   const ticks = Math.min(5, Math.floor(elapsed / DOOM_TICK_MS));
@@ -117,6 +128,7 @@ function tickToNow(
   }
   setRemainder(elapsed - ticks * DOOM_TICK_MS);
   setLastTickAt(now);
+  return ticks;
 }
 
 function renderFrame(
@@ -127,6 +139,7 @@ function renderFrame(
   status: string,
   renderMode: DoomRenderMode,
   assets: DoomAssetUrls | ReturnType<typeof embeddedDoomAssets>,
+  frameRevision: number,
 ): WebTerminalFrame {
   document.title = `Bootty / DOOM - ${status}`;
   const cells: WebCell[] = [];
@@ -137,11 +150,11 @@ function renderFrame(
 
   const images: WebImage[] = [];
   if (ready) {
-    const rgba = engine.getFrameRGBA();
     if (renderMode === "halfblock") {
+      const rgba = engine.getFrameRGBA();
       renderHalfBlocks(cells, rgba, engine.width, engine.height, cols, Math.max(1, rows - 4));
     } else {
-      images.push(doomImage(rgba, engine.width, engine.height, cols, rows));
+      images.push(doomImage(engine.getFrameBGRX(), engine.width, engine.height, cols, rows, frameRevision));
     }
   } else {
     addText(cells, 1, 3, "Fetching doom.js, doom.wasm, and a WAD. Add ?doom to run this mode.", yellow(), null, false);
@@ -163,7 +176,14 @@ function renderFrame(
   };
 }
 
-function doomImage(rgba: Uint8Array, width: number, height: number, cols: number, rows: number): WebImage {
+function doomImage(
+  rgba: Uint8Array<ArrayBufferLike>,
+  width: number,
+  height: number,
+  cols: number,
+  rows: number,
+  revision: number,
+): WebImage {
   const surfaceWidth = cols * CELL_WIDTH;
   const surfaceHeight = rows * CELL_HEIGHT;
   const headerHeight = CELL_HEIGHT * 2;
@@ -183,6 +203,8 @@ function doomImage(rgba: Uint8Array, width: number, height: number, cols: number
     imageHeight: height,
     source: { minX: 0, minY: 0, maxX: width, maxY: height },
     destination: { minX: left, minY: top, maxX: left + gameWidth, maxY: top + gameHeight },
+    pixelFormat: "bgrx",
+    revision,
     rgba,
   };
 }

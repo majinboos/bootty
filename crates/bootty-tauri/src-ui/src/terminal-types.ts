@@ -35,6 +35,8 @@ export type WebImage = {
   imageHeight: number;
   source: WebRect;
   destination: WebRect;
+  pixelFormat?: "rgba" | "bgrx";
+  revision?: number;
   rgba: ArrayLike<number>;
 };
 

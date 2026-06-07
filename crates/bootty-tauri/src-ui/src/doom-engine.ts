@@ -29,6 +29,7 @@ type DoomModule = {
   _DG_PushKeyEvent(pressed: number, key: number): void;
   _malloc(size: number): number;
   _free(ptr: number): void;
+  HEAPU8: Uint8Array;
   HEAPU32: Uint32Array;
   FS_createPath(parent: string, path: string, canRead: boolean, canWrite: boolean): string;
   FS_createDataFile(parent: string, name: string, data: ArrayLike<number>, canRead: boolean, canWrite: boolean): void;
@@ -39,6 +40,7 @@ export class BrowserDoomEngine {
   private module: DoomModule | null = null;
   private frameBufferPtr = 0;
   private frameBuffer = new Uint8Array();
+  private frameBufferBgrx: Uint8Array<ArrayBufferLike> = new Uint8Array();
   private frameBufferWords: Uint32Array | null = null;
   private initialized = false;
   private screenWidth = 640;
@@ -97,6 +99,7 @@ export class BrowserDoomEngine {
     this.screenWidth = module._DG_GetScreenWidth();
     this.screenHeight = module._DG_GetScreenHeight();
     this.frameBuffer = new Uint8Array(this.screenWidth * this.screenHeight * 4);
+    this.frameBufferBgrx = new Uint8Array(module.HEAPU8.buffer, this.frameBufferPtr, this.screenWidth * this.screenHeight * 4);
     this.frameBufferWords = new Uint32Array(module.HEAPU32.buffer, this.frameBufferPtr, this.screenWidth * this.screenHeight);
     this.initialized = true;
   }
@@ -121,6 +124,10 @@ export class BrowserDoomEngine {
       this.frameBuffer[offset + 3] = 255;
     }
     return this.frameBuffer;
+  }
+
+  getFrameBGRX(): Uint8Array<ArrayBufferLike> {
+    return this.initialized ? this.frameBufferBgrx : this.frameBuffer;
   }
 
   pushKey(pressed: boolean, key: number): void {

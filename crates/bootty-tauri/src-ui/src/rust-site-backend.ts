@@ -16,10 +16,14 @@ export async function createRustSiteBackend(search = new URLSearchParams()): Pro
   }
   let lastFrame = site.frame() as WebTerminalFrame;
   let doomOverlay: import("./doom-tab-overlay").DoomTabOverlay | null = null;
+  let doomActive = false;
+  let detailFocused = false;
 
   const render = async (frame: WebTerminalFrame): Promise<WebTerminalFrame> => {
     const { isDoomTab, DoomTabOverlay } = await import("./doom-tab-overlay");
-    if (!isDoomTab(frame)) {
+    doomActive = isDoomTab(frame);
+    detailFocused = isDetailFocused(frame);
+    if (!doomActive) {
       return frame;
     }
     doomOverlay ??= new DoomTabOverlay();
@@ -34,6 +38,10 @@ export async function createRustSiteBackend(search = new URLSearchParams()): Pro
       return lastFrame;
     },
     async readFrame() {
+      if (doomActive && doomOverlay) {
+        lastFrame = doomOverlay.render(lastFrame);
+        return lastFrame;
+      }
       lastFrame = site.frame() as WebTerminalFrame;
       lastFrame = await render(lastFrame);
       return lastFrame;
@@ -48,7 +56,7 @@ export async function createRustSiteBackend(search = new URLSearchParams()): Pro
       lastFrame = await render(lastFrame);
     },
     wantsKey(_event: TerminalKey, frame: WebTerminalFrame) {
-      return isDoomFrame(frame) && isDetailFocused(frame);
+      return (doomActive || isDoomFrame(frame)) && (detailFocused || isDetailFocused(frame));
     },
     async key(event: TerminalKey) {
       if (!doomOverlay) {

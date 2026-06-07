@@ -6,6 +6,7 @@ type ImageTexture = {
   texture: WebGLTexture;
   width: number;
   height: number;
+  revision?: number;
 };
 
 type Glyph = {
@@ -212,6 +213,7 @@ export class WebGlTerminalRenderer {
       this.height,
     );
     gl.uniform1i(required(gl.getUniformLocation(this.imageProgram, "u_image"), "image sampler"), 0);
+    const pixelFormatLocation = required(gl.getUniformLocation(this.imageProgram, "u_pixel_format"), "image pixel format");
     gl.bindBuffer(gl.ARRAY_BUFFER, this.imageBuffer);
     bindAttribute(gl, this.imageProgram, "a_position", 2, IMAGE_VERTEX_FLOATS, 0, false);
     bindAttribute(gl, this.imageProgram, "a_uv", 2, IMAGE_VERTEX_FLOATS, 2, false);
@@ -226,6 +228,7 @@ export class WebGlTerminalRenderer {
       const texture = this.imageTexture(image);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, texture.texture);
+      gl.uniform1i(pixelFormatLocation, image.pixelFormat === "bgrx" ? 1 : 0);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(vertices), gl.STREAM_DRAW);
       gl.drawArrays(gl.TRIANGLES, 0, vertices.length / IMAGE_VERTEX_FLOATS);
     }
@@ -236,7 +239,10 @@ export class WebGlTerminalRenderer {
   private imageTexture(image: WebImage): ImageTexture {
     const cached = this.imageTextures.get(image.key);
     if (cached && cached.width === image.imageWidth && cached.height === image.imageHeight) {
-      this.uploadImageTexture(cached.texture, image);
+      if (image.revision == null || cached.revision !== image.revision) {
+        this.updateImageTexture(cached.texture, image);
+        cached.revision = image.revision;
+      }
       return cached;
     }
     if (cached) {
@@ -244,18 +250,23 @@ export class WebGlTerminalRenderer {
     }
 
     const texture = required(this.gl.createTexture(), "create image texture");
+    this.configureImageTexture(texture);
     this.uploadImageTexture(texture, image);
-    const stored = { texture, width: image.imageWidth, height: image.imageHeight };
+    const stored = { texture, width: image.imageWidth, height: image.imageHeight, revision: image.revision };
     this.imageTextures.set(image.key, stored);
     return stored;
   }
 
-  private uploadImageTexture(texture: WebGLTexture, image: WebImage): void {
+  private configureImageTexture(texture: WebGLTexture): void {
     this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MIN_FILTER, this.gl.NEAREST);
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_MAG_FILTER, this.gl.NEAREST);
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_S, this.gl.CLAMP_TO_EDGE);
     this.gl.texParameteri(this.gl.TEXTURE_2D, this.gl.TEXTURE_WRAP_T, this.gl.CLAMP_TO_EDGE);
+  }
+
+  private uploadImageTexture(texture: WebGLTexture, image: WebImage): void {
+    this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
     this.gl.pixelStorei(this.gl.UNPACK_ALIGNMENT, 1);
     this.gl.texImage2D(
       this.gl.TEXTURE_2D,
@@ -266,7 +277,23 @@ export class WebGlTerminalRenderer {
       0,
       this.gl.RGBA,
       this.gl.UNSIGNED_BYTE,
-      new Uint8Array(image.rgba),
+      imagePixels(image),
+    );
+  }
+
+  private updateImageTexture(texture: WebGLTexture, image: WebImage): void {
+    this.gl.bindTexture(this.gl.TEXTURE_2D, texture);
+    this.gl.pixelStorei(this.gl.UNPACK_ALIGNMENT, 1);
+    this.gl.texSubImage2D(
+      this.gl.TEXTURE_2D,
+      0,
+      0,
+      0,
+      image.imageWidth,
+      image.imageHeight,
+      this.gl.RGBA,
+      this.gl.UNSIGNED_BYTE,
+      imagePixels(image),
     );
   }
 
@@ -455,6 +482,16 @@ function imageVertices(image: WebImage): number[] {
   return [x0, y0, u0, v0, x0, y1, u0, v1, x1, y1, u1, v1, x0, y0, u0, v0, x1, y1, u1, v1, x1, y0, u1, v0];
 }
 
+function imagePixels(image: WebImage): Uint8Array {
+  if (image.rgba instanceof Uint8Array) {
+    return image.rgba;
+  }
+  if (ArrayBuffer.isView(image.rgba)) {
+    return new Uint8Array(image.rgba.buffer, image.rgba.byteOffset, image.rgba.byteLength);
+  }
+  return new Uint8Array(image.rgba);
+}
+
 function bindInstancedAttribute(
   gl: WebGL2RenderingContext,
   program: WebGLProgram,
@@ -590,11 +627,13 @@ void main() {
 const IMAGE_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 uniform sampler2D u_image;
+uniform int u_pixel_format;
 in vec2 v_uv;
 out vec4 out_color;
 
 void main() {
-  out_color = texture(u_image, v_uv);
+  vec4 color = texture(u_image, v_uv);
+  out_color = u_pixel_format == 1 ? vec4(color.bgr, 1.0) : color;
 }`;
 
 const TEXT_VERTEX_SHADER = `#version 300 es
