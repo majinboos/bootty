@@ -18,7 +18,6 @@ function App() {
   const [status, setStatus] = useState("starting terminal");
   const fpsRef = useRef({ frames: 0, startedAt: performance.now() });
   const [fps, setFps] = useState(0);
-  const [inputCount, setInputCount] = useState(0);
 
   const focusTerminal = useCallback(() => {
     window.requestAnimationFrame(() => canvasRef.current?.focus());
@@ -61,7 +60,7 @@ function App() {
     const renderer = new WebGlTerminalRenderer(canvas);
     rendererRef.current = renderer;
     let stop = false;
-    let timeout = 0;
+    let animationFrame = 0;
 
     async function drawNextFrame() {
       try {
@@ -87,7 +86,9 @@ function App() {
       }
 
       if (!stop) {
-        timeout = window.setTimeout(drawNextFrame, 33);
+        animationFrame = window.requestAnimationFrame(() => {
+          void drawNextFrame();
+        });
       }
     }
 
@@ -107,14 +108,16 @@ function App() {
       recordFrame(fpsRef, setFps);
       setStatus(backend.label);
       focusTerminal();
-      timeout = window.setTimeout(drawNextFrame, 33);
+      animationFrame = window.requestAnimationFrame(() => {
+        void drawNextFrame();
+      });
     }
 
     start().catch((error) => setStatus(String(error)));
 
     return () => {
       stop = true;
-      window.clearTimeout(timeout);
+      window.cancelAnimationFrame(animationFrame);
       renderer.dispose();
       backendRef.current = null;
       rendererRef.current = null;
@@ -150,10 +153,7 @@ function App() {
     if (!backend) {
       return;
     }
-    backend
-      .write(input)
-      .then(() => setInputCount((count) => count + input.length))
-      .catch((error) => setStatus(String(error)));
+    backend.write(input).catch((error) => setStatus(String(error)));
   }, []);
 
   const onKeyDown = useCallback(
@@ -174,7 +174,6 @@ function App() {
         <strong>Bootty Web Terminal</strong>
         <span>{status}</span>
         <span>fps: {fps.toFixed(1)}</span>
-        <span>input: {inputCount}</span>
       </header>
       <canvas
         ref={canvasRef}
