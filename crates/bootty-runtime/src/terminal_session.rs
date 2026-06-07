@@ -30,7 +30,7 @@ pub(crate) const MAX_DRAIN_TIME_US: u128 = 20_000;
 const MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const MAX_COLLECT_CHUNKS_PER_TICK: usize = 64;
 const MAX_READER_QUEUE_CHUNKS: usize = MAX_COLLECT_CHUNKS_PER_TICK * 2;
-const MAJIN_SHELL_ENV: &str = "MAJIN_SHELL";
+const BOOTTY_SHELL_ENV: &str = "BOOTTY_SHELL";
 const DEFAULT_SHELL: &str = "/bin/zsh";
 pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(4);
@@ -750,7 +750,7 @@ fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Resu
 
 fn shell_command_path(configured: Option<String>) -> String {
     select_shell_path(
-        env::var(MAJIN_SHELL_ENV).ok(),
+        env::var(BOOTTY_SHELL_ENV).ok(),
         configured,
         configured_login_shell(),
         env::var("SHELL").ok(),

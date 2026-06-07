@@ -1,0 +1,54 @@
+[package]
+name = "bootty-app"
+edition.workspace = true
+
+[[bin]]
+name = "bootty"
+path = "src/main.rs"
+
+[dependencies]
+ab_glyph.workspace = true
+anyhow.workspace = true
+arboard.workspace = true
+derive_more.workspace = true
+eframe.workspace = true
+epaint_default_fonts.workspace = true
+fontdb.workspace = true
+libghostty-vt.workspace = true
+bootty-winit = { path = "../bootty-winit" }
+bootty-ui = { path = "../bootty-ui" }
+bootty-render = { path = "../bootty-render" }
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-surface = { path = "../bootty-surface" }
+bootty-terminal = { path = "../bootty-terminal" }
+pollster.workspace = true
+portable-pty.workspace = true
+png.workspace = true
+regex.workspace = true
+rmux-ipc.workspace = true
+rmux-proto.workspace = true
+rmux-sdk.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+toml_edit.workspace = true
+ttf-parser.workspace = true
+unicode-width.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-app-kit.workspace = true
+objc2-foundation.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+indoc.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "paint_plan"
+harness = false

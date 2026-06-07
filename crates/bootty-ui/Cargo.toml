@@ -1,0 +1,6 @@
+[package]
+name = "bootty-ui"
+edition.workspace = true
+
+[dependencies]
+eframe.workspace = true

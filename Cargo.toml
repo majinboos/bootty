@@ -29,20 +29,58 @@ too_many_lines = "allow"
 ab_glyph = "0.2"
 anyhow = "1"
 arboard = "3"
+criterion = "0.8"
+derive_more = { version = "2.1.1", default-features = false, features = [
+  "deref",
+  "deref_mut",
+] }
 eframe = { version = "0.34", default-features = true }
-fontdb = "0.23"
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "24ea1cf3f3e829e3e66c0c211860614aa2268136", features = ["png"] }
-png = "0.18"
-pollster = "0.4"
 epaint_default_fonts = "0.34"
+fontdb = "0.23"
+indoc = "2"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "24ea1cf3f3e829e3e66c0c211860614aa2268136", features = [
+  "png",
+] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "NSApplication",
+  "NSScreen",
+  "NSWindow",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "NSGeometry",
+  "objc2-core-foundation",
+] }
+pollster = "0.4"
+png = "0.18"
 portable-pty = "0.9"
 proptest = "1"
+regex = "1"
+rmux-sdk = "0.3.1"
+rmux-ipc = "0.3.1"
+rmux-proto = "0.3.1"
 rstest = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", default-features = true }
 tauri-build = { version = "2", features = [] }
+tempfile = "3"
+tokio = "1.48.0"
+toml_edit = { version = "0.25", features = ["serde"] }
 ttf-parser = "0.25"
 unicode-width = "0.2"
 wgpu = "29"
 winit = "0.30"
+
+[profile.dev]
+debug = "limited"
+
+[profile.profiling]
+inherits = "release"
+debug = "full"
+lto = false
+strip = false
+
+[profile.release]
+lto = "fat"
+split-debuginfo = "off"

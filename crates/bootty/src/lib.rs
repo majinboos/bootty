@@ -1,4 +1,4 @@
-//! Bootty is the reusable terminal embedding layer extracted from Majin.
+//! Bootty's reusable terminal embedding layer.
 //!
 //! Use `bootty-runtime` to own PTY-backed terminal sessions, `bootty-terminal`
 //! for frame data, `bootty-render` for paint plans and WGPU rendering, and the
