@@ -217,25 +217,33 @@ impl SiteBackend {
 
     fn handle_mouse(&mut self, kind: &str, x: u16, y: u16) -> Result<(), JsValue> {
         if kind == "leave" {
+            self.hovered_menu = None;
             self.notice = "mouse left terminal".to_owned();
             return Ok(());
         }
 
         match hit_target(self.cols, self.rows, x, y) {
             Some(HitTarget::Menu(index)) => {
-                self.selected = index.min(sections().len() - 1);
-                self.focus = Focus::Menu;
-                self.notice = format!("{} selected", sections()[self.selected].plain_label);
-                self.menu.attr(Attribute::Focus, AttrValue::Flag(true));
-                self.detail.attr(Attribute::Focus, AttrValue::Flag(false));
+                let index = index.min(sections().len() - 1);
+                self.hovered_menu = Some(index);
                 if kind == "down" {
+                    self.selected = index;
+                    self.focus = Focus::Menu;
+                    self.notice = format!("{} selected", sections()[self.selected].plain_label);
+                    self.menu.attr(Attribute::Focus, AttrValue::Flag(true));
+                    self.detail.attr(Attribute::Focus, AttrValue::Flag(false));
                     self.update(Msg::ToggleFocus)?;
+                } else {
+                    self.notice = format!("{} hovered", sections()[index].plain_label);
                 }
             }
             Some(HitTarget::Detail) if kind == "down" => {
+                self.hovered_menu = None;
                 self.update(Msg::Focus(Focus::Detail))?;
             }
-            _ => {}
+            _ => {
+                self.hovered_menu = None;
+            }
         }
         Ok(())
     }
@@ -319,6 +327,7 @@ impl SiteBackend {
         match msg {
             Msg::Move(delta) => {
                 self.selected = wrap(self.selected as isize + delta, sections().len());
+                self.hovered_menu = None;
                 self.notice = format!(
                     "{} selected",
                     sections()[self.selected].plain_label.to_lowercase()
@@ -378,6 +387,7 @@ struct SectionLink {
 
 struct SiteViewState<'a> {
     selected: usize,
+    hovered_menu: Option<usize>,
     focus: Focus,
     notice: &'a str,
     tick: u64,
@@ -623,7 +633,10 @@ fn draw_site(
     } = site_layout(area.width, area.height);
 
     draw_header(frame, header, state.tick, state.fps);
-    menu_component.attr(Attribute::Value, AttrValue::Number(state.selected as isize));
+    menu_component.attr(
+        Attribute::Value,
+        AttrValue::Number(state.hovered_menu.unwrap_or(state.selected) as isize),
+    );
     menu_component.attr(
         Attribute::Focus,
         AttrValue::Flag(state.focus == Focus::Menu),
@@ -1244,6 +1257,7 @@ pub struct SiteBackend {
     detail: Detail,
     terminal: Option<TestTerminalAdapter>,
     selected: usize,
+    hovered_menu: Option<usize>,
     focus: Focus,
     notice: String,
     tick: u64,
@@ -1271,6 +1285,7 @@ impl SiteBackend {
                     .expect("test terminal starts"),
             ),
             selected: 0,
+            hovered_menu: None,
             focus: Focus::Menu,
             notice: "Bootty terminal website".to_owned(),
             tick: 0,
@@ -1316,6 +1331,7 @@ impl SiteBackend {
     pub fn frame(&mut self) -> Result<JsValue, JsValue> {
         self.tick = self.tick.wrapping_add(1);
         let selected = self.selected;
+        let hovered_menu = self.hovered_menu;
         let focus = self.focus;
         let notice = self.notice.clone();
         let tick = self.tick;
@@ -1334,6 +1350,7 @@ impl SiteBackend {
                     &mut self.detail,
                     SiteViewState {
                         selected,
+                        hovered_menu,
                         focus,
                         notice: &notice,
                         tick,
@@ -1375,6 +1392,30 @@ mod tests {
     }
 
     #[test]
+    fn menu_hover_highlights_without_changing_selected_page() {
+        let mut site = SiteBackend::new();
+
+        site.handle_mouse("move", 2, 7).expect("mouse move handles");
+
+        assert_eq!(site.selected, 0);
+        assert_eq!(site.hovered_menu, Some(2));
+        assert_eq!(
+            site.notice,
+            format!("{} hovered", sections()[2].plain_label)
+        );
+    }
+
+    #[test]
+    fn menu_click_changes_selected_page() {
+        let mut site = SiteBackend::new();
+
+        site.handle_mouse("down", 2, 7).expect("mouse down handles");
+
+        assert_eq!(site.selected, 2);
+        assert_eq!(site.hovered_menu, Some(2));
+    }
+
+    #[test]
     fn selected_menu_row_keeps_icon_in_a_stable_column() {
         let mut terminal =
             TestTerminalAdapter::new(Size::new(96, 32)).expect("test terminal starts");
@@ -1386,6 +1427,7 @@ mod tests {
                     &mut Detail::default(),
                     SiteViewState {
                         selected: 0,
+                        hovered_menu: None,
                         focus: Focus::Menu,
                         notice: "test",
                         tick: 0,
