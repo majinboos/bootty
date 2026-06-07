@@ -16,8 +16,6 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_ACCOUNT_ID: 93df7ec23fc4b4ef936f2a0a1f1f5515
     steps:
       - uses: actions/checkout@v4
 
@@ -36,13 +34,9 @@ jobs:
         run: npm run build:pages
 
       - name: Deploy to Cloudflare Pages
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          npx wrangler@4.98.0 pages deploy \
-            crates/bootty-tauri/pages-dist \
-            --project-name bootty \
-            --branch main \
-            --commit-hash "$GITHUB_SHA" \
-            --commit-message "${{ github.event.head_commit.message }}" \
-            --commit-dirty=false
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: 93df7ec23fc4b4ef936f2a0a1f1f5515
+          command: pages deploy crates/bootty-tauri/pages-dist --project-name=bootty --branch=main --commit-hash=${{ github.sha }} --commit-message="${{ github.event.head_commit.message }}" --commit-dirty=false
+          gitHubToken: ${{ secrets.GITHUB_TOKEN }}
