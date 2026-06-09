@@ -39,15 +39,28 @@ pub fn is_hidden_path(path: &Path) -> bool {
 }
 
 pub fn truncate_label(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let mut out = text
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    out.push('…');
+    let mut out = String::new();
+    push_truncated_label(&mut out, text, max_chars);
     out
+}
+
+pub fn push_truncated_label(out: &mut String, text: &str, max_chars: usize) {
+    if max_chars == 0 {
+        return;
+    }
+
+    let mut truncate_at = None;
+    for (count, (index, _)) in text.char_indices().enumerate() {
+        if count == max_chars - 1 {
+            truncate_at = Some(index);
+        } else if count == max_chars {
+            out.push_str(&text[..truncate_at.unwrap_or(index)]);
+            out.push('…');
+            return;
+        }
+    }
+
+    out.push_str(text);
 }
 
 pub fn csv_field(value: &str) -> String {
@@ -72,5 +85,32 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
         assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+    }
+
+    #[test]
+    fn push_truncated_label_appends_exact_fit_without_ellipsis() {
+        let mut out = String::from("prefix ");
+
+        push_truncated_label(&mut out, "abcd", 4);
+
+        assert_eq!(out, "prefix abcd");
+    }
+
+    #[test]
+    fn push_truncated_label_appends_truncated_text() {
+        let mut out = String::new();
+
+        push_truncated_label(&mut out, "abcde", 4);
+
+        assert_eq!(out, "abc…");
+    }
+
+    #[test]
+    fn push_truncated_label_handles_zero_width() {
+        let mut out = String::from("prefix");
+
+        push_truncated_label(&mut out, "abc", 0);
+
+        assert_eq!(out, "prefix");
     }
 }

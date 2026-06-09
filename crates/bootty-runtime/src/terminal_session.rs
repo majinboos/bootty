@@ -552,14 +552,17 @@ impl TerminalWorker {
             self.pending_pty_bytes += bytes.len();
             self.pending_pty.push_back(bytes);
         }
-        self.pending_pty_len
-            .store(self.pending_pty_bytes, Ordering::Relaxed);
+        if did_work {
+            self.pending_pty_len
+                .store(self.pending_pty_bytes, Ordering::Relaxed);
+        }
         did_work
     }
 
     fn drain_pty(&mut self) -> DrainStats {
         let start = Instant::now();
         let mut stats = DrainStats::default();
+        let pending_before = self.pending_pty_bytes;
 
         while self.pending_pty_bytes > 0
             && !drain_budget_exhausted(stats)
@@ -580,8 +583,10 @@ impl TerminalWorker {
             stats.bytes += consumed;
         }
 
-        self.pending_pty_len
-            .store(self.pending_pty_bytes, Ordering::Relaxed);
+        if self.pending_pty_bytes != pending_before {
+            self.pending_pty_len
+                .store(self.pending_pty_bytes, Ordering::Relaxed);
+        }
         stats.elapsed_us = start.elapsed().as_micros() as u64;
         stats
     }

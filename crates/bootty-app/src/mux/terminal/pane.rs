@@ -199,14 +199,14 @@ impl BackendPaneTerminal {
     pub fn sync_mux_anchor(
         &mut self,
         config: &MultiplexerConfig,
-        anchor: Option<MuxPaneAnchor>,
+        anchor: Option<&MuxPaneAnchor>,
     ) -> Result<()> {
         let backend = selected_backend(config);
-        let target = anchor.map(MuxPaneTarget::from);
-        if self.backend == backend && self.active_target == target {
+        if self.backend == backend && target_matches_anchor(self.active_target.as_ref(), anchor) {
             return Ok(());
         }
 
+        let target = anchor.cloned().map(MuxPaneTarget::from);
         self.park_native_terminal();
         let terminal = self
             .start_terminal(backend, target.as_ref())
@@ -389,6 +389,17 @@ impl From<MuxPaneAnchor> for MuxPaneTarget {
     }
 }
 
+fn target_matches_anchor(target: Option<&MuxPaneTarget>, anchor: Option<&MuxPaneAnchor>) -> bool {
+    match (target, anchor) {
+        (None, None) => true,
+        (Some(target), Some(anchor)) => {
+            let anchor_selector = anchor.pane_id.as_deref().unwrap_or(&anchor.session_id);
+            target.session_id() == anchor.session_id && target.input_selector() == anchor_selector
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn backend_attach_launch(
     backend: MuxBackendKind,
     target: &MuxPaneTarget,
@@ -504,20 +515,61 @@ mod tests {
             Arc::new(|| {}),
         );
 
+        let anchor = MuxPaneAnchor {
+            session_id: String::new(),
+            pane_id: Some("%11".to_owned()),
+            cwd: None,
+            process: None,
+        };
         let result = terminal.sync_mux_anchor(
             &MultiplexerConfig {
                 backend: MultiplexerBackendConfig::Rmux,
             },
-            Some(MuxPaneAnchor {
-                session_id: String::new(),
-                pane_id: Some("%11".to_owned()),
-                cwd: None,
-                process: None,
-            }),
+            Some(&anchor),
         );
 
         assert!(result.is_err());
         assert_eq!(terminal.active_target, None);
+    }
+
+    #[test]
+    fn target_match_uses_session_and_pane_without_cloning_metadata() {
+        let target = MuxPaneTarget::Pane {
+            session_id: "agents".to_owned(),
+            pane_id: "%3".to_owned(),
+            cwd: Some("/repo".to_owned()),
+        };
+        let anchor = MuxPaneAnchor {
+            session_id: "agents".to_owned(),
+            pane_id: Some("%3".to_owned()),
+            cwd: Some("/repo/subdir".to_owned()),
+            process: Some("zsh".to_owned()),
+        };
+
+        assert!(target_matches_anchor(Some(&target), Some(&anchor)));
+    }
+
+    #[test]
+    fn target_match_distinguishes_missing_and_changed_panes() {
+        let target = MuxPaneTarget::Pane {
+            session_id: "agents".to_owned(),
+            pane_id: "%3".to_owned(),
+            cwd: None,
+        };
+        let session_anchor = MuxPaneAnchor {
+            session_id: "agents".to_owned(),
+            pane_id: None,
+            cwd: None,
+            process: None,
+        };
+        let other_pane = MuxPaneAnchor {
+            pane_id: Some("%4".to_owned()),
+            ..session_anchor.clone()
+        };
+
+        assert!(!target_matches_anchor(Some(&target), Some(&session_anchor)));
+        assert!(!target_matches_anchor(Some(&target), Some(&other_pane)));
+        assert!(target_matches_anchor(None, None));
     }
 
     #[test]

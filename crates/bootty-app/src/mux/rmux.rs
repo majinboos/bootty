@@ -1,3 +1,5 @@
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{Context, Result};
 use rmux_sdk::{
     EnsureSession, EnsureSessionPolicy, InfoSnapshot, PaneInfo, PaneProcessState, ProcessSpec,
@@ -102,17 +104,11 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
     }
 }
 
-pub struct SdkRmuxClient {
-    runtime: Runtime,
-}
+pub struct SdkRmuxClient;
 
 impl SdkRmuxClient {
     pub fn new() -> Self {
-        let runtime = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("rmux sdk runtime should initialize");
-        Self { runtime }
+        Self
     }
 }
 
@@ -124,51 +120,72 @@ impl Default for SdkRmuxClient {
 
 impl RmuxSessionClient for SdkRmuxClient {
     fn snapshot(&self) -> Result<MuxSnapshot> {
-        self.runtime.block_on(async {
-            let rmux = connect_bootty_rmux().await?;
-            let names = rmux.list_sessions().await?;
-            let mut sessions = Vec::with_capacity(names.len());
-            for name in names {
-                let handle = rmux.session(name.clone()).await?;
-                let info = handle.pane(0, 0).info().await?;
-                sessions.push(session_from_info(&name, &info));
-            }
-            Ok(MuxSnapshot {
-                active_session_id: sessions
-                    .iter()
-                    .find(|session| session.active)
-                    .map(|session| session.id.clone()),
-                sessions,
+        shared_rmux_runtime()
+            .lock()
+            .expect("rmux runtime lock")
+            .block_on(async {
+                let rmux = connect_bootty_rmux().await?;
+                let names = rmux.list_sessions().await?;
+                let mut sessions = Vec::with_capacity(names.len());
+                for name in names {
+                    let handle = rmux.session(name.clone()).await?;
+                    let info = handle.pane(0, 0).info().await?;
+                    sessions.push(session_from_info(&name, &info));
+                }
+                Ok(MuxSnapshot {
+                    active_session_id: sessions
+                        .iter()
+                        .find(|session| session.active)
+                        .map(|session| session.id.clone()),
+                    sessions,
+                })
             })
-        })
     }
 
     fn ensure_session(&self, session_name: &str, cwd: &str) -> Result<()> {
-        self.runtime.block_on(async {
-            let rmux = connect_bootty_rmux().await?;
-            let name = SessionName::new(session_name).context("invalid rmux session name")?;
-            rmux.ensure_session(
-                EnsureSession::named(name)
-                    .policy(EnsureSessionPolicy::CreateOrReuse)
-                    .detached(true)
-                    .working_directory(cwd)
-                    .size(TerminalSizeSpec::new(80, 24))
-                    .process(ProcessSpec::default()),
-            )
-            .await?;
-            Ok(())
-        })
+        shared_rmux_runtime()
+            .lock()
+            .expect("rmux runtime lock")
+            .block_on(async {
+                let rmux = connect_bootty_rmux().await?;
+                let name = SessionName::new(session_name).context("invalid rmux session name")?;
+                rmux.ensure_session(
+                    EnsureSession::named(name)
+                        .policy(EnsureSessionPolicy::CreateOrReuse)
+                        .detached(true)
+                        .working_directory(cwd)
+                        .size(TerminalSizeSpec::new(80, 24))
+                        .process(ProcessSpec::default()),
+                )
+                .await?;
+                Ok(())
+            })
     }
 
     fn kill_session(&self, session_name: &str) -> Result<()> {
-        self.runtime.block_on(async {
-            let rmux = connect_bootty_rmux().await?;
-            let name = SessionName::new(session_name).context("invalid rmux session name")?;
-            let session = rmux.session(name).await?;
-            session.kill().await?;
-            Ok(())
-        })
+        shared_rmux_runtime()
+            .lock()
+            .expect("rmux runtime lock")
+            .block_on(async {
+                let rmux = connect_bootty_rmux().await?;
+                let name = SessionName::new(session_name).context("invalid rmux session name")?;
+                let session = rmux.session(name).await?;
+                session.kill().await?;
+                Ok(())
+            })
     }
+}
+
+fn shared_rmux_runtime() -> &'static Mutex<Runtime> {
+    static RUNTIME: OnceLock<Mutex<Runtime>> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        Mutex::new(
+            Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rmux sdk runtime should initialize"),
+        )
+    })
 }
 
 async fn connect_bootty_rmux() -> Result<Rmux> {

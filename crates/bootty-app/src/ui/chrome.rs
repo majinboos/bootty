@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{borrow::Cow, fmt::Write as _, time::Duration};
 
 use bootty_ui::ThemePalette;
 use eframe::egui::{self, Pos2, Rect, RichText, Stroke, TextureHandle};
@@ -12,8 +12,10 @@ use crate::{
         sidebar_meta::{DiffStat, SidebarMetadata},
         snapshot::{MuxSession, MuxSnapshot, MuxWindow},
     },
-    strings::truncate_label,
-    ui::sidebar::{SidebarItem, SidebarItemKind, build_sidebar_items, item_label},
+    strings::{push_truncated_label, truncate_label},
+    ui::sidebar::{
+        SidebarItem, SidebarItemKind, build_visible_sidebar_items, item_label, push_prefixed_label,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -88,9 +90,11 @@ pub fn show_status_bar(ui: &mut egui::Ui, palette: ThemePalette, model: StatusBa
 
 const SIDEBAR_HEADER_HEIGHT: f32 = 44.0;
 const SIDEBAR_FOOTER_BASE_HEIGHT: f32 = 44.0;
+const SIDEBAR_MAX_USAGE_BARS: usize = 3;
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
 const SIDEBAR_PAD_X: f32 = 14.0;
 const MACOS_TITLEBAR_BUTTON_SAFE_WIDTH: f32 = 72.0;
+const AGENT_DETAIL_MAX_CHARS: usize = 18;
 const MACOS_TITLEBAR_BUTTON_CENTER_Y: f32 = 16.0;
 
 pub fn show_sidebar(
@@ -124,7 +128,8 @@ pub fn show_sidebar(
     }
 
     let list_top = content_top + header_h;
-    let footer_h = sidebar_footer_height(model.metadata.usage_lines());
+    let usage_bars = parse_usage_bars(model.metadata.usage_lines());
+    let footer_h = sidebar_footer_height(usage_bars.len());
     let list_bottom = (rect.max.y - footer_h).max(list_top);
     if model.sessions.is_empty() {
         painter.text(
@@ -136,39 +141,35 @@ pub fn show_sidebar(
         );
     }
 
-    let items = build_sidebar_items(model.sessions, model.selected_session, model.metadata);
     let max_rows = ((list_bottom - list_top) / SIDEBAR_ROW_HEIGHT)
         .floor()
         .max(0.0) as usize;
-    let visible_items = items.iter().take(max_rows).collect::<Vec<_>>();
+    let items = build_visible_sidebar_items(
+        model.sessions,
+        model.selected_session,
+        model.metadata,
+        max_rows,
+    );
     let pointer_pos = ui.input(|input| input.pointer.hover_pos());
-    let hovered_session = pointer_pos.and_then(|pos| {
-        visible_items.iter().enumerate().find_map(|(index, item)| {
-            let row_rect = Rect::from_min_size(
-                Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
-                egui::vec2(width, SIDEBAR_ROW_HEIGHT),
-            );
-            (row_rect.contains(pos))
-                .then_some(item.session_id.as_deref())
-                .flatten()
-        })
-    });
+    let hovered_session = pointer_pos
+        .and_then(|pos| sidebar_hovered_row(pos, rect.min.x, list_top, width, max_rows))
+        .and_then(|index| items.get(index))
+        .and_then(|item| item.session_id);
 
     let mut activated = None;
-    for (index, item) in visible_items.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         let row_rect = Rect::from_min_size(
             Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
             egui::vec2(width, SIDEBAR_ROW_HEIGHT),
         );
         let hovered = item
             .session_id
-            .as_deref()
             .is_some_and(|session_id| Some(session_id) == hovered_session);
         let response = sidebar_item_row(ui, row_rect, item, hovered, palette);
         if response.clicked()
             && let Some(session_id) = &item.session_id
         {
-            activated = Some(session_id.clone());
+            activated = Some((*session_id).to_owned());
         }
     }
 
@@ -176,7 +177,7 @@ pub fn show_sidebar(
         ui,
         rect,
         footer_h,
-        model.metadata.usage_lines(),
+        &usage_bars,
         model.separator_visible,
         palette,
     );
@@ -192,6 +193,24 @@ fn sidebar_hover_color(palette: ThemePalette) -> egui::Color32 {
 
 fn sidebar_current_color(palette: ThemePalette) -> egui::Color32 {
     mix_color(palette.base, palette.text, 0.065)
+}
+
+fn sidebar_hovered_row(
+    pos: Pos2,
+    left: f32,
+    top: f32,
+    width: f32,
+    max_rows: usize,
+) -> Option<usize> {
+    let list_rect = Rect::from_min_size(
+        Pos2::new(left, top),
+        egui::vec2(width, max_rows as f32 * SIDEBAR_ROW_HEIGHT),
+    );
+    if !list_rect.contains(pos) {
+        return None;
+    }
+    let row = ((pos.y - top) / SIDEBAR_ROW_HEIGHT).floor() as usize;
+    (row < max_rows).then_some(row)
 }
 
 fn subtle_border(palette: ThemePalette) -> egui::Color32 {
@@ -362,7 +381,7 @@ pub fn selection_after_refresh(current: Option<String>, snapshot: &MuxSnapshot) 
 fn sidebar_item_row(
     ui: &mut egui::Ui,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     hovered_session: bool,
     palette: ThemePalette,
 ) -> egui::Response {
@@ -397,26 +416,19 @@ fn sidebar_item_row(
                 active,
                 process,
                 diff,
-            } => paint_session_item(
-                &painter,
-                rect,
-                item,
-                *active,
-                process.as_deref(),
-                *diff,
-                palette,
-            ),
+            } => paint_session_item(&painter, rect, item, *active, *process, *diff, palette),
             SidebarItemKind::Process {
                 name,
                 cpu_pct,
                 mem_bytes,
             } => paint_process_item(&painter, rect, item, name, *cpu_pct, *mem_bytes, palette),
             SidebarItemKind::Agent { text } => {
-                if is_agent_active(text) {
+                let active = is_agent_active(text);
+                if active {
                     ui.ctx().request_repaint_after(Duration::from_millis(180));
                 }
                 let time = ui.input(|input| input.time);
-                paint_agent_item(&painter, rect, item, text, time, palette)
+                paint_agent_item(&painter, rect, item, text, active, time, palette)
             }
             SidebarItemKind::Branch { name } => {
                 paint_detail_item(&painter, rect, item, "", name, palette)
@@ -434,7 +446,7 @@ fn sidebar_item_row(
 fn paint_group_item(
     painter: &egui::Painter,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     palette: ThemePalette,
 ) {
     painter.text(
@@ -449,7 +461,7 @@ fn paint_group_item(
 fn paint_session_item(
     painter: &egui::Painter,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     active: bool,
     process: Option<&str>,
     diff: Option<DiffStat>,
@@ -500,34 +512,40 @@ fn paint_diff_stat(painter: &egui::Painter, rect: Rect, diff: DiffStat, palette:
 fn paint_process_item(
     painter: &egui::Painter,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     name: &str,
     cpu_pct: Option<f32>,
     mem_bytes: Option<u64>,
     palette: ThemePalette,
 ) {
-    let prefix = crate::ui::sidebar::tree_prefix(item.tree, item.indent);
     let (icon, color) = process_style(name, palette);
+    let mut label = String::new();
+    push_prefixed_label(&mut label, item.tree, item.indent, icon);
+    label.push(' ');
+    push_truncated_label(&mut label, name, 16);
     painter.text(
         Pos2::new(rect.min.x + 12.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{prefix}{icon} {}", truncate_label(name, 16)),
+        label,
         egui::FontId::monospace(11.0),
         color,
     );
 
-    let mut metrics = Vec::new();
+    let mut metrics = String::new();
     if let Some(cpu_pct) = cpu_pct {
-        metrics.push(format!("{cpu_pct:.1}%"));
+        let _ = write!(metrics, "{cpu_pct:.1}%");
     }
     if let Some(mem_bytes) = mem_bytes.filter(|bytes| *bytes > 0) {
-        metrics.push(format_bytes(mem_bytes));
+        if !metrics.is_empty() {
+            metrics.push(' ');
+        }
+        push_formatted_bytes(&mut metrics, mem_bytes);
     }
     if !metrics.is_empty() {
         painter.text(
             Pos2::new(rect.max.x - 12.0, rect.center().y),
             egui::Align2::RIGHT_CENTER,
-            metrics.join(" "),
+            metrics,
             egui::FontId::monospace(11.0),
             palette.border,
         );
@@ -546,43 +564,42 @@ fn process_style(name: &str, palette: ThemePalette) -> (&'static str, egui::Colo
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
+fn push_formatted_bytes(out: &mut String, bytes: u64) {
     const MIB: u64 = 1024 * 1024;
     const GIB: u64 = 1024 * MIB;
     if bytes >= GIB {
-        format!("{:.1}g", bytes as f64 / GIB as f64)
+        let _ = write!(out, "{:.1}g", bytes as f64 / GIB as f64);
     } else {
-        format!("{}m", bytes.div_ceil(MIB))
+        let _ = write!(out, "{}m", bytes.div_ceil(MIB));
     }
 }
 
 fn paint_agent_item(
     painter: &egui::Painter,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     text: &str,
+    active: bool,
     time: f64,
     palette: ThemePalette,
 ) {
-    let prefix = crate::ui::sidebar::tree_prefix(item.tree, item.indent);
     let (name, detail) = text.split_once(' ').unwrap_or((text, ""));
     let (icon, color) = agent_style(name, palette);
-    let pulse = if is_agent_active(text) {
-        ".".repeat(((time * 5.0) as usize % 4) + 1)
-    } else {
-        String::new()
-    };
+    let mut label = String::new();
+    push_prefixed_label(&mut label, item.tree, item.indent, icon);
+    label.push(' ');
+    label.push_str(name);
     painter.text(
         Pos2::new(rect.min.x + 12.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{prefix}{icon} {name}"),
+        label,
         egui::FontId::monospace(11.0),
         color,
     );
     painter.text(
         Pos2::new(rect.max.x - 12.0, rect.center().y),
         egui::Align2::RIGHT_CENTER,
-        truncate_label(&format!("{detail}{pulse}"), 18),
+        agent_detail_label(detail, active, time),
         egui::FontId::monospace(11.0),
         if detail.contains("asking") {
             palette.warning
@@ -594,6 +611,28 @@ fn paint_agent_item(
 
 fn is_agent_active(text: &str) -> bool {
     text.contains('…') || text.contains("Working")
+}
+
+fn agent_detail_label(detail: &str, active: bool, time: f64) -> String {
+    let pulse_len = if active {
+        ((time * 5.0) as usize % 4) + 1
+    } else {
+        0
+    };
+    let mut label = String::with_capacity(detail.len().min(AGENT_DETAIL_MAX_CHARS * 4) + pulse_len);
+    let mut chars = detail.chars().chain(std::iter::repeat_n('.', pulse_len));
+    for _ in 0..AGENT_DETAIL_MAX_CHARS {
+        let Some(ch) = chars.next() else {
+            return label;
+        };
+        label.push(ch);
+    }
+
+    if chars.next().is_some() {
+        label.pop();
+        label.push('…');
+    }
+    label
 }
 
 fn agent_style(name: &str, palette: ThemePalette) -> (&'static str, egui::Color32) {
@@ -608,25 +647,20 @@ fn agent_style(name: &str, palette: ThemePalette) -> (&'static str, egui::Color3
 fn paint_detail_item(
     painter: &egui::Painter,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     kind: &str,
     text: &str,
     palette: ThemePalette,
 ) {
-    let display = if kind.is_empty() {
-        format!(
-            "{}{}",
-            crate::ui::sidebar::tree_prefix(item.tree, item.indent),
-            truncate_label(text, 26)
-        )
+    let mut display = String::new();
+    if kind.is_empty() {
+        push_prefixed_label(&mut display, item.tree, item.indent, "");
+        push_truncated_label(&mut display, text, 26);
     } else {
-        format!(
-            "{}{} {}",
-            crate::ui::sidebar::tree_prefix(item.tree, item.indent),
-            kind,
-            truncate_label(text, 22)
-        )
-    };
+        push_prefixed_label(&mut display, item.tree, item.indent, kind);
+        display.push(' ');
+        push_truncated_label(&mut display, text, 22);
+    }
     painter.text(
         Pos2::new(rect.min.x + 12.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
@@ -639,18 +673,22 @@ fn paint_detail_item(
 fn paint_progress_item(
     painter: &egui::Painter,
     rect: Rect,
-    item: &SidebarItem,
+    item: &SidebarItem<'_>,
     pct: u8,
     palette: ThemePalette,
 ) {
-    let prefix = crate::ui::sidebar::tree_prefix(item.tree, item.indent);
     let bar_cells = 12usize;
     let filled = (pct as usize * bar_cells) / 100;
     let empty = bar_cells.saturating_sub(filled);
+    let mut label = String::new();
+    push_prefixed_label(&mut label, item.tree, item.indent, "");
+    label.extend(std::iter::repeat_n('█', filled));
+    label.extend(std::iter::repeat_n('░', empty));
+    let _ = write!(label, " {pct}%");
     painter.text(
         Pos2::new(rect.min.x + 12.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        format!("{prefix}{}{} {pct}%", "█".repeat(filled), "░".repeat(empty)),
+        label,
         egui::FontId::monospace(11.0),
         if pct >= 100 {
             palette.success
@@ -660,8 +698,8 @@ fn paint_progress_item(
     );
 }
 
-fn sidebar_footer_height(usage_lines: &[String]) -> f32 {
-    let usage_count = parse_usage_bars(usage_lines).len().min(3);
+fn sidebar_footer_height(usage_bar_count: usize) -> f32 {
+    let usage_count = usage_bar_count.min(SIDEBAR_MAX_USAGE_BARS);
     SIDEBAR_FOOTER_BASE_HEIGHT + usage_count as f32 * 30.0
 }
 
@@ -669,7 +707,7 @@ fn paint_sidebar_footer(
     ui: &egui::Ui,
     rect: Rect,
     footer_h: f32,
-    usage_lines: &[String],
+    usage_bars: &UsageBars,
     separator_visible: bool,
     palette: ThemePalette,
 ) {
@@ -683,7 +721,7 @@ fn paint_sidebar_footer(
     }
 
     let mut row_y = y + 18.0;
-    for bar in parse_usage_bars(usage_lines).iter().take(3) {
+    for bar in usage_bars.iter() {
         paint_usage_bar(
             &painter,
             Rect::from_min_size(
@@ -706,14 +744,56 @@ fn paint_sidebar_footer(
 }
 
 #[derive(Clone, Debug)]
-struct UsageBar {
-    label: String,
+struct UsageBar<'a> {
+    label: Cow<'a, str>,
     pct: u8,
-    pace: String,
+    pace: Cow<'a, str>,
     pace_marker: Option<f32>,
     color: egui::Color32,
 }
-fn paint_usage_bar(painter: &egui::Painter, rect: Rect, bar: &UsageBar, palette: ThemePalette) {
+
+#[derive(Clone, Debug)]
+struct UsageBars<'a> {
+    bars: [Option<UsageBar<'a>>; SIDEBAR_MAX_USAGE_BARS],
+    len: usize,
+}
+
+impl<'a> UsageBars<'a> {
+    fn new() -> Self {
+        Self {
+            bars: std::array::from_fn(|_| None),
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, bar: UsageBar<'a>) -> bool {
+        if self.len >= SIDEBAR_MAX_USAGE_BARS {
+            return false;
+        }
+        self.bars[self.len] = Some(bar);
+        self.len += 1;
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &UsageBar<'a>> {
+        self.bars[..self.len]
+            .iter()
+            .filter_map(std::option::Option::as_ref)
+    }
+}
+
+impl<'a> std::ops::Index<usize> for UsageBars<'a> {
+    type Output = UsageBar<'a>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.bars[index].as_ref().expect("usage bar index in range")
+    }
+}
+fn paint_usage_bar(painter: &egui::Painter, rect: Rect, bar: &UsageBar<'_>, palette: ThemePalette) {
     painter.text(
         Pos2::new(rect.min.x, rect.min.y + 6.0),
         egui::Align2::LEFT_CENTER,
@@ -751,7 +831,7 @@ fn paint_usage_bar(painter: &egui::Painter, rect: Rect, bar: &UsageBar, palette:
 fn paint_usage_right_text(
     painter: &egui::Painter,
     rect: Rect,
-    bar: &UsageBar,
+    bar: &UsageBar<'_>,
     palette: ThemePalette,
 ) {
     if bar.pace.is_empty() {
@@ -781,37 +861,119 @@ fn paint_usage_right_text(
         bar.color,
     );
 }
-fn parse_usage_bars(lines: &[String]) -> Vec<UsageBar> {
-    lines
-        .iter()
-        .filter_map(|line| {
-            let text = strip_ansi(line);
-            let pct = parse_percent(&text)?;
-            let pace = usage_pace(&text);
-            let label = text
-                .split_whitespace()
-                .filter(|part| !part.contains('%'))
-                .filter(|part| !part.starts_with('+') && !part.contains(':') && !part.contains('↺'))
-                .filter(|part| part.chars().any(|ch| ch.is_ascii_alphanumeric()))
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" ");
-            Some(UsageBar {
-                label: if label.is_empty() {
-                    "usage".to_owned()
-                } else {
-                    label
-                },
-                pct,
-                pace,
-                pace_marker: usage_pace_marker(&text),
-                color: first_ansi_color(line).unwrap_or(egui::Color32::from_rgb(0x89, 0xb4, 0xfa)),
-            })
-        })
-        .collect()
+fn parse_usage_bars(lines: &[String]) -> UsageBars<'_> {
+    let mut bars = UsageBars::new();
+    for line in lines {
+        let (pct, label, pace, pace_marker) = match strip_ansi(line) {
+            Cow::Borrowed(text) => {
+                let Some(pct) = parse_percent(text) else {
+                    continue;
+                };
+                (
+                    pct,
+                    usage_label(text, true),
+                    usage_pace(text, true),
+                    usage_pace_marker(text),
+                )
+            }
+            Cow::Owned(text) => {
+                let Some(pct) = parse_percent(&text) else {
+                    continue;
+                };
+                (
+                    pct,
+                    Cow::Owned(usage_label(&text, true).into_owned()),
+                    Cow::Owned(usage_pace(&text, true).into_owned()),
+                    usage_pace_marker(&text),
+                )
+            }
+        };
+        if !bars.push(UsageBar {
+            label: if label.is_empty() {
+                Cow::Borrowed("usage")
+            } else {
+                label
+            },
+            pct,
+            pace,
+            pace_marker,
+            color: first_ansi_color(line).unwrap_or(egui::Color32::from_rgb(0x89, 0xb4, 0xfa)),
+        }) {
+            break;
+        }
+    }
+    bars
+}
+
+fn usage_label<'a>(text: &'a str, borrow_single_part: bool) -> Cow<'a, str> {
+    let mut label = None;
+    for part in text
+        .split_whitespace()
+        .filter(|part| !part.contains('%'))
+        .filter(|part| !part.starts_with('+') && !part.contains(':') && !part.contains('↺'))
+        .filter(|part| part.chars().any(|ch| ch.is_ascii_alphanumeric()))
+        .take(2)
+    {
+        let Some(first) = label else {
+            label = Some(Cow::Borrowed(part));
+            continue;
+        };
+        let mut joined = String::with_capacity(first.len() + 1 + part.len());
+        joined.push_str(&first);
+        joined.push(' ');
+        joined.push_str(part);
+        return Cow::Owned(joined);
+    }
+    match label {
+        Some(label) if borrow_single_part => label,
+        Some(label) => Cow::Owned(label.into_owned()),
+        None => Cow::Borrowed(""),
+    }
+}
+
+fn usage_pace<'a>(text: &'a str, borrow_single_part: bool) -> Cow<'a, str> {
+    let mut seen_pct = false;
+    let mut first = None;
+    let mut joined = None::<String>;
+    let mut count = 0usize;
+    for part in text.split_whitespace() {
+        if part.ends_with('%') {
+            seen_pct = true;
+            continue;
+        }
+        if !seen_pct || !(part.starts_with('+') || part.contains(':') || part.contains('↺')) {
+            continue;
+        }
+        count += 1;
+        if count == 1 {
+            first = Some(part);
+        } else {
+            let joined = joined.get_or_insert_with(|| {
+                let first = first.unwrap_or_default();
+                let mut joined = String::with_capacity(first.len() + 1 + part.len());
+                joined.push_str(first);
+                joined
+            });
+            joined.push(' ');
+            joined.push_str(part);
+        }
+        if count == 3 {
+            break;
+        }
+    }
+    match (joined, first) {
+        (Some(pace), _) => Cow::Owned(pace),
+        (None, Some(pace)) if borrow_single_part => Cow::Borrowed(pace),
+        (None, Some(pace)) => Cow::Owned(pace.to_owned()),
+        (None, None) => Cow::Borrowed(""),
+    }
 }
 
 fn usage_pace_marker(text: &str) -> Option<f32> {
+    if !text.contains('↺') {
+        return None;
+    }
+
     let total = text
         .split_whitespace()
         .take_while(|part| !part.ends_with('%'))
@@ -872,21 +1034,6 @@ fn parse_clock_seconds(token: &str) -> Option<u64> {
     (minutes < 60).then_some(hours.saturating_mul(60 * 60) + minutes * 60)
 }
 
-fn usage_pace(text: &str) -> String {
-    let mut seen_pct = false;
-    text.split_whitespace()
-        .filter(|part| {
-            if part.ends_with('%') {
-                seen_pct = true;
-                return false;
-            }
-            seen_pct && (part.starts_with('+') || part.contains(':') || part.contains('↺'))
-        })
-        .take(3)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn parse_percent(text: &str) -> Option<u8> {
     text.split_whitespace().find_map(|part| {
         part.strip_suffix('%')
@@ -894,8 +1041,13 @@ fn parse_percent(text: &str) -> Option<u8> {
             .map(|pct| pct.min(100))
     })
 }
-fn strip_ansi(line: &str) -> String {
-    let mut out = String::new();
+fn strip_ansi(line: &str) -> Cow<'_, str> {
+    if !line.contains('\x1b') && !line.chars().any(|ch| matches!(ch, '█' | '░' | '▒' | '▓'))
+    {
+        return Cow::Borrowed(line.trim());
+    }
+
+    let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' && chars.peek() == Some(&'[') {
@@ -909,28 +1061,29 @@ fn strip_ansi(line: &str) -> String {
             out.push(ch);
         }
     }
-    out.trim().to_owned()
+    Cow::Owned(out.trim().to_owned())
 }
 
 fn first_ansi_color(line: &str) -> Option<egui::Color32> {
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' || chars.peek() != Some(&'[') {
-            continue;
-        }
-        chars.next();
-        let mut code = String::new();
-        for c in chars.by_ref() {
-            if c.is_ascii_alphabetic() {
-                if c == 'm'
-                    && let Some(color) = sgr_color(&code)
-                {
-                    return Some(color);
-                }
-                break;
+    if !line.contains('\x1b') {
+        return None;
+    }
+
+    let mut offset = 0;
+    while let Some(start) = line[offset..].find("\x1b[") {
+        let code_start = offset + start + 2;
+        let code = &line[code_start..];
+        let Some(command_offset) = code.bytes().position(|byte| byte.is_ascii_alphabetic()) else {
+            break;
+        };
+        let command = code.as_bytes()[command_offset];
+        if command == b'm' {
+            let code = &code[..command_offset];
+            if let Some(color) = sgr_color(code) {
+                return Some(color);
             }
-            code.push(c);
         }
+        offset = code_start + command_offset + 1;
     }
     None
 }
@@ -939,19 +1092,18 @@ fn sgr_color(code: &str) -> Option<egui::Color32> {
     if code == "0" || code == "39" {
         return None;
     }
-    let parts = code.split(';').collect::<Vec<_>>();
-    if parts.len() == 5
-        && parts[0] == "38"
-        && parts[1] == "2"
-        && let (Ok(r), Ok(g), Ok(b)) = (
-            parts[2].parse::<u8>(),
-            parts[3].parse::<u8>(),
-            parts[4].parse::<u8>(),
-        )
-    {
-        return Some(egui::Color32::from_rgb(r, g, b));
+
+    let mut parts = code.split(';');
+    if parts.next()? != "38" || parts.next()? != "2" {
+        return None;
     }
-    None
+    let r = parts.next()?.parse::<u8>().ok()?;
+    let g = parts.next()?.parse::<u8>().ok()?;
+    let b = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(egui::Color32::from_rgb(r, g, b))
 }
 
 fn window_tab(
@@ -1044,8 +1196,28 @@ mod tests {
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].pct, 90);
         assert!(bars[0].label.contains("5h"));
+        assert_eq!(bars[0].label, "5h");
+        assert_eq!(bars[0].pace, "+38m");
         assert_eq!(bars[0].color, egui::Color32::from_rgb(116, 199, 236));
         assert_eq!(bars[0].pace_marker, None);
+    }
+
+    #[test]
+    fn usage_lines_parse_only_painted_bars() {
+        let lines = vec![
+            "not a usage line".to_owned(),
+            "first 10% +1m".to_owned(),
+            "second 20% +2m".to_owned(),
+            "third 30% +3m".to_owned(),
+            "fourth 40% +4m".to_owned(),
+        ];
+
+        let bars = parse_usage_bars(&lines);
+
+        assert_eq!(bars.len(), SIDEBAR_MAX_USAGE_BARS);
+        assert_eq!(bars[0].label, "first");
+        assert_eq!(bars[1].label, "second");
+        assert_eq!(bars[2].label, "third");
     }
 
     #[test]
@@ -1057,12 +1229,29 @@ mod tests {
 
         let bars = parse_usage_bars(&lines);
 
+        assert_eq!(bars[0].pace, "+3h03 ↺50m");
+        assert_eq!(bars[1].pace, "+1d06:20 ↺3d20:18");
         assert!((bars[0].pace_marker.unwrap() - (50.0 / (5.0 * 60.0))).abs() < 0.001);
         assert!(
             (bars[1].pace_marker.unwrap()
                 - ((3.0 * 24.0 * 60.0 + 20.0 * 60.0 + 18.0) / (7.0 * 24.0 * 60.0)))
                 .abs()
                 < 0.001
+        );
+    }
+
+    #[test]
+    fn agent_detail_label_formats_active_pulse_without_intermediate_text() {
+        assert_eq!(agent_detail_label("Working", false, 0.0), "Working");
+        assert_eq!(agent_detail_label("Working", true, 0.0), "Working.");
+        assert_eq!(agent_detail_label("Working", true, 0.6), "Working....");
+        assert_eq!(
+            agent_detail_label("abcdefghijklmnop", true, 0.6),
+            "abcdefghijklmnop.…"
+        );
+        assert_eq!(
+            agent_detail_label("abcdefghijklmnopqrst", true, 0.0),
+            "abcdefghijklmnopq…"
         );
     }
 
@@ -1081,6 +1270,38 @@ mod tests {
         assert_eq!(normal.title_pos.y, SIDEBAR_HEADER_HEIGHT * 0.5);
         assert_eq!(reserved.title_pos.y, MACOS_TITLEBAR_BUTTON_CENTER_Y);
         assert!(reserved.title_pos.x > reserved.icon_rect.max.x);
+    }
+
+    #[test]
+    fn sidebar_hovered_row_maps_pointer_to_visible_rows() {
+        assert_eq!(
+            sidebar_hovered_row(Pos2::new(20.0, 10.0), 10.0, 10.0, 100.0, 3),
+            Some(0)
+        );
+        assert_eq!(
+            sidebar_hovered_row(
+                Pos2::new(20.0, 10.0 + SIDEBAR_ROW_HEIGHT * 2.0 + 1.0),
+                10.0,
+                10.0,
+                100.0,
+                3
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            sidebar_hovered_row(
+                Pos2::new(20.0, 10.0 + SIDEBAR_ROW_HEIGHT * 3.0),
+                10.0,
+                10.0,
+                100.0,
+                3
+            ),
+            None
+        );
+        assert_eq!(
+            sidebar_hovered_row(Pos2::new(9.0, 10.0), 10.0, 10.0, 100.0, 3),
+            None
+        );
     }
 
     #[test]

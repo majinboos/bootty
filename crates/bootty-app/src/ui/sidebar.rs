@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::{collections::HashMap, fmt::Write as _};
 
 use eframe::egui::Color32;
 
@@ -7,7 +7,7 @@ use crate::{
         sidebar_meta::{DiffStat, SidebarMetadata},
         snapshot::MuxSession,
     },
-    strings::truncate_label,
+    strings::push_truncated_label,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -16,30 +16,48 @@ pub struct SidebarState {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum SidebarItemKind {
+pub enum SidebarItemKind<'a> {
     Group,
     Session {
         active: bool,
-        process: Option<String>,
+        process: Option<&'a str>,
         diff: Option<DiffStat>,
     },
     Process {
-        name: String,
+        name: &'a str,
         cpu_pct: Option<f32>,
         mem_bytes: Option<u64>,
     },
     Agent {
-        text: String,
+        text: &'a str,
     },
     Branch {
-        name: String,
+        name: &'a str,
     },
     Status {
-        text: String,
+        text: &'a str,
     },
     Progress {
         pct: u8,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SidebarItemId<'a> {
+    Group(&'a str),
+    Session(&'a str),
+    Process(&'a str),
+    Agent(&'a str),
+    Branch(&'a str),
+    Status(&'a str),
+    Progress(&'a str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarDisplay<'a> {
+    Text(&'a str),
+    Numbered { glyph: char, label: &'a str },
+    Progress(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,16 +70,16 @@ pub enum SidebarTree {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct SidebarItem {
-    pub id: String,
-    pub display: String,
+pub struct SidebarItem<'a> {
+    pub id: SidebarItemId<'a>,
+    pub display: SidebarDisplay<'a>,
     pub indent: u16,
     pub tree: SidebarTree,
     pub selectable: bool,
-    pub session_id: Option<String>,
+    pub session_id: Option<&'a str>,
     pub color: Color32,
     pub dim_color: Color32,
-    pub kind: SidebarItemKind,
+    pub kind: SidebarItemKind<'a>,
     pub current: bool,
 }
 
@@ -99,39 +117,49 @@ fn num_glyph(index: usize, selected: bool) -> char {
     *table.get(index).unwrap_or(&table[table.len() - 1])
 }
 
-pub fn build_sidebar_items(
-    sessions: &[MuxSession],
+pub fn build_sidebar_items<'a>(
+    sessions: &'a [MuxSession],
     selected_session: Option<&str>,
-    metadata: &SidebarMetadata,
-) -> Vec<SidebarItem> {
-    let names = sessions
-        .iter()
-        .map(|session| session.name.clone())
-        .collect::<Vec<_>>();
-    let group_meta = GroupMeta::new(&names);
-    let colors = session_colors(&names, &group_meta);
-    let color_by_name = colors
-        .into_iter()
-        .map(|(name, color, dim)| (name, (color, dim)))
-        .collect::<BTreeMap<_, _>>();
+    metadata: &'a SidebarMetadata,
+) -> Vec<SidebarItem<'a>> {
+    build_sidebar_items_inner(sessions, selected_session, metadata, None)
+}
 
-    let mut items = Vec::new();
+pub fn build_visible_sidebar_items<'a>(
+    sessions: &'a [MuxSession],
+    selected_session: Option<&str>,
+    metadata: &'a SidebarMetadata,
+    max_rows: usize,
+) -> Vec<SidebarItem<'a>> {
+    build_sidebar_items_inner(sessions, selected_session, metadata, Some(max_rows))
+}
+
+fn build_sidebar_items_inner<'a>(
+    sessions: &'a [MuxSession],
+    selected_session: Option<&str>,
+    metadata: &'a SidebarMetadata,
+    max_rows: Option<usize>,
+) -> Vec<SidebarItem<'a>> {
+    if max_rows == Some(0) {
+        return Vec::new();
+    }
+    let mut group_meta = GroupMeta::new(sessions);
+    let full_capacity = sessions.len().saturating_mul(6);
+    let mut items = Vec::with_capacity(max_rows.unwrap_or(full_capacity).min(full_capacity));
     let mut ordinal = 0usize;
     let mut last_group = "";
 
     for (index, session) in sessions.iter().enumerate() {
-        let group = session_group(&session.name);
-        let group_total = if group.is_empty() {
-            0
-        } else {
-            *group_meta.counts.get(group).unwrap_or(&0)
+        let Some(group_info) = group_meta.session(index) else {
+            continue;
         };
+        let group = group_info.name;
+        let group_index = group_info.index;
+        let group_count = group_info.count;
+        let group_total = if group.is_empty() { 0 } else { group_count };
         let is_grouped = !group.is_empty() && group_total > 1;
-        let is_last_in_group = is_grouped
-            && sessions
-                .get(index + 1)
-                .map(|next| session_group(&next.name))
-                != Some(group);
+        let is_last_in_group =
+            is_grouped && group_meta.session_group_index(index + 1) != Some(group_index);
         let session_tree = if !is_grouped {
             SidebarTree::None
         } else if is_last_in_group {
@@ -146,10 +174,12 @@ pub fn build_sidebar_items(
         } else {
             SidebarTree::Pipe
         };
-        let (color, dim_color) = color_by_name
-            .get(&session.name)
-            .copied()
-            .unwrap_or((Color32::WHITE, Color32::GRAY));
+        let (color, dim_color) = computed_color(
+            group_index,
+            group_meta.dynamic_total,
+            group_info.position,
+            group_total,
+        );
 
         let selected = if selected_session.is_some() {
             selected_session == Some(session.id.as_str())
@@ -160,8 +190,8 @@ pub fn build_sidebar_items(
         let (display, session_indent, detail_indent) = if is_grouped {
             if group != last_group {
                 items.push(SidebarItem {
-                    id: format!("__group__{group}"),
-                    display: group.to_owned(),
+                    id: SidebarItemId::Group(group),
+                    display: SidebarDisplay::Text(group),
                     indent: 0,
                     tree: SidebarTree::None,
                     selectable: false,
@@ -171,10 +201,16 @@ pub fn build_sidebar_items(
                     kind: SidebarItemKind::Group,
                     current: false,
                 });
+                if max_rows.is_some_and(|limit| items.len() >= limit) {
+                    break;
+                }
             }
             let suffix = session_suffix(&session.name);
             let label = if suffix.is_empty() { group } else { suffix };
-            let display = format!("{} {label}", num_glyph(ordinal, selected));
+            let display = SidebarDisplay::Numbered {
+                glyph: num_glyph(ordinal, selected),
+                label,
+            };
             ordinal += 1;
             (display, 2, 4)
         } else {
@@ -183,45 +219,54 @@ pub fn build_sidebar_items(
             } else {
                 group
             };
-            let display = format!("{} {label}", num_glyph(ordinal, selected));
+            let display = SidebarDisplay::Numbered {
+                glyph: num_glyph(ordinal, selected),
+                label,
+            };
             ordinal += 1;
             (display, 0, 2)
         };
 
         let meta = metadata.get(&session.name);
         items.push(SidebarItem {
-            id: session.id.clone(),
+            id: SidebarItemId::Session(session.id.as_str()),
             display,
             indent: session_indent,
             tree: session_tree,
             selectable: true,
-            session_id: Some(session.id.clone()),
+            session_id: Some(session.id.as_str()),
             color,
             dim_color,
             kind: SidebarItemKind::Session {
                 active: selected,
-                process: session.anchor.process.clone(),
+                process: session.anchor.process.as_deref(),
                 diff: meta.and_then(|meta| meta.diff),
             },
             current: selected,
         });
+        if max_rows.is_some_and(|limit| items.len() >= limit) {
+            break;
+        }
         if let Some(process) = meta.and_then(|meta| meta.processes.first()) {
             items.push(SidebarItem {
-                id: format!("__process__{}", session.id),
-                display: process.name.clone(),
+                id: SidebarItemId::Process(session.id.as_str()),
+                display: SidebarDisplay::Text(process.name.as_str()),
                 indent: detail_indent,
                 tree: detail_tree,
                 selectable: false,
-                session_id: Some(session.id.clone()),
+                session_id: Some(session.id.as_str()),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Process {
-                    name: process.name.clone(),
+                    name: process.name.as_str(),
                     cpu_pct: Some(process.cpu_pct),
                     mem_bytes: Some(process.mem_bytes),
                 },
                 current: selected,
             });
+            if max_rows.is_some_and(|limit| items.len() >= limit) {
+                break;
+            }
         } else if let Some(process) = session
             .anchor
             .process
@@ -229,16 +274,16 @@ pub fn build_sidebar_items(
             .filter(|process| !process.is_empty())
         {
             items.push(SidebarItem {
-                id: format!("__process__{}", session.id),
-                display: process.clone(),
+                id: SidebarItemId::Process(session.id.as_str()),
+                display: SidebarDisplay::Text(process.as_str()),
                 indent: detail_indent,
                 tree: detail_tree,
                 selectable: false,
-                session_id: Some(session.id.clone()),
+                session_id: Some(session.id.as_str()),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Process {
-                    name: process.clone(),
+                    name: process.as_str(),
                     cpu_pct: meta
                         .and_then(|meta| meta.process_cpu.as_deref())
                         .and_then(parse_cpu_percent),
@@ -246,68 +291,83 @@ pub fn build_sidebar_items(
                 },
                 current: selected,
             });
+            if max_rows.is_some_and(|limit| items.len() >= limit) {
+                break;
+            }
         }
         if let Some(agent_status) = meta.and_then(|meta| meta.agent_status.as_ref()) {
             items.push(SidebarItem {
-                id: format!("__agent__{}", session.id),
-                display: agent_status.clone(),
+                id: SidebarItemId::Agent(session.id.as_str()),
+                display: SidebarDisplay::Text(agent_status.as_str()),
                 indent: detail_indent,
                 tree: detail_tree,
                 selectable: false,
-                session_id: Some(session.id.clone()),
+                session_id: Some(session.id.as_str()),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Agent {
-                    text: agent_status.clone(),
+                    text: agent_status.as_str(),
                 },
                 current: selected,
             });
+            if max_rows.is_some_and(|limit| items.len() >= limit) {
+                break;
+            }
         }
         if let Some(branch) = meta.and_then(|meta| meta.branch.as_ref()) {
             items.push(SidebarItem {
-                id: format!("__branch__{}", session.id),
-                display: branch.clone(),
+                id: SidebarItemId::Branch(session.id.as_str()),
+                display: SidebarDisplay::Text(branch.as_str()),
                 indent: detail_indent,
                 tree: detail_tree,
                 selectable: false,
-                session_id: Some(session.id.clone()),
+                session_id: Some(session.id.as_str()),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Branch {
-                    name: branch.clone(),
+                    name: branch.as_str(),
                 },
                 current: selected,
             });
+            if max_rows.is_some_and(|limit| items.len() >= limit) {
+                break;
+            }
         }
         if let Some(status) = meta.and_then(|meta| meta.status.as_ref()) {
             items.push(SidebarItem {
-                id: format!("__status__{}", session.id),
-                display: status.clone(),
+                id: SidebarItemId::Status(session.id.as_str()),
+                display: SidebarDisplay::Text(status.as_str()),
                 indent: detail_indent,
                 tree: detail_tree,
                 selectable: false,
-                session_id: Some(session.id.clone()),
+                session_id: Some(session.id.as_str()),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Status {
-                    text: status.clone(),
+                    text: status.as_str(),
                 },
                 current: selected,
             });
+            if max_rows.is_some_and(|limit| items.len() >= limit) {
+                break;
+            }
         }
         if let Some(progress) = meta.and_then(|meta| meta.progress) {
             items.push(SidebarItem {
-                id: format!("__progress__{}", session.id),
-                display: format!("{progress}%"),
+                id: SidebarItemId::Progress(session.id.as_str()),
+                display: SidebarDisplay::Progress(progress),
                 indent: detail_indent,
                 tree: detail_tree,
                 selectable: false,
-                session_id: Some(session.id.clone()),
+                session_id: Some(session.id.as_str()),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Progress { pct: progress },
                 current: selected,
             });
+            if max_rows.is_some_and(|limit| items.len() >= limit) {
+                break;
+            }
         }
 
         last_group = group;
@@ -325,73 +385,226 @@ pub fn session_suffix(name: &str) -> &str {
 }
 
 pub fn tree_prefix(tree: SidebarTree, indent: u16) -> String {
-    let spaces = " ".repeat(indent as usize);
+    let mut prefix = String::new();
+    push_tree_prefix(&mut prefix, tree, indent);
+    prefix
+}
+
+fn tree_prefix_chars(tree: SidebarTree, indent: u16) -> usize {
     match tree {
-        SidebarTree::None | SidebarTree::Blank => spaces,
-        SidebarTree::Middle => format!("├{}", " ".repeat(indent.saturating_sub(1) as usize)),
-        SidebarTree::Last => format!("└{}", " ".repeat(indent.saturating_sub(1) as usize)),
-        SidebarTree::Pipe => format!("│{}", " ".repeat(indent.saturating_sub(1) as usize)),
+        SidebarTree::None | SidebarTree::Blank => indent as usize,
+        SidebarTree::Middle | SidebarTree::Last | SidebarTree::Pipe => {
+            1 + indent.saturating_sub(1) as usize
+        }
     }
 }
 
-pub fn item_label(item: &SidebarItem, width: usize) -> String {
-    truncate_label(
-        &format!("{}{}", tree_prefix(item.tree, item.indent), item.display),
-        width,
-    )
+fn push_tree_prefix(out: &mut String, tree: SidebarTree, indent: u16) {
+    match tree {
+        SidebarTree::None | SidebarTree::Blank => {
+            out.extend(std::iter::repeat_n(' ', indent as usize));
+        }
+        SidebarTree::Middle => {
+            out.push('├');
+            out.extend(std::iter::repeat_n(' ', indent.saturating_sub(1) as usize));
+        }
+        SidebarTree::Last => {
+            out.push('└');
+            out.extend(std::iter::repeat_n(' ', indent.saturating_sub(1) as usize));
+        }
+        SidebarTree::Pipe => {
+            out.push('│');
+            out.extend(std::iter::repeat_n(' ', indent.saturating_sub(1) as usize));
+        }
+    }
+}
+
+pub fn push_prefixed_label(out: &mut String, tree: SidebarTree, indent: u16, text: &str) {
+    push_tree_prefix(out, tree, indent);
+    out.push_str(text);
+}
+
+fn display_len(display: SidebarDisplay<'_>) -> usize {
+    match display {
+        SidebarDisplay::Text(text) => text.len(),
+        SidebarDisplay::Numbered { glyph, label } => glyph.len_utf8() + 1 + label.len(),
+        SidebarDisplay::Progress(pct) => {
+            if pct >= 100 {
+                4
+            } else if pct >= 10 {
+                3
+            } else {
+                2
+            }
+        }
+    }
+}
+
+fn push_display(out: &mut String, display: SidebarDisplay<'_>) {
+    match display {
+        SidebarDisplay::Text(text) => out.push_str(text),
+        SidebarDisplay::Numbered { glyph, label } => {
+            out.push(glyph);
+            out.push(' ');
+            out.push_str(label);
+        }
+        SidebarDisplay::Progress(pct) => {
+            let _ = write!(out, "{pct}%");
+        }
+    }
+}
+
+fn push_truncated_display(out: &mut String, display: SidebarDisplay<'_>, max_chars: usize) {
+    match display {
+        SidebarDisplay::Text(text) => push_truncated_label(out, text, max_chars),
+        SidebarDisplay::Numbered { glyph, label } => {
+            push_truncated_chars(
+                out,
+                std::iter::once(glyph)
+                    .chain(" ".chars())
+                    .chain(label.chars()),
+                max_chars,
+            );
+        }
+        SidebarDisplay::Progress(pct) => {
+            let mut text = String::new();
+            let _ = write!(text, "{pct}%");
+            push_truncated_label(out, &text, max_chars);
+        }
+    }
+}
+
+fn push_truncated_chars<I>(out: &mut String, chars: I, max_chars: usize)
+where
+    I: IntoIterator<Item = char>,
+{
+    if max_chars == 0 {
+        return;
+    }
+
+    let mut chars = chars.into_iter();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return;
+        };
+        out.push(ch);
+    }
+    if chars.next().is_some() {
+        out.pop();
+        out.push('…');
+    }
+}
+
+pub fn item_label(item: &SidebarItem<'_>, width: usize) -> String {
+    let prefix_chars = tree_prefix_chars(item.tree, item.indent);
+    let mut out = String::with_capacity(item.indent as usize + display_len(item.display));
+    if width > prefix_chars {
+        push_prefixed_label(&mut out, item.tree, item.indent, "");
+        push_truncated_display(&mut out, item.display, width - prefix_chars);
+        return out;
+    }
+    push_prefixed_label(&mut out, item.tree, item.indent, "");
+    push_display(&mut out, item.display);
+    let full = out;
+    let mut out = String::new();
+    push_truncated_label(&mut out, &full, width);
+    out
 }
 
 #[derive(Debug)]
-struct GroupMeta {
-    counts: BTreeMap<String, usize>,
-    group_idx: BTreeMap<String, usize>,
+struct GroupSummary<'a> {
+    name: &'a str,
+    count: usize,
+    position: usize,
+}
+
+#[derive(Debug)]
+struct GroupSession<'a> {
+    name: &'a str,
+    index: usize,
+    count: usize,
+    position: usize,
+}
+
+struct GroupMeta<'a> {
+    groups: Vec<GroupSummary<'a>>,
+    session_groups: Vec<usize>,
     dynamic_total: usize,
 }
 
-impl GroupMeta {
-    fn new(sessions: &[String]) -> Self {
-        let mut counts = BTreeMap::new();
-        let mut order = Vec::new();
-        let mut seen = HashSet::new();
+const HASHED_GROUP_LOOKUP_THRESHOLD: usize = 32;
+
+impl<'a> GroupMeta<'a> {
+    fn new(sessions: &'a [MuxSession]) -> Self {
+        let mut groups = Vec::<GroupSummary<'a>>::new();
+        let mut session_groups = Vec::with_capacity(sessions.len());
+        let mut lookup = None::<HashMap<&'a str, usize>>;
         for session in sessions {
-            let group = session_group(session);
-            *counts.entry(group.to_owned()).or_default() += 1;
-            if seen.insert(group.to_owned()) {
-                order.push(group.to_owned());
+            let group = session_group(&session.name);
+            if let Some(index) = lookup
+                .as_ref()
+                .and_then(|lookup| lookup.get(group).copied())
+            {
+                groups[index].count += 1;
+                session_groups.push(index);
+                continue;
+            }
+            if lookup.is_none()
+                && let Some((index, existing)) = groups
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, summary)| summary.name == group)
+            {
+                existing.count += 1;
+                session_groups.push(index);
+                continue;
+            }
+
+            let index = groups.len();
+            groups.push(GroupSummary {
+                name: group,
+                count: 1,
+                position: 0,
+            });
+            session_groups.push(index);
+            if let Some(lookup) = &mut lookup {
+                lookup.insert(group, index);
+            } else if groups.len() > HASHED_GROUP_LOOKUP_THRESHOLD {
+                lookup = Some(
+                    groups
+                        .iter()
+                        .enumerate()
+                        .map(|(index, summary)| (summary.name, index))
+                        .collect(),
+                );
             }
         }
-        let group_idx = order
-            .iter()
-            .enumerate()
-            .map(|(index, group)| (group.clone(), index))
-            .collect::<BTreeMap<_, _>>();
+        let dynamic_total = groups.len();
         Self {
-            counts,
-            group_idx,
-            dynamic_total: order.len(),
+            groups,
+            session_groups,
+            dynamic_total,
         }
     }
-}
 
-fn session_colors(sessions: &[String], meta: &GroupMeta) -> Vec<(String, Color32, Color32)> {
-    let mut group_positions = BTreeMap::<&str, usize>::new();
-    let mut result = Vec::with_capacity(sessions.len());
-    for session in sessions {
-        let group = session_group(session);
-        let group_total = if group.is_empty() {
-            0
-        } else {
-            *meta.counts.get(group).unwrap_or(&0)
-        };
-        let group_pos = *group_positions.get(group).unwrap_or(&0);
-        let group_index = *meta.group_idx.get(group).unwrap_or(&0);
-        let (color, dim) = computed_color(group_index, meta.dynamic_total, group_pos, group_total);
-        if !group.is_empty() {
-            *group_positions.entry(group).or_default() += 1;
-        }
-        result.push((session.clone(), color, dim));
+    fn session_group_index(&self, index: usize) -> Option<usize> {
+        self.session_groups.get(index).copied()
     }
-    result
+
+    fn session(&mut self, index: usize) -> Option<GroupSession<'a>> {
+        let group_index = self.session_group_index(index)?;
+        let summary = self.groups.get_mut(group_index)?;
+        let position = summary.position;
+        if !summary.name.is_empty() {
+            summary.position += 1;
+        }
+        Some(GroupSession {
+            name: summary.name,
+            index: group_index,
+            count: summary.count,
+            position,
+        })
+    }
 }
 
 fn parse_cpu_percent(value: &str) -> Option<f32> {
@@ -474,9 +687,9 @@ mod tests {
         );
 
         let items = build_sidebar_items(&sessions, Some("$1"), &metadata);
-        assert_ne!(items[1].display, "1 api");
+        assert_ne!(item_label(&items[1], 80), "1 api");
 
-        assert!(items[1].display.ends_with(" api"));
+        assert!(item_label(&items[1], 80).ends_with(" api"));
         assert!(matches!(items[1].kind, SidebarItemKind::Session { .. }));
         assert!(matches!(items[2].kind, SidebarItemKind::Process { .. }));
         assert!(matches!(items[3].kind, SidebarItemKind::Branch { .. }));
@@ -485,7 +698,7 @@ mod tests {
             items[5].kind,
             SidebarItemKind::Progress { pct: 42 }
         ));
-        assert!(items[6].display.ends_with(" ui"));
+        assert!(item_label(&items[6], 80).ends_with(" ui"));
         assert_eq!(items[1].tree, SidebarTree::Middle);
         assert_eq!(items[6].tree, SidebarTree::Last);
     }
@@ -494,15 +707,60 @@ mod tests {
     fn selected_session_does_not_also_mark_attached_session_current() {
         let mut sessions = vec![session("$1", "one", "zsh"), session("$2", "two", "fish")];
         sessions[0].active = true;
+        let metadata = SidebarMetadata::default();
 
-        let items = build_sidebar_items(&sessions, Some("$2"), &SidebarMetadata::default());
+        let items = build_sidebar_items(&sessions, Some("$2"), &metadata);
 
         let current = items
             .iter()
             .filter(|item| matches!(item.kind, SidebarItemKind::Session { .. }) && item.current)
-            .map(|item| item.session_id.as_deref())
+            .map(|item| item.session_id)
             .collect::<Vec<_>>();
         assert_eq!(current, vec![Some("$2")]);
+    }
+
+    #[test]
+    fn visible_sidebar_items_match_full_prefix() {
+        let sessions = vec![
+            session("$1", "work/api", "zsh"),
+            session("$2", "work/ui", "nvim"),
+            session("$3", "work/bench", "cargo"),
+            session("$4", "ops/logs", "tail"),
+        ];
+        let mut metadata = SidebarMetadata::default();
+        metadata.insert(
+            "work/api",
+            SidebarSessionMetadata {
+                branch: Some("main".to_owned()),
+                status: Some("review".to_owned()),
+                progress: Some(42),
+                ..SidebarSessionMetadata::default()
+            },
+        );
+
+        let full = build_sidebar_items(&sessions, Some("$2"), &metadata);
+        let visible = build_visible_sidebar_items(&sessions, Some("$2"), &metadata, 5);
+
+        assert_eq!(visible.as_slice(), &full[..5]);
+    }
+
+    #[test]
+    fn visible_sidebar_items_match_full_prefix_with_many_groups() {
+        let sessions = (0..40)
+            .map(|index| {
+                session(
+                    &format!("${index}"),
+                    &format!("group-{index}/session"),
+                    "zsh",
+                )
+            })
+            .collect::<Vec<_>>();
+        let metadata = SidebarMetadata::default();
+
+        let full = build_sidebar_items(&sessions, Some("$2"), &metadata);
+        let visible = build_visible_sidebar_items(&sessions, Some("$2"), &metadata, 17);
+
+        assert_eq!(visible.as_slice(), &full[..17]);
     }
 
     #[test]

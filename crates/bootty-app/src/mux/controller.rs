@@ -60,7 +60,9 @@ pub struct MuxController {
     selected_window: Option<String>,
     current_backend: Option<MuxBackendKind>,
     last_session_refresh: Option<Instant>,
+    session_refresh_tx: Option<mpsc::Sender<MultiplexerConfig>>,
     session_refresh_rx: Option<mpsc::Receiver<SessionRefreshResult>>,
+    session_refresh_pending: bool,
     mux_command_rx: Option<mpsc::Receiver<MuxCommandResult>>,
 }
 
@@ -134,27 +136,54 @@ impl MuxController {
         if self
             .last_session_refresh
             .is_some_and(|last| last.elapsed() < MUX_SESSION_REFRESH_INTERVAL)
-            || self.session_refresh_rx.is_some()
         {
             return None;
         }
 
-        self.last_session_refresh = Some(Instant::now());
-        let (tx, rx) = mpsc::channel();
-        let repaint = ctx.clone();
-        let mux_config = config.clone();
-        thread::spawn(move || {
-            let backend_kind = selected_backend(&mux_config);
-            let result = build_backend(&mux_config)
-                .snapshot()
-                .map(|snapshot| (backend_kind, snapshot))
-                .map_err(|error| error.to_string());
-            if tx.send(result).is_ok() {
-                repaint.request_repaint();
+        if selected_backend(config) == MuxBackendKind::Native {
+            return self.refresh_native_sessions(config);
+        }
+
+        if self.session_refresh_pending {
+            return None;
+        }
+
+        self.ensure_session_refresh_worker(ctx);
+        let Some(tx) = &self.session_refresh_tx else {
+            return Some("mux session refresh worker did not start".to_owned());
+        };
+        match tx.send(config.clone()) {
+            Ok(()) => {
+                self.last_session_refresh = Some(Instant::now());
+                self.session_refresh_pending = true;
+                None
             }
-        });
-        self.session_refresh_rx = Some(rx);
-        None
+            Err(_) => {
+                self.session_refresh_tx = None;
+                self.session_refresh_rx = None;
+                self.session_refresh_pending = false;
+                Some("mux session refresh worker stopped".to_owned())
+            }
+        }
+    }
+
+    fn refresh_native_sessions(&mut self, config: &MultiplexerConfig) -> Option<String> {
+        match build_backend(config).snapshot() {
+            Ok(snapshot) => {
+                let same_backend = self.current_backend == Some(MuxBackendKind::Native);
+                let current_session = same_backend.then(|| self.selected_session.take()).flatten();
+                let current_window = same_backend.then(|| self.selected_window.take()).flatten();
+                self.apply_snapshot(
+                    MuxBackendKind::Native,
+                    snapshot,
+                    current_session,
+                    current_window,
+                );
+                self.last_session_refresh = Some(Instant::now());
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        }
     }
 
     pub fn poll_command(&mut self) -> Option<Result<(), String>> {
@@ -273,9 +302,34 @@ impl MuxController {
             }
         };
         if result.is_some() {
-            self.session_refresh_rx = None;
+            self.session_refresh_pending = false;
         }
         result
+    }
+
+    fn ensure_session_refresh_worker(&mut self, ctx: &egui::Context) {
+        if self.session_refresh_tx.is_some() && self.session_refresh_rx.is_some() {
+            return;
+        }
+
+        let (request_tx, request_rx) = mpsc::channel::<MultiplexerConfig>();
+        let (result_tx, result_rx) = mpsc::channel::<SessionRefreshResult>();
+        let repaint = ctx.clone();
+        thread::spawn(move || {
+            while let Ok(mux_config) = request_rx.recv() {
+                let backend_kind = selected_backend(&mux_config);
+                let result = build_backend(&mux_config)
+                    .snapshot()
+                    .map(|snapshot| (backend_kind, snapshot))
+                    .map_err(|error| error.to_string());
+                if result_tx.send(result).is_err() {
+                    break;
+                }
+                repaint.request_repaint();
+            }
+        });
+        self.session_refresh_tx = Some(request_tx);
+        self.session_refresh_rx = Some(result_rx);
     }
 
     pub fn execute_command(
@@ -451,6 +505,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["$2", "$1", "$3"]
         );
+    }
+
+    #[test]
+    fn native_refresh_populates_sessions_without_worker() {
+        let ctx = egui::Context::default();
+        let config = MultiplexerConfig {
+            backend: crate::config::MultiplexerBackendConfig::Native,
+        };
+        let mut controller = MuxController::new();
+
+        let error = controller.refresh_sessions(&ctx, &config);
+
+        assert_eq!(error, None);
+        assert_eq!(controller.current_backend, Some(MuxBackendKind::Native));
+        assert!(!controller.sessions.is_empty());
+        assert!(controller.session_refresh_tx.is_none());
+        assert!(controller.session_refresh_rx.is_none());
+        assert!(!controller.session_refresh_pending);
     }
 
     fn session(id: &str, name: &str) -> MuxSession {

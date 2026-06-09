@@ -30,7 +30,10 @@ use crate::{
         command::MuxCommand,
         config::selected_backend,
         controller::MuxController,
-        sidebar_meta::{SidebarMetadata, collect_sidebar_metadata},
+        sidebar_meta::{
+            SidebarMetadata, SidebarMetadataSession, collect_sidebar_metadata,
+            sidebar_metadata_sessions,
+        },
         terminal::ActiveTerminal,
     },
     platform::{
@@ -41,7 +44,7 @@ use crate::{
     renderer::TerminalWidget,
     scheduler::{RepaintScheduler, RepaintSignal},
     terminal::DrainStats,
-    theme::theme_from_config,
+    theme::{theme_from_config, theme_palette_from_config},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
         new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
@@ -49,6 +52,9 @@ use crate::{
 };
 
 const SIDEBAR_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const SIDEBAR_METADATA_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const MACOS_APP_ICON_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const MACOS_APP_ICON_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct BoottyApp {
     terminal: ActiveTerminal,
@@ -72,11 +78,34 @@ pub struct BoottyApp {
     config_hot_reload: ConfigHotReload,
     sidebar_metadata: SidebarMetadata,
     last_sidebar_metadata_refresh: Instant,
+    sidebar_metadata_tx: Option<mpsc::Sender<Vec<SidebarMetadataSession>>>,
     sidebar_metadata_rx: Option<mpsc::Receiver<SidebarMetadata>>,
+    sidebar_metadata_pending: bool,
     new_mux_session_dialog: Option<NewMuxSessionDialog>,
     app_icon_texture: Option<TextureHandle>,
     macos_app_icon_installed: bool,
+    next_macos_app_icon_install: Instant,
     macos_non_native_fullscreen_active: bool,
+}
+
+fn initial_sidebar_metadata_refresh_mark(started_at: Instant) -> Instant {
+    started_at - SIDEBAR_METADATA_REFRESH_INTERVAL + SIDEBAR_METADATA_INITIAL_DELAY
+}
+
+fn sidebar_metadata_refresh_due(last_refresh: Instant, now: Instant, pending: bool) -> bool {
+    !pending && now.duration_since(last_refresh) >= SIDEBAR_METADATA_REFRESH_INTERVAL
+}
+
+fn initial_macos_app_icon_install_after(started_at: Instant) -> Instant {
+    started_at + MACOS_APP_ICON_INITIAL_DELAY
+}
+
+fn macos_app_icon_install_due(installed: bool, next_attempt: Instant, now: Instant) -> bool {
+    !installed && now >= next_attempt
+}
+
+fn next_macos_app_icon_retry(now: Instant) -> Instant {
+    now + MACOS_APP_ICON_RETRY_INTERVAL
 }
 
 #[cfg(test)]
@@ -170,11 +199,14 @@ impl BoottyApp {
             stability_trace,
             config_hot_reload,
             sidebar_metadata: SidebarMetadata::default(),
-            last_sidebar_metadata_refresh: Instant::now() - SIDEBAR_METADATA_REFRESH_INTERVAL,
+            last_sidebar_metadata_refresh: initial_sidebar_metadata_refresh_mark(Instant::now()),
+            sidebar_metadata_tx: None,
             sidebar_metadata_rx: None,
+            sidebar_metadata_pending: false,
             new_mux_session_dialog: None,
             app_icon_texture: None,
             macos_app_icon_installed: false,
+            next_macos_app_icon_install: initial_macos_app_icon_install_after(Instant::now()),
             macos_non_native_fullscreen_active,
         })
     }
@@ -187,8 +219,16 @@ impl eframe::App for BoottyApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if !self.macos_app_icon_installed {
+        let now = Instant::now();
+        if macos_app_icon_install_due(
+            self.macos_app_icon_installed,
+            self.next_macos_app_icon_install,
+            now,
+        ) {
             self.macos_app_icon_installed = install_macos_app_icon();
+            if !self.macos_app_icon_installed {
+                self.next_macos_app_icon_install = next_macos_app_icon_retry(now);
+            }
         }
         self.last_drain = self.terminal.drain_pty();
         match self.terminal.child_exited() {
@@ -200,18 +240,22 @@ impl eframe::App for BoottyApp {
             Err(error) => self.last_error = Some(error.to_string()),
         }
 
-        let mux_config = self.config().multiplexer.clone();
-        if let Some(error) = self.mux.refresh_sessions(ctx, &mux_config) {
+        if let Some(error) = self
+            .mux
+            .refresh_sessions(ctx, &self.config_state.current().multiplexer)
+        {
             self.last_error = Some(error);
         }
         if let Some(result) = self.mux.poll_command() {
             self.last_error = result.err();
         }
-        self.refresh_sidebar_metadata(ctx);
-        if let Err(error) = self
-            .terminal
-            .sync_mux_anchor(&mux_config, self.mux.selected_session_anchor().cloned())
-        {
+        if self.config_state.current().chrome.sidebar {
+            self.refresh_sidebar_metadata(ctx);
+        }
+        if let Err(error) = self.terminal.sync_mux_anchor(
+            &self.config_state.current().multiplexer,
+            self.mux.selected_session_anchor(),
+        ) {
             self.last_error = Some(error.to_string());
         }
         self.hot_reload_config_if_changed(ctx);
@@ -264,9 +308,7 @@ impl eframe::App for BoottyApp {
 }
 
 fn configure_egui_fonts(ctx: &egui::Context, families: &[String]) {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
-
+    let db = bootty_render::font_database::system_font_database();
     let mut fonts = FontDefinitions::default();
     for family in families.iter().rev() {
         let query_families = [fontdb::Family::Name(family)];
@@ -315,53 +357,88 @@ impl BoottyApp {
             match rx.try_recv() {
                 Ok(metadata) => {
                     self.sidebar_metadata = metadata;
-                    self.sidebar_metadata_rx = None;
+                    self.sidebar_metadata_pending = false;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    self.sidebar_metadata_tx = None;
                     self.sidebar_metadata_rx = None;
+                    self.sidebar_metadata_pending = false;
                 }
             }
         }
 
-        if self.sidebar_metadata_rx.is_some()
-            || self.last_sidebar_metadata_refresh.elapsed() < SIDEBAR_METADATA_REFRESH_INTERVAL
-        {
+        if !sidebar_metadata_refresh_due(
+            self.last_sidebar_metadata_refresh,
+            Instant::now(),
+            self.sidebar_metadata_pending,
+        ) {
             return;
         }
 
-        self.last_sidebar_metadata_refresh = Instant::now();
-        let sessions = self.mux.sessions().to_vec();
-        let (tx, rx) = mpsc::channel();
+        self.ensure_sidebar_metadata_worker(ctx);
+        let Some(tx) = &self.sidebar_metadata_tx else {
+            return;
+        };
+        match tx.send(sidebar_metadata_sessions(self.mux.sessions())) {
+            Ok(()) => {
+                self.last_sidebar_metadata_refresh = Instant::now();
+                self.sidebar_metadata_pending = true;
+            }
+            Err(_) => {
+                self.sidebar_metadata_tx = None;
+                self.sidebar_metadata_rx = None;
+                self.sidebar_metadata_pending = false;
+            }
+        }
+    }
+
+    fn ensure_sidebar_metadata_worker(&mut self, ctx: &egui::Context) {
+        if self.sidebar_metadata_tx.is_some() && self.sidebar_metadata_rx.is_some() {
+            return;
+        }
+
+        let (request_tx, request_rx) = mpsc::channel::<Vec<SidebarMetadataSession>>();
+        let (result_tx, result_rx) = mpsc::channel::<SidebarMetadata>();
         let repaint = ctx.clone();
         std::thread::spawn(move || {
-            let metadata = collect_sidebar_metadata(&sessions);
-            if tx.send(metadata).is_ok() {
+            while let Ok(sessions) = request_rx.recv() {
+                let metadata = collect_sidebar_metadata(&sessions);
+                if result_tx.send(metadata).is_err() {
+                    break;
+                }
                 repaint.request_repaint();
             }
         });
-        self.sidebar_metadata_rx = Some(rx);
+        self.sidebar_metadata_tx = Some(request_tx);
+        self.sidebar_metadata_rx = Some(result_rx);
     }
 
     fn show_fixed_layout(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
-        let chrome = self.config().chrome.clone();
+        let palette = theme_palette_from_config(self.config());
+        let chrome = &self.config().chrome;
+        let sidebar = chrome.sidebar;
+        let status_bar = chrome.status_bar;
+        let configured_sidebar_width = chrome.sidebar_width;
+        let status_height_config = chrome.status_height;
+        let chrome_gap = chrome.gap;
         let fullscreen_chrome = self.macos_non_native_fullscreen_active
             || ui
                 .ctx()
                 .input(|input| input.viewport().fullscreen.unwrap_or(false));
-        let sidebar_width = if chrome.sidebar {
-            chrome.sidebar_width
+        let sidebar_width = if sidebar {
+            configured_sidebar_width
         } else {
             0.0
         };
-        let gap = if chrome.sidebar && sidebar_width > 0.0 && !fullscreen_chrome {
-            chrome.gap
+        let gap = if sidebar && sidebar_width > 0.0 && !fullscreen_chrome {
+            chrome_gap
         } else {
             0.0
         };
-        let status_height = if chrome.status_bar {
-            chrome.status_height
+        let status_height = if status_bar {
+            status_height_config
         } else {
             0.0
         };
@@ -371,7 +448,14 @@ impl BoottyApp {
                 | crate::config::MultiplexerBackendConfig::Native
         ) && !self.mux.selected_session_windows().is_empty();
         let window_tabs_height = if show_window_tabs { 34.0 } else { 0.0 };
-        let sidebar_rect = chrome::sidebar_rect(rect, &chrome);
+        let sidebar_rect = if sidebar {
+            Rect::from_min_size(
+                rect.min,
+                egui::vec2(sidebar_width.min(rect.width()), rect.height()),
+            )
+        } else {
+            Rect::from_min_size(rect.min, egui::vec2(0.0, rect.height()))
+        };
         let right_rect = Rect::from_min_max(
             Pos2::new((sidebar_rect.max.x + gap).min(rect.max.x), rect.min.y),
             rect.max,
@@ -392,7 +476,7 @@ impl BoottyApp {
             right_rect.max,
         );
 
-        if chrome.sidebar {
+        if sidebar {
             ui.scope_builder(
                 UiBuilder::new()
                     .max_rect(sidebar_rect)
@@ -411,7 +495,7 @@ impl BoottyApp {
                     });
                     if let Some(session_id) = chrome::show_sidebar(
                         ui,
-                        self.ui_theme().palette,
+                        palette,
                         sidebar_rect.height(),
                         SidebarModel {
                             sessions: self.mux.sessions(),
@@ -433,7 +517,7 @@ impl BoottyApp {
             );
         }
 
-        if chrome.status_bar {
+        if status_bar {
             ui.scope_builder(
                 UiBuilder::new()
                     .max_rect(status_rect)
@@ -441,7 +525,7 @@ impl BoottyApp {
                 |ui| {
                     chrome::show_status_bar(
                         ui,
-                        self.ui_theme().palette,
+                        palette,
                         StatusBarModel {
                             backend: selected_backend(&self.config().multiplexer),
                             selected_session_name: chrome::selected_session_name(
@@ -464,7 +548,7 @@ impl BoottyApp {
                 |ui| {
                     if let Some(window_id) = chrome::show_window_tabs(
                         ui,
-                        self.ui_theme().palette,
+                        palette,
                         chrome::WindowTabsModel {
                             windows: self.mux.selected_session_windows(),
                             selected_window: self.mux.selected_window(),
@@ -978,6 +1062,65 @@ mod tests {
         config.window.fullscreen = WindowFullscreen::NonNative;
 
         assert!(!should_toggle_native_fullscreen(&config.window));
+    }
+
+    #[test]
+    fn initial_sidebar_metadata_refresh_is_deferred() {
+        let started_at = Instant::now();
+        let last_refresh = initial_sidebar_metadata_refresh_mark(started_at);
+
+        assert!(!sidebar_metadata_refresh_due(
+            last_refresh,
+            started_at,
+            false
+        ));
+        assert!(sidebar_metadata_refresh_due(
+            last_refresh,
+            started_at + SIDEBAR_METADATA_INITIAL_DELAY,
+            false
+        ));
+    }
+
+    #[test]
+    fn sidebar_metadata_refresh_waits_when_pending() {
+        let now = Instant::now();
+        let last_refresh = now - SIDEBAR_METADATA_REFRESH_INTERVAL;
+
+        assert!(!sidebar_metadata_refresh_due(last_refresh, now, true));
+    }
+
+    #[test]
+    fn initial_macos_app_icon_install_is_deferred() {
+        let started_at = Instant::now();
+        let next_attempt = initial_macos_app_icon_install_after(started_at);
+
+        assert!(!macos_app_icon_install_due(false, next_attempt, started_at));
+        assert!(macos_app_icon_install_due(
+            false,
+            next_attempt,
+            started_at + MACOS_APP_ICON_INITIAL_DELAY
+        ));
+    }
+
+    #[test]
+    fn macos_app_icon_install_does_not_retry_when_installed() {
+        let now = Instant::now();
+        let next_attempt = now - MACOS_APP_ICON_INITIAL_DELAY;
+
+        assert!(!macos_app_icon_install_due(true, next_attempt, now));
+    }
+
+    #[test]
+    fn failed_macos_app_icon_install_retries_later() {
+        let now = Instant::now();
+        let next_attempt = next_macos_app_icon_retry(now);
+
+        assert!(!macos_app_icon_install_due(false, next_attempt, now));
+        assert!(macos_app_icon_install_due(
+            false,
+            next_attempt,
+            now + MACOS_APP_ICON_RETRY_INTERVAL
+        ));
     }
 
     #[test]

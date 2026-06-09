@@ -24,6 +24,13 @@ pub struct SidebarSessionMetadata {
     pub processes: Vec<ProcessStatus>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarMetadataSession {
+    id: String,
+    name: String,
+    cwd: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ProcessStatus {
     pub name: String,
@@ -35,6 +42,16 @@ pub struct ProcessStatus {
 pub struct DiffStat {
     pub added: u32,
     pub removed: u32,
+}
+
+impl SidebarMetadataSession {
+    fn from_mux_session(session: &MuxSession) -> Self {
+        Self {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            cwd: session.anchor.cwd.clone(),
+        }
+    }
 }
 
 impl SidebarMetadata {
@@ -49,47 +66,93 @@ impl SidebarMetadata {
     pub fn usage_lines(&self) -> &[String] {
         &self.usage_lines
     }
+
+    pub fn set_usage_lines(&mut self, usage_lines: Vec<String>) {
+        self.usage_lines = usage_lines;
+    }
 }
 
-pub fn collect_sidebar_metadata(sessions: &[MuxSession]) -> SidebarMetadata {
+pub fn sidebar_metadata_sessions(sessions: &[MuxSession]) -> Vec<SidebarMetadataSession> {
+    let mut metadata_sessions = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        if !needs_sidebar_metadata_request(session) {
+            continue;
+        }
+        metadata_sessions.push(SidebarMetadataSession::from_mux_session(session));
+    }
+    metadata_sessions
+}
+
+fn needs_sidebar_metadata_request(session: &MuxSession) -> bool {
+    session.id.starts_with('$') || session.anchor.cwd.is_some()
+}
+
+pub fn collect_sidebar_metadata(sessions: &[SidebarMetadataSession]) -> SidebarMetadata {
     let mut metadata = SidebarMetadata {
         usage_lines: collect_usage_lines(32),
         ..SidebarMetadata::default()
     };
-    let process_cpu = tmux_active_process_cpu();
-    let agent_status = tmux_agent_status();
-    let process_status = tmux_active_process_status();
+    let tmux_metadata = has_tmux_sessions(sessions).then(|| {
+        let active_panes = tmux_active_panes();
+        TmuxSidebarMetadata {
+            process_status: tmux_active_process_status(&active_panes),
+            agent_status: tmux_agent_status(&active_panes),
+            session_options: tmux_session_options_by_id(),
+        }
+    });
+    let mut repo_metadata = HashMap::<&str, (Option<String>, Option<DiffStat>)>::new();
     for session in sessions {
-        let repo = session
-            .anchor
+        let (branch, diff) = session
             .cwd
             .as_deref()
-            .map(|cwd| SidebarSessionMetadata {
-                branch: git_branch(cwd).filter(|branch| !branch.is_empty()),
-                diff: git_diff_stat(cwd),
-                ..SidebarSessionMetadata::default()
+            .map(|cwd| {
+                repo_metadata
+                    .entry(cwd)
+                    .or_insert_with(|| {
+                        (
+                            git_branch(cwd).filter(|branch| !branch.is_empty()),
+                            git_diff_stat(cwd),
+                        )
+                    })
+                    .clone()
             })
             .unwrap_or_default();
-        let tmux = tmux_session_options(&session.id).unwrap_or_default();
+        let tmux = tmux_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.session_options.get(&session.id))
+            .cloned()
+            .unwrap_or_default();
+        let process = tmux_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.process_status.get(&session.id));
         let session_meta = SidebarSessionMetadata {
-            branch: repo.branch,
-            diff: repo.diff,
+            branch,
+            diff,
             attention: tmux.attention,
             status: tmux.status,
             progress: tmux.progress,
-            process_cpu: process_cpu.get(&session.id).cloned(),
-            agent_status: agent_status.get(&session.id).cloned(),
-            processes: process_status
-                .get(&session.id)
-                .cloned()
-                .into_iter()
-                .collect(),
+            process_cpu: process.map(|status| format!("{:.1}%", status.cpu_pct)),
+            agent_status: tmux_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.agent_status.get(&session.id))
+                .cloned(),
+            processes: process.cloned().into_iter().collect(),
         };
         if !session_meta.is_empty() {
             metadata.insert(session.name.clone(), session_meta);
         }
     }
     metadata
+}
+
+struct TmuxSidebarMetadata {
+    process_status: BTreeMap<String, ProcessStatus>,
+    agent_status: BTreeMap<String, String>,
+    session_options: BTreeMap<String, SidebarSessionMetadata>,
+}
+
+fn has_tmux_sessions(sessions: &[SidebarMetadataSession]) -> bool {
+    sessions.iter().any(|session| session.id.starts_with('$'))
 }
 
 impl SidebarSessionMetadata {
@@ -105,22 +168,31 @@ impl SidebarSessionMetadata {
     }
 }
 
-fn tmux_session_options(target: &str) -> Option<SidebarSessionMetadata> {
+fn tmux_session_options_by_id() -> BTreeMap<String, SidebarSessionMetadata> {
     let output = Command::new("tmux")
         .args([
-            "display-message",
-            "-p",
-            "-t",
-            target,
-            "#{@attention}\t#{@sidebar_status}\t#{@sidebar_progress}",
+            "list-sessions",
+            "-F",
+            "#{session_id}\t#{@attention}\t#{@sidebar_status}\t#{@sidebar_progress}",
         ])
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .output();
+    let Ok(output) = output else {
+        return BTreeMap::new();
+    };
     if !output.status.success() {
-        return None;
+        return BTreeMap::new();
     }
-    parse_tmux_session_options(&String::from_utf8_lossy(&output.stdout))
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_tmux_session_options_line)
+        .collect()
+}
+
+fn parse_tmux_session_options_line(line: &str) -> Option<(String, SidebarSessionMetadata)> {
+    let (session_id, options) = line.split_once('\t')?;
+    (!session_id.is_empty()).then_some(())?;
+    parse_tmux_session_options(options).map(|metadata| (session_id.to_owned(), metadata))
 }
 
 fn parse_tmux_session_options(output: &str) -> Option<SidebarSessionMetadata> {
@@ -145,47 +217,57 @@ fn parse_tmux_session_options(output: &str) -> Option<SidebarSessionMetadata> {
     (!meta.is_empty()).then_some(meta)
 }
 
-fn tmux_active_process_cpu() -> BTreeMap<String, String> {
-    tmux_active_process_status()
-        .into_iter()
-        .map(|(session, status)| (session, format!("{:.1}%", status.cpu_pct)))
-        .collect()
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TmuxActivePane {
+    session_id: String,
+    pane_id: String,
+    pid: u32,
+    command: String,
 }
 
-fn tmux_active_process_status() -> BTreeMap<String, ProcessStatus> {
+fn tmux_active_panes() -> Vec<TmuxActivePane> {
     let output = Command::new("tmux")
         .args([
             "list-panes",
             "-a",
             "-F",
-            "#{session_id}\t#{pane_active}\t#{pane_pid}\t#{pane_current_command}",
+            "#{session_id}\t#{pane_active}\t#{pane_id}\t#{pane_pid}\t#{pane_current_command}",
         ])
         .stderr(Stdio::null())
         .output();
     let Ok(output) = output else {
-        return BTreeMap::new();
+        return Vec::new();
     };
     if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_tmux_active_pane)
+        .collect()
+}
+
+fn tmux_active_process_status(panes: &[TmuxActivePane]) -> BTreeMap<String, ProcessStatus> {
+    if panes.is_empty() {
         return BTreeMap::new();
     }
 
     let samples = build_process_info();
     let children = build_children(&samples);
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_tmux_active_pane_process)
-        .filter_map(|(session_id, pid, command)| {
-            let pid = pid.parse::<u32>().ok()?;
+    panes
+        .iter()
+        .map(|pane| {
             let mut memo = HashMap::new();
-            let (cpu_pct, mem_bytes) = subtree_usage(pid, &children, &samples, &mut memo);
-            Some((
-                session_id,
+            let (cpu_pct, mem_bytes) = subtree_usage(pane.pid, &children, &samples, &mut memo);
+            (
+                pane.session_id.clone(),
                 ProcessStatus {
-                    name: command,
+                    name: pane.command.clone(),
                     cpu_pct,
                     mem_bytes,
                 },
-            ))
+            )
         })
         .collect()
 }
@@ -269,58 +351,47 @@ fn subtree_usage(
     (cpu, mem)
 }
 
-fn parse_tmux_active_pane_process(line: &str) -> Option<(String, String, String)> {
-    let mut fields = line.split('\t');
-    let session_id = fields.next()?;
-    let active = fields.next()?;
-    let pid = fields.next()?;
-    let command = fields.next()?.trim();
-    (active == "1" && !pid.is_empty() && !command.is_empty()).then(|| {
-        (
-            session_id.to_owned(),
-            pid.to_owned(),
-            command.rsplit('/').next().unwrap_or(command).to_owned(),
-        )
-    })
-}
-
-fn tmux_agent_status() -> BTreeMap<String, String> {
-    let output = Command::new("tmux")
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_id}\t#{pane_active}\t#{pane_id}\t#{pane_current_command}",
-        ])
-        .stderr(Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return BTreeMap::new();
-    };
-    if !output.status.success() {
-        return BTreeMap::new();
-    }
-
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(parse_agent_target)
-        .filter_map(|(session_id, pane_id, agent)| {
-            capture_agent_status(&pane_id, &agent).map(|status| (session_id, status))
-        })
-        .collect()
-}
-
-fn parse_agent_target(line: &str) -> Option<(String, String, String)> {
+fn parse_tmux_active_pane(line: &str) -> Option<TmuxActivePane> {
     let mut fields = line.split('\t');
     let session_id = fields.next()?;
     let active = fields.next()?;
     let pane_id = fields.next()?;
-    let command = fields.next()?.to_ascii_lowercase();
-    if active != "1" || pane_id.is_empty() {
+    let pid = fields.next()?;
+    let command = fields.next()?.trim();
+    if active != "1" || session_id.is_empty() || pane_id.is_empty() || command.is_empty() {
         return None;
     }
-    matches!(command.as_str(), "claude" | "codex" | "opencode")
-        .then(|| (session_id.to_owned(), pane_id.to_owned(), command))
+    let pid = pid.parse::<u32>().ok()?;
+    Some(TmuxActivePane {
+        session_id: session_id.to_owned(),
+        pane_id: pane_id.to_owned(),
+        pid,
+        command: command.rsplit('/').next().unwrap_or(command).to_owned(),
+    })
+}
+
+fn tmux_agent_status(panes: &[TmuxActivePane]) -> BTreeMap<String, String> {
+    panes
+        .iter()
+        .filter_map(|pane| {
+            agent_command(&pane.command).and_then(|agent| {
+                capture_agent_status(&pane.pane_id, agent)
+                    .map(|status| (pane.session_id.clone(), status))
+            })
+        })
+        .collect()
+}
+
+fn agent_command(command: &str) -> Option<&'static str> {
+    if command.eq_ignore_ascii_case("claude") {
+        Some("claude")
+    } else if command.eq_ignore_ascii_case("codex") {
+        Some("codex")
+    } else if command.eq_ignore_ascii_case("opencode") {
+        Some("opencode")
+    } else {
+        None
+    }
 }
 
 fn capture_agent_status(pane_id: &str, agent: &str) -> Option<String> {
@@ -492,6 +563,7 @@ fn parse_git_numstat(output: &str) -> Option<DiffStat> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::snapshot::{MuxPaneAnchor, MuxSession, MuxWindow};
     use super::*;
 
     #[test]
@@ -511,11 +583,143 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_metadata_sessions_keep_only_worker_inputs() {
+        let tmux_anchor = MuxPaneAnchor {
+            session_id: "$1".to_owned(),
+            pane_id: Some("%1".to_owned()),
+            cwd: Some("/tmp/project".to_owned()),
+            process: Some("zsh".to_owned()),
+        };
+        let native_repo_anchor = MuxPaneAnchor {
+            session_id: "local-repo".to_owned(),
+            pane_id: None,
+            cwd: Some("/tmp/native".to_owned()),
+            process: Some("zsh".to_owned()),
+        };
+        let native_empty_anchor = MuxPaneAnchor {
+            session_id: "local-empty".to_owned(),
+            pane_id: None,
+            cwd: None,
+            process: Some("zsh".to_owned()),
+        };
+        let sessions = vec![
+            MuxSession {
+                id: "$1".to_owned(),
+                name: "work/api".to_owned(),
+                active: true,
+                anchor: tmux_anchor.clone(),
+                active_window_id: Some("@1".to_owned()),
+                windows: vec![MuxWindow {
+                    id: "@1".to_owned(),
+                    index: 0,
+                    name: "editor".to_owned(),
+                    active: true,
+                    anchor: tmux_anchor,
+                }],
+            },
+            MuxSession {
+                id: "local-repo".to_owned(),
+                name: "native/repo".to_owned(),
+                active: false,
+                anchor: native_repo_anchor,
+                active_window_id: None,
+                windows: Vec::new(),
+            },
+            MuxSession {
+                id: "local-empty".to_owned(),
+                name: "native/empty".to_owned(),
+                active: false,
+                anchor: native_empty_anchor,
+                active_window_id: None,
+                windows: Vec::new(),
+            },
+        ];
+
+        let metadata_sessions = sidebar_metadata_sessions(&sessions);
+
+        assert_eq!(
+            metadata_sessions,
+            vec![
+                SidebarMetadataSession {
+                    id: "$1".to_owned(),
+                    name: "work/api".to_owned(),
+                    cwd: Some("/tmp/project".to_owned()),
+                },
+                SidebarMetadataSession {
+                    id: "local-repo".to_owned(),
+                    name: "native/repo".to_owned(),
+                    cwd: Some("/tmp/native".to_owned()),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn native_sidebar_metadata_sessions_do_not_need_tmux_polling() {
+        let sessions = vec![SidebarMetadataSession {
+            id: "local".to_owned(),
+            name: "local".to_owned(),
+            cwd: None,
+        }];
+
+        assert!(!has_tmux_sessions(&sessions));
+    }
+
+    #[test]
+    fn tmux_sidebar_metadata_sessions_need_tmux_polling() {
+        let sessions = vec![SidebarMetadataSession {
+            id: "$1".to_owned(),
+            name: "work".to_owned(),
+            cwd: None,
+        }];
+
+        assert!(has_tmux_sessions(&sessions));
+    }
+
+    #[test]
     fn parses_tmux_status_and_progress_options() {
         let meta = parse_tmux_session_options("1\treview needed\t142\n").unwrap();
 
         assert!(meta.attention);
         assert_eq!(meta.status.as_deref(), Some("review needed"));
         assert_eq!(meta.progress, Some(100));
+    }
+
+    #[test]
+    fn parses_tmux_session_options_line_with_session_id() {
+        let (session_id, meta) = parse_tmux_session_options_line("$2\t0\tbuilding\t64").unwrap();
+
+        assert_eq!(session_id, "$2");
+        assert!(!meta.attention);
+        assert_eq!(meta.status.as_deref(), Some("building"));
+        assert_eq!(meta.progress, Some(64));
+    }
+
+    #[test]
+    fn empty_tmux_session_options_line_is_ignored() {
+        assert_eq!(parse_tmux_session_options_line("$2\t\t\t"), None);
+    }
+
+    #[test]
+    fn parses_active_tmux_pane_once_for_process_and_agent_metadata() {
+        assert_eq!(
+            parse_tmux_active_pane("$2\t1\t%7\t1234\t/opt/homebrew/bin/codex"),
+            Some(TmuxActivePane {
+                session_id: "$2".to_owned(),
+                pane_id: "%7".to_owned(),
+                pid: 1234,
+                command: "codex".to_owned(),
+            })
+        );
+        assert_eq!(parse_tmux_active_pane("$2\t0\t%7\t1234\tcodex"), None);
+        assert_eq!(parse_tmux_active_pane("$2\t1\t%7\tbad\tcodex"), None);
+    }
+
+    #[test]
+    fn agent_command_matches_known_agents_case_insensitively() {
+        assert_eq!(agent_command("Codex"), Some("codex"));
+        assert_eq!(agent_command("claude"), Some("claude"));
+        assert_eq!(agent_command("opencode"), Some("opencode"));
+        assert_eq!(agent_command("zsh"), None);
     }
 }
