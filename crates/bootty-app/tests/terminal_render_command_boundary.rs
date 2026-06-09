@@ -167,6 +167,35 @@ fn command_boundary_routes_prompt_sprites_away_from_ordinary_text() {
 }
 
 #[test]
+fn command_boundary_keeps_ordinary_text_run_as_single_text_command() {
+    let plan = plan_with_text_runs(
+        SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0),
+        vec![text_run(
+            SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0),
+            4,
+            "abcd",
+        )],
+    );
+
+    let frame = TerminalRenderFrame::from_plan(&plan, &text_contract());
+    let text_commands = frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            TerminalRenderCommand::Text(text) => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(text_commands.len(), 1);
+    assert_eq!(text_commands[0].text, "abcd");
+    assert_eq!(
+        text_commands[0].rect,
+        SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0)
+    );
+}
+
+#[test]
 fn command_boundary_preserves_prompt_separator_foreground_color() {
     let prompt_color = color(125, 207, 255);
     let mut run = text_run(SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0), 1, "❯");

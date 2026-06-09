@@ -90,6 +90,26 @@ fn extract_frame_repacking_preserves_clean_row_text_after_earlier_row_length_cha
 }
 
 #[test]
+fn clean_extract_frame_reuses_retained_cells_without_stale_dirty_rows() -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    engine.write_vt(b"\x1b[1;1Hcached frame\x1b[2;1Hrow two");
+    let first = engine.extract_frame()?.clone();
+
+    let frame = engine.extract_frame()?;
+
+    assert_eq!(frame.dirty, libghostty_vt::render::Dirty::Clean);
+    assert_eq!(row_text(frame, 0), row_text(&first, 0));
+    assert_eq!(row_text(frame, 1), row_text(&first, 1));
+    assert_eq!(frame.cells.len(), first.cells.len());
+    assert_eq!(frame.text.len(), first.text.len());
+    assert_eq!(frame.row_dirty, vec![false; usize::from(frame.rows)]);
+    assert_eq!(frame.stats.dirty_rows, 0);
+    assert_eq!(frame.stats.cells, frame.cells.len());
+    assert_eq!(frame.stats.chars, frame.text.len());
+    Ok(())
+}
+
+#[test]
 fn hidden_hardware_cursor_is_not_extracted() -> Result<()> {
     let mut engine = TerminalEngine::new(TerminalGeometry {
         cols: 10,

@@ -1,6 +1,7 @@
 mod families;
 
 use crate::{geometry::SurfaceRect, paint_plan::PlanColor};
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SpriteRegistry;
@@ -51,20 +52,22 @@ pub enum SpriteCommand {
     },
     FillPolygon {
         shape: SpriteShape,
-        points: Vec<SpritePoint>,
+        points: SpritePoints,
         alpha: f32,
     },
     StrokePolyline {
-        points: Vec<SpritePoint>,
+        points: SpritePoints,
         width: f32,
         alpha: f32,
     },
     ClearStrokePolyline {
-        points: Vec<SpritePoint>,
+        points: SpritePoints,
         width: f32,
         alpha: f32,
     },
 }
+
+pub type SpritePoints = SmallVec<[SpritePoint; 4]>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SpriteShape {

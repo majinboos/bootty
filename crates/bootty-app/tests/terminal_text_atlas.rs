@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use bootty_app::{
     geometry::{DEFAULT_FONT_SIZE, SurfaceRect},
     paint_plan::PlanColor,
     terminal_render::TextCommand,
     terminal_text::{FontFeature, FontStyle, ResolvedFontFace},
     terminal_text_atlas::{
-        GlyphAtlas, GlyphAtlasError, GlyphAtlasFormat, GlyphAtlasKey, TerminalTextShaper,
-        TextAtlasBuilder,
+        GlyphAtlas, GlyphAtlasError, GlyphAtlasFaceKey, GlyphAtlasFormat, GlyphAtlasKey,
+        GlyphAtlasTextKey, TerminalTextShaper, TextAtlasBuilder, TexturedGlyphQuad,
     },
 };
 
@@ -59,6 +61,27 @@ fn text_shaper_noop_contract_maps_codepoints_to_cells() {
     assert_eq!(clusters[2].text, "e\u{301}");
     assert_eq!(clusters[2].cell, 7);
     assert_eq!(clusters[2].cells, 1);
+}
+
+#[test]
+fn text_shaper_shape_into_replaces_previous_clusters() {
+    let shaper = TerminalTextShaper::default();
+    let mut clusters = shaper.shape("stale", 0);
+
+    let total_cells = shaper.shape_into("A界e\u{301}", 4, &mut clusters);
+
+    assert_eq!(total_cells, 4);
+    assert_eq!(clusters, shaper.shape("A界e\u{301}", 4));
+    assert_eq!(clusters.len(), 3);
+    assert_eq!(clusters[0].text, "A");
+    assert_eq!(clusters[1].text, "界");
+    assert_eq!(clusters[2].text, "e\u{301}");
+
+    let total_cells = shaper.shape_into("fi", 0, &mut clusters);
+
+    assert_eq!(total_cells, 2);
+    assert_eq!(clusters.len(), 1);
+    assert_eq!(clusters[0].text, "fi");
 }
 
 #[test]
@@ -121,8 +144,8 @@ fn text_shaper_ports_backend_boundary_and_symbol_cases() {
 fn atlas_reuses_cached_glyph_entries_for_same_key() {
     let mut atlas = GlyphAtlas::new(64, 64);
     let key = GlyphAtlasKey {
-        face: face(),
-        text: "A".to_owned(),
+        face: GlyphAtlasFaceKey::new(face()),
+        text: GlyphAtlasTextKey::new("A"),
         font_size_bits: DEFAULT_FONT_SIZE.to_bits(),
         pixels_per_point_bits: 1.0_f32.to_bits(),
         width: 8,
@@ -293,7 +316,7 @@ fn text_atlas_builder_emits_one_textured_quad_per_shaped_cluster() {
         rect: SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0),
         text: "A界".to_owned(),
         attrs: attrs(),
-        face: face(),
+        face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
     };
     let mut builder = TextAtlasBuilder::new(128, 128);
@@ -307,12 +330,36 @@ fn text_atlas_builder_emits_one_textured_quad_per_shaped_cluster() {
 }
 
 #[test]
+fn text_atlas_builder_appends_textured_quads_without_replacing_existing_batch() {
+    let command = TextCommand {
+        rect: SurfaceRect::from_min_size(0.0, 0.0, 20.0, 20.0),
+        text: "AB".to_owned(),
+        attrs: attrs(),
+        face: Arc::new(face()),
+        font_size: DEFAULT_FONT_SIZE,
+    };
+    let sentinel = TexturedGlyphQuad {
+        rect: SurfaceRect::from_min_size(99.0, 99.0, 1.0, 1.0),
+        uv: SurfaceRect::from_min_size(0.0, 0.0, 1.0, 1.0),
+        color: attrs().fg,
+    };
+    let mut builder = TextAtlasBuilder::new(128, 128);
+    let mut quads = vec![sentinel];
+
+    builder.prepare_text_command_into(&command, 1.0, &mut quads);
+
+    assert_eq!(quads.len(), 3);
+    assert_eq!(quads[0], sentinel);
+    assert_eq!(builder.atlas_len(), 2);
+}
+
+#[test]
 fn atlas_keys_separate_same_glyph_at_different_pixel_scales() {
     let command = TextCommand {
         rect: SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0),
         text: "A".to_owned(),
         attrs: attrs(),
-        face: face(),
+        face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
     };
     let mut builder = TextAtlasBuilder::new(128, 128);
@@ -324,19 +371,28 @@ fn atlas_keys_separate_same_glyph_at_different_pixel_scales() {
 }
 
 #[test]
-fn whitespace_clusters_have_no_atlas_ink() {
+fn whitespace_clusters_do_not_create_invisible_quads_or_atlas_entries() {
     let command = TextCommand {
-        rect: SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0),
-        text: " ".to_owned(),
+        rect: SurfaceRect::from_min_size(0.0, 0.0, 30.0, 20.0),
+        text: "A B".to_owned(),
         attrs: attrs(),
-        face: face(),
+        face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
     };
     let mut builder = TextAtlasBuilder::new(64, 64);
 
-    builder.prepare_text_command(&command, 1.0);
+    let quads = builder.prepare_text_command(&command, 1.0);
 
-    assert!(builder.atlas_pixels().iter().all(|alpha| *alpha == 0));
+    assert_eq!(quads.len(), 2);
+    assert_eq!(
+        quads[0].rect,
+        SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0)
+    );
+    assert_eq!(
+        quads[1].rect,
+        SurfaceRect::from_min_size(20.0, 0.0, 10.0, 20.0)
+    );
+    assert_eq!(builder.atlas_len(), 2);
 }
 
 fn face() -> ResolvedFontFace {

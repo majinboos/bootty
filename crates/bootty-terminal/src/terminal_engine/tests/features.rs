@@ -34,6 +34,74 @@ fn text_cell_width(chars: impl Iterator<Item = char>) -> u16 {
         .sum()
 }
 
+#[test]
+fn find_subslice_handles_empty_single_and_missing_needles() {
+    assert_eq!(find_subslice(b"abc", b""), None);
+    assert_eq!(find_subslice(b"abc", b"b"), Some(1));
+    assert_eq!(find_subslice(b"abc", b"x"), None);
+    assert_eq!(find_subslice(b"abc", b"abcd"), None);
+}
+
+#[test]
+fn find_subslice_skips_to_candidate_first_bytes() {
+    assert_eq!(
+        find_subslice(b"\x1b[0m text \x1b_Gpayload", b"\x1b_G"),
+        Some(10)
+    );
+    assert_eq!(find_subslice(b"aaaaab", b"aaab"), Some(2));
+}
+
+#[test]
+fn kitty_graphics_sanitizer_reports_presence_without_allocating_clean_input() {
+    let clean = sanitize_kitty_graphics_commands(b"plain terminal output");
+    assert!(!clean.touched);
+    assert!(matches!(clean.bytes, std::borrow::Cow::Borrowed(_)));
+
+    let kitty = sanitize_kitty_graphics_commands(b"\x1b_Ga=T,i=1,q=1;AAAA\x1b\\");
+    assert!(kitty.touched);
+    assert!(matches!(kitty.bytes, std::borrow::Cow::Borrowed(_)));
+}
+
+#[test]
+fn terminal_write_feature_detection_ignores_plain_and_ansi_csi_output() {
+    assert_eq!(
+        terminal_write_features(b"plain terminal output"),
+        TerminalWriteFeatures::default()
+    );
+    assert_eq!(
+        terminal_write_features(b"\x1b[38;2;1;2;3mcolored\x1b[0m"),
+        TerminalWriteFeatures::default()
+    );
+}
+
+#[test]
+fn terminal_write_feature_detection_finds_expensive_protocols() {
+    assert_eq!(
+        terminal_write_features(b"\x1bPtmux;\x1b\x1b]7;file:///tmp\x1b\\"),
+        TerminalWriteFeatures {
+            tmux_passthrough: true,
+            kitty_graphics: false,
+            osc_pwd: true,
+        }
+    );
+    assert_eq!(
+        terminal_write_features(b"\x1b_Ga=T,i=1;AAAA\x1b\\"),
+        TerminalWriteFeatures {
+            tmux_passthrough: false,
+            kitty_graphics: true,
+            osc_pwd: false,
+        }
+    );
+    assert_eq!(
+        terminal_write_features(b"\x1b]7;file:///tmp\x1b\\"),
+        TerminalWriteFeatures {
+            tmux_passthrough: false,
+            kitty_graphics: false,
+            osc_pwd: true,
+        }
+    );
+}
+
 fn test_geometry(cols: u16, rows: u16) -> TerminalGeometry {
     TerminalGeometry {
         cols,

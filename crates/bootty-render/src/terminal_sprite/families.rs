@@ -1,6 +1,6 @@
 use crate::geometry::SurfaceRect;
 
-use super::{SpriteCommand, SpriteFamily, SpriteGlyph, SpritePoint, SpriteShape};
+use super::{SpriteCommand, SpriteFamily, SpriteGlyph, SpritePoint, SpritePoints, SpriteShape};
 
 macro_rules! block_rect_specs {
     ($($ch:literal => ($row:literal, $col:literal, $rows:literal, $cols:literal),)+) => {
@@ -129,17 +129,17 @@ fn separator_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
         _ => return Vec::new(),
     };
     let points = match ch {
-        '❯' | '' => vec![
+        '❯' | '' => points_from_array([
             SpritePoint::new(left, top),
             SpritePoint::new(right, center),
             SpritePoint::new(left, bottom),
-        ],
-        '❮' | '' => vec![
+        ]),
+        '❮' | '' => points_from_array([
             SpritePoint::new(right, top),
             SpritePoint::new(left, center),
             SpritePoint::new(right, bottom),
-        ],
-        _ => Vec::new(),
+        ]),
+        _ => SpritePoints::new(),
     };
 
     vec![SpriteCommand::StrokePolyline {
@@ -532,7 +532,7 @@ fn box_horizontal_dash_commands(dashes: BoxDashes, rect: SurfaceRect) -> Vec<Spr
     let mut extra = total_dash_width % count;
     let y = rect.min_y + (rect.height() - box_line_width(dashes.style, rect)) * 0.5;
     let mut x = rect.min_x + (gap_width / 2.0).floor();
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(usize::from(dashes.count));
 
     for _ in 0..dashes.count {
         let mut width = dash_width;
@@ -557,7 +557,7 @@ fn box_vertical_dash_commands(dashes: BoxDashes, rect: SurfaceRect) -> Vec<Sprit
     let mut extra = total_dash_height % count;
     let x = rect.min_x + (rect.width() - box_line_width(dashes.style, rect)) * 0.5;
     let mut y = rect.min_y;
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(usize::from(dashes.count));
 
     for _ in 0..dashes.count {
         let mut height = dash_height;
@@ -574,24 +574,24 @@ fn box_vertical_dash_commands(dashes: BoxDashes, rect: SurfaceRect) -> Vec<Sprit
 fn box_diagonal_commands(diagonals: BoxDiagonals, rect: SurfaceRect) -> Vec<SpriteCommand> {
     let slope_x = rect.width().min(rect.height()) / rect.height();
     let slope_y = rect.width().min(rect.height()) / rect.width();
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(2);
 
     if diagonals.upper_right_to_lower_left {
         commands.push(SpriteCommand::StrokePolyline {
-            points: vec![
+            points: points_from_array([
                 SpritePoint::new(rect.max_x + 0.5 * slope_x, rect.min_y - 0.5 * slope_y),
                 SpritePoint::new(rect.min_x - 0.5 * slope_x, rect.max_y + 0.5 * slope_y),
-            ],
+            ]),
             width: line_width(rect),
             alpha: 1.0,
         });
     }
     if diagonals.upper_left_to_lower_right {
         commands.push(SpriteCommand::StrokePolyline {
-            points: vec![
+            points: points_from_array([
                 SpritePoint::new(rect.min_x - 0.5 * slope_x, rect.min_y - 0.5 * slope_y),
                 SpritePoint::new(rect.max_x + 0.5 * slope_x, rect.max_y + 0.5 * slope_y),
-            ],
+            ]),
             width: line_width(rect),
             alpha: 1.0,
         });
@@ -663,7 +663,7 @@ fn box_rounded_corner_command(corner: BoxRoundedCorner, rect: SurfaceRect) -> Sp
     }
 
     SpriteCommand::StrokePolyline {
-        points,
+        points: points_from_vec(points),
         width: thick,
         alpha: 1.0,
     }
@@ -749,7 +749,7 @@ fn box_line_commands(lines: BoxLines, rect: SurfaceRect) -> Vec<SpriteCommand> {
         v_light_right
     };
 
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(8);
     match lines.up {
         BoxLineStyle::None => {}
         BoxLineStyle::Light | BoxLineStyle::Heavy => {
@@ -929,7 +929,7 @@ fn braille_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
     if dots == 0 {
         return Vec::new();
     }
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(8);
     let layout = braille_dot_layout(rect);
     let positions = [
         (0, 0),
@@ -1247,7 +1247,7 @@ fn legacy_inverse_diagonal_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCo
         0x1FBBD => commands.extend(light_diagonal_cross_clear_commands(rect)),
         0x1FBBE => {
             let (from, to) = legacy_corner_diagonal_segment(LegacyCorner::LowerRight, rect);
-            commands.push(clear_stroke_polyline(vec![from, to], rect));
+            commands.push(clear_stroke_segment(from, to, rect));
         }
         0x1FBBF => {
             commands.extend(
@@ -1260,7 +1260,7 @@ fn legacy_inverse_diagonal_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCo
                 .into_iter()
                 .map(|corner| {
                     let (from, to) = legacy_corner_diagonal_segment(corner, rect);
-                    clear_stroke_polyline(vec![from, to], rect)
+                    clear_stroke_segment(from, to, rect)
                 }),
             );
         }
@@ -1273,18 +1273,14 @@ fn light_diagonal_cross_clear_commands(rect: SurfaceRect) -> Vec<SpriteCommand> 
     let slope_x = rect.width().min(rect.height()) / rect.height().max(1.0);
     let slope_y = rect.height().min(rect.width()) / rect.width().max(1.0);
     vec![
-        clear_stroke_polyline(
-            vec![
-                SpritePoint::new(rect.max_x + 0.5 * slope_x, rect.min_y - 0.5 * slope_y),
-                SpritePoint::new(rect.min_x - 0.5 * slope_x, rect.max_y + 0.5 * slope_y),
-            ],
+        clear_stroke_segment(
+            SpritePoint::new(rect.max_x + 0.5 * slope_x, rect.min_y - 0.5 * slope_y),
+            SpritePoint::new(rect.min_x - 0.5 * slope_x, rect.max_y + 0.5 * slope_y),
             rect,
         ),
-        clear_stroke_polyline(
-            vec![
-                SpritePoint::new(rect.min_x - 0.5 * slope_x, rect.min_y - 0.5 * slope_y),
-                SpritePoint::new(rect.max_x + 0.5 * slope_x, rect.max_y + 0.5 * slope_y),
-            ],
+        clear_stroke_segment(
+            SpritePoint::new(rect.min_x - 0.5 * slope_x, rect.min_y - 0.5 * slope_y),
+            SpritePoint::new(rect.max_x + 0.5 * slope_x, rect.max_y + 0.5 * slope_y),
             rect,
         ),
     ]
@@ -1343,7 +1339,7 @@ fn legacy_corner_triangle_shade_commands(ch: char, rect: SurfaceRect) -> Vec<Spr
     };
     vec![SpriteCommand::FillPolygon {
         shape: SpriteShape::Triangle,
-        points: points.to_vec(),
+        points: points_from_array(points),
         alpha: 0.5,
     }]
 }
@@ -1374,7 +1370,7 @@ enum LegacyCirclePosition {
 
 fn circle_arc_command(rect: SurfaceRect, position: LegacyCirclePosition) -> SpriteCommand {
     SpriteCommand::StrokePolyline {
-        points: circle_arc_points(rect, position),
+        points: points_from_vec(circle_arc_points(rect, position)),
         width: line_width(rect),
         alpha: 1.0,
     }
@@ -1544,7 +1540,7 @@ fn legacy_corner_diagonal_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCom
         .iter()
         .map(|corner| {
             let (from, to) = legacy_corner_diagonal_segment(*corner, rect);
-            stroke_polyline(vec![from, to], rect)
+            stroke_segment(from, to, rect)
         })
         .collect()
 }
@@ -1950,7 +1946,7 @@ fn supplement_circle_piece_command(
             && point.y <= rect.max_y
     });
     SpriteCommand::StrokePolyline {
-        points,
+        points: points_from_vec(points),
         width: line_width(rect),
         alpha: 1.0,
     }
@@ -2141,7 +2137,7 @@ fn sixteenth_block_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
 fn sixel_grid_commands(pattern: u8, rect: SurfaceRect, rows: u8, cols: u8) -> Vec<SpriteCommand> {
     let cell_width = rect.width() / f32::from(cols);
     let cell_height = rect.height() / f32::from(rows);
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(usize::from(rows) * usize::from(cols));
 
     for row in 0..rows {
         for col in 0..cols {
@@ -2232,7 +2228,7 @@ fn checkerboard_commands(rect: SurfaceRect, parity: usize) -> Vec<SpriteCommand>
     let y_cells = (4.0 * (rect.height() / rect.width())).round().max(1.0) as usize;
     let cell_width = rect.width() / x_cells as f32;
     let cell_height = rect.height() / y_cells as f32;
-    let mut commands = Vec::new();
+    let mut commands = Vec::with_capacity(x_cells * y_cells);
 
     for x in 0..x_cells {
         for y in 0..y_cells {
@@ -2328,16 +2324,17 @@ fn triangle_commands(a: SpritePoint, b: SpritePoint, c: SpritePoint) -> Vec<Spri
 }
 
 fn stroke_commands(pairs: &[(SpritePoint, SpritePoint)], rect: SurfaceRect) -> Vec<SpriteCommand> {
-    pairs
-        .iter()
-        .map(|(start, end)| stroke_polyline(vec![*start, *end], rect))
-        .collect()
+    let mut commands = Vec::with_capacity(pairs.len());
+    for (start, end) in pairs {
+        commands.push(stroke_segment(*start, *end, rect));
+    }
+    commands
 }
 
 fn filled_triangle(points: [SpritePoint; 3]) -> SpriteCommand {
     SpriteCommand::FillPolygon {
         shape: SpriteShape::Triangle,
-        points: points.to_vec(),
+        points: points_from_array(points),
         alpha: 1.0,
     }
 }
@@ -2345,25 +2342,41 @@ fn filled_triangle(points: [SpritePoint; 3]) -> SpriteCommand {
 fn filled_polygon(points: Vec<SpritePoint>) -> SpriteCommand {
     SpriteCommand::FillPolygon {
         shape: SpriteShape::Polygon,
-        points,
+        points: points_from_vec(points),
         alpha: 1.0,
     }
 }
 
 fn stroke_polyline(points: Vec<SpritePoint>, rect: SurfaceRect) -> SpriteCommand {
     SpriteCommand::StrokePolyline {
-        points,
+        points: points_from_vec(points),
         width: soft_powerline_width(rect),
         alpha: 1.0,
     }
 }
 
-fn clear_stroke_polyline(points: Vec<SpritePoint>, rect: SurfaceRect) -> SpriteCommand {
+fn stroke_segment(start: SpritePoint, end: SpritePoint, rect: SurfaceRect) -> SpriteCommand {
+    SpriteCommand::StrokePolyline {
+        points: points_from_array([start, end]),
+        width: soft_powerline_width(rect),
+        alpha: 1.0,
+    }
+}
+
+fn clear_stroke_segment(start: SpritePoint, end: SpritePoint, rect: SurfaceRect) -> SpriteCommand {
     SpriteCommand::ClearStrokePolyline {
-        points,
+        points: points_from_array([start, end]),
         width: line_width(rect),
         alpha: 1.0,
     }
+}
+
+fn points_from_array<const N: usize>(points: [SpritePoint; N]) -> SpritePoints {
+    points.into_iter().collect()
+}
+
+fn points_from_vec(points: Vec<SpritePoint>) -> SpritePoints {
+    SpritePoints::from_vec(points)
 }
 
 fn block_rect(rect: SurfaceRect, row: u8, col: u8, rows: u8, cols: u8) -> SurfaceRect {

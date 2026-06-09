@@ -1,5 +1,4 @@
 use bootty_app::{
-    bare_host::{BareTerminalViewport, terminal_render_frame_for_bare_host},
     geometry::{CellMetrics, SurfaceRect, TerminalPadding},
     paint_plan::{
         BackgroundRect, CursorPlan, CursorShape, CursorTextPlan, DecorationLine, DecorationStyle,
@@ -15,6 +14,7 @@ use bootty_app::{
         terminal_text_draws,
     },
 };
+use bootty_winit::bare_host::{BareTerminalViewport, terminal_render_frame_for_bare_host};
 use std::sync::Arc;
 
 fn color(r: u8, g: u8, b: u8) -> PlanColor {

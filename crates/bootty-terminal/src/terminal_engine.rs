@@ -7,7 +7,7 @@ use std::{
 use crate::{
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface},
     terminal_image::{
-        KittyImageDataCache, KittyVirtualCell, append_virtual_image_placements,
+        KittyImageDataCache, KittyImageFrame, KittyVirtualCell, append_virtual_image_placements,
         collect_kitty_image_frame,
     },
     terminal_png_decoder::BoottyPngDecoder,
@@ -17,7 +17,7 @@ use libghostty_vt::{
     Terminal, TerminalOptions, focus, key,
     kitty::graphics::set_png_decoder,
     mouse, paste,
-    render::{CellIterator, CursorVisualStyle, RenderState, RowIterator},
+    render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator},
     style::RgbColor,
     terminal::{
         ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode,
@@ -27,7 +27,7 @@ use libghostty_vt::{
 };
 
 use crate::terminal_frame::{
-    CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, RenderCell, RenderFrame,
+    CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, FrameStats, RenderCell, RenderFrame,
 };
 use crate::terminal_input_model::{KeyInput, MouseAction, MouseEncoderSize, MouseInput};
 use crate::terminal_palette::generate_256_palette;
@@ -93,6 +93,9 @@ pub struct TerminalEngine {
     osc_pwd_pending: Vec<u8>,
     current_working_directory: String,
     colors: TerminalColorConfig,
+    content_epoch: u64,
+    extracted_content_epoch: u64,
+    kitty_graphics_touched: bool,
 }
 
 fn configure_default_colors(
@@ -154,9 +157,20 @@ fn default_device_attributes() -> DeviceAttributes {
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+    let first = *needle.first()?;
+    if needle.len() == 1 {
+        return haystack.iter().position(|byte| *byte == first);
+    }
+
+    let mut offset = 0;
+    while let Some(relative_start) = haystack[offset..].iter().position(|byte| *byte == first) {
+        let start = offset + relative_start;
+        if haystack[start..].starts_with(needle) {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+    None
 }
 
 fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
@@ -169,6 +183,44 @@ fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalWriteFeatures {
+    tmux_passthrough: bool,
+    kitty_graphics: bool,
+    osc_pwd: bool,
+}
+
+impl TerminalWriteFeatures {
+    fn needs_sanitizing(self) -> bool {
+        self.tmux_passthrough || self.kitty_graphics || self.osc_pwd
+    }
+}
+
+fn terminal_write_features(data: &[u8]) -> TerminalWriteFeatures {
+    let mut features = TerminalWriteFeatures::default();
+    let mut index = 0;
+    while let Some(relative_start) = data[index..].iter().position(|byte| *byte == 0x1b) {
+        let start = index + relative_start;
+        match data.get(start + 1).copied() {
+            Some(b'P') if data.get(start + 2..start + 7) == Some(b"tmux;") => {
+                features.tmux_passthrough = true;
+            }
+            Some(b'_') if data.get(start + 2) == Some(&b'G') => {
+                features.kitty_graphics = true;
+            }
+            Some(b']') if data.get(start + 2..start + 4) == Some(b"7;") => {
+                features.osc_pwd = true;
+            }
+            _ => {}
+        }
+        if features.tmux_passthrough && features.kitty_graphics && features.osc_pwd {
+            break;
+        }
+        index = start + 1;
+    }
+    features
 }
 
 fn unwrap_tmux_passthrough_commands(data: &[u8]) -> Cow<'_, [u8]> {
@@ -215,10 +267,17 @@ fn unwrap_tmux_passthrough_commands(data: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-fn sanitize_kitty_graphics_commands(data: &[u8]) -> Cow<'_, [u8]> {
+struct SanitizedKittyGraphics<'a> {
+    bytes: Cow<'a, [u8]>,
+    touched: bool,
+}
+
+fn sanitize_kitty_graphics_commands(data: &[u8]) -> SanitizedKittyGraphics<'_> {
     let mut out: Option<Vec<u8>> = None;
     let mut read_start = 0;
+    let mut touched = false;
     while let Some(relative_start) = find_subslice(&data[read_start..], b"\x1b_G") {
+        touched = true;
         let start = read_start + relative_start;
         let payload_start = start + 3;
         let Some((payload_len, terminator_len)) = find_osc_terminator(&data[payload_start..])
@@ -249,9 +308,15 @@ fn sanitize_kitty_graphics_commands(data: &[u8]) -> Cow<'_, [u8]> {
     match out {
         Some(mut out) => {
             out.extend_from_slice(&data[read_start..]);
-            Cow::Owned(out)
+            SanitizedKittyGraphics {
+                bytes: Cow::Owned(out),
+                touched,
+            }
         }
-        None => Cow::Borrowed(data),
+        None => SanitizedKittyGraphics {
+            bytes: Cow::Borrowed(data),
+            touched,
+        },
     }
 }
 
@@ -323,13 +388,12 @@ impl TerminalEngine {
             geometry.cell_width,
             geometry.cell_height,
         )?;
-        terminal.set_kitty_image_storage_limit(64 * 1024 * 1024)?;
         terminal.set_kitty_image_from_file_allowed(true)?;
         terminal.set_kitty_image_from_temp_file_allowed(true)?;
         terminal.set_kitty_image_from_shared_mem_allowed(false)?;
         set_png_decoder(Some(Box::new(BoottyPngDecoder)))?;
 
-        Ok(Self {
+        let mut engine = Self {
             terminal,
             render_state: RenderState::new()?,
             rows: RowIterator::new()?,
@@ -350,7 +414,22 @@ impl TerminalEngine {
             osc_pwd_pending: Vec::new(),
             current_working_directory: String::new(),
             colors,
-        })
+            content_epoch: 0,
+            extracted_content_epoch: u64::MAX,
+            kitty_graphics_touched: false,
+        };
+        engine.set_kitty_image_storage_limit(64 * 1024 * 1024)?;
+        Ok(engine)
+    }
+
+    fn mark_content_changed(&mut self) {
+        self.content_epoch = self.content_epoch.wrapping_add(1);
+    }
+
+    pub fn set_kitty_image_storage_limit(&mut self, limit: u64) -> Result<()> {
+        self.terminal.set_kitty_image_storage_limit(limit)?;
+        self.mark_content_changed();
+        Ok(())
     }
 
     pub fn on_pty_write(
@@ -375,12 +454,14 @@ impl TerminalEngine {
 
     pub fn set_default_color_palette(&mut self, palette: [RgbColor; 256]) -> Result<()> {
         self.terminal.set_default_color_palette(Some(palette))?;
+        self.mark_content_changed();
         Ok(())
     }
 
     pub fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
         configure_default_colors(&mut self.terminal, &colors)?;
         self.colors = colors;
+        self.mark_content_changed();
         Ok(())
     }
 
@@ -399,16 +480,51 @@ impl TerminalEngine {
             geometry.cell_width,
             geometry.cell_height,
         )?;
+        self.mark_content_changed();
 
         Ok(())
     }
 
     pub fn write_vt(&mut self, bytes: &[u8]) {
-        let bytes = unwrap_tmux_passthrough_commands(bytes);
-        let bytes = sanitize_kitty_graphics_commands(&bytes);
-        self.terminal.vt_write(&bytes);
-        self.apply_osc_pwd_updates(&bytes);
+        let mut features = terminal_write_features(bytes);
+        if !self.osc_pwd_pending.is_empty() {
+            features.osc_pwd = true;
+        }
+        if !features.needs_sanitizing() {
+            self.terminal.vt_write(bytes);
+            self.mouse_encoder_options_dirty = true;
+            self.mark_content_changed();
+            return;
+        }
+
+        let bytes = if features.tmux_passthrough {
+            let unwrapped = unwrap_tmux_passthrough_commands(bytes);
+            features = terminal_write_features(unwrapped.as_ref());
+            if !self.osc_pwd_pending.is_empty() {
+                features.osc_pwd = true;
+            }
+            unwrapped
+        } else {
+            Cow::Borrowed(bytes)
+        };
+
+        let sanitized = if features.kitty_graphics {
+            sanitize_kitty_graphics_commands(bytes.as_ref())
+        } else {
+            SanitizedKittyGraphics {
+                bytes,
+                touched: false,
+            }
+        };
+        if sanitized.touched {
+            self.kitty_graphics_touched = true;
+        }
+        self.terminal.vt_write(sanitized.bytes.as_ref());
+        if features.osc_pwd {
+            self.apply_osc_pwd_updates(sanitized.bytes.as_ref());
+        }
         self.mouse_encoder_options_dirty = true;
+        self.mark_content_changed();
     }
 
     pub fn current_working_directory(&self) -> &str {
@@ -553,10 +669,12 @@ impl TerminalEngine {
 
     pub fn scroll_viewport_delta(&mut self, delta: isize) {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+        self.mark_content_changed();
     }
 
     pub fn scroll_viewport_bottom(&mut self) {
         self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        self.mark_content_changed();
     }
 
     pub fn is_mouse_tracking(&self) -> Result<bool> {
@@ -569,11 +687,21 @@ impl TerminalEngine {
         let snapshot = self.render_state.update(&self.terminal)?;
         let render_state_update_us = update_start.elapsed().as_micros() as u64;
         let colors = snapshot.colors()?;
+        let cols = snapshot.cols()?;
+        let rows = snapshot.rows()?;
+        let dirty = snapshot.dirty()?;
+        let can_reuse_clean_frame = self.content_epoch == self.extracted_content_epoch
+            && self.frame.cols == cols
+            && self.frame.rows == rows
+            && !self.frame.cells.is_empty();
 
-        self.frame.clear();
-        self.frame.cols = snapshot.cols()?;
-        self.frame.rows = snapshot.rows()?;
-        self.frame.dirty = snapshot.dirty()?;
+        self.frame.cols = cols;
+        self.frame.rows = rows;
+        self.frame.dirty = if can_reuse_clean_frame {
+            Dirty::Clean
+        } else {
+            dirty
+        };
         self.frame.colors = FrameColors {
             background: colors.background,
             foreground: colors.foreground,
@@ -602,6 +730,26 @@ impl TerminalEngine {
             offset: scrollbar.offset,
             len: scrollbar.len,
         });
+        if can_reuse_clean_frame {
+            self.frame.row_dirty.clear();
+            self.frame
+                .row_dirty
+                .resize(usize::from(self.frame.rows), false);
+            self.frame.stats = FrameStats {
+                render_state_update_us,
+                extraction_us: extract_start.elapsed().as_micros() as u64,
+                cells: self.frame.cells.len(),
+                chars: self.frame.text.len(),
+                dirty_rows: 0,
+            };
+            return Ok(&self.frame);
+        }
+
+        self.frame.row_dirty.clear();
+        self.frame.cells.clear();
+        self.frame.text.clear();
+        self.frame.images = KittyImageFrame::default();
+        self.frame.stats = FrameStats::default();
 
         let mut row_iter = self.rows.update(&snapshot)?;
         let mut row_index = 0_u16;
@@ -678,26 +826,29 @@ impl TerminalEngine {
         }
 
         self.frame.stats.render_state_update_us = render_state_update_us;
-        let surface = TerminalSurface::for_logical_size(
-            f32::from(self.geometry.pixel_width()),
-            f32::from(self.geometry.pixel_height()),
-            CellMetrics::new(
-                self.geometry.cell_width as f32,
-                self.geometry.cell_height as f32,
-            ),
-            TerminalPadding::default(),
-        );
-        let mut images = collect_kitty_image_frame(
-            &self.terminal,
-            surface,
-            &mut self.image_placements,
-            &mut self.image_data_cache,
-        )
-        .unwrap_or_default();
-        append_virtual_image_placements(&self.terminal, surface, &mut images, &virtual_cells)?;
-        images.virtual_placeholder_rows = virtual_placeholder_rows;
-        self.frame.images = images;
+        if self.kitty_graphics_touched || !virtual_cells.is_empty() {
+            let surface = TerminalSurface::for_logical_size(
+                f32::from(self.geometry.pixel_width()),
+                f32::from(self.geometry.pixel_height()),
+                CellMetrics::new(
+                    self.geometry.cell_width as f32,
+                    self.geometry.cell_height as f32,
+                ),
+                TerminalPadding::default(),
+            );
+            let mut images = collect_kitty_image_frame(
+                &self.terminal,
+                surface,
+                &mut self.image_placements,
+                &mut self.image_data_cache,
+            )
+            .unwrap_or_default();
+            append_virtual_image_placements(&self.terminal, surface, &mut images, &virtual_cells)?;
+            images.virtual_placeholder_rows = virtual_placeholder_rows;
+            self.frame.images = images;
+        }
         self.frame.stats.extraction_us = extract_start.elapsed().as_micros() as u64;
+        self.extracted_content_epoch = self.content_epoch;
         Ok(&self.frame)
     }
 }

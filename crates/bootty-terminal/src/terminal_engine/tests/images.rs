@@ -648,7 +648,7 @@ fn terminal_engine_ports_kitty_cleanup_commands_and_storage_disable() -> Result<
     assert_eq!(frame.images.placements.len(), 1);
     assert_eq!(frame.images.placements[0].placement_id, 3);
 
-    engine.terminal.set_kitty_image_storage_limit(0)?;
+    engine.set_kitty_image_storage_limit(0)?;
     let frame = engine.extract_frame()?;
     assert!(frame.images.placements.is_empty());
     assert!(engine.terminal.kitty_graphics()?.image(31).is_none());

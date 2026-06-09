@@ -1,4 +1,5 @@
 use crate::{
+    font_database::system_font_database,
     geometry::{CellMetrics, GHOSTTY_CONFIG_CELL_HEIGHT_ADJUSTMENT},
     terminal_text::{FontStyle, ResolvedFontFace},
 };
@@ -58,22 +59,20 @@ pub(super) fn ghostty_cell_metrics_from_font(font: &FontArc, font_size: f32) -> 
 }
 
 struct TerminalFontCache {
-    database: fontdb::Database,
+    database: &'static fontdb::Database,
     fonts: HashMap<ResolvedFontFace, Option<FontArc>>,
 }
 
 impl TerminalFontCache {
     fn new() -> Self {
-        let mut database = fontdb::Database::new();
-        database.load_system_fonts();
         Self {
-            database,
+            database: system_font_database(),
             fonts: HashMap::new(),
         }
     }
 
     fn font_for_face(&mut self, face: &ResolvedFontFace) -> Option<FontArc> {
-        let database = &self.database;
+        let database = self.database;
         self.fonts
             .entry(face.clone())
             .or_insert_with(|| load_terminal_font(database, face))

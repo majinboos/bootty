@@ -27,11 +27,14 @@ use pipelines::{
     text_pipeline, text_texture_format,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(test)]
 use vertices::color_to_float;
+#[cfg(test)]
+use vertices::text_vertices;
 use vertices::{
-    BackgroundVertex, TerminalQuadDraw, TextVertex, background_vertices, image_vertices,
-    text_vertices, vertex_bytes,
+    BackgroundVertex, TerminalQuadDraw, TextVertex, background_quad_vertices, image_vertices,
+    text_vertices_into, vertex_bytes,
 };
 
 #[cfg(test)]
@@ -295,12 +298,17 @@ fn terminal_callback_key(
 
 struct TerminalBackgroundFrameResources {
     vertex_buffer: wgpu::Buffer,
+    vertices: Vec<BackgroundVertex>,
     vertex_count: u32,
     byte_capacity: usize,
 }
 
 impl TerminalBackgroundFrameResources {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[BackgroundVertex]) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vertices: &mut Vec<BackgroundVertex>,
+    ) -> Self {
         let mut resources = Self {
             vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bootty_terminal_renderer_vertices"),
@@ -308,6 +316,7 @@ impl TerminalBackgroundFrameResources {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            vertices: Vec::new(),
             vertex_count: 0,
             byte_capacity: 0,
         };
@@ -319,8 +328,15 @@ impl TerminalBackgroundFrameResources {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &[BackgroundVertex],
+        vertices: &mut Vec<BackgroundVertex>,
     ) {
+        if vertices.is_empty() {
+            self.vertices.clear();
+            self.vertex_count = 0;
+            return;
+        }
+
+        let vertex_count = vertices.len() as u32;
         let bytes = vertex_bytes(vertices);
         if bytes.len() > self.byte_capacity {
             self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -329,10 +345,12 @@ impl TerminalBackgroundFrameResources {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             self.byte_capacity = bytes.len();
-        } else if !bytes.is_empty() {
+            std::mem::swap(&mut self.vertices, vertices);
+        } else if self.vertices.as_slice() != vertices {
             queue.write_buffer(&self.vertex_buffer, 0, bytes);
+            std::mem::swap(&mut self.vertices, vertices);
         }
-        self.vertex_count = vertices.len() as u32;
+        self.vertex_count = vertex_count;
     }
 }
 
@@ -341,6 +359,14 @@ enum TerminalPreparedLayer {
     Text(usize),
     Image(usize),
 }
+
+struct PreparedTerminalFrameCache {
+    frame: TerminalRenderFrame,
+    pixels_per_point_bits: u32,
+    vertex_count: u32,
+}
+
+const PREPARED_FRAME_CACHE_MISS_COOLDOWN: u8 = 8;
 
 pub struct TerminalWgpuRenderer {
     pipeline: wgpu::RenderPipeline,
@@ -355,7 +381,13 @@ pub struct TerminalWgpuRenderer {
     layers: Vec<TerminalPreparedLayer>,
     background_resources: Vec<TerminalBackgroundFrameResources>,
     text_resources: Option<TerminalTextFrameResources>,
+    text_vertex_scratch: Vec<TextVertex>,
+    background_batch_scratch: Vec<Vec<BackgroundVertex>>,
+    text_batch_scratch: Vec<Vec<TexturedGlyphQuad>>,
+    text_batch_dirty_scratch: Vec<bool>,
     image_resources: Vec<Option<TerminalImageFrameResources>>,
+    prepared_frame_cache: Option<PreparedTerminalFrameCache>,
+    prepared_frame_cache_cooldown: u8,
 }
 
 impl TerminalWgpuRenderer {
@@ -389,7 +421,13 @@ impl TerminalWgpuRenderer {
             layers: Vec::new(),
             background_resources: Vec::new(),
             text_resources: None,
+            text_vertex_scratch: Vec::new(),
+            background_batch_scratch: Vec::new(),
+            text_batch_scratch: Vec::new(),
+            text_batch_dirty_scratch: Vec::new(),
             image_resources: Vec::new(),
+            prepared_frame_cache: None,
+            prepared_frame_cache_cooldown: 0,
         }
     }
 
@@ -400,37 +438,88 @@ impl TerminalWgpuRenderer {
         frame: &TerminalRenderFrame,
         pixels_per_point: f32,
     ) -> u32 {
-        self.layers.clear();
-        self.image_resources.clear();
+        let pixels_per_point_bits = pixels_per_point.to_bits();
+        let mut update_frame_cache = true;
+        if self.prepared_frame_cache_cooldown > 0 {
+            self.prepared_frame_cache_cooldown -= 1;
+            update_frame_cache = self.prepared_frame_cache_cooldown == 0;
+        } else if let Some(cache) = &self.prepared_frame_cache {
+            if cache.pixels_per_point_bits == pixels_per_point_bits && cache.frame == *frame {
+                return cache.vertex_count;
+            }
+            self.prepared_frame_cache_cooldown = PREPARED_FRAME_CACHE_MISS_COOLDOWN;
+            update_frame_cache = false;
+        }
 
-        let mut background_batches = Vec::new();
-        let mut text_batches = Vec::new();
+        self.layers.clear();
+        let mut previous_image_resources = std::mem::take(&mut self.image_resources).into_iter();
+
+        let mut background_batches = std::mem::take(&mut self.background_batch_scratch);
+        let mut text_batches = std::mem::take(&mut self.text_batch_scratch);
+        let mut text_batch_dirty = std::mem::take(&mut self.text_batch_dirty_scratch);
+        background_batches.iter_mut().for_each(Vec::clear);
+        text_batches.iter_mut().for_each(Vec::clear);
+        text_batch_dirty.clear();
+        let mut background_batch_count = 0;
+        let mut text_batch_count = 0;
         let mut image_vertex_count = 0;
 
+        self.text_builder.begin_text_frame();
         for command in &frame.commands {
             match command {
                 TerminalRenderCommand::Text(text) => {
-                    let quads = self
-                        .text_builder
-                        .prepare_text_command(text, pixels_per_point);
-                    push_text_batch(&mut self.layers, &mut text_batches, quads);
-                }
-                TerminalRenderCommand::Sprite(sprite) => {
-                    let quads = self
-                        .text_builder
-                        .prepare_sprite_command(sprite, pixels_per_point);
-                    push_text_batch(&mut self.layers, &mut text_batches, quads);
-                }
-                TerminalRenderCommand::FillRect(_)
-                | TerminalRenderCommand::Decoration(_)
-                | TerminalRenderCommand::Cursor(_) => {
-                    push_background_batch(
+                    push_text_command(
                         &mut self.layers,
-                        &mut background_batches,
-                        background_command_vertices(frame.surface, command),
+                        &mut text_batches,
+                        &mut text_batch_dirty,
+                        &mut text_batch_count,
+                        &mut self.text_builder,
+                        text,
+                        pixels_per_point,
                     );
                 }
+                TerminalRenderCommand::Sprite(sprite) => {
+                    let quad = self
+                        .text_builder
+                        .prepare_sprite_command(sprite, pixels_per_point);
+                    push_text_quad(
+                        &mut self.layers,
+                        &mut text_batches,
+                        &mut text_batch_dirty,
+                        &mut text_batch_count,
+                        quad,
+                    );
+                }
+                TerminalRenderCommand::FillRect(fill) => {
+                    push_background_quad(
+                        &mut self.layers,
+                        &mut background_batches,
+                        &mut background_batch_count,
+                        frame.surface,
+                        TerminalQuadDraw {
+                            rect: fill.rect,
+                            color: fill.color,
+                        },
+                    );
+                }
+                TerminalRenderCommand::Decoration(line) => {
+                    push_decoration_command(
+                        &mut self.layers,
+                        &mut background_batches,
+                        &mut background_batch_count,
+                        frame.surface,
+                        line,
+                    );
+                }
+                TerminalRenderCommand::Cursor(cursor) => push_cursor_background_quads(
+                    &mut self.layers,
+                    &mut background_batches,
+                    &mut background_batch_count,
+                    frame.surface,
+                    cursor,
+                ),
                 TerminalRenderCommand::Image(image) => {
+                    let previous = previous_image_resources.next().flatten();
                     let resources = prepare_image_resource(
                         device,
                         queue,
@@ -438,6 +527,7 @@ impl TerminalWgpuRenderer {
                         image,
                         &self.image_bind_group_layout,
                         &self.image_sampler,
+                        previous,
                     );
                     image_vertex_count += resources
                         .as_ref()
@@ -450,15 +540,33 @@ impl TerminalWgpuRenderer {
                 TerminalRenderCommand::KittyVirtualPlacement(_) => {}
             }
         }
+        self.text_builder.finish_text_frame();
 
-        image_vertex_count
-            + self.prepare_background_resources(device, queue, &background_batches)
-            + self.prepare_text_resources(
-                device,
-                queue,
-                frame.surface,
-                text_batches.iter().map(Vec::as_slice),
-            )
+        let background_vertex_count = self.prepare_background_resources(
+            device,
+            queue,
+            &mut background_batches[..background_batch_count],
+        );
+        let text_vertex_count = self.prepare_text_resources(
+            device,
+            queue,
+            frame.surface,
+            text_batches[..text_batch_count].iter().map(Vec::as_slice),
+            &text_batch_dirty[..text_batch_count],
+        );
+        self.background_batch_scratch = background_batches;
+        self.text_batch_scratch = text_batches;
+        self.text_batch_dirty_scratch = text_batch_dirty;
+
+        let vertex_count = image_vertex_count + background_vertex_count + text_vertex_count;
+        if update_frame_cache {
+            self.prepared_frame_cache = Some(PreparedTerminalFrameCache {
+                frame: frame.clone(),
+                pixels_per_point_bits,
+                vertex_count,
+            });
+        }
+        vertex_count
     }
 
     pub fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>) {
@@ -513,10 +621,10 @@ impl TerminalWgpuRenderer {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        batches: &[Vec<BackgroundVertex>],
+        batches: &mut [Vec<BackgroundVertex>],
     ) -> u32 {
         let mut vertex_count = 0;
-        for (layer_index, vertices) in batches.iter().enumerate() {
+        for (layer_index, vertices) in batches.iter_mut().enumerate() {
             if let Some(resources) = self.background_resources.get_mut(layer_index) {
                 resources.update(device, queue, vertices);
             } else {
@@ -537,6 +645,7 @@ impl TerminalWgpuRenderer {
         queue: &wgpu::Queue,
         surface: SurfaceRect,
         batches: impl Iterator<Item = &'a [TexturedGlyphQuad]>,
+        dirty_batches: &[bool],
     ) -> u32 {
         let mut batches = batches.peekable();
         if batches.peek().is_none() {
@@ -552,20 +661,26 @@ impl TerminalWgpuRenderer {
 
         let mut resources = self.text_resources.take().unwrap_or_default();
         let mut vertex_count = 0;
-        let mut layer_index = 0;
-        for quads in batches {
-            let vertices = text_vertices(surface, quads);
+        let mut vertices = std::mem::take(&mut self.text_vertex_scratch);
+        for (layer_index, quads) in batches.enumerate() {
+            let changed = dirty_batches.get(layer_index).copied().unwrap_or(true);
             if let Some(layer) = resources.layers.get_mut(layer_index) {
-                layer.update(device, queue, &vertices);
+                if changed || layer.surface != Some(surface) {
+                    layer.update(device, queue, surface, quads, changed, &mut vertices);
+                }
             } else {
-                resources
-                    .layers
-                    .push(TerminalTextLayerResources::new(device, queue, &vertices));
+                resources.layers.push(TerminalTextLayerResources::new(
+                    device,
+                    queue,
+                    surface,
+                    quads,
+                    &mut vertices,
+                ));
             }
             vertex_count += resources.layers[layer_index].vertex_count;
-            layer_index += 1;
         }
-        resources.layers.truncate(layer_index);
+        self.text_vertex_scratch = vertices;
+        resources.layers.truncate(dirty_batches.len());
         self.text_resources = Some(resources);
         vertex_count
     }
@@ -696,12 +811,20 @@ impl TerminalTextAtlasTexture {
 
 struct TerminalTextLayerResources {
     vertex_buffer: wgpu::Buffer,
+    surface: Option<SurfaceRect>,
+    quads: Vec<TexturedGlyphQuad>,
     vertex_count: u32,
     byte_capacity: usize,
 }
 
 impl TerminalTextLayerResources {
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[TextVertex]) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: SurfaceRect,
+        quads: &[TexturedGlyphQuad],
+        vertices: &mut Vec<TextVertex>,
+    ) -> Self {
         let mut resources = Self {
             vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("bootty_terminal_text_vertices"),
@@ -709,14 +832,40 @@ impl TerminalTextLayerResources {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
+            surface: None,
+            quads: Vec::new(),
             vertex_count: 0,
             byte_capacity: 0,
         };
-        resources.update(device, queue, vertices);
+        resources.update(device, queue, surface, quads, true, vertices);
         resources
     }
 
-    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[TextVertex]) {
+    fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface: SurfaceRect,
+        quads: &[TexturedGlyphQuad],
+        changed: bool,
+        vertices: &mut Vec<TextVertex>,
+    ) {
+        if quads.is_empty() {
+            self.surface = None;
+            self.quads.clear();
+            self.vertex_count = 0;
+            return;
+        }
+        if !changed && self.surface == Some(surface) {
+            return;
+        }
+        if self.surface == Some(surface) && self.quads.as_slice() == quads {
+            return;
+        }
+
+        vertices.clear();
+        text_vertices_into(surface, quads, vertices);
+        let vertex_count = vertices.len() as u32;
         let bytes = vertex_bytes(vertices);
         if bytes.len() > self.byte_capacity {
             self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -725,19 +874,56 @@ impl TerminalTextLayerResources {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
             self.byte_capacity = bytes.len();
-        } else if !bytes.is_empty() {
+        } else {
             queue.write_buffer(&self.vertex_buffer, 0, bytes);
         }
-        self.vertex_count = vertices.len() as u32;
+        self.surface = Some(surface);
+        self.quads.clear();
+        self.quads.extend_from_slice(quads);
+        self.vertex_count = vertex_count;
     }
 }
 
 struct TerminalImageFrameResources {
+    texture_key: TerminalImageTextureKey,
     _texture: wgpu::Texture,
     _view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
+    vertices: [TextVertex; 6],
     vertex_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalImageTextureKey {
+    data_ptr: usize,
+    data_len: usize,
+    image_id: u32,
+    image_width: u32,
+    image_height: u32,
+    image_format: libghostty_vt::kitty::graphics::ImageFormat,
+}
+
+impl TerminalImageTextureKey {
+    fn from_image(image: &KittyImagePlacement) -> Self {
+        Self {
+            data_ptr: Arc::as_ptr(&image.data) as usize,
+            data_len: image.data.len(),
+            image_id: image.image_id,
+            image_width: image.image_width,
+            image_height: image.image_height,
+            image_format: image.image_format,
+        }
+    }
+}
+
+impl TerminalImageFrameResources {
+    fn update_vertices(&mut self, queue: &wgpu::Queue, vertices: [TextVertex; 6]) {
+        if self.vertices != vertices {
+            queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes(&vertices));
+            self.vertices = vertices;
+        }
+    }
 }
 
 fn prepare_image_resource(
@@ -747,9 +933,18 @@ fn prepare_image_resource(
     image: &KittyImagePlacement,
     bind_group_layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
+    previous: Option<TerminalImageFrameResources>,
 ) -> Option<TerminalImageFrameResources> {
     if !image_fits_device_limits(device, image) {
         return None;
+    }
+    let vertices = image_vertices(surface, image)?;
+    let texture_key = TerminalImageTextureKey::from_image(image);
+    if let Some(mut previous) = previous
+        && previous.texture_key == texture_key
+    {
+        previous.update_vertices(queue, vertices);
+        return Some(previous);
     }
     let pixels = rgba_image_pixels(image)?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -800,87 +995,143 @@ fn prepare_image_resource(
             },
         ],
     });
-    let vertices = image_vertices(surface, image);
-    if vertices.is_empty() {
-        return None;
-    }
     Some(TerminalImageFrameResources {
+        texture_key,
         _texture: texture,
         _view: view,
         bind_group,
         vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bootty_terminal_image_vertices"),
             contents: vertex_bytes(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         }),
+        vertices,
         vertex_count: vertices.len() as u32,
     })
 }
 
-fn push_background_batch(
+fn background_batch_mut<'a>(
     layers: &mut Vec<TerminalPreparedLayer>,
-    batches: &mut Vec<Vec<BackgroundVertex>>,
-    vertices: Vec<BackgroundVertex>,
-) {
-    if vertices.is_empty() {
-        return;
-    }
+    batches: &'a mut Vec<Vec<BackgroundVertex>>,
+    batch_count: &mut usize,
+) -> &'a mut Vec<BackgroundVertex> {
     if let Some(TerminalPreparedLayer::Background(index)) = layers.last() {
-        batches[*index].extend(vertices);
+        &mut batches[*index]
     } else {
-        let index = batches.len();
-        batches.push(vertices);
+        let index = *batch_count;
+        *batch_count += 1;
+        if index == batches.len() {
+            batches.push(Vec::new());
+        }
         layers.push(TerminalPreparedLayer::Background(index));
+        &mut batches[index]
     }
 }
 
-fn push_text_batch(
+fn push_background_quad(
+    layers: &mut Vec<TerminalPreparedLayer>,
+    batches: &mut Vec<Vec<BackgroundVertex>>,
+    batch_count: &mut usize,
+    surface: SurfaceRect,
+    draw: TerminalQuadDraw,
+) {
+    let vertices = background_quad_vertices(surface, draw);
+    background_batch_mut(layers, batches, batch_count).extend(vertices);
+}
+
+fn push_decoration_command(
+    layers: &mut Vec<TerminalPreparedLayer>,
+    batches: &mut Vec<Vec<BackgroundVertex>>,
+    batch_count: &mut usize,
+    surface: SurfaceRect,
+    line: &crate::terminal_render::LineCommand,
+) {
+    let batch = background_batch_mut(layers, batches, batch_count);
+    decoration_command_vertices_into(surface, line, batch);
+}
+
+fn push_text_command(
     layers: &mut Vec<TerminalPreparedLayer>,
     batches: &mut Vec<Vec<TexturedGlyphQuad>>,
-    quads: Vec<TexturedGlyphQuad>,
+    dirty_batches: &mut Vec<bool>,
+    batch_count: &mut usize,
+    text_builder: &mut TextAtlasBuilder,
+    command: &TextCommand,
+    pixels_per_point: f32,
 ) {
-    if quads.is_empty() {
-        return;
-    }
     if let Some(TerminalPreparedLayer::Text(index)) = layers.last() {
-        batches[*index].extend(quads);
+        let changed = text_builder.prepare_text_command_into_frame(
+            command,
+            pixels_per_point,
+            &mut batches[*index],
+        );
+        dirty_batches[*index] |= changed;
     } else {
-        let index = batches.len();
-        batches.push(quads);
+        let index = *batch_count;
+        *batch_count += 1;
+        if index == batches.len() {
+            batches.push(Vec::new());
+        }
+        if index == dirty_batches.len() {
+            dirty_batches.push(false);
+        } else {
+            dirty_batches[index] = false;
+        }
+        dirty_batches[index] = text_builder.prepare_text_command_into_frame(
+            command,
+            pixels_per_point,
+            &mut batches[index],
+        );
         layers.push(TerminalPreparedLayer::Text(index));
     }
 }
 
-fn background_command_vertices(
-    surface: SurfaceRect,
-    command: &TerminalRenderCommand,
-) -> Vec<BackgroundVertex> {
-    match command {
-        TerminalRenderCommand::FillRect(fill) => background_vertices(
-            surface,
-            &[TerminalQuadDraw {
-                rect: fill.rect,
-                color: fill.color,
-            }],
-        ),
-        TerminalRenderCommand::Cursor(cursor) => cursor_command_vertices(surface, cursor),
-        TerminalRenderCommand::Decoration(line) => decoration_command_vertices(surface, line),
-        TerminalRenderCommand::Text(_)
-        | TerminalRenderCommand::Sprite(_)
-        | TerminalRenderCommand::Image(_)
-        | TerminalRenderCommand::KittyVirtualPlacement(_) => Vec::new(),
+fn push_text_quad(
+    layers: &mut Vec<TerminalPreparedLayer>,
+    batches: &mut Vec<Vec<TexturedGlyphQuad>>,
+    dirty_batches: &mut Vec<bool>,
+    batch_count: &mut usize,
+    quad: TexturedGlyphQuad,
+) {
+    if let Some(TerminalPreparedLayer::Text(index)) = layers.last() {
+        batches[*index].push(quad);
+        dirty_batches[*index] = true;
+    } else {
+        let index = *batch_count;
+        *batch_count += 1;
+        if index == batches.len() {
+            batches.push(Vec::new());
+        }
+        if index == dirty_batches.len() {
+            dirty_batches.push(true);
+        } else {
+            dirty_batches[index] = true;
+        }
+        batches[index].push(quad);
+        layers.push(TerminalPreparedLayer::Text(index));
     }
 }
 
-fn decoration_command_vertices(
+fn decoration_command_vertices_into(
     surface: SurfaceRect,
     line: &crate::terminal_render::LineCommand,
-) -> Vec<BackgroundVertex> {
-    let draws = decoration_draws(line);
-    background_vertices(surface, &draws)
+    vertices: &mut Vec<BackgroundVertex>,
+) {
+    emit_decoration_draws(line, |draw| {
+        vertices.extend(background_quad_vertices(surface, draw));
+    });
 }
 
 fn decoration_draws(line: &crate::terminal_render::LineCommand) -> Vec<TerminalQuadDraw> {
+    let mut draws = Vec::new();
+    emit_decoration_draws(line, |draw| draws.push(draw));
+    draws
+}
+
+fn emit_decoration_draws(
+    line: &crate::terminal_render::LineCommand,
+    mut emit: impl FnMut(TerminalQuadDraw),
+) {
     let min_x = line.start_x.min(line.end_x);
     let max_x = line.start_x.max(line.end_x);
     let min_y = line.start_y.min(line.end_y);
@@ -892,49 +1143,55 @@ fn decoration_draws(line: &crate::terminal_render::LineCommand) -> Vec<TerminalQ
     };
 
     match line.style {
-        DecorationStyle::Double => vec![
-            TerminalQuadDraw {
+        DecorationStyle::Double => {
+            emit(TerminalQuadDraw {
                 rect: SurfaceRect::from_min_size(rect.min_x, rect.min_y - 1.0, rect.width(), 1.0),
                 color: line.color,
-            },
-            TerminalQuadDraw {
+            });
+            emit(TerminalQuadDraw {
                 rect: SurfaceRect::from_min_size(rect.min_x, rect.min_y + 1.0, rect.width(), 1.0),
                 color: line.color,
-            },
-        ],
-        DecorationStyle::Dotted => segmented_decoration_draws(rect, line.color, 1.0, 2.0),
-        DecorationStyle::Dashed => segmented_decoration_draws(rect, line.color, 4.0, 3.0),
-        DecorationStyle::Curly => curly_decoration_draws(rect, line.color),
+            });
+        }
+        DecorationStyle::Dotted => {
+            emit_segmented_decoration_draws(rect, line.color, 1.0, 2.0, emit)
+        }
+        DecorationStyle::Dashed => {
+            emit_segmented_decoration_draws(rect, line.color, 4.0, 3.0, emit)
+        }
+        DecorationStyle::Curly => emit_curly_decoration_draws(rect, line.color, emit),
         DecorationStyle::Single | DecorationStyle::Strikethrough | DecorationStyle::Overline => {
-            vec![TerminalQuadDraw {
+            emit(TerminalQuadDraw {
                 rect,
                 color: line.color,
-            }]
+            });
         }
     }
 }
 
-fn segmented_decoration_draws(
+fn emit_segmented_decoration_draws(
     rect: SurfaceRect,
     color: PlanColor,
     segment_width: f32,
     gap_width: f32,
-) -> Vec<TerminalQuadDraw> {
-    let mut draws = Vec::new();
+    mut emit: impl FnMut(TerminalQuadDraw),
+) {
     let mut x = rect.min_x;
     while x < rect.max_x {
         let width = segment_width.min(rect.max_x - x).max(1.0);
-        draws.push(TerminalQuadDraw {
+        emit(TerminalQuadDraw {
             rect: SurfaceRect::from_min_size(x, rect.min_y, width, rect.height()),
             color,
         });
         x += segment_width + gap_width;
     }
-    draws
 }
 
-fn curly_decoration_draws(rect: SurfaceRect, color: PlanColor) -> Vec<TerminalQuadDraw> {
-    let mut draws = Vec::new();
+fn emit_curly_decoration_draws(
+    rect: SurfaceRect,
+    color: PlanColor,
+    mut emit: impl FnMut(TerminalQuadDraw),
+) {
     let mut x = rect.min_x;
     let mut high = true;
     while x < rect.max_x {
@@ -943,14 +1200,13 @@ fn curly_decoration_draws(rect: SurfaceRect, color: PlanColor) -> Vec<TerminalQu
         } else {
             rect.min_y + 1.0
         };
-        draws.push(TerminalQuadDraw {
+        emit(TerminalQuadDraw {
             rect: SurfaceRect::from_min_size(x, y, 2.0_f32.min(rect.max_x - x).max(1.0), 1.0),
             color,
         });
         high = !high;
         x += 2.0;
     }
-    draws
 }
 
 fn cursor_draws(cursor: &CursorCommand) -> Vec<TerminalCursorDraw> {
@@ -968,6 +1224,16 @@ fn cursor_draws(cursor: &CursorCommand) -> Vec<TerminalCursorDraw> {
 }
 
 fn hollow_cursor_draws(cursor: &CursorCommand) -> Vec<TerminalCursorDraw> {
+    hollow_cursor_rects(cursor)
+        .into_iter()
+        .map(|rect| TerminalCursorDraw {
+            rect,
+            color: cursor.color,
+        })
+        .collect()
+}
+
+fn hollow_cursor_rects(cursor: &CursorCommand) -> [SurfaceRect; 4] {
     let rect = cursor.rect;
     let stroke = 1.0_f32.min(rect.width()).min(rect.height());
     let right_x = (rect.max_x - stroke).max(rect.min_x);
@@ -979,24 +1245,43 @@ fn hollow_cursor_draws(cursor: &CursorCommand) -> Vec<TerminalCursorDraw> {
         SurfaceRect::from_min_size(rect.min_x, rect.min_y, stroke, rect.height()),
         SurfaceRect::from_min_size(right_x, rect.min_y, stroke, rect.height()),
     ]
-    .into_iter()
-    .map(|rect| TerminalCursorDraw {
-        rect,
-        color: cursor.color,
-    })
-    .collect()
 }
 
-fn cursor_command_vertices(surface: SurfaceRect, cursor: &CursorCommand) -> Vec<BackgroundVertex> {
-    let draws = cursor_draws(cursor)
-        .into_iter()
-        .map(|draw| TerminalQuadDraw {
-            rect: draw.rect,
-            color: draw.color,
-        })
-        .collect::<Vec<_>>();
-
-    background_vertices(surface, &draws)
+fn push_cursor_background_quads(
+    layers: &mut Vec<TerminalPreparedLayer>,
+    batches: &mut Vec<Vec<BackgroundVertex>>,
+    batch_count: &mut usize,
+    surface: SurfaceRect,
+    cursor: &CursorCommand,
+) {
+    match cursor.shape {
+        crate::paint_plan::CursorShape::Bar
+        | crate::paint_plan::CursorShape::Underline
+        | crate::paint_plan::CursorShape::Block => push_background_quad(
+            layers,
+            batches,
+            batch_count,
+            surface,
+            TerminalQuadDraw {
+                rect: cursor.fill_rect,
+                color: cursor.color,
+            },
+        ),
+        crate::paint_plan::CursorShape::HollowBlock => {
+            for rect in hollow_cursor_rects(cursor) {
+                push_background_quad(
+                    layers,
+                    batches,
+                    batch_count,
+                    surface,
+                    TerminalQuadDraw {
+                        rect,
+                        color: cursor.color,
+                    },
+                );
+            }
+        }
+    }
 }
 
 fn sprite_draw(command: &SpriteCommandBatch) -> TerminalSpriteDraw {

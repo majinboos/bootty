@@ -14,7 +14,7 @@ use crate::{
     paint_plan::{CursorBlinkPhase, PaintPlanner},
     scheduler::CURSOR_BLINK_REFRESH_INTERVAL,
     terminal::{CursorSnapshot, RenderFrame},
-    terminal_render::TerminalRenderFrame,
+    terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
     terminal_wgpu::{terminal_render_callback, terminal_text_cell_metrics},
 };
@@ -28,6 +28,7 @@ pub struct TerminalWidget {
     cursor_blink: CursorBlinkClock,
     scrollbar: ScrollbarVisibility,
     target_format: Option<wgpu::TextureFormat>,
+    render_cache: TerminalRenderCache,
 }
 
 pub trait TerminalRenderSource {
@@ -61,13 +62,14 @@ impl TerminalWidget {
     }
 
     pub fn with_text_config(mut self, text_config: TerminalTextConfig) -> Self {
-        self.text_config = text_config;
+        self.set_text_config(text_config);
         self
     }
 
     pub fn set_text_config(&mut self, text_config: TerminalTextConfig) {
         self.text_config = text_config;
         self.update_cell_metrics();
+        self.render_cache.clear();
     }
 
     pub fn initial_geometry() -> crate::geometry::TerminalGeometry {
@@ -86,14 +88,13 @@ impl TerminalWidget {
             response.request_focus();
         }
 
-        self.update_cell_metrics();
         let surface = TerminalSurface::for_rect(rect, self.cell);
         terminal.resize(surface.geometry())?;
 
         let extract_start = Instant::now();
         let frame = terminal.extract_frame()?;
         self.metrics.extract_total_us = extract_start.elapsed().as_micros() as u64;
-        self.handle_scrollbar_interaction(ui, surface, &frame, terminal)?;
+        self.handle_scrollbar_interaction(ui, surface, frame.as_ref(), terminal)?;
         self.paint(ui, surface, &frame)?;
         self.metrics.render_state_update_us = frame.stats.render_state_update_us;
         self.metrics.frame_extraction_us = frame.stats.extraction_us;
@@ -120,7 +121,7 @@ impl TerminalWidget {
         &mut self,
         ui: &mut egui::Ui,
         surface: TerminalSurface,
-        frame: &crate::terminal::RenderFrame,
+        frame: &Arc<crate::terminal::RenderFrame>,
     ) -> Result<()> {
         let paint_start = Instant::now();
         anyhow::ensure!(
@@ -129,20 +130,26 @@ impl TerminalWidget {
         );
         let cursor_blinking = frame.cursor.is_some_and(|cursor| cursor.blinking);
         let cursor_blink_phase = self.cursor_blink.phase(Instant::now(), frame.cursor);
-        let plan = self.planner.plan_with_cursor_blink_phase(
-            surface,
-            frame,
-            self.text_config.font_size,
-            cursor_blink_phase,
-        );
-        let text_contract = TerminalTextContract::for_terminal_paint_plan(plan, &self.text_config);
-        let text_runs = plan.text_runs.len();
-        let render_frame =
-            TerminalRenderFrame::from_plan_and_images(plan, &text_contract, &frame.images);
-        paint_terminal_content(ui, &render_frame, self.target_format);
+        if !self.render_cache.matches(surface, frame) {
+            let plan = self.planner.plan_with_cursor_blink_phase(
+                surface,
+                frame,
+                self.text_config.font_size,
+                CursorBlinkPhase::visible(),
+            );
+            let text_contract =
+                TerminalTextContract::for_terminal_paint_plan(plan, &self.text_config);
+            let text_runs = plan.text_runs.len();
+            let render_frame =
+                TerminalRenderFrame::from_plan_and_images(plan, &text_contract, &frame.images);
+            self.render_cache
+                .store(surface, frame, render_frame, text_runs);
+        }
+        self.render_cache.apply_cursor_phase(cursor_blink_phase);
+        paint_terminal_content(ui, self.render_cache.render_frame(), self.target_format);
         self.metrics.cursor_blinking = cursor_blinking;
-        self.metrics.text_runs = text_runs;
-        self.paint_scrollbar(ui, surface, frame);
+        self.metrics.text_runs = self.render_cache.text_runs();
+        self.paint_scrollbar(ui, surface, frame.as_ref());
         if cursor_blinking {
             ui.ctx()
                 .request_repaint_after(CURSOR_BLINK_REFRESH_INTERVAL);
@@ -261,6 +268,119 @@ pub struct RendererMetrics {
 const CURSOR_BLINK_PERIOD: Duration = Duration::from_millis(1_400);
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_millis(900);
 const SCROLLBAR_HIT_WIDTH: f32 = 16.0;
+
+struct TerminalRenderCache {
+    frame: Option<Arc<RenderFrame>>,
+    surface: Option<TerminalSurface>,
+    render_frame: TerminalRenderFrame,
+    visible_cursor_tail: Vec<TerminalRenderCommand>,
+    cursor_tail_start: Option<usize>,
+    cursor_alpha: Option<u8>,
+    text_runs: usize,
+}
+
+impl Default for TerminalRenderCache {
+    fn default() -> Self {
+        Self {
+            frame: None,
+            surface: None,
+            render_frame: TerminalRenderFrame {
+                surface: SurfaceRect::from_min_size(0.0, 0.0, 0.0, 0.0),
+                commands: Vec::new(),
+            },
+            visible_cursor_tail: Vec::new(),
+            cursor_tail_start: None,
+            cursor_alpha: None,
+            text_runs: 0,
+        }
+    }
+}
+
+impl TerminalRenderCache {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn matches(&self, surface: TerminalSurface, frame: &Arc<RenderFrame>) -> bool {
+        self.surface == Some(surface)
+            && self
+                .frame
+                .as_ref()
+                .is_some_and(|cached| Arc::ptr_eq(cached, frame))
+    }
+
+    fn store(
+        &mut self,
+        surface: TerminalSurface,
+        frame: &Arc<RenderFrame>,
+        render_frame: TerminalRenderFrame,
+        text_runs: usize,
+    ) {
+        self.cursor_tail_start = render_frame
+            .commands
+            .iter()
+            .position(|command| matches!(command, TerminalRenderCommand::Cursor(_)));
+        self.visible_cursor_tail = self
+            .cursor_tail_start
+            .map(|start| render_frame.commands[start..].to_vec())
+            .unwrap_or_default();
+        self.frame = Some(Arc::clone(frame));
+        self.surface = Some(surface);
+        self.render_frame = render_frame;
+        self.cursor_alpha = None;
+        self.text_runs = text_runs;
+    }
+
+    fn apply_cursor_phase(&mut self, phase: CursorBlinkPhase) {
+        let Some(start) = self.cursor_tail_start else {
+            return;
+        };
+        let alpha = cursor_blink_alpha(phase);
+        if self.cursor_alpha == Some(alpha) {
+            return;
+        }
+
+        self.render_frame.commands.truncate(start);
+        if alpha > 0 {
+            self.render_frame.commands.extend(
+                self.visible_cursor_tail
+                    .iter()
+                    .cloned()
+                    .map(|command| cursor_tail_command_with_alpha(command, alpha)),
+            );
+        }
+        self.cursor_alpha = Some(alpha);
+    }
+
+    fn render_frame(&self) -> &TerminalRenderFrame {
+        &self.render_frame
+    }
+
+    fn text_runs(&self) -> usize {
+        self.text_runs
+    }
+}
+
+fn cursor_tail_command_with_alpha(
+    mut command: TerminalRenderCommand,
+    alpha: u8,
+) -> TerminalRenderCommand {
+    match &mut command {
+        TerminalRenderCommand::Cursor(cursor) => cursor.color.a = alpha,
+        TerminalRenderCommand::Text(text) => text.attrs.fg.a = alpha,
+        TerminalRenderCommand::Sprite(sprite) => sprite.color.a = alpha,
+        TerminalRenderCommand::FillRect(_)
+        | TerminalRenderCommand::Image(_)
+        | TerminalRenderCommand::KittyVirtualPlacement(_)
+        | TerminalRenderCommand::Decoration(_) => {}
+    }
+    command
+}
+
+fn cursor_blink_alpha(phase: CursorBlinkPhase) -> u8 {
+    (phase.opacity() * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
 #[derive(Default)]
 struct ScrollbarVisibility {
     last_offset: Option<u64>,
@@ -434,10 +554,10 @@ mod tests {
     use super::*;
     use crate::{
         geometry::{CellMetrics, DEFAULT_FONT_SIZE, TerminalGeometry, TerminalPadding},
-        paint_plan::{PlanColor, TerminalPaintPlan},
+        paint_plan::{CursorShape, PlanColor, TerminalPaintPlan},
         terminal::{CursorSnapshot, FrameColors, RenderFrame, TerminalEngine},
         terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement},
-        terminal_render::{FillRole, TerminalRenderCommand},
+        terminal_render::{CursorCommand, FillCommand, FillRole, TerminalRenderCommand},
         terminal_text::terminal_text_config_for_plan,
     };
     use libghostty_vt::{
@@ -644,6 +764,77 @@ mod tests {
         let config = terminal_text_config_for_plan(&plan, &base);
 
         assert_eq!(config, base);
+    }
+
+    #[test]
+    fn with_text_config_refreshes_cached_cell_metrics() {
+        let config = TerminalTextConfig {
+            font_size: 31.0,
+            ..TerminalTextConfig::default()
+        };
+        let expected = terminal_text_cell_metrics(&config).rounded_size();
+
+        let widget = TerminalWidget::new(None).with_text_config(config);
+
+        assert_eq!(widget.cell_size(), expected);
+    }
+
+    #[test]
+    fn render_cache_reuses_static_commands_and_updates_cursor_alpha() {
+        let surface = TerminalSurface::for_size(
+            Vec2::new(80.0, 40.0),
+            CellMetrics::new(10.0, 20.0),
+            TerminalPadding::default(),
+        );
+        let frame = Arc::new(RenderFrame::default());
+        let rect = SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0);
+        let mut cache = TerminalRenderCache::default();
+        cache.store(
+            surface,
+            &frame,
+            TerminalRenderFrame {
+                surface: rect,
+                commands: vec![
+                    TerminalRenderCommand::FillRect(FillCommand {
+                        rect,
+                        color: PlanColor {
+                            r: 1,
+                            g: 2,
+                            b: 3,
+                            a: 255,
+                        },
+                        role: FillRole::SurfaceBackground,
+                    }),
+                    TerminalRenderCommand::Cursor(CursorCommand {
+                        rect,
+                        fill_rect: rect,
+                        color: PlanColor {
+                            r: 4,
+                            g: 5,
+                            b: 6,
+                            a: 255,
+                        },
+                        shape: CursorShape::Block,
+                    }),
+                ],
+            },
+            9,
+        );
+
+        cache.apply_cursor_phase(CursorBlinkPhase::hidden());
+        assert_eq!(cache.render_frame().commands.len(), 1);
+        assert!(cache.matches(surface, &frame));
+        assert_eq!(cache.text_runs(), 9);
+
+        cache.apply_cursor_phase(CursorBlinkPhase::from_opacity(0.5));
+
+        assert!(matches!(
+            cache.render_frame().commands.as_slice(),
+            [
+                TerminalRenderCommand::FillRect(_),
+                TerminalRenderCommand::Cursor(cursor)
+            ] if cursor.color.a == 128
+        ));
     }
 
     #[test]

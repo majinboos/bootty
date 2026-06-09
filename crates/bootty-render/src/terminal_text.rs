@@ -1,9 +1,9 @@
 use crate::{
     geometry::{CellMetrics, DEFAULT_CELL_WIDTH, DEFAULT_FONT_SIZE, DEFAULT_LINE_HEIGHT},
-    paint_plan::{PlanColor, TerminalPaintPlan, TextAttrs, TextRun},
-    terminal_sprite::{SpriteFamily, SpriteRegistry},
+    paint_plan::{TerminalPaintPlan, TextAttrs, TextRun},
+    terminal_sprite::{SpriteFamily, SpriteGlyph, SpriteRegistry},
 };
-use std::fmt;
+use std::{fmt, sync::Arc};
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -414,51 +414,79 @@ fn skip_space(bytes: &[u8], mut index: usize) -> usize {
 #[derive(Clone, Debug, PartialEq)]
 pub struct FontResolver {
     config: TerminalTextConfig,
+    default_faces: [Arc<ResolvedFontFace>; 4],
 }
 
 impl FontResolver {
     pub fn new(config: TerminalTextConfig) -> Self {
-        Self { config }
+        let default_faces = std::array::from_fn(|index| {
+            Arc::new(resolve_face_for_char_and_style(
+                &config,
+                None,
+                FontStyle::from_index(index),
+            ))
+        });
+        Self {
+            config,
+            default_faces,
+        }
     }
 
     pub fn resolve_face(&self, attrs: &TextAttrs) -> ResolvedFontFace {
-        self.resolve_face_for_char(attrs, None)
+        self.resolve_face_handle(attrs, None).as_ref().clone()
     }
 
     pub fn resolve_face_for_text(&self, attrs: &TextAttrs, text: &str) -> ResolvedFontFace {
-        self.resolve_face_for_char(attrs, text.chars().find(|ch| terminal_char_width(*ch) > 0))
+        self.resolve_face_handle_for_text(attrs, text)
+            .as_ref()
+            .clone()
     }
 
-    fn resolve_face_for_char(&self, attrs: &TextAttrs, ch: Option<char>) -> ResolvedFontFace {
-        self.resolve_face_for_char_and_style(ch, FontStyle::from_attrs(attrs))
-    }
-
-    fn resolve_face_for_char_and_style(
+    pub fn resolve_face_handle_for_text(
         &self,
-        ch: Option<char>,
-        style: FontStyle,
-    ) -> ResolvedFontFace {
-        let mut families = self.config.families.iter();
-        let default_family = families
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "monospace".to_owned());
-        let override_family = ch.and_then(|ch| self.config.codepoint_overrides.family_for(ch));
-        let family = override_family
-            .map(str::to_owned)
-            .unwrap_or_else(|| default_family.clone());
-        let fallback_families = if override_family.is_some() {
-            std::iter::once(default_family)
-                .chain(families.cloned())
-                .collect()
-        } else {
-            families.cloned().collect()
-        };
-        ResolvedFontFace {
-            family,
-            fallback_families,
-            style,
+        attrs: &TextAttrs,
+        text: &str,
+    ) -> Arc<ResolvedFontFace> {
+        self.resolve_face_handle(attrs, text.chars().find(|ch| terminal_char_width(*ch) > 0))
+    }
+
+    fn resolve_face_handle(&self, attrs: &TextAttrs, ch: Option<char>) -> Arc<ResolvedFontFace> {
+        let style = FontStyle::from_attrs(attrs);
+        if ch
+            .and_then(|ch| self.config.codepoint_overrides.family_for(ch))
+            .is_none()
+        {
+            return Arc::clone(&self.default_faces[style.index()]);
         }
+        Arc::new(resolve_face_for_char_and_style(&self.config, ch, style))
+    }
+}
+
+fn resolve_face_for_char_and_style(
+    config: &TerminalTextConfig,
+    ch: Option<char>,
+    style: FontStyle,
+) -> ResolvedFontFace {
+    let mut families = config.families.iter();
+    let default_family = families
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "monospace".to_owned());
+    let override_family = ch.and_then(|ch| config.codepoint_overrides.family_for(ch));
+    let family = override_family
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_family.clone());
+    let fallback_families = if override_family.is_some() {
+        std::iter::once(default_family)
+            .chain(families.cloned())
+            .collect()
+    } else {
+        families.cloned().collect()
+    };
+    ResolvedFontFace {
+        family,
+        fallback_families,
+        style,
     }
 }
 
@@ -518,10 +546,11 @@ impl TerminalCodepointResolver {
         } else {
             FontStyle::Regular
         };
-        Some(CodepointResolution::Font(
-            self.font_resolver
-                .resolve_face_for_char_and_style(Some(ch), style),
-        ))
+        Some(CodepointResolution::Font(resolve_face_for_char_and_style(
+            &self.font_resolver.config,
+            Some(ch),
+            style,
+        )))
     }
 }
 
@@ -542,6 +571,24 @@ pub enum FontStyle {
 }
 
 impl FontStyle {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::Regular,
+            1 => Self::Bold,
+            2 => Self::Italic,
+            _ => Self::BoldItalic,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Regular => 0,
+            Self::Bold => 1,
+            Self::Italic => 2,
+            Self::BoldItalic => 3,
+        }
+    }
+
     fn from_attrs(attrs: &TextAttrs) -> Self {
         match (attrs.bold, attrs.italic) {
             (true, true) => Self::BoldItalic,
@@ -650,96 +697,6 @@ pub enum NativeSymbolClass {
     Special,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ShapedTextCacheKey {
-    text: String,
-    cells: u16,
-    attrs: TextAttrsKey,
-    resolved_font: ResolvedFontFace,
-    font_size: F32Key,
-    cell_width: F32Key,
-    cell_height: F32Key,
-    baseline_adjustment: F32Key,
-    font_features: Vec<FontFeature>,
-    native_symbol_policy: NativeSymbolPolicy,
-    sprite_registry: SpriteRegistry,
-}
-
-impl ShapedTextCacheKey {
-    pub fn from_run(
-        run: &TextRun,
-        config: &TerminalTextConfig,
-        face: &ResolvedFontFace,
-        native_symbol_policy: NativeSymbolPolicy,
-        sprite_registry: SpriteRegistry,
-    ) -> Self {
-        Self {
-            text: run.text.clone(),
-            cells: run.cells,
-            attrs: TextAttrsKey::from(run.attrs),
-            resolved_font: face.clone(),
-            font_size: F32Key::new(config.font_size),
-            cell_width: F32Key::new(config.cell_width),
-            cell_height: F32Key::new(config.cell_height),
-            baseline_adjustment: F32Key::new(config.baseline_adjustment),
-            font_features: config.font_features.clone(),
-            native_symbol_policy,
-            sprite_registry,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct F32Key(u32);
-
-impl F32Key {
-    fn new(value: f32) -> Self {
-        Self(value.to_bits())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TextAttrsKey {
-    fg: ColorKey,
-    bold: bool,
-    italic: bool,
-    underline: bool,
-    strikethrough: bool,
-    overline: bool,
-}
-
-impl From<TextAttrs> for TextAttrsKey {
-    fn from(attrs: TextAttrs) -> Self {
-        Self {
-            fg: ColorKey::from(attrs.fg),
-            bold: attrs.bold,
-            italic: attrs.italic,
-            underline: attrs.underline != libghostty_vt::style::Underline::None,
-            strikethrough: attrs.strikethrough,
-            overline: attrs.overline,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct ColorKey {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
-}
-
-impl From<PlanColor> for ColorKey {
-    fn from(color: PlanColor) -> Self {
-        Self {
-            r: color.r,
-            g: color.g,
-            b: color.b,
-            a: color.a,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalTextContract {
     pub config: TerminalTextConfig,
@@ -770,21 +727,31 @@ impl TerminalTextContract {
     }
 
     pub fn shape_run(&self, run: &TextRun) -> ShapedTerminalText {
-        let face = self.resolver.resolve_face_for_text(&run.attrs, &run.text);
-        let cache_key = ShapedTextCacheKey::from_run(
-            run,
-            &self.config,
-            &face,
-            self.native_symbol_policy,
-            self.sprite_registry,
-        );
+        let face = self.resolve_face_for_run(run);
         let fragments = self.shape_fragments(run);
 
-        ShapedTerminalText {
-            cache_key,
-            face,
-            fragments,
+        ShapedTerminalText { face, fragments }
+    }
+
+    pub fn resolve_face_for_run(&self, run: &TextRun) -> ResolvedFontFace {
+        self.resolver.resolve_face_for_text(&run.attrs, &run.text)
+    }
+
+    pub fn resolve_face_handle_for_run(&self, run: &TextRun) -> Arc<ResolvedFontFace> {
+        self.resolver
+            .resolve_face_handle_for_text(&run.attrs, &run.text)
+    }
+
+    pub fn has_native_symbol_fragments(&self, text: &str) -> bool {
+        if text.is_ascii() {
+            return false;
         }
+        text.chars().any(|ch| self.sprite_class(ch).is_some())
+    }
+
+    pub fn native_symbol_glyph(&self, ch: char) -> Option<SpriteGlyph> {
+        self.native_symbol_policy.classify(ch)?;
+        self.sprite_registry.glyph_for(ch)
     }
 
     pub fn shape_fragments(&self, run: &TextRun) -> Vec<TerminalTextFragment> {
@@ -824,9 +791,7 @@ impl TerminalTextContract {
     }
 
     fn sprite_class(&self, ch: char) -> Option<NativeSymbolClass> {
-        self.native_symbol_policy.classify(ch)?;
-        self.sprite_registry
-            .glyph_for(ch)
+        self.native_symbol_glyph(ch)
             .map(|glyph| native_symbol_class_for_family(glyph.family))
     }
 }
@@ -906,7 +871,6 @@ pub fn for_terminal_text_cells(text: &str, mut emit: impl FnMut(u16, &str)) {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShapedTerminalText {
-    pub cache_key: ShapedTextCacheKey,
     pub face: ResolvedFontFace,
     pub fragments: Vec<TerminalTextFragment>,
 }
@@ -927,7 +891,7 @@ pub enum TerminalTextFragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::SurfaceRect;
+    use crate::{geometry::SurfaceRect, paint_plan::PlanColor};
 
     fn attrs() -> TextAttrs {
         TextAttrs {
@@ -1222,6 +1186,21 @@ mod tests {
     }
 
     #[test]
+    fn text_contract_detects_when_native_symbol_shaping_is_needed() {
+        let contract = TerminalTextContract::new(
+            TerminalTextConfig {
+                families: vec!["Regular Mono".to_owned()],
+                ..TerminalTextConfig::default()
+            },
+            NativeSymbolPolicy::terminal_glyph_primitives(),
+        );
+
+        assert!(!contract.has_native_symbol_fragments("ordinary ascii"));
+        assert!(!contract.has_native_symbol_fragments("ASCII !@#$%^&*() 0123456789"));
+        assert!(contract.has_native_symbol_fragments("box ─ line"));
+    }
+
+    #[test]
     fn codepoint_resolver_ports_disabled_style_fallback() {
         let mut resolver = TerminalCodepointResolver::new(TerminalTextConfig {
             families: vec!["Regular Mono".to_owned()],
@@ -1253,77 +1232,6 @@ mod tests {
                 style: FontStyle::Italic,
             }))
         );
-    }
-
-    #[test]
-    fn cache_key_changes_for_renderer_relevant_inputs() {
-        let config = TerminalTextConfig {
-            families: vec!["Maple Mono NF".to_owned(), "Menlo".to_owned()],
-            font_features: default_font_features(),
-            codepoint_overrides: CodepointFontMap::default(),
-            font_size: 13.0,
-            cell_width: 9.0,
-            cell_height: 22.0,
-            baseline_adjustment: -1.0,
-            underline_position: 2.0,
-            underline_thickness: 1.0,
-        };
-        let resolver = FontResolver::new(config.clone());
-        let face = resolver.resolve_face(&attrs());
-        let key = ShapedTextCacheKey::from_run(
-            &run("abc"),
-            &config,
-            &face,
-            NativeSymbolPolicy::default(),
-            SpriteRegistry::prompt_graphics(),
-        );
-
-        let mut changed_config = config.clone();
-        changed_config.cell_height = 23.0;
-        let changed_metric = ShapedTextCacheKey::from_run(
-            &run("abc"),
-            &changed_config,
-            &face,
-            NativeSymbolPolicy::default(),
-            SpriteRegistry::prompt_graphics(),
-        );
-        assert_ne!(key, changed_metric);
-
-        let mut bold = attrs();
-        bold.bold = true;
-        let bold_face = resolver.resolve_face(&bold);
-        let bold_run = TextRun {
-            attrs: bold,
-            ..run("abc")
-        };
-        let changed_style = ShapedTextCacheKey::from_run(
-            &bold_run,
-            &config,
-            &bold_face,
-            NativeSymbolPolicy::default(),
-            SpriteRegistry::prompt_graphics(),
-        );
-        assert_ne!(key, changed_style);
-
-        let changed_policy = ShapedTextCacheKey::from_run(
-            &run("abc"),
-            &config,
-            &face,
-            NativeSymbolPolicy::font_only(),
-            SpriteRegistry::prompt_graphics(),
-        );
-        assert_ne!(key, changed_policy);
-
-        let mut changed_config = config.clone();
-        changed_config.font_features = vec![FontFeature::new(*b"liga", 0)];
-        let changed_features = ShapedTextCacheKey::from_run(
-            &run("abc"),
-            &changed_config,
-            &face,
-            NativeSymbolPolicy::default(),
-            SpriteRegistry::prompt_graphics(),
-        );
-        assert_ne!(key, changed_features);
     }
 
     #[test]

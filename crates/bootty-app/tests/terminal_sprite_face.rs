@@ -45,7 +45,7 @@ fn prepare_sprite_quads(
     let registry = SpriteRegistry::prompt_graphics();
     let batch = sprite_command_batch(&registry, ch, rect);
     let mut builder = TextAtlasBuilder::new(atlas_width, atlas_height);
-    let quads = builder.prepare_sprite_command(&batch, 1.0);
+    let quads = vec![builder.prepare_sprite_command(&batch, 1.0)];
     (builder, quads)
 }
 
@@ -2183,7 +2183,7 @@ fn hatch_line(rect: SurfaceRect, offset: f32, descending: bool) -> SpriteCommand
     }
 
     SpriteCommand::StrokePolyline {
-        points,
+        points: points.into_iter().collect(),
         width: 2.0,
         alpha: 1.0,
     }
@@ -2234,7 +2234,7 @@ fn inverse_corner_diagonals(rect: SurfaceRect, corners: &[&str]) -> Vec<SpriteCo
 
 fn circle_arc(position: &str) -> SpriteCommand {
     SpriteCommand::StrokePolyline {
-        points: circle_arc_points(position),
+        points: circle_arc_points(position).into_iter().collect(),
         width: 2.0,
         alpha: 1.0,
     }
@@ -2553,7 +2553,7 @@ fn polygon(points: Vec<(f32, f32)>) -> SpriteCommand {
 fn polygon_points(points: Vec<SpritePoint>) -> SpriteCommand {
     SpriteCommand::FillPolygon {
         shape: SpriteShape::Polygon,
-        points,
+        points: points.into_iter().collect(),
         alpha: 1.0,
     }
 }
@@ -2593,7 +2593,7 @@ fn clear_stroke(points: Vec<(f32, f32)>) -> SpriteCommand {
 
 fn clear_stroke_points(points: Vec<SpritePoint>) -> SpriteCommand {
     SpriteCommand::ClearStrokePolyline {
-        points,
+        points: points.into_iter().collect(),
         width: 2.0,
         alpha: 1.0,
     }
@@ -2601,7 +2601,7 @@ fn clear_stroke_points(points: Vec<SpritePoint>) -> SpriteCommand {
 
 fn stroke_points(points: Vec<SpritePoint>) -> SpriteCommand {
     SpriteCommand::StrokePolyline {
-        points,
+        points: points.into_iter().collect(),
         width: 2.0,
         alpha: 1.0,
     }

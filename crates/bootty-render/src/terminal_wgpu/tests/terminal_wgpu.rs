@@ -6,6 +6,48 @@ use crate::{
 };
 use std::sync::Arc;
 
+fn prepared_background_vertices(
+    surface: SurfaceRect,
+    commands: &[TerminalRenderCommand],
+) -> Vec<BackgroundVertex> {
+    let mut layers = Vec::new();
+    let mut batches = Vec::new();
+    let mut batch_count = 0;
+
+    for command in commands {
+        match command {
+            TerminalRenderCommand::FillRect(fill) => push_background_quad(
+                &mut layers,
+                &mut batches,
+                &mut batch_count,
+                surface,
+                TerminalQuadDraw {
+                    rect: fill.rect,
+                    color: fill.color,
+                },
+            ),
+            TerminalRenderCommand::Decoration(line) => {
+                push_decoration_command(&mut layers, &mut batches, &mut batch_count, surface, line)
+            }
+            TerminalRenderCommand::Cursor(cursor) => {
+                push_cursor_background_quads(
+                    &mut layers,
+                    &mut batches,
+                    &mut batch_count,
+                    surface,
+                    cursor,
+                );
+            }
+            TerminalRenderCommand::Text(_)
+            | TerminalRenderCommand::Sprite(_)
+            | TerminalRenderCommand::Image(_)
+            | TerminalRenderCommand::KittyVirtualPlacement(_) => {}
+        }
+    }
+
+    batches.into_iter().flatten().collect()
+}
+
 #[test]
 fn terminal_font_priority_matches_reference_default_before_system_fallback() {
     assert_eq!(GHOSTTY_FONT_FAMILY_PRIORITY[0], "JetBrains Mono");
@@ -108,10 +150,7 @@ fn background_command_vertices_include_cursor_commands_in_frame_order() {
         }),
     ];
 
-    let vertices = commands
-        .iter()
-        .flat_map(|command| background_command_vertices(surface, command))
-        .collect::<Vec<_>>();
+    let vertices = prepared_background_vertices(surface, &commands);
 
     assert_eq!(vertices.len(), 18);
     assert_eq!(vertices[0].color, color_to_float(red));
@@ -151,10 +190,7 @@ fn background_command_vertices_keep_decorations_before_cursor() {
         }),
     ];
 
-    let vertices = commands
-        .iter()
-        .flat_map(|command| background_command_vertices(surface, command))
-        .collect::<Vec<_>>();
+    let vertices = prepared_background_vertices(surface, &commands);
 
     assert_eq!(vertices.len(), 12);
     assert_eq!(vertices[0].color, color_to_float(red));
@@ -206,11 +242,11 @@ fn zero_width_text_does_not_advance_following_glyphs() {
             strikethrough: false,
             overline: false,
         },
-        face: ResolvedFontFace {
+        face: Arc::new(ResolvedFontFace {
             family: "monospace".to_owned(),
             fallback_families: Vec::new(),
             style: FontStyle::Regular,
-        },
+        }),
         font_size: 10.0,
     };
 
@@ -225,6 +261,33 @@ fn zero_width_text_does_not_advance_following_glyphs() {
         b_min_x < 20.0,
         "b rendered outside command rect at {b_min_x}"
     );
+}
+
+#[test]
+fn text_vertices_into_appends_without_replacing_existing_vertices() {
+    let surface = SurfaceRect::from_min_size(0.0, 0.0, 10.0, 10.0);
+    let quad = TexturedGlyphQuad {
+        rect: SurfaceRect::from_min_size(1.0, 2.0, 3.0, 4.0),
+        uv: SurfaceRect::from_min_size(0.1, 0.2, 0.3, 0.4),
+        color: PlanColor {
+            r: 128,
+            g: 64,
+            b: 32,
+            a: 255,
+        },
+    };
+    let sentinel = TextVertex {
+        position: [9.0, 9.0],
+        uv: [8.0, 8.0],
+        color: [7.0, 7.0, 7.0, 7.0],
+    };
+    let expected = text_vertices(surface, &[quad]);
+    let mut vertices = vec![sentinel];
+
+    text_vertices_into(surface, &[quad], &mut vertices);
+
+    assert_eq!(vertices[0], sentinel);
+    assert_eq!(&vertices[1..], expected.as_slice());
 }
 
 #[test]
@@ -243,13 +306,58 @@ fn image_vertices_use_destination_and_source_rect_uvs() {
         vec![0; 10 * 20 * 4],
     );
 
-    let vertices = image_vertices(surface, &image);
+    let vertices = image_vertices(surface, &image).expect("valid image source rect");
 
     assert_eq!(vertices.len(), 6);
     assert_float_pair(vertices[0].position, [-0.8, 0.6]);
     assert_float_pair(vertices[2].position, [-0.2, -0.2]);
     assert_float_pair(vertices[0].uv, [0.15, 0.125]);
     assert_float_pair(vertices[2].uv, [0.35, 0.275]);
+}
+
+#[test]
+fn image_texture_key_reuses_texture_across_placement_geometry_changes() {
+    let data = Arc::new(vec![1; 2 * 2 * 4]);
+    let image = KittyImagePlacement {
+        data: Arc::clone(&data),
+        ..image_placement(
+            SurfaceRect::from_min_size(0.0, 0.0, 10.0, 10.0),
+            libghostty_vt::kitty::graphics::SourceRect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            2,
+            2,
+            Vec::new(),
+        )
+    };
+    let moved = KittyImagePlacement {
+        placement_id: 2,
+        source: libghostty_vt::kitty::graphics::SourceRect {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        },
+        destination: SurfaceRect::from_min_size(5.0, 6.0, 7.0, 8.0),
+        data,
+        ..image.clone()
+    };
+    let replaced = KittyImagePlacement {
+        data: Arc::new(vec![1; 2 * 2 * 4]),
+        ..image.clone()
+    };
+
+    assert_eq!(
+        TerminalImageTextureKey::from_image(&image),
+        TerminalImageTextureKey::from_image(&moved)
+    );
+    assert_ne!(
+        TerminalImageTextureKey::from_image(&image),
+        TerminalImageTextureKey::from_image(&replaced)
+    );
 }
 
 #[test]
@@ -342,7 +450,7 @@ fn image_vertices_reject_out_of_bounds_source_rects() {
         vec![0; 16],
     );
 
-    assert!(image_vertices(SurfaceRect::from_min_size(0.0, 0.0, 1.0, 1.0), &image).is_empty());
+    assert!(image_vertices(SurfaceRect::from_min_size(0.0, 0.0, 1.0, 1.0), &image).is_none());
 }
 
 fn assert_float_pair(actual: [f32; 2], expected: [f32; 2]) {

@@ -1,10 +1,15 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 use ab_glyph::{Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont, point};
 
 mod coretext;
 
 use crate::{
+    font_database::system_font_database,
     geometry::SurfaceRect,
     paint_plan::PlanColor,
     terminal_font_face::{FontFaceMetrics, GlyphSize, terminal_glyph_constraint},
@@ -35,37 +40,70 @@ impl TerminalTextShaper {
 
     pub fn shape(&self, text: &str, start_cell: u16) -> Vec<ShapedCluster> {
         let mut clusters = Vec::new();
-        let mut cell = start_cell;
-        let mut chars = text.chars().peekable();
+        self.shape_into(text, start_cell, &mut clusters);
+        clusters
+    }
+
+    pub fn shape_into(
+        &self,
+        text: &str,
+        start_cell: u16,
+        clusters: &mut Vec<ShapedCluster>,
+    ) -> u16 {
+        let (total_cells, cluster_len) = self.shape_into_retained(text, start_cell, clusters);
+        clusters.truncate(cluster_len);
+        total_cells
+    }
+
+    fn shape_into_retained(
+        &self,
+        text: &str,
+        start_cell: u16,
+        clusters: &mut Vec<ShapedCluster>,
+    ) -> (u16, usize) {
         let liga_enabled = self.feature_enabled(*b"liga");
+        if is_printable_ascii(text) {
+            return shape_ascii_into_retained(text, start_cell, liga_enabled, clusters);
+        }
+
+        let mut cell = start_cell;
+        let mut total_cells = 0_u16;
+        let mut chars = text.chars().peekable();
+        let mut cluster_index = 0;
         while let Some(ch) = chars.next() {
-            let mut cluster = String::from(ch);
+            let cluster = shaped_cluster_slot(clusters, cluster_index);
+            cluster.text.clear();
+            cluster.text.push(ch);
+            cluster.cell = cell;
+            cluster.is_whitespace = ch.is_whitespace();
+            total_cells = total_cells.saturating_add(terminal_char_width(ch));
             while let Some(next) = chars.peek().copied() {
                 if is_combining_mark(next) || is_variation_selector(next) {
-                    cluster.push(next);
+                    cluster.text.push(next);
+                    cluster.is_whitespace &= next.is_whitespace();
+                    total_cells = total_cells.saturating_add(terminal_char_width(next));
                     chars.next();
                 } else {
                     break;
                 }
             }
-            if liga_enabled && cluster == "f" && chars.peek() == Some(&'i') {
-                cluster.push('i');
+            if liga_enabled && cluster.text == "f" && chars.peek() == Some(&'i') {
+                cluster.text.push('i');
+                cluster.is_whitespace = false;
+                total_cells = total_cells.saturating_add(terminal_char_width('i'));
                 chars.next();
             }
-            let cells = cluster
+            cluster.cells = cluster
+                .text
                 .chars()
                 .next()
                 .map(terminal_char_width)
                 .unwrap_or(1)
                 .max(1);
-            clusters.push(ShapedCluster {
-                text: cluster,
-                cell,
-                cells,
-            });
-            cell = cell.saturating_add(cells);
+            cell = cell.saturating_add(cluster.cells);
+            cluster_index += 1;
         }
-        clusters
+        (total_cells.max(1), cluster_index)
     }
 
     fn feature_enabled(&self, tag: [u8; 4]) -> bool {
@@ -77,21 +115,150 @@ impl TerminalTextShaper {
     }
 }
 
+fn is_printable_ascii(text: &str) -> bool {
+    text.bytes().all(|byte| matches!(byte, b' '..=b'~'))
+}
+
+fn shape_ascii_into_retained(
+    text: &str,
+    start_cell: u16,
+    liga_enabled: bool,
+    clusters: &mut Vec<ShapedCluster>,
+) -> (u16, usize) {
+    let mut cell = start_cell;
+    let mut index = 0;
+    let mut cluster_index = 0;
+    while index < text.len() {
+        let cluster_len = if liga_enabled
+            && text.as_bytes()[index] == b'f'
+            && text.as_bytes().get(index + 1) == Some(&b'i')
+        {
+            2
+        } else {
+            1
+        };
+        let cluster = shaped_cluster_slot(clusters, cluster_index);
+        cluster.text.clear();
+        cluster.text.push_str(&text[index..index + cluster_len]);
+        cluster.cell = cell;
+        cluster.cells = cluster_len as u16;
+        cluster.is_whitespace = text.as_bytes()[index] == b' ';
+        cell = cell.saturating_add(cluster_len as u16);
+        index += cluster_len;
+        cluster_index += 1;
+    }
+    (
+        u16::try_from(text.len()).unwrap_or(u16::MAX).max(1),
+        cluster_index,
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShapedCluster {
     pub text: String,
     pub cell: u16,
     pub cells: u16,
+    pub is_whitespace: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+fn shaped_cluster_slot(clusters: &mut Vec<ShapedCluster>, index: usize) -> &mut ShapedCluster {
+    if index == clusters.len() {
+        clusters.push(ShapedCluster {
+            text: String::new(),
+            cell: 0,
+            cells: 0,
+            is_whitespace: false,
+        });
+    }
+    &mut clusters[index]
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlyphAtlasKey {
-    pub face: ResolvedFontFace,
-    pub text: String,
+    pub face: GlyphAtlasFaceKey,
+    pub text: GlyphAtlasTextKey,
     pub font_size_bits: u32,
     pub pixels_per_point_bits: u32,
     pub width: u32,
     pub height: u32,
+}
+
+impl Hash for GlyphAtlasKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let mut hash = self.face.hash ^ self.text.hash.rotate_left(13);
+        hash ^= u64::from(self.font_size_bits).rotate_left(29);
+        hash ^= u64::from(self.pixels_per_point_bits).rotate_left(43);
+        hash ^= u64::from(self.width) << 32 | u64::from(self.height);
+        state.write_u64(hash);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GlyphAtlasTextKey {
+    text: Arc<str>,
+    hash: u64,
+}
+
+impl GlyphAtlasTextKey {
+    pub fn new(text: impl AsRef<str>) -> Self {
+        let text = text.as_ref();
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        Self {
+            text: Arc::from(text),
+            hash: hasher.finish(),
+        }
+    }
+
+    fn for_char(ch: char) -> Self {
+        let mut buffer = [0_u8; 4];
+        Self::new(ch.encode_utf8(&mut buffer))
+    }
+}
+
+impl PartialEq for GlyphAtlasTextKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.text == other.text
+    }
+}
+
+impl Eq for GlyphAtlasTextKey {}
+
+impl Hash for GlyphAtlasTextKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GlyphAtlasFaceKey {
+    face: Arc<ResolvedFontFace>,
+    hash: u64,
+}
+
+impl GlyphAtlasFaceKey {
+    pub fn new(face: ResolvedFontFace) -> Self {
+        let mut hasher = DefaultHasher::new();
+        face.hash(&mut hasher);
+        Self {
+            face: Arc::new(face),
+            hash: hasher.finish(),
+        }
+    }
+}
+
+impl PartialEq for GlyphAtlasFaceKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && (Arc::ptr_eq(&self.face, &other.face) || self.face == other.face)
+    }
+}
+
+impl Eq for GlyphAtlasFaceKey {}
+
+impl Hash for GlyphAtlasFaceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +267,12 @@ pub struct GlyphAtlasEntry {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GlyphAtlasRecord {
+    entry: GlyphAtlasEntry,
+    is_color_glyph: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,7 +303,7 @@ pub struct GlyphAtlas {
     height: u32,
     format: GlyphAtlasFormat,
     allocations: Vec<GlyphAtlasEntry>,
-    entries: HashMap<GlyphAtlasKey, GlyphAtlasEntry>,
+    entries: HashMap<GlyphAtlasKey, GlyphAtlasRecord>,
     pixels: Vec<u8>,
     modified: u64,
     resized: u64,
@@ -187,8 +360,19 @@ impl GlyphAtlas {
         height: u32,
         pixels: impl FnOnce() -> Vec<u8>,
     ) -> GlyphAtlasEntry {
-        if let Some(entry) = self.entries.get(&key) {
-            return *entry;
+        self.insert_or_get_with_color(key, width, height, || (pixels(), false))
+            .0
+    }
+
+    fn insert_or_get_with_color(
+        &mut self,
+        key: GlyphAtlasKey,
+        width: u32,
+        height: u32,
+        pixels: impl FnOnce() -> (Vec<u8>, bool),
+    ) -> (GlyphAtlasEntry, bool) {
+        if let Some(record) = self.entries.get(&key) {
+            return (record.entry, record.is_color_glyph);
         }
 
         let width = width.max(1);
@@ -203,14 +387,20 @@ impl GlyphAtlas {
             entry.width = entry.width.min(width);
             entry.height = entry.height.min(height);
         }
-        let pixels = pixels();
+        let (pixels, is_color_glyph) = pixels();
         self.set(entry, &pixels);
-        self.entries.insert(key, entry);
-        entry
+        self.entries.insert(
+            key,
+            GlyphAtlasRecord {
+                entry,
+                is_color_glyph,
+            },
+        );
+        (entry, is_color_glyph)
     }
 
     pub fn get(&self, key: &GlyphAtlasKey) -> Option<GlyphAtlasEntry> {
-        self.entries.get(key).copied()
+        self.entries.get(key).map(|record| record.entry)
     }
 
     pub fn reserve(&mut self, width: u32, height: u32) -> Option<GlyphAtlasEntry> {
@@ -372,11 +562,48 @@ pub struct TexturedGlyphQuad {
 }
 
 #[derive(Clone, Debug)]
+struct AsciiGlyphAtlasRecord {
+    face: GlyphAtlasFaceKey,
+    font_size_bits: u32,
+    pixels_per_point_bits: u32,
+    width: u32,
+    height: u32,
+    record: GlyphAtlasRecord,
+}
+
+struct ClusterGlyphRequest<'a> {
+    command: &'a TextCommand,
+    cluster: &'a ShapedCluster,
+    face_key: GlyphAtlasFaceKey,
+    pixels_per_point: f32,
+    constraint_cells: u16,
+    glyph_width: u32,
+    glyph_height: u32,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedTextCommandCacheEntry {
+    command: TextCommand,
+    pixels_per_point_bits: u32,
+    atlas_resized_count: u64,
+    quads: Vec<TexturedGlyphQuad>,
+}
+
+#[derive(Clone, Debug)]
 pub struct TextAtlasBuilder {
     shaper: TerminalTextShaper,
     atlas: GlyphAtlas,
     fonts: FontLibrary,
-    color_glyphs: HashMap<GlyphAtlasKey, bool>,
+    face_cache: HashMap<ResolvedFontFace, GlyphAtlasFaceKey>,
+    text_cache: HashMap<String, GlyphAtlasTextKey>,
+    ascii_char_cache: [Option<GlyphAtlasTextKey>; 128],
+    ascii_glyph_cache: [Option<AsciiGlyphAtlasRecord>; 128],
+    char_cache: HashMap<char, GlyphAtlasTextKey>,
+    sprite_face_key: GlyphAtlasFaceKey,
+    clusters: Vec<ShapedCluster>,
+    prepared_text_cache: Vec<PreparedTextCommandCacheEntry>,
+    prepared_text_cache_cursor: usize,
+    prepared_text_frame_active: bool,
 }
 
 impl TextAtlasBuilder {
@@ -393,7 +620,33 @@ impl TextAtlasBuilder {
             shaper: TerminalTextShaper::default(),
             atlas: GlyphAtlas::with_format(width, height, format),
             fonts: FontLibrary::new(),
-            color_glyphs: HashMap::new(),
+            face_cache: HashMap::new(),
+            text_cache: HashMap::new(),
+            ascii_char_cache: std::array::from_fn(|_| None),
+            ascii_glyph_cache: std::array::from_fn(|_| None),
+            char_cache: HashMap::new(),
+            sprite_face_key: GlyphAtlasFaceKey::new(ResolvedFontFace {
+                family: "Ghostty Sprite".to_owned(),
+                fallback_families: Vec::new(),
+                style: FontStyle::Regular,
+            }),
+            clusters: Vec::new(),
+            prepared_text_cache: Vec::new(),
+            prepared_text_cache_cursor: 0,
+            prepared_text_frame_active: false,
+        }
+    }
+
+    pub(crate) fn begin_text_frame(&mut self) {
+        self.prepared_text_frame_active = true;
+        self.prepared_text_cache_cursor = 0;
+    }
+
+    pub(crate) fn finish_text_frame(&mut self) {
+        if self.prepared_text_frame_active {
+            self.prepared_text_cache
+                .truncate(self.prepared_text_cache_cursor);
+            self.prepared_text_frame_active = false;
         }
     }
 
@@ -402,21 +655,109 @@ impl TextAtlasBuilder {
         command: &TextCommand,
         pixels_per_point: f32,
     ) -> Vec<TexturedGlyphQuad> {
-        let total_cells = command
-            .text
-            .chars()
-            .map(terminal_char_width)
-            .sum::<u16>()
-            .max(1);
-        let cell_width = command.rect.width() / f32::from(total_cells);
-        let clusters = self.shaper.shape(&command.text, 0);
-        let mut quads = Vec::with_capacity(clusters.len());
+        let mut quads = Vec::new();
+        self.prepare_text_command_into(command, pixels_per_point, &mut quads);
+        quads
+    }
 
-        for (index, cluster) in clusters.iter().enumerate() {
+    pub fn prepare_text_command_into(
+        &mut self,
+        command: &TextCommand,
+        pixels_per_point: f32,
+        quads: &mut Vec<TexturedGlyphQuad>,
+    ) {
+        self.prepare_text_command_into_frame(command, pixels_per_point, quads);
+    }
+
+    pub(crate) fn prepare_text_command_into_frame(
+        &mut self,
+        command: &TextCommand,
+        pixels_per_point: f32,
+        quads: &mut Vec<TexturedGlyphQuad>,
+    ) -> bool {
+        if self.prepared_text_frame_active {
+            return self.prepare_text_command_into_cached(command, pixels_per_point, quads);
+        }
+        self.prepare_text_command_into_uncached(command, pixels_per_point, quads);
+        true
+    }
+
+    fn prepare_text_command_into_cached(
+        &mut self,
+        command: &TextCommand,
+        pixels_per_point: f32,
+        quads: &mut Vec<TexturedGlyphQuad>,
+    ) -> bool {
+        let cache_index = self.prepared_text_cache_cursor;
+        self.prepared_text_cache_cursor += 1;
+        let pixels_per_point_bits = pixels_per_point.to_bits();
+        let atlas_resized_count = self.atlas.resized_count();
+
+        if let Some(cached) = self.prepared_text_cache.get(cache_index)
+            && cached.atlas_resized_count == atlas_resized_count
+            && cached.pixels_per_point_bits == pixels_per_point_bits
+            && cached.command == *command
+        {
+            quads.extend_from_slice(&cached.quads);
+            return false;
+        }
+
+        let start = quads.len();
+        self.prepare_text_command_into_uncached(command, pixels_per_point, quads);
+        let cached = PreparedTextCommandCacheEntry {
+            command: command.clone(),
+            pixels_per_point_bits,
+            atlas_resized_count: self.atlas.resized_count(),
+            quads: quads[start..].to_vec(),
+        };
+        if cache_index == self.prepared_text_cache.len() {
+            self.prepared_text_cache.push(cached);
+        } else {
+            self.prepared_text_cache[cache_index] = cached;
+        }
+        true
+    }
+
+    fn prepare_text_command_into_uncached(
+        &mut self,
+        command: &TextCommand,
+        pixels_per_point: f32,
+        quads: &mut Vec<TexturedGlyphQuad>,
+    ) {
+        let face_key = self.intern_face(&command.face);
+        self.prepare_text_command_into_uncached_with_face(
+            command,
+            pixels_per_point,
+            face_key,
+            quads,
+        );
+    }
+
+    fn prepare_text_command_into_uncached_with_face(
+        &mut self,
+        command: &TextCommand,
+        pixels_per_point: f32,
+        face_key: GlyphAtlasFaceKey,
+        quads: &mut Vec<TexturedGlyphQuad>,
+    ) {
+        let mut clusters = std::mem::take(&mut self.clusters);
+        let (total_cells, cluster_len) =
+            self.shaper
+                .shape_into_retained(&command.text, 0, &mut clusters);
+        let active_clusters = &clusters[..cluster_len];
+        let cell_width = command.rect.width() / f32::from(total_cells);
+        quads.reserve(active_clusters.len());
+
+        for (index, cluster) in active_clusters.iter().enumerate() {
+            if cluster.is_whitespace {
+                continue;
+            }
             let constraint_cells = cluster_constraint_cells(
-                index.checked_sub(1).and_then(|index| clusters.get(index)),
+                index
+                    .checked_sub(1)
+                    .and_then(|index| active_clusters.get(index)),
                 cluster,
-                clusters.get(index + 1),
+                active_clusters.get(index + 1),
             );
             let rect = SurfaceRect::from_min_size(
                 command.rect.min_x + f32::from(cluster.cell) * cell_width,
@@ -426,34 +767,19 @@ impl TextAtlasBuilder {
             );
             let glyph_width = (rect.width() * pixels_per_point).ceil().max(1.0) as u32;
             let glyph_height = (rect.height() * pixels_per_point).ceil().max(1.0) as u32;
-            let key = GlyphAtlasKey {
-                face: command.face.clone(),
-                text: cluster.text.clone(),
-                font_size_bits: command.font_size.to_bits(),
-                pixels_per_point_bits: pixels_per_point.to_bits(),
-                width: glyph_width,
-                height: glyph_height,
+            let request = ClusterGlyphRequest {
+                command,
+                cluster,
+                face_key: face_key.clone(),
+                pixels_per_point,
+                constraint_cells,
+                glyph_width,
+                glyph_height,
             };
-            let (entry, is_color_glyph) = if let Some(entry) = self.atlas.get(&key) {
-                (entry, self.color_glyphs.get(&key).copied().unwrap_or(false))
+            let (entry, is_color_glyph) = if let Some(ch) = single_ascii_cluster(cluster) {
+                self.prepare_ascii_cluster(ch, request)
             } else {
-                let rasterized = self.fonts.rasterize_cluster(RasterizeClusterRequest {
-                    face: &command.face,
-                    cluster,
-                    font_size: command.font_size,
-                    pixels_per_point,
-                    constraint_cells,
-                    tile: (glyph_width, glyph_height),
-                    format: self.atlas.format(),
-                });
-                let color = rasterized.color;
-                let entry =
-                    self.atlas
-                        .insert_or_get_with(key.clone(), glyph_width, glyph_height, || {
-                            rasterized.pixels
-                        });
-                self.color_glyphs.insert(key, color);
-                (entry, color)
+                self.prepare_cluster(request)
             };
             let color = if is_color_glyph {
                 PlanColor {
@@ -471,41 +797,141 @@ impl TextAtlasBuilder {
                 color,
             });
         }
+        self.clusters = clusters;
+    }
 
-        quads
+    fn prepare_ascii_cluster(
+        &mut self,
+        ch: u8,
+        request: ClusterGlyphRequest<'_>,
+    ) -> (GlyphAtlasEntry, bool) {
+        let font_size_bits = request.command.font_size.to_bits();
+        let pixels_per_point_bits = request.pixels_per_point.to_bits();
+        let cache_index = usize::from(ch);
+        if let Some(cached) = &self.ascii_glyph_cache[cache_index]
+            && cached.face == request.face_key
+            && cached.font_size_bits == font_size_bits
+            && cached.pixels_per_point_bits == pixels_per_point_bits
+            && cached.width == request.glyph_width
+            && cached.height == request.glyph_height
+        {
+            return (cached.record.entry, cached.record.is_color_glyph);
+        }
+
+        let face_key = request.face_key.clone();
+        let width = request.glyph_width;
+        let height = request.glyph_height;
+        let (entry, is_color_glyph) = self.prepare_cluster(request);
+        self.ascii_glyph_cache[cache_index] = Some(AsciiGlyphAtlasRecord {
+            face: face_key,
+            font_size_bits,
+            pixels_per_point_bits,
+            width,
+            height,
+            record: GlyphAtlasRecord {
+                entry,
+                is_color_glyph,
+            },
+        });
+        (entry, is_color_glyph)
+    }
+
+    fn prepare_cluster(&mut self, request: ClusterGlyphRequest<'_>) -> (GlyphAtlasEntry, bool) {
+        let key = GlyphAtlasKey {
+            face: request.face_key,
+            text: self.intern_cluster_text(&request.cluster.text),
+            font_size_bits: request.command.font_size.to_bits(),
+            pixels_per_point_bits: request.pixels_per_point.to_bits(),
+            width: request.glyph_width,
+            height: request.glyph_height,
+        };
+        let format = self.atlas.format();
+        self.atlas
+            .insert_or_get_with_color(key, request.glyph_width, request.glyph_height, || {
+                let rasterized = self.fonts.rasterize_cluster(RasterizeClusterRequest {
+                    face: &request.command.face,
+                    cluster: request.cluster,
+                    font_size: request.command.font_size,
+                    pixels_per_point: request.pixels_per_point,
+                    constraint_cells: request.constraint_cells,
+                    tile: (request.glyph_width, request.glyph_height),
+                    format,
+                });
+                (rasterized.pixels, rasterized.color)
+            })
+    }
+
+    fn intern_text(&mut self, text: &str) -> GlyphAtlasTextKey {
+        if let Some(cached) = self.text_cache.get(text) {
+            return cached.clone();
+        }
+        let cached = GlyphAtlasTextKey::new(text);
+        self.text_cache.insert(text.to_owned(), cached.clone());
+        cached
+    }
+
+    fn intern_cluster_text(&mut self, text: &str) -> GlyphAtlasTextKey {
+        let mut chars = text.chars();
+        if let Some(ch) = chars.next()
+            && chars.next().is_none()
+        {
+            return self.intern_char(ch);
+        }
+        self.intern_text(text)
+    }
+
+    fn intern_char(&mut self, ch: char) -> GlyphAtlasTextKey {
+        if ch.is_ascii() {
+            let index = ch as usize;
+            if let Some(cached) = &self.ascii_char_cache[index] {
+                return cached.clone();
+            }
+            let cached = GlyphAtlasTextKey::for_char(ch);
+            self.ascii_char_cache[index] = Some(cached.clone());
+            return cached;
+        }
+        if let Some(cached) = self.char_cache.get(&ch) {
+            return cached.clone();
+        }
+        let cached = GlyphAtlasTextKey::for_char(ch);
+        self.char_cache.insert(ch, cached.clone());
+        cached
+    }
+
+    fn intern_face(&mut self, face: &ResolvedFontFace) -> GlyphAtlasFaceKey {
+        if let Some(cached) = self.face_cache.get(face) {
+            return cached.clone();
+        }
+        let cached = GlyphAtlasFaceKey::new(face.clone());
+        self.face_cache.insert(face.clone(), cached.clone());
+        cached
     }
 
     pub fn prepare_sprite_command(
         &mut self,
         command: &SpriteCommandBatch,
         pixels_per_point: f32,
-    ) -> Vec<TexturedGlyphQuad> {
+    ) -> TexturedGlyphQuad {
         let width = (command.rect.width() * pixels_per_point).ceil().max(1.0) as u32;
         let height = (command.rect.height() * pixels_per_point).ceil().max(1.0) as u32;
-        let alpha = rasterize_sprite_commands(&command.commands, command.rect, width, height);
-        let pixels = alpha_to_atlas_pixels(self.atlas.format(), alpha);
-        let entry = self.atlas.insert_or_get(
-            GlyphAtlasKey {
-                face: ResolvedFontFace {
-                    family: "Ghostty Sprite".to_owned(),
-                    fallback_families: Vec::new(),
-                    style: FontStyle::Regular,
-                },
-                text: command.ch.to_string(),
-                font_size_bits: command.rect.height().to_bits(),
-                pixels_per_point_bits: pixels_per_point.to_bits(),
-                width,
-                height,
-            },
+        let key = GlyphAtlasKey {
+            face: self.sprite_face_key.clone(),
+            text: self.intern_char(command.ch),
+            font_size_bits: command.rect.height().to_bits(),
+            pixels_per_point_bits: pixels_per_point.to_bits(),
             width,
             height,
-            pixels,
-        );
-        vec![TexturedGlyphQuad {
+        };
+        let format = self.atlas.format();
+        let entry = self.atlas.insert_or_get_with(key, width, height, || {
+            let alpha = rasterize_sprite_commands(&command.commands, command.rect, width, height);
+            alpha_to_atlas_pixels(format, alpha)
+        });
+        TexturedGlyphQuad {
             rect: command.rect,
             uv: atlas_uv(self.atlas.size(), entry),
             color: command.color,
-        }]
+        }
     }
 
     pub fn atlas_len(&self) -> usize {
@@ -531,6 +957,11 @@ impl TextAtlasBuilder {
     pub fn atlas_format(&self) -> GlyphAtlasFormat {
         self.atlas.format()
     }
+}
+
+fn single_ascii_cluster(cluster: &ShapedCluster) -> Option<u8> {
+    let bytes = cluster.text.as_bytes();
+    (bytes.len() == 1 && bytes[0].is_ascii()).then_some(bytes[0])
 }
 
 fn cluster_constraint_cells(
@@ -568,7 +999,7 @@ fn cluster_constraint_cells(
 
 #[derive(Clone, Debug)]
 struct FontLibrary {
-    database: fontdb::Database,
+    database: &'static fontdb::Database,
     fonts: HashMap<ResolvedFontFace, Option<FontArc>>,
 }
 
@@ -599,10 +1030,8 @@ struct PositionedClusterGlyphRequest {
 
 impl FontLibrary {
     fn new() -> Self {
-        let mut database = fontdb::Database::new();
-        database.load_system_fonts();
         Self {
-            database,
+            database: system_font_database(),
             fonts: HashMap::new(),
         }
     }
@@ -617,7 +1046,7 @@ impl FontLibrary {
             tile: (width, height),
             format,
         } = request;
-        if cluster.text.trim().is_empty() {
+        if cluster.is_whitespace {
             return RasterizedCluster {
                 pixels: vec![0; (width * height * format.depth()) as usize],
                 color: false,
@@ -752,8 +1181,7 @@ impl FontLibrary {
             }
         }
 
-        if let Some(font) = load_font_supporting_char(&self.database, face, ch, physical_font_size)
-        {
+        if let Some(font) = load_font_supporting_char(self.database, face, ch, physical_font_size) {
             return Some(font);
         }
 
@@ -762,7 +1190,7 @@ impl FontLibrary {
 
     fn font_for_face(&mut self, face: &ResolvedFontFace) -> Option<FontArc> {
         if !self.fonts.contains_key(face) {
-            let font = load_font(&self.database, face);
+            let font = load_font(self.database, face);
             self.fonts.insert(face.clone(), font);
         }
         self.fonts.get(face).cloned().flatten()
@@ -1152,7 +1580,7 @@ fn is_variation_selector(ch: char) -> bool {
 
 fn fallback_cluster_mask(cluster: &ShapedCluster, width: u32, height: u32) -> Vec<u8> {
     let mut alpha = vec![0; (width * height) as usize];
-    if cluster.text.trim().is_empty() {
+    if cluster.is_whitespace {
         return alpha;
     }
     if let Some(ch) = cluster.text.chars().next()

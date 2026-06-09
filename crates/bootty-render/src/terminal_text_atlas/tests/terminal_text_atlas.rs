@@ -18,7 +18,7 @@ fn font_library_from_paths(paths: impl IntoIterator<Item = std::path::PathBuf>) 
         database.load_font_file(path).expect("fixture font loads");
     }
     FontLibrary {
-        database,
+        database: Box::leak(Box::new(database)),
         fonts: HashMap::new(),
     }
 }
@@ -43,7 +43,36 @@ fn shaped_cluster(text: &str, cells: u16) -> ShapedCluster {
         text: text.to_owned(),
         cell: 0,
         cells,
+        is_whitespace: text.chars().all(char::is_whitespace),
     }
+}
+
+fn text_command(text: &str) -> TextCommand {
+    TextCommand {
+        rect: SurfaceRect::from_min_size(0.0, 0.0, text.len() as f32 * 10.0, 20.0),
+        text: text.to_owned(),
+        attrs: crate::paint_plan::TextAttrs {
+            fg: PlanColor {
+                r: 240,
+                g: 240,
+                b: 240,
+                a: 255,
+            },
+            bold: false,
+            italic: false,
+            underline: libghostty_vt::style::Underline::None,
+            strikethrough: false,
+            overline: false,
+        },
+        face: Arc::new(regular_face("Maple Mono", &[])),
+        font_size: 16.0,
+    }
+}
+
+fn force_atlas_resize(builder: &mut TextAtlasBuilder) {
+    builder
+        .atlas
+        .grow(builder.atlas.width * 2, builder.atlas.height * 2);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -192,8 +221,8 @@ fn atlas_rasterizer_matches_maple_nerd_font_icon_pixels() {
 fn glyph_atlas_lazy_insert_skips_pixel_generation_for_cached_glyphs() {
     let mut atlas = GlyphAtlas::new(64, 64);
     let key = GlyphAtlasKey {
-        face: regular_face("Maple Mono", &[]),
-        text: "A".to_owned(),
+        face: GlyphAtlasFaceKey::new(regular_face("Maple Mono", &[])),
+        text: GlyphAtlasTextKey::new("A"),
         font_size_bits: 16.0_f32.to_bits(),
         pixels_per_point_bits: 2.0_f32.to_bits(),
         width: 16,
@@ -213,6 +242,33 @@ fn glyph_atlas_lazy_insert_skips_pixel_generation_for_cached_glyphs() {
     assert_eq!(first, second);
     assert_eq!(generated, 1);
     assert_eq!(atlas.modified_count(), 1);
+}
+
+#[test]
+fn prepared_text_frame_cache_refreshes_uvs_after_atlas_resize() {
+    let mut builder = TextAtlasBuilder::new(64, 64);
+    let command = text_command("A");
+    let mut first = Vec::new();
+
+    builder.begin_text_frame();
+    builder.prepare_text_command_into(&command, 1.0, &mut first);
+    builder.finish_text_frame();
+    let old_uv = first[0].uv;
+    let old_resized_count = builder.atlas_resized_count();
+
+    force_atlas_resize(&mut builder);
+    assert!(builder.atlas_resized_count() > old_resized_count);
+
+    let mut second = Vec::new();
+    builder.begin_text_frame();
+    builder.prepare_text_command_into(&command, 1.0, &mut second);
+    builder.finish_text_frame();
+
+    assert_ne!(second[0].uv, old_uv);
+    assert_eq!(
+        builder.prepared_text_cache[0].atlas_resized_count,
+        builder.atlas_resized_count()
+    );
 }
 
 #[test]

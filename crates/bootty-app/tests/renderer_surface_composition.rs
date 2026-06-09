@@ -1,5 +1,4 @@
 use bootty_app::{
-    bare_host::renderer_parity_gallery_frame,
     geometry::{CellMetrics, TerminalPadding, TerminalSurface},
     paint_plan::PlanColor,
     renderer_frame::{
@@ -9,6 +8,7 @@ use bootty_app::{
     terminal_render::{FillRole, TerminalRenderCommand},
     terminal_text::TerminalTextConfig,
 };
+use bootty_winit::bare_host::renderer_parity_gallery_frame;
 use libghostty_vt::{
     render::{CursorVisualStyle, Dirty},
     style::RgbColor,

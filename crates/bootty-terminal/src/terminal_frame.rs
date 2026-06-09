@@ -39,16 +39,6 @@ impl Default for RenderFrame {
 }
 
 impl RenderFrame {
-    pub(crate) fn clear(&mut self) {
-        self.cursor = None;
-        self.row_dirty.clear();
-        self.cells.clear();
-        self.text.clear();
-        self.images = KittyImageFrame::default();
-        self.scrollbar = None;
-        self.stats = FrameStats::default();
-    }
-
     pub fn cell_text(&self, cell: &RenderCell) -> &[char] {
         &self.text[cell.text_start..cell.text_start + cell.text_len]
     }

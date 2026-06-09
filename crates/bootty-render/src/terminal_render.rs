@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     geometry::SurfaceRect,
     paint_plan::{
@@ -8,9 +10,7 @@ use crate::{
         KittyImageFrame, KittyImageLayer, KittyImagePlacement, KittyVirtualPlacement,
     },
     terminal_sprite::{SpriteCommand, SpriteGlyph},
-    terminal_text::{
-        ResolvedFontFace, TerminalTextContract, TerminalTextFragment, for_terminal_text_cells,
-    },
+    terminal_text::{ResolvedFontFace, TerminalTextContract},
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,7 +23,7 @@ impl TerminalRenderFrame {
     pub fn background_from_plan(plan: &TerminalPaintPlan) -> Self {
         let mut frame = Self {
             surface: plan.surface,
-            commands: Vec::new(),
+            commands: Vec::with_capacity(1 + plan.backgrounds.len()),
         };
 
         frame.push_fill(
@@ -49,7 +49,7 @@ impl TerminalRenderFrame {
     ) -> Self {
         let mut frame = Self {
             surface: plan.surface,
-            commands: Vec::new(),
+            commands: Vec::with_capacity(command_capacity_for_plan(plan, images)),
         };
 
         frame.push_fill(
@@ -112,36 +112,76 @@ impl TerminalRenderFrame {
     }
 
     fn push_text_run(&mut self, run: &TextRun, text_contract: &TerminalTextContract) {
-        let shaped = text_contract.shape_run(run);
         let cell_width = run.rect.width() / f32::from(run.cells.max(1));
+        if run.text.is_ascii() {
+            let face = text_contract.resolve_face_handle_for_run(run);
+            self.push_text_fragment(
+                run,
+                cell_width,
+                TextCellSpan {
+                    start: 0,
+                    width: run.cells,
+                },
+                &run.text,
+                Arc::clone(&face),
+                text_contract.config.font_size,
+            );
+            return;
+        }
 
-        for fragment in shaped.fragments {
-            match fragment {
-                TerminalTextFragment::Text { cell, text } => {
+        let mut text_start_byte = 0_usize;
+        let mut text_start_cell = 0_u16;
+        let mut text_active = false;
+        let mut cell = 0_u16;
+        let mut face = None;
+
+        for (byte_index, ch) in run.text.char_indices() {
+            if let Some(glyph) = text_contract.native_symbol_glyph(ch) {
+                if text_active {
+                    let face = Arc::clone(
+                        face.get_or_insert_with(|| text_contract.resolve_face_handle_for_run(run)),
+                    );
                     self.push_text_fragment(
                         run,
                         cell_width,
-                        cell,
-                        &text,
-                        &shaped.face,
+                        TextCellSpan {
+                            start: text_start_cell,
+                            width: cell.saturating_sub(text_start_cell),
+                        },
+                        &run.text[text_start_byte..byte_index],
+                        face,
                         text_contract.config.font_size,
                     );
+                    text_active = false;
                 }
-                TerminalTextFragment::NativeSymbol { cell, ch, .. } => {
-                    let Some(glyph) = text_contract.sprite_registry.glyph_for(ch) else {
-                        self.push_text_fragment(
-                            run,
-                            cell_width,
-                            cell,
-                            &ch.to_string(),
-                            &shaped.face,
-                            text_contract.config.font_size,
-                        );
-                        continue;
-                    };
-                    self.push_sprite_fragment(run, cell_width, cell, ch, glyph, text_contract);
-                }
+                self.push_sprite_fragment(run, cell_width, cell, ch, glyph, text_contract);
+                cell = cell.saturating_add(crate::terminal_text::terminal_char_width(ch));
+                continue;
             }
+
+            if !text_active {
+                text_start_byte = byte_index;
+                text_start_cell = cell;
+                text_active = true;
+            }
+            cell = cell.saturating_add(crate::terminal_text::terminal_char_width(ch));
+        }
+
+        if text_active {
+            let face = face
+                .take()
+                .unwrap_or_else(|| text_contract.resolve_face_handle_for_run(run));
+            self.push_text_fragment(
+                run,
+                cell_width,
+                TextCellSpan {
+                    start: text_start_cell,
+                    width: cell.saturating_sub(text_start_cell),
+                },
+                &run.text[text_start_byte..],
+                face,
+                text_contract.config.font_size,
+            );
         }
     }
 
@@ -149,21 +189,21 @@ impl TerminalRenderFrame {
         &mut self,
         run: &TextRun,
         cell_width: f32,
-        start_cell: u16,
+        cells: TextCellSpan,
         text: &str,
-        face: &ResolvedFontFace,
+        face: Arc<ResolvedFontFace>,
         font_size: f32,
     ) {
-        for_terminal_text_cells(text, |relative_cell, cell_text| {
-            let cell = start_cell.saturating_add(relative_cell);
-            self.commands.push(TerminalRenderCommand::Text(TextCommand {
-                rect: cell_rect(run.rect, cell_width, cell, text_cell_width(cell_text)),
-                text: cell_text.to_owned(),
-                attrs: run.attrs,
-                face: face.clone(),
-                font_size,
-            }));
-        });
+        if text.is_empty() {
+            return;
+        }
+        self.commands.push(TerminalRenderCommand::Text(TextCommand {
+            rect: cell_rect(run.rect, cell_width, cells.start, cells.width),
+            text: text.to_owned(),
+            attrs: run.attrs,
+            face,
+            font_size,
+        }));
     }
 
     fn push_sprite_fragment(
@@ -226,6 +266,25 @@ impl TerminalRenderFrame {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextCellSpan {
+    start: u16,
+    width: u16,
+}
+
+fn command_capacity_for_plan(plan: &TerminalPaintPlan, images: &KittyImageFrame) -> usize {
+    let cursor_commands = plan.cursor.as_ref().map_or(0, |cursor| {
+        1 + usize::from(cursor.text_under_cursor.is_some())
+    });
+
+    1 + plan.backgrounds.len()
+        + images.placements.len()
+        + plan.text_runs.len()
+        + plan.decorations.len()
+        + images.virtual_placements.len()
+        + cursor_commands
+}
+
 fn translate_image_placement(
     placement: &KittyImagePlacement,
     surface: SurfaceRect,
@@ -273,7 +332,7 @@ pub struct TextCommand {
     pub rect: SurfaceRect,
     pub text: String,
     pub attrs: TextAttrs,
-    pub face: ResolvedFontFace,
+    pub face: Arc<ResolvedFontFace>,
     pub font_size: f32,
 }
 
@@ -356,6 +415,57 @@ mod tests {
         )
     }
 
+    #[test]
+    fn mixed_text_and_native_symbol_run_preserves_fragments() {
+        let plan = TerminalPaintPlan {
+            surface: SurfaceRect::from_min_size(0.0, 0.0, 100.0, 20.0),
+            default_background: color(0),
+            backgrounds: Vec::new(),
+            text_runs: vec![TextRun {
+                rect: SurfaceRect::from_min_size(0.0, 0.0, 50.0, 10.0),
+                cells: 5,
+                text: "ab─cd".to_owned(),
+                attrs: attrs(),
+            }],
+            decorations: Vec::new(),
+            cursor: None,
+        };
+
+        let frame = TerminalRenderFrame::from_plan(&plan, &text_contract());
+        assert_eq!(frame.commands.len(), 4);
+
+        match &frame.commands[1] {
+            TerminalRenderCommand::Text(command) => {
+                assert_eq!(command.text, "ab");
+                assert_eq!(
+                    command.rect,
+                    SurfaceRect::from_min_size(0.0, 0.0, 20.0, 10.0)
+                );
+            }
+            command => panic!("expected leading text command, got {command:?}"),
+        }
+        match &frame.commands[2] {
+            TerminalRenderCommand::Sprite(command) => {
+                assert_eq!(command.ch, '─');
+                assert_eq!(
+                    command.rect,
+                    SurfaceRect::from_min_size(20.0, 0.0, 10.0, 10.0)
+                );
+            }
+            command => panic!("expected sprite command, got {command:?}"),
+        }
+        match &frame.commands[3] {
+            TerminalRenderCommand::Text(command) => {
+                assert_eq!(command.text, "cd");
+                assert_eq!(
+                    command.rect,
+                    SurfaceRect::from_min_size(30.0, 0.0, 20.0, 10.0)
+                );
+            }
+            command => panic!("expected trailing text command, got {command:?}"),
+        }
+    }
+
     proptest! {
         #[test]
         fn property_ascii_render_command_count_matches_plan_resources(
@@ -392,7 +502,7 @@ mod tests {
                     attrs: attrs(),
                 })
                 .collect::<Vec<_>>();
-            let expected_text_commands = run_bytes.iter().map(Vec::len).sum::<usize>();
+            let expected_text_commands = run_bytes.len();
             let plan = TerminalPaintPlan {
                 surface: SurfaceRect::from_min_size(0.0, 0.0, 200.0, 120.0),
                 default_background: color(0),

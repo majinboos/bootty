@@ -239,7 +239,10 @@ impl PaintPlanner {
         default_bg: PlanColor,
     ) {
         for cell in &frame.cells {
-            let (_, bg) = cell_colors(cell, default_fg, default_bg);
+            if !cell.style.inverse && cell.bg.is_none() {
+                continue;
+            }
+            let bg = cell_background(cell, default_fg, default_bg);
             if bg != default_bg {
                 self.push_background(surface.cell_rect(cell.x, cell.y), bg);
             }
@@ -271,7 +274,6 @@ impl PaintPlanner {
         let mut cell_index = 0;
         while cell_index < frame.cells.len() {
             let first = &frame.cells[cell_index];
-            let attrs = paint_attrs(first, default_fg, default_bg);
             let first_text = frame.cell_text(first);
 
             if first.style.invisible || first_text.is_empty() {
@@ -279,6 +281,7 @@ impl PaintPlanner {
                 continue;
             }
 
+            let attrs = paint_attrs(first, default_fg, default_bg);
             let mut run_text = self.take_run_text();
             run_text.clear();
             run_text.extend(first_text);
@@ -488,6 +491,14 @@ fn cell_colors(
     (fg, bg)
 }
 
+fn cell_background(cell: &RenderCell, default_fg: PlanColor, default_bg: PlanColor) -> PlanColor {
+    if cell.style.inverse {
+        cell.fg.map_or(default_fg, PlanColor::opaque)
+    } else {
+        cell.bg.map_or(default_bg, PlanColor::opaque)
+    }
+}
+
 fn paint_attrs(cell: &RenderCell, default_fg: PlanColor, default_bg: PlanColor) -> TextAttrs {
     let (fg, _) = cell_colors(cell, default_fg, default_bg);
     TextAttrs {
@@ -637,6 +648,23 @@ mod tests {
 
         assert_eq!(plan.backgrounds.len(), 1);
         assert_eq!(plan.backgrounds[0].rect, surface().run_rect(0, 0, 3));
+    }
+
+    #[test]
+    fn inverse_cells_use_foreground_as_planned_background() {
+        let mut inverse = style();
+        inverse.inverse = true;
+        let mut frame = frame_from_cells(vec![(0, 0, 'x', inverse)]);
+        frame.cells[0].fg = Some(rgb(10, 20, 30));
+
+        let mut planner = PaintPlanner::default();
+        let plan = planner.plan(surface(), &frame, 16.0);
+
+        assert_eq!(plan.backgrounds.len(), 1);
+        assert_eq!(
+            plan.backgrounds[0].color,
+            PlanColor::opaque(rgb(10, 20, 30))
+        );
     }
 
     #[test]
