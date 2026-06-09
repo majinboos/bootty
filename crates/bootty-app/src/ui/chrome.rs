@@ -130,7 +130,6 @@ pub fn show_sidebar(
     let list_top = content_top + header_h;
     let usage_bars = parse_usage_bars(model.metadata.usage_lines());
     let footer_h = sidebar_footer_height(usage_bars.len());
-    let list_bottom = (rect.max.y - footer_h).max(list_top);
     if model.sessions.is_empty() {
         painter.text(
             Pos2::new(rect.center().x, list_top + 42.0),
@@ -141,9 +140,7 @@ pub fn show_sidebar(
         );
     }
 
-    let max_rows = ((list_bottom - list_top) / SIDEBAR_ROW_HEIGHT)
-        .floor()
-        .max(0.0) as usize;
+    let max_rows = visible_sidebar_row_capacity(height, model.top_inset, header_h, footer_h);
     let items = build_visible_sidebar_items(
         model.sessions,
         model.selected_session,
@@ -182,6 +179,31 @@ pub fn show_sidebar(
         palette,
     );
     activated
+}
+
+pub(crate) fn sidebar_metadata_session_budget(
+    height: f32,
+    top_inset: f32,
+    title_visible: bool,
+    usage_lines: &[String],
+) -> usize {
+    let header_h = sidebar_header_height(title_visible);
+    let usage_bars = parse_usage_bars(usage_lines);
+    let footer_h = sidebar_footer_height(usage_bars.len());
+    visible_sidebar_row_capacity(height, top_inset, header_h, footer_h)
+}
+
+fn visible_sidebar_row_capacity(
+    height: f32,
+    top_inset: f32,
+    header_h: f32,
+    footer_h: f32,
+) -> usize {
+    let list_top = top_inset + header_h;
+    let list_bottom = (height - footer_h).max(list_top);
+    ((list_bottom - list_top) / SIDEBAR_ROW_HEIGHT)
+        .floor()
+        .max(0.0) as usize
 }
 
 fn sidebar_palette(palette: ThemePalette) -> ThemePalette {
@@ -1308,5 +1330,22 @@ mod tests {
     fn sidebar_header_collapses_when_title_is_hidden() {
         assert_eq!(sidebar_header_height(true), SIDEBAR_HEADER_HEIGHT);
         assert_eq!(sidebar_header_height(false), 0.0);
+    }
+
+    #[test]
+    fn sidebar_metadata_budget_tracks_visible_row_capacity() {
+        let plain = sidebar_metadata_session_budget(900.0, 0.0, true, &[]);
+        let with_usage = sidebar_metadata_session_budget(
+            900.0,
+            0.0,
+            true,
+            &[
+                "terminal 5h 90% +38m".to_owned(),
+                "agent 7d 73% +1d06:20".to_owned(),
+            ],
+        );
+
+        assert!(with_usage < plain);
+        assert_eq!(plain, 33);
     }
 }

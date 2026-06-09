@@ -32,7 +32,7 @@ use crate::{
         controller::MuxController,
         sidebar_meta::{
             SidebarMetadata, SidebarMetadataSession, collect_sidebar_metadata,
-            sidebar_metadata_sessions,
+            sidebar_metadata_sessions_for_prefix,
         },
         terminal::ActiveTerminal,
     },
@@ -380,7 +380,11 @@ impl BoottyApp {
         let Some(tx) = &self.sidebar_metadata_tx else {
             return;
         };
-        match tx.send(sidebar_metadata_sessions(self.mux.sessions())) {
+        let max_sessions = self.sidebar_metadata_session_budget(ctx);
+        match tx.send(sidebar_metadata_sessions_for_prefix(
+            self.mux.sessions(),
+            max_sessions,
+        )) {
             Ok(()) => {
                 self.last_sidebar_metadata_refresh = Instant::now();
                 self.sidebar_metadata_pending = true;
@@ -391,6 +395,24 @@ impl BoottyApp {
                 self.sidebar_metadata_pending = false;
             }
         }
+    }
+
+    fn sidebar_metadata_session_budget(&self, ctx: &egui::Context) -> usize {
+        let height = ctx.input(|input| input.content_rect().height());
+        let fullscreen_chrome = self.macos_non_native_fullscreen_active
+            || ctx.input(|input| input.viewport().fullscreen.unwrap_or(false));
+        let title_visible = self.config().window.custom_chrome_title_visible();
+        let top_inset = if fullscreen_chrome && !title_visible {
+            28.0
+        } else {
+            0.0
+        };
+        chrome::sidebar_metadata_session_budget(
+            height,
+            top_inset,
+            title_visible,
+            self.sidebar_metadata.usage_lines(),
+        )
     }
 
     fn ensure_sidebar_metadata_worker(&mut self, ctx: &egui::Context) {

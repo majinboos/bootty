@@ -5,7 +5,7 @@ use bootty_app::{
     mux::{
         sidebar_meta::{
             DiffStat, ProcessStatus, SidebarMetadata, SidebarSessionMetadata,
-            sidebar_metadata_sessions,
+            sidebar_metadata_sessions, sidebar_metadata_sessions_for_prefix,
         },
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
@@ -28,6 +28,7 @@ use eframe::{
 type ScenarioBuilder = (&'static str, fn() -> TerminalEngine);
 
 const SIDEBAR_BENCH_SESSION_COUNTS: [usize; 3] = [24, 96, 384];
+const SIDEBAR_VISIBLE_METADATA_PREFIX: usize = 42;
 
 struct PreparedScenario {
     name: &'static str,
@@ -673,6 +674,18 @@ fn bench_sidebar_metadata_request(c: &mut Criterion) {
         c.bench_function(
             &format!("sidebar_metadata_request_{count}_rich_sessions"),
             |b| b.iter(|| black_box(sidebar_metadata_sessions(black_box(&sessions))).len()),
+        );
+        c.bench_function(
+            &format!("sidebar_metadata_request_{count}_rich_sessions_visible_prefix"),
+            |b| {
+                b.iter(|| {
+                    black_box(sidebar_metadata_sessions_for_prefix(
+                        black_box(&sessions),
+                        black_box(SIDEBAR_VISIBLE_METADATA_PREFIX),
+                    ))
+                    .len()
+                })
+            },
         );
 
         let native_sessions = native_sidebar_sessions_without_metadata(count);

@@ -73,8 +73,15 @@ impl SidebarMetadata {
 }
 
 pub fn sidebar_metadata_sessions(sessions: &[MuxSession]) -> Vec<SidebarMetadataSession> {
-    let mut metadata_sessions = Vec::with_capacity(sessions.len());
-    for session in sessions {
+    sidebar_metadata_sessions_for_prefix(sessions, sessions.len())
+}
+
+pub fn sidebar_metadata_sessions_for_prefix(
+    sessions: &[MuxSession],
+    max_sessions: usize,
+) -> Vec<SidebarMetadataSession> {
+    let mut metadata_sessions = Vec::with_capacity(sessions.len().min(max_sessions));
+    for session in sessions.iter().take(max_sessions) {
         if !needs_sidebar_metadata_request(session) {
             continue;
         }
@@ -651,6 +658,49 @@ mod tests {
                     cwd: Some("/tmp/native".to_owned()),
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn sidebar_metadata_sessions_for_prefix_skips_offscreen_sessions() {
+        let sessions = vec![
+            MuxSession {
+                id: "$1".to_owned(),
+                name: "work/one".to_owned(),
+                active: true,
+                anchor: MuxPaneAnchor {
+                    session_id: "$1".to_owned(),
+                    pane_id: Some("%1".to_owned()),
+                    cwd: Some("/tmp/one".to_owned()),
+                    process: Some("zsh".to_owned()),
+                },
+                active_window_id: None,
+                windows: Vec::new(),
+            },
+            MuxSession {
+                id: "$2".to_owned(),
+                name: "work/two".to_owned(),
+                active: false,
+                anchor: MuxPaneAnchor {
+                    session_id: "$2".to_owned(),
+                    pane_id: Some("%2".to_owned()),
+                    cwd: Some("/tmp/two".to_owned()),
+                    process: Some("zsh".to_owned()),
+                },
+                active_window_id: None,
+                windows: Vec::new(),
+            },
+        ];
+
+        let metadata_sessions = sidebar_metadata_sessions_for_prefix(&sessions, 1);
+
+        assert_eq!(
+            metadata_sessions,
+            vec![SidebarMetadataSession {
+                id: "$1".to_owned(),
+                name: "work/one".to_owned(),
+                cwd: Some("/tmp/one".to_owned()),
+            }]
         );
     }
 
