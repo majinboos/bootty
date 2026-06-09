@@ -4,6 +4,7 @@ use super::{
     backend::MuxBackend,
     command::MuxCommand,
     config::MuxBackendKind,
+    order,
     process::{CommandRunner, SystemCommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
 };
@@ -65,7 +66,7 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
             "-F",
             "#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{window_active}\t#{pane_active}\t#{pane_id}\t#{pane_current_path}\t#{pane_current_command}",
         ])?;
-        parse_tmux_snapshot(&sessions, &panes)
+        parse_tmux_snapshot(&sessions, &panes, true)
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
@@ -96,11 +97,17 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
             MuxCommand::DitchSession { session_id } => {
                 self.run_owned(vec!["kill-session".into(), "-t".into(), session_id])?;
             }
+            MuxCommand::MoveSession { delta } => {
+                let current_session = self.run(&["display-message", "-p", "#S"])?;
+                let current_session = current_session.trim();
+                if !current_session.is_empty() {
+                    order::move_session(current_session, delta);
+                }
+            }
             MuxCommand::ActivateNextSession
             | MuxCommand::ActivatePreviousSession
             | MuxCommand::ActivateLastSession
             | MuxCommand::ActivateSessionIndex { .. }
-            | MuxCommand::MoveSession { .. }
             | MuxCommand::NewWindow { .. }
             | MuxCommand::ActivateNextWindow { .. }
             | MuxCommand::ActivatePreviousWindow { .. }
@@ -119,7 +126,11 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
     }
 }
 
-fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxSnapshot> {
+fn parse_tmux_snapshot(
+    sessions_output: &str,
+    panes_output: &str,
+    apply_session_order: bool,
+) -> Result<MuxSnapshot> {
     let mut sessions = Vec::new();
     for line in sessions_output
         .lines()
@@ -150,6 +161,9 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
         });
     }
     add_tmux_windows(&mut sessions, panes_output)?;
+    if apply_session_order {
+        order_tmux_sessions(&mut sessions);
+    }
 
     Ok(MuxSnapshot {
         active_session_id: sessions
@@ -158,6 +172,22 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
             .map(|session| session.id.clone()),
         sessions,
     })
+}
+
+fn order_tmux_sessions(sessions: &mut Vec<MuxSession>) {
+    use std::collections::{HashMap, HashSet};
+
+    let alive = sessions
+        .iter()
+        .map(|session| session.name.clone())
+        .collect::<HashSet<_>>();
+    let ordered_names = order::compute_order(&alive, false);
+    let ranks = ordered_names
+        .into_iter()
+        .enumerate()
+        .map(|(rank, name)| (name, rank))
+        .collect::<HashMap<_, _>>();
+    sessions.sort_by_key(|session| ranks.get(&session.name).copied().unwrap_or(usize::MAX));
 }
 
 fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<()> {

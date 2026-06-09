@@ -20,6 +20,8 @@ pub enum AppAction {
     NewMuxSession,
     Close,
     ToggleFullscreen,
+    ToggleSidebarFocus,
+    ToggleSidebarVisibility,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,6 +247,10 @@ fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
             Ok(KeybindAction::App(AppAction::Close))
         }
         BindingAction::ToggleFullscreen => Ok(KeybindAction::App(AppAction::ToggleFullscreen)),
+        BindingAction::ToggleSidebarFocus => Ok(KeybindAction::App(AppAction::ToggleSidebarFocus)),
+        BindingAction::ToggleSidebarVisibility => {
+            Ok(KeybindAction::App(AppAction::ToggleSidebarVisibility))
+        }
         BindingAction::NewTab => Ok(KeybindAction::Mux(MuxKeyAction::NewTab)),
         BindingAction::NextTab => Ok(KeybindAction::Mux(MuxKeyAction::NextTab)),
         BindingAction::PreviousTab => Ok(KeybindAction::Mux(MuxKeyAction::PreviousTab)),

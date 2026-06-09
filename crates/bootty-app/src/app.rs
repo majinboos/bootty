@@ -1,7 +1,12 @@
-use std::{sync::mpsc, time::Instant};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
-use eframe::egui::{self, Pos2, Rect, TextureHandle, UiBuilder};
+use eframe::egui::{
+    self, FontData, FontDefinitions, FontFamily, Pos2, Rect, TextureHandle, UiBuilder,
+};
 
 use crate::{
     app_actions::{
@@ -22,7 +27,10 @@ use crate::{
     },
     modifier_remap::ModifierRemapSet,
     mux::{
-        command::MuxCommand, config::selected_backend, controller::MuxController,
+        command::MuxCommand,
+        config::selected_backend,
+        controller::MuxController,
+        sidebar_meta::{SidebarMetadata, collect_sidebar_metadata},
         terminal::ActiveTerminal,
     },
     platform::{
@@ -39,6 +47,8 @@ use crate::{
         new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
     },
 };
+
+const SIDEBAR_METADATA_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct BoottyApp {
     terminal: ActiveTerminal,
@@ -60,6 +70,9 @@ pub struct BoottyApp {
     modifier_remaps: ModifierRemapSet,
     stability_trace: Option<StabilityTrace>,
     config_hot_reload: ConfigHotReload,
+    sidebar_metadata: SidebarMetadata,
+    last_sidebar_metadata_refresh: Instant,
+    sidebar_metadata_rx: Option<mpsc::Receiver<SidebarMetadata>>,
     new_mux_session_dialog: Option<NewMuxSessionDialog>,
     app_icon_texture: Option<TextureHandle>,
     macos_app_icon_installed: bool,
@@ -111,6 +124,7 @@ impl BoottyApp {
         config: BoottyConfig,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
     ) -> Result<Self> {
+        configure_egui_fonts(&cc.egui_ctx, &config.font.family);
         let repaint_ctx = cc.egui_ctx.clone();
         let modifier_remaps = config.input.modifier_remaps()?;
         let keybinds = config
@@ -155,6 +169,9 @@ impl BoottyApp {
             modifier_remaps,
             stability_trace,
             config_hot_reload,
+            sidebar_metadata: SidebarMetadata::default(),
+            last_sidebar_metadata_refresh: Instant::now() - SIDEBAR_METADATA_REFRESH_INTERVAL,
+            sidebar_metadata_rx: None,
             new_mux_session_dialog: None,
             app_icon_texture: None,
             macos_app_icon_installed: false,
@@ -190,6 +207,7 @@ impl eframe::App for BoottyApp {
         if let Some(result) = self.mux.poll_command() {
             self.last_error = result.err();
         }
+        self.refresh_sidebar_metadata(ctx);
         if let Err(error) = self
             .terminal
             .sync_mux_anchor(&mux_config, self.mux.selected_session_anchor().cloned())
@@ -245,6 +263,44 @@ impl eframe::App for BoottyApp {
     }
 }
 
+fn configure_egui_fonts(ctx: &egui::Context, families: &[String]) {
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+
+    let mut fonts = FontDefinitions::default();
+    for family in families.iter().rev() {
+        let query_families = [fontdb::Family::Name(family)];
+        let query = fontdb::Query {
+            families: &query_families,
+            ..fontdb::Query::default()
+        };
+        let Some(id) = db.query(&query) else {
+            continue;
+        };
+        let Some((bytes, index)) = db.with_face_data(id, |data, index| (data.to_vec(), index))
+        else {
+            continue;
+        };
+        let name = format!("bootty-ui-{family}");
+        let mut font_data = FontData::from_owned(bytes);
+        font_data.index = index;
+        fonts
+            .font_data
+            .insert(name.clone(), std::sync::Arc::new(font_data));
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .insert(0, name.clone());
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, name);
+    }
+
+    ctx.set_fonts(fonts);
+}
 impl BoottyApp {
     fn config(&self) -> &BoottyConfig {
         self.config_state.current()
@@ -254,15 +310,52 @@ impl BoottyApp {
         theme_from_config(self.config())
     }
 
+    fn refresh_sidebar_metadata(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.sidebar_metadata_rx {
+            match rx.try_recv() {
+                Ok(metadata) => {
+                    self.sidebar_metadata = metadata;
+                    self.sidebar_metadata_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.sidebar_metadata_rx = None;
+                }
+            }
+        }
+
+        if self.sidebar_metadata_rx.is_some()
+            || self.last_sidebar_metadata_refresh.elapsed() < SIDEBAR_METADATA_REFRESH_INTERVAL
+        {
+            return;
+        }
+
+        self.last_sidebar_metadata_refresh = Instant::now();
+        let sessions = self.mux.sessions().to_vec();
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        std::thread::spawn(move || {
+            let metadata = collect_sidebar_metadata(&sessions);
+            if tx.send(metadata).is_ok() {
+                repaint.request_repaint();
+            }
+        });
+        self.sidebar_metadata_rx = Some(rx);
+    }
+
     fn show_fixed_layout(&mut self, ui: &mut egui::Ui) {
         let rect = ui.max_rect();
         let chrome = self.config().chrome.clone();
+        let fullscreen_chrome = self.macos_non_native_fullscreen_active
+            || ui
+                .ctx()
+                .input(|input| input.viewport().fullscreen.unwrap_or(false));
         let sidebar_width = if chrome.sidebar {
             chrome.sidebar_width
         } else {
             0.0
         };
-        let gap = if chrome.sidebar && sidebar_width > 0.0 {
+        let gap = if chrome.sidebar && sidebar_width > 0.0 && !fullscreen_chrome {
             chrome.gap
         } else {
             0.0
@@ -308,6 +401,12 @@ impl BoottyApp {
                     let title_visible = self.config().window.custom_chrome_title_visible();
                     let reserve_titlebar_buttons =
                         self.config().window.reserves_macos_titlebar_button_area();
+                    let fullscreen_chrome = fullscreen_chrome;
+                    let top_inset = if fullscreen_chrome && !title_visible {
+                        28.0
+                    } else {
+                        0.0
+                    };
                     let title_icon = title_visible.then(|| {
                         chrome::load_app_icon_texture(ui.ctx(), &mut self.app_icon_texture)
                     });
@@ -318,9 +417,13 @@ impl BoottyApp {
                         SidebarModel {
                             sessions: self.mux.sessions(),
                             selected_session: self.mux.selected_session(),
+                            metadata: &self.sidebar_metadata,
                             title_visible,
                             reserve_titlebar_buttons,
                             title_icon: title_icon.as_ref(),
+                            top_inset,
+                            border_visible: !fullscreen_chrome,
+                            separator_visible: !fullscreen_chrome,
                         },
                     ) {
                         let mux_config = self.config().multiplexer.clone();
@@ -510,14 +613,15 @@ impl BoottyApp {
     ) -> (Vec<egui::Event>, Vec<KeybindAction>) {
         split_app_actions_for_bindings(&mut self.app_key_bindings, events)
     }
+
     fn handle_egui_input(&mut self, ctx: &egui::Context) -> usize {
         let (snapshot, actions) = ctx.input(|input| {
-            let routed = route_events(self.input_focus, input.events.clone());
-            let (events, actions) = self.split_app_actions(routed.terminal_events);
+            let (events, actions) = self.split_app_actions(input.events.clone());
+            let routed = route_events(self.input_focus, events);
             let events = if self.new_mux_session_dialog.is_some() {
                 Vec::new()
             } else {
-                events
+                routed.terminal_events
             };
             (
                 InputSnapshot {
@@ -549,7 +653,6 @@ impl BoottyApp {
 
         count
     }
-
     fn drain_direct_input(&mut self) {
         let Some(rx) = &self.direct_input_rx else {
             return;
@@ -628,6 +731,23 @@ impl BoottyApp {
                     }
                 }
             }
+            KeybindAction::App(AppAction::ToggleSidebarFocus) => {
+                if self.input_focus == InputFocus::Sidebar {
+                    self.input_focus = InputFocus::Terminal;
+                } else {
+                    self.config_state.current_mut().chrome.sidebar = true;
+                    self.input_focus = InputFocus::Sidebar;
+                }
+                ctx.request_repaint();
+            }
+            KeybindAction::App(AppAction::ToggleSidebarVisibility) => {
+                let chrome = &mut self.config_state.current_mut().chrome;
+                chrome.sidebar = !chrome.sidebar;
+                if !chrome.sidebar {
+                    self.input_focus = InputFocus::Terminal;
+                }
+                ctx.request_repaint();
+            }
             KeybindAction::Mux(action) => self.apply_mux_key_action(ctx, action),
             KeybindAction::Scroll(action) => self.apply_terminal_scroll_action(action),
             KeybindAction::Write(bytes) => {
@@ -652,6 +772,9 @@ impl BoottyApp {
     }
 
     fn apply_mux_key_action(&mut self, ctx: &egui::Context, action: MuxKeyAction) {
+        if self.apply_session_navigation_action(ctx, action) {
+            return;
+        }
         let selected_session = self.mux.selected_session().unwrap_or("local").to_owned();
         let command = match action {
             MuxKeyAction::NextSession => MuxCommand::ActivateNextSession,
@@ -701,6 +824,46 @@ impl BoottyApp {
         };
         let mux_config = self.config().multiplexer.clone();
         self.mux.execute_command(ctx, &mux_config, command);
+    }
+
+    fn apply_session_navigation_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: MuxKeyAction,
+    ) -> bool {
+        let target = match action {
+            MuxKeyAction::SelectSession(index) => self
+                .mux
+                .sessions()
+                .get(index.saturating_sub(1) as usize)
+                .map(|session| session.id.clone()),
+            MuxKeyAction::NextSession => self.relative_session(1),
+            MuxKeyAction::PreviousSession => self.relative_session(-1),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let mux_config = self.config().multiplexer.clone();
+        self.mux.activate_session(&target, ctx, &mux_config);
+        true
+    }
+
+    fn relative_session(&self, delta: isize) -> Option<String> {
+        let sessions = self.mux.sessions();
+        if sessions.is_empty() {
+            return None;
+        }
+        let selected = self.mux.selected_session();
+        let current = selected
+            .and_then(|selected| {
+                sessions
+                    .iter()
+                    .position(|session| session.id == selected || session.name == selected)
+            })
+            .unwrap_or(0);
+        let next = (current as isize + delta).rem_euclid(sessions.len() as isize) as usize;
+        sessions.get(next).map(|session| session.id.clone())
     }
 
     fn apply_terminal_scroll_action(&mut self, action: TerminalScrollAction) {

@@ -29,6 +29,7 @@ rmux-ipc.workspace = true
 rmux-proto.workspace = true
 rmux-sdk.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 toml_edit.workspace = true
 ttf-parser.workspace = true
@@ -46,7 +47,6 @@ criterion.workspace = true
 indoc.workspace = true
 proptest.workspace = true
 rstest.workspace = true
-serde_json.workspace = true
 tempfile.workspace = true
 
 [[bench]]
