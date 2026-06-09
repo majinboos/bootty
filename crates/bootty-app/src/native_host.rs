@@ -20,7 +20,7 @@ pub fn run(options: eframe::NativeOptions, config: BoottyConfig) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("create bootty event loop")?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
     let (direct_input_tx, direct_input_rx) = mpsc::channel();
     let app_creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
         Ok(Box::new(BoottyApp::new_with_direct_input(
