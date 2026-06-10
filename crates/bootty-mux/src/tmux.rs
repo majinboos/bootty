@@ -252,7 +252,7 @@ mod tests {
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     use super::*;
-    use crate::mux::process::{CommandOutput, CommandRunner};
+    use crate::process::{CommandOutput, CommandRunner};
 
     #[derive(Clone, Default)]
     struct RecordingRunner {

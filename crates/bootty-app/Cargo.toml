@@ -9,24 +9,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 arboard.workspace = true
-derive_more.workspace = true
 eframe.workspace = true
 fontdb.workspace = true
 libghostty-vt.workspace = true
 bootty-winit = { path = "../bootty-winit", default-features = false }
 bootty-config = { path = "../bootty-config" }
+bootty-mux = { path = "../bootty-mux" }
 bootty-ui = { path = "../bootty-ui" }
 bootty-render = { path = "../bootty-render" }
 bootty-runtime = { path = "../bootty-runtime" }
 bootty-surface = { path = "../bootty-surface" }
 bootty-terminal = { path = "../bootty-terminal" }
 png.workspace = true
-rmux-ipc.workspace = true
-rmux-proto.workspace = true
-rmux-sdk.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-tokio = { workspace = true, features = ["rt"] }
 wgpu.workspace = true
 winit.workspace = true
 

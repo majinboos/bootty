@@ -31,27 +31,7 @@ pub struct TerminalWidget {
     render_cache: TerminalRenderCache,
 }
 
-pub trait TerminalRenderSource {
-    fn resize(&mut self, geometry: crate::geometry::TerminalGeometry) -> Result<()>;
-    fn extract_frame(&mut self) -> Result<Arc<RenderFrame>>;
-    fn scroll_viewport_delta(&mut self, _delta: isize) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl TerminalRenderSource for crate::terminal::TerminalSession {
-    fn resize(&mut self, geometry: crate::geometry::TerminalGeometry) -> Result<()> {
-        Self::resize(self, geometry)
-    }
-
-    fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
-        Self::extract_frame(self)
-    }
-
-    fn scroll_viewport_delta(&mut self, delta: isize) -> Result<()> {
-        Self::scroll_viewport_delta(self, delta)
-    }
-}
+pub use bootty_runtime::render_source::TerminalRenderSource;
 
 impl TerminalWidget {
     pub fn new(target_format: Option<wgpu::TextureFormat>) -> Self {

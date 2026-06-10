@@ -71,6 +71,7 @@ pub struct BoottyApp {
     app_key_bindings: AppKeyBindings,
     has_new_session_config_changes: bool,
     mux: MuxController,
+    repaint: crate::mux::RepaintHandle,
     direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
     modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     modifier_sides: ModifierSideState,
@@ -173,6 +174,8 @@ impl BoottyApp {
     ) -> Result<Self> {
         configure_egui_fonts(&cc.egui_ctx, &config.font.family);
         let repaint_ctx = cc.egui_ctx.clone();
+        let repaint: crate::mux::RepaintHandle =
+            std::sync::Arc::new(move || repaint_ctx.request_repaint());
         let modifier_remaps = config.input.modifier_remaps()?;
         let macos_option_as_alt = config.input.macos_option_as_alt.into();
         let keybinds = config
@@ -192,7 +195,7 @@ impl BoottyApp {
                 TerminalWidget::initial_geometry(),
                 &config.multiplexer,
                 session_config,
-                std::sync::Arc::new(move || repaint_ctx.request_repaint()),
+                repaint.clone(),
             ),
             terminal_widget: TerminalWidget::new(
                 cc.wgpu_render_state
@@ -212,6 +215,7 @@ impl BoottyApp {
             app_key_bindings,
             has_new_session_config_changes: false,
             mux: MuxController::new(),
+            repaint,
             direct_input_rx,
             modifier_side_rx,
             modifier_sides: ModifierSideState::default(),
@@ -265,7 +269,7 @@ impl eframe::App for BoottyApp {
 
         if let Some(error) = self
             .mux
-            .refresh_sessions(ctx, &self.config_state.current().multiplexer)
+            .refresh_sessions(&self.repaint, &self.config_state.current().multiplexer)
         {
             self.last_error = Some(error);
         }
@@ -556,7 +560,7 @@ impl BoottyApp {
                     ) {
                         let mux_config = self.config().multiplexer.clone();
                         self.mux
-                            .activate_session(&session_id, ui.ctx(), &mux_config);
+                            .activate_session(&session_id, &self.repaint, &mux_config);
                     }
                 },
             );
@@ -601,8 +605,12 @@ impl BoottyApp {
                     ) && let Some(session_id) = self.mux.selected_session().map(str::to_owned)
                     {
                         let mux_config = self.config().multiplexer.clone();
-                        self.mux
-                            .activate_window(&session_id, &window_id, ui.ctx(), &mux_config);
+                        self.mux.activate_window(
+                            &session_id,
+                            &window_id,
+                            &self.repaint,
+                            &mux_config,
+                        );
                     }
                 },
             );
@@ -640,7 +648,8 @@ impl BoottyApp {
             }
             NewSessionPickerEvent::CreateSession(request) => {
                 let mux_config = self.config().multiplexer.clone();
-                self.mux.create_project_session(request, ctx, &mux_config);
+                self.mux
+                    .create_project_session(request, &self.repaint, &mux_config);
             }
         }
     }
@@ -896,7 +905,7 @@ impl BoottyApp {
                 }
                 ctx.request_repaint();
             }
-            KeybindAction::Mux(action) => self.apply_mux_key_action(ctx, action),
+            KeybindAction::Mux(action) => self.apply_mux_key_action(action),
             KeybindAction::Scroll(action) => self.apply_terminal_scroll_action(action),
             KeybindAction::Write(bytes) => {
                 if let Err(error) = self.terminal.write_input(&bytes) {
@@ -919,8 +928,8 @@ impl BoottyApp {
         }
     }
 
-    fn apply_mux_key_action(&mut self, ctx: &egui::Context, action: MuxKeyAction) {
-        if self.apply_session_navigation_action(ctx, action) {
+    fn apply_mux_key_action(&mut self, action: MuxKeyAction) {
+        if self.apply_session_navigation_action(action) {
             return;
         }
         let selected_session = self.mux.selected_session().unwrap_or("local").to_owned();
@@ -971,14 +980,11 @@ impl BoottyApp {
             },
         };
         let mux_config = self.config().multiplexer.clone();
-        self.mux.execute_command(ctx, &mux_config, command);
+        self.mux
+            .execute_command(&self.repaint, &mux_config, command);
     }
 
-    fn apply_session_navigation_action(
-        &mut self,
-        ctx: &egui::Context,
-        action: MuxKeyAction,
-    ) -> bool {
+    fn apply_session_navigation_action(&mut self, action: MuxKeyAction) -> bool {
         let target = match action {
             MuxKeyAction::SelectSession(index) => self
                 .mux
@@ -993,7 +999,8 @@ impl BoottyApp {
             return false;
         };
         let mux_config = self.config().multiplexer.clone();
-        self.mux.activate_session(&target, ctx, &mux_config);
+        self.mux
+            .activate_session(&target, &self.repaint, &mux_config);
         true
     }
 

@@ -31,6 +31,10 @@ multiple callers.
   includes, restricted theme color resolution, reload state, and round-trip
   TOML writeback. It is host-neutral so non-egui hosts can load the same
   config.
+- `bootty-mux` owns backend-neutral session snapshots, lifecycle commands,
+  Bootty-native mux state, rmux/tmux/zellij adapter command translation, and
+  the tmux control-mode protocol parser. It is egui-free: the controller
+  signals repaints through a `RepaintHandle` callback supplied by the host.
 - `bootty` is the stable library facade: re-exports of the four core library
   crates for external callers.
 - `bootty-ui` owns egui theme/color widgets shared by app chrome.
@@ -87,8 +91,8 @@ render frames.
   resolution, includes, restricted theme resolution, reload state, and
   round-trip TOML writeback. `bootty-config::config_reload` owns hot-reload
   polling state.
-- `mux/` owns backend selection, backend-neutral commands, snapshots, and mux
-  backend contracts.
+- `bootty-mux` owns backend selection, backend-neutral commands, snapshots,
+  and mux backend contracts.
 - `input/` owns app input focus and event routing before terminal input
   conversion.
 - `ui/` owns native sidebar, picker, and dialog state/rendering.
@@ -132,10 +136,9 @@ render frames.
   fills, text, color glyphs, sprites, decorations, images, and cursors.
 - `bootty-winit::bare_host` owns the minimal non-egui window path and its surface
   format selection guardrail so terminal palette colors are not gamma-shifted.
-- `bootty::mux` owns backend-neutral session snapshots, lifecycle commands,
-  Bootty-native mux state, and rmux/tmux/zellij adapter command translation.
-  `app.rs` consumes this contract and must not invoke backend command surfaces
-  directly.
+- `bootty-mux` exposes the mux contract consumed by `app.rs`; the app must not
+  invoke backend command surfaces directly. The crate boundary enforces that
+  mux logic stays free of egui and app types.
 
 ## Runtime flow
 

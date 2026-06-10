@@ -1,4 +1,4 @@
-use crate::config::{MultiplexerBackendConfig, MultiplexerConfig};
+use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
 use super::{
     backend::MuxBackend, native::NativeBackend, rmux::RmuxBackend, tmux::TmuxBackend,
@@ -40,7 +40,7 @@ pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::MultiplexerConfig;
+    use bootty_config::config::MultiplexerConfig;
 
     #[test]
     fn selected_backend_preserves_configured_backend_without_fallback() {

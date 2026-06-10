@@ -12,14 +12,15 @@ use bootty_surface::geometry::TerminalGeometry;
 use bootty_terminal::terminal_frame::RenderFrame;
 use derive_more::{Deref, DerefMut};
 
+use bootty_config::config::MultiplexerConfig;
+use bootty_runtime::{
+    DrainStats, TerminalSession, TerminalSessionConfig, render_source::TerminalRenderSource,
+};
+use bootty_terminal::terminal_input_model::{KeyInput, MouseInput};
+
 use crate::{
-    config::MultiplexerConfig,
-    mux::{
-        config::{MuxBackendKind, selected_backend},
-        snapshot::MuxPaneAnchor,
-    },
-    renderer::TerminalRenderSource,
-    terminal::{DrainStats, KeyInput, MouseInput, TerminalSession, TerminalSessionConfig},
+    config::{MuxBackendKind, selected_backend},
+    snapshot::MuxPaneAnchor,
 };
 
 use super::{rmux_native::RmuxNativeTerminal, tmux_control::TmuxControlTerminal};
@@ -471,7 +472,7 @@ mod tests {
     use bootty_terminal::terminal_engine::TerminalColorConfig;
     use tempfile::TempDir;
 
-    use crate::config::{MultiplexerBackendConfig, MultiplexerConfig};
+    use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
     fn terminal_config() -> TerminalSessionConfig {
         TerminalSessionConfig {
@@ -619,7 +620,7 @@ mod tests {
     #[test]
     fn backend_owned_ui_uses_tmux_compatible_term() {
         let mut config = TerminalSessionConfig {
-            launch: crate::terminal::SessionLaunchConfig {
+            launch: bootty_runtime::SessionLaunchConfig {
                 term: "xterm-ghostty".to_owned(),
                 ..Default::default()
             },

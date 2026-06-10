@@ -11,7 +11,7 @@ pub trait MuxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mux::snapshot::{MuxPaneAnchor, MuxSession};
+    use crate::snapshot::{MuxPaneAnchor, MuxSession};
 
     #[derive(Default)]
     struct FakeBackend {

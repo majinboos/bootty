@@ -18,11 +18,11 @@ use bootty_terminal::{
     terminal_input_model::{KeyInput, MacosOptionAsAlt, MouseInput},
 };
 
+use bootty_runtime::{DrainStats, render_source::TerminalRenderSource};
+
 use crate::{
-    mux::config::MuxBackendKind,
-    renderer::TerminalRenderSource,
-    terminal::DrainStats,
-    tmux::{TmuxControlNotification, TmuxControlParser},
+    config::MuxBackendKind,
+    tmux_protocol::{TmuxControlNotification, TmuxControlParser},
 };
 
 use super::{

@@ -267,7 +267,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::mux::command::MuxCommand;
+    use crate::command::MuxCommand;
 
     #[derive(Clone, Default)]
     struct RecordingClient {

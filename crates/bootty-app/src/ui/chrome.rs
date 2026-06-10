@@ -10,7 +10,7 @@ use crate::{
     mux::{
         config::MuxBackendKind,
         sidebar_meta::{DiffStat, SidebarMetadata},
-        snapshot::{MuxSession, MuxSnapshot, MuxWindow},
+        snapshot::{MuxSession, MuxWindow},
     },
     strings::{push_truncated_label, truncate_label},
     ui::sidebar::{
@@ -387,17 +387,6 @@ pub fn selected_session_name<'a>(
         .iter()
         .find(|session| session.id == selected || session.name == selected)
         .map(|session| session.name.as_str())
-}
-
-pub fn selection_after_refresh(current: Option<String>, snapshot: &MuxSnapshot) -> Option<String> {
-    current.or_else(|| {
-        snapshot
-            .sessions
-            .iter()
-            .find(|session| session.active)
-            .or_else(|| snapshot.sessions.first())
-            .map(|session| session.id.clone())
-    })
 }
 
 fn sidebar_item_row(

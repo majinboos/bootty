@@ -24,7 +24,7 @@ use rmux_sdk::{
 };
 use tokio::runtime::{Builder, Runtime};
 
-use crate::{renderer::TerminalRenderSource, terminal::DrainStats};
+use bootty_runtime::{DrainStats, render_source::TerminalRenderSource};
 
 use super::pane::{MuxPaneTarget, TerminalRuntime};
 
@@ -287,7 +287,7 @@ fn rmux_key_token(input: KeyInput) -> Option<String> {
     }
 }
 
-fn has_terminal_modifier(mods: crate::terminal::KeyMods) -> bool {
+fn has_terminal_modifier(mods: bootty_terminal::terminal_input_model::KeyMods) -> bool {
     mods.ctrl || mods.alt
 }
 
@@ -305,8 +305,8 @@ fn rmux_key_base(input: KeyInput) -> Option<String> {
     rmux_named_key(input.key).map(str::to_owned)
 }
 
-fn rmux_named_key(key: crate::terminal::TerminalKey) -> Option<&'static str> {
-    use crate::terminal::TerminalKey;
+fn rmux_named_key(key: bootty_terminal::terminal_input_model::TerminalKey) -> Option<&'static str> {
+    use bootty_terminal::terminal_input_model::TerminalKey;
 
     Some(match key {
         TerminalKey::Enter => "Enter",
@@ -621,7 +621,9 @@ fn local_endpoint(endpoint: &RmuxEndpoint) -> Result<LocalEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::{KeyMods, MouseAction, MouseButton, MouseEncoderSize, TerminalKey};
+    use bootty_terminal::terminal_input_model::{
+        KeyMods, MouseAction, MouseButton, MouseEncoderSize, TerminalKey,
+    };
     use rmux_sdk::{PaneCell, PaneCursor, PaneGlyph, SessionName};
 
     fn snapshot(cells: Vec<PaneCell>) -> PaneSnapshot {

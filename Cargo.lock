@@ -607,6 +607,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "bootty-config",
+ "bootty-mux",
  "bootty-render",
  "bootty-runtime",
  "bootty-surface",
@@ -614,7 +615,6 @@ dependencies = [
  "bootty-ui",
  "bootty-winit",
  "criterion",
- "derive_more",
  "eframe",
  "fontdb",
  "indoc",
@@ -625,14 +625,9 @@ dependencies = [
  "png 0.18.1",
  "pollster",
  "proptest",
- "rmux-ipc",
- "rmux-proto",
- "rmux-sdk",
  "rstest",
  "serde",
- "serde_json",
  "tempfile",
- "tokio",
  "wgpu",
  "winit",
 ]
@@ -652,6 +647,26 @@ dependencies = [
  "serde",
  "tempfile",
  "toml_edit 0.25.12+spec-1.1.0",
+]
+
+[[package]]
+name = "bootty-mux"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bootty-config",
+ "bootty-runtime",
+ "bootty-surface",
+ "bootty-terminal",
+ "derive_more",
+ "libghostty-vt",
+ "rmux-ipc",
+ "rmux-proto",
+ "rmux-sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

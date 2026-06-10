@@ -14,11 +14,7 @@ use model::{
     picker_selection_after_navigation,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NewMuxSessionRequest {
-    pub session_id: String,
-    pub cwd: String,
-}
+pub use crate::mux::controller::NewMuxSessionRequest;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewMuxSessionDialog {

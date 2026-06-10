@@ -4,19 +4,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use eframe::egui;
+use bootty_config::config::MultiplexerConfig;
 
 use crate::{
-    config::MultiplexerConfig,
-    mux::{
-        command::MuxCommand,
-        config::{MuxBackendKind, build_backend, selected_backend},
-        snapshot::{MuxSession, MuxSnapshot},
-    },
-    ui::{chrome, new_session_picker::NewMuxSessionRequest},
+    RepaintHandle,
+    command::MuxCommand,
+    config::{MuxBackendKind, build_backend, selected_backend},
+    snapshot::{MuxSession, MuxSnapshot, selection_after_refresh},
 };
 
 const MUX_SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(900);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewMuxSessionRequest {
+    pub session_id: String,
+    pub cwd: String,
+}
 
 type SessionRefreshResult = std::result::Result<(MuxBackendKind, MuxSnapshot), String>;
 type MuxCommandResult = std::result::Result<Option<String>, String>;
@@ -82,7 +85,7 @@ impl MuxController {
         self.selected_session.as_deref()
     }
 
-    pub fn selected_session_anchor(&self) -> Option<&crate::mux::snapshot::MuxPaneAnchor> {
+    pub fn selected_session_anchor(&self) -> Option<&crate::snapshot::MuxPaneAnchor> {
         let selected = self.selected_session.as_deref()?;
         let session = self
             .sessions
@@ -99,7 +102,7 @@ impl MuxController {
         Some(&session.anchor)
     }
 
-    pub fn selected_session_windows(&self) -> &[crate::mux::snapshot::MuxWindow] {
+    pub fn selected_session_windows(&self) -> &[crate::snapshot::MuxWindow] {
         let Some(selected) = self.selected_session.as_deref() else {
             return &[];
         };
@@ -116,7 +119,7 @@ impl MuxController {
 
     pub fn refresh_sessions(
         &mut self,
-        ctx: &egui::Context,
+        repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) -> Option<String> {
         if let Some(result) = self.poll_session_refresh() {
@@ -148,7 +151,7 @@ impl MuxController {
             return None;
         }
 
-        self.ensure_session_refresh_worker(ctx);
+        self.ensure_session_refresh_worker(repaint);
         let Some(tx) = &self.session_refresh_tx else {
             return Some("mux session refresh worker did not start".to_owned());
         };
@@ -211,7 +214,7 @@ impl MuxController {
     pub fn activate_session(
         &mut self,
         session_id: &str,
-        ctx: &egui::Context,
+        repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) {
         self.selected_session = Some(session_id.to_owned());
@@ -223,20 +226,20 @@ impl MuxController {
             .execute_native_command(config, command.clone(), Some(session_id.to_owned()), None)
             .is_ok()
         {
-            ctx.request_repaint();
+            repaint();
             return;
         }
         if self.mux_command_rx.is_some() {
             return;
         }
-        self.spawn_command(ctx, config, command, Some(session_id.to_owned()));
+        self.spawn_command(repaint, config, command, Some(session_id.to_owned()));
     }
 
     pub fn activate_window(
         &mut self,
         session_id: &str,
         window_id: &str,
-        ctx: &egui::Context,
+        repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) {
         self.selected_session = Some(session_id.to_owned());
@@ -254,19 +257,19 @@ impl MuxController {
             )
             .is_ok()
         {
-            ctx.request_repaint();
+            repaint();
             return;
         }
         if self.mux_command_rx.is_some() {
             return;
         }
-        self.spawn_command(ctx, config, command, Some(session_id.to_owned()));
+        self.spawn_command(repaint, config, command, Some(session_id.to_owned()));
     }
 
     pub fn create_project_session(
         &mut self,
         request: NewMuxSessionRequest,
-        ctx: &egui::Context,
+        repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) {
         let command = MuxCommand::CreateProjectSession {
@@ -282,7 +285,7 @@ impl MuxController {
             )
             .is_ok()
         {
-            ctx.request_repaint();
+            repaint();
             return;
         }
         if self.mux_command_rx.is_some() {
@@ -290,7 +293,7 @@ impl MuxController {
         }
         self.selected_session = Some(request.session_id.clone());
         self.selected_window = None;
-        self.spawn_command(ctx, config, command, Some(request.session_id));
+        self.spawn_command(repaint, config, command, Some(request.session_id));
     }
 
     fn poll_session_refresh(&mut self) -> Option<SessionRefreshResult> {
@@ -307,14 +310,14 @@ impl MuxController {
         result
     }
 
-    fn ensure_session_refresh_worker(&mut self, ctx: &egui::Context) {
+    fn ensure_session_refresh_worker(&mut self, repaint: &RepaintHandle) {
         if self.session_refresh_tx.is_some() && self.session_refresh_rx.is_some() {
             return;
         }
 
         let (request_tx, request_rx) = mpsc::channel::<MultiplexerConfig>();
         let (result_tx, result_rx) = mpsc::channel::<SessionRefreshResult>();
-        let repaint = ctx.clone();
+        let repaint = repaint.clone();
         thread::spawn(move || {
             while let Ok(mux_config) = request_rx.recv() {
                 let backend_kind = selected_backend(&mux_config);
@@ -325,7 +328,7 @@ impl MuxController {
                 if result_tx.send(result).is_err() {
                     break;
                 }
-                repaint.request_repaint();
+                repaint();
             }
         });
         self.session_refresh_tx = Some(request_tx);
@@ -334,7 +337,7 @@ impl MuxController {
 
     pub fn execute_command(
         &mut self,
-        ctx: &egui::Context,
+        repaint: &RepaintHandle,
         config: &MultiplexerConfig,
         command: MuxCommand,
     ) {
@@ -342,13 +345,13 @@ impl MuxController {
             .execute_native_command(config, command.clone(), None, None)
             .is_ok()
         {
-            ctx.request_repaint();
+            repaint();
             return;
         }
         if self.mux_command_rx.is_some() {
             return;
         }
-        self.spawn_command(ctx, config, command, None);
+        self.spawn_command(repaint, config, command, None);
     }
 
     fn execute_native_command(
@@ -388,7 +391,7 @@ impl MuxController {
         if same_backend {
             snapshot.sessions = stable_session_order(&self.sessions, snapshot.sessions);
         }
-        self.selected_session = chrome::selection_after_refresh(preferred_session, &snapshot);
+        self.selected_session = selection_after_refresh(preferred_session, &snapshot);
         self.selected_window = selected_window_after_refresh(
             self.selected_session.as_deref(),
             preferred_window,
@@ -400,13 +403,13 @@ impl MuxController {
 
     fn spawn_command(
         &mut self,
-        ctx: &egui::Context,
+        repaint: &RepaintHandle,
         config: &MultiplexerConfig,
         command: MuxCommand,
         selected_session: Option<String>,
     ) {
         let (tx, rx) = mpsc::channel();
-        let repaint = ctx.clone();
+        let repaint = repaint.clone();
         let mux_config = config.clone();
         thread::spawn(move || {
             let mut backend = build_backend(&mux_config);
@@ -415,7 +418,7 @@ impl MuxController {
                 .map(|()| selected_session)
                 .map_err(|error| error.to_string());
             if tx.send(result).is_ok() {
-                repaint.request_repaint();
+                repaint();
             }
         });
         self.mux_command_rx = Some(rx);
@@ -425,7 +428,7 @@ impl MuxController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mux::snapshot::{MuxPaneAnchor, MuxWindow};
+    use crate::snapshot::{MuxPaneAnchor, MuxWindow};
 
     #[test]
     fn selected_session_anchor_resolves_by_backend_id_or_session_name() {
@@ -509,13 +512,13 @@ mod tests {
 
     #[test]
     fn native_refresh_populates_sessions_without_worker() {
-        let ctx = egui::Context::default();
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
         let config = MultiplexerConfig {
-            backend: crate::config::MultiplexerBackendConfig::Native,
+            backend: bootty_config::config::MultiplexerBackendConfig::Native,
         };
         let mut controller = MuxController::new();
 
-        let error = controller.refresh_sessions(&ctx, &config);
+        let error = controller.refresh_sessions(&repaint, &config);
 
         assert_eq!(error, None);
         assert_eq!(controller.current_backend, Some(MuxBackendKind::Native));

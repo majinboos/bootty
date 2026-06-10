@@ -1,0 +1,21 @@
+[package]
+name = "bootty-mux"
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+derive_more.workspace = true
+libghostty-vt.workspace = true
+rmux-ipc.workspace = true
+rmux-proto.workspace = true
+rmux-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt"] }
+bootty-config = { path = "../bootty-config" }
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-surface = { path = "../bootty-surface" }
+bootty-terminal = { path = "../bootty-terminal" }
+
+[dev-dependencies]
+tempfile.workspace = true

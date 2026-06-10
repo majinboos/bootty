@@ -145,7 +145,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::mux::{
+    use crate::{
         command::MuxCommand,
         process::{CommandOutput, CommandRunner},
     };
