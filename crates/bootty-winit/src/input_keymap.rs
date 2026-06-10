@@ -7,9 +7,7 @@ use winit::{
 use crate::{
     geometry::TerminalSurface,
     modifier_remap::ModifierRemapSet,
-    terminal::{
-        KeyInput, KeyMods, MouseAction, MouseButton, MouseEncoderSize, MouseInput, TerminalKey,
-    },
+    terminal::{KeyInput, KeyMods, MouseAction, MouseButton, MouseInput, TerminalKey},
 };
 
 pub fn key_mods_from_egui_modifiers(modifiers: egui::Modifiers) -> KeyMods {
@@ -288,7 +286,6 @@ pub fn mouse_input_from_surface(
     surface: TerminalSurface,
 ) -> Option<MouseInput> {
     let position = surface.relative_position(pos)?;
-    let metrics = surface.mouse_metrics();
 
     Some(MouseInput {
         action,
@@ -296,16 +293,7 @@ pub fn mouse_input_from_surface(
         mods,
         x: position.x,
         y: position.y,
-        size: MouseEncoderSize {
-            screen_width: metrics.screen_width,
-            screen_height: metrics.screen_height,
-            cell_width: metrics.cell_width.max(1),
-            cell_height: metrics.cell_height.max(1),
-            padding_top: metrics.padding.top,
-            padding_bottom: metrics.padding.bottom,
-            padding_right: metrics.padding.right,
-            padding_left: metrics.padding.left,
-        },
+        size: surface.mouse_metrics().into(),
     })
 }
 

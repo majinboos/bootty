@@ -1,3 +1,4 @@
+use bootty_surface::geometry::MouseSurfaceMetrics;
 use libghostty_vt::{key, mouse};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,6 +101,23 @@ pub struct MouseEncoderSize {
     pub padding_bottom: u32,
     pub padding_right: u32,
     pub padding_left: u32,
+}
+
+impl From<MouseSurfaceMetrics> for MouseEncoderSize {
+    fn from(metrics: MouseSurfaceMetrics) -> Self {
+        Self {
+            screen_width: metrics.screen_width,
+            screen_height: metrics.screen_height,
+            // The VT mouse encoder divides by cell dimensions; a surface can
+            // report zero-sized cells before the first real layout.
+            cell_width: metrics.cell_width.max(1),
+            cell_height: metrics.cell_height.max(1),
+            padding_top: metrics.padding.top,
+            padding_bottom: metrics.padding.bottom,
+            padding_right: metrics.padding.right,
+            padding_left: metrics.padding.left,
+        }
+    }
 }
 
 impl From<MouseEncoderSize> for mouse::EncoderSize {
@@ -369,5 +387,60 @@ impl From<TerminalKey> for key::Key {
             TerminalKey::AltLeft => key::Key::AltLeft,
             TerminalKey::AltRight => key::Key::AltRight,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bootty_surface::geometry::RoundedPadding;
+
+    use super::*;
+
+    #[test]
+    fn zero_cell_dimensions_clamp_to_one() {
+        let metrics = MouseSurfaceMetrics {
+            screen_width: 0,
+            screen_height: 0,
+            cell_width: 0,
+            cell_height: 0,
+            padding: RoundedPadding {
+                top: 0,
+                right: 0,
+                bottom: 0,
+                left: 0,
+            },
+        };
+
+        let size = MouseEncoderSize::from(metrics);
+
+        assert_eq!(size.cell_width, 1);
+        assert_eq!(size.cell_height, 1);
+    }
+
+    #[test]
+    fn conversion_maps_each_field_without_transposition() {
+        let metrics = MouseSurfaceMetrics {
+            screen_width: 1001,
+            screen_height: 1002,
+            cell_width: 11,
+            cell_height: 12,
+            padding: RoundedPadding {
+                top: 21,
+                right: 22,
+                bottom: 23,
+                left: 24,
+            },
+        };
+
+        let size = MouseEncoderSize::from(metrics);
+
+        assert_eq!(size.screen_width, 1001);
+        assert_eq!(size.screen_height, 1002);
+        assert_eq!(size.cell_width, 11);
+        assert_eq!(size.cell_height, 12);
+        assert_eq!(size.padding_top, 21);
+        assert_eq!(size.padding_right, 22);
+        assert_eq!(size.padding_bottom, 23);
+        assert_eq!(size.padding_left, 24);
     }
 }
