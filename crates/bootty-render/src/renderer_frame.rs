@@ -9,8 +9,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::{
     geometry::{CellMetrics, SurfaceRect, TerminalPadding, TerminalSurface},
     paint_plan::{
-        BackgroundRect, CursorBlinkPhase, CursorShape, DecorationLine, DecorationStyle,
-        PaintPlanner, PlanColor, TerminalPaintPlan, TextAttrs, TextRun,
+        BackgroundRect, CursorBlinkPhase, DecorationLine, DecorationStyle, PaintPlanner, PlanColor,
+        TerminalPaintPlan, TextAttrs, TextRun,
     },
     terminal::{CellStyle, CursorSnapshot, RenderFrame},
     terminal_image::KittyImageFrame,
@@ -24,10 +24,10 @@ pub struct RendererFrame {
     pub rows: Vec<RendererRow>,
     pub cells: Vec<RendererCell>,
     pub cursor: Option<RendererCursor>,
-    pub default_foreground: PlanColor,
-    pub default_background: PlanColor,
-    pub selection_foreground: Option<PlanColor>,
-    pub selection_background: Option<PlanColor>,
+    default_foreground: PlanColor,
+    default_background: PlanColor,
+    selection_foreground: Option<PlanColor>,
+    selection_background: Option<PlanColor>,
     pub images: KittyImageFrame,
     source_dirty: Dirty,
     paint_plan: TerminalPaintPlan,
@@ -69,14 +69,6 @@ pub struct RendererLinkCellMap {
 impl RendererLinkCellMap {
     pub fn contains(&self, x: u16, y: u16) -> bool {
         self.cells.contains(&RendererCellPoint { x, y })
-    }
-
-    pub fn len(&self) -> usize {
-        self.cells.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
     }
 }
 
@@ -620,7 +612,7 @@ pub enum GhosttyGraphicsElement {
 }
 
 impl GhosttyGraphicsElement {
-    pub fn classify(ch: char) -> Option<Self> {
+    fn classify(ch: char) -> Option<Self> {
         match ch {
             '▀'..='▐' | '▔' | '▕' => Some(Self::Block),
             '░' | '▒' | '▓' => Some(Self::Shade),
@@ -838,15 +830,6 @@ impl RendererCursorShape {
             libghostty_vt::render::CursorVisualStyle::BlockHollow => Self::HollowBlock,
             libghostty_vt::render::CursorVisualStyle::Block => Self::Block,
             _ => Self::Block,
-        }
-    }
-
-    pub fn to_plan(self) -> CursorShape {
-        match self {
-            Self::Block => CursorShape::Block,
-            Self::HollowBlock => CursorShape::HollowBlock,
-            Self::Bar => CursorShape::Bar,
-            Self::Underline => CursorShape::Underline,
         }
     }
 }
