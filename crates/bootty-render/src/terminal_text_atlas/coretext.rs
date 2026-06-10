@@ -58,6 +58,8 @@ type UniChar = u16;
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 #[cfg(target_os = "macos")]
 const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
+#[cfg(target_os = "macos")]
+const K_CT_FONT_TRAIT_COLOR_GLYPHS: u32 = 1 << 13;
 
 #[cfg(target_os = "macos")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -138,6 +140,7 @@ unsafe extern "C" {
     ) -> CTFontRef;
     fn CTFontCopyFamilyName(font: CTFontRef) -> CFStringRef;
     fn CTFontCopyPostScriptName(font: CTFontRef) -> CFStringRef;
+    fn CTFontGetSymbolicTraits(font: CTFontRef) -> u32;
 }
 
 #[cfg(target_os = "macos")]
@@ -280,6 +283,12 @@ pub(super) fn rasterize_color_with_family(
         );
         CFRelease(family_ref);
         if font.is_null() {
+            return None;
+        }
+        // Monochrome fonts draw with the context's default black fill; only fonts
+        // with embedded color glyphs may bypass theme tinting.
+        if CTFontGetSymbolicTraits(font) & K_CT_FONT_TRAIT_COLOR_GLYPHS == 0 {
+            CFRelease(font);
             return None;
         }
 

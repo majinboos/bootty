@@ -430,6 +430,23 @@ fn coretext_color_rasterizer_draws_dumpling_emoji_pixels() {
     assert!(rgba_color_pixel_count(&rgba) >= 100);
 }
 
+#[test]
+fn text_presentation_symbols_stay_off_the_color_emoji_path() {
+    assert!(!is_color_emoji_cluster(&shaped_cluster("⚠", 1)));
+    assert!(!is_color_emoji_cluster(&shaped_cluster("✔", 1)));
+    assert!(is_color_emoji_cluster(&shaped_cluster("⚠\u{fe0f}", 2)));
+    assert!(!is_color_emoji_cluster(&shaped_cluster("⚡\u{fe0e}", 1)));
+    assert!(is_color_emoji_cluster(&shaped_cluster("⚡", 1)));
+    assert!(is_color_emoji_cluster(&shaped_cluster("🥟", 2)));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn coretext_color_rasterizer_rejects_monochrome_fonts() {
+    let cluster = shaped_cluster("⚠", 1);
+    assert!(coretext::rasterize_color_with_family("Menlo", &cluster, 31.333_334, 48, 48).is_none());
+}
+
 #[derive(Clone, Copy, Debug)]
 struct AlphaBounds {
     min_x: u32,
