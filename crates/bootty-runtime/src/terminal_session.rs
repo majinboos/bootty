@@ -20,7 +20,7 @@ use bootty_surface::geometry::TerminalGeometry;
 use bootty_terminal::{
     terminal_engine::{TERMINAL_TERM, TerminalColorConfig, TerminalEngine},
     terminal_frame::RenderFrame,
-    terminal_input_model::{KeyInput, MouseInput},
+    terminal_input_model::{KeyInput, MacosOptionAsAlt, MouseInput},
 };
 
 pub(crate) const MAX_DRAIN_BYTES_PER_FRAME: usize = 4 * 1024 * 1024;
@@ -42,6 +42,7 @@ pub struct TerminalSessionConfig {
     pub launch: SessionLaunchConfig,
     pub colors: TerminalColorConfig,
     pub max_scrollback: usize,
+    pub macos_option_as_alt: MacosOptionAsAlt,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLaunchConfig {
@@ -160,6 +161,7 @@ impl TerminalSession {
             geometry,
             colors: config.colors,
             max_scrollback: config.max_scrollback,
+            macos_option_as_alt: config.macos_option_as_alt,
             pty_rx,
             pty_writer,
             command_rx,
@@ -276,6 +278,7 @@ struct TerminalWorkerConfig {
     geometry: TerminalGeometry,
     colors: TerminalColorConfig,
     max_scrollback: usize,
+    macos_option_as_alt: MacosOptionAsAlt,
     pty_rx: Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     command_rx: Receiver<TerminalCommand>,
@@ -288,10 +291,11 @@ struct TerminalWorkerConfig {
 fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
-        let mut engine = match TerminalEngine::new_with_scrollback(
+        let mut engine = match TerminalEngine::new_with_options(
             config.geometry,
             config.colors,
             config.max_scrollback,
+            config.macos_option_as_alt,
         ) {
             Ok(engine) => engine,
             Err(error) => {

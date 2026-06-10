@@ -108,6 +108,7 @@ impl TabsExample {
         let snapshot = ctx.input(|input| InputSnapshot {
             events: input.events.clone(),
             modifiers: input.modifiers,
+            modifier_sides: Default::default(),
             hover_pos: input.pointer.hover_pos(),
             pressed_mouse_button: pressed_mouse_button_from_egui(&input.pointer),
             surface: tab.surface,

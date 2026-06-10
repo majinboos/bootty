@@ -1,5 +1,25 @@
 use libghostty_vt::{key, mouse};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MacosOptionAsAlt {
+    None,
+    Left,
+    Right,
+    #[default]
+    Both,
+}
+
+impl From<MacosOptionAsAlt> for key::OptionAsAlt {
+    fn from(value: MacosOptionAsAlt) -> Self {
+        match value {
+            MacosOptionAsAlt::None => Self::False,
+            MacosOptionAsAlt::Left => Self::Left,
+            MacosOptionAsAlt::Right => Self::Right,
+            MacosOptionAsAlt::Both => Self::True,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyInput {
     pub key: TerminalKey,

@@ -29,7 +29,9 @@ use libghostty_vt::{
 use crate::terminal_frame::{
     CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, FrameStats, RenderCell, RenderFrame,
 };
-use crate::terminal_input_model::{KeyInput, MouseAction, MouseEncoderSize, MouseInput};
+use crate::terminal_input_model::{
+    KeyInput, MacosOptionAsAlt, MouseAction, MouseEncoderSize, MouseInput,
+};
 use crate::terminal_palette::generate_256_palette;
 
 #[cfg(test)]
@@ -88,6 +90,7 @@ pub struct TerminalEngine {
     grapheme_scratch: Vec<char>,
     key_encoder: key::Encoder<'static>,
     key_event: key::Event<'static>,
+    macos_option_as_alt: MacosOptionAsAlt,
     mouse_encoder: mouse::Encoder<'static>,
     mouse_event: mouse::Event<'static>,
     mouse_any_button_pressed: bool,
@@ -369,10 +372,33 @@ impl TerminalEngine {
         Self::new_with_scrollback(geometry, colors, DEFAULT_MAX_SCROLLBACK)
     }
 
+    pub fn new_with_options(
+        geometry: TerminalGeometry,
+        colors: TerminalColorConfig,
+        max_scrollback: usize,
+        macos_option_as_alt: MacosOptionAsAlt,
+    ) -> Result<Self> {
+        Self::new_inner(geometry, colors, max_scrollback, macos_option_as_alt)
+    }
+
     pub fn new_with_scrollback(
         geometry: TerminalGeometry,
         colors: TerminalColorConfig,
         max_scrollback: usize,
+    ) -> Result<Self> {
+        Self::new_inner(
+            geometry,
+            colors,
+            max_scrollback,
+            MacosOptionAsAlt::default(),
+        )
+    }
+
+    fn new_inner(
+        geometry: TerminalGeometry,
+        colors: TerminalColorConfig,
+        max_scrollback: usize,
+        macos_option_as_alt: MacosOptionAsAlt,
     ) -> Result<Self> {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: geometry.cols,
@@ -416,6 +442,7 @@ impl TerminalEngine {
             grapheme_scratch: Vec::new(),
             key_encoder: key::Encoder::new()?,
             key_event: key::Event::new()?,
+            macos_option_as_alt,
             mouse_encoder: mouse::Encoder::new()?,
             mouse_event: mouse::Event::new()?,
             mouse_any_button_pressed: false,
@@ -596,7 +623,7 @@ impl TerminalEngine {
         self.key_encoder
             .set_options_from_terminal(&self.terminal)
             .set_alt_esc_prefix(true)
-            .set_macos_option_as_alt(key::OptionAsAlt::True);
+            .set_macos_option_as_alt(self.macos_option_as_alt.into());
         self.key_event
             .set_action(if input.repeat {
                 key::Action::Repeat

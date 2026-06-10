@@ -6,5 +6,6 @@ pub use bootty_terminal::terminal_frame::{
     CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, FrameStats, RenderCell, RenderFrame,
 };
 pub use bootty_terminal::terminal_input_model::{
-    KeyInput, KeyMods, MouseAction, MouseButton, MouseEncoderSize, MouseInput, TerminalKey,
+    KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize, MouseInput,
+    TerminalKey,
 };

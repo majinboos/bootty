@@ -222,6 +222,10 @@ impl BackendPaneTerminal {
         Ok(())
     }
 
+    pub fn set_terminal_config(&mut self, terminal_config: TerminalSessionConfig) {
+        self.terminal_config = terminal_config;
+    }
+
     fn start_terminal(
         &mut self,
         backend: MuxBackendKind,
@@ -268,6 +272,7 @@ impl BackendPaneTerminal {
                 target.clone(),
                 self.geometry,
                 self.terminal_config.colors.clone(),
+                self.terminal_config.macos_option_as_alt,
                 Arc::clone(&self.repaint_wakeup),
             )?)))
         }
@@ -473,6 +478,7 @@ mod tests {
             launch: Default::default(),
             colors: TerminalColorConfig::default(),
             max_scrollback: 0,
+            macos_option_as_alt: Default::default(),
         }
     }
 
@@ -619,6 +625,7 @@ mod tests {
             },
             colors: TerminalColorConfig::default(),
             max_scrollback: 0,
+            macos_option_as_alt: Default::default(),
         };
         let (program, args) = backend_attach_launch(MuxBackendKind::Tmux, &target("agents"));
         config.launch.shell = Some(program);

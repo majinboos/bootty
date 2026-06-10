@@ -11,7 +11,7 @@ use toml_edit::{DocumentMut, Item, Table, TableLike};
 use crate::{
     color::Color,
     modifier_remap::ModifierRemapSet,
-    terminal::{SessionLaunchConfig, TerminalSessionConfig},
+    terminal::{MacosOptionAsAlt, SessionLaunchConfig, TerminalSessionConfig},
     terminal_engine::TerminalColorConfig,
     terminal_text::TerminalTextConfig,
 };
@@ -197,8 +197,32 @@ pub enum MultiplexerBackendConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputConfig {
     pub modifier_remap: Vec<String>,
+    pub macos_option_as_alt: MacosOptionAsAltConfig,
     pub keybind: Vec<String>,
     pub backend_keybinds: BackendKeybindConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MacosOptionAsAltConfig {
+    #[serde(alias = "false")]
+    None,
+    Left,
+    Right,
+    #[default]
+    #[serde(alias = "true")]
+    Both,
+}
+
+impl From<MacosOptionAsAltConfig> for MacosOptionAsAlt {
+    fn from(value: MacosOptionAsAltConfig) -> Self {
+        match value {
+            MacosOptionAsAltConfig::None => Self::None,
+            MacosOptionAsAltConfig::Left => Self::Left,
+            MacosOptionAsAltConfig::Right => Self::Right,
+            MacosOptionAsAltConfig::Both => Self::Both,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -213,6 +237,7 @@ pub struct BackendKeybindConfig {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct InputPatch {
     modifier_remap: Option<Vec<String>>,
+    macos_option_as_alt: Option<MacosOptionAsAltConfig>,
     keybind: Option<Vec<String>>,
     backend_keybind: Option<BackendKeybindPatch>,
 }
@@ -401,6 +426,7 @@ impl BoottyConfig {
             launch: self.session.launch_config(),
             colors: self.colors.terminal_color_config(),
             max_scrollback: 0,
+            macos_option_as_alt: self.input.macos_option_as_alt.into(),
         }
     }
 }
@@ -625,6 +651,7 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             modifier_remap: Vec::new(),
+            macos_option_as_alt: MacosOptionAsAltConfig::default(),
             keybind: owned_keybinds(common_keybinds()),
             backend_keybinds: BackendKeybindConfig {
                 native: owned_keybinds(native_keybinds()),
@@ -1215,6 +1242,7 @@ fn apply_partial_multiplexer(multiplexer: &mut MultiplexerConfig, partial: Multi
 
 fn apply_partial_input(input: &mut InputConfig, partial: InputPatch) {
     apply_value(&mut input.modifier_remap, partial.modifier_remap);
+    apply_value(&mut input.macos_option_as_alt, partial.macos_option_as_alt);
     if let Some(value) = partial.keybind {
         input.keybind = apply_keybind_entries(value);
     }

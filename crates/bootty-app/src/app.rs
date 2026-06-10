@@ -19,11 +19,11 @@ use crate::{
         STATUS_METRICS_SAMPLE_INTERVAL, StabilityTrace, StabilityTraceSample, StatusMetrics,
         should_sample_status_metrics,
     },
-    direct_input::{DirectKeyInput, suppress_egui_events_for_direct_input},
+    direct_input::{DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input},
     geometry::TerminalSurface,
     input::{
         InputSnapshot, TerminalInputCommand, focus::InputFocus, router::route_events,
-        terminal_input_commands_with_modifier_remaps,
+        terminal_input_commands_with_options,
     },
     modifier_remap::ModifierRemapSet,
     mux::{
@@ -72,8 +72,11 @@ pub struct BoottyApp {
     has_new_session_config_changes: bool,
     mux: MuxController,
     direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
+    modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
+    modifier_sides: ModifierSideState,
     pending_direct_input: Vec<DirectKeyInput>,
     modifier_remaps: ModifierRemapSet,
+    macos_option_as_alt: crate::terminal::MacosOptionAsAlt,
     stability_trace: Option<StabilityTrace>,
     config_hot_reload: ConfigHotReload,
     sidebar_metadata: SidebarMetadata,
@@ -137,25 +140,28 @@ impl BoottyApp {
     }
 
     pub fn new_with_config(cc: &eframe::CreationContext<'_>, config: BoottyConfig) -> Result<Self> {
-        Self::new_inner(cc, config, None)
+        Self::new_inner(cc, config, None, None)
     }
 
     pub fn new_with_direct_input(
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
         direct_input_rx: mpsc::Receiver<DirectKeyInput>,
+        modifier_side_rx: mpsc::Receiver<ModifierSideState>,
     ) -> Result<Self> {
-        Self::new_inner(cc, config, Some(direct_input_rx))
+        Self::new_inner(cc, config, Some(direct_input_rx), Some(modifier_side_rx))
     }
 
     fn new_inner(
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
+        modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
         configure_egui_fonts(&cc.egui_ctx, &config.font.family);
         let repaint_ctx = cc.egui_ctx.clone();
         let modifier_remaps = config.input.modifier_remaps()?;
+        let macos_option_as_alt = config.input.macos_option_as_alt.into();
         let keybinds = config
             .input
             .keybinds_for_backend(config.multiplexer.backend);
@@ -194,8 +200,11 @@ impl BoottyApp {
             has_new_session_config_changes: false,
             mux: MuxController::new(),
             direct_input_rx,
+            modifier_side_rx,
+            modifier_sides: ModifierSideState::default(),
             pending_direct_input: Vec::new(),
             modifier_remaps,
+            macos_option_as_alt,
             stability_trace,
             config_hot_reload,
             sidebar_metadata: SidebarMetadata::default(),
@@ -689,7 +698,10 @@ impl BoottyApp {
         }
 
         self.modifier_remaps = modifier_remaps;
+        self.macos_option_as_alt = next.input.macos_option_as_alt.into();
         self.app_key_bindings = app_key_bindings;
+        self.terminal
+            .set_terminal_config(next.terminal_session_config());
         self.has_new_session_config_changes = new_session_only_config_changed(&previous, &next)
             || self.has_new_session_config_changes;
         self.config_state.accept(next);
@@ -732,6 +744,7 @@ impl BoottyApp {
                 InputSnapshot {
                     events,
                     modifiers: input.modifiers,
+                    modifier_sides: self.modifier_sides,
                     hover_pos: input.pointer.hover_pos(),
                     pressed_mouse_button: crate::input::pressed_mouse_button_from_egui(
                         &input.pointer,
@@ -744,8 +757,11 @@ impl BoottyApp {
                 actions,
             )
         });
-        let commands =
-            terminal_input_commands_with_modifier_remaps(snapshot, &self.modifier_remaps);
+        let commands = terminal_input_commands_with_options(
+            snapshot,
+            &self.modifier_remaps,
+            self.macos_option_as_alt,
+        );
         let count = commands.len() + actions.len();
 
         for action in actions {
@@ -759,6 +775,17 @@ impl BoottyApp {
         count
     }
     fn drain_direct_input(&mut self) {
+        if let Some(rx) = &self.modifier_side_rx {
+            let mut latest = self.modifier_sides;
+            let mut latest_alt = None;
+            for side_state in rx.try_iter() {
+                if side_state.left_alt || side_state.right_alt {
+                    latest_alt = Some(side_state);
+                }
+                latest = side_state;
+            }
+            self.modifier_sides = latest_alt.unwrap_or(latest);
+        }
         let Some(rx) = &self.direct_input_rx else {
             return;
         };

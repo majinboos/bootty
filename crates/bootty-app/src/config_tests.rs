@@ -458,6 +458,29 @@ fn documented_sample_config_loads() {
 }
 
 #[test]
+fn config_maps_macos_option_as_alt_to_terminal_session_config() {
+    let config = load_config_source(indoc! {r#"
+        [input]
+        macos-option-as-alt = "right"
+    "#});
+
+    assert_eq!(
+        config.input.macos_option_as_alt,
+        MacosOptionAsAltConfig::Right
+    );
+    assert_eq!(
+        config.terminal_session_config().macos_option_as_alt,
+        crate::terminal::MacosOptionAsAlt::Right
+    );
+    assert_eq!(
+        BoottyConfig::default()
+            .terminal_session_config()
+            .macos_option_as_alt,
+        crate::terminal::MacosOptionAsAlt::Both
+    );
+}
+
+#[test]
 fn keybind_clear_directive_replaces_existing_bindings() {
     let config = load_config_source(indoc! {r#"
         version = 1

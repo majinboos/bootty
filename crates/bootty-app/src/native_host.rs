@@ -22,17 +22,20 @@ pub fn run(options: eframe::NativeOptions, config: BoottyConfig) -> Result<()> {
         .context("create bootty event loop")?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let (direct_input_tx, direct_input_rx) = mpsc::channel();
+    let (modifier_side_tx, modifier_side_rx) = mpsc::channel();
     let app_creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
         Ok(Box::new(BoottyApp::new_with_direct_input(
             cc,
             config,
             direct_input_rx,
+            modifier_side_rx,
         )?) as Box<dyn eframe::App>)
     });
     let inner = eframe::create_native("Bootty", options, app_creator, &event_loop);
     let mut app = BoottyNativeHost {
         inner,
         direct_input_tx,
+        modifier_side_tx,
         modifiers: ModifiersState::empty(),
         side_state: ModifierSideState::default(),
     };
@@ -43,6 +46,7 @@ pub fn run(options: eframe::NativeOptions, config: BoottyConfig) -> Result<()> {
 struct BoottyNativeHost<'app> {
     inner: eframe::EframeWinitApplication<'app>,
     direct_input_tx: mpsc::Sender<DirectKeyInput>,
+    modifier_side_tx: mpsc::Sender<ModifierSideState>,
     modifiers: ModifiersState,
     side_state: ModifierSideState,
 }
@@ -69,6 +73,7 @@ impl ApplicationHandler<UserEvent> for BoottyNativeHost<'_> {
             } => {
                 if let winit::keyboard::PhysicalKey::Code(code) = event.physical_key {
                     self.side_state.update_key(code, event.state);
+                    let _ = self.modifier_side_tx.send(self.side_state);
                 }
                 if let Some(input) =
                     direct_key_input_from_winit_event(event, self.modifiers, self.side_state)

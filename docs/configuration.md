@@ -57,6 +57,7 @@ backend = "rmux"
 
 [input]
 keybind = ["cmd+shift+,=reload_config"]
+macos-option-as-alt = "both" # none, left, right, or both
 modifier-remap = ["right_alt=left_ctrl"]
 
 [session]
@@ -152,7 +153,7 @@ Live-applied fields:
 
 - `[chrome]` sidebar/status visibility and layout
 - `[multiplexer]` backend selection and backend UI mode
-- `[input]` modifier remaps and reload keybinds
+- `[input]` modifier remaps, macOS Option-as-Meta mode, and reload keybinds
 - `[font]` terminal text metrics
 - `theme` and `[colors]` terminal defaults
 - `[window].title`

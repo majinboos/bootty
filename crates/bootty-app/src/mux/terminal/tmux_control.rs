@@ -15,7 +15,7 @@ use bootty_surface::geometry::TerminalGeometry;
 use bootty_terminal::{
     terminal_engine::{TerminalColorConfig, TerminalEngine},
     terminal_frame::RenderFrame,
-    terminal_input_model::{KeyInput, MouseInput},
+    terminal_input_model::{KeyInput, MacosOptionAsAlt, MouseInput},
 };
 
 use crate::{
@@ -48,6 +48,7 @@ impl TmuxControlTerminal {
         target: MuxPaneTarget,
         geometry: TerminalGeometry,
         colors: TerminalColorConfig,
+        macos_option_as_alt: MacosOptionAsAlt,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> Result<Self> {
         let program = native_control_program(backend)?;
@@ -91,6 +92,7 @@ impl TmuxControlTerminal {
             target,
             geometry,
             colors,
+            macos_option_as_alt,
             stdin,
             line_rx,
             repaint_wakeup,
@@ -239,6 +241,7 @@ struct TmuxControlWorkerConfig {
     target: MuxPaneTarget,
     geometry: TerminalGeometry,
     colors: TerminalColorConfig,
+    macos_option_as_alt: MacosOptionAsAlt,
     stdin: Arc<Mutex<ChildStdin>>,
     line_rx: mpsc::Receiver<String>,
     repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -262,7 +265,12 @@ fn spawn_tmux_control_worker(config: TmuxControlWorkerConfig) -> Result<()> {
 
 impl TmuxControlWorker {
     fn new(config: TmuxControlWorkerConfig) -> Result<Self> {
-        let mut engine = TerminalEngine::new_with_colors(config.geometry, config.colors)?;
+        let mut engine = TerminalEngine::new_with_options(
+            config.geometry,
+            config.colors,
+            bootty_terminal::terminal_engine::DEFAULT_MAX_SCROLLBACK,
+            config.macos_option_as_alt,
+        )?;
         let input_stdin = Arc::clone(&config.stdin);
         let input_target = target_input_selector(&config.target).to_owned();
         engine.on_pty_write(move |_terminal, bytes| {

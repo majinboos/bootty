@@ -81,6 +81,10 @@ impl ModifierSideState {
         input.mods.right_command = input.mods.command && self.right_command;
     }
 
+    pub(crate) fn has_alt(self) -> bool {
+        self.left_alt || self.right_alt
+    }
+
     pub(crate) fn has_right_shift(self) -> bool {
         self.right_shift
     }

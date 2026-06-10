@@ -36,13 +36,8 @@ macos-titlebar-style = "transparent"
 
 [font]
 # Live-reloaded terminal text metrics.
-family = [
-  "Maple Mono",
-  "Font Awesome 7 Brands",
-  "Maple Mono NF",
-  "monospace",
-]
-size = 15.666
+family = ["Maple Mono", "Font Awesome 7 Brands", "Maple Mono NF", "monospace"]
+size = 15
 cell-width = 10
 cell-height = 22
 baseline-adjustment = 3
@@ -90,6 +85,9 @@ keybind = [
   "cmd+q=quit",
   "cmd+alt+ctrl+f=toggle_fullscreen",
 ]
+
+# macOS Option-as-Meta behavior. Values: none, left, right, both.
+macos-option-as-alt = "both"
 
 # Optional backend-specific shards are appended only for the selected backend.
 # Modifier remaps are live-reloaded and apply to egui and direct input paths.

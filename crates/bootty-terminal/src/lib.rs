@@ -17,6 +17,7 @@ pub mod terminal {
         CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, FrameStats, RenderCell, RenderFrame,
     };
     pub use crate::terminal_input_model::{
-        KeyInput, KeyMods, MouseAction, MouseButton, MouseEncoderSize, MouseInput, TerminalKey,
+        KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
+        MouseInput, TerminalKey,
     };
 }

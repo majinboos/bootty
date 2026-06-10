@@ -3,17 +3,19 @@ use eframe::egui::{self, Pos2, Rect};
 use crate::{
     geometry::TerminalSurface,
     input_keymap::{
-        egui_key_utf8, is_control_key, key_mods_from_egui_modifiers, key_unshifted,
-        mouse_input_from_surface, mouse_mods_from_egui_modifiers, mouse_wheel_button_from_delta_y,
+        ModifierSideState, egui_key_utf8, is_control_key, key_mods_from_egui_modifiers,
+        key_unshifted, mouse_input_from_surface, mouse_mods_from_egui_modifiers,
+        mouse_wheel_button_from_delta_y,
     },
     modifier_remap::ModifierRemapSet,
-    terminal::{KeyInput, MouseAction, MouseButton, MouseInput, TerminalKey},
+    terminal::{KeyInput, MacosOptionAsAlt, MouseAction, MouseButton, MouseInput, TerminalKey},
 };
 
 #[derive(Clone, Debug)]
 pub struct InputSnapshot {
     pub events: Vec<egui::Event>,
     pub modifiers: egui::Modifiers,
+    pub modifier_sides: ModifierSideState,
     pub hover_pos: Option<Pos2>,
     pub pressed_mouse_button: Option<MouseButton>,
     pub surface: Option<TerminalSurface>,
@@ -41,21 +43,33 @@ pub fn terminal_input_commands_with_modifier_remaps(
     snapshot: InputSnapshot,
     modifier_remaps: &ModifierRemapSet,
 ) -> Vec<TerminalInputCommand> {
+    terminal_input_commands_with_options(snapshot, modifier_remaps, MacosOptionAsAlt::default())
+}
+
+pub fn terminal_input_commands_with_options(
+    snapshot: InputSnapshot,
+    modifier_remaps: &ModifierRemapSet,
+    macos_option_as_alt: MacosOptionAsAlt,
+) -> Vec<TerminalInputCommand> {
     let mut commands = Vec::with_capacity(snapshot.events.len());
-    let suppress_modified_text = snapshot.modifiers.alt
-        || snapshot.modifiers.ctrl
-        || snapshot.modifiers.command
-        || snapshot.modifiers.mac_cmd
-        || snapshot.events.iter().any(|event| {
-            matches!(
-                event,
-                egui::Event::Key {
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if modifiers.alt || modifiers.ctrl || modifiers.command || modifiers.mac_cmd
+    let suppress_modified_text = text_modifiers_are_suppressed(
+        snapshot.modifiers,
+        macos_option_as_alt,
+        snapshot.modifier_sides,
+    ) || snapshot.events.iter().any(|event| {
+        matches!(
+            event,
+            egui::Event::Key {
+                pressed: true,
+                modifiers,
+                ..
+            } if text_modifiers_are_suppressed(
+                *modifiers,
+                macos_option_as_alt,
+                snapshot.modifier_sides,
             )
-        });
+        )
+    });
 
     for event in snapshot.events {
         match event {
@@ -131,7 +145,12 @@ pub fn terminal_input_commands_with_modifier_remaps(
                 ..
             } => {
                 if let Some(term_key) = terminal_key(key) {
-                    if !should_encode_key(term_key, modifiers) {
+                    if !should_encode_key(
+                        term_key,
+                        modifiers,
+                        macos_option_as_alt,
+                        snapshot.modifier_sides,
+                    ) {
                         continue;
                     }
                     let mut input = KeyInput {
@@ -141,6 +160,7 @@ pub fn terminal_input_commands_with_modifier_remaps(
                         utf8: egui_key_utf8(term_key, modifiers.shift),
                         unshifted: key_unshifted(term_key),
                     };
+                    snapshot.modifier_sides.apply_to_key_input(&mut input);
                     input.mods = modifier_remaps.apply(input.mods);
                     commands.push(TerminalInputCommand::Key(input));
                 }
@@ -244,8 +264,38 @@ pub fn terminal_key(key: egui::Key) -> Option<TerminalKey> {
     }
 }
 
-fn should_encode_key(key: TerminalKey, modifiers: egui::Modifiers) -> bool {
-    is_control_key(key) || modifiers.ctrl || modifiers.alt
+fn should_encode_key(
+    key: TerminalKey,
+    modifiers: egui::Modifiers,
+    macos_option_as_alt: MacosOptionAsAlt,
+    modifier_sides: ModifierSideState,
+) -> bool {
+    is_control_key(key)
+        || modifiers.ctrl
+        || (modifiers.alt && option_alt_is_meta(macos_option_as_alt, modifier_sides))
+}
+
+fn text_modifiers_are_suppressed(
+    modifiers: egui::Modifiers,
+    macos_option_as_alt: MacosOptionAsAlt,
+    modifier_sides: ModifierSideState,
+) -> bool {
+    modifiers.ctrl
+        || modifiers.command
+        || modifiers.mac_cmd
+        || (modifiers.alt && option_alt_is_meta(macos_option_as_alt, modifier_sides))
+}
+
+fn option_alt_is_meta(
+    macos_option_as_alt: MacosOptionAsAlt,
+    modifier_sides: ModifierSideState,
+) -> bool {
+    match macos_option_as_alt {
+        MacosOptionAsAlt::None => false,
+        MacosOptionAsAlt::Both => true,
+        MacosOptionAsAlt::Left => modifier_sides.left_alt || !modifier_sides.has_alt(),
+        MacosOptionAsAlt::Right => modifier_sides.right_alt || !modifier_sides.has_alt(),
+    }
 }
 
 fn mouse_excluded(pos: Pos2, exclusion: Option<Rect>) -> bool {
@@ -310,11 +360,40 @@ mod tests {
         terminal_input_commands(InputSnapshot {
             events,
             modifiers: egui::Modifiers::default(),
+            modifier_sides: ModifierSideState::default(),
             hover_pos: None,
             pressed_mouse_button: None,
             surface: None,
             mouse_exclusion: None,
         })
+    }
+
+    fn option_text_commands(
+        macos_option_as_alt: MacosOptionAsAlt,
+        modifier_sides: ModifierSideState,
+    ) -> Vec<TerminalInputCommand> {
+        terminal_input_commands_with_options(
+            InputSnapshot {
+                events: vec![
+                    egui::Event::Key {
+                        key: egui::Key::W,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: modifiers(false, true, false),
+                    },
+                    egui::Event::Text("∑".to_owned()),
+                ],
+                modifiers: egui::Modifiers::default(),
+                modifier_sides,
+                hover_pos: None,
+                pressed_mouse_button: None,
+                surface: None,
+                mouse_exclusion: None,
+            },
+            &ModifierRemapSet::default(),
+            macos_option_as_alt,
+        )
     }
 
     #[test]
@@ -419,6 +498,7 @@ mod tests {
                 egui::Event::Text("¡".to_owned()),
             ],
             modifiers: egui::Modifiers::default(),
+            modifier_sides: ModifierSideState::default(),
             hover_pos: None,
             pressed_mouse_button: None,
             surface: None,
@@ -440,6 +520,77 @@ mod tests {
     }
 
     #[test]
+    fn macos_option_text_passes_through_when_option_is_not_meta() {
+        let commands = option_text_commands(
+            MacosOptionAsAlt::None,
+            ModifierSideState {
+                left_alt: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(commands, vec![TerminalInputCommand::Text("∑".to_owned())]);
+    }
+
+    #[test]
+    fn macos_option_as_alt_can_target_left_or_right_option() {
+        let left_commands = option_text_commands(
+            MacosOptionAsAlt::Left,
+            ModifierSideState {
+                left_alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            left_commands,
+            vec![TerminalInputCommand::Key(KeyInput {
+                key: TerminalKey::W,
+                mods: KeyMods {
+                    alt: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                utf8: Some("w"),
+                unshifted: Some('w'),
+            })]
+        );
+
+        let right_commands = option_text_commands(
+            MacosOptionAsAlt::Left,
+            ModifierSideState {
+                right_alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            right_commands,
+            vec![TerminalInputCommand::Text("∑".to_owned())]
+        );
+
+        let right_meta_commands = option_text_commands(
+            MacosOptionAsAlt::Right,
+            ModifierSideState {
+                right_alt: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            right_meta_commands,
+            vec![TerminalInputCommand::Key(KeyInput {
+                key: TerminalKey::W,
+                mods: KeyMods {
+                    alt: true,
+                    right_alt: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                utf8: Some("w"),
+                unshifted: Some('w'),
+            })]
+        );
+    }
+
+    #[test]
     fn mac_command_modified_text_is_not_sent_to_terminal() {
         let commands = terminal_input_commands(InputSnapshot {
             events: vec![
@@ -454,6 +605,7 @@ mod tests {
                 egui::Event::Text("2~".to_owned()),
             ],
             modifiers: egui::Modifiers::MAC_CMD,
+            modifier_sides: ModifierSideState::default(),
             hover_pos: None,
             pressed_mouse_button: None,
             surface: None,
@@ -543,6 +695,7 @@ mod tests {
                     modifiers: modifiers(false, true, false),
                 }],
                 modifiers: egui::Modifiers::default(),
+                modifier_sides: ModifierSideState::default(),
                 hover_pos: None,
                 pressed_mouse_button: None,
                 surface: None,
@@ -630,6 +783,7 @@ mod tests {
         let commands = terminal_input_commands(InputSnapshot {
             events: vec![egui::Event::PointerMoved(Pos2::new(35.0, 70.0))],
             modifiers: egui::Modifiers::default(),
+            modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(35.0, 70.0)),
             pressed_mouse_button: Some(MouseButton::Left),
             surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
@@ -683,6 +837,7 @@ mod tests {
                 },
             ],
             modifiers: egui::Modifiers::default(),
+            modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(35.0, 70.0)),
             pressed_mouse_button: None,
             surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
@@ -753,6 +908,7 @@ mod tests {
                 },
             ],
             modifiers: egui::Modifiers::default(),
+            modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(210.0, 72.0)),
             pressed_mouse_button: Some(MouseButton::Left),
             surface: Some(TerminalSurface::for_rect(
