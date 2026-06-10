@@ -1,4 +1,6 @@
 mod families;
+#[cfg(test)]
+mod tests;
 
 use crate::{geometry::SurfaceRect, paint_plan::PlanColor};
 use smallvec::SmallVec;
