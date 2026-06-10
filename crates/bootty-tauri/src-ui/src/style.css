@@ -35,6 +35,7 @@ body {
 
 .terminal-site {
   display: grid;
+  position: relative;
   width: 100vw;
   height: 100vh;
   min-width: 0;
@@ -54,4 +55,11 @@ body {
   background: #11121a;
   touch-action: none;
   user-select: none;
+}
+
+.terminal-site-link {
+  position: absolute;
+  display: block;
+  z-index: 2;
+  cursor: pointer;
 }

@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import type { Root } from "react-dom/client";
 import { createTerminalBackend } from "./terminal-api";
@@ -8,6 +8,7 @@ import { type TerminalSelection, WebGlTerminalRenderer } from "./webgl-terminal"
 import "./style.css";
 
 type GridSize = { cols: number; rows: number };
+type LinkOverlay = { key: string; href: string; left: number; top: number; width: number; height: number };
 
 declare global {
   interface Window {
@@ -23,12 +24,21 @@ function App() {
   const backendRef = useRef<TerminalBackend | null>(null);
   const selectionRef = useRef<TerminalSelection | null>(null);
   const selectingRef = useRef(false);
+  const linkOverlaySignatureRef = useRef("");
   const resizeInFlightRef = useRef(false);
   const fpsRef = useRef({ frames: 0, startedAt: performance.now() });
+  const [linkOverlays, setLinkOverlays] = useState<LinkOverlay[]>([]);
 
   const renderFrame = useCallback((frame: WebTerminalFrame) => {
     frameRef.current = frame;
     rendererRef.current?.render(frame, selectionRef.current);
+    const canvas = canvasRef.current;
+    const overlays = canvas ? linkOverlaysForFrame(frame, canvas) : [];
+    const signature = JSON.stringify(overlays);
+    if (signature !== linkOverlaySignatureRef.current) {
+      linkOverlaySignatureRef.current = signature;
+      setLinkOverlays(overlays);
+    }
   }, []);
 
   const resizeToCanvas = useCallback(async (backend: TerminalBackend, frame: WebTerminalFrame) => {
@@ -125,13 +135,11 @@ function App() {
       if (kind === "down" && eguiLink) {
         selectionRef.current = null;
         selectingRef.current = false;
-        window.location.assign(eguiLink);
         return;
       }
       if (kind === "down" && osc8) {
         selectionRef.current = null;
         selectingRef.current = false;
-        window.location.assign(osc8);
         return;
       }
       if (kind === "down") {
@@ -312,6 +320,22 @@ function App() {
         onPointerLeave={(event) => sendMouse("leave", event)}
         onWheel={sendWheel}
       />
+      {linkOverlays.map((link) => (
+        <a
+          key={link.key}
+          className="terminal-site-link"
+          href={link.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            left: link.left,
+            top: link.top,
+            width: link.width,
+            height: link.height,
+          }}
+          aria-label={link.href}
+        />
+      ))}
     </main>
   );
 }
@@ -367,6 +391,43 @@ function cellForPoint(
 function canvasPoint(canvas: HTMLCanvasElement, clientX: number, clientY: number): { x: number; y: number } {
   const rect = canvas.getBoundingClientRect();
   return { x: clientX - rect.left, y: clientY - rect.top };
+}
+
+function linkOverlaysForFrame(frame: WebTerminalFrame, canvas: HTMLCanvasElement): LinkOverlay[] {
+  const { scaleX, scaleY } = frameScale(frame, canvas);
+  const overlays: LinkOverlay[] = [];
+  for (const [index, link] of (frame.egui?.links ?? []).entries()) {
+    overlays.push({
+      key: `egui-${index}-${link.url}`,
+      href: link.url,
+      left: link.rect.minX * scaleX,
+      top: link.rect.minY * scaleY,
+      width: (link.rect.maxX - link.rect.minX) * scaleX,
+      height: (link.rect.maxY - link.rect.minY) * scaleY,
+    });
+  }
+  for (const cell of frame.cells) {
+    if (!cell.osc8) {
+      continue;
+    }
+    overlays.push({
+      key: `osc8-${cell.x}-${cell.y}-${cell.osc8}`,
+      href: cell.osc8,
+      left: cell.x * frame.cellWidth * scaleX,
+      top: cell.y * frame.cellHeight * scaleY,
+      width: frame.cellWidth * scaleX,
+      height: frame.cellHeight * scaleY,
+    });
+  }
+  return overlays;
+}
+
+function frameScale(frame: WebTerminalFrame, canvas: HTMLCanvasElement): { scaleX: number; scaleY: number } {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    scaleX: rect.width / (frame.cols * frame.cellWidth),
+    scaleY: rect.height / (frame.rows * frame.cellHeight),
+  };
 }
 
 function selectedText(frame: WebTerminalFrame, selection: TerminalSelection): string {

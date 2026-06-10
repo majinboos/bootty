@@ -33,7 +33,7 @@ const ICON_TEXTURE_SIZE: u32 = 96;
 const ICON_RENDER_SIZE: u32 = 48;
 const ICON_PNG: &[u8] = include_bytes!("../../bootty-tauri/src-ui/public/bootty-mascot.png");
 const SECTION_DETAIL_STATIC_ROWS: u16 = 4;
-const EGUI_SIDEBAR_TOP_PX: f32 = 70.0;
+const EGUI_SIDEBAR_TOP_PX: f32 = 18.0;
 const EGUI_SIDEBAR_ROW_HEIGHT_PX: f32 = 36.0;
 const EGUI_SIDEBAR_WIDTH_COLS: u16 = 32;
 const EGUI_HEADER_ROWS: u16 = 4;
@@ -403,6 +403,7 @@ enum SectionIcon {
     Guide,
     Doom,
     Renderer,
+    Palette,
     Runtime,
     Shell,
     App,
@@ -416,6 +417,7 @@ impl SectionIcon {
             SectionIcon::Guide => "\u{f02d}",
             SectionIcon::Doom => "\u{f11b}",
             SectionIcon::Renderer => "\u{f03e}",
+            SectionIcon::Palette => "\u{f1fc}",
             SectionIcon::Runtime => "\u{f017}",
             SectionIcon::Shell => "\u{f120}",
             SectionIcon::App => "\u{f108}",
@@ -521,6 +523,18 @@ impl Component for Detail {
                 Paragraph::new(text)
                     .scroll((self.scroll, 0))
                     .wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+        if section.plain_label == "Palette" {
+            let lines = palette_demo_lines(section);
+            let max_scroll = max_scroll(lines.len(), area.height);
+            self.scroll = self.scroll.min(max_scroll);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .scroll((self.scroll, 0))
+                    .wrap(Wrap { trim: true }),
                 area,
             );
             return;
@@ -639,6 +653,298 @@ impl AppComponent<Msg, NoUserEvent> for Detail {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DemoRgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl DemoRgb {
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    fn color(self) -> Color {
+        Color::Rgb(self.r, self.g, self.b)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DemoLab {
+    l: f32,
+    a: f32,
+    b: f32,
+}
+
+impl DemoLab {
+    fn from_rgb(rgb: DemoRgb) -> Self {
+        let red = srgb_to_linear(f32::from(rgb.r) / 255.0);
+        let green = srgb_to_linear(f32::from(rgb.g) / 255.0);
+        let blue = srgb_to_linear(f32::from(rgb.b) / 255.0);
+
+        let x = xyz_to_lab_curve(
+            (red * 0.412_456_4 + green * 0.357_576_1 + blue * 0.180_437_5) / 0.950_47,
+        );
+        let y = xyz_to_lab_curve(red * 0.212_672_9 + green * 0.715_152_2 + blue * 0.072_175);
+        let z = xyz_to_lab_curve(
+            (red * 0.019_333_9 + green * 0.119_192 + blue * 0.950_304_1) / 1.088_83,
+        );
+
+        Self {
+            l: 116.0 * y - 16.0,
+            a: 500.0 * (x - y),
+            b: 200.0 * (y - z),
+        }
+    }
+
+    fn to_rgb(self) -> DemoRgb {
+        let y = (self.l + 16.0) / 116.0;
+        let x = self.a / 500.0 + y;
+        let z = y - self.b / 200.0;
+
+        let x = lab_to_xyz_curve(x, x * x * x) * 0.950_47;
+        let y = lab_to_xyz_curve(y, y * y * y);
+        let z = lab_to_xyz_curve(z, z * z * z) * 1.088_83;
+
+        DemoRgb {
+            r: linear_to_srgb_byte(x * 3.240_454_2 - y * 1.537_138_5 - z * 0.498_531_4),
+            g: linear_to_srgb_byte(-x * 0.969_266 + y * 1.876_010_8 + z * 0.041_556),
+            b: linear_to_srgb_byte(x * 0.055_643_4 - y * 0.204_025_9 + z * 1.057_225_2),
+        }
+    }
+
+    fn lerp(t: f32, a: Self, b: Self) -> Self {
+        Self {
+            l: a.l + t * (b.l - a.l),
+            a: a.a + t * (b.a - a.a),
+            b: a.b + t * (b.b - a.b),
+        }
+    }
+}
+
+fn palette_demo_lines(section: Section) -> Vec<Line<'static>> {
+    let palette = harmonious_demo_palette();
+    let mut lines = vec![Line::from(Span::styled(
+        section.title,
+        Style::default()
+            .fg(section.accent)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    for row in 0..12 {
+        lines.push(palette_board_row(row, &palette));
+    }
+    lines.extend([
+        palette_spacer_row(),
+        palette_default_row(&palette),
+        palette_ansi_row(&palette, 0),
+        palette_ansi_row(&palette, 8),
+    ]);
+    lines
+}
+
+fn palette_board_row(row: usize, palette: &[DemoRgb; 256]) -> Line<'static> {
+    let red_start = if row < 6 { 0 } else { 3 };
+    let green = 5 - row % 6;
+    let mut spans = vec![palette_edge_cell(
+        (15usize.saturating_sub(row)) & 0xf,
+        row < 6,
+    )];
+    for red in red_start..red_start + 3 {
+        for blue in 0..6 {
+            let index = 16 + red * 36 + green * 6 + blue;
+            spans.push(palette_board_cell(index, palette[index]));
+        }
+        spans.push(Span::raw(" "));
+    }
+    spans.push(palette_edge_cell((row + 3) & 0xf, row < 6));
+    if row < 8 {
+        spans.push(Span::raw("   "));
+        spans.push(palette_legend_cell(row, palette[row]));
+        spans.push(palette_legend_cell(row + 8, palette[row + 8]));
+    }
+    Line::from(spans)
+}
+
+fn palette_default_row(palette: &[DemoRgb; 256]) -> Line<'static> {
+    let mut spans = Vec::with_capacity(30);
+    for (index, color) in palette.iter().enumerate().take(238).skip(232) {
+        spans.push(palette_gray_cell(index, *color));
+    }
+    spans.push(Span::styled(
+        "  Default  ",
+        Style::default().fg(Color::White),
+    ));
+    for (index, color) in palette.iter().enumerate().take(256).skip(250) {
+        spans.push(palette_gray_cell(index, *color));
+    }
+    spans.push(Span::raw("   "));
+    for (index, color) in palette.iter().enumerate().take(250).skip(238) {
+        spans.push(palette_gray_cell(index, *color));
+    }
+    Line::from(spans)
+}
+
+fn palette_ansi_row(palette: &[DemoRgb; 256], start: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    for (index, color) in palette.iter().enumerate().skip(start).take(8) {
+        spans.push(palette_legend_cell(index, *color));
+    }
+    Line::from(spans)
+}
+
+fn palette_spacer_row() -> Line<'static> {
+    Line::from("")
+}
+
+fn palette_board_cell(index: usize, color: DemoRgb) -> Span<'static> {
+    let glyph = format!("{:x} ", index & 0xf);
+    if color_luma(color) < 75_000 {
+        Span::styled(glyph, Style::default().fg(color.color()))
+    } else {
+        Span::styled(
+            glyph,
+            Style::default()
+                .fg(readable_palette_text(color))
+                .bg(color.color()),
+        )
+    }
+}
+
+fn palette_edge_cell(value: usize, filled: bool) -> Span<'static> {
+    let color = DemoRgb::new(176, 181, 196);
+    if filled {
+        Span::styled(
+            format!("{value:x} "),
+            Style::default().fg(Color::Black).bg(color.color()),
+        )
+    } else {
+        Span::styled(format!("{value:x} "), Style::default().fg(color.color()))
+    }
+}
+
+fn palette_legend_cell(index: usize, color: DemoRgb) -> Span<'static> {
+    Span::styled(
+        format!("{:x} ", index & 0xf),
+        Style::default()
+            .fg(readable_palette_text(color))
+            .bg(color.color()),
+    )
+}
+
+fn palette_gray_cell(index: usize, color: DemoRgb) -> Span<'static> {
+    palette_legend_cell(index, color)
+}
+
+fn readable_palette_text(color: DemoRgb) -> Color {
+    if color_luma(color) > 140_000 {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+fn color_luma(color: DemoRgb) -> u32 {
+    u32::from(color.r) * 299 + u32::from(color.g) * 587 + u32::from(color.b) * 114
+}
+
+fn harmonious_demo_palette() -> [DemoRgb; 256] {
+    let mut palette = [DemoRgb::new(0, 0, 0); 256];
+    for (index, color) in demo_base16().into_iter().enumerate() {
+        palette[index] = color;
+    }
+    let anchors = [
+        DemoLab::from_rgb(DEMO_BACKGROUND),
+        DemoLab::from_rgb(palette[1]),
+        DemoLab::from_rgb(palette[2]),
+        DemoLab::from_rgb(palette[3]),
+        DemoLab::from_rgb(palette[4]),
+        DemoLab::from_rgb(palette[5]),
+        DemoLab::from_rgb(palette[6]),
+        DemoLab::from_rgb(DEMO_FOREGROUND),
+    ];
+
+    let mut index = 16;
+    for red in 0..6 {
+        let c0 = DemoLab::lerp(red as f32 / 5.0, anchors[0], anchors[1]);
+        let c1 = DemoLab::lerp(red as f32 / 5.0, anchors[2], anchors[3]);
+        let c2 = DemoLab::lerp(red as f32 / 5.0, anchors[4], anchors[5]);
+        let c3 = DemoLab::lerp(red as f32 / 5.0, anchors[6], anchors[7]);
+        for green in 0..6 {
+            let c4 = DemoLab::lerp(green as f32 / 5.0, c0, c1);
+            let c5 = DemoLab::lerp(green as f32 / 5.0, c2, c3);
+            for blue in 0..6 {
+                palette[index] = DemoLab::lerp(blue as f32 / 5.0, c4, c5).to_rgb();
+                index += 1;
+            }
+        }
+    }
+
+    for step in 0..24 {
+        palette[index] = DemoLab::lerp((step + 1) as f32 / 25.0, anchors[0], anchors[7]).to_rgb();
+        index += 1;
+    }
+
+    palette
+}
+
+const DEMO_BACKGROUND: DemoRgb = DemoRgb::new(17, 18, 26);
+const DEMO_FOREGROUND: DemoRgb = DemoRgb::new(192, 202, 245);
+
+fn demo_base16() -> [DemoRgb; 16] {
+    [
+        DEMO_BACKGROUND,
+        DemoRgb::new(247, 118, 142),
+        DemoRgb::new(158, 206, 106),
+        DemoRgb::new(224, 175, 104),
+        DemoRgb::new(122, 162, 247),
+        DemoRgb::new(255, 79, 176),
+        DemoRgb::new(125, 207, 255),
+        DemoRgb::new(169, 177, 214),
+        DemoRgb::new(86, 95, 137),
+        DemoRgb::new(255, 139, 161),
+        DemoRgb::new(177, 214, 123),
+        DemoRgb::new(239, 196, 126),
+        DemoRgb::new(151, 184, 255),
+        DemoRgb::new(255, 122, 201),
+        DemoRgb::new(154, 220, 255),
+        DEMO_FOREGROUND,
+    ]
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value > 0.040_45 {
+        ((value + 0.055) / 1.055).powf(2.4)
+    } else {
+        value / 12.92
+    }
+}
+
+fn xyz_to_lab_curve(value: f32) -> f32 {
+    if value > 0.008_856 {
+        value.cbrt()
+    } else {
+        7.787 * value + 16.0 / 116.0
+    }
+}
+
+fn lab_to_xyz_curve(value: f32, cubed: f32) -> f32 {
+    if cubed > 0.008_856 {
+        cubed
+    } else {
+        (value - 16.0 / 116.0) / 7.787
+    }
+}
+
+fn linear_to_srgb_byte(value: f32) -> u8 {
+    let srgb = if value > 0.003_130_8 {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    } else {
+        12.92 * value
+    };
+    (srgb.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+}
+
 fn draw_site(
     frame: &mut Frame<'_>,
     menu_component: &mut Menu,
@@ -713,9 +1019,13 @@ fn sections() -> &'static [Section] {
             title: "A terminal UI toolkit with a real renderer.",
             accent: Color::Magenta,
             lines: &[
-                "Bootty gives Rust apps a terminal surface that feels native.",
-                "Text, sprites, images, cursor state, and links share one frame model.",
-                "Use it for dense developer tools, interactive shells, and app chrome.",
+                "Cells, images, cursor state, selections, and links travel in one frame.",
+                "Hosts render the frame directly instead of scraping terminal output.",
+                "",
+                "Use it for:",
+                "  - native Rust tools with terminal ergonomics",
+                "  - shell surfaces embedded in app chrome",
+                "  - demos where text and pixels need to compose cleanly",
             ],
             links: &[],
         },
@@ -738,6 +1048,9 @@ fn sections() -> &'static [Section] {
                 "Click the panel and play with WASD or arrows.",
                 "Fire with F or Control. Use Space for doors and switches.",
                 "Number keys 1-7 switch weapons.",
+                "",
+                "The game is a texture layer in the same frame as the terminal UI.",
+                "Keyboard focus stays with the frame so gameplay and shell input share routing.",
             ],
             links: &[],
         },
@@ -748,9 +1061,26 @@ fn sections() -> &'static [Section] {
             title: "GPU rendering for terminal UI.",
             accent: Color::Blue,
             lines: &[
-                "Crisp glyphs, box drawing, images, cursors, and decorations are batched.",
-                "The renderer keeps terminal geometry explicit instead of guessing from DOM layout.",
-                "The same drawing contract works in the desktop app and the browser demo.",
+                "Glyphs, box drawing, images, cursor shapes, and decorations batch together.",
+                "Terminal geometry remains explicit: cells, pixels, scale, and padding are separate.",
+                "",
+                "Renderer path:",
+                "  frame -> paint plan -> glyph atlas -> image layers -> swapchain",
+                "",
+                "The same drawing contract drives the desktop app, bare host, and site demo.",
+            ],
+            links: &[],
+        },
+        Section {
+            icon: SectionIcon::Palette,
+            label: "Palette",
+            plain_label: "Palette",
+            title: "Harmonious generated 256-color palette.",
+            accent: Color::Cyan,
+            lines: &[
+                "The extended ANSI palette is generated from the active base16 theme.",
+                "The cube and grayscale ramp interpolate in CIELAB so related colors keep apparent brightness.",
+                "Harmonious mode preserves foreground/background semantics for light and dark themes.",
             ],
             links: &[],
         },
@@ -763,7 +1093,11 @@ fn sections() -> &'static [Section] {
             lines: &[
                 "PTY draining, resize handling, frame publication, and input encoding stay explicit.",
                 "The UI consumes frames instead of parsing shell output on the render path.",
-                "Backpressure and repaint cadence are part of the runtime contract.",
+                "",
+                "Runtime responsibilities:",
+                "  - coalesce resize and repaint work",
+                "  - publish frames without blocking input",
+                "  - keep backpressure visible to the host",
             ],
             links: &[],
         },
@@ -773,7 +1107,7 @@ fn sections() -> &'static [Section] {
             plain_label: "Shell",
             title: "Demo shell.",
             accent: Color::Yellow,
-            lines: &[],
+            lines: &["Type `help`, `frame`, `renderer`, `runtime`, or `clear`."],
             links: &[],
         },
         Section {
@@ -785,7 +1119,12 @@ fn sections() -> &'static [Section] {
             lines: &[
                 "Bootty ships a native terminal shell with sidebar chrome and shared WGPU rendering.",
                 "Examples cover the bare host and egui-tab integration paths.",
-                "The site uses the same frame model to keep docs and demos close to the app.",
+                "",
+                "App surfaces:",
+                "  - full desktop shell",
+                "  - bare WGPU host",
+                "  - egui tab integration",
+                "  - browser-backed docs and demos",
             ],
             links: &[],
         },
@@ -1025,15 +1364,39 @@ fn paint_egui_shell(
             Pos2::new(sidebar.left(), row_y),
             Vec2::new(sidebar.width(), EGUI_SIDEBAR_ROW_HEIGHT_PX),
         );
+        let row_frame = row.shrink2(Vec2::new(8.0, 3.0));
         let active = index == selected;
         let hovered = hovered_menu == Some(index);
-        if hovered || active {
-            painter.rect_filled(
-                row.shrink2(Vec2::new(8.0, 2.0)),
-                4.0,
-                if active { current } else { hover },
-            );
-        }
+        painter.rect_filled(
+            row_frame.translate(Vec2::new(1.0, 1.0)),
+            5.0,
+            Color32::from_rgba_unmultiplied(0, 0, 0, if active { 58 } else { 30 }),
+        );
+        painter.rect_filled(
+            row_frame,
+            5.0,
+            if active {
+                current
+            } else if hovered {
+                hover
+            } else {
+                Color32::from_rgb(18, 20, 30)
+            },
+        );
+        painter.line_segment(
+            [
+                Pos2::new(row_frame.left() + 6.0, row_frame.top() + 0.5),
+                Pos2::new(row_frame.right() - 6.0, row_frame.top() + 0.5),
+            ],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 10)),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(row_frame.left() + 6.0, row_frame.bottom() - 0.5),
+                Pos2::new(row_frame.right() - 6.0, row_frame.bottom() - 0.5),
+            ],
+            Stroke::new(1.0, Color32::from_rgba_unmultiplied(0, 0, 0, 56)),
+        );
         if active {
             painter.rect_filled(
                 EguiRect::from_min_size(
@@ -1042,26 +1405,6 @@ fn paint_egui_shell(
                 ),
                 2.0,
                 egui_accent(section.accent),
-            );
-        }
-        if active {
-            painter.rect_filled(
-                EguiRect::from_center_size(
-                    Pos2::new(row.left() + 32.0, row.center().y),
-                    Vec2::splat(24.0),
-                ),
-                5.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 12),
-            );
-        }
-        if !active {
-            painter.rect_filled(
-                EguiRect::from_center_size(
-                    Pos2::new(row.left() + 32.0, row.center().y),
-                    Vec2::splat(24.0),
-                ),
-                5.0,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 8),
             );
         }
         row_y += EGUI_SIDEBAR_ROW_HEIGHT_PX;
@@ -1805,21 +2148,21 @@ mod tests {
 
     #[test]
     fn wide_menu_hit_tracks_drawn_menu_rows() {
-        assert_eq!(hit_target(96, 32, 2, 8), Some(HitTarget::Menu(0)));
-        assert_eq!(hit_target(96, 32, 2, 10), Some(HitTarget::Menu(1)));
-        assert_eq!(hit_target(96, 32, 2, 18), Some(HitTarget::Menu(5)));
+        assert_eq!(hit_target(96, 32, 2, 5), Some(HitTarget::Menu(0)));
+        assert_eq!(hit_target(96, 32, 2, 7), Some(HitTarget::Menu(1)));
+        assert_eq!(hit_target(96, 32, 2, 15), Some(HitTarget::Menu(5)));
     }
 
     #[test]
     fn wide_menu_hit_rejects_border_and_detail() {
-        assert_eq!(hit_target(96, 32, 0, 5), None);
+        assert_eq!(hit_target(96, 32, 0, 4), None);
         assert_eq!(hit_target(96, 32, 40, 5), Some(HitTarget::Detail));
     }
 
     #[test]
     fn narrow_menu_hit_uses_vertical_layout() {
-        assert_eq!(hit_target(60, 32, 2, 8), Some(HitTarget::Menu(0)));
-        assert_eq!(hit_target(60, 32, 2, 18), Some(HitTarget::Menu(5)));
+        assert_eq!(hit_target(60, 32, 2, 5), Some(HitTarget::Menu(0)));
+        assert_eq!(hit_target(60, 32, 2, 15), Some(HitTarget::Menu(5)));
         assert_eq!(hit_target(60, 32, 2, 25), Some(HitTarget::Detail));
     }
 
@@ -1827,7 +2170,7 @@ mod tests {
     fn menu_hover_highlights_without_changing_selected_page() {
         let mut site = SiteBackend::new();
 
-        site.handle_mouse("move", 2, 12, 0)
+        site.handle_mouse("move", 2, 10, 0)
             .expect("mouse move handles");
 
         assert_eq!(site.selected, 0);
@@ -1838,7 +2181,7 @@ mod tests {
     fn menu_click_changes_selected_page() {
         let mut site = SiteBackend::new();
 
-        site.handle_mouse("down", 2, 12, 0)
+        site.handle_mouse("down", 2, 10, 0)
             .expect("mouse down handles");
 
         assert_eq!(site.selected, 2);
@@ -1861,7 +2204,7 @@ mod tests {
         let mut site = SiteBackend::new();
         site.detail_scroll = 12;
 
-        site.handle_mouse("down", 2, 12, 0)
+        site.handle_mouse("down", 2, 10, 0)
             .expect("mouse down handles");
 
         assert_eq!(site.selected, 2);
@@ -1971,6 +2314,39 @@ mod tests {
         assert_eq!(section.title, "Source");
         assert_eq!(section.links[0].text, "GitHub");
         assert_eq!(section.links[0].url, GITHUB_URL);
+    }
+
+    #[test]
+    fn palette_section_renders_harmonious_demo_swatches() {
+        let palette_section = sections()
+            .iter()
+            .find(|section| section.plain_label == "Palette")
+            .expect("palette section exists");
+        let palette = harmonious_demo_palette();
+        let lines = palette_demo_lines(*palette_section);
+        let content = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        let palette_glyph_count = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| {
+                let content = span.content.as_ref();
+                content.len() == 2
+                    && content.ends_with(' ')
+                    && content
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_hexdigit())
+            })
+            .count();
+
+        assert!(matches!(palette_section.icon, SectionIcon::Palette));
+        assert_eq!(palette_section.icon.glyph(), "\u{f1fc}");
+        assert!(content.contains("Default"));
+        assert!(!content.contains("216-color cube"));
+        assert_eq!(lines.len(), 17);
+        assert!(palette_glyph_count >= 256);
+        assert_eq!(palette[16], DEMO_BACKGROUND);
+        assert_eq!(palette[231], DEMO_FOREGROUND);
     }
 
     #[test]
