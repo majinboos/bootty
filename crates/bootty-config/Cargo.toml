@@ -1,0 +1,18 @@
+[package]
+name = "bootty-config"
+edition.workspace = true
+
+[dependencies]
+libghostty-vt.workspace = true
+serde.workspace = true
+toml_edit.workspace = true
+bootty-render = { path = "../bootty-render" }
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-terminal = { path = "../bootty-terminal" }
+bootty-winit = { path = "../bootty-winit", default-features = false }
+
+[dev-dependencies]
+indoc.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+tempfile.workspace = true

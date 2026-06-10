@@ -5,11 +5,11 @@ Bootty is a Rust-first, cross-platform terminal application. The app shell is
 render commands submitted as an eframe WGPU callback; egui owns chrome, layout,
 focus, input capture, and repaint scheduling.
 
-The workspace keeps one binary crate, `bootty`, and splits reusable terminal
-implementation into supporting library crates. These crates are not
-compatibility wrappers: each owns a seam whose deletion would push state,
-runtime, geometry, renderer, or host-specific complexity back into multiple
-callers.
+The workspace keeps one binary crate, `bootty-app` (binary name `bootty`), and
+splits reusable terminal implementation into supporting library crates. These
+crates are not compatibility wrappers: each owns a seam whose deletion would
+push state, runtime, geometry, renderer, or host-specific complexity back into
+multiple callers.
 
 ## Design constraints
 
@@ -24,9 +24,19 @@ callers.
 
 ## Crate boundaries
 
-- `bootty` owns product composition: the default binary, full egui app, config
-  loading/reload/writeback, theme resolution, mux chrome, app-level metrics,
-  examples, and compatibility-facing re-exports for tests and package examples.
+- `bootty-app` owns product composition: the default binary, full egui app,
+  theme resolution, mux chrome, app-level metrics, examples, and
+  compatibility-facing re-exports for tests and package examples.
+- `bootty-config` owns the Bootty TOML schema, XDG config path resolution,
+  includes, restricted theme color resolution, reload state, and round-trip
+  TOML writeback. It is host-neutral so non-egui hosts can load the same
+  config.
+- `bootty` is the stable library facade: re-exports of the four core library
+  crates for external callers.
+- `bootty-ui` owns egui theme/color widgets shared by app chrome.
+- `bootty-tauri` is a Tauri host adapter exposing terminal sessions over Tauri
+  commands.
+- `bootty-site` is the documentation website and interactive demo.
 - `bootty-surface` owns terminal geometry: cell metrics, padding, viewport
   rectangles, grid sizing, PTY pixel dimensions, and pointer transforms.
 - `bootty-terminal` owns the `libghostty-vt` adapter, frame snapshots, terminal
@@ -73,8 +83,10 @@ render frames.
 
 - `app.rs` owns app-level orchestration, status metrics, repaint/runtime
   lifecycle, and terminal command application.
-- `config.rs` owns the Bootty TOML schema, XDG config path resolution, includes,
-  restricted theme resolution, reload state, and round-trip TOML writeback.
+- `bootty-config::config` owns the Bootty TOML schema, XDG config path
+  resolution, includes, restricted theme resolution, reload state, and
+  round-trip TOML writeback. `bootty-config::config_reload` owns hot-reload
+  polling state.
 - `mux/` owns backend selection, backend-neutral commands, snapshots, and mux
   backend contracts.
 - `input/` owns app input focus and event routing before terminal input

@@ -470,13 +470,13 @@ fn config_maps_macos_option_as_alt_to_terminal_session_config() {
     );
     assert_eq!(
         config.terminal_session_config().macos_option_as_alt,
-        crate::terminal::MacosOptionAsAlt::Right
+        MacosOptionAsAlt::Right
     );
     assert_eq!(
         BoottyConfig::default()
             .terminal_session_config()
             .macos_option_as_alt,
-        crate::terminal::MacosOptionAsAlt::Both
+        MacosOptionAsAlt::Both
     );
 }
 

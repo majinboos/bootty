@@ -8,13 +8,14 @@ use std::{
 use serde::{Deserialize, Deserializer};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use crate::{
-    color::Color,
-    modifier_remap::ModifierRemapSet,
-    terminal::{MacosOptionAsAlt, SessionLaunchConfig, TerminalSessionConfig},
-    terminal_engine::TerminalColorConfig,
-    terminal_text::TerminalTextConfig,
+use bootty_render::terminal_text::TerminalTextConfig;
+use bootty_runtime::{SessionLaunchConfig, TerminalSessionConfig};
+use bootty_terminal::{
+    terminal_engine::TerminalColorConfig, terminal_input_model::MacosOptionAsAlt,
 };
+use bootty_winit::modifier_remap::ModifierRemapSet;
+
+use crate::color::Color;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoottyConfig {
