@@ -203,7 +203,9 @@ impl BackendPaneTerminal {
         anchor: Option<&MuxPaneAnchor>,
     ) -> Result<()> {
         let backend = selected_backend(config);
-        if self.backend == backend && target_matches_anchor(self.active_target.as_ref(), anchor) {
+        if self.backend == backend
+            && target_matches_anchor(backend, self.active_target.as_ref(), anchor)
+        {
             return Ok(());
         }
 
@@ -252,8 +254,12 @@ impl BackendPaneTerminal {
                 )?,
             )))
         } else if matches!(backend, MuxBackendKind::Tmux | MuxBackendKind::Zellij) {
-            let config =
-                backend_attach_session_config(self.terminal_config.clone(), backend, target)?;
+            let config = backend_attach_session_config(
+                self.terminal_config.clone(),
+                backend,
+                target,
+                bootty_runtime::terminfo::vendored_terminfo_dir().is_some(),
+            )?;
             Ok(ActiveTerminalRuntime(Box::new(
                 TerminalSession::new_with_config(
                     self.geometry,
@@ -395,12 +401,25 @@ impl From<MuxPaneAnchor> for MuxPaneTarget {
     }
 }
 
-fn target_matches_anchor(target: Option<&MuxPaneTarget>, anchor: Option<&MuxPaneAnchor>) -> bool {
+fn target_matches_anchor(
+    backend: MuxBackendKind,
+    target: Option<&MuxPaneTarget>,
+    anchor: Option<&MuxPaneAnchor>,
+) -> bool {
     match (target, anchor) {
         (None, None) => true,
         (Some(target), Some(anchor)) => {
+            if target.session_id() != anchor.session_id {
+                return false;
+            }
+            // Attached clients (tmux/zellij attach PTYs) follow pane and
+            // window changes server-side; restarting them on an active-pane
+            // change blanks the whole surface for nothing.
+            if matches!(backend, MuxBackendKind::Tmux | MuxBackendKind::Zellij) {
+                return true;
+            }
             let anchor_selector = anchor.pane_id.as_deref().unwrap_or(&anchor.session_id);
-            target.session_id() == anchor.session_id && target.input_selector() == anchor_selector
+            target.input_selector() == anchor_selector
         }
         _ => false,
     }
@@ -412,9 +431,18 @@ pub(super) fn backend_attach_launch(
 ) -> (String, Vec<String>) {
     let session = target.session_id().to_owned();
     match backend {
+        // -T declares outer-terminal features tmux cannot learn from the
+        // forced xterm-256color terminfo; "sync" makes tmux wrap redraws in
+        // DEC 2026 so layout changes repaint without a blank flash.
         MuxBackendKind::Tmux => (
             "tmux".to_owned(),
-            vec!["attach-session".to_owned(), "-t".to_owned(), session],
+            vec![
+                "-T".to_owned(),
+                "256,RGB,sync".to_owned(),
+                "attach-session".to_owned(),
+                "-t".to_owned(),
+                session,
+            ],
         ),
         MuxBackendKind::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
         MuxBackendKind::Native => unreachable!("native panes are rendered directly by Bootty"),
@@ -438,12 +466,20 @@ fn backend_attach_session_config(
     mut config: TerminalSessionConfig,
     backend: MuxBackendKind,
     target: &MuxPaneTarget,
+    ghostty_terminfo_available: bool,
 ) -> Result<TerminalSessionConfig> {
     let (program, args) = backend_attach_launch(backend, target);
     config.launch.shell = Some(resolve_launch_program(&program)?);
     config.launch.args = args;
     config.launch.env_remove = backend_attach_env_remove(backend);
-    config.launch.term = "xterm-256color".to_owned();
+    // The attach client hard-fails on a TERM it cannot resolve. xterm-ghostty
+    // only resolves through Bootty's vendored terminfo; anything else falls
+    // back to the universally installed xterm-256color, with required
+    // features pinned via the -T attach flag either way.
+    if config.launch.term != bootty_runtime::terminfo::XTERM_GHOSTTY || !ghostty_terminfo_available
+    {
+        config.launch.term = "xterm-256color".to_owned();
+    }
     Ok(config)
 }
 
@@ -553,11 +589,15 @@ mod tests {
             process: Some("zsh".to_owned()),
         };
 
-        assert!(target_matches_anchor(Some(&target), Some(&anchor)));
+        assert!(target_matches_anchor(
+            MuxBackendKind::Rmux,
+            Some(&target),
+            Some(&anchor)
+        ));
     }
 
     #[test]
-    fn target_match_distinguishes_missing_and_changed_panes() {
+    fn pane_rendering_backends_restart_on_missing_and_changed_panes() {
         let target = MuxPaneTarget::Pane {
             session_id: "agents".to_owned(),
             pane_id: "%3".to_owned(),
@@ -574,9 +614,52 @@ mod tests {
             ..session_anchor.clone()
         };
 
-        assert!(!target_matches_anchor(Some(&target), Some(&session_anchor)));
-        assert!(!target_matches_anchor(Some(&target), Some(&other_pane)));
-        assert!(target_matches_anchor(None, None));
+        for backend in [MuxBackendKind::Rmux, MuxBackendKind::Native] {
+            assert!(!target_matches_anchor(
+                backend,
+                Some(&target),
+                Some(&session_anchor)
+            ));
+            assert!(!target_matches_anchor(
+                backend,
+                Some(&target),
+                Some(&other_pane)
+            ));
+            assert!(target_matches_anchor(backend, None, None));
+        }
+    }
+
+    #[test]
+    fn attached_client_backends_follow_pane_changes_without_restart() {
+        let target = MuxPaneTarget::Pane {
+            session_id: "agents".to_owned(),
+            pane_id: "%3".to_owned(),
+            cwd: None,
+        };
+        let split_changed_active_pane = MuxPaneAnchor {
+            session_id: "agents".to_owned(),
+            pane_id: Some("%4".to_owned()),
+            cwd: None,
+            process: None,
+        };
+        let other_session = MuxPaneAnchor {
+            session_id: "dotfiles".to_owned(),
+            ..split_changed_active_pane.clone()
+        };
+
+        for backend in [MuxBackendKind::Tmux, MuxBackendKind::Zellij] {
+            assert!(target_matches_anchor(
+                backend,
+                Some(&target),
+                Some(&split_changed_active_pane)
+            ));
+            assert!(!target_matches_anchor(
+                backend,
+                Some(&target),
+                Some(&other_session)
+            ));
+            assert!(!target_matches_anchor(backend, Some(&target), None));
+        }
     }
 
     #[test]
@@ -586,6 +669,8 @@ mod tests {
             (
                 "tmux".to_owned(),
                 vec![
+                    "-T".to_owned(),
+                    "256,RGB,sync".to_owned(),
                     "attach-session".to_owned(),
                     "-t".to_owned(),
                     "agents".to_owned()
@@ -615,6 +700,51 @@ mod tests {
             backend_attach_env_remove(MuxBackendKind::Zellij),
             vec!["ZELLIJ".to_owned()]
         );
+    }
+
+    #[test]
+    fn attach_keeps_ghostty_term_only_when_vendored_terminfo_resolves() {
+        let config = TerminalSessionConfig {
+            launch: bootty_runtime::SessionLaunchConfig {
+                term: "xterm-ghostty".to_owned(),
+                ..Default::default()
+            },
+            colors: TerminalColorConfig::default(),
+            max_scrollback: 0,
+            macos_option_as_alt: Default::default(),
+        };
+
+        let with_terminfo = backend_attach_session_config(
+            config.clone(),
+            MuxBackendKind::Tmux,
+            &target("agents"),
+            true,
+        )
+        .expect("attach config");
+        assert_eq!(with_terminfo.launch.term, "xterm-ghostty");
+
+        let without_terminfo =
+            backend_attach_session_config(config, MuxBackendKind::Tmux, &target("agents"), false)
+                .expect("attach config");
+        assert_eq!(without_terminfo.launch.term, "xterm-256color");
+    }
+
+    #[test]
+    fn attach_downgrades_unresolvable_custom_term_to_tmux_compatible() {
+        let config = TerminalSessionConfig {
+            launch: bootty_runtime::SessionLaunchConfig {
+                term: "st-256color".to_owned(),
+                ..Default::default()
+            },
+            colors: TerminalColorConfig::default(),
+            max_scrollback: 0,
+            macos_option_as_alt: Default::default(),
+        };
+
+        let attach =
+            backend_attach_session_config(config, MuxBackendKind::Tmux, &target("agents"), true)
+                .expect("attach config");
+        assert_eq!(attach.launch.term, "xterm-256color");
     }
 
     #[test]

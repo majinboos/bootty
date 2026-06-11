@@ -40,7 +40,7 @@ const DEFAULT_SHELL: &str = "/bin/zsh";
 pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(4);
 pub(crate) const WORKER_SETTLED_FRAME_DELAY: Duration = Duration::from_millis(16);
-pub(crate) const WORKER_MAX_UNPUBLISHED_FRAME_DELAY: Duration = Duration::from_millis(500);
+pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSessionConfig {
@@ -330,7 +330,8 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             pending_pty_bytes: 0,
             pending_front_offset: 0,
             last_frame_publish: Instant::now() - WORKER_READY_FRAME_INTERVAL,
-            unpublished_frame_since: None,
+            has_unpublished_frame: false,
+            sync_output_since: None,
             last_terminal_change: None,
             force_next_frame_publish: false,
             command_disconnected: false,
@@ -359,7 +360,8 @@ struct TerminalWorker {
     pending_pty_bytes: usize,
     pending_front_offset: usize,
     last_frame_publish: Instant,
-    unpublished_frame_since: Option<Instant>,
+    has_unpublished_frame: bool,
+    sync_output_since: Option<Instant>,
     last_terminal_change: Option<Instant>,
     force_next_frame_publish: bool,
     command_disconnected: bool,
@@ -410,24 +412,32 @@ impl TerminalWorker {
         self.command_disconnected && self.pty_disconnected && self.pending_pty_bytes == 0
     }
 
-    fn should_publish_frame(&self) -> bool {
+    fn should_publish_frame(&mut self) -> bool {
+        let sync_output_suppressed = self.sync_output_suppressed();
         should_publish_frame_after_work(
-            self.unpublished_frame_since.is_some(),
+            self.has_unpublished_frame,
             self.force_next_frame_publish,
+            sync_output_suppressed,
             self.pending_pty_bytes,
             self.last_terminal_change
                 .map(|instant| instant.elapsed())
                 .unwrap_or(Duration::ZERO),
-            self.unpublished_frame_since
-                .map(|instant| instant.elapsed())
-                .unwrap_or(Duration::ZERO),
+            self.last_frame_publish.elapsed(),
         )
     }
 
+    fn sync_output_suppressed(&mut self) -> bool {
+        if !self.engine.is_synchronized_output().unwrap_or(false) {
+            self.sync_output_since = None;
+            return false;
+        }
+        let since = *self.sync_output_since.get_or_insert_with(Instant::now);
+        sync_output_suppresses_publish(true, since.elapsed())
+    }
+
     fn mark_unpublished_frame(&mut self) {
-        let now = Instant::now();
-        self.unpublished_frame_since.get_or_insert(now);
-        self.last_terminal_change = Some(now);
+        self.has_unpublished_frame = true;
+        self.last_terminal_change = Some(Instant::now());
     }
 
     fn mark_input_fast_path(&mut self) {
@@ -637,7 +647,7 @@ impl TerminalWorker {
             && self.latest_frame.publish(frame).is_ok()
         {
             self.force_next_frame_publish = false;
-            self.unpublished_frame_since = None;
+            self.has_unpublished_frame = false;
             (self.repaint_wakeup)();
         }
     }
@@ -681,29 +691,43 @@ pub(crate) fn drain_budget_exhausted(stats: DrainStats) -> bool {
     stats.bytes >= MAX_DRAIN_BYTES_PER_FRAME || stats.chunks >= MAX_DRAIN_CHUNKS_PER_FRAME
 }
 
+// DEC mode 2026 (synchronized output): applications wrap multi-step redraws
+// in BSU/ESU so intermediate states (e.g. a cleared screen before a tmux
+// layout repaint) never reach the display. The grace period bounds a client
+// that sets the mode and dies without clearing it.
+pub(crate) fn sync_output_suppresses_publish(
+    sync_output_active: bool,
+    elapsed_since_sync_start: Duration,
+) -> bool {
+    sync_output_active && elapsed_since_sync_start < SYNC_OUTPUT_MAX_SUPPRESS
+}
+
 pub(crate) fn should_publish_frame_after_work(
     unpublished_frame: bool,
     force_next_frame_publish: bool,
+    sync_output_suppressed: bool,
     pending_pty_bytes: usize,
     elapsed_since_last_terminal_change: Duration,
-    elapsed_since_first_unpublished: Duration,
+    elapsed_since_last_publish: Duration,
 ) -> bool {
     if !unpublished_frame {
+        return false;
+    }
+    if sync_output_suppressed {
         return false;
     }
     if force_next_frame_publish {
         return true;
     }
+    // Sustained output never settles, so a settle-only policy starves the UI
+    // down to a heartbeat. Publish on a display-rate cadence instead.
+    if elapsed_since_last_publish >= WORKER_READY_FRAME_INTERVAL {
+        return true;
+    }
     if pending_pty_bytes > 0 {
         return false;
     }
-    if elapsed_since_last_terminal_change >= WORKER_SETTLED_FRAME_DELAY {
-        return true;
-    }
-    if elapsed_since_first_unpublished >= WORKER_MAX_UNPUBLISHED_FRAME_DELAY {
-        return true;
-    }
-    false
+    elapsed_since_last_terminal_change >= WORKER_SETTLED_FRAME_DELAY
 }
 
 fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Result<SpawnedPty> {
@@ -721,6 +745,9 @@ fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Resu
     command.env("TERM", &config.term);
     command.env("COLORTERM", &config.colorterm);
     for (name, value) in &config.env {
+        command.env(name, value);
+    }
+    if let Some((name, value)) = crate::terminfo::terminfo_env_entry(&config.term, &config.env) {
         command.env(name, value);
     }
     for name in &config.env_remove {
@@ -921,18 +948,11 @@ mod tests {
     }
 
     #[test]
-    fn worker_frame_publish_policy_avoids_backlog_flicker() {
-        assert!(WORKER_READY_FRAME_INTERVAL >= Duration::from_millis(16));
-        assert!(WORKER_SETTLED_FRAME_DELAY >= Duration::from_millis(16));
-        assert!(WORKER_MAX_UNPUBLISHED_FRAME_DELAY >= Duration::from_millis(500));
-        assert!(WORKER_IDLE_SLEEP > Duration::ZERO);
-    }
-
-    #[test]
     fn input_wakeup_does_not_publish_stale_pre_echo_frame() {
         assert!(!should_publish_frame_after_work(
             false,
             true,
+            false,
             0,
             Duration::ZERO,
             Duration::ZERO,
@@ -944,6 +964,7 @@ mod tests {
         assert!(should_publish_frame_after_work(
             true,
             true,
+            false,
             0,
             Duration::ZERO,
             Duration::ZERO,
@@ -951,13 +972,26 @@ mod tests {
     }
 
     #[test]
-    fn backlog_catchup_does_not_publish_intermediate_frames() {
+    fn backlog_catchup_batches_within_ready_interval() {
         assert!(!should_publish_frame_after_work(
             true,
             false,
+            false,
             4096,
-            WORKER_MAX_UNPUBLISHED_FRAME_DELAY * 2,
-            WORKER_MAX_UNPUBLISHED_FRAME_DELAY * 2,
+            Duration::ZERO,
+            WORKER_READY_FRAME_INTERVAL / 2,
+        ));
+    }
+
+    #[test]
+    fn sustained_output_publishes_at_ready_interval_cadence() {
+        assert!(should_publish_frame_after_work(
+            true,
+            false,
+            false,
+            4096,
+            Duration::ZERO,
+            WORKER_READY_FRAME_INTERVAL,
         ));
     }
 
@@ -966,21 +1000,36 @@ mod tests {
         assert!(should_publish_frame_after_work(
             true,
             false,
+            false,
             0,
             WORKER_SETTLED_FRAME_DELAY,
-            WORKER_SETTLED_FRAME_DELAY,
+            Duration::ZERO,
         ));
     }
 
     #[test]
-    fn continuous_output_has_low_frequency_heartbeat() {
-        assert!(should_publish_frame_after_work(
+    fn sync_output_holds_back_mid_redraw_frames_even_for_input_echo() {
+        assert!(!should_publish_frame_after_work(
             true,
-            false,
+            true,
+            true,
             0,
-            Duration::ZERO,
-            WORKER_MAX_UNPUBLISHED_FRAME_DELAY,
+            WORKER_SETTLED_FRAME_DELAY,
+            WORKER_READY_FRAME_INTERVAL,
         ));
+    }
+
+    #[test]
+    fn stuck_sync_output_mode_stops_suppressing_after_grace_period() {
+        assert!(sync_output_suppresses_publish(
+            true,
+            SYNC_OUTPUT_MAX_SUPPRESS / 2
+        ));
+        assert!(!sync_output_suppresses_publish(
+            true,
+            SYNC_OUTPUT_MAX_SUPPRESS
+        ));
+        assert!(!sync_output_suppresses_publish(false, Duration::ZERO));
     }
 
     #[test]
@@ -1156,43 +1205,50 @@ mod tests {
         }
 
         #[test]
-        fn property_publish_policy_preserves_fast_path_settle_and_backlog_invariants(
+        fn property_publish_policy_preserves_fast_path_cadence_and_settle_invariants(
             unpublished in any::<bool>(),
             force in any::<bool>(),
+            sync_suppressed in any::<bool>(),
             pending_pty_bytes in 0_usize..8192,
             elapsed_change_ms in 0_u64..1000,
-            elapsed_unpublished_ms in 0_u64..1000,
+            elapsed_publish_ms in 0_u64..1000,
         ) {
             let elapsed_change = Duration::from_millis(elapsed_change_ms);
-            let elapsed_unpublished = Duration::from_millis(elapsed_unpublished_ms);
+            let elapsed_publish = Duration::from_millis(elapsed_publish_ms);
             let should_publish = should_publish_frame_after_work(
                 unpublished,
                 force,
+                sync_suppressed,
                 pending_pty_bytes,
                 elapsed_change,
-                elapsed_unpublished,
+                elapsed_publish,
             );
 
-            if !unpublished {
+            if !unpublished || sync_suppressed {
                 prop_assert!(!should_publish);
             }
-            if unpublished && force {
+            if unpublished && !sync_suppressed && force {
                 prop_assert!(should_publish);
             }
-            if unpublished && !force && pending_pty_bytes > 0 {
-                prop_assert!(!should_publish);
-            }
             if unpublished
+                && !sync_suppressed
                 && !force
-                && pending_pty_bytes == 0
-                && elapsed_change >= WORKER_SETTLED_FRAME_DELAY
+                && elapsed_publish >= WORKER_READY_FRAME_INTERVAL
             {
                 prop_assert!(should_publish);
             }
             if unpublished
                 && !force
+                && elapsed_publish < WORKER_READY_FRAME_INTERVAL
+                && pending_pty_bytes > 0
+            {
+                prop_assert!(!should_publish);
+            }
+            if unpublished
+                && !sync_suppressed
+                && !force
                 && pending_pty_bytes == 0
-                && elapsed_unpublished >= WORKER_MAX_UNPUBLISHED_FRAME_DELAY
+                && elapsed_change >= WORKER_SETTLED_FRAME_DELAY
             {
                 prop_assert!(should_publish);
             }

@@ -698,6 +698,7 @@ dependencies = [
  "bootty-terminal",
  "portable-pty",
  "proptest",
+ "tempfile",
 ]
 
 [[package]]

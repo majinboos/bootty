@@ -1,6 +1,7 @@
 pub mod render_source;
 pub mod scheduler;
 pub mod terminal_session;
+pub mod terminfo;
 
 pub use terminal_session::{
     DrainStats, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,

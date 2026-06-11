@@ -10,3 +10,4 @@ portable-pty.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile.workspace = true

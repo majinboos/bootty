@@ -720,6 +720,10 @@ impl TerminalEngine {
         self.terminal.is_mouse_tracking().map_err(Into::into)
     }
 
+    pub fn is_synchronized_output(&self) -> Result<bool> {
+        self.terminal.mode(Mode::SYNC_OUTPUT).map_err(Into::into)
+    }
+
     pub fn extract_frame(&mut self) -> Result<&RenderFrame> {
         let extract_start = Instant::now();
         let update_start = Instant::now();
