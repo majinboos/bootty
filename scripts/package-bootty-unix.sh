@@ -37,7 +37,8 @@ case "$(uname -s)" in
     fi
 
     ICON_PARTIAL_INFO="$CONTENTS_DIR/assetcatalog-info.plist"
-    "$ACTOOL" "$MACOS_ICON_SOURCE" \
+    ACTOOL_LOG="$(mktemp)"
+    if ! "$ACTOOL" "$MACOS_ICON_SOURCE" \
       --compile "$RESOURCES_DIR" \
       --app-icon "$MACOS_ICON_NAME" \
       --enable-on-demand-resources NO \
@@ -48,8 +49,12 @@ case "$(uname -s)" in
       --include-all-app-icons \
       --minimum-deployment-target 13.0 \
       --output-partial-info-plist "$ICON_PARTIAL_INFO" \
-      >/dev/null
-    rm -f "$ICON_PARTIAL_INFO"
+      >"$ACTOOL_LOG" 2>&1; then
+      echo "actool failed compiling the app icon:" >&2
+      cat "$ACTOOL_LOG" >&2
+      exit 1
+    fi
+    rm -f "$ICON_PARTIAL_INFO" "$ACTOOL_LOG"
     chmod +x "$MACOS_DIR/$BINARY_NAME"
 
     cat > "$CONTENTS_DIR/Info.plist" <<PLIST

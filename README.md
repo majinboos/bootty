@@ -35,8 +35,9 @@ Native Bootty app bundles are built from `bootty-app --bin bootty`, not from the
 Tauri demo crate.
 
 ```sh
-./scripts/package-bootty-unix.sh          # macOS .app zip or Linux tarball
-pwsh ./scripts/package-bootty-windows.ps1 # Windows zip
+mise run package          # macOS .app zip or Linux tarball
+mise run package:windows  # Windows zip
+mise run install          # package and install Bootty.app into /Applications (macOS)
 ```
 
 The CI workflow runs full Rust validation on pull requests and pushes, then
