@@ -56,9 +56,6 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
         match command {
-            MuxCommand::ActivateSession { session_id } => {
-                self.run_owned(vec!["action".into(), "switch-session".into(), session_id])?;
-            }
             MuxCommand::ActivateWindow { .. } => {
                 anyhow::bail!("zellij native window activation is not implemented");
             }
@@ -88,12 +85,7 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
             MuxCommand::DitchSession { session_id } => {
                 self.run_owned(vec!["kill-session".into(), session_id])?;
             }
-            MuxCommand::ActivateNextSession
-            | MuxCommand::ActivatePreviousSession
-            | MuxCommand::ActivateLastSession
-            | MuxCommand::ActivateSessionIndex { .. }
-            | MuxCommand::MoveSession { .. }
-            | MuxCommand::NewWindow { .. }
+            MuxCommand::NewWindow { .. }
             | MuxCommand::ActivateNextWindow { .. }
             | MuxCommand::ActivatePreviousWindow { .. }
             | MuxCommand::ActivateLastWindow { .. }
@@ -176,11 +168,6 @@ mod tests {
         let mut backend = ZellijBackend::with_runner(runner);
 
         backend
-            .execute(MuxCommand::ActivateSession {
-                session_id: "project".to_owned(),
-            })
-            .unwrap();
-        backend
             .execute(MuxCommand::CreateProjectSession {
                 session_id: "next".to_owned(),
                 cwd: "/next".to_owned(),
@@ -201,7 +188,6 @@ mod tests {
         assert_eq!(
             calls.borrow().as_slice(),
             vec![
-                vec!["zellij", "action", "switch-session", "project"],
                 vec![
                     "zellij",
                     "--layout-string",

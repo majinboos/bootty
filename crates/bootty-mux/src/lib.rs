@@ -7,7 +7,6 @@ pub mod command;
 pub mod config;
 pub mod controller;
 pub mod native;
-pub mod order;
 pub mod process;
 pub mod rmux;
 pub mod sidebar_meta;

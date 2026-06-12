@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fmt::Write as _, time::Duration};
+use std::{borrow::Cow, collections::HashMap, fmt::Write as _, time::Duration};
 
 use bootty_ui::ThemePalette;
 use eframe::egui::{self, Pos2, Rect, RichText, Stroke, TextureHandle};
@@ -43,6 +43,15 @@ pub struct SidebarModel<'a> {
     pub focused: bool,
     pub hovered_session: Option<&'a str>,
     pub unfocused_dim: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SidebarEvent {
+    ActivateSession(String),
+    Reorder {
+        source: String,
+        before: Option<String>,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct WindowTabsModel<'a> {
@@ -108,7 +117,7 @@ pub fn show_sidebar(
     palette: ThemePalette,
     height: f32,
     model: SidebarModel<'_>,
-) -> Option<String> {
+) -> Option<SidebarEvent> {
     let palette = sidebar_palette(palette);
     let width = ui.max_rect().width().max(0.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
@@ -153,13 +162,25 @@ pub fn show_sidebar(
         model.metadata,
         max_rows,
     );
-    let pointer_pos = ui.input(|input| input.pointer.hover_pos());
+    let preview_labels = sidebar_drag_preview_labels(&items);
+    let drag_id = egui::Id::new("mux-sidebar-drag-anchor");
+    let mut dragged = ui
+        .ctx()
+        .data_mut(|data| data.get_persisted::<SidebarDragState>(drag_id));
+    let pointer_pos = ui.input(|input| {
+        input
+            .pointer
+            .latest_pos()
+            .or_else(|| input.pointer.hover_pos())
+    });
+    let primary_down = ui.input(|input| input.pointer.primary_down());
     let pointer_hovered_session = pointer_pos
         .and_then(|pos| sidebar_hovered_row(pos, rect.min.x, list_top, width, max_rows))
         .and_then(|index| items.get(index))
         .and_then(|item| item.session_id);
+    let suppress_click = dragged.is_some();
 
-    let mut activated = None;
+    let mut event = None;
     for (index, item) in items.iter().enumerate() {
         let row_rect = Rect::from_min_size(
             Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
@@ -170,10 +191,61 @@ pub fn show_sidebar(
                 || model.focused && Some(session_id) == model.hovered_session
         });
         let response = sidebar_item_row(ui, row_rect, item, hovered, palette);
-        if response.clicked_by(egui::PointerButton::Primary)
+        if response.drag_started()
+            && let Some(anchor) = item.reorder_anchor
+        {
+            let state = SidebarDragState {
+                anchor: anchor.to_owned(),
+                preview: preview_labels
+                    .get(anchor)
+                    .cloned()
+                    .unwrap_or_else(|| anchor.to_owned()),
+            };
+            ui.ctx()
+                .data_mut(|data| data.insert_persisted(drag_id, state.clone()));
+            dragged = Some(state);
+            ui.ctx().request_repaint();
+        }
+
+        if event.is_none()
+            && !suppress_click
+            && response.clicked_by(egui::PointerButton::Primary)
             && let Some(session_id) = &item.session_id
         {
-            activated = Some((*session_id).to_owned());
+            event = Some(SidebarEvent::ActivateSession((*session_id).to_owned()));
+        }
+    }
+
+    let drop = dragged.as_ref().and_then(|drag| {
+        sidebar_drop_target(
+            &items,
+            pointer_pos,
+            rect.min.x,
+            list_top,
+            width,
+            &drag.anchor,
+        )
+    });
+    if let Some((_, indicator_y)) = drop {
+        painter.line_segment(
+            [
+                Pos2::new(rect.min.x, indicator_y),
+                Pos2::new(rect.max.x, indicator_y),
+            ],
+            Stroke::new(2.0, palette.primary),
+        );
+    }
+
+    if let Some(drag) = dragged.as_ref() {
+        paint_sidebar_drag_preview(ui, pointer_pos, &drag.preview, palette);
+        if primary_down {
+            ui.ctx().request_repaint();
+        } else {
+            if event.is_none() {
+                event = sidebar_reorder_event(dragged.as_ref(), drop);
+            }
+            ui.ctx()
+                .data_mut(|data| data.remove::<SidebarDragState>(drag_id));
         }
     }
 
@@ -188,7 +260,7 @@ pub fn show_sidebar(
     if !model.focused {
         painter.rect_filled(rect, 0.0, dim_overlay_color(model.unfocused_dim));
     }
-    activated
+    event
 }
 
 pub(crate) fn sidebar_metadata_session_budget(
@@ -243,6 +315,174 @@ fn sidebar_hovered_row(
     }
     let row = ((pos.y - top) / SIDEBAR_ROW_HEIGHT).floor() as usize;
     (row < max_rows).then_some(row)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidebarBlock<'a> {
+    anchor: &'a str,
+    start_row: usize,
+    end_row: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SidebarDragState {
+    anchor: String,
+    preview: String,
+}
+
+fn sidebar_drag_preview_labels<'a>(items: &'a [SidebarItem<'a>]) -> HashMap<&'a str, String> {
+    let mut labels = HashMap::new();
+    for item in items {
+        let Some(anchor) = item.reorder_anchor else {
+            continue;
+        };
+        labels
+            .entry(anchor)
+            .or_insert_with(|| sidebar_drag_label(item));
+    }
+    labels
+}
+
+fn sidebar_drag_label(item: &SidebarItem<'_>) -> String {
+    match item.display {
+        SidebarDisplay::Text(text) => text.to_owned(),
+        SidebarDisplay::Numbered { label, .. } => label.to_owned(),
+        SidebarDisplay::Progress(pct) => format!("{pct}%"),
+    }
+}
+
+fn paint_sidebar_drag_preview(
+    ui: &egui::Ui,
+    pointer_pos: Option<Pos2>,
+    preview: &str,
+    palette: ThemePalette,
+) {
+    let Some(pointer_pos) = pointer_pos else {
+        return;
+    };
+    let preview = truncate_label(preview, 24);
+    let font = egui::FontId::monospace(13.0);
+    let width = preview.chars().count() as f32 * 7.4 + 18.0;
+    let rect = Rect::from_min_size(
+        pointer_pos + egui::vec2(14.0, 14.0),
+        egui::vec2(width.max(48.0), SIDEBAR_ROW_HEIGHT - 2.0),
+    );
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("mux-sidebar-drag-preview"),
+    ));
+    painter.rect_filled(rect, 6.0, mix_color(palette.base, palette.text, 0.12));
+    painter.rect_stroke(
+        rect,
+        6.0,
+        Stroke::new(1.0, palette.primary),
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_center() + egui::vec2(9.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        preview,
+        font,
+        palette.text,
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarDropTarget<'a> {
+    Before(&'a str),
+    End,
+}
+
+fn sidebar_drop_target<'a>(
+    items: &'a [SidebarItem<'a>],
+    pos: Option<Pos2>,
+    left: f32,
+    top: f32,
+    width: f32,
+    dragged_anchor: &str,
+) -> Option<(SidebarDropTarget<'a>, f32)> {
+    let pos = pos?;
+    let row = sidebar_hovered_row(pos, left, top, width, items.len())?;
+    let blocks = sidebar_blocks(items);
+    let source_index = blocks
+        .iter()
+        .position(|block| block.anchor == dragged_anchor)?;
+    let block_index = blocks
+        .iter()
+        .position(|block| block.start_row <= row && row <= block.end_row)?;
+    let block = blocks[block_index];
+    let block_top = top + block.start_row as f32 * SIDEBAR_ROW_HEIGHT;
+    let block_bottom = top + (block.end_row + 1) as f32 * SIDEBAR_ROW_HEIGHT;
+    let midpoint = (block_top + block_bottom) * 0.5;
+
+    let (target, target_index, indicator_y) = if pos.y < midpoint {
+        (
+            SidebarDropTarget::Before(block.anchor),
+            Some(block_index),
+            block_top,
+        )
+    } else if let Some(next_block) = blocks.get(block_index + 1) {
+        (
+            SidebarDropTarget::Before(next_block.anchor),
+            Some(block_index + 1),
+            top + next_block.start_row as f32 * SIDEBAR_ROW_HEIGHT,
+        )
+    } else {
+        (SidebarDropTarget::End, None, block_bottom)
+    };
+
+    if sidebar_drop_is_noop(source_index, target_index, blocks.len()) {
+        return None;
+    }
+
+    Some((target, indicator_y))
+}
+
+fn sidebar_reorder_event(
+    dragged: Option<&SidebarDragState>,
+    drop: Option<(SidebarDropTarget<'_>, f32)>,
+) -> Option<SidebarEvent> {
+    let (drag, (drop_target, _)) = (dragged?, drop?);
+    Some(SidebarEvent::Reorder {
+        source: drag.anchor.clone(),
+        before: match drop_target {
+            SidebarDropTarget::Before(target) => Some(target.to_owned()),
+            SidebarDropTarget::End => None,
+        },
+    })
+}
+
+fn sidebar_drop_is_noop(
+    source_index: usize,
+    target_index: Option<usize>,
+    block_count: usize,
+) -> bool {
+    match target_index {
+        Some(target_index) if source_index < target_index => source_index + 1 == target_index,
+        Some(target_index) => source_index == target_index,
+        None => source_index + 1 == block_count,
+    }
+}
+
+fn sidebar_blocks<'a>(items: &'a [SidebarItem<'a>]) -> Vec<SidebarBlock<'a>> {
+    let mut blocks: Vec<SidebarBlock<'a>> = Vec::new();
+    for (row, item) in items.iter().enumerate() {
+        let Some(anchor) = item.reorder_anchor else {
+            continue;
+        };
+        if let Some(block) = blocks.last_mut()
+            && block.anchor == anchor
+        {
+            block.end_row = row;
+            continue;
+        }
+        blocks.push(SidebarBlock {
+            anchor,
+            start_row: row,
+            end_row: row,
+        });
+    }
+    blocks
 }
 
 fn subtle_border(palette: ThemePalette) -> egui::Color32 {
@@ -416,7 +656,9 @@ fn sidebar_item_row(
     let response = ui.interact(
         rect,
         ui.make_persistent_id(("mux-sidebar-item", &item.id)),
-        if item.session_id.is_some() || item.selectable {
+        if item.reorder_anchor.is_some() {
+            egui::Sense::click_and_drag()
+        } else if item.session_id.is_some() || item.selectable {
             egui::Sense::click()
         } else {
             egui::Sense::hover()
@@ -1456,7 +1698,7 @@ mod tests {
         }
     }
 
-    fn show_test_sidebar(ui: &mut egui::Ui, sessions: &[MuxSession]) -> Option<String> {
+    fn show_test_sidebar(ui: &mut egui::Ui, sessions: &[MuxSession]) -> Option<SidebarEvent> {
         show_sidebar(
             ui,
             ThemePalette::default(),
@@ -1501,7 +1743,7 @@ mod tests {
                 },
             );
 
-            let mut activated = None;
+            let mut event = None;
             let _ = context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
@@ -1515,12 +1757,69 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    activated = show_test_sidebar(ui, &sessions);
+                    event = show_test_sidebar(ui, &sessions);
                 },
             );
 
-            assert_eq!(activated, None);
+            assert_eq!(event, None);
         }
+    }
+
+    #[test]
+    fn sidebar_drop_target_uses_group_midpoint_for_after_group_moves() {
+        let sessions = vec![
+            test_session("s1", "agents", true),
+            test_session("s2", "arc/migrations", false),
+            test_session("s3", "arc/readiness", false),
+            test_session("s4", "bootty", false),
+        ];
+        let metadata = SidebarMetadata::default();
+        let items = build_visible_sidebar_items(&sessions, Some("s1"), &metadata, 32);
+
+        assert_eq!(
+            sidebar_drop_target(
+                &items,
+                Some(Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 3.5)),
+                0.0,
+                0.0,
+                240.0,
+                "agents",
+            ),
+            Some((
+                SidebarDropTarget::Before("bootty"),
+                SIDEBAR_ROW_HEIGHT * 4.0,
+            ))
+        );
+    }
+
+    #[test]
+    fn sidebar_reorder_event_commits_drop_target() {
+        let drag = SidebarDragState {
+            anchor: String::from("agents"),
+            preview: String::from("agents"),
+        };
+
+        assert_eq!(
+            sidebar_reorder_event(
+                Some(&drag),
+                Some((
+                    SidebarDropTarget::Before("bootty"),
+                    SIDEBAR_ROW_HEIGHT * 4.0
+                )),
+            ),
+            Some(SidebarEvent::Reorder {
+                source: String::from("agents"),
+                before: Some(String::from("bootty")),
+            })
+        );
+        assert_eq!(sidebar_reorder_event(Some(&drag), None), None);
+        assert_eq!(
+            sidebar_reorder_event(Some(&drag), Some((SidebarDropTarget::End, 0.0))),
+            Some(SidebarEvent::Reorder {
+                source: String::from("agents"),
+                before: None,
+            })
+        );
     }
 
     #[test]

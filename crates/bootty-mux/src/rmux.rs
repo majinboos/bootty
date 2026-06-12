@@ -67,7 +67,7 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
         match command {
-            MuxCommand::ActivateSession { .. } | MuxCommand::ActivateWindow { .. } => {
+            MuxCommand::ActivateWindow { .. } => {
                 // Bootty owns rmux selection and pane rendering natively; there is no
                 // attached rmux client to switch.
             }
@@ -81,12 +81,7 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
             MuxCommand::DitchSession { session_id } => {
                 self.client.kill_session(&session_id)?;
             }
-            MuxCommand::ActivateNextSession
-            | MuxCommand::ActivatePreviousSession
-            | MuxCommand::ActivateLastSession
-            | MuxCommand::ActivateSessionIndex { .. }
-            | MuxCommand::MoveSession { .. }
-            | MuxCommand::NewWindow { .. }
+            MuxCommand::NewWindow { .. }
             | MuxCommand::ActivateNextWindow { .. }
             | MuxCommand::ActivatePreviousWindow { .. }
             | MuxCommand::ActivateLastWindow { .. }
@@ -363,11 +358,6 @@ mod tests {
         let calls = client.calls.clone();
         let mut backend = RmuxBackend::with_client(client);
 
-        backend
-            .execute(MuxCommand::ActivateSession {
-                session_id: "project".to_owned(),
-            })
-            .unwrap();
         backend
             .execute(MuxCommand::ActivateWindow {
                 session_id: "project".to_owned(),

@@ -179,7 +179,7 @@ impl BoottyApp {
                     let title_icon = title_visible.then(|| {
                         chrome::load_app_icon_texture(ui.ctx(), &mut self.app_icon_texture)
                     });
-                    if let Some(session_id) = chrome::show_sidebar(
+                    if let Some(event) = chrome::show_sidebar(
                         ui,
                         palette,
                         sidebar_rect.height(),
@@ -198,7 +198,15 @@ impl BoottyApp {
                             unfocused_dim: self.state.config().chrome.unfocused_sidebar_dim,
                         },
                     ) {
-                        self.state.activate_session_from_ui(&session_id);
+                        match event {
+                            chrome::SidebarEvent::ActivateSession(session_id) => {
+                                self.state.activate_session_from_ui(&session_id);
+                            }
+                            chrome::SidebarEvent::Reorder { source, before } => {
+                                self.state
+                                    .reorder_session_before(&source, before.as_deref());
+                            }
+                        }
                     }
                 },
             );

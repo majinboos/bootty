@@ -56,10 +56,23 @@ fn stable_session_order(
     ordered
 }
 
+fn order_sessions_by_names(sessions: &[MuxSession], ordered_names: &[String]) -> Vec<MuxSession> {
+    let mut remaining = sessions.to_vec();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    for name in ordered_names {
+        if let Some(index) = remaining.iter().position(|session| &session.name == name) {
+            ordered.push(remaining.remove(index));
+        }
+    }
+    ordered.extend(remaining);
+    ordered
+}
+
 #[derive(Default)]
 pub struct MuxController {
     sessions: Vec<MuxSession>,
     selected_session: Option<String>,
+    previous_selected_session: Option<String>,
     selected_window: Option<String>,
     current_backend: Option<MuxBackendKind>,
     last_session_refresh: Option<Instant>,
@@ -83,6 +96,14 @@ impl MuxController {
 
     pub fn selected_session(&self) -> Option<&str> {
         self.selected_session.as_deref()
+    }
+
+    pub fn previous_selected_session(&self) -> Option<&str> {
+        let selected = self.previous_selected_session.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == selected || session.name == selected)
+            .map(|session| session.id.as_str())
     }
 
     pub fn selected_session_anchor(&self) -> Option<&crate::snapshot::MuxPaneAnchor> {
@@ -111,6 +132,10 @@ impl MuxController {
             .find(|session| session.id == selected || session.name == selected)
             .map(|session| session.windows.as_slice())
             .unwrap_or_default()
+    }
+
+    pub fn apply_session_order(&mut self, ordered_names: &[String]) {
+        self.sessions = order_sessions_by_names(&self.sessions, ordered_names);
     }
 
     pub fn selected_window(&self) -> Option<&str> {
@@ -202,7 +227,7 @@ impl MuxController {
         Some(match result {
             Ok(selected_session) => {
                 if let Some(session) = selected_session {
-                    self.selected_session = Some(session);
+                    self.activate_session(&session);
                 }
                 self.last_session_refresh = Some(Instant::now() - MUX_SESSION_REFRESH_INTERVAL);
                 Ok(())
@@ -211,28 +236,19 @@ impl MuxController {
         })
     }
 
-    pub fn activate_session(
-        &mut self,
-        session_id: &str,
-        repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
-    ) {
-        self.selected_session = Some(session_id.to_owned());
+    fn set_selected_session(&mut self, session_id: Option<String>) {
+        if self.selected_session == session_id {
+            return;
+        }
+        if let Some(current) = self.selected_session.take() {
+            self.previous_selected_session = Some(current);
+        }
+        self.selected_session = session_id;
+    }
+
+    pub fn activate_session(&mut self, session_id: &str) {
+        self.set_selected_session(Some(session_id.to_owned()));
         self.selected_window = None;
-        let command = MuxCommand::ActivateSession {
-            session_id: session_id.to_owned(),
-        };
-        if self
-            .execute_native_command(config, command.clone(), Some(session_id.to_owned()), None)
-            .is_ok()
-        {
-            repaint();
-            return;
-        }
-        if self.mux_command_rx.is_some() {
-            return;
-        }
-        self.spawn_command(repaint, config, command, Some(session_id.to_owned()));
     }
 
     pub fn activate_window(
@@ -242,7 +258,7 @@ impl MuxController {
         repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) {
-        self.selected_session = Some(session_id.to_owned());
+        self.set_selected_session(Some(session_id.to_owned()));
         self.selected_window = Some(window_id.to_owned());
         let command = MuxCommand::ActivateWindow {
             session_id: session_id.to_owned(),
@@ -291,8 +307,7 @@ impl MuxController {
         if self.mux_command_rx.is_some() {
             return;
         }
-        self.selected_session = Some(request.session_id.clone());
-        self.selected_window = None;
+        self.activate_session(&request.session_id);
         self.spawn_command(repaint, config, command, Some(request.session_id));
     }
 
@@ -391,7 +406,7 @@ impl MuxController {
         if same_backend {
             snapshot.sessions = stable_session_order(&self.sessions, snapshot.sessions);
         }
-        self.selected_session = selection_after_refresh(preferred_session, &snapshot);
+        self.set_selected_session(selection_after_refresh(preferred_session, &snapshot));
         self.selected_window = selected_window_after_refresh(
             self.selected_session.as_deref(),
             preferred_window,
@@ -508,6 +523,46 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["$2", "$1", "$3"]
         );
+    }
+
+    #[test]
+    fn apply_session_order_reorders_sessions_by_name_and_appends_new_sessions() {
+        let mut controller = MuxController {
+            sessions: vec![
+                session("$1", "main"),
+                session("$2", "work"),
+                session("$3", "new"),
+            ],
+            ..Default::default()
+        };
+
+        controller.apply_session_order(&["work".to_owned(), "main".to_owned()]);
+
+        assert_eq!(
+            controller
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work", "main", "new"]
+        );
+    }
+
+    #[test]
+    fn activate_session_tracks_previous_bootty_selection() {
+        let mut controller = MuxController {
+            sessions: vec![session("$1", "main"), session("$2", "work")],
+            ..Default::default()
+        };
+
+        controller.activate_session("$1");
+        controller.activate_session("$2");
+        assert_eq!(controller.selected_session(), Some("$2"));
+        assert_eq!(controller.previous_selected_session(), Some("$1"));
+
+        controller.activate_session("$1");
+        assert_eq!(controller.selected_session(), Some("$1"));
+        assert_eq!(controller.previous_selected_session(), Some("$2"));
     }
 
     #[test]

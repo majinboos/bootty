@@ -78,12 +78,6 @@ impl NativeMuxState {
         self.active_session_id = session_id.to_owned();
     }
 
-    fn activate_session(&mut self, session_id: &str) {
-        if self.sessions.iter().any(|session| session.id == session_id) {
-            self.active_session_id = session_id.to_owned();
-        }
-    }
-
     fn activate_window(&mut self, session_id: &str, window_id: &str) {
         if let Some(session) = self
             .sessions
@@ -115,36 +109,6 @@ impl NativeMuxState {
                 .map(|session| session.id.clone())
                 .unwrap_or_default();
         }
-    }
-
-    fn active_session_index(&self) -> Option<usize> {
-        self.sessions
-            .iter()
-            .position(|session| session.id == self.active_session_id)
-    }
-
-    fn activate_relative_session(&mut self, delta: i32) {
-        let Some(index) = self.active_session_index() else {
-            return;
-        };
-        let len = self.sessions.len();
-        if len > 1 {
-            self.active_session_id = self.sessions[wrap_index(index, delta, len)].id.clone();
-        }
-    }
-
-    fn activate_session_index(&mut self, index: u32) {
-        if let Some(session) = self.sessions.get(index.saturating_sub(1) as usize) {
-            self.active_session_id = session.id.clone();
-        }
-    }
-
-    fn move_active_session(&mut self, delta: i32) {
-        let Some(index) = self.active_session_index() else {
-            return;
-        };
-        let next = clamp_move_index(index, delta, self.sessions.len());
-        self.sessions.swap(index, next);
     }
 
     fn active_session_mut(&mut self, session_id: &str) -> Option<&mut NativeSession> {
@@ -389,12 +353,6 @@ impl MuxBackend for NativeBackend {
             .lock()
             .map_err(|_| anyhow::anyhow!("native mux state lock poisoned"))?;
         match command {
-            MuxCommand::ActivateSession { session_id } => state.activate_session(&session_id),
-            MuxCommand::ActivateNextSession => state.activate_relative_session(1),
-            MuxCommand::ActivatePreviousSession => state.activate_relative_session(-1),
-            MuxCommand::ActivateLastSession => state.activate_relative_session(-1),
-            MuxCommand::ActivateSessionIndex { index } => state.activate_session_index(index),
-            MuxCommand::MoveSession { delta } => state.move_active_session(delta),
             MuxCommand::ActivateWindow {
                 session_id,
                 window_id,
@@ -472,11 +430,6 @@ mod tests {
             })
             .unwrap();
         backend
-            .execute(MuxCommand::ActivateSession {
-                session_id: "local".to_owned(),
-            })
-            .unwrap();
-        backend
             .execute(MuxCommand::RenameSession {
                 session_id: "project".to_owned(),
                 name: "renamed".to_owned(),
@@ -485,7 +438,7 @@ mod tests {
 
         let snapshot = backend.snapshot().unwrap();
 
-        assert_eq!(snapshot.active_session_id.as_deref(), Some("local"));
+        assert_eq!(snapshot.active_session_id.as_deref(), Some("project"));
         assert_eq!(snapshot.sessions.len(), 2);
         assert_eq!(snapshot.sessions[1].name, "renamed");
         assert_eq!(snapshot.sessions[1].anchor.cwd.as_deref(), Some("/repo"));

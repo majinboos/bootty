@@ -74,6 +74,7 @@ pub struct SidebarItem<'a> {
     pub tree: SidebarTree,
     pub selectable: bool,
     pub session_id: Option<&'a str>,
+    pub reorder_anchor: Option<&'a str>,
     pub color: Color32,
     pub dim_color: Color32,
     pub kind: SidebarItemKind<'a>,
@@ -143,12 +144,16 @@ fn build_sidebar_items_inner<'a>(
             group_info.position,
             group_total,
         );
-
         let selected = if selected_session.is_some() {
             selected_session == Some(session.id.as_str())
                 || selected_session == Some(session.name.as_str())
         } else {
             session.active
+        };
+        let reorder_anchor = if is_grouped {
+            group_info.leader_session
+        } else {
+            session.name.as_str()
         };
         let (display, session_indent, detail_indent) = if is_grouped {
             if group != last_group {
@@ -159,6 +164,7 @@ fn build_sidebar_items_inner<'a>(
                     tree: SidebarTree::None,
                     selectable: false,
                     session_id: None,
+                    reorder_anchor: Some(reorder_anchor),
                     color,
                     dim_color,
                     kind: SidebarItemKind::Group,
@@ -198,6 +204,7 @@ fn build_sidebar_items_inner<'a>(
             tree: session_tree,
             selectable: true,
             session_id: Some(session.id.as_str()),
+            reorder_anchor: Some(reorder_anchor),
             color,
             dim_color,
             kind: SidebarItemKind::Session {
@@ -218,6 +225,7 @@ fn build_sidebar_items_inner<'a>(
                 tree: detail_tree,
                 selectable: false,
                 session_id: Some(session.id.as_str()),
+                reorder_anchor: Some(reorder_anchor),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Process {
@@ -243,6 +251,7 @@ fn build_sidebar_items_inner<'a>(
                 tree: detail_tree,
                 selectable: false,
                 session_id: Some(session.id.as_str()),
+                reorder_anchor: Some(reorder_anchor),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Process {
@@ -266,6 +275,7 @@ fn build_sidebar_items_inner<'a>(
                 tree: detail_tree,
                 selectable: false,
                 session_id: Some(session.id.as_str()),
+                reorder_anchor: Some(reorder_anchor),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Agent {
@@ -285,6 +295,7 @@ fn build_sidebar_items_inner<'a>(
                 tree: detail_tree,
                 selectable: false,
                 session_id: Some(session.id.as_str()),
+                reorder_anchor: Some(reorder_anchor),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Branch {
@@ -304,6 +315,7 @@ fn build_sidebar_items_inner<'a>(
                 tree: detail_tree,
                 selectable: false,
                 session_id: Some(session.id.as_str()),
+                reorder_anchor: Some(reorder_anchor),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Status {
@@ -323,6 +335,7 @@ fn build_sidebar_items_inner<'a>(
                 tree: detail_tree,
                 selectable: false,
                 session_id: Some(session.id.as_str()),
+                reorder_anchor: Some(reorder_anchor),
                 color,
                 dim_color,
                 kind: SidebarItemKind::Progress { pct: progress },
@@ -350,6 +363,7 @@ pub fn session_suffix(name: &str) -> &str {
 #[derive(Debug)]
 struct GroupSummary<'a> {
     name: &'a str,
+    leader_session: &'a str,
     count: usize,
     position: usize,
 }
@@ -357,6 +371,7 @@ struct GroupSummary<'a> {
 #[derive(Debug)]
 struct GroupSession<'a> {
     name: &'a str,
+    leader_session: &'a str,
     index: usize,
     count: usize,
     position: usize,
@@ -399,6 +414,7 @@ impl<'a> GroupMeta<'a> {
             let index = groups.len();
             groups.push(GroupSummary {
                 name: group,
+                leader_session: session.name.as_str(),
                 count: 1,
                 position: 0,
             });
@@ -436,6 +452,7 @@ impl<'a> GroupMeta<'a> {
         }
         Some(GroupSession {
             name: summary.name,
+            leader_session: summary.leader_session,
             index: group_index,
             count: summary.count,
             position,

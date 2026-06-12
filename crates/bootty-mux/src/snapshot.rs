@@ -32,12 +32,19 @@ pub struct MuxPaneAnchor {
 }
 
 pub fn selection_after_refresh(current: Option<String>, snapshot: &MuxSnapshot) -> Option<String> {
-    current.or_else(|| {
-        snapshot
-            .sessions
-            .iter()
-            .find(|session| session.active)
-            .or_else(|| snapshot.sessions.first())
-            .map(|session| session.id.clone())
-    })
+    current
+        .filter(|current| {
+            snapshot
+                .sessions
+                .iter()
+                .any(|session| session.id == *current || session.name == *current)
+        })
+        .or_else(|| {
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| session.active)
+                .or_else(|| snapshot.sessions.first())
+                .map(|session| session.id.clone())
+        })
 }

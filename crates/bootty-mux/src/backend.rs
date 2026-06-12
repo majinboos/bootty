@@ -65,9 +65,6 @@ mod tests {
         assert_eq!(snapshot.sessions[0].anchor.cwd.as_deref(), Some("/repo"));
 
         let commands = [
-            MuxCommand::ActivateSession {
-                session_id: "project".to_owned(),
-            },
             MuxCommand::ActivateWindow {
                 session_id: "project".to_owned(),
                 window_id: "@1".to_owned(),

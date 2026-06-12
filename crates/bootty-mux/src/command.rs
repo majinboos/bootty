@@ -8,18 +8,6 @@ pub enum MuxDirection {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuxCommand {
-    ActivateSession {
-        session_id: String,
-    },
-    ActivateNextSession,
-    ActivatePreviousSession,
-    ActivateLastSession,
-    ActivateSessionIndex {
-        index: u32,
-    },
-    MoveSession {
-        delta: i32,
-    },
     ActivateWindow {
         session_id: String,
         window_id: String,

@@ -42,6 +42,7 @@ use crate::{
     },
     renderer::{RendererMetrics, TerminalWidget},
     scheduler::{RepaintScheduler, RepaintSignal},
+    session_order::SessionOrderStore,
     terminal::{DrainStats, MouseButton},
     terminal_text::TerminalTextConfig,
     theme::theme_from_config,
@@ -117,6 +118,7 @@ pub struct AppState {
     macos_option_as_alt: crate::terminal::MacosOptionAsAlt,
     stability_trace: Option<StabilityTrace>,
     config_hot_reload: ConfigHotReload,
+    session_order: SessionOrderStore,
     sidebar_metadata: SidebarMetadata,
     last_sidebar_metadata_refresh: Instant,
     sidebar_metadata_tx: Option<mpsc::Sender<Vec<SidebarMetadataSession>>>,
@@ -203,6 +205,7 @@ impl AppState {
         let stability_trace = StabilityTrace::from_config(&config);
         let session_config = config.terminal_session_config();
         let config_hot_reload = ConfigHotReload::new(&config.config_path);
+        let session_order = SessionOrderStore::for_config_path(&config.config_path);
         let macos_non_native_fullscreen_active = config.window.non_native_fullscreen_enabled();
         apply_macos_non_native_fullscreen_presentation(&config.window);
 
@@ -236,6 +239,7 @@ impl AppState {
             macos_option_as_alt,
             stability_trace,
             config_hot_reload,
+            session_order,
             sidebar_metadata: SidebarMetadata::default(),
             last_sidebar_metadata_refresh: initial_sidebar_metadata_refresh_mark(Instant::now()),
             sidebar_metadata_tx: None,
@@ -306,9 +310,7 @@ impl AppState {
     }
 
     pub fn activate_session_from_ui(&mut self, session_id: &str) {
-        let mux_config = self.config().multiplexer.clone();
-        self.mux
-            .activate_session(session_id, &self.repaint, &mux_config);
+        self.mux.activate_session(session_id);
         self.sidebar_hovered_session = Some(session_id.to_owned());
     }
 
@@ -316,6 +318,58 @@ impl AppState {
         let mux_config = self.config().multiplexer.clone();
         self.mux
             .activate_window(session_id, window_id, &self.repaint, &mux_config);
+    }
+
+    fn sync_session_order(&mut self) {
+        let ordered_names = self.session_order.sync_sessions(
+            self.mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str()),
+        );
+        self.mux.apply_session_order(&ordered_names);
+    }
+
+    fn move_selected_session(&mut self, delta: i32) -> bool {
+        let Some(selected) = self.mux.selected_session() else {
+            return false;
+        };
+        let Some(selected_name) = self
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| session.id == selected || session.name == selected)
+            .map(|session| session.name.clone())
+        else {
+            return false;
+        };
+        if !self.session_order.move_session(
+            &selected_name,
+            delta,
+            self.mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str()),
+        ) {
+            return false;
+        }
+        self.sync_session_order();
+        true
+    }
+
+    pub fn reorder_session_before(&mut self, source: &str, target: Option<&str>) -> bool {
+        if !self.session_order.move_block_before(
+            source,
+            target,
+            self.mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str()),
+        ) {
+            return false;
+        }
+        self.sync_session_order();
+        true
     }
 
     pub fn take_dialog(&mut self) -> Option<NewMuxSessionDialog> {
@@ -428,6 +482,7 @@ impl AppState {
         if let Some(result) = self.mux.poll_command() {
             self.last_error = result.err();
         }
+        self.sync_session_order();
         if self.config_state.current().chrome.sidebar {
             self.refresh_sidebar_metadata(viewport);
         }
@@ -675,6 +730,8 @@ impl AppState {
         self.has_new_session_config_changes = new_session_only_config_changed(&previous, &next)
             || self.has_new_session_config_changes;
         self.config_state.accept(next);
+        self.session_order = SessionOrderStore::for_config_path(&self.config().config_path);
+        self.sync_session_order();
         self.last_error = if self.has_new_session_config_changes {
             Some("config reloaded; session/window creation changes apply next time".to_owned())
         } else {
@@ -932,13 +989,12 @@ impl AppState {
         if self.apply_session_navigation_action(action) {
             return;
         }
+        if let MuxKeyAction::MoveSession(delta) = action {
+            self.move_selected_session(delta);
+            return;
+        }
         let selected_session = self.mux.selected_session().unwrap_or("local").to_owned();
         let command = match action {
-            MuxKeyAction::NextSession => MuxCommand::ActivateNextSession,
-            MuxKeyAction::PreviousSession => MuxCommand::ActivatePreviousSession,
-            MuxKeyAction::LastSession => MuxCommand::ActivateLastSession,
-            MuxKeyAction::SelectSession(index) => MuxCommand::ActivateSessionIndex { index },
-            MuxKeyAction::MoveSession(delta) => MuxCommand::MoveSession { delta },
             MuxKeyAction::NewTab => MuxCommand::NewWindow {
                 session_id: selected_session,
             },
@@ -975,6 +1031,13 @@ impl AppState {
             MuxKeyAction::TogglePaneZoom => MuxCommand::TogglePaneZoom {
                 session_id: selected_session,
             },
+            MuxKeyAction::NextSession
+            | MuxKeyAction::PreviousSession
+            | MuxKeyAction::LastSession
+            | MuxKeyAction::SelectSession(_)
+            | MuxKeyAction::MoveSession(_) => {
+                unreachable!("session actions are handled by Bootty state")
+            }
             MuxKeyAction::DitchSession => MuxCommand::DitchSession {
                 session_id: selected_session,
             },
@@ -1043,14 +1106,13 @@ impl AppState {
                 .map(|session| session.id.clone()),
             MuxKeyAction::NextSession => self.relative_session(1),
             MuxKeyAction::PreviousSession => self.relative_session(-1),
+            MuxKeyAction::LastSession => self.mux.previous_selected_session().map(str::to_owned),
             _ => None,
         };
         let Some(target) = target else {
             return false;
         };
-        let mux_config = self.config().multiplexer.clone();
-        self.mux
-            .activate_session(&target, &self.repaint, &mux_config);
+        self.mux.activate_session(&target);
         true
     }
 
@@ -1277,7 +1339,15 @@ mod tests {
 
     fn test_state() -> AppState {
         let repaint: RepaintHandle = std::sync::Arc::new(|| {});
-        AppState::new(BoottyConfig::default(), repaint, None, None).expect("state")
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let config = BoottyConfig {
+            config_path: std::env::temp_dir().join(format!("bootty-test-{unique}.toml")),
+            ..BoottyConfig::default()
+        };
+        AppState::new(config, repaint, None, None).expect("state")
     }
 
     fn key_event(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
@@ -1370,6 +1440,75 @@ mod tests {
             &mut Vec::new(),
         );
         assert!(!state.direct_input_suppresses_egui_events());
+    }
+
+    #[test]
+    fn last_session_toggles_bootty_selected_session() {
+        let mut state = test_state();
+        let mux_config = state.config().multiplexer.clone();
+        state.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: "project".to_owned(),
+                cwd: "/repo".to_owned(),
+            },
+            &state.repaint,
+            &mux_config,
+        );
+
+        state.activate_session_from_ui("local");
+        state.activate_session_from_ui("project");
+        state.apply_mux_key_action(MuxKeyAction::LastSession);
+        assert_eq!(state.mux.selected_session(), Some("local"));
+
+        state.apply_mux_key_action(MuxKeyAction::LastSession);
+        assert_eq!(state.mux.selected_session(), Some("project"));
+    }
+
+    #[test]
+    fn move_session_reorders_bootty_owned_session_order() {
+        let mut state = test_state();
+        let mux_config = state.config().multiplexer.clone();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let alpha = format!("alpha-{unique}");
+        let beta = format!("beta-{unique}");
+        state.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: alpha.clone(),
+                cwd: "/repo/a".to_owned(),
+            },
+            &state.repaint,
+            &mux_config,
+        );
+        state.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: beta.clone(),
+                cwd: "/repo/b".to_owned(),
+            },
+            &state.repaint,
+            &mux_config,
+        );
+
+        state.apply_mux_key_action(MuxKeyAction::MoveSession(-1));
+
+        assert_eq!(state.mux.selected_session(), Some(beta.as_str()));
+        let ordered = state
+            .mux
+            .sessions()
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>();
+        let beta_index = ordered
+            .iter()
+            .position(|name| *name == beta)
+            .expect("beta present");
+        let alpha_index = ordered
+            .iter()
+            .position(|name| *name == alpha)
+            .expect("alpha present");
+        assert!(beta_index < alpha_index, "{ordered:?}");
     }
 
     #[test]
