@@ -1,11 +1,14 @@
 use std::{
     collections::HashMap,
-    fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::params;
+
+use crate::{
+    config::MultiplexerConfig,
+    workspace::{WorkspaceStore, open_db as workspace_open_db},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionNameRecord {
@@ -17,38 +20,28 @@ pub struct SessionNameRecord {
 
 #[derive(Debug, Clone)]
 pub struct SessionNameStore {
+    config_path: PathBuf,
+    multiplexer: MultiplexerConfig,
     path: PathBuf,
+    binding_id: Option<i64>,
     records: HashMap<String, SessionNameRecord>,
     loaded: bool,
 }
 
-fn sqlite_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("session-order.sqlite3")
-}
-
-fn open_db(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_millis(250))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_name_metadata (
-            session_id TEXT PRIMARY KEY,
-            cwd TEXT NOT NULL,
-            generated_name TEXT NOT NULL,
-            explicit INTEGER NOT NULL DEFAULT 0
-        );",
-    )?;
-    Ok(conn)
-}
-
 impl SessionNameStore {
     pub fn lazy_for_config_path(config_path: &Path) -> Self {
+        Self::lazy_for_config_path_with_multiplexer(config_path, &MultiplexerConfig::default())
+    }
+
+    pub fn lazy_for_config_path_with_multiplexer(
+        config_path: &Path,
+        multiplexer: &MultiplexerConfig,
+    ) -> Self {
         Self {
-            path: sqlite_path(config_path),
+            config_path: config_path.to_path_buf(),
+            multiplexer: multiplexer.clone(),
+            path: crate::workspace::sqlite_path(config_path),
+            binding_id: None,
             records: HashMap::new(),
             loaded: false,
         }
@@ -58,21 +51,28 @@ impl SessionNameStore {
         if self.loaded {
             return;
         }
-        self.records = Self::load_records(&self.path);
+        let workspace = WorkspaceStore::for_config_path(&self.config_path, &self.multiplexer);
+        self.path = workspace.path().to_path_buf();
+        self.binding_id = workspace.binding_id();
+        self.records = self
+            .binding_id
+            .map(|binding_id| Self::load_records(&self.path, binding_id))
+            .unwrap_or_default();
         self.loaded = true;
     }
 
-    fn load_records(path: &Path) -> HashMap<String, SessionNameRecord> {
-        let Ok(conn) = open_db(path) else {
+    fn load_records(path: &Path, binding_id: i64) -> HashMap<String, SessionNameRecord> {
+        let Ok(conn) = workspace_open_db(path) else {
             return HashMap::new();
         };
         let Ok(mut statement) = conn.prepare(
             "SELECT session_id, cwd, generated_name, explicit
-             FROM session_name_metadata",
+             FROM workspace_session_name_metadata
+             WHERE binding_id = ?1",
         ) else {
             return HashMap::new();
         };
-        let Ok(rows) = statement.query_map([], |row| {
+        let Ok(rows) = statement.query_map([binding_id], |row| {
             Ok(SessionNameRecord {
                 session_id: row.get(0)?,
                 cwd: row.get(1)?,
@@ -89,28 +89,32 @@ impl SessionNameStore {
     }
 
     fn save(&self) {
-        let Some(parent) = self.path.parent() else {
+        let Some(binding_id) = self.binding_id else {
             return;
         };
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        let Ok(mut conn) = open_db(&self.path) else {
+        let Ok(mut conn) = workspace_open_db(&self.path) else {
             return;
         };
         let Ok(tx) = conn.transaction() else {
             return;
         };
-        if tx.execute("DELETE FROM session_name_metadata", []).is_err() {
+        if tx
+            .execute(
+                "DELETE FROM workspace_session_name_metadata WHERE binding_id = ?1",
+                [binding_id],
+            )
+            .is_err()
+        {
             return;
         }
         for record in self.records.values() {
             if tx
                 .execute(
-                    "INSERT INTO session_name_metadata
-                        (session_id, cwd, generated_name, explicit)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO workspace_session_name_metadata
+                        (binding_id, session_id, cwd, generated_name, explicit)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
+                        binding_id,
                         record.session_id,
                         record.cwd,
                         record.generated_name,
@@ -199,6 +203,7 @@ impl SessionNameStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp_config_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()

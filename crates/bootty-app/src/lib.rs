@@ -30,4 +30,5 @@ pub mod strings;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+pub(crate) mod workspace;
 pub mod worktree_catalog;

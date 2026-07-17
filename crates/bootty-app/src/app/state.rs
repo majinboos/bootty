@@ -85,6 +85,7 @@ use crate::{
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
+    workspace::WorkspaceStore,
 };
 use bootty_terminal::terminal_engine::{
     TerminalCopyModeAction, TerminalSelectionFormat, TerminalSideEffect, TerminalSideEffectEvent,
@@ -514,11 +515,15 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 impl AppState {
     pub fn new(
-        config: BoottyConfig,
+        mut config: BoottyConfig,
         repaint: RepaintHandle,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
+        let workspace = WorkspaceStore::for_config_path(&config.config_path, &config.multiplexer);
+        if let Some(binding) = workspace.binding() {
+            config.multiplexer = binding.multiplexer_config();
+        }
         let modifier_remaps = config.input.modifier_remaps()?;
         let macos_option_as_alt = config.input.macos_option_as_alt.into();
         let keybinds = config
@@ -536,8 +541,14 @@ impl AppState {
             &terminal_side_effect_tx,
         );
         let config_hot_reload = ConfigHotReload::new(&config.config_path);
-        let session_order = SessionOrderStore::lazy_for_config_path(&config.config_path);
-        let session_names = SessionNameStore::lazy_for_config_path(&config.config_path);
+        let session_order = SessionOrderStore::lazy_for_config_path_with_multiplexer(
+            &config.config_path,
+            &config.multiplexer,
+        );
+        let session_names = SessionNameStore::lazy_for_config_path_with_multiplexer(
+            &config.config_path,
+            &config.multiplexer,
+        );
         let macos_non_native_fullscreen_active = config.window.non_native_fullscreen_enabled();
         let macos_non_native_fullscreen_applied =
             apply_macos_non_native_fullscreen_presentation(&config.window);
@@ -2747,7 +2758,7 @@ impl AppState {
     fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
         let previous = self.config().clone();
         let path = previous.config_path.clone();
-        let next = match load_config_from_path(&path) {
+        let mut next = match load_config_from_path(&path) {
             Ok(config) => config,
             Err(error) => {
                 self.config_state.reject(error.to_string());
@@ -2755,6 +2766,10 @@ impl AppState {
                 return false;
             }
         };
+        let workspace = WorkspaceStore::for_config_path(&next.config_path, &next.multiplexer);
+        if let Some(binding) = workspace.binding() {
+            next.multiplexer = binding.multiplexer_config();
+        }
         let modifier_remaps = match next.input.modifier_remaps() {
             Ok(remaps) => remaps,
             Err(error) => {
@@ -2840,9 +2855,13 @@ impl AppState {
             || self.has_new_session_config_changes;
         self.config_state.accept(next);
         self.set_mouse_pointer_hidden_while_typing(self.mouse_pointer_hidden_while_typing, effects);
-        self.session_names = SessionNameStore::lazy_for_config_path(&self.config().config_path);
+        let config_path = self.config().config_path.clone();
+        let multiplexer = self.config().multiplexer.clone();
+        self.session_names =
+            SessionNameStore::lazy_for_config_path_with_multiplexer(&config_path, &multiplexer);
         self.pending_generated_names.clear();
-        self.session_order = SessionOrderStore::lazy_for_config_path(&self.config().config_path);
+        self.session_order =
+            SessionOrderStore::lazy_for_config_path_with_multiplexer(&config_path, &multiplexer);
         self.sync_session_order();
         self.last_error = if self.has_new_session_config_changes {
             Some(
