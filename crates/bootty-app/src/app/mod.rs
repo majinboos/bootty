@@ -23,7 +23,6 @@ use crate::{
     direct_input::{DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input},
     layout::SplitDirection,
     menu::AppMenu,
-    mux::config::selected_backend,
     renderer::TerminalWidget,
     terminal_text::TerminalTextConfig,
     theme::{theme_palette_from_config, theme_tokens},
@@ -1618,11 +1617,7 @@ impl BoottyApp {
             }
         }
 
-        let terminal_backend = selected_backend(&self.state.config().multiplexer);
-        let terminal_transition_key = self.state.mux().selected_session_anchor().map(|anchor| {
-            let pane_id = anchor.pane_id.as_deref().unwrap_or_default();
-            format!("{terminal_backend:?}:{}:{pane_id}", anchor.session_id)
-        });
+        let terminal_transition_key = self.state.terminal_transition_key();
         // Native-layout backends whose tabs have all been closed have no pane to attach. Paint an
         // empty state instead of the terminal widget, which would otherwise hold the closed
         // terminal's last frame.

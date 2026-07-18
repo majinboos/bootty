@@ -6,20 +6,27 @@ use std::{
     time::Duration,
 };
 
-use crate::config::{MultiplexerBackendConfig, MultiplexerConfig};
+use crate::{
+    config::{MultiplexerBackendConfig, MultiplexerConfig},
+    mux::controller::{BindingId, MuxScope, SpaceId},
+};
 
 const DEFAULT_SPACE_NAME: &str = "Default Space";
 const DEFAULT_BINDING_NAME: &str = "Default Binding";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceBinding {
-    binding_id: i64,
+    scope: MuxScope,
     multiplexer: MultiplexerConfig,
 }
 
 impl WorkspaceBinding {
     pub(crate) fn multiplexer_config(&self) -> MultiplexerConfig {
         self.multiplexer.clone()
+    }
+
+    pub(crate) fn mux_scope(&self) -> MuxScope {
+        self.scope
     }
 }
 
@@ -45,7 +52,9 @@ impl WorkspaceStore {
     }
 
     pub(crate) fn binding_id(&self) -> Option<i64> {
-        self.binding.as_ref().map(|binding| binding.binding_id)
+        self.binding
+            .as_ref()
+            .map(|binding| binding.scope.binding_id().persistence_value())
     }
 
     fn load_or_migrate(
@@ -126,7 +135,7 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 
 fn load_binding(tx: &Transaction<'_>) -> rusqlite::Result<Option<WorkspaceBinding>> {
     tx.query_row(
-        "SELECT b.id, b.backend, b.hide_tmux_status
+        "SELECT s.id, b.id, b.backend, b.hide_tmux_status
          FROM workspace_spaces s
          JOIN workspace_bindings b ON b.space_id = s.id
          ORDER BY s.position, b.id
@@ -134,10 +143,13 @@ fn load_binding(tx: &Transaction<'_>) -> rusqlite::Result<Option<WorkspaceBindin
         [],
         |row| {
             Ok(WorkspaceBinding {
-                binding_id: row.get(0)?,
+                scope: MuxScope::new(
+                    SpaceId::from_persistence(row.get(0)?),
+                    BindingId::from_persistence(row.get(1)?),
+                ),
                 multiplexer: MultiplexerConfig {
-                    backend: backend_from_storage(&row.get::<_, String>(1)?),
-                    hide_tmux_status: row.get::<_, i64>(2)? != 0,
+                    backend: backend_from_storage(&row.get::<_, String>(2)?),
+                    hide_tmux_status: row.get::<_, i64>(3)? != 0,
                 },
             })
         },
@@ -168,7 +180,10 @@ fn create_default_binding(
     let binding_id = tx.last_insert_rowid();
     migrate_legacy_metadata(tx, binding_id, path)?;
     Ok(WorkspaceBinding {
-        binding_id,
+        scope: MuxScope::new(
+            SpaceId::from_persistence(space_id),
+            BindingId::from_persistence(binding_id),
+        ),
         multiplexer: config.clone(),
     })
 }
