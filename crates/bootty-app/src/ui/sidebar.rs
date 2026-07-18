@@ -4,7 +4,11 @@ use eframe::egui::Color32;
 
 use crate::{
     extensions::{ModuleItem, ModulePrimitive},
-    mux::snapshot::MuxSession,
+    mux::{
+        controller::{BindingId, MuxScope, SpaceId},
+        snapshot::MuxSession,
+    },
+    ui::session_navigation::BindingSessionGroup,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -21,8 +25,9 @@ pub enum SidebarItemKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SidebarItemId<'a> {
-    Group(&'a str),
-    Session(&'a str),
+    Binding(MuxScope),
+    Group { scope: MuxScope, name: &'a str },
+    Session { scope: MuxScope, id: &'a str },
     Row(&'a str),
 }
 
@@ -49,11 +54,13 @@ pub struct SidebarItem<'a> {
     pub tree: SidebarTree,
     pub selectable: bool,
     pub session_id: Option<&'a str>,
+    pub session_scope: Option<MuxScope>,
     pub reorder_anchor: Option<&'a str>,
     pub color: Color32,
     pub dim_color: Color32,
     pub kind: SidebarItemKind,
     pub current: bool,
+    pub can_return_to_last_session: bool,
     pub icon: Option<&'a str>,
     pub primitives: &'a [ModulePrimitive],
 }
@@ -62,7 +69,14 @@ pub fn build_sidebar_items<'a>(
     sessions: &'a [MuxSession],
     selected_session: Option<&str>,
 ) -> Vec<SidebarItem<'a>> {
-    build_sidebar_items_inner(sessions, selected_session, None)
+    build_sidebar_items_inner(
+        default_scope(),
+        sessions,
+        selected_session,
+        true,
+        false,
+        None,
+    )
 }
 
 pub fn build_visible_sidebar_items<'a>(
@@ -70,7 +84,55 @@ pub fn build_visible_sidebar_items<'a>(
     selected_session: Option<&str>,
     max_rows: usize,
 ) -> Vec<SidebarItem<'a>> {
-    build_sidebar_items_inner(sessions, selected_session, Some(max_rows))
+    build_sidebar_items_inner(
+        default_scope(),
+        sessions,
+        selected_session,
+        true,
+        false,
+        Some(max_rows),
+    )
+}
+
+pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec<SidebarItem<'a>> {
+    let mut items = Vec::new();
+    for group in groups {
+        items.push(SidebarItem {
+            id: SidebarItemId::Binding(group.scope),
+            display: SidebarDisplay::Text(&group.label),
+            indent: 0,
+            tree: SidebarTree::None,
+            selectable: false,
+            session_id: None,
+            session_scope: None,
+            reorder_anchor: None,
+            color: Color32::WHITE,
+            dim_color: Color32::GRAY,
+            kind: SidebarItemKind::Group,
+            current: false,
+            can_return_to_last_session: false,
+            icon: Some("terminal"),
+            primitives: &[],
+        });
+        let mut binding_items = build_sidebar_items_inner(
+            group.scope,
+            &group.sessions,
+            group.selected_session.as_deref(),
+            group.active,
+            group.can_return_to_last_session,
+            None,
+        );
+        for item in &mut binding_items {
+            item.indent = item.indent.saturating_add(2);
+            item.reorder_anchor = None;
+        }
+        items.extend(binding_items);
+    }
+    items
+}
+
+fn default_scope() -> MuxScope {
+    MuxScope::new(SpaceId::from_persistence(0), BindingId::from_persistence(0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,17 +172,23 @@ pub fn sidebar_session_colors(sessions: &[MuxSession]) -> Vec<SidebarSessionColo
 
 pub fn build_sidebar_items_from_module_items<'a>(
     items: &'a [ModuleItem],
+    scope: MuxScope,
     selected_session: Option<&str>,
+    can_return_to_last_session: bool,
 ) -> Vec<SidebarItem<'a>> {
     items
         .iter()
-        .filter_map(|item| sidebar_item_from_module_item(item, selected_session))
+        .filter_map(|item| {
+            sidebar_item_from_module_item(item, scope, selected_session, can_return_to_last_session)
+        })
         .collect()
 }
 
 fn sidebar_item_from_module_item<'a>(
     item: &'a ModuleItem,
+    scope: MuxScope,
     selected_session: Option<&str>,
+    can_return_to_last_session: bool,
 ) -> Option<SidebarItem<'a>> {
     let kind = item.kind.as_deref().unwrap_or("row");
     if kind == "footer" {
@@ -159,26 +227,33 @@ fn sidebar_item_from_module_item<'a>(
     };
     let color = item.fg.unwrap_or(Color32::WHITE);
     Some(SidebarItem {
-        id: sidebar_item_id(kind, row_key, item.text.as_str()),
+        id: sidebar_item_id(kind, scope, row_key, item.text.as_str()),
         display,
         indent: item.indent.unwrap_or(0),
         tree: sidebar_tree(item.tree.as_deref()),
         selectable,
         session_id: item.session_id.as_deref(),
+        session_scope: item.session_id.as_ref().map(|_| scope),
         reorder_anchor: item.reorder_anchor.as_deref(),
         color,
         dim_color: item.dim_fg.unwrap_or(color),
         kind: sidebar_kind,
         current,
+        can_return_to_last_session: kind == "session" && can_return_to_last_session,
         icon: item.icon.as_deref(),
         primitives: &item.primitives,
     })
 }
 
-fn sidebar_item_id<'a>(kind: &str, row_key: &'a str, text: &'a str) -> SidebarItemId<'a> {
+fn sidebar_item_id<'a>(
+    kind: &str,
+    scope: MuxScope,
+    row_key: &'a str,
+    text: &'a str,
+) -> SidebarItemId<'a> {
     match kind {
-        "group" => SidebarItemId::Group(text),
-        "session" => SidebarItemId::Session(row_key),
+        "group" => SidebarItemId::Group { scope, name: text },
+        "session" => SidebarItemId::Session { scope, id: row_key },
         _ => SidebarItemId::Row(row_key),
     }
 }
@@ -194,8 +269,11 @@ fn sidebar_tree(value: Option<&str>) -> SidebarTree {
 }
 
 fn build_sidebar_items_inner<'a>(
+    scope: MuxScope,
     sessions: &'a [MuxSession],
     selected_session: Option<&str>,
+    binding_active: bool,
+    can_return_to_last_session: bool,
     max_rows: Option<usize>,
 ) -> Vec<SidebarItem<'a>> {
     if max_rows == Some(0) {
@@ -232,12 +310,13 @@ fn build_sidebar_items_inner<'a>(
             group_info.position,
             group_total,
         );
-        let selected = if selected_session.is_some() {
-            selected_session == Some(session.id.as_str())
-                || selected_session == Some(session.name.as_str())
-        } else {
-            session.active
-        };
+        let selected = binding_active
+            && if selected_session.is_some() {
+                selected_session == Some(session.id.as_str())
+                    || selected_session == Some(session.name.as_str())
+            } else {
+                session.active
+            };
         let reorder_anchor = if is_grouped {
             group_info.leader_session
         } else {
@@ -246,17 +325,19 @@ fn build_sidebar_items_inner<'a>(
         let (display, session_indent) = if is_grouped {
             if group != last_group {
                 items.push(SidebarItem {
-                    id: SidebarItemId::Group(group),
+                    id: SidebarItemId::Group { scope, name: group },
                     display: SidebarDisplay::Text(group),
                     indent: 0,
                     tree: SidebarTree::None,
                     selectable: false,
                     session_id: None,
+                    session_scope: None,
                     reorder_anchor: Some(reorder_anchor),
                     color,
                     dim_color,
                     kind: SidebarItemKind::Group,
                     current: false,
+                    can_return_to_last_session: false,
                     icon: None,
                     primitives: &[],
                 });
@@ -287,17 +368,22 @@ fn build_sidebar_items_inner<'a>(
         };
 
         items.push(SidebarItem {
-            id: SidebarItemId::Session(session.id.as_str()),
+            id: SidebarItemId::Session {
+                scope,
+                id: session.id.as_str(),
+            },
             display,
             indent: session_indent,
             tree: session_tree,
             selectable: true,
             session_id: Some(session.id.as_str()),
+            session_scope: Some(scope),
             reorder_anchor: Some(reorder_anchor),
             color,
             dim_color,
             kind: SidebarItemKind::Session { active: selected },
             current: selected,
+            can_return_to_last_session,
             icon: None,
             primitives: &[],
         });
@@ -506,7 +592,7 @@ mod tests {
             },
         ];
 
-        let rows = build_sidebar_items_from_module_items(&items, None);
+        let rows = build_sidebar_items_from_module_items(&items, default_scope(), None, false);
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, Some("$1"));
@@ -548,14 +634,58 @@ mod tests {
             },
         ];
 
-        let rows = build_sidebar_items_from_module_items(&items, Some("$2"));
+        let rows = build_sidebar_items_from_module_items(&items, default_scope(), Some("$2"), true);
 
         assert!(!rows[0].current);
         assert!(rows[1].current);
+        assert!(rows.iter().all(|row| row.can_return_to_last_session));
         assert!(matches!(
             rows[1].kind,
             SidebarItemKind::Session { active: true, .. }
         ));
+    }
+
+    #[test]
+    fn binding_groups_keep_colliding_session_ids_scoped_and_labelled() {
+        let local_scope = crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(10),
+        );
+        let remote_scope = crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(20),
+        );
+        let groups = vec![
+            crate::ui::session_navigation::BindingSessionGroup {
+                scope: local_scope,
+                label: "Local".to_owned(),
+                sessions: vec![session("$1", "work", "zsh")],
+                selected_session: Some("$1".to_owned()),
+                active: true,
+                can_return_to_last_session: false,
+            },
+            crate::ui::session_navigation::BindingSessionGroup {
+                scope: remote_scope,
+                label: "Remote".to_owned(),
+                sessions: vec![session("$1", "work", "ssh")],
+                selected_session: Some("$1".to_owned()),
+                active: false,
+                can_return_to_last_session: true,
+            },
+        ];
+
+        let items = build_binding_sidebar_items(&groups);
+
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].display, SidebarDisplay::Text("Local"));
+        assert_eq!(items[2].display, SidebarDisplay::Text("Remote"));
+        assert_eq!(items[1].session_scope, Some(local_scope));
+        assert_eq!(items[3].session_scope, Some(remote_scope));
+        assert!(items[1].current);
+        assert!(!items[3].current);
+        assert!(!items[1].can_return_to_last_session);
+        assert!(items[3].can_return_to_last_session);
+        assert_ne!(items[1].id, items[3].id);
     }
 
     #[test]

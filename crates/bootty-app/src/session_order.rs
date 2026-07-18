@@ -321,6 +321,23 @@ impl SessionOrderStore {
         }
     }
 
+    pub fn for_binding(
+        config_path: &Path,
+        multiplexer: &MultiplexerConfig,
+        binding_id: i64,
+    ) -> Self {
+        let path = crate::workspace::sqlite_path(config_path);
+        let store = Self::load_store(&path, Some(binding_id));
+        Self {
+            config_path: config_path.to_path_buf(),
+            multiplexer: multiplexer.clone(),
+            path,
+            binding_id: Some(binding_id),
+            store,
+            loaded: true,
+        }
+    }
+
     fn load_store(path: &Path, binding_id: Option<i64>) -> SessionStore {
         binding_id
             .and_then(|binding_id| SessionStore::load_sqlite(path, binding_id).ok())

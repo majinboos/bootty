@@ -47,6 +47,22 @@ impl SessionNameStore {
         }
     }
 
+    pub fn for_binding(
+        config_path: &Path,
+        multiplexer: &MultiplexerConfig,
+        binding_id: i64,
+    ) -> Self {
+        let path = crate::workspace::sqlite_path(config_path);
+        Self {
+            config_path: config_path.to_path_buf(),
+            multiplexer: multiplexer.clone(),
+            records: Self::load_records(&path, binding_id),
+            path,
+            binding_id: Some(binding_id),
+            loaded: true,
+        }
+    }
+
     fn ensure_loaded(&mut self) {
         if self.loaded {
             return;

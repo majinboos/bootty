@@ -11,6 +11,7 @@ use crate::{
     strings::truncate_label,
     ui::{
         icons::paint_icon_slug,
+        session_navigation::ScopedSessionTarget,
         sidebar::{SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree},
     },
 };
@@ -29,9 +30,8 @@ pub struct SidebarModel<'a> {
     pub top_inset: f32,
     pub border_visible: bool,
     pub separator_visible: bool,
-    pub can_return_to_last_session: bool,
     pub focused: bool,
-    pub hovered_session: Option<&'a str>,
+    pub hovered_session: Option<&'a ScopedSessionTarget>,
     pub unfocused_dim: f32,
     /// Explicit color overrides from `[sidebar]`; each falls back to a theme-derived tint.
     pub fullscreen: bool,
@@ -42,9 +42,9 @@ pub struct SidebarModel<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarEvent {
-    ActivateSession(String),
+    ActivateSession(ScopedSessionTarget),
     ContextAction {
-        session_id: String,
+        target: ScopedSessionTarget,
         action: SessionContextAction,
     },
     Reorder {
@@ -79,29 +79,47 @@ const MACOS_TITLEBAR_BUTTON_CENTER_Y: f32 = 16.0;
 /// background, so each element fades in its own hue rather than washing toward white.
 const UNFOCUSED_ROW_KEEP: f32 = 0.5;
 
-fn sidebar_session_id<'a>(item: &SidebarItem<'a>) -> Option<&'a str> {
-    matches!(&item.kind, SidebarItemKind::Session { .. })
-        .then_some(item.session_id)
-        .flatten()
+fn sidebar_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
+    if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
+        return None;
+    }
+    Some(ScopedSessionTarget::new(
+        item.session_scope?,
+        item.session_id?,
+    ))
 }
 
-fn sidebar_context_session_id<'a>(item: &SidebarItem<'a>) -> Option<&'a str> {
+fn sidebar_context_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
     item.selectable
-        .then_some(sidebar_session_id(item))
+        .then(|| sidebar_session_target(item))
         .flatten()
 }
 
-fn sidebar_session_ids<'a>(items: &[SidebarItem<'a>]) -> Vec<&'a str> {
-    let mut session_ids = Vec::new();
+fn sidebar_session_targets(items: &[SidebarItem<'_>]) -> Vec<ScopedSessionTarget> {
+    let mut targets = Vec::new();
     for item in items {
-        let Some(session_id) = sidebar_session_id(item) else {
+        let Some(target) = sidebar_session_target(item) else {
             continue;
         };
-        if !session_ids.contains(&session_id) {
-            session_ids.push(session_id);
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
-    session_ids
+    targets
+}
+
+fn sidebar_binding_target_position(
+    targets: &[ScopedSessionTarget],
+    target: &ScopedSessionTarget,
+) -> Option<(usize, usize)> {
+    let binding_targets = targets
+        .iter()
+        .filter(|candidate| candidate.scope == target.scope)
+        .collect::<Vec<_>>();
+    let position = binding_targets
+        .iter()
+        .position(|candidate| *candidate == target)?;
+    Some((position, binding_targets.len()))
 }
 
 fn sidebar_title_drag_rect(rect: Rect, reserve_titlebar_buttons: bool) -> Rect {
@@ -189,7 +207,7 @@ pub fn show_sidebar(
         .take(max_rows)
         .cloned()
         .collect::<Vec<_>>();
-    let session_ids = sidebar_session_ids(model.items);
+    let session_targets = sidebar_session_targets(model.items);
     let preview_labels = sidebar_drag_preview_labels(&items);
     let drag_id = egui::Id::new("mux-sidebar-drag-anchor");
     let mut dragged = ui
@@ -205,7 +223,7 @@ pub fn show_sidebar(
     let pointer_hovered_session = pointer_pos
         .and_then(|pos| sidebar_hovered_row(pos, rect.min.x, list_top, width, max_rows))
         .and_then(|index| items.get(index))
-        .and_then(|item| item.selectable.then_some(item.session_id).flatten());
+        .and_then(sidebar_session_target);
     let suppress_click = dragged.is_some();
 
     let mut event = None;
@@ -214,10 +232,11 @@ pub fn show_sidebar(
             Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
             egui::vec2(width, SIDEBAR_ROW_HEIGHT),
         );
+        let item_target = sidebar_session_target(item);
         let hovered = item.selectable
-            && item.session_id.is_some_and(|session_id| {
-                Some(session_id) == pointer_hovered_session
-                    || model.focused && Some(session_id) == model.hovered_session
+            && item_target.as_ref().is_some_and(|target| {
+                Some(target) == pointer_hovered_session.as_ref()
+                    || model.focused && Some(target) == model.hovered_session
             });
         let response = sidebar_item_row(
             ui,
@@ -248,28 +267,24 @@ pub fn show_sidebar(
             && !suppress_click
             && response.clicked_by(egui::PointerButton::Primary)
             && item.selectable
-            && let Some(session_id) = &item.session_id
+            && let Some(target) = item_target.clone()
         {
-            event = Some(SidebarEvent::ActivateSession((*session_id).to_owned()));
+            event = Some(SidebarEvent::ActivateSession(target));
         }
         if event.is_none()
-            && let Some(session_id) = sidebar_context_session_id(item)
-            && let Some(position) = session_ids
-                .iter()
-                .position(|candidate| *candidate == session_id)
+            && let Some(target) = sidebar_context_session_target(item)
+            && let Some((position, binding_session_count)) =
+                sidebar_binding_target_position(&session_targets, &target)
             && let Some(action) = session_context_action(
                 &response,
                 !item.current,
-                position > 0,
-                position + 1 < session_ids.len(),
-                session_ids.len() > 1,
-                model.can_return_to_last_session,
+                item.reorder_anchor.is_some() && position > 0,
+                item.reorder_anchor.is_some() && position + 1 < binding_session_count,
+                binding_session_count > 1,
+                item.can_return_to_last_session,
             )
         {
-            event = Some(SidebarEvent::ContextAction {
-                session_id: session_id.to_owned(),
-                action,
-            });
+            event = Some(SidebarEvent::ContextAction { target, action });
         }
     }
 
@@ -1075,10 +1090,28 @@ mod tests {
     use crate::{
         config::ChromeConfig,
         mux::snapshot::MuxSession,
-        ui::sidebar::{
-            SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree, build_visible_sidebar_items,
+        ui::{
+            session_navigation::BindingSessionGroup,
+            sidebar::{
+                SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree,
+                build_binding_sidebar_items, build_visible_sidebar_items,
+            },
         },
     };
+
+    fn test_scope() -> crate::mux::controller::MuxScope {
+        crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(0),
+            crate::mux::controller::BindingId::from_persistence(0),
+        )
+    }
+
+    fn binding_scope(binding_id: i64) -> crate::mux::controller::MuxScope {
+        crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(binding_id),
+        )
+    }
 
     #[test]
     fn sidebar_rect_uses_configured_width_and_can_be_disabled() {
@@ -1119,6 +1152,29 @@ mod tests {
         assert_eq!(
             sidebar_title_drag_rect(rect, true).min.x,
             MACOS_TITLEBAR_BUTTON_SAFE_WIDTH
+        );
+    }
+
+    #[test]
+    fn context_navigation_counts_sessions_within_the_target_binding() {
+        let local_scope = binding_scope(10);
+        let remote_scope = binding_scope(20);
+        let targets = vec![
+            ScopedSessionTarget::new(local_scope, "$1"),
+            ScopedSessionTarget::new(local_scope, "$2"),
+            ScopedSessionTarget::new(remote_scope, "$1"),
+        ];
+
+        assert_eq!(
+            sidebar_binding_target_position(&targets, &ScopedSessionTarget::new(local_scope, "$2"),),
+            Some((1, 2))
+        );
+        assert_eq!(
+            sidebar_binding_target_position(
+                &targets,
+                &ScopedSessionTarget::new(remote_scope, "$1"),
+            ),
+            Some((0, 1))
         );
     }
 
@@ -1185,7 +1241,6 @@ mod tests {
                 top_inset: 0.0,
                 border_visible: false,
                 separator_visible: false,
-                can_return_to_last_session: false,
                 focused: false,
                 hovered_session: None,
                 unfocused_dim: 0.0,
@@ -1195,6 +1250,95 @@ mod tests {
                 border_override: None,
             },
         )
+    }
+
+    #[test]
+    fn sidebar_pointer_activation_preserves_binding_scope_for_colliding_session_ids() {
+        let local_scope = binding_scope(10);
+        let remote_scope = binding_scope(20);
+        let groups = vec![
+            BindingSessionGroup {
+                scope: local_scope,
+                label: "Local".to_owned(),
+                sessions: vec![test_session("$1", "work", true)],
+                selected_session: Some("$1".to_owned()),
+                active: true,
+                can_return_to_last_session: false,
+            },
+            BindingSessionGroup {
+                scope: remote_scope,
+                label: "Remote".to_owned(),
+                sessions: vec![test_session("$1", "work", false)],
+                selected_session: Some("$1".to_owned()),
+                active: false,
+                can_return_to_last_session: false,
+            },
+        ];
+        let items = build_binding_sidebar_items(&groups);
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
+        let show = |events: Vec<egui::Event>| {
+            let mut event = None;
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        event = show_sidebar(
+                            ui,
+                            ThemePalette::default(),
+                            300.0,
+                            SidebarModel {
+                                items: &items,
+                                footer_items: &[],
+                                session_count: 2,
+                                has_sessions: true,
+                                title_visible: false,
+                                reserve_titlebar_buttons: false,
+                                title_icon: None,
+                                top_inset: 0.0,
+                                border_visible: false,
+                                separator_visible: false,
+                                focused: false,
+                                hovered_session: None,
+                                unfocused_dim: 0.0,
+                                fullscreen: false,
+                                hover_override: None,
+                                current_override: None,
+                                border_override: None,
+                            },
+                        );
+                    });
+                },
+            );
+            event
+        };
+        let remote_row = Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 3.5);
+        show(vec![egui::Event::PointerMoved(remote_row)]);
+        show(vec![egui::Event::PointerButton {
+            pos: remote_row,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let event = show(vec![egui::Event::PointerButton {
+            pos: remote_row,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(
+            event,
+            Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
+                remote_scope,
+                "$1",
+            )))
+        );
     }
 
     #[test]
@@ -1213,9 +1357,19 @@ mod tests {
         let duplicate = items[2].clone();
         items.push(duplicate);
 
-        assert_eq!(sidebar_session_ids(&items), vec!["s1", "s2"]);
-        assert_eq!(sidebar_context_session_id(&items[0]), Some("s1"));
-        assert_eq!(sidebar_context_session_id(&items[1]), None);
+        let targets = sidebar_session_targets(&items);
+        assert_eq!(
+            targets,
+            vec![
+                ScopedSessionTarget::new(test_scope(), "s1"),
+                ScopedSessionTarget::new(test_scope(), "s2"),
+            ]
+        );
+        assert_eq!(
+            sidebar_context_session_target(&items[0]),
+            Some(ScopedSessionTarget::new(test_scope(), "s1"))
+        );
+        assert_eq!(sidebar_context_session_target(&items[1]), None);
     }
 
     #[test]
@@ -1242,7 +1396,10 @@ mod tests {
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let item_id = crate::ui::sidebar::SidebarItemId::Session("s2");
+                        let item_id = crate::ui::sidebar::SidebarItemId::Session {
+                            scope: test_scope(),
+                            id: "s2",
+                        };
                         let id = ui.make_persistent_id(("mux-sidebar-item", &item_id));
                         ui.memory_mut(|memory| memory.request_focus(id));
                         show_test_sidebar(ui, &sessions);
@@ -1346,7 +1503,7 @@ mod tests {
         assert_eq!(
             captured,
             Some(SidebarEvent::ContextAction {
-                session_id: "s2".to_owned(),
+                target: ScopedSessionTarget::new(test_scope(), "s2"),
                 action: SessionContextAction::Activate,
             })
         );
@@ -1359,17 +1516,22 @@ mod tests {
         let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
         let items = vec![
             SidebarItem {
-                id: crate::ui::sidebar::SidebarItemId::Session("s1"),
+                id: crate::ui::sidebar::SidebarItemId::Session {
+                    scope: test_scope(),
+                    id: "s1",
+                },
                 display: SidebarDisplay::Text("alpha"),
                 indent: 0,
                 tree: SidebarTree::None,
                 selectable: true,
                 session_id: Some("s1"),
+                session_scope: Some(test_scope()),
                 reorder_anchor: Some("alpha"),
                 color: egui::Color32::WHITE,
                 dim_color: egui::Color32::GRAY,
                 kind: SidebarItemKind::Session { active: true },
                 current: true,
+                can_return_to_last_session: false,
                 icon: None,
                 primitives: &[],
             },
@@ -1380,11 +1542,13 @@ mod tests {
                 tree: SidebarTree::None,
                 selectable: false,
                 session_id: Some("s1"),
+                session_scope: Some(test_scope()),
                 reorder_anchor: Some("alpha"),
                 color: egui::Color32::WHITE,
                 dim_color: egui::Color32::GRAY,
                 kind: SidebarItemKind::Row,
                 current: true,
+                can_return_to_last_session: false,
                 icon: None,
                 primitives: &[],
             },
@@ -1406,7 +1570,6 @@ mod tests {
                     top_inset: 0.0,
                     border_visible: false,
                     separator_visible: false,
-                    can_return_to_last_session: false,
                     focused: false,
                     hovered_session: None,
                     unfocused_dim: 0.0,

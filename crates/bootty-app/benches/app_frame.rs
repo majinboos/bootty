@@ -200,7 +200,6 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, sessions: &[MuxSession], selected: Option
                     top_inset: 0.0,
                     border_visible: true,
                     separator_visible: true,
-                    can_return_to_last_session: false,
                     focused: false,
                     hovered_session: None,
                     unfocused_dim: 0.0,

@@ -17,10 +17,14 @@ const DEFAULT_BINDING_NAME: &str = "Default Binding";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceBinding {
     scope: MuxScope,
+    name: String,
     multiplexer: MultiplexerConfig,
 }
 
 impl WorkspaceBinding {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
     pub(crate) fn multiplexer_config(&self) -> MultiplexerConfig {
         self.multiplexer.clone()
     }
@@ -33,18 +37,22 @@ impl WorkspaceBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct WorkspaceStore {
     path: PathBuf,
-    binding: Option<WorkspaceBinding>,
+    bindings: Vec<WorkspaceBinding>,
 }
 
 impl WorkspaceStore {
     pub(crate) fn for_config_path(config_path: &Path, config: &MultiplexerConfig) -> Self {
         let path = sqlite_path(config_path);
-        let binding = Self::load_or_migrate(&path, config).ok();
-        Self { path, binding }
+        let bindings = Self::load_or_migrate(&path, config).unwrap_or_default();
+        Self { path, bindings }
     }
 
     pub(crate) fn binding(&self) -> Option<&WorkspaceBinding> {
-        self.binding.as_ref()
+        self.bindings.first()
+    }
+
+    pub(crate) fn bindings(&self) -> &[WorkspaceBinding] {
+        &self.bindings
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -52,28 +60,28 @@ impl WorkspaceStore {
     }
 
     pub(crate) fn binding_id(&self) -> Option<i64> {
-        self.binding
-            .as_ref()
+        self.binding()
             .map(|binding| binding.scope.binding_id().persistence_value())
     }
 
     fn load_or_migrate(
         path: &Path,
         config: &MultiplexerConfig,
-    ) -> rusqlite::Result<WorkspaceBinding> {
+    ) -> rusqlite::Result<Vec<WorkspaceBinding>> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
         let mut conn = open_db(path)?;
+        migrate_workspace_binding_cardinality(&conn)?;
         let tx = conn.transaction()?;
         create_workspace_schema(&tx)?;
-        let binding = match load_binding(&tx)? {
-            Some(binding) => binding,
-            None => create_default_binding(&tx, path, config)?,
+        let bindings = match load_bindings(&tx)? {
+            bindings if !bindings.is_empty() => bindings,
+            _ => vec![create_default_binding(&tx, path, config)?],
         };
         tx.commit()?;
-        Ok(binding)
+        Ok(bindings)
     }
 }
 
@@ -93,6 +101,51 @@ pub(crate) fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqlite::Result<()> {
+    let table_sql = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'workspace_bindings'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let had_single_binding_constraint = table_sql.is_some_and(|sql| {
+        sql.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase()
+            .contains("space_id integer not null unique")
+    });
+    if !had_single_binding_constraint {
+        return Ok(());
+    }
+
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    let migration = conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE workspace_bindings_multiple (
+             id INTEGER PRIMARY KEY,
+             space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
+             name TEXT NOT NULL,
+             backend TEXT NOT NULL,
+             hide_tmux_status INTEGER NOT NULL
+         );
+         INSERT INTO workspace_bindings_multiple
+             (id, space_id, name, backend, hide_tmux_status)
+         SELECT id, space_id, name, backend, hide_tmux_status
+         FROM workspace_bindings;
+         DROP TABLE workspace_bindings;
+         ALTER TABLE workspace_bindings_multiple RENAME TO workspace_bindings;
+         COMMIT;",
+    );
+    if migration.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    let foreign_keys = conn.pragma_update(None, "foreign_keys", "ON");
+    migration?;
+    foreign_keys
+}
+
 fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_spaces (
@@ -102,7 +155,7 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
         );
         CREATE TABLE IF NOT EXISTS workspace_bindings (
             id INTEGER PRIMARY KEY,
-            space_id INTEGER NOT NULL UNIQUE REFERENCES workspace_spaces(id) ON DELETE CASCADE,
+            space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
             backend TEXT NOT NULL,
             hide_tmux_status INTEGER NOT NULL
@@ -133,28 +186,30 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     )
 }
 
-fn load_binding(tx: &Transaction<'_>) -> rusqlite::Result<Option<WorkspaceBinding>> {
-    tx.query_row(
-        "SELECT s.id, b.id, b.backend, b.hide_tmux_status
+fn load_bindings(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceBinding>> {
+    let mut statement = tx.prepare(
+        "SELECT s.id, b.id, b.name, b.backend, b.hide_tmux_status
          FROM workspace_spaces s
          JOIN workspace_bindings b ON b.space_id = s.id
-         ORDER BY s.position, b.id
-         LIMIT 1",
-        [],
-        |row| {
-            Ok(WorkspaceBinding {
-                scope: MuxScope::new(
-                    SpaceId::from_persistence(row.get(0)?),
-                    BindingId::from_persistence(row.get(1)?),
-                ),
-                multiplexer: MultiplexerConfig {
-                    backend: backend_from_storage(&row.get::<_, String>(2)?),
-                    hide_tmux_status: row.get::<_, i64>(3)? != 0,
-                },
-            })
-        },
-    )
-    .optional()
+         WHERE s.id = (
+             SELECT id FROM workspace_spaces ORDER BY position, id LIMIT 1
+         )
+         ORDER BY b.id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(WorkspaceBinding {
+            scope: MuxScope::new(
+                SpaceId::from_persistence(row.get(0)?),
+                BindingId::from_persistence(row.get(1)?),
+            ),
+            name: row.get(2)?,
+            multiplexer: MultiplexerConfig {
+                backend: backend_from_storage(&row.get::<_, String>(3)?),
+                hide_tmux_status: row.get::<_, i64>(4)? != 0,
+            },
+        })
+    })?;
+    rows.collect()
 }
 
 fn create_default_binding(
@@ -184,6 +239,7 @@ fn create_default_binding(
             SpaceId::from_persistence(space_id),
             BindingId::from_persistence(binding_id),
         ),
+        name: DEFAULT_BINDING_NAME.to_owned(),
         multiplexer: config.clone(),
     })
 }
@@ -389,6 +445,114 @@ mod tests {
                 .multiplexer_config(),
             config
         );
+    }
+
+    #[test]
+    fn reopening_loads_multiple_bindings_in_the_same_space() {
+        let config_path = temp_config_path("multiple-bindings");
+        let store = WorkspaceStore::for_config_path(&config_path, &MultiplexerConfig::default());
+        let default = store.binding().expect("default binding");
+        let space_id = default.mux_scope().space_id().persistence_value();
+        let conn = open_db(store.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![space_id, "Remote", "tmux", 1_i64],
+        )
+        .expect("insert second binding");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Other Space"],
+        )
+        .expect("insert other space");
+        let other_space_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![other_space_id, "Other Space Binding", "zellij", 0_i64],
+        )
+        .expect("insert other space binding");
+
+        let reopened = WorkspaceStore::for_config_path(&config_path, &MultiplexerConfig::default());
+
+        assert_eq!(reopened.bindings().len(), 2);
+        assert_eq!(reopened.bindings()[0].name(), DEFAULT_BINDING_NAME);
+        assert_eq!(reopened.bindings()[1].name(), "Remote");
+        assert_eq!(
+            reopened.bindings()[1].multiplexer_config(),
+            MultiplexerConfig {
+                backend: MultiplexerBackendConfig::Tmux,
+                hide_tmux_status: true,
+            }
+        );
+        assert_ne!(
+            reopened.bindings()[0].mux_scope(),
+            reopened.bindings()[1].mux_scope()
+        );
+        assert!(
+            reopened
+                .bindings()
+                .iter()
+                .all(|binding| { binding.mux_scope().space_id().persistence_value() == space_id })
+        );
+    }
+
+    #[test]
+    fn existing_single_binding_schema_migrates_without_losing_scoped_metadata() {
+        let config_path = temp_config_path("binding-cardinality-migration");
+        let db_path = sqlite_path(&config_path);
+        let conn = open_db(&db_path).expect("open old workspace database");
+        conn.execute_batch(
+            "CREATE TABLE workspace_spaces (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL UNIQUE
+            );
+            CREATE TABLE workspace_bindings (
+                id INTEGER PRIMARY KEY,
+                space_id INTEGER NOT NULL UNIQUE REFERENCES workspace_spaces(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                hide_tmux_status INTEGER NOT NULL
+            );
+            CREATE TABLE workspace_session_name_metadata (
+                binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                generated_name TEXT NOT NULL,
+                explicit INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(binding_id, session_id)
+            );
+            INSERT INTO workspace_spaces (id, name, position)
+            VALUES (1, 'Default Space', 0);
+            INSERT INTO workspace_bindings
+                (id, space_id, name, backend, hide_tmux_status)
+            VALUES (1, 1, 'Default Binding', 'native', 0);
+            INSERT INTO workspace_session_name_metadata
+                (binding_id, session_id, cwd, generated_name, explicit)
+            VALUES (1, '$1', '/repo', 'repo', 0);",
+        )
+        .expect("create old single-binding schema");
+
+        let store = WorkspaceStore::for_config_path(&config_path, &MultiplexerConfig::default());
+        let conn = open_db(store.path()).expect("open migrated database");
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (1, 'Remote', 'tmux', 1)",
+            [],
+        )
+        .expect("single-binding constraint removed");
+        let metadata_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_session_name_metadata
+                 WHERE binding_id = 1 AND session_id = '$1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved metadata count");
+
+        assert_eq!(store.bindings().len(), 1);
+        assert_eq!(metadata_count, 1);
     }
 
     #[test]

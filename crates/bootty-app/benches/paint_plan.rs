@@ -9,7 +9,10 @@ use bootty_app::{
     input_binding::BindingAction,
     input_binding_set::BindingSet,
     modifier_remap::ModifierRemapSet,
-    mux::snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+    mux::{
+        controller::{BindingId, MuxScope, SpaceId},
+        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+    },
     paint_plan::PaintPlanner,
     terminal::{
         KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
@@ -20,6 +23,7 @@ use bootty_app::{
     ui::{
         chrome::{self, SidebarModel},
         icons,
+        session_navigation::BindingSessionGroup,
         session_picker::SessionPickerDialog,
         sidebar::{build_sidebar_items, build_visible_sidebar_items},
     },
@@ -589,7 +593,6 @@ fn bench_sidebar_ui(c: &mut Criterion) {
                                     top_inset: 0.0,
                                     border_visible: true,
                                     separator_visible: true,
-                                    can_return_to_last_session: false,
                                     focused: false,
                                     hovered_session: None,
                                     unfocused_dim: 0.0,
@@ -647,7 +650,6 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
                                     top_inset: 0.0,
                                     border_visible: true,
                                     separator_visible: true,
-                                    can_return_to_last_session: false,
                                     focused: false,
                                     hovered_session: None,
                                     unfocused_dim: 0.0,
@@ -670,8 +672,16 @@ fn bench_session_picker_ui(c: &mut Criterion) {
     let sessions = sidebar_sessions(384);
     let selected = sessions
         .get(sessions.len() / 2)
-        .map(|session| session.id.as_str())
-        .unwrap_or("$1");
+        .map(|session| session.id.clone())
+        .unwrap_or_else(|| "$1".to_owned());
+    let groups = [BindingSessionGroup {
+        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
+        label: "Default Binding".to_owned(),
+        sessions,
+        selected_session: Some(selected),
+        active: true,
+        can_return_to_last_session: false,
+    }];
     let context = egui::Context::default();
     icons::install_icon_fonts(&context);
     let theme = bootty_ui::Theme::new(bootty_ui::ThemePalette::default());
@@ -687,12 +697,7 @@ fn bench_session_picker_ui(c: &mut Criterion) {
                     ..Default::default()
                 },
                 |ui| {
-                    black_box(dialog.show(
-                        ui.ctx(),
-                        black_box(theme),
-                        black_box(&sessions),
-                        black_box(Some(selected)),
-                    ));
+                    black_box(dialog.show(ui.ctx(), black_box(theme), black_box(&groups)));
                 },
             );
             black_box(output.shapes.len())

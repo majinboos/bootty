@@ -1223,10 +1223,17 @@ impl BoottyApp {
         } else {
             Vec::new()
         };
-        let sidebar_items = crate::ui::sidebar::build_sidebar_items_from_module_items(
-            &sidebar_session_items,
-            self.state.mux().selected_session(),
-        );
+        let binding_groups = self.state.binding_session_groups();
+        let sidebar_items = if binding_groups.len() > 1 {
+            crate::ui::sidebar::build_binding_sidebar_items(&binding_groups)
+        } else {
+            crate::ui::sidebar::build_sidebar_items_from_module_items(
+                &sidebar_session_items,
+                self.state.mux_scope(),
+                self.state.mux().selected_session(),
+                self.state.mux().previous_selected_session().is_some(),
+            )
+        };
         let sidebar_on_right = matches!(
             self.state.config().sidebar.position,
             crate::config::SidebarPosition::Right
@@ -1422,19 +1429,19 @@ impl BoottyApp {
                         SidebarModel {
                             items: &sidebar_items,
                             footer_items: &sidebar_footer_items,
-                            session_count: self.state.mux().sessions().len(),
-                            has_sessions: !self.state.mux().sessions().is_empty(),
+                            session_count: binding_groups
+                                .iter()
+                                .map(|group| group.sessions.len())
+                                .sum(),
+                            has_sessions: binding_groups
+                                .iter()
+                                .any(|group| !group.sessions.is_empty()),
                             title_visible,
                             reserve_titlebar_buttons,
                             title_icon: title_icon.as_ref(),
                             top_inset,
                             border_visible: !fullscreen_chrome,
                             separator_visible: !fullscreen_chrome,
-                            can_return_to_last_session: self
-                                .state
-                                .mux()
-                                .previous_selected_session()
-                                .is_some(),
                             focused: self.state.sidebar_focused(),
                             hovered_session: self.state.sidebar_hovered_session(),
                             unfocused_dim: self.state.config().chrome.unfocused_sidebar_dim,
@@ -1447,41 +1454,59 @@ impl BoottyApp {
                         },
                     ) {
                         match event {
-                            chrome::SidebarEvent::ActivateSession(session_id) => {
-                                self.state.activate_session_from_ui(&session_id);
+                            chrome::SidebarEvent::ActivateSession(target) => {
+                                self.state.activate_scoped_session_from_ui(&target);
                             }
-                            chrome::SidebarEvent::ContextAction { session_id, action } => {
+                            chrome::SidebarEvent::ContextAction { target, action } => {
                                 let handled = match action {
                                     chrome::SessionContextAction::Activate => {
-                                        self.state.activate_session_from_ui(&session_id);
-                                        true
-                                    }
-                                    chrome::SessionContextAction::NewSession => {
-                                        self.state.open_new_session_dialog_from_ui()
-                                    }
-                                    chrome::SessionContextAction::SwitchSession => {
-                                        self.state.open_session_picker_dialog_from_ui()
+                                        self.state.activate_scoped_session_from_ui(&target)
                                     }
                                     chrome::SessionContextAction::PreviousSession => self
                                         .state
-                                        .activate_relative_session_from_ui(&session_id, -1),
-                                    chrome::SessionContextAction::NextSession => {
-                                        self.state.activate_relative_session_from_ui(&session_id, 1)
-                                    }
-                                    chrome::SessionContextAction::LastSession => {
-                                        self.state.activate_last_session_from_ui()
-                                    }
-                                    chrome::SessionContextAction::Rename => {
-                                        self.state.open_rename_session_dialog_for(&session_id)
-                                    }
-                                    chrome::SessionContextAction::MoveUp => {
-                                        self.state.move_session_from_ui(&session_id, -1)
-                                    }
-                                    chrome::SessionContextAction::MoveDown => {
-                                        self.state.move_session_from_ui(&session_id, 1)
-                                    }
-                                    chrome::SessionContextAction::Ditch => {
-                                        self.state.open_ditch_session_dialog_for(&session_id)
+                                        .activate_relative_scoped_session_from_ui(&target, -1),
+                                    chrome::SessionContextAction::NextSession => self
+                                        .state
+                                        .activate_relative_scoped_session_from_ui(&target, 1),
+                                    action => {
+                                        if !self.state.activate_scoped_session_from_ui(&target) {
+                                            false
+                                        } else {
+                                            match action {
+                                                chrome::SessionContextAction::NewSession => {
+                                                    self.state.open_new_session_dialog_from_ui()
+                                                }
+                                                chrome::SessionContextAction::SwitchSession => {
+                                                    self.state.open_session_picker_dialog_from_ui()
+                                                }
+                                                chrome::SessionContextAction::LastSession => {
+                                                    self.state.activate_last_session_from_ui()
+                                                }
+                                                chrome::SessionContextAction::Rename => {
+                                                    self.state.open_rename_session_dialog_for(
+                                                        &target.session_id,
+                                                    )
+                                                }
+                                                chrome::SessionContextAction::MoveUp => self
+                                                    .state
+                                                    .move_session_from_ui(&target.session_id, -1),
+                                                chrome::SessionContextAction::MoveDown => self
+                                                    .state
+                                                    .move_session_from_ui(&target.session_id, 1),
+                                                chrome::SessionContextAction::Ditch => {
+                                                    self.state.open_ditch_session_dialog_for(
+                                                        &target.session_id,
+                                                    )
+                                                }
+                                                chrome::SessionContextAction::Activate
+                                                | chrome::SessionContextAction::PreviousSession
+                                                | chrome::SessionContextAction::NextSession => {
+                                                    unreachable!(
+                                                        "scoped session actions handled above"
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                 };
                                 if handled {
@@ -1622,7 +1647,7 @@ impl BoottyApp {
         // empty state instead of the terminal widget, which would otherwise hold the closed
         // terminal's last frame.
         let native_layout_backend =
-            backend_uses_native_layout_renderer(self.state.config().multiplexer.backend);
+            backend_uses_native_layout_renderer(self.state.multiplexer_backend());
         let has_terminal = !native_layout_backend
             || self
                 .state
@@ -1723,14 +1748,8 @@ impl BoottyApp {
         let Some(mut dialog) = self.state.take_session_picker_dialog() else {
             return;
         };
-        let sessions = self.state.mux().sessions().to_vec();
-        let selected_session = self.state.mux().selected_session().map(str::to_owned);
-        let event = dialog.show(
-            ctx,
-            self.state.ui_theme(),
-            &sessions,
-            selected_session.as_deref(),
-        );
+        let groups = self.state.binding_session_groups();
+        let event = dialog.show(ctx, self.state.ui_theme(), &groups);
         self.state.apply_session_picker_event(dialog, event);
     }
 

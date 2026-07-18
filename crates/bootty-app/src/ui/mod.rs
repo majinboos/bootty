@@ -8,6 +8,7 @@ pub mod lua_window;
 pub mod new_session_picker;
 pub mod overlay;
 pub mod rename;
+pub mod session_navigation;
 pub mod session_picker;
 pub mod settings;
 pub mod sidebar;

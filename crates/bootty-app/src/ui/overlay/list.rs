@@ -436,6 +436,34 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_navigation_skips_binding_section_rows() {
+        let rows = vec![
+            ListRow {
+                primary: "Local".to_owned(),
+                section: true,
+                ..ListRow::default()
+            },
+            ListRow {
+                primary: "local session".to_owned(),
+                ..ListRow::default()
+            },
+            ListRow {
+                primary: "Remote".to_owned(),
+                section: true,
+                ..ListRow::default()
+            },
+            ListRow {
+                primary: "remote session".to_owned(),
+                ..ListRow::default()
+            },
+        ];
+
+        assert_eq!(selectable_selection_after_nav(0, &rows, false, false), 1);
+        assert_eq!(selectable_selection_after_nav(1, &rows, true, false), 3);
+        assert_eq!(selectable_selection_after_nav(3, &rows, false, true), 1);
+    }
+
+    #[test]
     fn stationary_pointer_does_not_select_hovered_row() {
         let context = egui::Context::default();
         let rows = vec![
