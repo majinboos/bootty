@@ -14,6 +14,7 @@ mod copy_mode;
 mod diagnostic_actions;
 mod recorded_chord;
 mod selection;
+mod space_presentation;
 
 use copy_mode::{
     CopyModeKeyAction, copy_mode_action_for_egui_event, copy_mode_action_for_input,
@@ -29,6 +30,7 @@ use recorded_chord::normalize_recorded_chord;
 use selection::{TerminalSelectionAction, TerminalSelectionRouteContext, TerminalSelectionRouter};
 #[cfg(test)]
 use selection::{selection_drag_scroll_delta, terminal_selection_event_clamped};
+use space_presentation::SpacePresentationTree;
 
 use crate::{
     app_actions::{
@@ -239,6 +241,9 @@ struct BindingRuntime {
     generated_names_signature: Option<u64>,
     terminal_side_effect_tx: mpsc::Sender<TerminalSideEffectEvent>,
     terminal_side_effect_rx: mpsc::Receiver<TerminalSideEffectEvent>,
+    terminal_surface: Option<TerminalSurface>,
+    terminal_view_transform: ViewTransform,
+    terminal_cursor_icon: egui::CursorIcon,
     pane_layouts: HashMap<ScopedWindowId, PaneLayout>,
     pending_pane_split_directions: HashMap<ScopedWindowId, SplitDirection>,
     custom_tab_names: HashSet<ScopedWindowId>,
@@ -269,6 +274,9 @@ impl BindingRuntime {
             ),
             terminal_side_effect_tx,
             terminal_side_effect_rx,
+            terminal_surface: None,
+            terminal_view_transform: ViewTransform::IDENTITY,
+            terminal_cursor_icon: egui::CursorIcon::Default,
             mux: BindingMuxController::new(scope),
             session_order: SessionOrderStore::for_binding(
                 &config.config_path,
@@ -329,16 +337,16 @@ fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig
 pub struct AppState {
     binding: BindingRuntime,
     inactive_bindings: Vec<BindingRuntime>,
+    presentation: SpacePresentationTree,
+    deferred_binding_pointer_events: Vec<egui::Event>,
     repaint_scheduler: RepaintScheduler,
     last_error: Option<String>,
     last_drain: DrainStats,
     last_frame_dt_ms: f32,
     status_metrics: StatusMetrics,
     last_status_metrics_sample: Instant,
-    terminal_surface: Option<TerminalSurface>,
     /// The full terminal area the panes were last laid out within, for geometric neighbor lookup.
     last_pane_area: Option<Rect>,
-    terminal_view_transform: ViewTransform,
     config_state: ConfigState,
     active_appearance_variant: AppearanceVariant,
     input_focus: InputFocus,
@@ -365,6 +373,7 @@ pub struct AppState {
     wheel_scroll_state: WheelScrollState,
     modifier_remaps: ModifierRemapSet,
     terminal_cursor_icon: egui::CursorIcon,
+    pending_terminal_cursor_icon_effect: bool,
     mouse_pointer_hidden_while_typing: bool,
     last_mouse_hover_pos: Option<Pos2>,
     macos_option_as_alt: crate::terminal::MacosOptionAsAlt,
@@ -682,6 +691,10 @@ impl AppState {
         }
         let binding = bindings.remove(0);
         let inactive_bindings = bindings;
+        let presentation = SpacePresentationTree::from_scopes(
+            std::iter::once(binding.scope)
+                .chain(inactive_bindings.iter().map(|binding| binding.scope)),
+        );
         let config_hot_reload = ConfigHotReload::new(&config.config_path);
         let macos_non_native_fullscreen_active = config.window.non_native_fullscreen_enabled();
         let macos_non_native_fullscreen_applied =
@@ -694,16 +707,16 @@ impl AppState {
         Ok(Self {
             binding,
             inactive_bindings,
+            presentation,
+            deferred_binding_pointer_events: Vec::new(),
             repaint_scheduler: RepaintScheduler::default(),
             last_error: None,
             last_drain: DrainStats::default(),
             last_frame_dt_ms: 0.0,
             status_metrics: StatusMetrics::default(),
             last_status_metrics_sample: Instant::now() - STATUS_METRICS_SAMPLE_INTERVAL,
-            terminal_surface: None,
             last_pane_area: None,
             chrome_handle_rects: Vec::new(),
-            terminal_view_transform: ViewTransform::IDENTITY,
             config_state: ConfigState::new(config),
             active_appearance_variant,
             input_focus: InputFocus::Terminal,
@@ -722,6 +735,7 @@ impl AppState {
             wheel_scroll_state: WheelScrollState::default(),
             modifier_remaps,
             terminal_cursor_icon: egui::CursorIcon::Default,
+            pending_terminal_cursor_icon_effect: false,
             mouse_pointer_hidden_while_typing: false,
             last_mouse_hover_pos: None,
             macos_option_as_alt,
@@ -913,6 +927,93 @@ impl AppState {
     pub fn binding_count(&self) -> usize {
         self.inactive_bindings.len() + 1
     }
+    fn binding_runtime(&self, scope: MuxScope) -> Option<&BindingRuntime> {
+        if self.binding.scope == scope {
+            Some(&self.binding)
+        } else {
+            self.inactive_bindings
+                .iter()
+                .find(|binding| binding.scope == scope)
+        }
+    }
+
+    fn binding_runtime_mut(&mut self, scope: MuxScope) -> Option<&mut BindingRuntime> {
+        if self.binding.scope == scope {
+            Some(&mut self.binding)
+        } else {
+            self.inactive_bindings
+                .iter_mut()
+                .find(|binding| binding.scope == scope)
+        }
+    }
+
+    pub fn binding_view_layout(&self, rect: Rect, gap: f32) -> Vec<(MuxScope, Rect)> {
+        self.presentation.layout(rect, gap)
+    }
+
+    pub fn focused_binding_scope(&self) -> MuxScope {
+        self.presentation.focused().unwrap_or(self.binding.scope)
+    }
+
+    pub fn binding_label_for_scope(&self, scope: MuxScope) -> Option<String> {
+        let binding = self.binding_runtime(scope)?;
+        let duplicate = self
+            .binding_runtimes()
+            .filter(|candidate| candidate.label == binding.label)
+            .count()
+            > 1;
+        Some(if duplicate {
+            format!(
+                "{} / Binding {}",
+                binding.label,
+                binding.scope.binding_id().persistence_value()
+            )
+        } else {
+            binding.label.clone()
+        })
+    }
+
+    pub fn binding_has_terminal(&self, scope: MuxScope) -> bool {
+        self.binding_runtime(scope).is_some_and(|binding| {
+            !matches!(
+                binding.multiplexer.backend,
+                crate::config::MultiplexerBackendConfig::Native
+                    | crate::config::MultiplexerBackendConfig::Rmux
+            ) || binding
+                .mux
+                .selected_session_anchor()
+                .is_some_and(|anchor| anchor.pane_id.is_some())
+        })
+    }
+
+    pub fn binding_terminal_transition_key(&self, scope: MuxScope) -> Option<String> {
+        let binding = self.binding_runtime(scope)?;
+        binding.mux.selected_session_anchor().map(|anchor| {
+            scoped_terminal_transition_key(
+                binding.scope,
+                selected_backend(&binding.multiplexer),
+                &anchor.session_id,
+                anchor.pane_id.as_deref(),
+            )
+        })
+    }
+
+    pub fn binding_view_widget_key(&self, scope: MuxScope) -> String {
+        format!(
+            "binding-view:{}:{}",
+            scope.space_id().persistence_value(),
+            scope.binding_id().persistence_value()
+        )
+    }
+
+    pub fn terminal_for_scope_mut(&mut self, scope: MuxScope) -> Option<&mut ActiveTerminal> {
+        self.binding_runtime_mut(scope)
+            .map(|binding| &mut binding.terminal)
+    }
+
+    pub fn reorder_binding_view(&mut self, source: MuxScope, before: Option<MuxScope>) -> bool {
+        self.presentation.reorder(source, before)
+    }
 
     pub fn binding_session_groups(&self) -> Vec<BindingSessionGroup> {
         let mut bindings = std::iter::once(&self.binding)
@@ -950,6 +1051,9 @@ impl AppState {
 
     fn binding_runtimes_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
         std::iter::once(&mut self.binding).chain(self.inactive_bindings.iter_mut())
+    }
+    fn binding_runtimes(&self) -> impl Iterator<Item = &BindingRuntime> {
+        std::iter::once(&self.binding).chain(self.inactive_bindings.iter())
     }
 
     fn set_binding_terminal_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
@@ -1045,7 +1149,19 @@ impl AppState {
     }
 
     pub fn record_surface(&mut self, surface: TerminalSurface) {
-        self.terminal_surface = Some(surface);
+        self.binding.terminal_surface = Some(surface);
+    }
+
+    pub fn record_binding_surface(&mut self, scope: MuxScope, surface: TerminalSurface) {
+        if let Some(binding) = self.binding_runtime_mut(scope) {
+            binding.terminal_surface = Some(surface);
+        }
+    }
+
+    pub fn record_binding_view_transform(&mut self, scope: MuxScope, view: ViewTransform) {
+        if let Some(binding) = self.binding_runtime_mut(scope) {
+            binding.terminal_view_transform = view;
+        }
     }
 
     pub fn record_render_error(&mut self, error: impl ToString) {
@@ -1060,6 +1176,12 @@ impl AppState {
 
     pub fn register_chrome_handle(&mut self, rect: egui::Rect) {
         self.chrome_handle_rects.push(rect);
+    }
+
+    pub fn chrome_handle_contains(&self, pos: Pos2) -> bool {
+        self.chrome_handle_rects
+            .iter()
+            .any(|rect| rect.contains(pos))
     }
 
     fn is_native(&self) -> bool {
@@ -1564,31 +1686,59 @@ impl AppState {
     }
 
     pub fn activate_scoped_session_from_ui(&mut self, target: &ScopedSessionTarget) -> bool {
-        if target.scope != self.binding.scope {
-            let Some(index) = self
-                .inactive_bindings
-                .iter()
-                .position(|binding| binding.scope == target.scope)
-            else {
-                return false;
-            };
-            let backend = self.inactive_bindings[index].multiplexer.backend;
-            let keybinds = self.config().input.keybinds_for_backend(backend);
-            let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
-                Ok(bindings) => bindings,
-                Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    return false;
-                }
-            };
-            std::mem::swap(&mut self.binding, &mut self.inactive_bindings[index]);
-            self.app_key_bindings = app_key_bindings;
-            self.terminal_surface = None;
-            self.last_pane_area = None;
+        if !self.focus_binding_view(target.scope) {
+            return false;
         }
         self.binding.mux.activate_session(&target.session_id);
         self.sync_native_layout_terminal_now();
         self.sidebar_hovered_session = Some(target.clone());
+        (self.repaint)();
+        true
+    }
+
+    pub fn resolve_binding_pointer_press(&mut self, scope: Option<MuxScope>) -> bool {
+        let Some(scope) = scope else {
+            self.deferred_binding_pointer_events.clear();
+            return false;
+        };
+        self.focus_binding_view(scope)
+    }
+
+    pub fn focus_binding_view(&mut self, scope: MuxScope) -> bool {
+        if scope == self.binding.scope {
+            self.presentation.add(scope);
+            self.presentation.focus(scope);
+            self.input_focus = InputFocus::Terminal;
+            return true;
+        }
+        let Some(index) = self
+            .inactive_bindings
+            .iter()
+            .position(|binding| binding.scope == scope)
+        else {
+            return false;
+        };
+        self.presentation.add(scope);
+        let backend = self.inactive_bindings[index].multiplexer.backend;
+        let keybinds = self.config().input.keybinds_for_backend(backend);
+        let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return false;
+            }
+        };
+        std::mem::swap(&mut self.binding, &mut self.inactive_bindings[index]);
+        self.app_key_bindings = app_key_bindings;
+        self.terminal_cursor_icon = self.binding.terminal_cursor_icon;
+        self.mouse_pointer_hidden_while_typing = false;
+        self.pending_terminal_cursor_icon_effect = true;
+        self.last_pane_area = None;
+        self.presentation.focus(scope);
+        self.input_focus = InputFocus::Terminal;
+        if let Err(error) = self.sync_terminal_panes() {
+            self.last_error = Some(error.to_string());
+        }
         (self.repaint)();
         true
     }
@@ -2479,6 +2629,65 @@ impl AppState {
         }
     }
 
+    fn service_inactive_binding_lifecycle(
+        &mut self,
+        effects: &mut Vec<AppEffect>,
+        terminal_cell_width: f32,
+        terminal_cell_height: f32,
+        terminal_scale_factor: f32,
+    ) {
+        for index in 0..self.inactive_bindings.len() {
+            std::mem::swap(&mut self.binding, &mut self.inactive_bindings[index]);
+            self.binding.terminal.drain_native_window();
+            let side_effects = self
+                .binding
+                .terminal_side_effect_rx
+                .try_iter()
+                .collect::<Vec<_>>();
+            let mut background_effects = Vec::new();
+            for side_effect in side_effects {
+                if let TerminalSideEffect::MouseShape(shape) = &side_effect.effect {
+                    if let Some(icon) = terminal_cursor_icon_for_mouse_shape(shape) {
+                        self.binding.terminal_cursor_icon = icon;
+                    }
+                    continue;
+                }
+                self.apply_terminal_side_effect_event(
+                    side_effect,
+                    &mut background_effects,
+                    terminal_cell_width,
+                    terminal_cell_height,
+                    terminal_scale_factor,
+                );
+            }
+            background_effects.retain(|effect| {
+                !matches!(
+                    effect,
+                    AppEffect::SetWindowTitle(_)
+                        | AppEffect::SetTerminalCursorIcon(_)
+                        | AppEffect::SetWindowFocus
+                )
+            });
+            effects.extend(background_effects);
+            self.close_exited_terminal_panes();
+            std::mem::swap(&mut self.binding, &mut self.inactive_bindings[index]);
+        }
+    }
+
+    fn close_exited_terminal_panes(&mut self) {
+        if self.is_native() {
+            for pane in self.binding.terminal.native_exited_panes() {
+                self.close_pane(&pane);
+            }
+        } else {
+            match self.binding.terminal.child_exited() {
+                Ok(true) => self.close_active_pane(),
+                Ok(false) => {}
+                Err(error) => self.last_error = Some(error.to_string()),
+            }
+        }
+    }
+
     fn apply_terminal_side_effect_event(
         &mut self,
         event: TerminalSideEffectEvent,
@@ -2523,6 +2732,7 @@ impl AppState {
             TerminalSideEffect::MouseShape(shape) => {
                 if let Some(icon) = terminal_cursor_icon_for_mouse_shape(&shape) {
                     self.terminal_cursor_icon = icon;
+                    self.binding.terminal_cursor_icon = icon;
                     effects.push(AppEffect::SetTerminalCursorIcon(
                         self.effective_terminal_cursor_icon(),
                     ));
@@ -2794,6 +3004,36 @@ impl AppState {
             terminal_view_transform,
         } = inputs;
         let mut effects = Vec::new();
+        if std::mem::take(&mut self.pending_terminal_cursor_icon_effect) {
+            effects.push(AppEffect::SetTerminalCursorIcon(
+                self.effective_terminal_cursor_icon(),
+            ));
+        }
+        self.binding.terminal_view_transform = terminal_view_transform;
+        let mut events_to_route = std::mem::take(&mut self.deferred_binding_pointer_events);
+        let defer_pointer_events = self.binding_count() > 1
+            && events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        if defer_pointer_events {
+            for event in events {
+                if event_is_terminal_pointer(&event) {
+                    self.deferred_binding_pointer_events.push(event);
+                } else {
+                    events_to_route.push(event);
+                }
+            }
+        } else {
+            events_to_route.extend(events);
+        }
+        let events = events_to_route;
 
         // A command-palette choice from the previous frame runs as soon as viewport/effects are
         // available, before mux refresh can retarget selected-window actions back to backend-active.
@@ -2811,19 +3051,13 @@ impl AppState {
             terminal_cell_height,
             terminal_scale_factor,
         );
-        // A shell exiting closes its pane, collapsing the split (or cascading to the tab when it was
-        // the last pane). On native, any pane's shell can exit, not just the focused one.
-        if self.is_native() {
-            for pane in self.binding.terminal.native_exited_panes() {
-                self.close_pane(&pane);
-            }
-        } else {
-            match self.binding.terminal.child_exited() {
-                Ok(true) => self.close_active_pane(),
-                Ok(false) => {}
-                Err(error) => self.last_error = Some(error.to_string()),
-            }
-        }
+        self.close_exited_terminal_panes();
+        self.service_inactive_binding_lifecycle(
+            &mut effects,
+            terminal_cell_width,
+            terminal_cell_height,
+            terminal_scale_factor,
+        );
 
         if let Some(Err(_)) = self.binding.mux.poll_command() {
             self.binding.pending_generated_names.clear();
@@ -2846,6 +3080,17 @@ impl AppState {
             binding.sync_session_order();
             schedule_mux_refresh |= mux_refresh_repaint_after(&binding.multiplexer).is_some();
         }
+        let mut inactive_terminal_error = None;
+        for binding in &mut self.inactive_bindings {
+            let config = binding.multiplexer.clone();
+            let anchor = binding.mux.selected_session_anchor().cloned();
+            if let Err(error) = binding.terminal.sync_mux_anchor(&config, anchor.as_ref()) {
+                inactive_terminal_error = Some(error.to_string());
+            }
+        }
+        if inactive_terminal_error.is_some() {
+            self.last_error = inactive_terminal_error;
+        }
         if schedule_mux_refresh {
             effects.push(AppEffect::RepaintAfter(MUX_SESSION_REFRESH_INTERVAL));
         }
@@ -2855,7 +3100,6 @@ impl AppState {
             self.last_error = Some(error.to_string());
         }
         self.hot_reload_config_if_changed(&mut effects, now);
-        self.terminal_view_transform = terminal_view_transform;
         self.restore_mouse_pointer_after_pointer_moved(&events, hover_pos, &mut effects);
         let input_commands = self.handle_direct_input(viewport, &mut effects)
             + self.handle_egui_input(
@@ -3525,7 +3769,7 @@ impl AppState {
         }
         let terminal_input_enabled = self.direct_terminal_input_enabled();
         let selection_surface = terminal_input_enabled
-            .then_some(self.terminal_surface)
+            .then_some(self.binding.terminal_surface)
             .flatten();
         let mouse_tracking = self.terminal_mouse_tracking_for_selection(
             &events,
@@ -3544,7 +3788,7 @@ impl AppState {
             events,
             TerminalSelectionRouteContext {
                 surface: selection_surface,
-                view: self.terminal_view_transform,
+                view: self.binding.terminal_view_transform,
                 mouse_tracking,
                 frame_modifiers: modifiers,
                 chrome_handle_rects: &chrome_handle_rects,
@@ -3552,7 +3796,7 @@ impl AppState {
         );
         selection_actions.extend(self.terminal_selection.autoscroll_actions(
             selection_surface,
-            self.terminal_view_transform,
+            self.binding.terminal_view_transform,
             modifiers,
         ));
         let selection_count = self.apply_terminal_selection_actions(selection_actions, effects);
@@ -3598,11 +3842,12 @@ impl AppState {
             modifier_sides: self.modifier_sides,
             hover_pos,
             pressed_mouse_button,
-            surface: self.terminal_surface,
+            surface: self.binding.terminal_surface,
             mouse_exclusion: self
+                .binding
                 .terminal_surface
                 .map(crate::renderer::scrollbar_hit_rect),
-            view: self.terminal_view_transform,
+            view: self.binding.terminal_view_transform,
         };
         let commands = terminal_input_commands_with_wheel_state(
             snapshot,
@@ -5805,6 +6050,152 @@ mod tests {
         assert_eq!(second.terminal_progress[&second_pane].percent(), Some(75));
         assert_eq!(first.mux.last_error(), Some("first failed"));
         assert_eq!(second.mux.last_error(), None);
+    }
+
+    #[test]
+    fn binding_view_focus_selects_the_clicked_surface_without_backend_topology_changes() {
+        let mut state = test_state();
+        let first_scope = state.binding.scope;
+        let second_scope = MuxScope::new(
+            first_scope.space_id(),
+            BindingId::from_persistence(
+                first_scope
+                    .binding_id()
+                    .persistence_value()
+                    .saturating_add(1000),
+            ),
+        );
+        state
+            .inactive_bindings
+            .push(test_binding_runtime(second_scope));
+        state.presentation.add(second_scope);
+
+        let first_rect = Rect::from_min_max(Pos2::ZERO, Pos2::new(496.0, 600.0));
+        let second_rect = Rect::from_min_max(Pos2::new(504.0, 0.0), Pos2::new(1000.0, 600.0));
+        let first_surface = TerminalSurface::new(
+            first_rect,
+            crate::geometry::CellMetrics::default(),
+            crate::geometry::TerminalPadding::uniform(0.0),
+        );
+        let second_surface = TerminalSurface::new(
+            second_rect,
+            crate::geometry::CellMetrics::default(),
+            crate::geometry::TerminalPadding::uniform(0.0),
+        );
+        state.record_binding_surface(first_scope, first_surface);
+        state.record_binding_surface(second_scope, second_surface);
+
+        assert!(state.reorder_binding_view(second_scope, Some(first_scope)));
+        assert_eq!(state.presentation.scopes(), vec![second_scope, first_scope]);
+        assert!(state.focus_binding_view(second_scope));
+        assert!(state.binding.mux.poll_command().is_none());
+        assert!(
+            state
+                .inactive_bindings
+                .iter_mut()
+                .find(|binding| binding.scope == first_scope)
+                .expect("first binding remains live")
+                .mux
+                .poll_command()
+                .is_none()
+        );
+        assert!(state.focus_binding_view(first_scope));
+        let mut inputs = test_frame_inputs(
+            vec![egui::Event::PointerButton {
+                pos: second_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            Some(second_rect.center()),
+        );
+        inputs.pressed_mouse_button = Some(MouseButton::Left);
+        state.update_frame(inputs);
+        assert_eq!(state.focused_binding_scope(), first_scope);
+        assert_eq!(state.deferred_binding_pointer_events.len(), 1);
+        assert!(!state.resolve_binding_pointer_press(None));
+        assert!(state.deferred_binding_pointer_events.is_empty());
+        let mut inputs = test_frame_inputs(
+            vec![egui::Event::PointerButton {
+                pos: second_rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            Some(second_rect.center()),
+        );
+        inputs.pressed_mouse_button = Some(MouseButton::Left);
+        state.update_frame(inputs);
+        assert!(state.resolve_binding_pointer_press(Some(second_scope)));
+        state.update_frame(test_frame_inputs(Vec::new(), Some(second_rect.center())));
+        assert!(state.deferred_binding_pointer_events.is_empty());
+
+        assert_eq!(state.focused_binding_scope(), second_scope);
+        assert_eq!(state.binding.terminal_surface, Some(second_surface));
+        assert_eq!(
+            state
+                .inactive_bindings
+                .iter()
+                .find(|binding| binding.scope == first_scope)
+                .and_then(|binding| binding.terminal_surface),
+            Some(first_surface)
+        );
+    }
+
+    #[test]
+    fn inactive_binding_lifecycle_drains_side_effects_without_stealing_window_focus() {
+        let mut state = test_state();
+        let second_scope = MuxScope::new(
+            state.binding.scope.space_id(),
+            BindingId::from_persistence(
+                state
+                    .binding
+                    .scope
+                    .binding_id()
+                    .persistence_value()
+                    .saturating_add(1000),
+            ),
+        );
+        let remote = test_binding_runtime(second_scope);
+        remote
+            .terminal_side_effect_tx
+            .send(TerminalSideEffectEvent::unscoped(TerminalSideEffect::Bell))
+            .expect("send background bell");
+        remote
+            .terminal_side_effect_tx
+            .send(TerminalSideEffectEvent::unscoped(
+                TerminalSideEffect::FocusWindow,
+            ))
+            .expect("send background focus request");
+        remote
+            .terminal_side_effect_tx
+            .send(TerminalSideEffectEvent::unscoped(
+                TerminalSideEffect::MouseShape("pointing_hand".to_owned()),
+            ))
+            .expect("send background cursor shape");
+        state.inactive_bindings.push(remote);
+        let mut effects = Vec::new();
+
+        state.service_inactive_binding_lifecycle(&mut effects, 10.0, 20.0, 1.0);
+
+        assert_eq!(effects, vec![AppEffect::Bell]);
+        assert!(
+            state.inactive_bindings[0]
+                .terminal_side_effect_rx
+                .try_recv()
+                .is_err()
+        );
+        assert_eq!(state.terminal_cursor_icon, egui::CursorIcon::Default);
+        assert_eq!(
+            state.inactive_bindings[0].terminal_cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
+        assert!(state.focus_binding_view(second_scope));
+        let focus_effects = state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert!(focus_effects.contains(&AppEffect::SetTerminalCursorIcon(
+            egui::CursorIcon::PointingHand
+        )));
+        assert_eq!(state.focused_binding_scope(), state.binding.scope);
     }
 
     #[test]
