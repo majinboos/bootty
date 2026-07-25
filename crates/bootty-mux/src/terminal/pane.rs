@@ -14,7 +14,7 @@ use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
 use bootty_terminal::terminal_frame::RenderFrame;
 use derive_more::{Deref, DerefMut};
 
-use bootty_config::config::MultiplexerConfig;
+use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 use bootty_runtime::{
     DrainStats, TerminalSession, TerminalSessionConfig, render_source::TerminalRenderSource,
 };
@@ -27,10 +27,7 @@ use bootty_terminal::{
     terminal_input_model::{KeyInput, MouseInput},
 };
 
-use crate::{
-    config::{MuxBackendKind, selected_backend},
-    snapshot::MuxPaneAnchor,
-};
+use crate::{config::selected_backend, controller::MuxScope, snapshot::MuxPaneAnchor};
 
 use super::{rmux_native::RmuxNativeTerminal, startup::StartingNativeTerminal};
 
@@ -50,17 +47,18 @@ struct RmuxWindowResizeWorker {
 
 #[derive(Deref, DerefMut)]
 pub struct BackendPaneTerminal {
-    backend: MuxBackendKind,
-    pub(super) active_target: Option<MuxPaneTarget>,
+    backend: MultiplexerBackendConfig,
+    active_target: Option<ScopedMuxPaneTarget>,
     geometry: TerminalGeometry,
     terminal_config: TerminalSessionConfig,
     repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
-    native_terminals: HashMap<MuxPaneTarget, ActiveTerminalRuntime>,
+    native_terminals: HashMap<ScopedMuxPaneTarget, Box<dyn TerminalRuntime>>,
     /// The active native window's panes (focused + the parked siblings rendered alongside it). Empty
     /// for non-native backends, which render a single attach surface.
-    native_window_targets: Vec<MuxPaneTarget>,
+    native_window_targets: Vec<ScopedMuxPaneTarget>,
     native_window_spawn_geometry: Option<TerminalGeometry>,
     native_window_id: Option<String>,
+    native_window_scope: Option<MuxScope>,
     last_rmux_window_size: Option<(String, u16, u16)>,
     rmux_window_resize_worker: Option<RmuxWindowResizeWorker>,
     /// Tmux sessions whose status bars are hidden while Bootty keeps an attached runtime.
@@ -69,77 +67,10 @@ pub struct BackendPaneTerminal {
     passthrough_all_panes: HashMap<String, TmuxPanePassthroughOverride>,
     #[deref]
     #[deref_mut]
-    terminal: ActiveTerminalRuntime,
+    terminal: Box<dyn TerminalRuntime>,
 }
-
-#[derive(Deref, DerefMut)]
-#[deref(forward)]
-#[deref_mut(forward)]
-pub struct ActiveTerminalRuntime(Box<dyn TerminalRuntime>);
-
-impl ActiveTerminalRuntime {
-    fn idle() -> Self {
-        Self(Box::new(IdleRenderSource))
-    }
-}
-
-// Lets a non-focused pane's runtime be rendered directly by a per-pane `TerminalWidget` without
-// going through `BackendPaneTerminal` (which only ever exposes the focused pane).
-impl TerminalRenderSource for ActiveTerminalRuntime {
-    fn set_display_scale(&mut self, display_scale: f32) -> Result<()> {
-        self.0.set_display_scale(display_scale)
-    }
-
-    fn set_render_cell_metrics(&mut self, cell: CellMetrics) -> Result<()> {
-        self.0.set_render_cell_metrics(cell)
-    }
-
-    fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
-        self.0.resize(geometry)
-    }
-
-    fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
-        self.0.extract_frame()
-    }
-
-    fn is_mouse_tracking(&mut self) -> Result<bool> {
-        self.0.is_mouse_tracking()
-    }
-
-    fn scroll_viewport_delta(&mut self, delta: isize) -> Result<()> {
-        self.0.scroll_viewport_delta(delta)
-    }
-
-    fn enter_copy_mode(&mut self) -> Result<()> {
-        self.0.enter_copy_mode()
-    }
-
-    fn copy_mode_active(&mut self) -> Result<bool> {
-        self.0.copy_mode_active()
-    }
-
-    fn handle_copy_mode_action(
-        &mut self,
-        action: TerminalCopyModeAction,
-    ) -> Result<TerminalCopyModeOutcome> {
-        self.0.handle_copy_mode_action(action)
-    }
-
-    fn search_viewport(&mut self, query: &str, direction: TerminalSearchDirection) -> Result<bool> {
-        self.0.search_viewport(query, direction)
-    }
-
-    fn begin_selection(&mut self, event: TerminalSelectionEvent) -> Result<()> {
-        self.0.begin_selection(event)
-    }
-
-    fn update_selection(&mut self, event: TerminalSelectionEvent) -> Result<()> {
-        self.0.update_selection(event)
-    }
-
-    fn end_selection(&mut self, event: Option<TerminalSelectionEvent>) -> Result<()> {
-        self.0.end_selection(event)
-    }
+fn idle_terminal() -> Box<dyn TerminalRuntime> {
+    Box::new(IdleRenderSource)
 }
 
 pub trait TerminalRuntime: TerminalRenderSource {
@@ -321,7 +252,7 @@ impl BackendPaneTerminal {
 
     pub(super) fn new_with_backend(
         geometry: TerminalGeometry,
-        backend: MuxBackendKind,
+        backend: MultiplexerBackendConfig,
         terminal_config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> Self {
@@ -335,11 +266,12 @@ impl BackendPaneTerminal {
             native_window_targets: Vec::new(),
             native_window_spawn_geometry: None,
             native_window_id: None,
+            native_window_scope: None,
             last_rmux_window_size: None,
             rmux_window_resize_worker: None,
             status_hidden_sessions: Vec::new(),
             passthrough_all_panes: HashMap::new(),
-            terminal: ActiveTerminalRuntime::idle(),
+            terminal: idle_terminal(),
         }
     }
 
@@ -348,10 +280,30 @@ impl BackendPaneTerminal {
         config: &MultiplexerConfig,
         anchor: Option<&MuxPaneAnchor>,
     ) -> Result<()> {
+        self.sync_mux_anchor_in_scope(None, config, anchor)
+    }
+
+    pub fn sync_scoped_mux_anchor(
+        &mut self,
+        scope: MuxScope,
+        config: &MultiplexerConfig,
+        anchor: Option<&MuxPaneAnchor>,
+    ) -> Result<()> {
+        self.sync_mux_anchor_in_scope(Some(scope), config, anchor)
+    }
+
+    fn sync_mux_anchor_in_scope(
+        &mut self,
+        scope: Option<MuxScope>,
+        config: &MultiplexerConfig,
+        anchor: Option<&MuxPaneAnchor>,
+    ) -> Result<()> {
         let backend = selected_backend(config);
-        let target = anchor.cloned().map(MuxPaneTarget::from);
+        let target = anchor
+            .cloned()
+            .map(|anchor| ScopedMuxPaneTarget::from_anchor(scope, anchor));
         if self.backend == backend
-            && target_matches_anchor(backend, self.active_target.as_ref(), anchor)
+            && scoped_target_matches_anchor(backend, scope, self.active_target.as_ref(), anchor)
         {
             // The tmux attach client follows pane/window changes server-side, so avoid
             // restarting it. Still update Bootty's tracked target so pane-local option
@@ -381,8 +333,10 @@ impl BackendPaneTerminal {
     }
 
     fn sync_tmux_passthrough_override(&mut self) {
-        let Some(pane_id) = passthrough_override_target(self.backend, self.active_target.as_ref())
-        else {
+        let Some(pane_id) = passthrough_override_target(
+            self.backend,
+            self.active_target.as_ref().map(|target| &target.target),
+        ) else {
             self.restore_tmux_passthrough_overrides();
             return;
         };
@@ -414,7 +368,9 @@ impl BackendPaneTerminal {
         let Some(session) = status_bar_hidden_target(
             hide_enabled,
             self.backend,
-            self.active_target.as_ref().map(MuxPaneTarget::session_id),
+            self.active_target
+                .as_ref()
+                .map(ScopedMuxPaneTarget::session_id),
         ) else {
             self.restore_tmux_status_bars();
             return;
@@ -437,6 +393,11 @@ impl BackendPaneTerminal {
         }
     }
 
+    pub fn deactivate_backend_side_effects(&mut self) {
+        self.restore_tmux_passthrough_overrides();
+        self.restore_tmux_status_bars();
+    }
+
     pub fn set_terminal_config(&mut self, terminal_config: TerminalSessionConfig) {
         self.terminal_config = terminal_config;
     }
@@ -456,73 +417,72 @@ impl BackendPaneTerminal {
 
     fn start_terminal(
         &mut self,
-        backend: MuxBackendKind,
-        target: Option<&MuxPaneTarget>,
-    ) -> Result<ActiveTerminalRuntime> {
+        backend: MultiplexerBackendConfig,
+        target: Option<&ScopedMuxPaneTarget>,
+    ) -> Result<Box<dyn TerminalRuntime>> {
         let Some(target) = target else {
-            return Ok(ActiveTerminalRuntime::idle());
+            return Ok(idle_terminal());
         };
 
         match backend {
-            MuxBackendKind::Native | MuxBackendKind::Rmux => {
+            MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux => {
                 // A native session whose tabs have all been closed resolves to a session-level target
                 // with no pane; it has no shell to attach, so it renders as idle. Rmux session targets
                 // can resolve to the active backend pane.
-                if backend == MuxBackendKind::Native
-                    && !matches!(target, MuxPaneTarget::Pane { .. })
+                if backend == MultiplexerBackendConfig::Native
+                    && !matches!(&target.target, MuxPaneTarget::Pane { .. })
                 {
-                    return Ok(ActiveTerminalRuntime::idle());
+                    return Ok(idle_terminal());
                 }
                 if let Some(terminal) = self.native_terminals.remove(target) {
                     return Ok(terminal);
                 }
-                if backend == MuxBackendKind::Native {
+                if backend == MultiplexerBackendConfig::Native {
                     return self.spawn_native_runtime(target);
                 }
                 let mut config = self.terminal_config.clone();
-                config.side_effect_pane_id = target.pane_id().map(str::to_owned);
-                Ok(ActiveTerminalRuntime(Box::new(RmuxNativeTerminal::new(
-                    target.clone(),
+                config.side_effect_pane_id = target.side_effect_pane_id();
+                Ok(Box::new(RmuxNativeTerminal::new(
+                    target.target.clone(),
                     self.native_window_spawn_geometry.unwrap_or(self.geometry),
                     config,
                     Arc::clone(&self.repaint_wakeup),
-                )?)))
+                )?))
             }
-            MuxBackendKind::Tmux | MuxBackendKind::Zellij => {
-                if backend == MuxBackendKind::Tmux
+            MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => {
+                if backend == MultiplexerBackendConfig::Tmux
                     && let Some(terminal) = self.native_terminals.remove(target)
                 {
                     return Ok(terminal);
                 }
                 let mut terminal_config = self.terminal_config.clone();
-                terminal_config.side_effect_pane_id = target.pane_id().map(str::to_owned);
+                terminal_config.side_effect_pane_id = target.side_effect_pane_id();
                 let config = backend_attach_session_config(
                     terminal_config,
                     backend,
                     target.session_id(),
                     bootty_runtime::terminfo::vendored_terminfo_dir().is_some(),
                 )?;
-                Ok(ActiveTerminalRuntime(Box::new(
-                    TerminalSession::new_with_config(
-                        self.geometry,
-                        config,
-                        Arc::clone(&self.repaint_wakeup),
-                    )?,
-                )))
+                Ok(Box::new(TerminalSession::new_with_config(
+                    self.geometry,
+                    config,
+                    Arc::clone(&self.repaint_wakeup),
+                )?))
             }
         }
     }
 
-    fn spawn_native_runtime(&self, target: &MuxPaneTarget) -> Result<ActiveTerminalRuntime> {
+    fn spawn_native_runtime(
+        &self,
+        target: &ScopedMuxPaneTarget,
+    ) -> Result<Box<dyn TerminalRuntime>> {
         let mut config = self.terminal_config.clone();
         config.launch.working_directory = target.cwd().map(Path::new).map(Path::to_path_buf);
-        config.side_effect_pane_id = target.pane_id().map(str::to_owned);
-        Ok(ActiveTerminalRuntime(Box::new(
-            StartingNativeTerminal::spawn(
-                self.native_window_spawn_geometry.unwrap_or(self.geometry),
-                config,
-                Arc::clone(&self.repaint_wakeup),
-            ),
+        config.side_effect_pane_id = target.side_effect_pane_id();
+        Ok(Box::new(StartingNativeTerminal::spawn(
+            self.native_window_spawn_geometry.unwrap_or(self.geometry),
+            config,
+            Arc::clone(&self.repaint_wakeup),
         )))
     }
 
@@ -535,24 +495,62 @@ impl BackendPaneTerminal {
         window_panes: &[MuxPaneAnchor],
         focused: Option<&MuxPaneAnchor>,
         window_id: Option<&str>,
-        layout_backend: MuxBackendKind,
+        layout_backend: MultiplexerBackendConfig,
+        hide_tmux_status: bool,
+    ) -> Result<()> {
+        self.sync_native_window_in_scope(
+            None,
+            window_panes,
+            focused,
+            window_id,
+            layout_backend,
+            hide_tmux_status,
+        )
+    }
+
+    pub fn sync_scoped_native_window(
+        &mut self,
+        scope: MuxScope,
+        window_panes: &[MuxPaneAnchor],
+        focused: Option<&MuxPaneAnchor>,
+        window_id: Option<&str>,
+        layout_backend: MultiplexerBackendConfig,
+        hide_tmux_status: bool,
+    ) -> Result<()> {
+        self.sync_native_window_in_scope(
+            Some(scope),
+            window_panes,
+            focused,
+            window_id,
+            layout_backend,
+            hide_tmux_status,
+        )
+    }
+
+    fn sync_native_window_in_scope(
+        &mut self,
+        scope: Option<MuxScope>,
+        window_panes: &[MuxPaneAnchor],
+        focused: Option<&MuxPaneAnchor>,
+        window_id: Option<&str>,
+        layout_backend: MultiplexerBackendConfig,
         hide_tmux_status: bool,
     ) -> Result<()> {
         debug_assert!(matches!(
             layout_backend,
-            MuxBackendKind::Native | MuxBackendKind::Rmux
+            MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux
         ));
         self.backend = layout_backend;
-        let targets: Vec<MuxPaneTarget> = window_panes
+        let targets: Vec<ScopedMuxPaneTarget> = window_panes
             .iter()
             .cloned()
-            .map(MuxPaneTarget::from)
-            .filter(|target| matches!(target, MuxPaneTarget::Pane { .. }))
+            .map(|anchor| ScopedMuxPaneTarget::from_anchor(scope, anchor))
+            .filter(|target| matches!(&target.target, MuxPaneTarget::Pane { .. }))
             .collect();
         let focused_target = focused
             .cloned()
-            .map(MuxPaneTarget::from)
-            .filter(|target| matches!(target, MuxPaneTarget::Pane { .. }))
+            .map(|anchor| ScopedMuxPaneTarget::from_anchor(scope, anchor))
+            .filter(|target| matches!(&target.target, MuxPaneTarget::Pane { .. }))
             .or_else(|| targets.first().cloned());
 
         if self.active_target.as_ref() != focused_target.as_ref() {
@@ -577,7 +575,8 @@ impl BackendPaneTerminal {
             }
         }
         let window_id = window_id.map(str::to_owned);
-        if self.native_window_id != window_id {
+        if self.native_window_scope != scope || self.native_window_id != window_id {
+            self.native_window_scope = scope;
             self.native_window_id = window_id;
             self.last_rmux_window_size = None;
         }
@@ -594,7 +593,7 @@ impl BackendPaneTerminal {
             cell_height: self.geometry.cell_height,
         });
         self.drain_rmux_window_resize_results()?;
-        if self.backend != MuxBackendKind::Rmux {
+        if self.backend != MultiplexerBackendConfig::Rmux {
             return Ok(());
         }
         let Some(window_id) = self.native_window_id.clone() else {
@@ -682,11 +681,14 @@ impl BackendPaneTerminal {
 
     /// A non-focused window pane's render source, for painting it into its own sub-rect. The focused
     /// pane is rendered through `BackendPaneTerminal` itself (which keeps `geometry` in sync).
-    pub fn render_source_for_pane(&mut self, pane_id: &str) -> Option<&mut ActiveTerminalRuntime> {
+    pub fn render_source_for_pane(
+        &mut self,
+        pane_id: &str,
+    ) -> Option<&mut (dyn TerminalRuntime + '_)> {
         if self
             .active_target
             .as_ref()
-            .map(MuxPaneTarget::input_selector)
+            .map(ScopedMuxPaneTarget::input_selector)
             == Some(pane_id)
         {
             return None;
@@ -696,14 +698,19 @@ impl BackendPaneTerminal {
             .iter()
             .find(|target| target.input_selector() == pane_id)?
             .clone();
-        self.native_terminals.get_mut(&target)
+        let terminal = self.native_terminals.get_mut(&target)?;
+        Some(&mut **terminal)
     }
 
     /// The focused pane's id (the deref/input runtime), if any.
     pub fn focused_pane_id(&self) -> Option<&str> {
         self.active_target
             .as_ref()
-            .map(MuxPaneTarget::input_selector)
+            .map(ScopedMuxPaneTarget::input_selector)
+    }
+
+    pub fn active_mux_scope(&self) -> Option<MuxScope> {
+        self.active_target.as_ref().and_then(|target| target.scope)
     }
 
     /// Pane ids in the active window whose shell has exited (focused or background), so the layout
@@ -745,8 +752,8 @@ impl BackendPaneTerminal {
         }
     }
 
-    /// Drain the focused terminal and every parked runtime so inactive tmux sessions and native
-    /// panes keep processing output. Returns the focused terminal's drain stats.
+    /// Drain the focused terminal and every cached runtime, including inactive scoped workspaces,
+    /// so background PTYs cannot stall while another Space is selected.
     pub fn drain_native_window(&mut self) -> DrainStats {
         let stats = self.terminal.drain_pty();
         for runtime in self.native_terminals.values_mut() {
@@ -774,16 +781,20 @@ impl BackendPaneTerminal {
         self.terminal.handle_copy_mode_action(action)
     }
 
-    pub fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
-        self.terminal.format_selection(format)
-    }
-
     pub fn set_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
-        self.terminal.set_cursor_config(cursor)
+        self.terminal.set_cursor_config(cursor)?;
+        for terminal in self.native_terminals.values_mut() {
+            terminal.set_cursor_config(cursor)?;
+        }
+        Ok(())
     }
 
     pub fn set_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
-        self.terminal.set_feature_config(features)
+        self.terminal.set_feature_config(features)?;
+        for terminal in self.native_terminals.values_mut() {
+            terminal.set_feature_config(features)?;
+        }
+        Ok(())
     }
 
     pub fn grid_size(&self) -> (u16, u16) {
@@ -797,33 +808,35 @@ impl BackendPaneTerminal {
     // Drop the active pane's terminal (its PTY is killed on drop) and forget its target, so the next
     // sync_mux_anchor attaches the surviving pane instead of parking the closed one.
     pub fn discard_active_pane(&mut self) {
-        self.terminal = ActiveTerminalRuntime::idle();
+        self.terminal = idle_terminal();
         self.active_target = None;
     }
 
     fn clear_terminal(&mut self) {
-        self.terminal = ActiveTerminalRuntime::idle();
+        self.terminal = idle_terminal();
     }
 
     fn park_native_layout_terminal(&mut self) {
         if !matches!(
             self.backend,
-            MuxBackendKind::Native | MuxBackendKind::Rmux | MuxBackendKind::Tmux
+            MultiplexerBackendConfig::Native
+                | MultiplexerBackendConfig::Rmux
+                | MultiplexerBackendConfig::Tmux
         ) {
             return;
         }
         let Some(target) = self.active_target.clone() else {
             return;
         };
-        let terminal = std::mem::replace(&mut self.terminal, ActiveTerminalRuntime::idle());
+        let terminal = std::mem::replace(&mut self.terminal, idle_terminal());
         self.native_terminals.insert(target, terminal);
     }
 }
 
 impl Drop for BackendPaneTerminal {
     fn drop(&mut self) {
-        self.restore_tmux_passthrough_overrides();
-        self.restore_tmux_status_bars();
+        // Best-effort cleanup: a hard kill skips this, and a later attach reapplies overrides.
+        self.deactivate_backend_side_effects();
     }
 }
 
@@ -958,8 +971,93 @@ impl From<MuxPaneAnchor> for MuxPaneTarget {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct ScopedMuxPaneTarget {
+    scope: Option<MuxScope>,
+    target: MuxPaneTarget,
+}
+
+impl ScopedMuxPaneTarget {
+    fn from_anchor(scope: Option<MuxScope>, anchor: MuxPaneAnchor) -> Self {
+        Self {
+            scope,
+            target: MuxPaneTarget::from(anchor),
+        }
+    }
+
+    fn session_id(&self) -> &str {
+        self.target.session_id()
+    }
+
+    fn input_selector(&self) -> &str {
+        self.target.input_selector()
+    }
+
+    fn pane_id(&self) -> Option<&str> {
+        self.target.pane_id()
+    }
+
+    fn cwd(&self) -> Option<&str> {
+        self.target.cwd()
+    }
+
+    fn side_effect_pane_id(&self) -> Option<String> {
+        let pane_id = self.pane_id()?;
+        Some(match self.scope {
+            Some(scope) => encode_scoped_pane_id(scope, pane_id),
+            None => pane_id.to_owned(),
+        })
+    }
+}
+
+impl From<MuxPaneTarget> for ScopedMuxPaneTarget {
+    fn from(target: MuxPaneTarget) -> Self {
+        Self {
+            scope: None,
+            target,
+        }
+    }
+}
+
+const SCOPED_PANE_PREFIX: &str = "bootty-scope:";
+
+pub fn encode_scoped_pane_id(scope: MuxScope, pane_id: &str) -> String {
+    format!(
+        "{SCOPED_PANE_PREFIX}{}:{}:{pane_id}",
+        scope.space_id().persistence_value(),
+        scope.binding_id().persistence_value()
+    )
+}
+
+pub fn decode_scoped_pane_id(value: &str) -> Option<(MuxScope, String)> {
+    let mut parts = value.strip_prefix(SCOPED_PANE_PREFIX)?.splitn(3, ':');
+    let space_id = parts.next()?.parse().ok()?;
+    let binding_id = parts.next()?.parse().ok()?;
+    let pane_id = parts.next()?.to_owned();
+    Some((
+        MuxScope::new(
+            crate::controller::SpaceId::from_persistence(space_id),
+            crate::controller::BindingId::from_persistence(binding_id),
+        ),
+        pane_id,
+    ))
+}
+
+fn scoped_target_matches_anchor(
+    backend: MultiplexerBackendConfig,
+    scope: Option<MuxScope>,
+    target: Option<&ScopedMuxPaneTarget>,
+    anchor: Option<&MuxPaneAnchor>,
+) -> bool {
+    match target {
+        Some(target) if target.scope != scope => false,
+        Some(target) => target_matches_anchor(backend, Some(&target.target), anchor),
+        None => target_matches_anchor(backend, None, anchor),
+    }
+}
+
 fn target_matches_anchor(
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     target: Option<&MuxPaneTarget>,
     anchor: Option<&MuxPaneAnchor>,
 ) -> bool {
@@ -972,7 +1070,10 @@ fn target_matches_anchor(
             // Attached clients (tmux/zellij attach PTYs) follow pane and
             // window changes server-side; restarting them on an active-pane
             // change blanks the whole surface for nothing.
-            if matches!(backend, MuxBackendKind::Tmux | MuxBackendKind::Zellij) {
+            if matches!(
+                backend,
+                MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij
+            ) {
                 return true;
             }
             let anchor_selector = anchor.pane_id.as_deref().unwrap_or(&anchor.session_id);
@@ -983,7 +1084,7 @@ fn target_matches_anchor(
 }
 
 pub(super) fn backend_attach_launch(
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     session: &str,
 ) -> (String, Vec<String>) {
     let session = session.to_owned();
@@ -991,7 +1092,7 @@ pub(super) fn backend_attach_launch(
         // -T declares outer-terminal features tmux cannot learn from the
         // forced xterm-256color terminfo; "clipboard" enables OSC 52 and
         // "sync" wraps redraws in DEC 2026 to avoid blank layout flashes.
-        MuxBackendKind::Tmux => (
+        MultiplexerBackendConfig::Tmux => (
             "tmux".to_owned(),
             vec![
                 "-T".to_owned(),
@@ -1001,27 +1102,31 @@ pub(super) fn backend_attach_launch(
                 session,
             ],
         ),
-        MuxBackendKind::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
-        MuxBackendKind::Native => unreachable!("native panes are rendered directly by Bootty"),
-        MuxBackendKind::Zellij => (
+        MultiplexerBackendConfig::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
+        MultiplexerBackendConfig::Native => {
+            unreachable!("native panes are rendered directly by Bootty")
+        }
+        MultiplexerBackendConfig::Zellij => (
             "zellij".to_owned(),
             vec!["attach".to_owned(), "--create".to_owned(), session],
         ),
     }
 }
 
-fn backend_attach_env_remove(backend: MuxBackendKind) -> Vec<String> {
+fn backend_attach_env_remove(backend: MultiplexerBackendConfig) -> Vec<String> {
     match backend {
-        MuxBackendKind::Tmux => vec!["TMUX".to_owned()],
-        MuxBackendKind::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
-        MuxBackendKind::Native => unreachable!("native panes are rendered directly by Bootty"),
-        MuxBackendKind::Zellij => vec!["ZELLIJ".to_owned()],
+        MultiplexerBackendConfig::Tmux => vec!["TMUX".to_owned()],
+        MultiplexerBackendConfig::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
+        MultiplexerBackendConfig::Native => {
+            unreachable!("native panes are rendered directly by Bootty")
+        }
+        MultiplexerBackendConfig::Zellij => vec!["ZELLIJ".to_owned()],
     }
 }
 
 fn backend_attach_session_config(
     config: TerminalSessionConfig,
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     attach_session: &str,
     bootty_terminfo_available: bool,
 ) -> Result<TerminalSessionConfig> {
@@ -1036,7 +1141,7 @@ fn backend_attach_session_config(
 
 fn backend_attach_session_config_with_path(
     mut config: TerminalSessionConfig,
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     attach_session: &str,
     bootty_terminfo_available: bool,
     path: Option<&OsStr>,
@@ -1075,10 +1180,10 @@ fn resolve_launch_program_with_path(program: &str, path: Option<&OsStr>) -> Resu
 }
 
 fn passthrough_override_target(
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     target: Option<&MuxPaneTarget>,
 ) -> Option<&str> {
-    if backend != MuxBackendKind::Tmux {
+    if backend != MultiplexerBackendConfig::Tmux {
         return None;
     }
     target.map(|target| match target {
@@ -1173,10 +1278,10 @@ fn unset_pane_allow_passthrough(pane_id: &str) -> Result<()> {
 /// touched, so this can only ever issue a `set-option` against a tmux server.
 fn status_bar_hidden_target(
     hide_enabled: bool,
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     session_id: Option<&str>,
 ) -> Option<&str> {
-    if hide_enabled && backend == MuxBackendKind::Tmux {
+    if hide_enabled && backend == MultiplexerBackendConfig::Tmux {
         session_id
     } else {
         None
@@ -1220,25 +1325,47 @@ mod tests {
     fn status_bar_hidden_only_targets_tmux_when_enabled() {
         // Enabled, tmux backend, attached session: that session is the target.
         assert_eq!(
-            status_bar_hidden_target(true, MuxBackendKind::Tmux, Some("$1")),
+            status_bar_hidden_target(true, MultiplexerBackendConfig::Tmux, Some("$1")),
             Some("$1")
         );
         // Disabled: never hide, even on tmux.
         assert_eq!(
-            status_bar_hidden_target(false, MuxBackendKind::Tmux, Some("$1")),
+            status_bar_hidden_target(false, MultiplexerBackendConfig::Tmux, Some("$1")),
             None
         );
         // Safety contract: a non-tmux backend is never touched, so bootty can
         // never run `set-option` against native/rmux/zellij sessions.
         assert_eq!(
-            status_bar_hidden_target(true, MuxBackendKind::Native, Some("$1")),
+            status_bar_hidden_target(true, MultiplexerBackendConfig::Native, Some("$1")),
             None
         );
         // No attached session means nothing to toggle.
         assert_eq!(
-            status_bar_hidden_target(true, MuxBackendKind::Tmux, None),
+            status_bar_hidden_target(true, MultiplexerBackendConfig::Tmux, None),
             None
         );
+    }
+
+    #[test]
+    fn deactivating_terminal_clears_tmux_status_override() {
+        let mut terminal = BackendPaneTerminal::new_with_backend(
+            TerminalGeometry {
+                cols: 80,
+                rows: 24,
+                cell_width: 10,
+                cell_height: 20,
+            },
+            MultiplexerBackendConfig::Tmux,
+            terminal_config(),
+            Arc::new(|| {}),
+        );
+        terminal
+            .status_hidden_sessions
+            .push("missing-test-session".to_owned());
+
+        terminal.deactivate_backend_side_effects();
+
+        assert!(terminal.status_hidden_sessions.is_empty());
     }
 
     #[test]
@@ -1251,16 +1378,90 @@ mod tests {
         };
         let mut terminal = BackendPaneTerminal::new_with_backend(
             geometry,
-            MuxBackendKind::Native,
+            MultiplexerBackendConfig::Native,
             terminal_config(),
             Arc::new(|| {}),
         );
 
         terminal
-            .sync_native_window(&[], None, Some("@1"), MuxBackendKind::Rmux, false)
+            .sync_native_window(&[], None, Some("@1"), MultiplexerBackendConfig::Rmux, false)
             .unwrap();
 
-        assert_eq!(terminal.backend, MuxBackendKind::Rmux);
+        assert_eq!(terminal.backend, MultiplexerBackendConfig::Rmux);
+    }
+
+    #[test]
+    fn scoped_native_cache_distinguishes_colliding_session_and_pane_ids() {
+        let geometry = TerminalGeometry {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let anchor = MuxPaneAnchor {
+            session_id: "$1".to_owned(),
+            pane_id: Some("%1".to_owned()),
+            cwd: None,
+            process: None,
+        };
+        let first_scope = MuxScope::new(
+            crate::controller::SpaceId::from_persistence(1),
+            crate::controller::BindingId::from_persistence(1),
+        );
+        let second_scope = MuxScope::new(
+            crate::controller::SpaceId::from_persistence(2),
+            crate::controller::BindingId::from_persistence(1),
+        );
+        let first_calls = Arc::new(Mutex::new(Vec::new()));
+        let second_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = BackendPaneTerminal::new_with_backend(
+            geometry,
+            MultiplexerBackendConfig::Rmux,
+            terminal_config(),
+            Arc::new(|| {}),
+        );
+        terminal.native_terminals.insert(
+            ScopedMuxPaneTarget::from_anchor(Some(first_scope), anchor.clone()),
+            Box::new(ResizeRecordingRuntime {
+                resize_calls: Arc::clone(&first_calls),
+            }),
+        );
+        terminal.native_terminals.insert(
+            ScopedMuxPaneTarget::from_anchor(Some(second_scope), anchor.clone()),
+            Box::new(ResizeRecordingRuntime {
+                resize_calls: Arc::clone(&second_calls),
+            }),
+        );
+
+        terminal
+            .sync_scoped_native_window(
+                first_scope,
+                std::slice::from_ref(&anchor),
+                Some(&anchor),
+                Some("@1"),
+                MultiplexerBackendConfig::Rmux,
+                false,
+            )
+            .unwrap();
+        terminal.terminal.force_resize().unwrap();
+        assert_eq!(terminal.active_mux_scope(), Some(first_scope));
+        assert_eq!(first_calls.lock().unwrap().len(), 1);
+        assert!(second_calls.lock().unwrap().is_empty());
+
+        terminal
+            .sync_scoped_native_window(
+                second_scope,
+                std::slice::from_ref(&anchor),
+                Some(&anchor),
+                Some("@1"),
+                MultiplexerBackendConfig::Rmux,
+                false,
+            )
+            .unwrap();
+        terminal.terminal.force_resize().unwrap();
+        assert_eq!(terminal.active_mux_scope(), Some(second_scope));
+        assert_eq!(first_calls.lock().unwrap().len(), 1);
+        assert_eq!(second_calls.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1322,7 +1523,7 @@ mod tests {
                 cell_width: 10,
                 cell_height: 20,
             },
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             terminal_config(),
             Arc::new(|| {}),
         );
@@ -1402,7 +1603,7 @@ mod tests {
                 cell_width: 10,
                 cell_height: 20,
             },
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             terminal_config(),
             Arc::new(|| {}),
         );
@@ -1412,7 +1613,7 @@ mod tests {
             &first_window.panes,
             Some(&first_focused),
             Some(&first_window.id),
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             false,
         )?;
         let attach_elapsed = attach_start.elapsed();
@@ -1422,7 +1623,7 @@ mod tests {
             &second_window.panes,
             Some(&second_focused),
             Some(&second_window.id),
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             false,
         )?;
         let switch_elapsed = switch_start.elapsed();
@@ -1454,20 +1655,20 @@ mod tests {
         };
 
         assert_eq!(
-            passthrough_override_target(MuxBackendKind::Tmux, Some(&target)),
+            passthrough_override_target(MultiplexerBackendConfig::Tmux, Some(&target)),
             Some("%3")
         );
         assert_eq!(
-            passthrough_override_target(MuxBackendKind::Native, Some(&target)),
+            passthrough_override_target(MultiplexerBackendConfig::Native, Some(&target)),
             None
         );
         assert_eq!(
-            passthrough_override_target(MuxBackendKind::Tmux, None),
+            passthrough_override_target(MultiplexerBackendConfig::Tmux, None),
             None
         );
         assert_eq!(
             passthrough_override_target(
-                MuxBackendKind::Tmux,
+                MultiplexerBackendConfig::Tmux,
                 Some(&MuxPaneTarget::Session {
                     session_id: "$1".to_owned(),
                     cwd: None,
@@ -1641,21 +1842,22 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
         };
-        let target = MuxPaneTarget::Pane {
+        let target: ScopedMuxPaneTarget = MuxPaneTarget::Pane {
             session_id: "agents".to_owned(),
             pane_id: "%4".to_owned(),
             cwd: None,
-        };
+        }
+        .into();
         let mut terminal = BackendPaneTerminal::new_with_backend(
             geometry,
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             terminal_config(),
             Arc::new(|| {}),
         );
         terminal.active_target = Some(target.clone());
-        terminal.terminal = ActiveTerminalRuntime(Box::new(ColorRecordingRuntime {
+        terminal.terminal = Box::new(ColorRecordingRuntime {
             colors: Arc::new(Mutex::new(Vec::new())),
-        }));
+        });
 
         terminal.park_native_layout_terminal();
 
@@ -1670,25 +1872,26 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
         };
-        let target = MuxPaneTarget::Session {
+        let target: ScopedMuxPaneTarget = MuxPaneTarget::Session {
             session_id: "$4".to_owned(),
             cwd: None,
-        };
+        }
+        .into();
         let resize_calls = Arc::new(Mutex::new(Vec::new()));
         let mut terminal = BackendPaneTerminal::new_with_backend(
             geometry,
-            MuxBackendKind::Tmux,
+            MultiplexerBackendConfig::Tmux,
             terminal_config(),
             Arc::new(|| {}),
         );
         terminal.active_target = Some(target.clone());
-        terminal.terminal = ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+        terminal.terminal = Box::new(ResizeRecordingRuntime {
             resize_calls: Arc::clone(&resize_calls),
-        }));
+        });
 
         terminal.park_native_layout_terminal();
         let mut restored = terminal
-            .start_terminal(MuxBackendKind::Tmux, Some(&target))
+            .start_terminal(MultiplexerBackendConfig::Tmux, Some(&target))
             .unwrap();
         let resized = TerminalGeometry {
             cols: 121,
@@ -1708,27 +1911,28 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
         };
-        let target = MuxPaneTarget::Pane {
+        let target: ScopedMuxPaneTarget = MuxPaneTarget::Pane {
             session_id: "agents".to_owned(),
             pane_id: "%7".to_owned(),
             cwd: None,
-        };
+        }
+        .into();
         let resize_calls = Arc::new(Mutex::new(Vec::new()));
         let mut terminal = BackendPaneTerminal::new_with_backend(
             previous_focused_geometry,
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             terminal_config(),
             Arc::new(|| {}),
         );
         terminal.native_terminals.insert(
             target.clone(),
-            ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+            Box::new(ResizeRecordingRuntime {
                 resize_calls: Arc::clone(&resize_calls),
-            })),
+            }),
         );
 
         let _restored = terminal
-            .start_terminal(MuxBackendKind::Rmux, Some(&target))
+            .start_terminal(MultiplexerBackendConfig::Rmux, Some(&target))
             .unwrap();
 
         assert!(resize_calls.lock().unwrap().is_empty());
@@ -1745,13 +1949,13 @@ mod tests {
         let resize_calls = Arc::new(Mutex::new(Vec::new()));
         let mut terminal = BackendPaneTerminal::new_with_backend(
             geometry,
-            MuxBackendKind::Tmux,
+            MultiplexerBackendConfig::Tmux,
             terminal_config(),
             Arc::new(|| {}),
         );
-        terminal.terminal = ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+        terminal.terminal = Box::new(ResizeRecordingRuntime {
             resize_calls: Arc::clone(&resize_calls),
-        }));
+        });
 
         TerminalRenderSource::resize(&mut terminal, geometry).unwrap();
 
@@ -1766,16 +1970,18 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
         };
-        let active_target = MuxPaneTarget::Pane {
+        let active_target: ScopedMuxPaneTarget = MuxPaneTarget::Pane {
             session_id: "agents".to_owned(),
             pane_id: "%7".to_owned(),
             cwd: None,
-        };
-        let parked_target = MuxPaneTarget::Pane {
+        }
+        .into();
+        let parked_target: ScopedMuxPaneTarget = MuxPaneTarget::Pane {
             session_id: "agents".to_owned(),
             pane_id: "%8".to_owned(),
             cwd: None,
-        };
+        }
+        .into();
         let active_calls = Arc::new(Mutex::new(Vec::new()));
         let parked_calls = Arc::new(Mutex::new(Vec::new()));
         let (tx, _rx) = mpsc::channel::<RmuxWindowResizeRequest>();
@@ -1783,7 +1989,7 @@ mod tests {
         result_tx.send(Ok(())).unwrap();
         let mut terminal = BackendPaneTerminal::new_with_backend(
             geometry,
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             terminal_config(),
             Arc::new(|| {}),
         );
@@ -1792,14 +1998,14 @@ mod tests {
         terminal.rmux_window_resize_worker = Some(RmuxWindowResizeWorker { tx, result_rx });
         terminal.active_target = Some(active_target.clone());
         terminal.native_window_targets = vec![active_target, parked_target.clone()];
-        terminal.terminal = ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+        terminal.terminal = Box::new(ResizeRecordingRuntime {
             resize_calls: Arc::clone(&active_calls),
-        }));
+        });
         terminal.native_terminals.insert(
             parked_target,
-            ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+            Box::new(ResizeRecordingRuntime {
                 resize_calls: Arc::clone(&parked_calls),
-            })),
+            }),
         );
 
         terminal.resize_native_layout_window(117, 40).unwrap();
@@ -1818,24 +2024,25 @@ mod tests {
         };
         let mut terminal = BackendPaneTerminal::new_with_backend(
             geometry,
-            MuxBackendKind::Native,
+            MultiplexerBackendConfig::Native,
             terminal_config(),
             Arc::new(|| {}),
         );
         let active_colors = Arc::new(Mutex::new(Vec::new()));
-        terminal.terminal = ActiveTerminalRuntime(Box::new(ColorRecordingRuntime {
+        terminal.terminal = Box::new(ColorRecordingRuntime {
             colors: Arc::clone(&active_colors),
-        }));
+        });
         let parked_colors = Arc::new(Mutex::new(Vec::new()));
         terminal.native_terminals.insert(
             MuxPaneTarget::Pane {
                 session_id: "agents".to_owned(),
                 pane_id: "%4".to_owned(),
                 cwd: None,
-            },
-            ActiveTerminalRuntime(Box::new(ColorRecordingRuntime {
+            }
+            .into(),
+            Box::new(ColorRecordingRuntime {
                 colors: Arc::clone(&parked_colors),
-            })),
+            }),
         );
 
         terminal.set_colors(color_config((1, 2, 3))).unwrap();
@@ -1879,7 +2086,7 @@ mod tests {
         };
 
         assert!(target_matches_anchor(
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             Some(&target),
             Some(&anchor)
         ));
@@ -1903,7 +2110,10 @@ mod tests {
             ..session_anchor.clone()
         };
 
-        for backend in [MuxBackendKind::Rmux, MuxBackendKind::Native] {
+        for backend in [
+            MultiplexerBackendConfig::Rmux,
+            MultiplexerBackendConfig::Native,
+        ] {
             assert!(!target_matches_anchor(
                 backend,
                 Some(&target),
@@ -1936,7 +2146,10 @@ mod tests {
             ..split_changed_active_pane.clone()
         };
 
-        for backend in [MuxBackendKind::Tmux, MuxBackendKind::Zellij] {
+        for backend in [
+            MultiplexerBackendConfig::Tmux,
+            MultiplexerBackendConfig::Zellij,
+        ] {
             assert!(target_matches_anchor(
                 backend,
                 Some(&target),
@@ -1954,7 +2167,7 @@ mod tests {
     #[test]
     fn backend_owned_ui_launches_normal_backend_attach() {
         assert_eq!(
-            backend_attach_launch(MuxBackendKind::Tmux, "agents"),
+            backend_attach_launch(MultiplexerBackendConfig::Tmux, "agents"),
             (
                 "tmux".to_owned(),
                 vec![
@@ -1968,7 +2181,7 @@ mod tests {
             )
         );
         assert_eq!(
-            backend_attach_launch(MuxBackendKind::Zellij, "agents"),
+            backend_attach_launch(MultiplexerBackendConfig::Zellij, "agents"),
             (
                 "zellij".to_owned(),
                 vec![
@@ -1983,11 +2196,11 @@ mod tests {
     #[test]
     fn backend_owned_ui_removes_nested_backend_environment() {
         assert_eq!(
-            backend_attach_env_remove(MuxBackendKind::Tmux),
+            backend_attach_env_remove(MultiplexerBackendConfig::Tmux),
             vec!["TMUX".to_owned()]
         );
         assert_eq!(
-            backend_attach_env_remove(MuxBackendKind::Zellij),
+            backend_attach_env_remove(MultiplexerBackendConfig::Zellij),
             vec!["ZELLIJ".to_owned()]
         );
     }
@@ -2012,7 +2225,7 @@ mod tests {
         let path = fake_backend_path("tmux");
         let with_terminfo = backend_attach_session_config_with_path(
             config.clone(),
-            MuxBackendKind::Tmux,
+            MultiplexerBackendConfig::Tmux,
             "agents",
             true,
             Some(path.path().as_os_str()),
@@ -2022,7 +2235,7 @@ mod tests {
 
         let without_terminfo = backend_attach_session_config_with_path(
             config,
-            MuxBackendKind::Tmux,
+            MultiplexerBackendConfig::Tmux,
             "agents",
             false,
             Some(path.path().as_os_str()),
@@ -2051,7 +2264,7 @@ mod tests {
         let path = fake_backend_path("tmux");
         let attach = backend_attach_session_config_with_path(
             config,
-            MuxBackendKind::Tmux,
+            MultiplexerBackendConfig::Tmux,
             "agents",
             true,
             Some(path.path().as_os_str()),
@@ -2076,10 +2289,10 @@ mod tests {
             side_effect_pane_id: None,
             benchmark_trace: None,
         };
-        let (program, args) = backend_attach_launch(MuxBackendKind::Tmux, "agents");
+        let (program, args) = backend_attach_launch(MultiplexerBackendConfig::Tmux, "agents");
         config.launch.shell = Some(program);
         config.launch.args = args;
-        config.launch.env_remove = backend_attach_env_remove(MuxBackendKind::Tmux);
+        config.launch.env_remove = backend_attach_env_remove(MultiplexerBackendConfig::Tmux);
         config.launch.term = "xterm-256color".to_owned();
 
         assert_eq!(config.launch.term, "xterm-256color");

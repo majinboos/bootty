@@ -6,7 +6,6 @@ use crate::rmux_bridge::{resize_rmux_window, rmux_execute, rmux_snapshot};
 use super::{
     backend::MuxBackend,
     command::{MuxCommand, MuxSplitDirection},
-    config::MuxBackendKind,
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxPaneSplitDirection, MuxSession, MuxSnapshot, MuxWindow,
     },
@@ -20,6 +19,9 @@ pub(crate) const RMUX_PANE_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1
 pub trait RmuxSessionClient {
     fn snapshot(&self) -> Result<MuxSnapshot>;
     fn ensure_session(&self, session_name: &str, cwd: &str) -> Result<()>;
+    fn rename_session(&self, session_name: &str, name: &str) -> Result<()> {
+        anyhow::bail!("rmux client does not support renaming {session_name} to {name}")
+    }
     fn kill_session(&self, session_name: &str) -> Result<()>;
     fn activate_window(&self, session_name: &str, window_id: &str) -> Result<()>;
     fn rename_window(&self, session_name: &str, window_id: &str, name: &str) -> Result<()>;
@@ -61,10 +63,6 @@ impl<C> RmuxBackend<C> {
 }
 
 impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
-    fn kind(&self) -> MuxBackendKind {
-        MuxBackendKind::Rmux
-    }
-
     fn snapshot(&self) -> Result<MuxSnapshot> {
         self.client.snapshot()
     }
@@ -81,8 +79,8 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
             | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
                 self.client.ensure_session(&session_id, &cwd)?;
             }
-            MuxCommand::RenameSession { .. } => {
-                anyhow::bail!("rmux-sdk does not expose session rename yet");
+            MuxCommand::RenameSession { session_id, name } => {
+                self.client.rename_session(&session_id, &name)?;
             }
             MuxCommand::DitchSession { session_id } => {
                 self.client.kill_session(&session_id)?;
@@ -180,6 +178,13 @@ impl RmuxSessionClient for SdkRmuxClient {
         rmux_execute(MuxCommand::CreateProjectSession {
             session_id: session_name.to_owned(),
             cwd: cwd.to_owned(),
+        })
+    }
+
+    fn rename_session(&self, session_name: &str, name: &str) -> Result<()> {
+        rmux_execute(MuxCommand::RenameSession {
+            session_id: session_name.to_owned(),
+            name: name.to_owned(),
         })
     }
 
@@ -572,6 +577,15 @@ mod tests {
                 "ensure_session".to_owned(),
                 session_name.to_owned(),
                 cwd.to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn rename_session(&self, session_name: &str, name: &str) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "rename_session".to_owned(),
+                session_name.to_owned(),
+                name.to_owned(),
             ]);
             Ok(())
         }

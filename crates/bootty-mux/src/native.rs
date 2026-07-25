@@ -8,7 +8,6 @@ use anyhow::Result;
 use super::{
     backend::MuxBackend,
     command::MuxCommand,
-    config::MuxBackendKind,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
 };
 
@@ -484,10 +483,6 @@ impl Default for NativeBackend {
 }
 
 impl MuxBackend for NativeBackend {
-    fn kind(&self) -> MuxBackendKind {
-        MuxBackendKind::Native
-    }
-
     fn snapshot(&self) -> Result<MuxSnapshot> {
         self.state
             .lock()

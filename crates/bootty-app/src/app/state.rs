@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
+use bootty_config::config::MultiplexerBackendConfig;
 use eframe::egui::{self, Pos2, Rect};
 
 mod copy_mode;
@@ -58,13 +59,13 @@ use crate::{
     mux::{
         RepaintHandle,
         command::{MuxCommand, MuxSplitDirection},
-        config::{MuxBackendKind, selected_backend},
+        config::selected_backend,
         controller::{
             BindingId, BindingMuxController, MUX_SESSION_REFRESH_INTERVAL, MuxController, MuxScope,
             SpaceId,
         },
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow, MuxWindowProgress},
-        terminal::{ActiveTerminal, ActiveTerminalRuntime},
+        terminal::{ActiveTerminal, TerminalRuntime},
     },
     platform::{
         apply_macos_non_native_fullscreen_presentation, macos_handles_non_native_fullscreen_frame,
@@ -103,7 +104,8 @@ use crate::terminal::{KeyInput, TerminalKey};
 use bootty_terminal::terminal_engine::TerminalCopyModeMotion;
 
 fn mux_refresh_repaint_after(config: &crate::config::MultiplexerConfig) -> Option<Duration> {
-    (selected_backend(config) != MuxBackendKind::Native).then_some(MUX_SESSION_REFRESH_INTERVAL)
+    (selected_backend(config) != MultiplexerBackendConfig::Native)
+        .then_some(MUX_SESSION_REFRESH_INTERVAL)
 }
 /// Per-frame snapshot of everything the state machine needs from the host.
 /// Captured once at frame start; `egui::Context` never enters this module.
@@ -269,7 +271,7 @@ impl BindingRuntime {
             ),
             terminal_side_effect_tx,
             terminal_side_effect_rx,
-            mux: BindingMuxController::new(scope),
+            mux: BindingMuxController::default(),
             session_order: SessionOrderStore::for_binding(
                 &config.config_path,
                 &config.multiplexer,
@@ -473,7 +475,7 @@ fn layout_direction(direction: crate::mux::command::MuxDirection) -> Direction {
 
 fn scoped_terminal_transition_key(
     scope: MuxScope,
-    backend: MuxBackendKind,
+    backend: MultiplexerBackendConfig,
     session_id: &str,
     pane_id: Option<&str>,
 ) -> String {
@@ -1172,10 +1174,11 @@ impl AppState {
         self.prune_pane_layouts();
         let config = self.active_multiplexer().clone();
         if !self.uses_native_terminal_layout() {
-            return self
-                .binding
-                .terminal
-                .sync_mux_anchor(&config, self.binding.mux.selected_session_anchor());
+            return self.binding.terminal.sync_scoped_mux_anchor(
+                self.binding.scope,
+                &config,
+                self.binding.mux.selected_session_anchor(),
+            );
         }
         let panes: Vec<MuxPaneAnchor> = self.binding.mux.selected_window_panes().to_vec();
         let pane_ids: Vec<String> = panes
@@ -1184,10 +1187,11 @@ impl AppState {
             .collect();
         if pane_ids.is_empty() {
             // Idle native session (all tabs closed): nothing to render.
-            return self
-                .binding
-                .terminal
-                .sync_mux_anchor(&config, self.binding.mux.selected_session_anchor());
+            return self.binding.terminal.sync_scoped_mux_anchor(
+                self.binding.scope,
+                &config,
+                self.binding.mux.selected_session_anchor(),
+            );
         }
         let key = self.current_window_key();
         let window_id = (!key.window_id.is_empty()).then(|| key.window_id.clone());
@@ -1277,7 +1281,8 @@ impl AppState {
             .iter()
             .find(|pane| pane.pane_id.as_deref() == Some(focused_id.as_str()))
             .cloned();
-        self.binding.terminal.sync_native_window(
+        self.binding.terminal.sync_scoped_native_window(
+            self.binding.scope,
             &panes,
             focused_anchor.as_ref(),
             window_id.as_deref(),
@@ -1418,7 +1423,10 @@ impl AppState {
         }
     }
 
-    pub fn render_source_for_pane(&mut self, pane_id: &str) -> Option<&mut ActiveTerminalRuntime> {
+    pub fn render_source_for_pane(
+        &mut self,
+        pane_id: &str,
+    ) -> Option<&mut (dyn TerminalRuntime + '_)> {
         self.binding.terminal.render_source_for_pane(pane_id)
     }
 
@@ -1494,9 +1502,9 @@ impl AppState {
         key: ScopedWindowId,
         focused: Option<String>,
         direction: SplitDirection,
-        backend: MuxBackendKind,
+        backend: MultiplexerBackendConfig,
     ) {
-        if backend == MuxBackendKind::Rmux {
+        if backend == MultiplexerBackendConfig::Rmux {
             self.binding
                 .pending_pane_split_directions
                 .insert(key, direction);
@@ -1964,7 +1972,8 @@ impl AppState {
             .values()
             .map(|pending| pending.name.clone())
             .collect::<HashSet<_>>();
-        let rename_supported = selected_backend(self.active_multiplexer()) != MuxBackendKind::Rmux;
+        let rename_supported =
+            selected_backend(self.active_multiplexer()) != MultiplexerBackendConfig::Rmux;
 
         for session in &sessions {
             let Some(raw_cwd) = session.anchor.cwd.as_deref() else {
@@ -2574,7 +2583,7 @@ impl AppState {
         // forwards OSC 9;4 only for the pane it currently shows. Recording the forwarded copy
         // would credit it to whichever pane the attach started on, painting a bar on the wrong
         // window and never clearing it.
-        if selected_backend(&self.config().multiplexer) == MuxBackendKind::Tmux {
+        if selected_backend(&self.config().multiplexer) == MultiplexerBackendConfig::Tmux {
             return;
         }
         let progress = TerminalProgress::from_conemu(&state, value);
@@ -5752,9 +5761,9 @@ mod tests {
         let first_pane = first.pane_id(first_window.clone(), "%1");
         let second_pane = second.pane_id(second_window.clone(), "%1");
         let first_transition =
-            scoped_terminal_transition_key(first.scope, MuxBackendKind::Tmux, "$1", Some("%1"));
+            scoped_terminal_transition_key(first.scope, MultiplexerBackendConfig::Tmux, "$1", Some("%1"));
         let second_transition =
-            scoped_terminal_transition_key(second.scope, MuxBackendKind::Tmux, "$1", Some("%1"));
+            scoped_terminal_transition_key(second.scope, MultiplexerBackendConfig::Tmux, "$1", Some("%1"));
 
         first
             .terminal_side_effect_tx
@@ -6440,7 +6449,7 @@ mod tests {
             key.clone(),
             Some("%1".to_owned()),
             SplitDirection::Down,
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
         );
 
         assert_eq!(

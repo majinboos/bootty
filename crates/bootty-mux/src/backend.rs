@@ -1,9 +1,8 @@
 use anyhow::Result;
 
-use super::{command::MuxCommand, config::MuxBackendKind, snapshot::MuxSnapshot};
+use super::{command::MuxCommand, snapshot::MuxSnapshot};
 
 pub trait MuxBackend {
-    fn kind(&self) -> MuxBackendKind;
     fn snapshot(&self) -> Result<MuxSnapshot>;
     fn execute(&mut self, command: MuxCommand) -> Result<()>;
 }
@@ -20,10 +19,6 @@ mod tests {
     }
 
     impl MuxBackend for FakeBackend {
-        fn kind(&self) -> MuxBackendKind {
-            MuxBackendKind::Rmux
-        }
-
         fn snapshot(&self) -> Result<MuxSnapshot> {
             Ok(MuxSnapshot {
                 active_session_id: self

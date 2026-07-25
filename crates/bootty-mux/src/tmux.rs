@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use super::{
     backend::MuxBackend,
     command::{MuxCommand, MuxDirection, MuxSplitDirection},
-    config::MuxBackendKind,
     process::{CommandRunner, SystemCommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
 };
@@ -76,10 +75,6 @@ impl<R: CommandRunner> TmuxBackend<R> {
 }
 
 impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
-    fn kind(&self) -> MuxBackendKind {
-        MuxBackendKind::Tmux
-    }
-
     fn snapshot(&self) -> Result<MuxSnapshot> {
         let Some(sessions) = self.run_snapshot(&[
             "list-sessions",

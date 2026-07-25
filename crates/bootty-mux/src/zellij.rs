@@ -3,7 +3,6 @@ use anyhow::Result;
 use super::{
     backend::MuxBackend,
     command::MuxCommand,
-    config::MuxBackendKind,
     process::{CommandRunner, SystemCommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot},
 };
@@ -45,10 +44,6 @@ impl<R: CommandRunner> ZellijBackend<R> {
 }
 
 impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
-    fn kind(&self) -> MuxBackendKind {
-        MuxBackendKind::Zellij
-    }
-
     fn snapshot(&self) -> Result<MuxSnapshot> {
         let output = self.run(&["list-sessions", "--short", "--no-formatting"])?;
         Ok(parse_zellij_snapshot(&output))

@@ -415,19 +415,15 @@ impl RmuxBridgeState {
     }
 
     async fn snapshot(&mut self) -> Result<MuxSnapshot> {
-        let first = self.snapshot_once().await;
+        let first = self.snapshot_current_sessions().await;
         match first {
             Ok(snapshot) => Ok(snapshot),
             Err(error) if should_retry_rmux_error(&error) => {
                 self.rmux = None;
-                self.snapshot_once().await
+                self.snapshot_current_sessions().await
             }
             Err(error) => Err(error),
         }
-    }
-
-    async fn snapshot_once(&mut self) -> Result<MuxSnapshot> {
-        self.snapshot_current_sessions().await
     }
 
     async fn snapshot_current_sessions(&mut self) -> Result<MuxSnapshot> {
@@ -468,8 +464,8 @@ impl RmuxBridgeState {
             | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
                 self.ensure_session(&session_id, &cwd).await
             }
-            MuxCommand::RenameSession { .. } => {
-                anyhow::bail!("rmux-sdk does not expose session rename yet")
+            MuxCommand::RenameSession { session_id, name } => {
+                self.rename_session(&session_id, &name).await
             }
             MuxCommand::DitchSession { session_id } => self.kill_session(&session_id).await,
             MuxCommand::RenameWindow {
@@ -541,7 +537,7 @@ impl RmuxBridgeState {
         let name = SessionName::new(session_name).context("invalid rmux session name")?;
         rmux.ensure_session(
             EnsureSession::named(name)
-                .policy(EnsureSessionPolicy::CreateOrReuse)
+                .policy(EnsureSessionPolicy::CreateOnly)
                 .detached(true)
                 .working_directory(cwd)
                 .size(TerminalSizeSpec::new(80, 24))
@@ -549,6 +545,20 @@ impl RmuxBridgeState {
         )
         .await?;
         Ok(())
+    }
+
+    async fn rename_session(&mut self, session_name: &str, name: &str) -> Result<()> {
+        let rmux = self.rmux().await?;
+        rmux_cmd_checked(
+            rmux,
+            vec![
+                "rename-session".to_owned(),
+                "-t".to_owned(),
+                session_name.to_owned(),
+                name.to_owned(),
+            ],
+        )
+        .await
     }
 
     async fn kill_session(&mut self, session_name: &str) -> Result<()> {
