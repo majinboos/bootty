@@ -66,6 +66,7 @@ pub enum SessionContextAction {
     Rename,
     MoveUp,
     MoveDown,
+    Detach,
     Ditch,
 }
 
@@ -457,7 +458,7 @@ pub fn show_sidebar(
         painter.text(
             Pos2::new(rect.center().x, list_top + 42.0),
             egui::Align2::CENTER_CENTER,
-            "no mux sessions",
+            "no sessions",
             egui::FontId::monospace(13.0),
             palette.muted,
         );
@@ -665,6 +666,9 @@ fn session_context_action(
             action = Some(SessionContextAction::MoveDown);
         }
         ui.separator();
+        if action.is_none() && ui.button("Detach from Space").clicked() {
+            action = Some(SessionContextAction::Detach);
+        }
         if action.is_none() && ui.button("Ditch Session…").clicked() {
             action = Some(SessionContextAction::Ditch);
         }

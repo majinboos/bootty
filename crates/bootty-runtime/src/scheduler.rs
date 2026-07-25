@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-pub const INPUT_REFRESH_INTERVAL: Duration = Duration::from_millis(8);
-pub const BUSY_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+pub const INPUT_REFRESH_INTERVAL: Duration = Duration::ZERO;
+pub const BUSY_REFRESH_INTERVAL: Duration = Duration::ZERO;
 pub const CURSOR_BLINK_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
 pub const CHROME_REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
@@ -111,7 +111,7 @@ mod tests {
             input_commands: 1,
         });
 
-        assert_eq!(recommendation.after, INPUT_REFRESH_INTERVAL);
+        assert_eq!(recommendation.after, Duration::ZERO);
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_pty_backlog_uses_idle_safety_cadence() {
+    fn pending_pty_backlog_keeps_interactive_cadence() {
         let scheduler = RepaintScheduler::default();
         let recommendation = scheduler.recommend(RepaintSignal {
             drained_bytes: 0,
@@ -194,11 +194,11 @@ mod tests {
             input_commands: 0,
         });
 
-        assert_eq!(recommendation.after, BUSY_REFRESH_INTERVAL);
+        assert_eq!(recommendation.after, Duration::ZERO);
     }
 
     #[test]
-    fn expensive_pty_parse_uses_busy_cadence() {
+    fn expensive_pty_parse_keeps_interactive_cadence() {
         let scheduler = RepaintScheduler::default();
         let recommendation = scheduler.recommend(RepaintSignal {
             drained_bytes: 64,
@@ -209,6 +209,6 @@ mod tests {
             input_commands: 0,
         });
 
-        assert_eq!(recommendation.after, BUSY_REFRESH_INTERVAL);
+        assert_eq!(recommendation.after, Duration::ZERO);
     }
 }

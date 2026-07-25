@@ -1283,7 +1283,7 @@ pub fn load_config_from_path(path: impl AsRef<Path>) -> ConfigResult<BoottyConfi
     let mut stack = Vec::new();
     let mut loaded = HashSet::new();
     let document = load_merged_config_document(path, &mut stack, &mut loaded)?;
-    let raw = parse_raw_config_source(&document.to_string(), path)?;
+    let raw = parse_raw_config_document(document, path)?;
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     ConfigResolver {
         path: path.to_path_buf(),
@@ -1376,11 +1376,11 @@ fn load_merged_config_document(
             path.display()
         ))
     })?;
-    let raw = parse_raw_config_source(&source, path)?;
+    let includes = config_document_includes(&document, path)?;
 
     stack.push(id.clone());
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    for include in raw.include {
+    for include in includes {
         let include = IncludePath::parse(&include);
         let include_path = include.resolve(base_dir);
         if !include_path.exists() && include.optional {
@@ -1408,6 +1408,38 @@ fn merge_toml_table_like(target: &mut dyn TableLike, overlay: &dyn TableLike) {
         }
         target.insert(key, value.clone());
     }
+}
+
+fn parse_raw_config_document(document: DocumentMut, path: &Path) -> ConfigResult<RawConfig> {
+    toml_edit::de::from_document(document).map_err(|error| {
+        ConfigLoadError::new(format!(
+            "failed to parse config file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn config_document_includes(document: &DocumentMut, path: &Path) -> ConfigResult<Vec<String>> {
+    let Some(item) = document.get("include") else {
+        return Ok(Vec::new());
+    };
+    let Some(array) = item.as_array() else {
+        return Err(ConfigLoadError::new(format!(
+            "failed to parse config file {}: include must be an array of strings",
+            path.display()
+        )));
+    };
+    array
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                ConfigLoadError::new(format!(
+                    "failed to parse config file {}: include must contain only strings",
+                    path.display()
+                ))
+            })
+        })
+        .collect()
 }
 
 fn parse_raw_config_source(source: &str, path: &Path) -> ConfigResult<RawConfig> {

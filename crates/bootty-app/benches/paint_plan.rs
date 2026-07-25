@@ -14,6 +14,7 @@ use bootty_app::{
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
     paint_plan::PaintPlanner,
+    renderer_frame::{RendererFrame, RendererLinkHighlight, RendererLinkMods, RendererLinkPattern},
     terminal::{
         KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
         MouseInput, TerminalKey,
@@ -28,6 +29,7 @@ use bootty_app::{
         sidebar::{build_sidebar_items, build_visible_sidebar_items},
     },
 };
+use bootty_terminal::terminal_frame::FrameSelection;
 use bootty_winit::input::{
     InputSnapshot, WheelScrollState, terminal_input_commands_with_wheel_state,
 };
@@ -261,6 +263,86 @@ fn bench_paint_plan(c: &mut Criterion) {
 /// Contrasts planning a fully dirty frame against a frame where only a single
 /// row changed.
 ///
+fn bench_paint_plan_overlay_scaling(c: &mut Criterion) {
+    let scenario = prepared_scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "complex_shell_180x80")
+        .expect("complex shell scenario");
+
+    for matches in [0, 64, 1_024] {
+        let mut frame = scenario.frame.clone();
+        frame.search_matches = (0..matches)
+            .map(|index| FrameSelection {
+                row: (index % usize::from(frame.rows)) as u16,
+                start_col: (index * 7 % usize::from(frame.cols)) as u16,
+                end_col: ((index * 7 % usize::from(frame.cols)) + 4)
+                    .min(usize::from(frame.cols) - 1) as u16,
+            })
+            .collect();
+        let mut planner = PaintPlanner::default();
+        c.bench_function(&format!("paint_plan_overlay_matches_{matches}"), |b| {
+            b.iter(|| {
+                black_box(
+                    planner
+                        .plan(scenario.surface, black_box(&frame), 16.0)
+                        .text_runs
+                        .len(),
+                )
+            })
+        });
+    }
+}
+fn bench_renderer_frame_scaling(c: &mut Criterion) {
+    let scenario = prepared_scenarios()
+        .into_iter()
+        .find(|scenario| scenario.name == "complex_shell_180x80")
+        .expect("complex shell scenario");
+    let text_config = TerminalTextConfig::default();
+
+    for matches in [0, 64, 1_024] {
+        let mut frame = scenario.frame.clone();
+        frame.search_matches = (0..matches)
+            .map(|index| FrameSelection {
+                row: (index % usize::from(frame.rows)) as u16,
+                start_col: (index * 7 % usize::from(frame.cols)) as u16,
+                end_col: ((index * 7 % usize::from(frame.cols)) + 4)
+                    .min(usize::from(frame.cols) - 1) as u16,
+            })
+            .collect();
+        c.bench_function(&format!("renderer_frame_overlay_matches_{matches}"), |b| {
+            b.iter(|| {
+                black_box(RendererFrame::from_terminal(
+                    black_box(&frame),
+                    scenario.surface,
+                    &text_config,
+                ))
+            })
+        });
+    }
+
+    let renderer = RendererFrame::from_terminal(&scenario.frame, scenario.surface, &text_config);
+    for patterns in [1, 32, 256] {
+        let links = (0..patterns)
+            .map(|index| RendererLinkPattern {
+                pattern: format!("missing-link-pattern-{index}"),
+                highlight: RendererLinkHighlight::Always,
+            })
+            .collect::<Vec<_>>();
+        c.bench_function(
+            &format!("renderer_link_cell_map_patterns_{patterns}"),
+            |b| {
+                b.iter(|| {
+                    black_box(renderer.link_cell_map(
+                        black_box(&links),
+                        None,
+                        RendererLinkMods::default(),
+                    ))
+                })
+            },
+        );
+    }
+}
+
 /// NOTE: bootty currently reports `Dirty::Full` with every row dirty for any
 /// edit (see the `dirty_tracking` characterization test in bootty-terminal), so
 /// the `one_row` arm exercises a full-dirty frame and tracks `full` today. It
@@ -739,6 +821,8 @@ name = benches;
 config = Criterion::default().noise_threshold(0.15);
 targets =
     bench_paint_plan,
+    bench_paint_plan_overlay_scaling,
+    bench_renderer_frame_scaling,
     bench_paint_plan_dirty_scope,
     bench_extract_frame,
     bench_extract_frame_one_row_mutate,

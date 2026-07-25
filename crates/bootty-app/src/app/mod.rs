@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{OnceLock, mpsc},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use anyhow::Result;
@@ -179,7 +179,6 @@ fn paint_pane_corner_masks(painter: &egui::Painter, rect: Rect, radius: f32, bg:
 }
 
 const TERMINAL_PROGRESS_HEIGHT: f32 = 2.0;
-const INDETERMINATE_PROGRESS_FRAME_INTERVAL: Duration = Duration::from_millis(8);
 const INDETERMINATE_PROGRESS_WIDTH: f32 = 0.25;
 const INDETERMINATE_PROGRESS_CYCLE: f64 = 1.5;
 
@@ -532,8 +531,8 @@ impl BoottyApp {
         segments: &[crate::config::StatusSegment],
         sidebar_visible: bool,
     ) -> Vec<chrome::ResolvedSegment> {
-        let palette = self.state.ui_theme().palette;
         let mux_view = self.current_extension_mux_view();
+        let palette = self.state.ui_theme().palette;
         let windows_theme = crate::extensions::BuiltinWindowsTheme {
             accent: palette.accent,
             surface: palette.surface,
@@ -1560,6 +1559,9 @@ impl BoottyApp {
                                                 chrome::SessionContextAction::MoveDown => self
                                                     .state
                                                     .move_session_from_ui(&target.session_id, 1),
+                                                chrome::SessionContextAction::Detach => self
+                                                    .state
+                                                    .detach_scoped_session_from_space(&target),
                                                 chrome::SessionContextAction::Ditch => {
                                                     self.state.open_ditch_session_dialog_for(
                                                         &target.session_id,
@@ -1614,8 +1616,7 @@ impl BoottyApp {
                                 alpha,
                             ),
                         );
-                        ui.ctx()
-                            .request_repaint_after(std::time::Duration::from_millis(16));
+                        ui.ctx().request_repaint();
                     }
                     if let Some(event) = chrome::show_space_switcher(
                         ui,
@@ -2109,7 +2110,7 @@ impl eframe::App for BoottyApp {
         let effects = self.state.update_frame(inputs);
         self.apply_effects(ctx, effects);
         if self.state.has_indeterminate_terminal_progress() {
-            ctx.request_repaint_after(INDETERMINATE_PROGRESS_FRAME_INTERVAL);
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
         ctx.set_cursor_icon(self.terminal_cursor_icon);
 
@@ -2223,7 +2224,9 @@ fn add_egui_default_text_font(fonts: &mut FontDefinitions, db: &fontdb::Database
 
 fn add_egui_symbol_fallback_fonts(fonts: &mut FontDefinitions, db: &fontdb::Database) {
     for family in EGUI_SYMBOL_FALLBACK_FAMILIES {
-        add_egui_font_family(fonts, db, family, EguiFontPlacement::Last);
+        if add_egui_font_family(fonts, db, family, EguiFontPlacement::Last) {
+            break;
+        }
     }
     for ch in EGUI_SYMBOL_FALLBACK_CHARS {
         add_egui_font_for_char(fonts, db, *ch);
@@ -2267,7 +2270,11 @@ fn add_egui_font_face(
     name: &str,
     placement: EguiFontPlacement,
 ) -> bool {
-    if fonts.font_data.contains_key(name) {
+    let name = db
+        .face(id)
+        .map(|face| format!("bootty-ui-face-{}", face.post_script_name))
+        .unwrap_or_else(|| name.to_owned());
+    if fonts.font_data.contains_key(&name) {
         return false;
     }
     let Some((bytes, index)) = db.with_face_data(id, |data, index| (data.to_vec(), index)) else {
@@ -2278,12 +2285,12 @@ fn add_egui_font_face(
     font_data.index = index;
     fonts
         .font_data
-        .insert(name.to_owned(), std::sync::Arc::new(font_data));
+        .insert(name.clone(), std::sync::Arc::new(font_data));
     for family in [FontFamily::Monospace, FontFamily::Proportional] {
         let entries = fonts.families.entry(family).or_default();
         match placement {
-            EguiFontPlacement::First => entries.insert(0, name.to_owned()),
-            EguiFontPlacement::Last => entries.push(name.to_owned()),
+            EguiFontPlacement::First => entries.insert(0, name.clone()),
+            EguiFontPlacement::Last => entries.push(name.clone()),
         }
     }
     true
@@ -2335,6 +2342,35 @@ mod tests {
 
         config.chrome.bottom_bar = true;
         assert!(uses_custom_egui_fonts(&config));
+    }
+
+    #[test]
+    fn egui_font_face_data_is_deduplicated_by_resolved_face() {
+        let db = bootty_render::font_database::system_font_database();
+        let id = db
+            .query(&fontdb::Query {
+                families: &[fontdb::Family::Monospace],
+                ..fontdb::Query::default()
+            })
+            .expect("system monospace font");
+        let mut fonts = FontDefinitions::default();
+        let initial_len = fonts.font_data.len();
+
+        assert!(add_egui_font_face(
+            &mut fonts,
+            db,
+            id,
+            "first-alias",
+            EguiFontPlacement::Last,
+        ));
+        assert!(!add_egui_font_face(
+            &mut fonts,
+            db,
+            id,
+            "second-alias",
+            EguiFontPlacement::Last,
+        ));
+        assert_eq!(fonts.font_data.len(), initial_len + 1);
     }
 
     #[test]

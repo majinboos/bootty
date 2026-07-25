@@ -4,6 +4,9 @@ use anyhow::Result;
 use clap::Parser;
 
 fn main() -> Result<()> {
+    if let Some(code) = bootty_mux::run_embedded_rmux_daemon()? {
+        std::process::exit(code);
+    }
     // Correct a stale `$SHELL` to the OS login shell before any child inherits
     // it; tmux otherwise bakes the wrong shell into the server's default-shell.
     bootty_app::shell_env::align_shell_env();

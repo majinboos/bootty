@@ -279,6 +279,46 @@ fn glyph_atlas_lazy_insert_skips_pixel_generation_for_cached_glyphs() {
     assert_eq!(generated, 1);
     assert_eq!(atlas.modified_count(), 1);
 }
+#[test]
+fn glyph_atlas_tracks_dirty_bounds_by_modification() {
+    let mut atlas = GlyphAtlas::new(64, 64);
+    let face = GlyphAtlasFaceKey::new(regular_face("Maple Mono", &[]));
+    for (text, width, height) in [("A", 4, 5), ("B", 3, 2)] {
+        atlas.insert_or_get_with(
+            GlyphAtlasKey {
+                face: face.clone(),
+                text: GlyphAtlasTextKey::new(text),
+                font_size_bits: 16.0_f32.to_bits(),
+                pixels_per_point_bits: 1.0_f32.to_bits(),
+                width,
+                height,
+            },
+            width,
+            height,
+            || vec![255; (width * height) as usize],
+        );
+    }
+
+    assert_eq!(
+        atlas.dirty_rect_since(0),
+        Some(GlyphAtlasEntry {
+            x: 1,
+            y: 1,
+            width: 8,
+            height: 5,
+        })
+    );
+    assert_eq!(
+        atlas.dirty_rect_since(1),
+        Some(GlyphAtlasEntry {
+            x: 6,
+            y: 1,
+            width: 3,
+            height: 2,
+        })
+    );
+    assert_eq!(atlas.dirty_rect_since(2), None);
+}
 
 #[test]
 fn glyph_atlas_grows_to_fit_instead_of_dropping_glyphs() {

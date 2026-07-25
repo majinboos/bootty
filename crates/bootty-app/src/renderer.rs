@@ -632,7 +632,7 @@ impl TerminalWidget {
             egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 238, 128, alpha)),
             egui::StrokeKind::Outside,
         );
-        ui.ctx().request_repaint_after(Duration::from_millis(16));
+        ui.ctx().request_repaint();
     }
 
     fn paint_copy_mode_position_overlay(

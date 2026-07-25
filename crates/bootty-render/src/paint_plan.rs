@@ -9,6 +9,9 @@ use crate::{
 };
 
 const TEXT_Y_OFFSET: f32 = 2.0;
+const OVERLAY_SELECTION: u8 = 1;
+const OVERLAY_ACTIVE_SEARCH: u8 = 2;
+const OVERLAY_SEARCH: u8 = 4;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlanColor {
@@ -184,6 +187,7 @@ impl Default for TerminalPaintPlan {
 pub struct PaintPlanner {
     plan: TerminalPaintPlan,
     run_text_pool: Vec<String>,
+    overlay_mask: Vec<u8>,
 }
 
 impl PaintPlanner {
@@ -255,9 +259,11 @@ impl PaintPlanner {
         plan_search_matches(&mut self.plan, surface, frame);
         plan_active_search_match(&mut self.plan, surface, frame);
         plan_selections(&mut self.plan, surface, frame, default_fg);
+        prepare_overlay_mask(&mut self.overlay_mask, frame);
         plan_text_runs(
             &mut self.plan,
             &mut self.run_text_pool,
+            &self.overlay_mask,
             surface,
             frame,
             TextPlanContext {
@@ -339,9 +345,67 @@ struct TextPlanContext {
     text_cell_height: f32,
 }
 
+fn prepare_overlay_mask(mask: &mut Vec<u8>, frame: &RenderFrame) {
+    if frame.selections.is_empty()
+        && frame.search_matches.is_empty()
+        && frame.active_search_match.is_none()
+    {
+        mask.clear();
+        return;
+    }
+    mask.resize(usize::from(frame.cols) * usize::from(frame.rows), 0);
+    mask.fill(0);
+    mark_overlay_ranges(
+        mask,
+        frame.cols,
+        frame.rows,
+        &frame.search_matches,
+        OVERLAY_SEARCH,
+    );
+    if let Some(active) = frame.active_search_match {
+        mark_overlay_ranges(
+            mask,
+            frame.cols,
+            frame.rows,
+            std::slice::from_ref(&active),
+            OVERLAY_ACTIVE_SEARCH,
+        );
+    }
+    mark_overlay_ranges(
+        mask,
+        frame.cols,
+        frame.rows,
+        &frame.selections,
+        OVERLAY_SELECTION,
+    );
+}
+
+fn mark_overlay_ranges(mask: &mut [u8], cols: u16, rows: u16, ranges: &[FrameSelection], flag: u8) {
+    for range in ranges {
+        if range.row >= rows || range.start_col >= cols {
+            continue;
+        }
+        let end_col = range.end_col.min(cols - 1);
+        if end_col < range.start_col {
+            continue;
+        }
+        let start = usize::from(range.row) * usize::from(cols) + usize::from(range.start_col);
+        let end = usize::from(range.row) * usize::from(cols) + usize::from(end_col);
+        mask[start..=end].fill(flag);
+    }
+}
+
+fn cell_overlay(mask: &[u8], cols: u16, cell: &RenderCell) -> u8 {
+    if mask.is_empty() {
+        return 0;
+    }
+    mask[usize::from(cell.y) * usize::from(cols) + usize::from(cell.x)]
+}
+
 fn plan_text_runs(
     plan: &mut TerminalPaintPlan,
     pool: &mut Vec<String>,
+    overlay_mask: &[u8],
     surface: TerminalSurface,
     frame: &RenderFrame,
     context: TextPlanContext,
@@ -361,7 +425,13 @@ fn plan_text_runs(
             continue;
         }
 
-        let attrs = paint_attrs(first, frame, context.default_fg, context.default_bg, colors);
+        let attrs = paint_attrs(
+            first,
+            cell_overlay(overlay_mask, frame.cols, first),
+            context.default_fg,
+            context.default_bg,
+            colors,
+        );
         let mut run_text = pool.pop().unwrap_or_default();
         run_text.clear();
         run_text.extend(first_text);
@@ -377,7 +447,13 @@ fn plan_text_runs(
                 || next.x != end_x
                 || next.style.invisible
                 || next_text.is_empty()
-                || paint_attrs(next, frame, context.default_fg, context.default_bg, colors) != attrs
+                || paint_attrs(
+                    next,
+                    cell_overlay(overlay_mask, frame.cols, next),
+                    context.default_fg,
+                    context.default_bg,
+                    colors,
+                ) != attrs
             {
                 break;
             }
@@ -693,26 +769,6 @@ fn selection_text_foreground(frame: &RenderFrame, default_bg: PlanColor) -> Plan
         .unwrap_or(default_bg)
 }
 
-fn cell_selected(frame: &RenderFrame, x: u16, y: u16) -> bool {
-    frame
-        .selections
-        .iter()
-        .any(|selection| selection.row == y && x >= selection.start_col && x <= selection.end_col)
-}
-
-fn cell_search_matched(frame: &RenderFrame, x: u16, y: u16) -> bool {
-    frame
-        .search_matches
-        .iter()
-        .any(|selection| selection.row == y && x >= selection.start_col && x <= selection.end_col)
-}
-
-fn cell_active_search_matched(frame: &RenderFrame, x: u16, y: u16) -> bool {
-    frame.active_search_match.is_some_and(|selection| {
-        selection.row == y && x >= selection.start_col && x <= selection.end_col
-    })
-}
-
 fn cell_background(cell: &RenderCell, default_fg: PlanColor, default_bg: PlanColor) -> PlanColor {
     if cell.style.inverse {
         cell.fg.map_or(default_fg, PlanColor::opaque)
@@ -730,17 +786,17 @@ struct OverlayTextColors {
 
 fn paint_attrs(
     cell: &RenderCell,
-    frame: &RenderFrame,
+    overlay: u8,
     default_fg: PlanColor,
     default_bg: PlanColor,
     colors: OverlayTextColors,
 ) -> TextAttrs {
     let (mut fg, _) = cell_colors(cell, default_fg, default_bg);
-    if cell_selected(frame, cell.x, cell.y) {
+    if overlay == OVERLAY_SELECTION {
         fg = colors.selection;
-    } else if cell_active_search_matched(frame, cell.x, cell.y) {
+    } else if overlay == OVERLAY_ACTIVE_SEARCH {
         fg = colors.active_search;
-    } else if cell_search_matched(frame, cell.x, cell.y) {
+    } else if overlay == OVERLAY_SEARCH {
         fg = colors.search;
     }
     TextAttrs {

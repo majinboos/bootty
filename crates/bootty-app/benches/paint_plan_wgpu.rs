@@ -347,6 +347,25 @@ fn ascii_dirty_text_frame(tick: u32) -> TerminalRenderFrame {
     TerminalRenderFrame::from_plan(&plan, &text_contract)
 }
 
+fn single_glyph_frame() -> TerminalRenderFrame {
+    let rect = SurfaceRect::from_min_size(0.0, 0.0, 9.0, 22.0);
+    let plan = TerminalPaintPlan {
+        surface: rect,
+        default_background: color(8, 10, 16),
+        backgrounds: Vec::new(),
+        text_runs: vec![text_run(rect, 1, "A", color(180, 210, 255))],
+        decorations: Vec::new(),
+        cursor: None,
+    };
+    TerminalRenderFrame::from_plan(
+        &plan,
+        &TerminalTextContract::new(
+            TerminalTextConfig::default(),
+            NativeSymbolPolicy::terminal_glyph_primitives(),
+        ),
+    )
+}
+
 fn warm_wgpu_renderer(
     context: &WgpuBenchContext,
     renderer: &mut TerminalWgpuRenderer,
@@ -516,6 +535,39 @@ fn bench_text_atlas_prepare_dirty_ascii(c: &mut Criterion) {
     });
 }
 
+fn bench_wgpu_incremental_text_atlas_upload(c: &mut Criterion) {
+    let context = create_wgpu_bench_context();
+    let mut renderer = TerminalWgpuRenderer::new(&context.device, context.format);
+    let mut frame = single_glyph_frame();
+    warm_wgpu_renderer(&context, &mut renderer, &frame);
+    let mut tick = 0_u32;
+
+    c.bench_function("wgpu_incremental_text_atlas_upload", |b| {
+        b.iter(|| {
+            tick = tick.wrapping_add(1);
+            let ch = char::from_u32(0x4e00 + tick % 20_000).expect("CJK codepoint");
+            let text = frame
+                .commands
+                .iter_mut()
+                .find_map(|command| match command {
+                    TerminalRenderCommand::Text(text) => Some(text),
+                    _ => None,
+                })
+                .expect("single text command");
+            text.text.clear();
+            text.text.push(ch);
+            let vertices = renderer.prepare_terminal_frame(
+                &context.device,
+                &context.queue,
+                &frame,
+                1.0,
+                ViewTransform::IDENTITY,
+            );
+            black_box((vertices, renderer.last_text_upload_bytes()))
+        })
+    });
+}
+
 fn bench_animated_agent_pipeline_wgpu_prepare(c: &mut Criterion) {
     let mut engine = terminal_engine(160, 60);
     let surface = surface_for(160, 60);
@@ -610,6 +662,7 @@ targets =
     bench_wgpu_scroll_text_prepare,
     bench_terminal_text_draws_dirty_ascii,
     bench_text_atlas_prepare_dirty_ascii,
+    bench_wgpu_incremental_text_atlas_upload,
     bench_wgpu_render_pass,
     bench_wgpu_first_frame_upload,
     bench_animated_agent_pipeline_wgpu_prepare

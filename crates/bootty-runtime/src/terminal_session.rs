@@ -54,7 +54,7 @@ const DEFAULT_SHELL: &str = "powershell.exe";
 const DEFAULT_SHELL: &str = "/bin/sh";
 pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_BACKLOG_FRAME_INTERVAL: Duration = Duration::from_millis(64);
-pub(crate) const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(4);
+pub(crate) const WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_SETTLED_FRAME_DELAY: Duration = Duration::from_millis(16);
 pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
 
@@ -568,6 +568,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             last_terminal_change: None,
             force_next_frame_publish: false,
             command_disconnected: false,
+            pending_command: None,
             pty_disconnected: false,
         };
         worker.trace_event(
@@ -591,6 +592,7 @@ struct TerminalWorker {
     pty_rx: Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     command_rx: Receiver<TerminalCommand>,
+    pending_command: Option<TerminalCommand>,
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
@@ -648,7 +650,13 @@ impl TerminalWorker {
                 if self.should_stop() {
                     break;
                 }
-                thread::sleep(WORKER_IDLE_SLEEP);
+                match self.command_rx.recv_timeout(WORKER_IDLE_WAIT) {
+                    Ok(command) => self.pending_command = Some(command),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        self.command_disconnected = true;
+                    }
+                }
             }
         }
         self.trace_event("worker_stop", &[]);
@@ -701,12 +709,16 @@ impl TerminalWorker {
     fn process_commands(&mut self) -> WorkerCommandStats {
         let mut stats = WorkerCommandStats::default();
         loop {
-            let command = match self.command_rx.try_recv() {
-                Ok(command) => command,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.command_disconnected = true;
-                    break;
+            let command = if let Some(command) = self.pending_command.take() {
+                command
+            } else {
+                match self.command_rx.try_recv() {
+                    Ok(command) => command,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.command_disconnected = true;
+                        break;
+                    }
                 }
             };
             stats.did_work = true;

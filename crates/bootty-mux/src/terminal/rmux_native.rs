@@ -44,7 +44,7 @@ const RMUX_RESTORE_DRAIN_CHUNKS_PER_TICK: usize = 4;
 const RMUX_RESTORE_DRAIN_TIME_US: u128 = 2_000;
 const RMUX_MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const RMUX_MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
-const RMUX_WORKER_IDLE_SLEEP: Duration = Duration::from_millis(4);
+const RMUX_WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 const RMUX_INITIAL_FRAME_AGE: Duration = Duration::from_millis(16);
 const RMUX_RESTORE_MAX_SCROLLBACK_LINES: usize = 10_000;
 
@@ -158,6 +158,7 @@ struct RmuxWorker {
     engine: TerminalEngine,
     engine_input_rx: mpsc::Receiver<Vec<u8>>,
     command_rx: mpsc::Receiver<RmuxTerminalCommand>,
+    pending_command: Option<RmuxTerminalCommand>,
     latest_frame: Arc<RmuxPublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_output: RmuxOutputBacklog,
@@ -566,6 +567,7 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
             waiting_initial_remote_frame: config.waiting_initial_remote_frame,
             scroll_bottom_after_output: false,
             command_disconnected: false,
+            pending_command: None,
             output_closed: false,
         };
         let _ = startup_tx.send(Ok(()));
@@ -614,7 +616,13 @@ impl RmuxWorker {
                 if self.should_stop() {
                     break;
                 }
-                thread::sleep(RMUX_WORKER_IDLE_SLEEP);
+                match self.command_rx.recv_timeout(RMUX_WORKER_IDLE_WAIT) {
+                    Ok(command) => self.pending_command = Some(command),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        self.command_disconnected = true;
+                    }
+                }
             }
         }
     }
@@ -622,12 +630,16 @@ impl RmuxWorker {
     fn process_commands(&mut self) -> RmuxCommandStats {
         let mut stats = RmuxCommandStats::default();
         loop {
-            let command = match self.command_rx.try_recv() {
-                Ok(command) => command,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.command_disconnected = true;
-                    break;
+            let command = if let Some(command) = self.pending_command.take() {
+                command
+            } else {
+                match self.command_rx.try_recv() {
+                    Ok(command) => command,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.command_disconnected = true;
+                        break;
+                    }
                 }
             };
             stats.did_work = true;

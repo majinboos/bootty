@@ -54,6 +54,40 @@ fn copy_mode_select_line_copies_current_line_and_exits() -> Result<()> {
 }
 
 #[test]
+fn copy_mode_visual_line_motion_keeps_whole_lines_selected() -> Result<()> {
+    let mut engine = small_terminal_engine(20, 4)?;
+    engine.write_vt(b"first line\r\nsecond row\r\nthird");
+
+    engine.enter_copy_mode()?;
+    engine.handle_copy_mode_action(TerminalCopyModeAction::SelectLine)?;
+    engine.handle_copy_mode_action(TerminalCopyModeAction::Move(TerminalCopyModeMotion::Up))?;
+    let outcome = engine.handle_copy_mode_action(TerminalCopyModeAction::CopySelectionAndCancel)?;
+
+    assert_eq!(copied_text(outcome), "second row\nthird");
+    Ok(())
+}
+
+#[test]
+fn copy_mode_toggle_selection_end_moves_cursor_between_ends() -> Result<()> {
+    let mut engine = small_terminal_engine(20, 4)?;
+    engine.write_vt(b"alpha beta");
+
+    engine.enter_copy_mode()?;
+    engine.handle_copy_mode_action(TerminalCopyModeAction::Move(
+        TerminalCopyModeMotion::StartOfLine,
+    ))?;
+    engine.handle_copy_mode_action(TerminalCopyModeAction::BeginSelection)?;
+    engine.handle_copy_mode_action(TerminalCopyModeAction::Move(
+        TerminalCopyModeMotion::NextWordEnd,
+    ))?;
+    assert_eq!(engine.extract_frame()?.cursor.expect("cursor").x, 4);
+
+    engine.handle_copy_mode_action(TerminalCopyModeAction::ToggleSelectionEnd)?;
+    assert_eq!(engine.extract_frame()?.cursor.expect("cursor").x, 0);
+    Ok(())
+}
+
+#[test]
 fn copy_mode_visual_selection_uses_vim_word_motion() -> Result<()> {
     let mut engine = small_terminal_engine(20, 4)?;
     engine.write_vt(b"alpha beta");

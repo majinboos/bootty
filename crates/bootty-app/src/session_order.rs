@@ -99,6 +99,17 @@ impl SessionStore {
         }
     }
 
+    fn remove(&mut self, name: &str) -> bool {
+        let Some((group, session)) = self.find_session(name) else {
+            return false;
+        };
+        self.entries[group].sessions.remove(session);
+        if self.entries[group].sessions.is_empty() {
+            self.entries.remove(group);
+        }
+        true
+    }
+
     fn rename_session(&mut self, old: &str, new: &str) -> bool {
         if old == new || self.existing_names().contains(new) {
             return false;
@@ -346,6 +357,14 @@ impl SessionOrderStore {
         }
     }
 
+    pub fn remove_session(&mut self, name: &str) -> bool {
+        let removed = self.store.remove(name);
+        if removed {
+            self.save();
+        }
+        removed
+    }
+
     pub fn rename_session(&mut self, old: &str, new: &str) -> bool {
         let renamed = self.store.rename_session(old, new);
         if renamed {
@@ -520,6 +539,23 @@ mod tests {
             second.sync_sessions(["first", "second"]),
             vec!["second"],
             "a second binding on the same backend must remain isolated"
+        );
+    }
+
+    #[test]
+    fn detached_session_can_be_attached_again() {
+        let path = temp_config_path("detach-attach");
+        let mut store = SessionOrderStore::for_config_path(&path);
+        store.add_session("first");
+        store.add_session("second");
+
+        assert!(store.remove_session("first"));
+        assert_eq!(store.sync_sessions(["first", "second"]), vec!["second"]);
+
+        store.add_session("first");
+        assert_eq!(
+            store.sync_sessions(["first", "second"]),
+            vec!["second", "first"]
         );
     }
     #[test]

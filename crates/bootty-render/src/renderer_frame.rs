@@ -290,8 +290,11 @@ impl RendererFrame {
         foreground: PlanColor,
         background: PlanColor,
     ) {
-        for cell in &mut self.cells {
-            if cell.y == row && cols.contains(&cell.x) {
+        let Some(cells) = self.rows.get(usize::from(row)).map(|row| row.cells.clone()) else {
+            return;
+        };
+        for cell in &mut self.cells[cells] {
+            if cols.contains(&cell.x) {
                 cell.selection = RendererSelectionIntent::Selected {
                     foreground,
                     background,
