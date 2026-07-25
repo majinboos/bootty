@@ -176,50 +176,6 @@ pub struct GridPoint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TerminalCoordinate {
-    Surface(SurfacePoint),
-    Terminal(SurfacePoint),
-    Grid(GridPoint),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CoordinateSpace {
-    Surface,
-    Terminal,
-    Grid,
-}
-
-impl TerminalCoordinate {
-    fn space(self) -> CoordinateSpace {
-        match self {
-            Self::Surface(_) => CoordinateSpace::Surface,
-            Self::Terminal(_) => CoordinateSpace::Terminal,
-            Self::Grid(_) => CoordinateSpace::Grid,
-        }
-    }
-
-    fn to_surface(self, surface: TerminalSurface) -> SurfacePoint {
-        match self {
-            Self::Surface(point) => point,
-            Self::Terminal(point) => {
-                let origin = surface.content_origin();
-                SurfacePoint {
-                    x: point.x + origin.x,
-                    y: point.y + origin.y,
-                }
-            }
-            Self::Grid(point) => {
-                let origin = surface.content_origin();
-                SurfacePoint {
-                    x: f32::from(point.x) * surface.cell.width + origin.x,
-                    y: f32::from(point.y) * surface.cell.height + origin.y,
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceRect {
     pub min_x: f32,
     pub min_y: f32,
@@ -456,35 +412,14 @@ impl TerminalSurface {
         padding
     }
 
-    pub fn convert_coordinate(
-        self,
-        coordinate: TerminalCoordinate,
-        to: CoordinateSpace,
-    ) -> TerminalCoordinate {
-        if coordinate.space() == to {
-            return coordinate;
-        }
-
-        let surface = coordinate.to_surface(self);
-        match to {
-            CoordinateSpace::Surface => TerminalCoordinate::Surface(surface),
-            CoordinateSpace::Terminal => {
-                let origin = self.content_origin();
-                TerminalCoordinate::Terminal(SurfacePoint {
-                    x: surface.x - origin.x,
-                    y: surface.y - origin.y,
-                })
-            }
-            CoordinateSpace::Grid => {
-                let origin = self.content_origin();
-                let grid = self.raw_grid_size();
-                let x = ((surface.x - origin.x).max(0.0) / self.cell.width).floor();
-                let y = ((surface.y - origin.y).max(0.0) / self.cell.height).floor();
-                TerminalCoordinate::Grid(GridPoint {
-                    x: (x as u16).min(grid.cols.saturating_sub(1)),
-                    y: (y as u16).min(grid.rows.saturating_sub(1)),
-                })
-            }
+    pub fn surface_to_grid(self, point: SurfacePoint) -> GridPoint {
+        let origin = self.content_origin();
+        let grid = self.raw_grid_size();
+        let x = ((point.x - origin.x).max(0.0) / self.cell.width).floor();
+        let y = ((point.y - origin.y).max(0.0) / self.cell.height).floor();
+        GridPoint {
+            x: (x as u16).min(grid.cols.saturating_sub(1)),
+            y: (y as u16).min(grid.rows.saturating_sub(1)),
         }
     }
 
@@ -818,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn renderer_coordinate_conversion_clamps_surface_to_grid() {
+    fn surface_to_grid_clamps_to_the_terminal_grid() {
         let surface = TerminalSurface::for_size(
             Vec2::new(100.0, 100.0),
             CellMetrics::new(5.0, 10.0),
@@ -846,43 +781,8 @@ mod tests {
         ];
 
         for (expected, actual) in cases {
-            assert_eq!(
-                surface.convert_coordinate(
-                    TerminalCoordinate::Surface(actual),
-                    CoordinateSpace::Grid,
-                ),
-                TerminalCoordinate::Grid(expected)
-            );
+            assert_eq!(surface.surface_to_grid(actual), expected);
         }
-    }
-
-    #[test]
-    fn renderer_coordinate_conversion_round_trips_terminal_and_surface_padding() {
-        let surface = TerminalSurface::for_size(
-            Vec2::new(100.0, 100.0),
-            CellMetrics::new(5.0, 10.0),
-            TerminalPadding {
-                top: 3.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: 7.0,
-            },
-        );
-
-        assert_eq!(
-            surface.convert_coordinate(
-                TerminalCoordinate::Terminal(SurfacePoint { x: 8.0, y: 12.0 }),
-                CoordinateSpace::Surface,
-            ),
-            TerminalCoordinate::Surface(SurfacePoint { x: 15.0, y: 15.0 })
-        );
-        assert_eq!(
-            surface.convert_coordinate(
-                TerminalCoordinate::Grid(GridPoint { x: 2, y: 3 }),
-                CoordinateSpace::Terminal,
-            ),
-            TerminalCoordinate::Terminal(SurfacePoint { x: 10.0, y: 30.0 })
-        );
     }
 
     proptest! {

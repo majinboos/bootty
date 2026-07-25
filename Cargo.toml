@@ -97,7 +97,6 @@ ttf-parser = "0.25"
 tuirealm = { version = "4.1.0", default-features = false, features = [
   "derive",
 ] }
-tui-markdown = { version = "0.3.7", default-features = false }
 unicode-width = "0.2"
 wasm-bindgen = "0.2"
 wgpu = { version = "29", default-features = false, features = [

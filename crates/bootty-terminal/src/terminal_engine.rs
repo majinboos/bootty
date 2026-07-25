@@ -2929,7 +2929,6 @@ impl TerminalEngine {
     ) -> Result<&RenderFrame> {
         self.frame.row_dirty = row_dirty;
         self.frame.row_wraps.clear();
-        self.frame.row_wrap_continuations.clear();
         self.frame.cells.clear();
         self.frame.text.clear();
         self.frame.images = KittyImageFrame::default();
@@ -2951,9 +2950,6 @@ impl TerminalEngine {
                 self.frame.selections.push(selection);
             }
             self.frame.row_wraps.push(row.wrapped);
-            self.frame
-                .row_wrap_continuations
-                .push(row.wrap_continuation);
             virtual_cells.extend(row.virtual_cells.iter().cloned());
             let text_offset = self.frame.text.len();
             self.frame.text.extend_from_slice(&row.text);

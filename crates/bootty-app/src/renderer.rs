@@ -11,9 +11,8 @@ use eframe::{
 
 use crate::{
     geometry::{
-        CellMetrics, CoordinateSpace, SurfacePoint, SurfaceRect, TerminalCoordinate,
-        TerminalSurface, ViewTransform, fit_cell_height_to_available_space,
-        fit_cell_width_to_available_space,
+        CellMetrics, SurfacePoint, SurfaceRect, TerminalSurface, ViewTransform,
+        fit_cell_height_to_available_space, fit_cell_width_to_available_space,
     },
     paint_plan::{CursorBlinkPhase, PaintPlanner, TerminalPaintPlan},
     scheduler::CURSOR_BLINK_REFRESH_INTERVAL,
@@ -740,12 +739,7 @@ fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Opt
     if !surface.rect.contains(pos) {
         return None;
     }
-    let TerminalCoordinate::Grid(point) = surface.convert_coordinate(
-        TerminalCoordinate::Surface(SurfacePoint { x: pos.x, y: pos.y }),
-        CoordinateSpace::Grid,
-    ) else {
-        return None;
-    };
+    let point = surface.surface_to_grid(SurfacePoint { x: pos.x, y: pos.y });
     if point.x >= frame.cols || point.y >= frame.rows {
         return None;
     }
@@ -1028,7 +1022,6 @@ mod tests {
             cursor: None,
             row_dirty: vec![true, true],
             row_wraps: vec![false, false],
-            row_wrap_continuations: vec![false, false],
             search_matches: Vec::new(),
             active_search_match: None,
             active_search_match_index: None,
@@ -1075,7 +1068,6 @@ mod tests {
             cursor: None,
             row_dirty: vec![true, true],
             row_wraps: vec![false, false],
-            row_wrap_continuations: vec![false, false],
             search_matches: Vec::new(),
             active_search_match: None,
             active_search_match_index: None,

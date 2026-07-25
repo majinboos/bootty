@@ -24,7 +24,6 @@ local PROVIDERS = {
 }
 
 local GREEN_COLOR = bootty.theme.success
-local TRACK_COLOR = bootty.theme.surface
 local TEXT_COLOR = bootty.theme.text
 local MUTED_COLOR = bootty.theme.muted
 local empty_renders = 0
@@ -107,7 +106,6 @@ local function usage_item(provider, label, window)
 		label = string.format("%s %d%% left", label, math.floor(remaining_pct + 0.5)),
 		text_color = TEXT_COLOR,
 		muted_color = MUTED_COLOR,
-		track = TRACK_COLOR,
 		color = color,
 		fill = remaining_pct / 100,
 		pace = pace,
