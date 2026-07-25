@@ -858,6 +858,7 @@ mod tests {
                     },
                     panes: Vec::new(),
                     layout: None,
+                    progress: None,
                 }],
             }],
             selected_session: Some("piu".to_owned()),
@@ -1204,6 +1205,7 @@ mod tests {
             anchor: MuxPaneAnchor::default(),
             panes: Vec::new(),
             layout: None,
+            progress: None,
         }
     }
 

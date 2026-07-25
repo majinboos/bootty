@@ -60,7 +60,7 @@ use crate::{
         command::{MuxCommand, MuxSplitDirection},
         config::{MuxBackendKind, selected_backend},
         controller::{MUX_SESSION_REFRESH_INTERVAL, MuxController},
-        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow, MuxWindowProgress},
         terminal::{ActiveTerminal, ActiveTerminalRuntime},
     },
     platform::{
@@ -175,6 +175,10 @@ impl TerminalProgress {
             _ => return None,
         };
         Some(Self { state, value })
+    }
+
+    fn from_mux(progress: &MuxWindowProgress) -> Option<Self> {
+        Self::from_conemu(&progress.state, progress.percent)
     }
 
     pub(crate) fn fraction(self) -> Option<f32> {
@@ -1044,6 +1048,23 @@ impl AppState {
     }
 
     pub(crate) fn current_terminal_progress(&self) -> Option<TerminalProgress> {
+        self.selected_window_backend_progress()
+            .or_else(|| self.current_terminal_progress_from_panes())
+    }
+
+    fn selected_window_backend_progress(&self) -> Option<TerminalProgress> {
+        let selected = self.mux.selected_window();
+        self.mux
+            .selected_session_windows()
+            .iter()
+            .find(|window| match selected {
+                Some(selected) => window.id == selected,
+                None => window.active,
+            })
+            .and_then(|window| self.backend_window_progress(window))
+    }
+
+    fn current_terminal_progress_from_panes(&self) -> Option<TerminalProgress> {
         self.focused_pane()
             .as_deref()
             .and_then(|pane_id| self.terminal_progress.get(pane_id).copied())
@@ -1068,6 +1089,9 @@ impl AppState {
     }
 
     pub(crate) fn window_has_indeterminate_progress(&self, window: &MuxWindow) -> bool {
+        if let Some(progress) = self.backend_window_progress(window) {
+            return progress.state == TerminalProgressState::Indeterminate;
+        }
         window
             .panes
             .iter()
@@ -1078,6 +1102,9 @@ impl AppState {
     }
 
     pub(crate) fn window_progress(&self, window: &MuxWindow) -> Option<u8> {
+        if let Some(progress) = self.backend_window_progress(window) {
+            return progress.percent();
+        }
         window
             .panes
             .iter()
@@ -1086,6 +1113,15 @@ impl AppState {
             .filter_map(|pane_id| self.pane_progress(pane_id))
             .filter_map(TerminalProgress::percent)
             .max()
+    }
+
+    /// An attached client forwards OSC 9;4 only for the pane it is currently showing, so its own
+    /// per-window bookkeeping is the only source that can speak for a background window.
+    fn backend_window_progress(&self, window: &MuxWindow) -> Option<TerminalProgress> {
+        window
+            .progress
+            .as_ref()
+            .and_then(TerminalProgress::from_mux)
     }
 
     pub fn pane_rects(&self, area: Rect, gap: f32) -> Vec<(String, Rect)> {
@@ -2170,6 +2206,13 @@ impl AppState {
         value: Option<u8>,
     ) {
         if state == "unknown" {
+            return;
+        }
+        // A tmux client reports progress for every window through its own bookkeeping, and
+        // forwards OSC 9;4 only for the pane it currently shows. Recording the forwarded copy
+        // would credit it to whichever pane the attach started on, painting a bar on the wrong
+        // window and never clearing it.
+        if selected_backend(&self.config().multiplexer) == MuxBackendKind::Tmux {
             return;
         }
         let progress = TerminalProgress::from_conemu(&state, value);
