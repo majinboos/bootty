@@ -1026,7 +1026,7 @@ impl RmuxWorker {
             return false;
         }
         let since = *self.sync_output_since.get_or_insert_with(Instant::now);
-        sync_output_suppresses_publish(true, since.elapsed())
+        sync_output_suppresses_publish(true, false, since.elapsed())
     }
 
     fn publish_frame(&mut self) {
