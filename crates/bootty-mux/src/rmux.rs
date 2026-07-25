@@ -499,6 +499,8 @@ pub(crate) fn session_from_rows(
                 panes: window_panes,
                 layout: window.layout.as_deref().and_then(rmux_window_layout),
                 anchor,
+                // Rmux panes each own a PTY, so their progress arrives as OSC 9;4.
+                progress: None,
             }
         })
         .collect::<Vec<_>>();

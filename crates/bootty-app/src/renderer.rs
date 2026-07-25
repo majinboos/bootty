@@ -39,6 +39,7 @@ pub struct TerminalWidget {
     search_pulse: SearchPulse,
     transition_key: Option<String>,
     transition_pending: bool,
+    transition_source_frame: Option<Arc<RenderFrame>>,
     view: ViewTransform,
     last_surface: Option<SurfaceRect>,
 }
@@ -74,6 +75,7 @@ impl TerminalWidget {
         self.render_cache.clear();
         self.transition_key = None;
         self.transition_pending = false;
+        self.transition_source_frame = None;
     }
 
     pub fn is_zoomed(&self) -> bool {
@@ -111,9 +113,17 @@ impl TerminalWidget {
         if self.transition_key == key {
             return;
         }
-        self.render_cache.clear();
+        self.transition_source_frame = self.render_cache.frame.clone();
         self.transition_key = key;
         self.transition_pending = true;
+    }
+
+    fn transition_frame_ready(&self, frame: &Arc<RenderFrame>) -> bool {
+        !is_transition_placeholder_frame(frame)
+            && !self
+                .transition_source_frame
+                .as_ref()
+                .is_some_and(|source| Arc::ptr_eq(source, frame))
     }
 
     pub fn initial_geometry() -> crate::geometry::TerminalGeometry {
@@ -231,12 +241,13 @@ impl TerminalWidget {
             self.target_format.is_some(),
             "terminal renderer requires an eframe WGPU target format"
         );
-        let transition_ready = !is_transition_placeholder_frame(frame);
+        let transition_ready = self.transition_frame_ready(frame);
         let frame = self
             .render_cache
-            .frame_for_paint(frame, self.transition_pending);
+            .frame_for_paint(frame, self.transition_pending && !transition_ready);
         if transition_ready {
             self.transition_pending = false;
+            self.transition_source_frame = None;
         }
         let cursor_blinking = frame.cursor.is_some_and(|cursor| cursor.blinking);
         let cursor_blink_phase = self.cursor_blink.phase(Instant::now(), frame.cursor);
@@ -1381,6 +1392,58 @@ mod tests {
         assert!(Arc::ptr_eq(&frame, &next_empty_initialized));
         let frame = cache.frame_for_paint(&next_ready, true);
         assert!(Arc::ptr_eq(&frame, &next_ready));
+    }
+
+    #[test]
+    fn transition_waits_for_a_genuinely_new_frame() {
+        let source = Arc::new(RenderFrame {
+            cols: 8,
+            rows: 2,
+            cells: vec![RenderCell {
+                x: 0,
+                y: 0,
+                text_start: 0,
+                text_len: 1,
+                fg: None,
+                bg: None,
+                style: CellStyle::default(),
+                hyperlink: None,
+            }],
+            text: vec!['a'],
+            ..Default::default()
+        });
+        let replacement = Arc::new(RenderFrame {
+            cols: 8,
+            rows: 2,
+            cells: source.cells.clone(),
+            text: vec!['b'],
+            ..Default::default()
+        });
+        let placeholder = Arc::new(RenderFrame::default());
+        let surface = TerminalSurface::for_size(
+            Vec2::new(80.0, 40.0),
+            CellMetrics::new(10.0, 20.0),
+            TerminalPadding::default(),
+        );
+        let mut widget = TerminalWidget {
+            transition_key: Some("a".into()),
+            ..Default::default()
+        };
+        widget.render_cache.store(
+            surface,
+            &source,
+            TerminalRenderFrame {
+                surface: SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0),
+                commands: Vec::new(),
+            },
+            1,
+        );
+
+        widget.set_transition_key(Some("b".into()));
+
+        assert!(!widget.transition_frame_ready(&source));
+        assert!(!widget.transition_frame_ready(&placeholder));
+        assert!(widget.transition_frame_ready(&replacement));
     }
 
     #[test]

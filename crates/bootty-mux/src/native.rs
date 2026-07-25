@@ -366,6 +366,8 @@ impl NativeMuxState {
                     anchor,
                     panes,
                     layout: None,
+                    // Native panes each own a PTY, so their progress arrives as OSC 9;4.
+                    progress: None,
                 }
             })
             .collect::<Vec<_>>();

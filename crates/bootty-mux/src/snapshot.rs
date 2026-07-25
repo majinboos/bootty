@@ -42,6 +42,17 @@ pub struct MuxWindow {
     pub panes: Vec<MuxPaneAnchor>,
     /// Native-layout shape for backends that expose a durable split tree.
     pub layout: Option<MuxPaneLayout>,
+    /// Progress the backend already tracks for this window, for backends that multiplex every
+    /// pane over one attach PTY. They only forward the active pane's OSC 9;4, so asking the
+    /// backend is the only way to see a background window's progress.
+    pub progress: Option<MuxWindowProgress>,
+}
+
+/// Backend-reported progress, in the ConEmu vocabulary the OSC 9;4 parser already speaks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MuxWindowProgress {
+    pub state: String,
+    pub percent: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -5,7 +5,7 @@ use super::{
     command::{MuxCommand, MuxDirection, MuxSplitDirection},
     config::MuxBackendKind,
     process::{CommandRunner, SystemCommandRunner, require_success},
-    snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
 };
 
 const TMUX_FIELD_SEPARATOR: char = '\x1f';
@@ -92,7 +92,7 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}",
         ])? else {
             return Ok(MuxSnapshot::default());
         };
@@ -353,9 +353,33 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
     })
 }
 
+/// tmux reports `hidden` for a pane with no progress, and an empty state for versions that
+/// predate the format entirely; both mean "nothing to draw".
+fn tmux_pane_progress(state: Option<String>, percent: Option<String>) -> Option<MuxWindowProgress> {
+    let state = state.filter(|state| !state.is_empty() && state != "hidden")?;
+    Some(MuxWindowProgress {
+        percent: percent.and_then(|percent| percent.parse().ok()),
+        state,
+    })
+}
+
+fn furthest_along(
+    current: Option<MuxWindowProgress>,
+    candidate: Option<MuxWindowProgress>,
+) -> Option<MuxWindowProgress> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(if candidate.percent > current.percent {
+            candidate
+        } else {
+            current
+        }),
+        (current, candidate) => current.or(candidate),
+    }
+}
+
 fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<()> {
     for line in panes_output.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = tmux_fields(line, 7).into_iter();
+        let mut fields = tmux_fields(line, 9).into_iter();
         let Some(session_id) = fields.next().filter(|value| !value.is_empty()) else {
             continue;
         };
@@ -371,6 +395,7 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
         let window_active = fields.next().is_some_and(|value| value != "0");
         let pane_active = fields.next().is_some_and(|value| value != "0");
         let pane_id = fields.next().filter(|value| !value.is_empty());
+        let progress = tmux_pane_progress(fields.next(), fields.next());
         let cwd = fields.next().filter(|value| !value.is_empty());
         let process = fields.next().filter(|value| !value.is_empty());
 
@@ -393,6 +418,8 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
                     process: process.clone(),
                 };
             }
+            // A window's bar stands for every pane in it, so the busiest pane wins.
+            window.progress = furthest_along(window.progress.take(), progress);
             continue;
         }
         let anchor = MuxPaneAnchor {
@@ -411,6 +438,7 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
             panes: vec![anchor.clone()],
             layout: None,
             anchor,
+            progress,
         });
     }
     for session in sessions {
@@ -741,7 +769,7 @@ mod tests {
     fn tmux_snapshot_recovers_underscore_joined_rows() {
         let snapshot = parse_tmux_snapshot(
             "$2_agents_0_3_%34_/Users/luan/src/agents_node\n",
-            "$2_@28_1_ai_1_1_%34_/Users/luan/src/agents_node\n",
+            "$2_@28_1_ai_1_1_%34_normal_42_/Users/luan/src/agents_node\n",
         )
         .unwrap();
 
@@ -774,6 +802,31 @@ mod tests {
         assert_eq!(snapshot.sessions[0].name, "boo");
         assert_eq!(snapshot.sessions[0].anchor.pane_id.as_deref(), Some("%3"));
         assert_eq!(snapshot.sessions[0].active_window_id.as_deref(), Some("@3"));
+    }
+
+    #[test]
+    fn tmux_snapshot_reads_window_progress_from_the_busiest_pane() {
+        let sessions = "$1\x1fboo\x1f1\x1f2\x1f%1\x1f/repo\x1fnode\n";
+        let panes = concat!(
+            "$1\x1f@1\x1f1\x1fbuild\x1f1\x1f1\x1f%1\x1fnormal\x1f12\x1f/repo\x1fnode\n",
+            "$1\x1f@1\x1f1\x1fbuild\x1f1\x1f0\x1f%2\x1fnormal\x1f80\x1f/repo\x1fnode\n",
+            "$1\x1f@2\x1f2\x1fidle\x1f0\x1f1\x1f%3\x1fhidden\x1f0\x1f/repo\x1ffish\n",
+        );
+
+        let snapshot = parse_tmux_snapshot(sessions, panes).unwrap();
+
+        let windows = &snapshot.sessions[0].windows;
+        assert_eq!(
+            windows[0].progress,
+            Some(MuxWindowProgress {
+                state: "normal".to_owned(),
+                percent: Some(80),
+            })
+        );
+        assert_eq!(windows[1].progress, None);
+        // Field order drifting between the query and the parser would land the state string in
+        // cwd; check the tail still resolves.
+        assert_eq!(windows[0].anchor.cwd.as_deref(), Some("/repo"));
     }
 
     #[test]

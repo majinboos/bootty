@@ -63,13 +63,10 @@ pub struct BackendPaneTerminal {
     native_window_id: Option<String>,
     last_rmux_window_size: Option<(String, u16, u16)>,
     rmux_window_resize_worker: Option<RmuxWindowResizeWorker>,
-    /// Session whose tmux `status` option bootty has toggled off so its own
-    /// status bar is the only one shown; restored when bootty stops showing it.
-    status_hidden_session: Option<String>,
-    /// Pane whose `allow-passthrough` option bootty has temporarily set to `all` so
-    /// Kitty graphics reach the attached Bootty client even when tmux does not
-    /// classify the pane as visible for `allow-passthrough on`.
-    passthrough_all_pane: Option<TmuxPanePassthroughOverride>,
+    /// Tmux sessions whose status bars are hidden while Bootty keeps an attached runtime.
+    status_hidden_sessions: Vec<String>,
+    /// Pane-local passthrough values to restore when Bootty releases its attached runtimes.
+    passthrough_all_panes: HashMap<String, TmuxPanePassthroughOverride>,
     #[deref]
     #[deref_mut]
     terminal: ActiveTerminalRuntime,
@@ -340,8 +337,8 @@ impl BackendPaneTerminal {
             native_window_id: None,
             last_rmux_window_size: None,
             rmux_window_resize_worker: None,
-            status_hidden_session: None,
-            passthrough_all_pane: None,
+            status_hidden_sessions: Vec::new(),
+            passthrough_all_panes: HashMap::new(),
             terminal: ActiveTerminalRuntime::idle(),
         }
     }
@@ -365,19 +362,6 @@ impl BackendPaneTerminal {
             return Ok(());
         }
 
-        if self.backend == MuxBackendKind::Tmux
-            && backend == MuxBackendKind::Tmux
-            && target.is_some()
-            && self.active_target.is_some()
-            && self
-                .switch_tmux_client(target.as_ref().expect("target checked above"))
-                .is_ok()
-        {
-            self.active_target = target;
-            self.sync_tmux_passthrough_override();
-            self.sync_status_bar(config.hide_tmux_status);
-            return Ok(());
-        }
         self.park_native_layout_terminal();
         let terminal = self
             .start_terminal(backend, target.as_ref())
@@ -397,52 +381,59 @@ impl BackendPaneTerminal {
     }
 
     fn sync_tmux_passthrough_override(&mut self) {
-        let want = passthrough_override_target(self.backend, self.active_target.as_ref());
-        if self
-            .passthrough_all_pane
-            .as_ref()
-            .map(|override_| override_.pane_id.as_str())
-            == want
-        {
+        let Some(pane_id) = passthrough_override_target(self.backend, self.active_target.as_ref())
+        else {
+            self.restore_tmux_passthrough_overrides();
+            return;
+        };
+        if self.passthrough_all_panes.contains_key(pane_id) {
             return;
         }
-
-        if let Some(previous) = self.passthrough_all_pane.take() {
-            let _ = restore_pane_allow_passthrough(&previous);
-        }
-
-        if let Some(pane_id) = want
-            && let Ok(previous) = pane_allow_passthrough(pane_id)
+        if let Ok(previous) = pane_allow_passthrough(pane_id)
             && set_pane_allow_passthrough(pane_id, "all").is_ok()
         {
-            self.passthrough_all_pane = Some(TmuxPanePassthroughOverride {
-                pane_id: pane_id.to_owned(),
-                previous,
-            });
+            self.passthrough_all_panes.insert(
+                pane_id.to_owned(),
+                TmuxPanePassthroughOverride {
+                    pane_id: pane_id.to_owned(),
+                    previous,
+                },
+            );
         }
     }
 
-    /// Toggle tmux's per-session `status` option so only bootty's own status bar
-    /// shows in its client, restoring the previous session's bar when bootty
-    /// moves off it. Session-scoped and reversible: it never touches a global
-    /// option, and only ever acts on the tmux backend. Best-effort, so a failed
-    /// toggle never blocks the attach.
+    fn restore_tmux_passthrough_overrides(&mut self) {
+        for (_, previous) in self.passthrough_all_panes.drain() {
+            let _ = restore_pane_allow_passthrough(&previous);
+        }
+    }
+
+    /// Keep status hidden for every tmux session with a live Bootty runtime. Restoring the previous
+    /// session during a switch resizes its client and destroys the cached frame we are swapping to.
     fn sync_status_bar(&mut self, hide_enabled: bool) {
-        let want = status_bar_hidden_target(
+        let Some(session) = status_bar_hidden_target(
             hide_enabled,
             self.backend,
             self.active_target.as_ref().map(MuxPaneTarget::session_id),
-        );
-        if self.status_hidden_session.as_deref() == want {
+        ) else {
+            self.restore_tmux_status_bars();
+            return;
+        };
+        if self
+            .status_hidden_sessions
+            .iter()
+            .any(|hidden| hidden == session)
+        {
             return;
         }
-        if let Some(previous) = self.status_hidden_session.take() {
-            let _ = set_session_status_hidden(&previous, false);
+        if set_session_status_hidden(session, true).is_ok() {
+            self.status_hidden_sessions.push(session.to_owned());
         }
-        if let Some(session) = want
-            && set_session_status_hidden(session, true).is_ok()
-        {
-            self.status_hidden_session = Some(session.to_owned());
+    }
+
+    fn restore_tmux_status_bars(&mut self) {
+        for session in self.status_hidden_sessions.drain(..) {
+            let _ = set_session_status_hidden(&session, false);
         }
     }
 
@@ -498,6 +489,11 @@ impl BackendPaneTerminal {
                 )?)))
             }
             MuxBackendKind::Tmux | MuxBackendKind::Zellij => {
+                if backend == MuxBackendKind::Tmux
+                    && let Some(terminal) = self.native_terminals.remove(target)
+                {
+                    return Ok(terminal);
+                }
                 let mut terminal_config = self.terminal_config.clone();
                 terminal_config.side_effect_pane_id = target.pane_id().map(str::to_owned);
                 let config = backend_attach_session_config(
@@ -749,18 +745,12 @@ impl BackendPaneTerminal {
         }
     }
 
-    /// Drain the focused pane and every parked sibling in the active window so background panes keep
-    /// processing PTY output and repaint. Returns the focused pane's drain stats.
+    /// Drain the focused terminal and every parked runtime so inactive tmux sessions and native
+    /// panes keep processing output. Returns the focused terminal's drain stats.
     pub fn drain_native_window(&mut self) -> DrainStats {
         let stats = self.terminal.drain_pty();
-        let targets = self.native_window_targets.clone();
-        for target in &targets {
-            if self.active_target.as_ref() == Some(target) {
-                continue;
-            }
-            if let Some(runtime) = self.native_terminals.get_mut(target) {
-                runtime.drain_pty();
-            }
+        for runtime in self.native_terminals.values_mut() {
+            runtime.drain_pty();
         }
         stats
     }
@@ -804,31 +794,10 @@ impl BackendPaneTerminal {
         self.terminal.child_exited()
     }
 
-    fn switch_tmux_client(&mut self, target: &MuxPaneTarget) -> Result<()> {
-        let tty = self
-            .terminal
-            .tty_name()
-            .ok_or_else(|| anyhow::anyhow!("active tmux attach client tty unavailable"))?
-            .to_owned();
-        self.terminal.discard_pending_output()?;
-        let status = Command::new(resolve_launch_program("tmux")?)
-            .args(["switch-client", "-c", &tty, "-t", target.session_id()])
-            .env_remove("TMUX")
-            .env_remove("ZELLIJ")
-            .status()?;
-        if !status.success() {
-            anyhow::bail!("tmux switch-client failed with status {status}");
-        }
-        Ok(())
-    }
-
     // Drop the active pane's terminal (its PTY is killed on drop) and forget its target, so the next
     // sync_mux_anchor attaches the surviving pane instead of parking the closed one.
     pub fn discard_active_pane(&mut self) {
         self.terminal = ActiveTerminalRuntime::idle();
-        if let Some(previous) = self.passthrough_all_pane.take() {
-            let _ = restore_pane_allow_passthrough(&previous);
-        }
         self.active_target = None;
     }
 
@@ -837,7 +806,10 @@ impl BackendPaneTerminal {
     }
 
     fn park_native_layout_terminal(&mut self) {
-        if !matches!(self.backend, MuxBackendKind::Native | MuxBackendKind::Rmux) {
+        if !matches!(
+            self.backend,
+            MuxBackendKind::Native | MuxBackendKind::Rmux | MuxBackendKind::Tmux
+        ) {
             return;
         }
         let Some(target) = self.active_target.clone() else {
@@ -850,15 +822,8 @@ impl BackendPaneTerminal {
 
 impl Drop for BackendPaneTerminal {
     fn drop(&mut self) {
-        // Bring the tmux status bar back when bootty stops showing the session
-        // (window closed, app quit). Best-effort: a hard kill skips this, and a
-        // later attach re-hides while a clean detach restores.
-        if let Some(previous) = self.passthrough_all_pane.take() {
-            let _ = restore_pane_allow_passthrough(&previous);
-        }
-        if let Some(session) = self.status_hidden_session.take() {
-            let _ = set_session_status_hidden(&session, false);
-        }
+        self.restore_tmux_passthrough_overrides();
+        self.restore_tmux_status_bars();
     }
 }
 
@@ -872,6 +837,9 @@ impl TerminalRenderSource for BackendPaneTerminal {
     }
 
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        if self.geometry == geometry {
+            return Ok(());
+        }
         self.geometry = geometry;
         self.terminal.resize(geometry)
     }
@@ -1695,6 +1663,44 @@ mod tests {
     }
 
     #[test]
+    fn tmux_session_switch_parks_and_restores_its_runtime() {
+        let geometry = TerminalGeometry {
+            cols: 120,
+            rows: 40,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let target = MuxPaneTarget::Session {
+            session_id: "$4".to_owned(),
+            cwd: None,
+        };
+        let resize_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = BackendPaneTerminal::new_with_backend(
+            geometry,
+            MuxBackendKind::Tmux,
+            terminal_config(),
+            Arc::new(|| {}),
+        );
+        terminal.active_target = Some(target.clone());
+        terminal.terminal = ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+            resize_calls: Arc::clone(&resize_calls),
+        }));
+
+        terminal.park_native_layout_terminal();
+        let mut restored = terminal
+            .start_terminal(MuxBackendKind::Tmux, Some(&target))
+            .unwrap();
+        let resized = TerminalGeometry {
+            cols: 121,
+            ..geometry
+        };
+        TerminalRenderSource::resize(&mut restored, resized).unwrap();
+
+        assert_eq!(resize_calls.lock().unwrap().as_slice(), &[resized]);
+        assert!(!terminal.native_terminals.contains_key(&target));
+    }
+
+    #[test]
     fn restoring_parked_native_runtime_keeps_its_pane_geometry_until_render_resize() {
         let previous_focused_geometry = TerminalGeometry {
             cols: 120,
@@ -1724,6 +1730,30 @@ mod tests {
         let _restored = terminal
             .start_terminal(MuxBackendKind::Rmux, Some(&target))
             .unwrap();
+
+        assert!(resize_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unchanged_render_geometry_does_not_resize_the_pty() {
+        let geometry = TerminalGeometry {
+            cols: 120,
+            rows: 40,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let resize_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = BackendPaneTerminal::new_with_backend(
+            geometry,
+            MuxBackendKind::Tmux,
+            terminal_config(),
+            Arc::new(|| {}),
+        );
+        terminal.terminal = ActiveTerminalRuntime(Box::new(ResizeRecordingRuntime {
+            resize_calls: Arc::clone(&resize_calls),
+        }));
+
+        TerminalRenderSource::resize(&mut terminal, geometry).unwrap();
 
         assert!(resize_calls.lock().unwrap().is_empty());
     }
