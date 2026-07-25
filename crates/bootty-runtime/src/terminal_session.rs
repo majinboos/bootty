@@ -56,7 +56,6 @@ pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(1
 pub(crate) const WORKER_BACKLOG_FRAME_INTERVAL: Duration = Duration::from_millis(64);
 pub(crate) const WORKER_IDLE_SLEEP: Duration = Duration::from_millis(4);
 pub(crate) const WORKER_SETTLED_FRAME_DELAY: Duration = Duration::from_millis(16);
-pub(crate) const RESIZE_RESPONSE_MAX_SUPPRESS: Duration = Duration::from_millis(100);
 pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default)]
@@ -566,7 +565,6 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             sync_output_since: None,
             sync_output_batch_pending: false,
             sync_output_escape_prefix_len: 0,
-            resize_pending_since: None,
             last_terminal_change: None,
             force_next_frame_publish: false,
             command_disconnected: false,
@@ -607,7 +605,6 @@ struct TerminalWorker {
     sync_output_since: Option<Instant>,
     sync_output_batch_pending: bool,
     sync_output_escape_prefix_len: usize,
-    resize_pending_since: Option<Instant>,
     last_terminal_change: Option<Instant>,
     force_next_frame_publish: bool,
     command_disconnected: bool,
@@ -662,10 +659,7 @@ impl TerminalWorker {
     }
 
     fn should_publish_frame(&mut self) -> bool {
-        let sync_output_suppressed = self.sync_output_suppressed()
-            || resize_response_suppresses_publish(
-                self.resize_pending_since.map(|since| since.elapsed()),
-            );
+        let sync_output_suppressed = self.sync_output_suppressed();
         should_publish_frame_after_work(
             self.has_unpublished_frame,
             self.force_next_frame_publish,
@@ -728,7 +722,6 @@ impl TerminalWorker {
                 }
                 TerminalCommand::Resize(geometry) => {
                     if self.engine.resize(geometry).is_ok() {
-                        self.resize_pending_since = Some(Instant::now());
                         stats.terminal_changed = true;
                     }
                 }
@@ -921,7 +914,6 @@ impl TerminalWorker {
         self.has_unpublished_frame = false;
         self.sync_output_batch_pending = false;
         self.sync_output_escape_prefix_len = 0;
-        self.resize_pending_since = None;
         self.last_terminal_change = None;
     }
 
@@ -1005,7 +997,6 @@ impl TerminalWorker {
         self.sync_output_escape_prefix_len = sync_output_escape_prefix_len;
         self.sync_output_batch_pending |= observed_sync_output;
         if stats.bytes > 0 {
-            self.resize_pending_since = None;
             self.publish_current_working_directory();
             self.trace_event(
                 "parse_done",
@@ -1379,10 +1370,6 @@ pub fn sync_output_suppresses_publish(
 ) -> bool {
     sync_output_observed_in_batch
         || (sync_output_active && elapsed_since_sync_start < SYNC_OUTPUT_MAX_SUPPRESS)
-}
-
-fn resize_response_suppresses_publish(elapsed_since_resize: Option<Duration>) -> bool {
-    elapsed_since_resize.is_some_and(|elapsed| elapsed < RESIZE_RESPONSE_MAX_SUPPRESS)
 }
 
 pub fn should_publish_frame_after_work(
@@ -1912,15 +1899,6 @@ mod tests {
             WORKER_SETTLED_FRAME_DELAY,
             WORKER_READY_FRAME_INTERVAL,
         ));
-    }
-
-    #[test]
-    fn recent_resize_suppresses_frame_until_pty_response_or_timeout() {
-        assert!(resize_response_suppresses_publish(Some(Duration::ZERO)));
-        assert!(!resize_response_suppresses_publish(Some(
-            RESIZE_RESPONSE_MAX_SUPPRESS
-        )));
-        assert!(!resize_response_suppresses_publish(None));
     }
 
     #[test]
