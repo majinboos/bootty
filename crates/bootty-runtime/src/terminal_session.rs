@@ -563,6 +563,8 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             last_frame_publish: Instant::now() - WORKER_READY_FRAME_INTERVAL,
             has_unpublished_frame: false,
             sync_output_since: None,
+            sync_output_batch_pending: false,
+            sync_output_escape_prefix_len: 0,
             last_terminal_change: None,
             force_next_frame_publish: false,
             command_disconnected: false,
@@ -601,6 +603,8 @@ struct TerminalWorker {
     last_frame_publish: Instant,
     has_unpublished_frame: bool,
     sync_output_since: Option<Instant>,
+    sync_output_batch_pending: bool,
+    sync_output_escape_prefix_len: usize,
     last_terminal_change: Option<Instant>,
     force_next_frame_publish: bool,
     command_disconnected: bool,
@@ -669,12 +673,20 @@ impl TerminalWorker {
     }
 
     fn sync_output_suppressed(&mut self) -> bool {
-        if !self.engine.is_synchronized_output().unwrap_or(false) {
+        let active = self.engine.is_synchronized_output().unwrap_or(false);
+        let elapsed = if active {
+            self.sync_output_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+        } else {
             self.sync_output_since = None;
-            return false;
-        }
-        let since = *self.sync_output_since.get_or_insert_with(Instant::now);
-        sync_output_suppresses_publish(true, since.elapsed())
+            Duration::ZERO
+        };
+        sync_output_suppresses_publish(
+            active,
+            std::mem::take(&mut self.sync_output_batch_pending),
+            elapsed,
+        )
     }
 
     fn mark_unpublished_frame(&mut self) {
@@ -901,6 +913,8 @@ impl TerminalWorker {
         }
         self.pending_pty_len.store(0, Ordering::Relaxed);
         self.has_unpublished_frame = false;
+        self.sync_output_batch_pending = false;
+        self.sync_output_escape_prefix_len = 0;
         self.last_terminal_change = None;
     }
 
@@ -962,17 +976,27 @@ impl TerminalWorker {
             );
         }
         let engine = &mut self.engine;
+        let mut observed_sync_output = engine.is_synchronized_output().unwrap_or(false);
+        let mut sync_output_escape_prefix_len = self.sync_output_escape_prefix_len;
+        let mut write = |bytes: &[u8]| {
+            observed_sync_output |=
+                observe_sync_output_start(bytes, &mut sync_output_escape_prefix_len);
+            engine.write_vt(bytes);
+            observed_sync_output |= engine.is_synchronized_output().unwrap_or(false);
+        };
         let stats = if self.force_next_frame_publish {
             drain_pty_backlog_with_limits(
                 &mut self.pending_pty,
                 INPUT_FAST_PATH_DRAIN_BYTES,
                 INPUT_FAST_PATH_DRAIN_CHUNKS,
                 INPUT_FAST_PATH_DRAIN_TIME_US,
-                |bytes| engine.write_vt(bytes),
+                &mut write,
             )
         } else {
-            drain_pty_backlog(&mut self.pending_pty, |bytes| engine.write_vt(bytes))
+            drain_pty_backlog(&mut self.pending_pty, &mut write)
         };
+        self.sync_output_escape_prefix_len = sync_output_escape_prefix_len;
+        self.sync_output_batch_pending |= observed_sync_output;
         if stats.bytes > 0 {
             self.publish_current_working_directory();
             self.trace_event(
@@ -1319,15 +1343,34 @@ fn drain_budget_exhausted_with_limits(
     stats.bytes >= max_bytes || stats.chunks >= max_chunks
 }
 
+fn observe_sync_output_start(bytes: &[u8], matched_prefix_len: &mut usize) -> bool {
+    const START: &[u8] = b"\x1b[?2026h";
+    let mut observed = false;
+    for byte in bytes {
+        if *byte == START[*matched_prefix_len] {
+            *matched_prefix_len += 1;
+            if *matched_prefix_len == START.len() {
+                observed = true;
+                *matched_prefix_len = 0;
+            }
+        } else {
+            *matched_prefix_len = usize::from(*byte == START[0]);
+        }
+    }
+    observed
+}
+
 // DEC mode 2026 (synchronized output): applications wrap multi-step redraws
 // in BSU/ESU so intermediate states (e.g. a cleared screen before a tmux
 // layout repaint) never reach the display. The grace period bounds a client
 // that sets the mode and dies without clearing it.
 pub fn sync_output_suppresses_publish(
     sync_output_active: bool,
+    sync_output_observed_in_batch: bool,
     elapsed_since_sync_start: Duration,
 ) -> bool {
-    sync_output_active && elapsed_since_sync_start < SYNC_OUTPUT_MAX_SUPPRESS
+    sync_output_observed_in_batch
+        || (sync_output_active && elapsed_since_sync_start < SYNC_OUTPUT_MAX_SUPPRESS)
 }
 
 pub fn should_publish_frame_after_work(
@@ -1860,16 +1903,45 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_output_start_is_detected_with_end_in_same_slice() {
+        let mut matched = 0;
+        assert!(observe_sync_output_start(
+            b"\x1b[?2026hredraw\x1b[?2026l",
+            &mut matched
+        ));
+        assert_eq!(matched, 0);
+    }
+
+    #[test]
+    fn synchronized_output_start_is_detected_across_slices() {
+        let mut matched = 0;
+        assert!(!observe_sync_output_start(b"\x1b[?20", &mut matched));
+        assert!(observe_sync_output_start(b"26hredraw", &mut matched));
+        assert_eq!(matched, 0);
+    }
+
+    #[test]
     fn stuck_sync_output_mode_stops_suppressing_after_grace_period() {
         assert!(sync_output_suppresses_publish(
             true,
+            false,
             SYNC_OUTPUT_MAX_SUPPRESS / 2
         ));
         assert!(!sync_output_suppresses_publish(
             true,
+            false,
             SYNC_OUTPUT_MAX_SUPPRESS
         ));
-        assert!(!sync_output_suppresses_publish(false, Duration::ZERO));
+        assert!(!sync_output_suppresses_publish(
+            false,
+            false,
+            Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn completed_sync_output_batch_suppresses_its_intermediate_frame() {
+        assert!(sync_output_suppresses_publish(false, true, Duration::ZERO));
     }
 
     #[test]
