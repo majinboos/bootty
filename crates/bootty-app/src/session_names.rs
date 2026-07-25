@@ -5,76 +5,32 @@ use std::{
 
 use rusqlite::params;
 
-use crate::{
-    config::MultiplexerConfig,
-    workspace::{WorkspaceStore, open_db as workspace_open_db},
-};
+use crate::workspace::open_db as workspace_open_db;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionNameRecord {
     pub session_id: String,
     pub cwd: String,
     pub generated_name: String,
+    pub session_name: String,
     pub explicit: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SessionNameStore {
-    config_path: PathBuf,
-    multiplexer: MultiplexerConfig,
     path: PathBuf,
-    binding_id: Option<i64>,
+    binding_id: i64,
     records: HashMap<String, SessionNameRecord>,
-    loaded: bool,
 }
 
 impl SessionNameStore {
-    pub fn lazy_for_config_path(config_path: &Path) -> Self {
-        Self::lazy_for_config_path_with_multiplexer(config_path, &MultiplexerConfig::default())
-    }
-
-    pub fn lazy_for_config_path_with_multiplexer(
-        config_path: &Path,
-        multiplexer: &MultiplexerConfig,
-    ) -> Self {
-        Self {
-            config_path: config_path.to_path_buf(),
-            multiplexer: multiplexer.clone(),
-            path: crate::workspace::sqlite_path(config_path),
-            binding_id: None,
-            records: HashMap::new(),
-            loaded: false,
-        }
-    }
-
-    pub fn for_binding(
-        config_path: &Path,
-        multiplexer: &MultiplexerConfig,
-        binding_id: i64,
-    ) -> Self {
+    pub fn for_binding(config_path: &Path, binding_id: i64) -> Self {
         let path = crate::workspace::sqlite_path(config_path);
         Self {
-            config_path: config_path.to_path_buf(),
-            multiplexer: multiplexer.clone(),
             records: Self::load_records(&path, binding_id),
             path,
-            binding_id: Some(binding_id),
-            loaded: true,
+            binding_id,
         }
-    }
-
-    fn ensure_loaded(&mut self) {
-        if self.loaded {
-            return;
-        }
-        let workspace = WorkspaceStore::for_config_path(&self.config_path, &self.multiplexer);
-        self.path = workspace.path().to_path_buf();
-        self.binding_id = workspace.binding_id();
-        self.records = self
-            .binding_id
-            .map(|binding_id| Self::load_records(&self.path, binding_id))
-            .unwrap_or_default();
-        self.loaded = true;
     }
 
     fn load_records(path: &Path, binding_id: i64) -> HashMap<String, SessionNameRecord> {
@@ -82,7 +38,7 @@ impl SessionNameStore {
             return HashMap::new();
         };
         let Ok(mut statement) = conn.prepare(
-            "SELECT session_id, cwd, generated_name, explicit
+            "SELECT session_id, cwd, generated_name, session_name, explicit
              FROM workspace_session_name_metadata
              WHERE binding_id = ?1",
         ) else {
@@ -93,7 +49,8 @@ impl SessionNameStore {
                 session_id: row.get(0)?,
                 cwd: row.get(1)?,
                 generated_name: row.get(2)?,
-                explicit: row.get::<_, i64>(3)? != 0,
+                session_name: row.get(3)?,
+                explicit: row.get::<_, i64>(4)? != 0,
             })
         }) else {
             return HashMap::new();
@@ -105,9 +62,7 @@ impl SessionNameStore {
     }
 
     fn save(&self) {
-        let Some(binding_id) = self.binding_id else {
-            return;
-        };
+        let binding_id = self.binding_id;
         let Ok(mut conn) = workspace_open_db(&self.path) else {
             return;
         };
@@ -127,13 +82,14 @@ impl SessionNameStore {
             if tx
                 .execute(
                     "INSERT INTO workspace_session_name_metadata
-                        (binding_id, session_id, cwd, generated_name, explicit)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (binding_id, session_id, cwd, generated_name, session_name, explicit)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         binding_id,
                         record.session_id,
                         record.cwd,
                         record.generated_name,
+                        record.session_name,
                         i64::from(record.explicit)
                     ],
                 )
@@ -155,14 +111,14 @@ impl SessionNameStore {
     pub fn observe_session(
         &mut self,
         session_id: &str,
-        _session_name: &str,
+        session_name: &str,
         cwd: &str,
     ) -> Option<SessionNameRecord> {
-        self.ensure_loaded();
         let key = self.matching_key(cwd)?;
         let mut record = self.records.remove(&key)?;
-        let changed = record.session_id != session_id;
+        let changed = record.session_id != session_id || record.session_name != session_name;
         record.session_id = session_id.to_owned();
+        record.session_name = session_name.to_owned();
         let result = record.clone();
         self.records.insert(session_id.to_owned(), record);
         if changed {
@@ -172,7 +128,6 @@ impl SessionNameStore {
     }
 
     pub fn remember_generated(&mut self, session_id: &str, cwd: &str, generated_name: &str) {
-        self.ensure_loaded();
         let existing_key = self.matching_key(cwd);
         if existing_key
             .as_ref()
@@ -191,6 +146,7 @@ impl SessionNameStore {
                 session_id: session_id.to_owned(),
                 cwd: cwd.to_owned(),
                 generated_name: generated_name.to_owned(),
+                session_name: generated_name.to_owned(),
                 explicit: false,
             },
         );
@@ -198,7 +154,6 @@ impl SessionNameStore {
     }
 
     pub fn mark_explicit(&mut self, session_id: &str, session_name: &str, cwd: &str) {
-        self.ensure_loaded();
         let existing_key = self.matching_key(cwd);
         let mut record = existing_key
             .and_then(|key| self.records.remove(&key))
@@ -206,21 +161,44 @@ impl SessionNameStore {
                 session_id: session_id.to_owned(),
                 cwd: cwd.to_owned(),
                 generated_name: session_name.to_owned(),
+                session_name: session_name.to_owned(),
                 explicit: false,
             });
         record.session_id = session_id.to_owned();
         record.cwd = cwd.to_owned();
+        record.session_name = session_name.to_owned();
         record.explicit = true;
         self.records.insert(session_id.to_owned(), record);
         self.save();
+    }
+
+    pub fn persisted_sessions(&self, names: &[String]) -> Vec<(String, String, String)> {
+        names
+            .iter()
+            .filter_map(|name| {
+                self.records
+                    .values()
+                    .find(|record| {
+                        record.session_name == *name
+                            || record.session_id == *name
+                            || record.generated_name == *name
+                    })
+                    .map(|record| (record.session_id.clone(), name.clone(), record.cwd.clone()))
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
+    use crate::workspace::WorkspaceStore;
+
+    use super::*;
     fn temp_config_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -231,10 +209,18 @@ mod tests {
         dir.join("config.toml")
     }
 
+    fn store(config_path: &Path) -> SessionNameStore {
+        let workspace = WorkspaceStore::for_config_path(config_path);
+        SessionNameStore::for_binding(
+            config_path,
+            workspace.binding_id().expect("default workspace binding"),
+        )
+    }
+
     #[test]
     fn generated_name_survives_session_id_discovery() {
         let config = temp_config_path("id");
-        let mut store = SessionNameStore::lazy_for_config_path(&config);
+        let mut store = store(&config);
         store.remember_generated("bootty/main", "/repo", "bootty/main");
 
         let record = store
@@ -248,11 +234,11 @@ mod tests {
     #[test]
     fn explicit_name_survives_reload() {
         let config = temp_config_path("explicit");
-        let mut store = SessionNameStore::lazy_for_config_path(&config);
-        store.remember_generated("$1", "/repo", "bootty/main");
-        store.mark_explicit("$1", "release", "/repo");
+        let mut names = store(&config);
+        names.remember_generated("$1", "/repo", "bootty/main");
+        names.mark_explicit("$1", "release", "/repo");
 
-        let mut reloaded = SessionNameStore::lazy_for_config_path(&config);
+        let mut reloaded = store(&config);
         let record = reloaded
             .observe_session("$1", "release", "/repo")
             .expect("stored session");
@@ -263,7 +249,7 @@ mod tests {
     #[test]
     fn explicit_name_blocks_later_generated_name_updates() {
         let config = temp_config_path("protected");
-        let mut store = SessionNameStore::lazy_for_config_path(&config);
+        let mut store = store(&config);
         store.remember_generated("$1", "/repo", "project/main");
         store.mark_explicit("$1", "release", "/repo");
         store.remember_generated("$1", "/repo", "project/feature");
@@ -279,7 +265,7 @@ mod tests {
     #[test]
     fn reused_mux_id_does_not_transfer_explicit_name_to_another_worktree() {
         let config = temp_config_path("reused-id");
-        let mut store = SessionNameStore::lazy_for_config_path(&config);
+        let mut store = store(&config);
         store.remember_generated("$1", "/old", "project/main");
         store.mark_explicit("$1", "release", "/old");
         store.remember_generated("$1", "/new", "other/main");

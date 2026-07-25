@@ -12,5 +12,6 @@ pub mod session_navigation;
 pub mod session_picker;
 pub mod settings;
 pub mod sidebar;
+pub mod space;
 pub mod terminal_find;
 pub mod theme_picker;

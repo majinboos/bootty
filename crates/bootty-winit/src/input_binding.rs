@@ -396,6 +396,12 @@ pub enum BindingAction {
     TogglePaneZoom,
     NextSession,
     PreviousSession,
+    CreateSpace,
+    CloseSpace,
+    EditSpace,
+    NextSpace,
+    PreviousSpace,
+    SelectSpace(u32),
     LastSession,
     SelectSession(u32),
     MoveSession(i32),
@@ -672,6 +678,12 @@ impl BindingAction {
             Self::TogglePaneZoom => "toggle_pane_zoom".to_owned(),
             Self::NextSession => "next_session".to_owned(),
             Self::PreviousSession => "previous_session".to_owned(),
+            Self::CreateSpace => "create_space".to_owned(),
+            Self::EditSpace => "edit_space".to_owned(),
+            Self::CloseSpace => "close_space".to_owned(),
+            Self::NextSpace => "next_space".to_owned(),
+            Self::PreviousSpace => "previous_space".to_owned(),
+            Self::SelectSpace(value) => format!("select_space:{value}"),
             Self::LastSession => "last_session".to_owned(),
             Self::SelectSession(value) => format!("select_session:{value}"),
             Self::MoveSession(value) => format!("move_session:{value}"),
@@ -929,6 +941,14 @@ pub fn parse_action(input: &str) -> Result<BindingAction, BindingParseError> {
         "toggle_pane_zoom" => parse_unit(value, BindingAction::TogglePaneZoom),
         "next_session" => parse_unit(value, BindingAction::NextSession),
         "previous_session" => parse_unit(value, BindingAction::PreviousSession),
+        "create_space" => parse_unit(value, BindingAction::CreateSpace),
+        "edit_space" => parse_unit(value, BindingAction::EditSpace),
+        "close_space" => parse_unit(value, BindingAction::CloseSpace),
+        "next_space" => parse_unit(value, BindingAction::NextSpace),
+        "previous_space" => parse_unit(value, BindingAction::PreviousSpace),
+        "select_space" => parse_required(value, |value| {
+            Ok(BindingAction::SelectSpace(parse_u32(value)?))
+        }),
         "last_session" => parse_unit(value, BindingAction::LastSession),
         "select_session" => parse_required(value, |value| {
             Ok(BindingAction::SelectSession(parse_u32(value)?))
@@ -1469,6 +1489,19 @@ mod tests {
             "set_tab_title:foo bar"
         );
     }
+    #[test]
+    fn input_binding_parser_accepts_space_actions() {
+        for (input, action) in [
+            ("a=create_space", BindingAction::CreateSpace),
+            ("a=close_space", BindingAction::CloseSpace),
+            ("a=edit_space", BindingAction::EditSpace),
+            ("a=next_space", BindingAction::NextSpace),
+            ("a=previous_space", BindingAction::PreviousSpace),
+            ("a=select_space:3", BindingAction::SelectSpace(3)),
+        ] {
+            assert_eq!(parse_binding(input).unwrap().action, action, "{input}");
+        }
+    }
 
     #[test]
     fn input_binding_ports_ordering() {
@@ -1542,6 +1575,7 @@ mod tests {
             (BindingAction::Quit, "quit"),
             (BindingAction::ToggleFullscreen, "toggle_fullscreen"),
             (BindingAction::OpenSettings, "open_settings"),
+            (BindingAction::EditSpace, "edit_space"),
             (BindingAction::Csi("0m".to_owned()), "csi:0m"),
             (BindingAction::Esc("7".to_owned()), "esc:7"),
             (BindingAction::Text("plain".to_owned()), "text:plain"),

@@ -65,7 +65,7 @@ use crate::{
             SpaceId,
         },
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow, MuxWindowProgress},
-        terminal::{ActiveTerminal, TerminalRuntime},
+        terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
     },
     platform::{
         apply_macos_non_native_fullscreen_presentation, macos_handles_non_native_fullscreen_frame,
@@ -87,10 +87,11 @@ use crate::{
         rename::{RenameSessionDialog, RenameSessionEvent, RenameTabDialog, RenameTabEvent},
         session_navigation::{BindingSessionGroup, ScopedSessionTarget},
         session_picker::{SessionPickerDialog, SessionPickerEvent},
+        space::{SpaceEditorDialog, SpaceEditorEvent, default_space_icon},
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::WorkspaceStore,
+    workspace::{WorkspaceSpace, WorkspaceStore},
 };
 use bootty_terminal::terminal_engine::{
     TerminalColorConfig, TerminalCopyModeAction, TerminalCursorConfig, TerminalFeatureConfig,
@@ -131,6 +132,16 @@ pub struct ViewportSnapshot {
     pub fullscreen: bool,
     pub maximized: bool,
     pub content_height: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceSummary {
+    pub id: SpaceId,
+    pub name: String,
+    pub icon: String,
+    pub color: [u8; 3],
+    pub tint_sidebar: bool,
+    pub active: bool,
 }
 
 /// Host actions requested by a frame update, applied by the eframe adapter.
@@ -229,11 +240,98 @@ struct ScopedPaneId {
     pane_id: String,
 }
 
+struct NativeTerminalOwner {
+    terminal: Box<ActiveTerminal>,
+    terminal_side_effect_tx: mpsc::Sender<TerminalSideEffectEvent>,
+    terminal_side_effect_rx: mpsc::Receiver<TerminalSideEffectEvent>,
+}
+
+impl NativeTerminalOwner {
+    fn new(config: &BoottyConfig, variant: AppearanceVariant, repaint: RepaintHandle) -> Self {
+        let (terminal_side_effect_tx, terminal_side_effect_rx) = mpsc::channel();
+        let session_config =
+            terminal_session_config_with_side_effects(config, variant, &terminal_side_effect_tx);
+        Self {
+            terminal: Box::new(ActiveTerminal::new(
+                TerminalWidget::initial_geometry(),
+                &config.multiplexer,
+                session_config,
+                repaint,
+            )),
+            terminal_side_effect_tx,
+            terminal_side_effect_rx,
+        }
+    }
+
+    fn replace_binding(binding: &mut BindingRuntime, replacement: Self) -> Self {
+        Self {
+            terminal: std::mem::replace(&mut binding.terminal, replacement.terminal),
+            terminal_side_effect_tx: std::mem::replace(
+                &mut binding.terminal_side_effect_tx,
+                replacement.terminal_side_effect_tx,
+            ),
+            terminal_side_effect_rx: std::mem::replace(
+                &mut binding.terminal_side_effect_rx,
+                replacement.terminal_side_effect_rx,
+            ),
+        }
+    }
+
+    fn swap_with_binding(&mut self, binding: &mut BindingRuntime) {
+        std::mem::swap(&mut self.terminal, &mut binding.terminal);
+        std::mem::swap(
+            &mut self.terminal_side_effect_tx,
+            &mut binding.terminal_side_effect_tx,
+        );
+        std::mem::swap(
+            &mut self.terminal_side_effect_rx,
+            &mut binding.terminal_side_effect_rx,
+        );
+    }
+
+    fn discard_side_effects(&mut self) {
+        self.terminal_side_effect_rx.try_iter().for_each(drop);
+    }
+
+    fn drain_inactive(&mut self) {
+        self.terminal.drain_native_window();
+        self.discard_side_effects();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedSessionRestoreDecision {
+    Wait,
+    Skip,
+    Restore,
+}
+
+fn persisted_session_restore_decision(
+    backend: MultiplexerBackendConfig,
+    refresh_completed: bool,
+    daemon_has_sessions: bool,
+) -> PersistedSessionRestoreDecision {
+    match backend {
+        MultiplexerBackendConfig::Native => PersistedSessionRestoreDecision::Restore,
+        MultiplexerBackendConfig::Rmux if !refresh_completed => {
+            PersistedSessionRestoreDecision::Wait
+        }
+        MultiplexerBackendConfig::Rmux if daemon_has_sessions => {
+            PersistedSessionRestoreDecision::Skip
+        }
+        MultiplexerBackendConfig::Rmux => PersistedSessionRestoreDecision::Restore,
+        MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => {
+            PersistedSessionRestoreDecision::Skip
+        }
+    }
+}
+
 struct BindingRuntime {
     scope: MuxScope,
     label: String,
+    backend_override: Option<MultiplexerBackendConfig>,
     multiplexer: crate::config::MultiplexerConfig,
-    terminal: ActiveTerminal,
+    terminal: Box<ActiveTerminal>,
     mux: BindingMuxController,
     session_order: SessionOrderStore,
     session_names: SessionNameStore,
@@ -247,6 +345,7 @@ struct BindingRuntime {
     terminal_tab_titles: HashMap<ScopedWindowId, String>,
     terminal_progress: HashMap<ScopedPaneId, TerminalProgress>,
     unscoped_terminal_progress: Option<TerminalProgress>,
+    persisted_sessions_restored: bool,
 }
 
 impl BindingRuntime {
@@ -256,30 +355,43 @@ impl BindingRuntime {
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
-        let (terminal_side_effect_tx, terminal_side_effect_rx) = mpsc::channel();
-        let session_config =
-            terminal_session_config_with_side_effects(config, variant, &terminal_side_effect_tx);
+        let mut binding =
+            Self::new_with_backend_override(scope, config, None, variant, repaint.clone());
+        binding.restore_persisted_sessions(&repaint);
+        binding
+    }
+
+    fn new_with_backend_override(
+        scope: MuxScope,
+        config: &BoottyConfig,
+        backend_override: Option<MultiplexerBackendConfig>,
+        variant: AppearanceVariant,
+        repaint: RepaintHandle,
+    ) -> Self {
+        let mut config = config.clone();
+        if let Some(backend) = backend_override {
+            config.multiplexer.backend = backend;
+        }
+        let NativeTerminalOwner {
+            terminal,
+            terminal_side_effect_tx,
+            terminal_side_effect_rx,
+        } = NativeTerminalOwner::new(&config, variant, repaint);
         Self {
             label: binding_label(scope, &config.multiplexer),
+            backend_override,
             multiplexer: config.multiplexer.clone(),
             scope,
-            terminal: ActiveTerminal::new(
-                TerminalWidget::initial_geometry(),
-                &config.multiplexer,
-                session_config,
-                repaint,
-            ),
+            terminal,
             terminal_side_effect_tx,
             terminal_side_effect_rx,
             mux: BindingMuxController::default(),
             session_order: SessionOrderStore::for_binding(
                 &config.config_path,
-                &config.multiplexer,
                 scope.binding_id().persistence_value(),
             ),
             session_names: SessionNameStore::for_binding(
                 &config.config_path,
-                &config.multiplexer,
                 scope.binding_id().persistence_value(),
             ),
             pending_generated_names: HashMap::new(),
@@ -290,7 +402,49 @@ impl BindingRuntime {
             terminal_tab_titles: HashMap::new(),
             terminal_progress: HashMap::new(),
             unscoped_terminal_progress: None,
+            persisted_sessions_restored: false,
         }
+    }
+
+    fn restore_persisted_sessions(&mut self, repaint: &RepaintHandle) {
+        if self.persisted_sessions_restored {
+            return;
+        }
+        let decision = persisted_session_restore_decision(
+            selected_backend(&self.multiplexer),
+            self.mux.take_refresh_completed(),
+            !self.mux.sessions().is_empty(),
+        );
+        match decision {
+            PersistedSessionRestoreDecision::Wait => return,
+            PersistedSessionRestoreDecision::Skip => {
+                self.persisted_sessions_restored = true;
+                return;
+            }
+            PersistedSessionRestoreDecision::Restore => {
+                self.persisted_sessions_restored = true;
+            }
+        }
+
+        // Flat-session fallback only; split-tree restoration remains out of scope.
+        for (session_id, name, cwd) in self
+            .session_names
+            .persisted_sessions(&self.session_order.session_names())
+        {
+            self.mux.create_project_session(
+                crate::mux::controller::NewMuxSessionRequest {
+                    session_id: session_id.clone(),
+                    cwd,
+                },
+                repaint,
+                &self.multiplexer,
+            );
+            if name != session_id {
+                self.mux
+                    .rename_session(&session_id, name, repaint, &self.multiplexer);
+            }
+        }
+        self.sync_session_order();
     }
 
     fn sync_session_order(&mut self) {
@@ -298,9 +452,18 @@ impl BindingRuntime {
             self.mux
                 .sessions()
                 .iter()
-                .map(|session| session.name.as_str()),
+                .map(|session| session.name.as_str())
+                .chain(
+                    self.pending_generated_names
+                        .values()
+                        .map(|pending| pending.name.as_str()),
+                ),
         );
         self.mux.apply_session_order(&ordered_names);
+    }
+
+    fn discard_terminal_side_effects(&mut self) {
+        self.terminal_side_effect_rx.try_iter().for_each(drop);
     }
 
     fn window_id(&self, session_id: String, window_id: String) -> ScopedWindowId {
@@ -312,6 +475,98 @@ impl BindingRuntime {
             window,
             pane_id: pane_id.into(),
         }
+    }
+}
+
+fn binding_runtime_for_multiplexer(
+    config: &BoottyConfig,
+    scope: MuxScope,
+    label: String,
+    backend_override: Option<MultiplexerBackendConfig>,
+    variant: AppearanceVariant,
+    repaint: RepaintHandle,
+) -> BindingRuntime {
+    let mut binding = BindingRuntime::new_with_backend_override(
+        scope,
+        config,
+        backend_override,
+        variant,
+        repaint.clone(),
+    );
+    binding.label = label;
+    binding.restore_persisted_sessions(&repaint);
+    binding
+}
+
+struct SpaceRuntime {
+    id: SpaceId,
+    name: String,
+    icon: String,
+    color: [u8; 3],
+    tint_sidebar: bool,
+    position: i64,
+    binding: BindingRuntime,
+    inactive_bindings: Vec<BindingRuntime>,
+}
+
+impl SpaceRuntime {
+    fn from_workspace(
+        space: &WorkspaceSpace,
+        config: &BoottyConfig,
+        variant: AppearanceVariant,
+        repaint: RepaintHandle,
+    ) -> Option<Self> {
+        let mut bindings = space
+            .bindings()
+            .iter()
+            .map(|workspace_binding| {
+                binding_runtime_for_multiplexer(
+                    config,
+                    workspace_binding.mux_scope(),
+                    workspace_binding.name().to_owned(),
+                    workspace_binding.backend_override(),
+                    variant,
+                    repaint.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if bindings.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id: space.id(),
+            name: space.name().to_owned(),
+            icon: space.icon().to_owned(),
+            color: space.color(),
+            tint_sidebar: space.tint_sidebar(),
+            position: space.position(),
+            binding: bindings.remove(0),
+            inactive_bindings: bindings,
+        })
+    }
+
+    fn bindings(&self) -> impl Iterator<Item = &BindingRuntime> {
+        std::iter::once(&self.binding).chain(self.inactive_bindings.iter())
+    }
+
+    fn bindings_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
+        std::iter::once(&mut self.binding).chain(self.inactive_bindings.iter_mut())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SpaceTransition {
+    from: SpaceId,
+    to: SpaceId,
+    started: Instant,
+}
+
+impl SpaceTransition {
+    const DURATION: Duration = Duration::from_millis(180);
+
+    fn progress_at(self, now: Instant) -> f32 {
+        (now.saturating_duration_since(self.started).as_secs_f32() / Self::DURATION.as_secs_f32())
+            .clamp(0.0, 1.0)
     }
 }
 
@@ -331,6 +586,16 @@ fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig
 pub struct AppState {
     binding: BindingRuntime,
     inactive_bindings: Vec<BindingRuntime>,
+    active_space_id: SpaceId,
+    active_space_name: String,
+    active_space_icon: String,
+    active_space_color: [u8; 3],
+    active_space_tint_sidebar: bool,
+    active_space_position: i64,
+    inactive_spaces: Vec<SpaceRuntime>,
+    space_transition: Option<SpaceTransition>,
+    /// Keeps the one live native terminal while a non-native binding is active.
+    parked_native_terminal: Option<NativeTerminalOwner>,
     repaint_scheduler: RepaintScheduler,
     last_error: Option<String>,
     last_drain: DrainStats,
@@ -381,6 +646,7 @@ pub struct AppState {
     keybind_help_dialog: Option<KeybindHelpDialog>,
     command_palette_dialog: Option<CommandPaletteDialog>,
     theme_picker_dialog: Option<ThemePickerDialog>,
+    space_editor_dialog: Option<SpaceEditorDialog>,
     terminal_find_dialog: Option<TerminalFindDialog>,
     terminal_find_return_focus_after_search: bool,
     last_terminal_search: String,
@@ -639,51 +905,63 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 impl AppState {
     pub fn new(
-        mut config: BoottyConfig,
+        config: BoottyConfig,
         repaint: RepaintHandle,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
-        let workspace = WorkspaceStore::for_config_path(&config.config_path, &config.multiplexer);
-        if let Some(binding) = workspace.binding() {
-            config.multiplexer = binding.multiplexer_config();
-        }
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
         let modifier_remaps = config.input.modifier_remaps()?;
         let macos_option_as_alt = config.input.macos_option_as_alt.into();
-        let keybinds = config
-            .input
-            .keybinds_for_backend(config.multiplexer.backend);
-        let app_key_bindings = AppKeyBindings::from_keybinds(&keybinds)?;
         let sidebar_key_bindings =
             SidebarKeyBindings::from_keybinds(&config.input.sidebar_keybind)?;
         let stability_trace = StabilityTrace::from_config(&config);
         let active_appearance_variant = config.appearance.mode.variant(AppearanceVariant::Dark);
-        let mut bindings = workspace
-            .bindings()
+        let mut spaces = workspace
+            .spaces()
             .iter()
-            .map(|workspace_binding| {
-                let mut binding_config = config.clone();
-                binding_config.multiplexer = workspace_binding.multiplexer_config();
-                let mut runtime = BindingRuntime::new(
-                    workspace_binding.mux_scope(),
-                    &binding_config,
+            .filter_map(|space| {
+                SpaceRuntime::from_workspace(
+                    space,
+                    &config,
                     active_appearance_variant,
                     repaint.clone(),
-                );
-                runtime.label = workspace_binding.name().to_owned();
-                runtime
+                )
             })
             .collect::<Vec<_>>();
-        if bindings.is_empty() {
-            bindings.push(BindingRuntime::new(
-                MuxScope::new(SpaceId::from_persistence(0), BindingId::from_persistence(0)),
-                &config,
-                active_appearance_variant,
-                repaint.clone(),
-            ));
+        if spaces.is_empty() {
+            spaces.push(SpaceRuntime {
+                id: SpaceId::from_persistence(0),
+                name: "Default Space".to_owned(),
+                icon: crate::workspace::DEFAULT_SPACE_ICON.to_owned(),
+                color: crate::workspace::DEFAULT_SPACE_COLOR,
+                tint_sidebar: false,
+                position: 0,
+                binding: BindingRuntime::new(
+                    MuxScope::new(SpaceId::from_persistence(0), BindingId::from_persistence(0)),
+                    &config,
+                    active_appearance_variant,
+                    repaint.clone(),
+                ),
+                inactive_bindings: Vec::new(),
+            });
         }
-        let binding = bindings.remove(0);
-        let inactive_bindings = bindings;
+        let active_space = spaces.remove(0);
+        let SpaceRuntime {
+            id: active_space_id,
+            name: active_space_name,
+            icon: active_space_icon,
+            color: active_space_color,
+            tint_sidebar: active_space_tint_sidebar,
+            position: active_space_position,
+            binding,
+            inactive_bindings,
+        } = active_space;
+        let inactive_spaces = spaces;
+        let keybinds = config
+            .input
+            .keybinds_for_backend(binding.multiplexer.backend);
+        let app_key_bindings = AppKeyBindings::from_keybinds(&keybinds)?;
         let config_hot_reload = ConfigHotReload::new(&config.config_path);
         let macos_non_native_fullscreen_active = config.window.non_native_fullscreen_enabled();
         let macos_non_native_fullscreen_applied =
@@ -696,6 +974,15 @@ impl AppState {
         Ok(Self {
             binding,
             inactive_bindings,
+            active_space_id,
+            active_space_name,
+            active_space_icon,
+            active_space_color,
+            active_space_tint_sidebar,
+            active_space_position,
+            inactive_spaces,
+            space_transition: None,
+            parked_native_terminal: None,
             repaint_scheduler: RepaintScheduler::default(),
             last_error: None,
             last_drain: DrainStats::default(),
@@ -736,6 +1023,7 @@ impl AppState {
             rename_tab_dialog: None,
             command_palette_dialog: None,
             theme_picker_dialog: None,
+            space_editor_dialog: None,
             terminal_find_dialog: None,
             terminal_find_return_focus_after_search: false,
             last_terminal_search: String::new(),
@@ -753,6 +1041,46 @@ impl AppState {
 
     pub fn config(&self) -> &BoottyConfig {
         self.config_state.current()
+    }
+
+    fn prepare_native_terminal_transition(&mut self, target: &mut BindingRuntime) {
+        let active_is_native =
+            selected_backend(&self.binding.multiplexer) == MultiplexerBackendConfig::Native;
+        let target_is_native =
+            selected_backend(&target.multiplexer) == MultiplexerBackendConfig::Native;
+
+        match (active_is_native, target_is_native) {
+            (true, true) => {
+                std::mem::swap(&mut self.binding.terminal, &mut target.terminal);
+                std::mem::swap(
+                    &mut self.binding.terminal_side_effect_tx,
+                    &mut target.terminal_side_effect_tx,
+                );
+                std::mem::swap(
+                    &mut self.binding.terminal_side_effect_rx,
+                    &mut target.terminal_side_effect_rx,
+                );
+            }
+            (true, false) => {
+                let mut binding_config = self.config().clone();
+                binding_config.multiplexer = self.binding.multiplexer.clone();
+                let replacement = NativeTerminalOwner::new(
+                    &binding_config,
+                    self.active_appearance_variant,
+                    self.repaint.clone(),
+                );
+                let native_terminal =
+                    NativeTerminalOwner::replace_binding(&mut self.binding, replacement);
+                debug_assert!(self.parked_native_terminal.is_none());
+                self.parked_native_terminal = Some(native_terminal);
+            }
+            (false, true) => {
+                if let Some(mut native_terminal) = self.parked_native_terminal.take() {
+                    native_terminal.swap_with_binding(target);
+                }
+            }
+            (false, false) => {}
+        }
     }
 
     /// Apply a dragged sidebar width to the live config without touching disk, so the layout
@@ -916,6 +1244,330 @@ impl AppState {
         self.inactive_bindings.len() + 1
     }
 
+    pub fn active_space_id(&self) -> SpaceId {
+        self.active_space_id
+    }
+
+    pub fn space_summaries(&self) -> Vec<SpaceSummary> {
+        let mut spaces = vec![(
+            self.active_space_position,
+            SpaceSummary {
+                id: self.active_space_id,
+                name: self.active_space_name.clone(),
+                icon: self.active_space_icon.clone(),
+                color: self.active_space_color,
+                tint_sidebar: self.active_space_tint_sidebar,
+                active: true,
+            },
+        )];
+        spaces.extend(self.inactive_spaces.iter().map(|space| {
+            (
+                space.position,
+                SpaceSummary {
+                    id: space.id,
+                    name: space.name.clone(),
+                    icon: space.icon.clone(),
+                    color: space.color,
+                    tint_sidebar: space.tint_sidebar,
+                    active: false,
+                },
+            )
+        }));
+        spaces.sort_by_key(|(position, _)| *position);
+        spaces.into_iter().map(|(_, summary)| summary).collect()
+    }
+
+    fn space_backend_override(
+        &self,
+        space_id: SpaceId,
+    ) -> Option<Option<MultiplexerBackendConfig>> {
+        if space_id == self.active_space_id {
+            return Some(self.binding.backend_override);
+        }
+        self.inactive_spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .map(|space| space.binding.backend_override)
+    }
+
+    pub fn space_transition(&self, now: Instant) -> Option<(SpaceId, SpaceId, f32)> {
+        let transition = self.space_transition?;
+        let progress = transition.progress_at(now);
+        (progress < 1.0).then_some((transition.from, transition.to, progress))
+    }
+
+    fn select_space(&mut self, index: u32) -> bool {
+        let Some(index) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_sub(1))
+        else {
+            return false;
+        };
+        self.space_summaries()
+            .get(index)
+            .is_some_and(|space| self.activate_space_from_ui(space.id))
+    }
+    pub fn create_space_from_ui(
+        &mut self,
+        name: &str,
+        icon: &str,
+        color: [u8; 3],
+        tint_sidebar: bool,
+    ) -> bool {
+        self.create_space_with_backend_from_ui(name, icon, color, tint_sidebar, None)
+    }
+
+    fn create_space_with_backend_from_ui(
+        &mut self,
+        name: &str,
+        icon: &str,
+        color: [u8; 3],
+        tint_sidebar: bool,
+        backend_override: Option<MultiplexerBackendConfig>,
+    ) -> bool {
+        let config_path = self.config().config_path.clone();
+        let mut workspace = WorkspaceStore::for_config_path(&config_path);
+        let space = match workspace.create_space(
+            name,
+            icon,
+            color,
+            tint_sidebar,
+            backend_override,
+            &self.config().multiplexer,
+        ) {
+            Ok(Some(space)) => space,
+            Ok(None) => return false,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return false;
+            }
+        };
+        let runtime = SpaceRuntime::from_workspace(
+            &space,
+            self.config(),
+            self.active_appearance_variant,
+            self.repaint.clone(),
+        )
+        .expect("newly created spaces always have a binding");
+        let id = runtime.id;
+        self.inactive_spaces.push(runtime);
+        self.inactive_spaces.sort_by_key(|space| space.position);
+        self.activate_space_from_ui(id)
+    }
+
+    pub fn close_space_from_ui(&mut self, space_id: SpaceId) -> bool {
+        let spaces = self.space_summaries();
+        if spaces.len() <= 1 {
+            return false;
+        }
+        let Some(index) = spaces.iter().position(|space| space.id == space_id) else {
+            return false;
+        };
+        if space_id == self.active_space_id {
+            let neighbor = spaces
+                .get(index + 1)
+                .or_else(|| index.checked_sub(1).and_then(|index| spaces.get(index)));
+            if !neighbor.is_some_and(|space| self.activate_space_from_ui(space.id)) {
+                return false;
+            }
+        }
+        let config_path = self.config().config_path.clone();
+        let mut workspace = WorkspaceStore::for_config_path(&config_path);
+        match workspace.delete_space(space_id) {
+            Ok(true) => {
+                self.inactive_spaces.retain(|space| space.id != space_id);
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    pub fn update_space_from_ui(
+        &mut self,
+        space_id: SpaceId,
+        name: &str,
+        icon: &str,
+        color: [u8; 3],
+        tint_sidebar: bool,
+        backend_override: Option<MultiplexerBackendConfig>,
+    ) -> bool {
+        let Some(previous_override) = self.space_backend_override(space_id) else {
+            return false;
+        };
+        let resolved_backend = backend_override.unwrap_or(self.config().multiplexer.backend);
+        let app_key_bindings = if space_id == self.active_space_id {
+            let keybinds = self.config().input.keybinds_for_backend(resolved_backend);
+            match AppKeyBindings::from_keybinds(&keybinds) {
+                Ok(bindings) => Some(bindings),
+                Err(error) => {
+                    self.last_error = Some(error.to_string());
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+        let backend_changed = previous_override != backend_override;
+        let config_path = self.config().config_path.clone();
+        let mut workspace = WorkspaceStore::for_config_path(&config_path);
+        let runtime_config = self.config().clone();
+        let active_appearance_variant = self.active_appearance_variant;
+        let repaint = self.repaint.clone();
+        match workspace.update_space(space_id, name, icon, color, tint_sidebar, backend_override) {
+            Ok(true) => {
+                if space_id == self.active_space_id {
+                    self.active_space_name = name.trim().to_owned();
+                    self.active_space_icon = icon.trim().to_owned();
+                    self.active_space_color = color;
+                    self.active_space_tint_sidebar = tint_sidebar;
+                    if backend_changed {
+                        let scope = self.binding.scope;
+                        let label = self.binding.label.clone();
+                        self.binding = binding_runtime_for_multiplexer(
+                            &runtime_config,
+                            scope,
+                            label,
+                            backend_override,
+                            active_appearance_variant,
+                            repaint.clone(),
+                        );
+                        self.app_key_bindings =
+                            app_key_bindings.expect("active backend bindings were validated");
+                        self.terminal_surface = None;
+                        self.last_pane_area = None;
+                        if let Err(error) = self.sync_terminal_panes() {
+                            self.last_error = Some(error.to_string());
+                        }
+                    }
+                } else if let Some(space) = self
+                    .inactive_spaces
+                    .iter_mut()
+                    .find(|space| space.id == space_id)
+                {
+                    space.name = name.trim().to_owned();
+                    space.icon = icon.trim().to_owned();
+                    space.color = color;
+                    space.tint_sidebar = tint_sidebar;
+                    if backend_changed {
+                        let scope = space.binding.scope;
+                        let label = space.binding.label.clone();
+                        space.binding = binding_runtime_for_multiplexer(
+                            &runtime_config,
+                            scope,
+                            label,
+                            backend_override,
+                            active_appearance_variant,
+                            repaint.clone(),
+                        );
+                    }
+                }
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn activate_relative_space(&mut self, delta: isize) -> bool {
+        let spaces = self.space_summaries();
+        let Some(active) = spaces.iter().position(|space| space.active) else {
+            return false;
+        };
+        let Some(target) = active
+            .checked_add_signed(delta)
+            .and_then(|index| spaces.get(index))
+        else {
+            return false;
+        };
+        self.activate_space_from_ui(target.id)
+    }
+
+    pub fn activate_space_from_ui(&mut self, space_id: SpaceId) -> bool {
+        if space_id == self.active_space_id {
+            return false;
+        }
+        let Some(index) = self
+            .inactive_spaces
+            .iter()
+            .position(|space| space.id == space_id)
+        else {
+            return false;
+        };
+        let backend = self.inactive_spaces[index].binding.multiplexer.backend;
+        let keybinds = self.config().input.keybinds_for_backend(backend);
+        let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return false;
+            }
+        };
+        self.binding.terminal.deactivate_backend_side_effects();
+        let mut target = self.inactive_spaces.remove(index);
+        self.binding.discard_terminal_side_effects();
+        for binding in &mut self.inactive_bindings {
+            binding.discard_terminal_side_effects();
+        }
+        for binding in target.bindings_mut() {
+            binding.discard_terminal_side_effects();
+        }
+        if let Some(owner) = &mut self.parked_native_terminal {
+            owner.discard_side_effects();
+        }
+        self.prepare_native_terminal_transition(&mut target.binding);
+        let current = SpaceRuntime {
+            id: std::mem::replace(&mut self.active_space_id, target.id),
+            name: std::mem::replace(&mut self.active_space_name, target.name),
+            icon: std::mem::replace(&mut self.active_space_icon, target.icon),
+            color: std::mem::replace(&mut self.active_space_color, target.color),
+            tint_sidebar: std::mem::replace(
+                &mut self.active_space_tint_sidebar,
+                target.tint_sidebar,
+            ),
+            position: std::mem::replace(&mut self.active_space_position, target.position),
+            binding: std::mem::replace(&mut self.binding, target.binding),
+            inactive_bindings: std::mem::replace(
+                &mut self.inactive_bindings,
+                target.inactive_bindings,
+            ),
+        };
+        let previous_space_id = current.id;
+        self.inactive_spaces.push(current);
+        self.inactive_spaces.sort_by_key(|space| space.position);
+        self.space_transition = Some(SpaceTransition {
+            from: previous_space_id,
+            to: self.active_space_id,
+            started: Instant::now(),
+        });
+        self.app_key_bindings = app_key_bindings;
+        self.terminal_surface = None;
+        self.last_pane_area = None;
+        self.clear_space_context_dialogs();
+        self.input_focus = InputFocus::Terminal;
+        if let Err(error) = self.sync_terminal_panes() {
+            self.last_error = Some(error.to_string());
+        }
+        (self.repaint)();
+        true
+    }
+
+    fn clear_space_context_dialogs(&mut self) {
+        self.new_mux_session_dialog = None;
+        self.sidebar_hovered_session = None;
+        self.session_picker_dialog = None;
+        self.rename_session_dialog = None;
+        self.rename_tab_dialog = None;
+        self.ditch_session_dialog = None;
+        self.space_editor_dialog = None;
+    }
+
     pub fn binding_session_groups(&self) -> Vec<BindingSessionGroup> {
         let mut bindings = std::iter::once(&self.binding)
             .chain(self.inactive_bindings.iter())
@@ -951,10 +1603,19 @@ impl AppState {
     }
 
     fn binding_runtimes_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
-        std::iter::once(&mut self.binding).chain(self.inactive_bindings.iter_mut())
+        std::iter::once(&mut self.binding)
+            .chain(self.inactive_bindings.iter_mut())
+            .chain(
+                self.inactive_spaces
+                    .iter_mut()
+                    .flat_map(SpaceRuntime::bindings_mut),
+            )
     }
 
     fn set_binding_terminal_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
+        if let Some(owner) = &mut self.parked_native_terminal {
+            owner.terminal.set_colors(colors.clone())?;
+        }
         for binding in self.binding_runtimes_mut() {
             binding.terminal.set_colors(colors.clone())?;
         }
@@ -962,6 +1623,9 @@ impl AppState {
     }
 
     fn set_binding_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
+        if let Some(owner) = &mut self.parked_native_terminal {
+            owner.terminal.set_cursor_config(cursor)?;
+        }
         for binding in self.binding_runtimes_mut() {
             binding.terminal.set_cursor_config(cursor)?;
         }
@@ -969,6 +1633,9 @@ impl AppState {
     }
 
     fn set_binding_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
+        if let Some(owner) = &mut self.parked_native_terminal {
+            owner.terminal.set_feature_config(features)?;
+        }
         for binding in self.binding_runtimes_mut() {
             binding.terminal.set_feature_config(features)?;
         }
@@ -1315,8 +1982,8 @@ impl AppState {
     }
 
     fn selected_window_backend_progress(&self) -> Option<TerminalProgress> {
-        let selected = self.mux.selected_window();
-        self.mux
+        let selected = self.mux().selected_window();
+        self.mux()
             .selected_session_windows()
             .iter()
             .find(|window| match selected {
@@ -1589,7 +2256,16 @@ impl AppState {
                     return false;
                 }
             };
-            std::mem::swap(&mut self.binding, &mut self.inactive_bindings[index]);
+            self.binding.terminal.deactivate_backend_side_effects();
+            let mut target_binding = self.inactive_bindings.remove(index);
+            self.binding.discard_terminal_side_effects();
+            target_binding.discard_terminal_side_effects();
+            if let Some(owner) = &mut self.parked_native_terminal {
+                owner.discard_side_effects();
+            }
+            self.prepare_native_terminal_transition(&mut target_binding);
+            let current_binding = std::mem::replace(&mut self.binding, target_binding);
+            self.inactive_bindings.insert(index, current_binding);
             self.app_key_bindings = app_key_bindings;
             self.terminal_surface = None;
             self.last_pane_area = None;
@@ -1957,14 +2633,16 @@ impl AppState {
         self.binding
             .pending_generated_names
             .retain(|session_id, pending| {
-                sessions.iter().any(|session| {
-                    session.id == *session_id
-                        && session
+                sessions
+                    .iter()
+                    .find(|session| session.id == *session_id)
+                    .is_none_or(|session| {
+                        session
                             .anchor
                             .cwd
                             .as_deref()
                             .is_some_and(|cwd| Self::session_root(cwd) == pending.cwd)
-                })
+                    })
             });
         let mut planned_names = self
             .binding
@@ -2075,38 +2753,34 @@ impl AppState {
 
     fn create_project_session_for_cwd(&mut self, cwd: String) {
         let cwd = Self::session_root(&cwd);
-        if let Some(session_id) = self.binding.mux.sessions().iter().find_map(|session| {
-            session
-                .anchor
-                .cwd
-                .as_deref()
-                .is_some_and(|open_cwd| Self::session_root(open_cwd) == cwd)
-                .then(|| session.id.clone())
-        }) {
-            self.activate_session_from_ui(&session_id);
-            return;
-        }
 
-        let existing_names = self
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.as_str())
-            .chain(
-                self.binding
-                    .pending_generated_names
-                    .values()
-                    .map(|pending| pending.name.as_str()),
-            )
+        let existing_names = std::iter::once(&self.binding)
+            .chain(self.inactive_bindings.iter())
+            .chain(self.inactive_spaces.iter().flat_map(SpaceRuntime::bindings))
+            .flat_map(|binding| {
+                binding.mux.backend_session_names().iter().cloned().chain(
+                    binding
+                        .pending_generated_names
+                        .values()
+                        .map(|pending| pending.name.clone()),
+                )
+            })
             .collect::<Vec<_>>();
         let session_id = crate::strings::unique_session_name(
             &crate::git::suggested_session_name(&cwd),
-            existing_names,
+            existing_names.iter().map(String::as_str),
+        );
+        self.binding.pending_generated_names.insert(
+            session_id.clone(),
+            PendingGeneratedName {
+                cwd: cwd.clone(),
+                name: session_id.clone(),
+            },
         );
         self.binding
             .session_names
             .remember_generated(&session_id, &cwd, &session_id);
+        self.binding.session_order.add_session(&session_id);
         let mux_config = self.active_multiplexer().clone();
         self.binding.mux.create_project_session(
             crate::ui::new_session_picker::NewMuxSessionRequest { session_id, cwd },
@@ -2177,6 +2851,45 @@ impl AppState {
     pub fn take_dialog(&mut self) -> Option<NewMuxSessionDialog> {
         self.new_mux_session_dialog.take()
     }
+    pub fn take_space_editor_dialog(&mut self) -> Option<SpaceEditorDialog> {
+        self.space_editor_dialog.take()
+    }
+
+    pub fn apply_space_editor_event(&mut self, dialog: SpaceEditorDialog, event: SpaceEditorEvent) {
+        match event {
+            SpaceEditorEvent::None => self.space_editor_dialog = Some(dialog),
+            SpaceEditorEvent::Close => self.input_focus = InputFocus::Terminal,
+            SpaceEditorEvent::Save {
+                space_id,
+                name,
+                icon,
+                color,
+                tint_sidebar,
+                backend,
+            } => {
+                let saved = match space_id {
+                    Some(space_id) => self.update_space_from_ui(
+                        space_id,
+                        &name,
+                        &icon,
+                        color,
+                        tint_sidebar,
+                        backend,
+                    ),
+                    None => self.create_space_with_backend_from_ui(
+                        &name,
+                        &icon,
+                        color,
+                        tint_sidebar,
+                        backend,
+                    ),
+                };
+                if !saved {
+                    self.space_editor_dialog = Some(dialog);
+                }
+            }
+        }
+    }
 
     pub fn take_session_picker_dialog(&mut self) -> Option<SessionPickerDialog> {
         self.session_picker_dialog.take()
@@ -2218,10 +2931,36 @@ impl AppState {
                 self.input_focus = InputFocus::Terminal;
             }
             RenameSessionEvent::Rename { session_id, name } => {
-                let mux_config = self.active_multiplexer().clone();
-                self.binding
+                let name = name.trim().to_owned();
+                let session = self
+                    .binding
                     .mux
-                    .rename_session(&session_id, name, &self.repaint, &mux_config);
+                    .sessions()
+                    .iter()
+                    .find(|session| session.id == session_id || session.name == session_id)
+                    .cloned();
+                if let Some(session) = session {
+                    let cwd = session
+                        .anchor
+                        .cwd
+                        .as_deref()
+                        .map(Self::session_root)
+                        .unwrap_or_default();
+                    self.binding
+                        .session_order
+                        .rename_session(&session.name, &name);
+                    self.binding.pending_generated_names.insert(
+                        name.clone(),
+                        PendingGeneratedName {
+                            cwd,
+                            name: name.clone(),
+                        },
+                    );
+                    let mux_config = self.active_multiplexer().clone();
+                    self.binding
+                        .mux
+                        .rename_session(&session.id, name, &self.repaint, &mux_config);
+                }
                 self.input_focus = InputFocus::Terminal;
             }
         }
@@ -2500,6 +3239,19 @@ impl AppState {
             source_pane_id,
             effect,
         } = event;
+        let source_pane_id = match source_pane_id {
+            Some(source_pane_id) => {
+                if let Some((scope, pane_id)) = decode_scoped_pane_id(&source_pane_id) {
+                    if scope != self.binding.scope {
+                        return;
+                    }
+                    Some(pane_id)
+                } else {
+                    Some(source_pane_id)
+                }
+            }
+            None => None,
+        };
         match effect {
             TerminalSideEffect::Bell => effects.push(AppEffect::Bell),
             TerminalSideEffect::ClipboardWrite(text) => {
@@ -2814,6 +3566,19 @@ impl AppState {
         // Drain the focused pane plus every live sibling in the active native window so background
         // panes keep processing output. For non-native this is just the single attach surface.
         self.last_drain = self.binding.terminal.drain_native_window();
+        for binding in &mut self.inactive_bindings {
+            binding.terminal.drain_native_window();
+            binding.discard_terminal_side_effects();
+        }
+        for space in &mut self.inactive_spaces {
+            for binding in space.bindings_mut() {
+                binding.terminal.drain_native_window();
+                binding.discard_terminal_side_effects();
+            }
+        }
+        if let Some(owner) = &mut self.parked_native_terminal {
+            owner.drain_inactive();
+        }
         self.drain_terminal_side_effects(
             &mut effects,
             terminal_cell_width,
@@ -2842,18 +3607,37 @@ impl AppState {
                 binding.pending_generated_names.clear();
             }
         }
+        for space in &mut self.inactive_spaces {
+            for binding in space.bindings_mut() {
+                if let Some(Err(_)) = binding.mux.poll_command() {
+                    binding.pending_generated_names.clear();
+                }
+            }
+        }
         let active_config = self.binding.multiplexer.clone();
         let _ = self
             .binding
             .mux
             .refresh_sessions(&self.repaint, &active_config);
+        self.binding.restore_persisted_sessions(&self.repaint);
         let mut schedule_mux_refresh = mux_refresh_repaint_after(&active_config).is_some();
         for binding in &mut self.inactive_bindings {
             let _ = binding
                 .mux
                 .refresh_sessions(&self.repaint, &binding.multiplexer);
+            binding.restore_persisted_sessions(&self.repaint);
             binding.sync_session_order();
             schedule_mux_refresh |= mux_refresh_repaint_after(&binding.multiplexer).is_some();
+        }
+        for space in &mut self.inactive_spaces {
+            for binding in space.bindings_mut() {
+                let _ = binding
+                    .mux
+                    .refresh_sessions(&self.repaint, &binding.multiplexer);
+                binding.restore_persisted_sessions(&self.repaint);
+                binding.sync_session_order();
+                schedule_mux_refresh |= mux_refresh_repaint_after(&binding.multiplexer).is_some();
+            }
         }
         if schedule_mux_refresh {
             effects.push(AppEffect::RepaintAfter(MUX_SESSION_REFRESH_INTERVAL));
@@ -2929,6 +3713,7 @@ impl AppState {
         self.keybind_help_dialog = None;
         self.command_palette_dialog = None;
         self.theme_picker_dialog = None;
+        self.space_editor_dialog = None;
         self.terminal_find_dialog = None;
         self.terminal_find_return_focus_after_search = false;
         restored_preview
@@ -2938,6 +3723,43 @@ impl AppState {
         self.close_overlay_dialogs();
         self.new_mux_session_dialog = Some(NewMuxSessionDialog::open());
         self.input_focus = InputFocus::Picker;
+    }
+    pub fn open_create_space_dialog_from_ui(&mut self) -> bool {
+        self.close_overlay_dialogs();
+        let existing_icons = self
+            .space_summaries()
+            .into_iter()
+            .map(|space| space.icon)
+            .collect::<Vec<_>>();
+        self.space_editor_dialog = Some(SpaceEditorDialog::new_space(
+            default_space_icon(&existing_icons),
+            None,
+        ));
+        self.input_focus = InputFocus::Picker;
+        true
+    }
+
+    pub fn open_edit_space_dialog_from_ui(&mut self, space_id: SpaceId) -> bool {
+        let backend = self.space_backend_override(space_id);
+        let Some((space, backend)) = self
+            .space_summaries()
+            .into_iter()
+            .find(|space| space.id == space_id)
+            .zip(backend)
+        else {
+            return false;
+        };
+        self.close_overlay_dialogs();
+        self.space_editor_dialog = Some(SpaceEditorDialog::edit_space(
+            space.id,
+            space.name,
+            space.icon,
+            space.color,
+            space.tint_sidebar,
+            backend,
+        ));
+        self.input_focus = InputFocus::Picker;
+        true
     }
 
     pub fn open_new_session_dialog_from_ui(&mut self) -> bool {
@@ -3130,6 +3952,7 @@ impl AppState {
             && self.keybind_help_dialog.is_none()
             && self.command_palette_dialog.is_none()
             && self.theme_picker_dialog.is_none()
+            && self.space_editor_dialog.is_none()
             && !self.lua_window_open
             && !self.settings_open
     }
@@ -3137,7 +3960,7 @@ impl AppState {
     fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
         let previous = self.config().clone();
         let path = previous.config_path.clone();
-        let mut next = match load_config_from_path(&path) {
+        let next = match load_config_from_path(&path) {
             Ok(config) => config,
             Err(error) => {
                 self.config_state.reject(error.to_string());
@@ -3145,10 +3968,6 @@ impl AppState {
                 return false;
             }
         };
-        let workspace = WorkspaceStore::for_config_path(&next.config_path, &next.multiplexer);
-        if let Some(binding) = workspace.binding() {
-            next.multiplexer = binding.multiplexer_config();
-        }
         let modifier_remaps = match next.input.modifier_remaps() {
             Ok(remaps) => remaps,
             Err(error) => {
@@ -3233,18 +4052,25 @@ impl AppState {
             );
             binding.terminal.set_terminal_config(session_config);
         }
+        if let Some(owner) = &mut self.parked_native_terminal {
+            let mut owner_config = next.clone();
+            owner_config.multiplexer.backend = crate::config::MultiplexerBackendConfig::Native;
+            let session_config = terminal_session_config_with_side_effects(
+                &owner_config,
+                active_appearance_variant,
+                &owner.terminal_side_effect_tx,
+            );
+            owner.terminal.set_terminal_config(session_config);
+        }
         self.has_new_session_config_changes = new_session_only_config_changed(&previous, &next)
             || self.has_new_session_config_changes;
         self.config_state.accept(next);
         self.set_mouse_pointer_hidden_while_typing(self.mouse_pointer_hidden_while_typing, effects);
         let config_path = self.config().config_path.clone();
-        let multiplexer = self.active_multiplexer().clone();
         let binding_id = self.binding.scope.binding_id().persistence_value();
-        self.binding.session_names =
-            SessionNameStore::for_binding(&config_path, &multiplexer, binding_id);
+        self.binding.session_names = SessionNameStore::for_binding(&config_path, binding_id);
         self.binding.pending_generated_names.clear();
-        self.binding.session_order =
-            SessionOrderStore::for_binding(&config_path, &multiplexer, binding_id);
+        self.binding.session_order = SessionOrderStore::for_binding(&config_path, binding_id);
         self.sync_session_order();
         self.last_error = if self.has_new_session_config_changes {
             Some(
@@ -3330,7 +4156,7 @@ impl AppState {
             return false;
         }
 
-        match TerminalRenderSource::is_mouse_tracking(&mut self.binding.terminal) {
+        match TerminalRenderSource::is_mouse_tracking(self.binding.terminal.as_mut()) {
             Ok(mouse_tracking) => mouse_tracking,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -3348,16 +4174,19 @@ impl AppState {
         for action in actions {
             let result = match action {
                 TerminalSelectionAction::Begin(event) => {
-                    TerminalRenderSource::begin_selection(&mut self.binding.terminal, event)
+                    TerminalRenderSource::begin_selection(self.binding.terminal.as_mut(), event)
                 }
                 TerminalSelectionAction::Scroll(delta) => {
-                    TerminalRenderSource::scroll_viewport_delta(&mut self.binding.terminal, delta)
+                    TerminalRenderSource::scroll_viewport_delta(
+                        self.binding.terminal.as_mut(),
+                        delta,
+                    )
                 }
                 TerminalSelectionAction::Update(event) => {
-                    TerminalRenderSource::update_selection(&mut self.binding.terminal, event)
+                    TerminalRenderSource::update_selection(self.binding.terminal.as_mut(), event)
                 }
                 TerminalSelectionAction::End(event) => {
-                    TerminalRenderSource::end_selection(&mut self.binding.terminal, event)
+                    TerminalRenderSource::end_selection(self.binding.terminal.as_mut(), event)
                 }
             };
             match result {
@@ -3369,7 +4198,7 @@ impl AppState {
     }
 
     fn terminal_copy_mode_active(&mut self) -> bool {
-        match TerminalRenderSource::copy_mode_active(&mut self.binding.terminal) {
+        match TerminalRenderSource::copy_mode_active(self.binding.terminal.as_mut()) {
             Ok(active) => active,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -3379,7 +4208,7 @@ impl AppState {
     }
 
     fn enter_terminal_copy_mode(&mut self, effects: &mut Vec<AppEffect>) {
-        match TerminalRenderSource::enter_copy_mode(&mut self.binding.terminal) {
+        match TerminalRenderSource::enter_copy_mode(self.binding.terminal.as_mut()) {
             Ok(()) => effects.push(AppEffect::RequestRepaint),
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -3437,7 +4266,8 @@ impl AppState {
             | TerminalCopyModeAction::SearchWord(direction) => Some(*direction),
             _ => None,
         };
-        match TerminalRenderSource::handle_copy_mode_action(&mut self.binding.terminal, action) {
+        match TerminalRenderSource::handle_copy_mode_action(self.binding.terminal.as_mut(), action)
+        {
             Ok(outcome) => {
                 if let Some(bytes) = outcome.copied {
                     let text = String::from_utf8_lossy(&bytes);
@@ -3796,6 +4626,33 @@ impl AppState {
             KeybindAction::App(AppAction::DitchSession) => {
                 self.open_ditch_session_dialog();
                 effects.push(AppEffect::RequestRepaint);
+            }
+            KeybindAction::App(AppAction::EditSpace) => {
+                self.open_edit_space_dialog_from_ui(self.active_space_id);
+                effects.push(AppEffect::RequestRepaint);
+            }
+            KeybindAction::App(AppAction::CreateSpace) => {
+                self.open_create_space_dialog_from_ui();
+                effects.push(AppEffect::RequestRepaint);
+            }
+            KeybindAction::App(AppAction::CloseSpace) => {
+                self.close_space_from_ui(self.active_space_id);
+                effects.push(AppEffect::RequestRepaint);
+            }
+            KeybindAction::App(AppAction::NextSpace) => {
+                if self.activate_relative_space(1) {
+                    effects.push(AppEffect::RequestRepaint);
+                }
+            }
+            KeybindAction::App(AppAction::PreviousSpace) => {
+                if self.activate_relative_space(-1) {
+                    effects.push(AppEffect::RequestRepaint);
+                }
+            }
+            KeybindAction::App(AppAction::SelectSpace(index)) => {
+                if self.select_space(index) {
+                    effects.push(AppEffect::RequestRepaint);
+                }
             }
             KeybindAction::App(AppAction::ShowKeybinds) => {
                 self.open_keybind_help_dialog();
@@ -4325,7 +5182,7 @@ impl AppState {
         direction: TerminalSearchDirection,
     ) -> TerminalFindResult {
         match TerminalRenderSource::handle_copy_mode_action(
-            &mut self.binding.terminal,
+            self.binding.terminal.as_mut(),
             TerminalCopyModeAction::Search {
                 query: query.to_owned(),
                 direction,
@@ -4490,6 +5347,7 @@ fn run_ditch_cleanup(cwd: Option<&str>, action: &DitchAction) -> Result<(), Stri
 mod tests {
     use super::*;
     use crate::config::{MultiplexerBackendConfig, WindowFullscreen};
+    use crate::mux::{backend::MuxBackend, command::MuxCommand, native::NativeBackend};
     use anyhow::Context;
     use std::{
         sync::atomic::{AtomicU64, Ordering},
@@ -5694,6 +6552,26 @@ mod tests {
     }
 
     #[test]
+    fn persisted_session_restore_waits_for_an_empty_completed_rmux_refresh() {
+        assert_eq!(
+            persisted_session_restore_decision(MultiplexerBackendConfig::Native, false, true),
+            PersistedSessionRestoreDecision::Restore
+        );
+        assert_eq!(
+            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, false, false),
+            PersistedSessionRestoreDecision::Wait
+        );
+        assert_eq!(
+            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, true, true),
+            PersistedSessionRestoreDecision::Skip
+        );
+        assert_eq!(
+            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, true, false),
+            PersistedSessionRestoreDecision::Restore
+        );
+    }
+
+    #[test]
     fn generated_name_sync_skips_unchanged_sessions_and_reruns_on_change() {
         // Guards the fix for the per-frame `git` fork: the reconciler must not repeat its
         // per-session worktree lookups while the session set is unchanged, but must re-run when a
@@ -5760,10 +6638,18 @@ mod tests {
         let second_window = second.window_id("$1".to_owned(), "@1".to_owned());
         let first_pane = first.pane_id(first_window.clone(), "%1");
         let second_pane = second.pane_id(second_window.clone(), "%1");
-        let first_transition =
-            scoped_terminal_transition_key(first.scope, MultiplexerBackendConfig::Tmux, "$1", Some("%1"));
-        let second_transition =
-            scoped_terminal_transition_key(second.scope, MultiplexerBackendConfig::Tmux, "$1", Some("%1"));
+        let first_transition = scoped_terminal_transition_key(
+            first.scope,
+            MultiplexerBackendConfig::Tmux,
+            "$1",
+            Some("%1"),
+        );
+        let second_transition = scoped_terminal_transition_key(
+            second.scope,
+            MultiplexerBackendConfig::Tmux,
+            "$1",
+            Some("%1"),
+        );
 
         first
             .terminal_side_effect_tx
@@ -6035,7 +6921,7 @@ mod tests {
             config_path: config_dir.join("config.toml"),
             ..BoottyConfig::default()
         };
-        let workspace = WorkspaceStore::for_config_path(&config.config_path, &config.multiplexer);
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
         let space_id = workspace
             .binding()
             .expect("default binding")
@@ -6061,6 +6947,936 @@ mod tests {
         assert_ne!(groups[0].label, groups[1].label);
         assert!(groups[0].active);
         assert!(!groups[1].active);
+    }
+
+    #[test]
+    fn creating_space_activates_it_and_survives_state_recreation() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-create-space-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config.clone(), repaint.clone(), None, None).expect("state");
+        let first_space = state.active_space_id();
+
+        assert!(!state.create_space_from_ui(
+            "   ",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        assert!(state.create_space_from_ui(
+            "Review",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let review_space = state.active_space_id();
+        assert_ne!(review_space, first_space);
+        assert_eq!(state.mux_scope().space_id(), review_space);
+        assert_eq!(
+            state
+                .space_summaries()
+                .iter()
+                .map(|space| (space.name.as_str(), space.active))
+                .collect::<Vec<_>>(),
+            vec![("Default Space", false), ("Review", true)]
+        );
+
+        drop(state);
+        let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
+        assert_eq!(
+            reopened
+                .space_summaries()
+                .iter()
+                .map(|space| space.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Default Space", "Review"]
+        );
+        assert!(reopened.activate_space_from_ui(review_space));
+        assert_eq!(reopened.active_space_id(), review_space);
+        assert_eq!(reopened.mux_scope().space_id(), review_space);
+    }
+
+    #[test]
+    fn space_editor_events_create_and_edit_persist_through_recreation() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-space-edit-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config.clone(), repaint.clone(), None, None).expect("state");
+        let default_space = state.active_space_id();
+
+        state.apply_space_editor_event(
+            SpaceEditorDialog::new_space(
+                "phosphor:alarm".to_owned(),
+                Some(MultiplexerBackendConfig::Native),
+            ),
+            SpaceEditorEvent::Save {
+                space_id: None,
+                name: "Review".to_owned(),
+                icon: "terminal".to_owned(),
+                color: [1, 2, 3],
+                tint_sidebar: true,
+                backend: Some(MultiplexerBackendConfig::Rmux),
+            },
+        );
+        let review_space = state.active_space_id();
+        assert_eq!(state.multiplexer_backend(), MultiplexerBackendConfig::Rmux);
+        state.apply_space_editor_event(
+            SpaceEditorDialog::edit_space(
+                review_space,
+                "Review".to_owned(),
+                "terminal".to_owned(),
+                [1, 2, 3],
+                true,
+                Some(MultiplexerBackendConfig::Rmux),
+            ),
+            SpaceEditorEvent::Save {
+                space_id: Some(review_space),
+                name: "Planning".to_owned(),
+                icon: "calendar".to_owned(),
+                color: [4, 5, 6],
+                tint_sidebar: false,
+                backend: Some(MultiplexerBackendConfig::Zellij),
+            },
+        );
+        assert_eq!(
+            state
+                .space_summaries()
+                .iter()
+                .find(|space| space.id == review_space)
+                .map(|space| {
+                    (
+                        space.name.as_str(),
+                        space.icon.as_str(),
+                        space.color,
+                        space.tint_sidebar,
+                    )
+                }),
+            Some(("Planning", "calendar", [4, 5, 6], false))
+        );
+        assert_eq!(
+            state.multiplexer_backend(),
+            MultiplexerBackendConfig::Zellij
+        );
+
+        drop(state);
+        let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
+        assert_eq!(
+            reopened
+                .space_summaries()
+                .iter()
+                .find(|space| space.id == review_space)
+                .map(|space| {
+                    (
+                        space.name.as_str(),
+                        space.icon.as_str(),
+                        space.color,
+                        space.tint_sidebar,
+                    )
+                }),
+            Some(("Planning", "calendar", [4, 5, 6], false))
+        );
+        assert!(reopened.activate_space_from_ui(review_space));
+        assert_eq!(
+            reopened.multiplexer_backend(),
+            MultiplexerBackendConfig::Zellij
+        );
+        assert!(reopened.close_space_from_ui(review_space));
+        assert_eq!(reopened.active_space_id(), default_space);
+        assert!(!reopened.close_space_from_ui(default_space));
+    }
+
+    #[test]
+    fn inherited_space_backend_resolves_the_current_global_backend_after_restart() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-inherit-space-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let mut config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state =
+            AppState::new(config.clone(), repaint.clone(), None, None).expect("native state");
+        let default_space = state.active_space_id();
+
+        assert!(state.create_space_from_ui(
+            "Override",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let override_space = state.active_space_id();
+        assert!(state.update_space_from_ui(
+            override_space,
+            "Override",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            Some(MultiplexerBackendConfig::Native),
+        ));
+        drop(state);
+
+        config.multiplexer.backend = MultiplexerBackendConfig::Tmux;
+        let mut reopened = AppState::new(config, repaint, None, None).expect("tmux state");
+        assert_eq!(reopened.active_space_id(), default_space);
+        assert_eq!(
+            reopened.multiplexer_backend(),
+            MultiplexerBackendConfig::Tmux
+        );
+        assert!(reopened.activate_space_from_ui(override_space));
+        assert_eq!(
+            reopened.multiplexer_backend(),
+            MultiplexerBackendConfig::Native
+        );
+        assert!(reopened.update_space_from_ui(
+            override_space,
+            "Override",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            None,
+        ));
+        assert_eq!(
+            reopened.multiplexer_backend(),
+            MultiplexerBackendConfig::Tmux
+        );
+    }
+
+    #[test]
+    fn native_sessions_rebuild_from_binding_metadata_without_cross_space_adoption() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-native-restore-{unique}"));
+        let cwd = config_dir.join("shared");
+        std::fs::create_dir_all(&cwd).expect("create shared cwd");
+        let mut config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state =
+            AppState::new(config.clone(), repaint.clone(), None, None).expect("native state");
+        let first_space = state.active_space_id();
+        state.create_project_session_for_cwd(cwd.to_string_lossy().into_owned());
+        let first_session = state
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| Some(session.id.as_str()) == state.binding.mux.selected_session())
+            .expect("selected first session")
+            .clone();
+
+        assert!(state.create_space_from_ui(
+            "Second",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let second_space = state.active_space_id();
+        state.create_project_session_for_cwd(cwd.to_string_lossy().into_owned());
+        let second_session = state
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| Some(session.id.as_str()) == state.binding.mux.selected_session())
+            .expect("selected second session")
+            .clone();
+        assert_ne!(first_session.id, second_session.id);
+        drop(state);
+
+        let mut native = NativeBackend::new();
+        for session_id in [&first_session.id, &second_session.id] {
+            native
+                .execute(MuxCommand::DitchSession {
+                    session_id: session_id.clone(),
+                })
+                .expect("clear process-local native session");
+        }
+
+        let mut reopened = AppState::new(config, repaint, None, None).expect("restored state");
+        assert_eq!(
+            reopened
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_session.id.as_str()]
+        );
+        assert!(reopened.activate_space_from_ui(second_space));
+        assert_eq!(
+            reopened
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![second_session.id.as_str()]
+        );
+        assert!(reopened.activate_space_from_ui(first_space));
+    }
+
+    #[test]
+    fn space_transition_progresses_deterministically() {
+        let started = Instant::now();
+        let transition = SpaceTransition {
+            from: SpaceId::from_persistence(1),
+            to: SpaceId::from_persistence(2),
+            started,
+        };
+
+        assert_eq!(transition.progress_at(started), 0.0);
+        assert!(
+            (transition.progress_at(started + SpaceTransition::DURATION / 2) - 0.5).abs() < 0.01
+        );
+        assert_eq!(
+            transition.progress_at(started + SpaceTransition::DURATION * 2),
+            1.0
+        );
+    }
+
+    #[test]
+    fn empty_new_space_ignores_shared_backend_sessions_after_refresh_and_recreation() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-empty-space-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config.clone(), repaint.clone(), None, None).expect("state");
+
+        let session_cwd = config_dir.join("existing-session");
+        std::fs::create_dir_all(&session_cwd).expect("create existing session directory");
+        state.create_project_session_for_cwd(session_cwd.to_string_lossy().into_owned());
+        state.sync_session_order();
+
+        assert!(state.create_space_from_ui(
+            "Empty",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let empty_space = state.active_space_id();
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert!(state.binding.mux.sessions().is_empty());
+
+        drop(state);
+        let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
+        assert!(reopened.activate_space_from_ui(empty_space));
+        reopened.update_frame(test_frame_inputs(Vec::new(), None));
+        assert!(reopened.binding.mux.sessions().is_empty());
+    }
+
+    #[test]
+    fn space_actions_follow_order_without_wrapping() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-space-actions-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let first_space = workspace.spaces()[0].id();
+        let conn = crate::workspace::open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 2)",
+            ["Last Space"],
+        )
+        .expect("insert last space");
+        let last_space = SpaceId::from_persistence(conn.last_insert_rowid());
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Middle Space"],
+        )
+        .expect("insert middle space");
+        let middle_space = SpaceId::from_persistence(conn.last_insert_rowid());
+        for (space_id, name) in [
+            (middle_space, "Middle Binding"),
+            (last_space, "Last Binding"),
+        ] {
+            conn.execute(
+                "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![space_id.persistence_value(), name, "native", 0_i64],
+            )
+            .expect("insert space binding");
+        }
+
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let mut effects = Vec::new();
+        assert_eq!(
+            state
+                .space_summaries()
+                .into_iter()
+                .map(|space| space.id)
+                .collect::<Vec<_>>(),
+            vec![first_space, middle_space, last_space]
+        );
+        let active_space = state
+            .space_summaries()
+            .into_iter()
+            .find(|space| space.active)
+            .expect("active space");
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::EditSpace),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        assert_eq!(
+            state.take_space_editor_dialog(),
+            Some(SpaceEditorDialog::edit_space(
+                active_space.id,
+                active_space.name,
+                active_space.icon,
+                active_space.color,
+                active_space.tint_sidebar,
+                None,
+            ))
+        );
+
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::PreviousSpace),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        assert_eq!(state.active_space_id(), first_space);
+
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::NextSpace),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        assert_eq!(state.active_space_id(), middle_space);
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::NextSpace),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        assert_eq!(state.active_space_id(), last_space);
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::NextSpace),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        assert_eq!(state.active_space_id(), last_space);
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::PreviousSpace),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        assert_eq!(state.active_space_id(), middle_space);
+    }
+
+    #[test]
+    fn switching_spaces_replaces_the_full_window_binding_context() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-multi-space-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let first_space = workspace.spaces()[0].id();
+        let conn = crate::workspace::open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Review Space"],
+        )
+        .expect("insert second space");
+        let second_space = SpaceId::from_persistence(conn.last_insert_rowid());
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                second_space.persistence_value(),
+                "Review Binding",
+                "native",
+                0_i64
+            ],
+        )
+        .expect("insert second space binding");
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let other_window =
+            AppState::new(config.clone(), repaint.clone(), None, None).expect("other state");
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let first_scope = state.binding.scope;
+        let first_config = state.binding.multiplexer.clone();
+        state.binding.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: "$1".to_owned(),
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            },
+            &state.repaint,
+            &first_config,
+        );
+        let second_runtime = state
+            .inactive_spaces
+            .iter_mut()
+            .find(|space| space.id == second_space)
+            .expect("second space runtime");
+        let second_scope = second_runtime.binding.scope;
+        let second_config = second_runtime.binding.multiplexer.clone();
+        second_runtime.binding.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: "$1".to_owned(),
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            },
+            &state.repaint,
+            &second_config,
+        );
+        second_runtime
+            .binding
+            .terminal_side_effect_tx
+            .send(TerminalSideEffectEvent::new(None, TerminalSideEffect::Bell))
+            .expect("queue inactive Space side effect");
+
+        let spaces = state.space_summaries();
+        assert_eq!(spaces.len(), 2);
+        assert_eq!(spaces[0].id, first_space);
+        assert_eq!(spaces[0].name, "Default Space");
+        assert!(spaces[0].active);
+        assert_eq!(spaces[1].id, second_space);
+        assert_eq!(spaces[1].name, "Review Space");
+        assert!(!spaces[1].active);
+        assert!(
+            state
+                .binding_session_groups()
+                .iter()
+                .all(|group| group.scope.space_id() == first_space)
+        );
+        assert_eq!(state.binding_session_groups()[0].scope, first_scope);
+        assert!(
+            state.binding_session_groups()[0]
+                .sessions
+                .iter()
+                .any(|session| session.id == "$1")
+        );
+
+        assert!(state.open_ditch_session_dialog_for("$1"));
+        assert!(state.ditch_session_dialog.is_some());
+        assert!(state.activate_space_from_ui(second_space));
+        assert!(state.ditch_session_dialog.is_none());
+        state
+            .binding
+            .terminal_side_effect_tx
+            .send(TerminalSideEffectEvent::new(None, TerminalSideEffect::Bell))
+            .expect("queue active Space side effect");
+        let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, AppEffect::Bell))
+                .count(),
+            1,
+            "inactive Space side effects must not replay after activation"
+        );
+
+        assert_eq!(state.active_space_id(), second_space);
+        assert!(
+            state
+                .binding_session_groups()
+                .iter()
+                .all(|group| group.scope.space_id() == second_space)
+        );
+        assert_eq!(state.binding_session_groups()[0].scope, second_scope);
+        assert!(
+            state.binding_session_groups()[0]
+                .sessions
+                .iter()
+                .any(|session| session.id == "$1")
+        );
+        assert_eq!(other_window.active_space_id(), first_space);
+        assert!(state.binding.mux.poll_command().is_none());
+        assert!(
+            state
+                .inactive_spaces
+                .iter_mut()
+                .find(|space| space.id == first_space)
+                .expect("first Space remains available")
+                .bindings_mut()
+                .all(|binding| binding.mux.poll_command().is_none())
+        );
+        assert_eq!(state.binding_count(), 1);
+    }
+
+    #[test]
+    fn spaces_filter_shared_backend_sessions_by_persisted_binding_membership() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-space-membership-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let first_space = workspace.spaces()[0].id();
+        let conn = crate::workspace::open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "UPDATE workspace_bindings SET backend = 'native' WHERE space_id = ?1",
+            [first_space.persistence_value()],
+        )
+        .expect("make first Space native");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Second Space"],
+        )
+        .expect("insert second space");
+        let second_space = SpaceId::from_persistence(conn.last_insert_rowid());
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                second_space.persistence_value(),
+                "Second Space Binding",
+                "native",
+                0_i64
+            ],
+        )
+        .expect("insert second Space binding");
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config.clone(), repaint.clone(), None, None).expect("state");
+
+        let shared_cwd = config_dir.join("shared");
+        std::fs::create_dir_all(&shared_cwd).expect("create shared session directory");
+        state.create_project_session_for_cwd(shared_cwd.to_string_lossy().into_owned());
+        state.sync_session_order();
+        let first_name = state.binding.mux.sessions()[0].name.clone();
+
+        assert!(state.activate_space_from_ui(second_space));
+        state.create_project_session_for_cwd(shared_cwd.to_string_lossy().into_owned());
+        state.create_project_session_for_cwd(shared_cwd.to_string_lossy().into_owned());
+        state.sync_session_order();
+        let second_names = state
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(second_names.len(), 2);
+        assert_ne!(second_names[0], second_names[1]);
+        assert!(second_names.iter().all(|name| name != &first_name));
+
+        drop(state);
+        let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
+        reopened.update_frame(test_frame_inputs(Vec::new(), None));
+        assert_eq!(
+            reopened
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![first_name.as_str()]
+        );
+
+        assert!(reopened.activate_space_from_ui(second_space));
+        reopened.update_frame(test_frame_inputs(Vec::new(), None));
+        assert_eq!(
+            reopened
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.clone())
+                .collect::<Vec<_>>(),
+            second_names
+        );
+    }
+
+    #[test]
+    fn native_terminal_owner_survives_space_switches_through_non_native_backend() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-native-space-owner-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let first_space = workspace.spaces()[0].id();
+        let conn = crate::workspace::open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "UPDATE workspace_bindings SET backend = 'native' WHERE space_id = ?1",
+            [first_space.persistence_value()],
+        )
+        .expect("make first space native");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Remote Space"],
+        )
+        .expect("insert non-native space");
+        let remote_space = SpaceId::from_persistence(conn.last_insert_rowid());
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                remote_space.persistence_value(),
+                "Remote Binding",
+                "rmux",
+                0_i64
+            ],
+        )
+        .expect("insert non-native binding");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 2)",
+            ["Second Native Space"],
+        )
+        .expect("insert second native space");
+        let second_native_space = SpaceId::from_persistence(conn.last_insert_rowid());
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                second_native_space.persistence_value(),
+                "Second Native Binding",
+                "native",
+                0_i64
+            ],
+        )
+        .expect("insert second native binding");
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let native_terminal = std::ptr::from_ref(state.binding.terminal.as_ref());
+        let native_side_effect_tx = state.binding.terminal_side_effect_tx.clone();
+        let first_scope = state.binding.scope;
+        let first_config = state.binding.multiplexer.clone();
+        state.binding.session_order.add_session("$1");
+        state.binding.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: "$1".to_owned(),
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            },
+            &state.repaint,
+            &first_config,
+        );
+        let first_anchor = state
+            .binding
+            .mux
+            .selected_session_anchor()
+            .expect("first native Space anchor")
+            .clone();
+        let repaint = state.repaint.clone();
+        let (second_scope, second_anchor) = {
+            let second_runtime = state
+                .inactive_spaces
+                .iter_mut()
+                .find(|space| space.id == second_native_space)
+                .expect("second native Space runtime");
+            let second_config = second_runtime.binding.multiplexer.clone();
+            second_runtime.binding.session_order.add_session("$1");
+            second_runtime.binding.mux.create_project_session(
+                crate::mux::controller::NewMuxSessionRequest {
+                    session_id: "$1".to_owned(),
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                },
+                &repaint,
+                &second_config,
+            );
+            (
+                second_runtime.binding.scope,
+                second_runtime
+                    .binding
+                    .mux
+                    .selected_session_anchor()
+                    .expect("second native Space anchor")
+                    .clone(),
+            )
+        };
+        assert_eq!(first_anchor.session_id, second_anchor.session_id);
+        assert_eq!(first_anchor.pane_id, second_anchor.pane_id);
+        state
+            .sync_terminal_panes()
+            .expect("sync first native Space terminal");
+        assert_eq!(state.binding.terminal.active_mux_scope(), Some(first_scope));
+
+        assert!(state.activate_space_from_ui(remote_space));
+        native_side_effect_tx
+            .send(TerminalSideEffectEvent::new(
+                Some("%1".to_owned()),
+                TerminalSideEffect::WindowTitle("inactive native owner".to_owned()),
+            ))
+            .expect("send inactive native side effect");
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert!(state.activate_space_from_ui(second_native_space));
+        assert_eq!(
+            state.binding.terminal.active_mux_scope(),
+            Some(second_scope),
+            "colliding native IDs must retarget to the selected Space scope"
+        );
+        native_side_effect_tx
+            .send(TerminalSideEffectEvent::new(
+                Some(crate::mux::terminal::encode_scoped_pane_id(
+                    first_scope,
+                    "%1",
+                )),
+                TerminalSideEffect::Bell,
+            ))
+            .expect("send inactive scoped side effect");
+        native_side_effect_tx
+            .send(TerminalSideEffectEvent::new(
+                Some(crate::mux::terminal::encode_scoped_pane_id(
+                    second_scope,
+                    "%1",
+                )),
+                TerminalSideEffect::Bell,
+            ))
+            .expect("send active scoped side effect");
+        let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, AppEffect::Bell))
+                .count(),
+            1,
+            "only side effects from the selected native Space may reach the host"
+        );
+        assert!(
+            state.binding.terminal_side_effect_rx.try_recv().is_err(),
+            "inactive native side effects must not leak into the newly active Space"
+        );
+
+        assert_eq!(
+            std::ptr::from_ref(state.binding.terminal.as_ref()),
+            native_terminal,
+            "the single native terminal must follow the active native Space"
+        );
+
+        assert!(state.activate_space_from_ui(first_space));
+        assert_eq!(state.binding.terminal.active_mux_scope(), Some(first_scope));
+        assert_eq!(
+            std::ptr::from_ref(state.binding.terminal.as_ref()),
+            native_terminal,
+            "direct native Space switches must retain the same terminal owner"
+        );
+        native_side_effect_tx
+            .send(TerminalSideEffectEvent::new(
+                Some("%1".to_owned()),
+                TerminalSideEffect::WindowTitle("native owner".to_owned()),
+            ))
+            .expect("send native side effect after Space switches");
+        assert!(matches!(
+            state.binding.terminal_side_effect_rx.try_recv(),
+            Ok(TerminalSideEffectEvent {
+                effect: TerminalSideEffect::WindowTitle(title),
+                ..
+            }) if title == "native owner"
+        ));
+    }
+
+    #[test]
+    fn native_terminal_owner_survives_binding_switch_within_space() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-native-binding-owner-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let space_id = workspace.spaces()[0].id();
+        let conn = crate::workspace::open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "UPDATE workspace_bindings SET backend = 'native' WHERE space_id = ?1",
+            [space_id.persistence_value()],
+        )
+        .expect("make first binding native");
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                space_id.persistence_value(),
+                "Other Native",
+                "native",
+                0_i64
+            ],
+        )
+        .expect("insert second native binding");
+        let other_binding = BindingId::from_persistence(conn.last_insert_rowid());
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let native_terminal = std::ptr::from_ref(state.binding.terminal.as_ref());
+        let first_scope = state.binding.scope;
+        let first_config = state.binding.multiplexer.clone();
+        state.binding.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: "$1".to_owned(),
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            },
+            &state.repaint,
+            &first_config,
+        );
+        let first_anchor = state
+            .binding
+            .mux
+            .selected_session_anchor()
+            .expect("first native binding anchor")
+            .clone();
+        let repaint = state.repaint.clone();
+        let (second_scope, second_anchor) = {
+            let second = state
+                .inactive_bindings
+                .iter_mut()
+                .find(|binding| binding.scope.binding_id() == other_binding)
+                .expect("second native binding runtime");
+            let second_config = second.multiplexer.clone();
+            second.mux.create_project_session(
+                crate::mux::controller::NewMuxSessionRequest {
+                    session_id: "$1".to_owned(),
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                },
+                &repaint,
+                &second_config,
+            );
+            (
+                second.scope,
+                second
+                    .mux
+                    .selected_session_anchor()
+                    .expect("second native binding anchor")
+                    .clone(),
+            )
+        };
+        assert_eq!(first_anchor.session_id, second_anchor.session_id);
+        assert_eq!(first_anchor.pane_id, second_anchor.pane_id);
+        state
+            .sync_terminal_panes()
+            .expect("sync first native binding terminal");
+        assert_eq!(state.binding.terminal.active_mux_scope(), Some(first_scope));
+        let target = ScopedSessionTarget::new(second_scope, "$1");
+
+        assert!(state.activate_scoped_session_from_ui(&target));
+        assert_eq!(
+            state.binding.terminal.active_mux_scope(),
+            Some(second_scope)
+        );
+        assert_eq!(
+            std::ptr::from_ref(state.binding.terminal.as_ref()),
+            native_terminal,
+            "native bindings in one Space must share the terminal owner"
+        );
     }
 
     #[test]
@@ -6612,6 +8428,7 @@ mod tests {
         let unique = unique_test_id();
         let alpha = format!("alpha-{unique}");
         let beta = format!("beta-{unique}");
+        state.binding.session_order.add_session(&alpha);
         state.binding.mux.create_project_session(
             crate::mux::controller::NewMuxSessionRequest {
                 session_id: alpha.clone(),
@@ -6620,6 +8437,7 @@ mod tests {
             &state.repaint,
             &mux_config,
         );
+        state.binding.session_order.add_session(&beta);
         state.binding.mux.create_project_session(
             crate::mux::controller::NewMuxSessionRequest {
                 session_id: beta.clone(),
@@ -6664,6 +8482,8 @@ mod tests {
             &state.repaint,
             &mux_config,
         );
+
+        assert_eq!(state.mux().selected_session(), Some(second.as_str()));
 
         state.open_rename_session_dialog_for(&first);
 
@@ -6742,6 +8562,7 @@ mod tests {
         let mux_config = state.config().multiplexer.clone();
         let first = format!("context-move-session-first-{}", unique_test_id());
         let second = format!("context-move-session-second-{}", unique_test_id());
+        state.binding.session_order.add_session(&first);
         state.binding.mux.create_project_session(
             crate::mux::controller::NewMuxSessionRequest {
                 session_id: first.clone(),
@@ -6750,6 +8571,7 @@ mod tests {
             &state.repaint,
             &mux_config,
         );
+        state.binding.session_order.add_session(&second);
         state.binding.mux.create_project_session(
             crate::mux::controller::NewMuxSessionRequest {
                 session_id: second.clone(),
@@ -6758,6 +8580,7 @@ mod tests {
             &state.repaint,
             &mux_config,
         );
+        state.binding.sync_session_order();
         let before = state
             .binding
             .mux
@@ -7116,6 +8939,7 @@ mod tests {
         let mut state = test_state();
         let mux_config = state.config().multiplexer.clone();
         let session_id = format!("palette-move-tab-{}", unique_test_id());
+        state.binding.session_order.add_session(&session_id);
         state.binding.mux.create_project_session(
             crate::mux::controller::NewMuxSessionRequest {
                 session_id,

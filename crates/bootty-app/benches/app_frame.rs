@@ -199,6 +199,7 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, sessions: &[MuxSession], selected: Option
                     title_icon: None,
                     top_inset: 0.0,
                     border_visible: true,
+                    border_bottom: true,
                     separator_visible: true,
                     focused: false,
                     hovered_session: None,

@@ -419,9 +419,13 @@ function ui.footer_meter(spec)
 			color = spec.text_color,
 			align = "left_center",
 		}),
-		ui.rect({ x = 0, x_px = 0, y = 0, y_px = 17, w = 1, h = 0, h_px = 4, radius = 2, fill = spec.track }),
-		ui.rect({ x = 0, x_px = 0, y = 0, y_px = 17, w = fill, h = 0, h_px = 4, radius = 2, fill = spec.color }),
 	}
+	if spec.track then
+		primitives[#primitives + 1] =
+			ui.rect({ x = 0, x_px = 0, y = 0, y_px = 17, w = 1, h = 0, h_px = 4, radius = 2, fill = spec.track })
+	end
+	primitives[#primitives + 1] =
+		ui.rect({ x = 0, x_px = 0, y = 0, y_px = 17, w = fill, h = 0, h_px = 4, radius = 2, fill = spec.color })
 	if spec.pace and spec.pace ~= "" then
 		primitives[#primitives + 1] = ui.text(spec.pace, {
 			x = 1,

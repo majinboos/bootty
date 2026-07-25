@@ -1897,7 +1897,7 @@ mod tests {
             cols: 121,
             ..geometry
         };
-        TerminalRenderSource::resize(&mut restored, resized).unwrap();
+        TerminalRenderSource::resize(restored.as_mut(), resized).unwrap();
 
         assert_eq!(resize_calls.lock().unwrap().as_slice(), &[resized]);
         assert!(!terminal.native_terminals.contains_key(&target));

@@ -33,6 +33,12 @@ pub enum AppAction {
     RenameSession,
     RenameTab,
     DitchSession,
+    CreateSpace,
+    CloseSpace,
+    EditSpace,
+    NextSpace,
+    PreviousSpace,
+    SelectSpace(u32),
     ShowKeybinds,
 }
 
@@ -413,6 +419,12 @@ fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
         BindingAction::TogglePaneZoom => Ok(KeybindAction::Mux(MuxKeyAction::TogglePaneZoom)),
         BindingAction::NextSession => Ok(KeybindAction::Mux(MuxKeyAction::NextSession)),
         BindingAction::PreviousSession => Ok(KeybindAction::Mux(MuxKeyAction::PreviousSession)),
+        BindingAction::CreateSpace => Ok(KeybindAction::App(AppAction::CreateSpace)),
+        BindingAction::EditSpace => Ok(KeybindAction::App(AppAction::EditSpace)),
+        BindingAction::CloseSpace => Ok(KeybindAction::App(AppAction::CloseSpace)),
+        BindingAction::NextSpace => Ok(KeybindAction::App(AppAction::NextSpace)),
+        BindingAction::PreviousSpace => Ok(KeybindAction::App(AppAction::PreviousSpace)),
+        BindingAction::SelectSpace(index) => Ok(KeybindAction::App(AppAction::SelectSpace(index))),
         BindingAction::LastSession => Ok(KeybindAction::Mux(MuxKeyAction::LastSession)),
         BindingAction::SelectSession(index) => {
             Ok(KeybindAction::Mux(MuxKeyAction::SelectSession(index)))
@@ -1309,6 +1321,62 @@ mod tests {
             keybind_action_for_name("rename_tab"),
             Some(KeybindAction::App(AppAction::RenameTab))
         );
+    }
+    #[test]
+    fn command_palette_action_resolves_space_commands() {
+        assert_eq!(
+            keybind_action_for_name("create_space"),
+            Some(KeybindAction::App(AppAction::CreateSpace))
+        );
+        assert_eq!(
+            keybind_action_for_name("edit_space"),
+            Some(KeybindAction::App(AppAction::EditSpace))
+        );
+        assert_eq!(
+            keybind_action_for_name("close_space"),
+            Some(KeybindAction::App(AppAction::CloseSpace))
+        );
+        assert_eq!(
+            keybind_action_for_name("next_space"),
+            Some(KeybindAction::App(AppAction::NextSpace))
+        );
+        assert_eq!(
+            keybind_action_for_name("previous_space"),
+            Some(KeybindAction::App(AppAction::PreviousSpace))
+        );
+        assert_eq!(
+            keybind_action_for_name("select_space:2"),
+            Some(KeybindAction::App(AppAction::SelectSpace(2)))
+        );
+    }
+    #[test]
+    fn app_keybindings_resolve_space_actions() {
+        let keybinds = vec![
+            "ctrl+a=next_space".to_owned(),
+            "ctrl+b=previous_space".to_owned(),
+            "ctrl+c=edit_space".to_owned(),
+        ];
+        let mut bindings = AppKeyBindings::from_keybinds(&keybinds).unwrap();
+
+        for (key, unshifted, action) in [
+            (TerminalKey::A, 'a', AppAction::NextSpace),
+            (TerminalKey::B, 'b', AppAction::PreviousSpace),
+            (TerminalKey::C, 'c', AppAction::EditSpace),
+        ] {
+            assert_eq!(
+                bindings.action_for_input(KeyInput {
+                    key,
+                    mods: crate::terminal::KeyMods {
+                        ctrl: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                    utf8: None,
+                    unshifted: Some(unshifted),
+                }),
+                Some(KeybindAction::App(action))
+            );
+        }
     }
 
     #[test]

@@ -36,6 +36,22 @@ pub enum Command {
     )]
     DitchSession,
     #[strum(
+        message = "New Space",
+        detailed_message = "Create and activate a new space"
+    )]
+    CreateSpace,
+    #[strum(message = "Edit Space", detailed_message = "Edit the active space")]
+    EditSpace,
+    #[strum(message = "Close Space", detailed_message = "Close the active space")]
+    CloseSpace,
+    #[strum(message = "Next Space", detailed_message = "Activate the next space")]
+    NextSpace,
+    #[strum(
+        message = "Previous Space",
+        detailed_message = "Activate the previous space"
+    )]
+    PreviousSpace,
+    #[strum(
         message = "Next Session",
         detailed_message = "Activate the next session"
     )]
@@ -235,6 +251,11 @@ pub enum Command {
     )]
     SelectSession,
     #[strum(
+        message = "Select Space",
+        detailed_message = "Jump to space N (value 1–9)"
+    )]
+    SelectSpace,
+    #[strum(
         message = "Move Session",
         detailed_message = "Reorder the current session by N"
     )]
@@ -304,6 +325,11 @@ impl Command {
             Self::SwitchSession => "session_picker",
             Self::RenameSession => "rename_session",
             Self::DitchSession => "ditch_session",
+            Self::CreateSpace => "create_space",
+            Self::EditSpace => "edit_space",
+            Self::CloseSpace => "close_space",
+            Self::NextSpace => "next_space",
+            Self::PreviousSpace => "previous_space",
             Self::NextSession => "next_session",
             Self::PreviousSession => "previous_session",
             Self::LastSession => "last_session",
@@ -347,6 +373,7 @@ impl Command {
             Self::MoveTab => "move_tab",
             Self::SelectPane => "select_pane",
             Self::SelectSession => "select_session",
+            Self::SelectSpace => "select_space",
             Self::MoveSession => "move_session",
             Self::ScrollPageUp => "scroll_page_up",
             Self::ScrollPageDown => "scroll_page_down",
@@ -367,7 +394,12 @@ impl Command {
             Self::SwitchSession => "terminal",
             Self::RenameSession => "pencil",
             Self::DitchSession => "trash-2",
+            Self::CreateSpace => "plus",
+            Self::EditSpace => "pencil",
+            Self::CloseSpace => "x",
             Self::NextSession => "chevron-down",
+            Self::NextSpace => "chevron-right",
+            Self::PreviousSpace => "chevron-left",
             Self::PreviousSession => "chevron-up",
             Self::LastSession => "history",
             Self::NewTab => "plus",
@@ -404,7 +436,7 @@ impl Command {
             Self::CommandPalette => "search",
             Self::CloseWindow => "x",
             Self::Ignore => "ban",
-            Self::SelectTab | Self::SelectSession => "hash",
+            Self::SelectTab | Self::SelectSession | Self::SelectSpace => "hash",
             Self::MoveTab | Self::MoveTabLeft | Self::MoveTabRight => "move-horizontal",
             Self::SelectPane => "layout",
             Self::MoveSession => "move-vertical",
@@ -433,6 +465,7 @@ impl Command {
             | Self::MoveTab
             | Self::SelectPane
             | Self::SelectSession
+            | Self::SelectSpace
             | Self::MoveSession
             | Self::ScrollPageUp
             | Self::ScrollPageDown
@@ -499,5 +532,14 @@ mod tests {
         assert_eq!(Command::MoveTab.palette_action(), None);
         assert_eq!(Command::MoveTabLeft.palette_action(), Some("move_tab:-1"));
         assert_eq!(Command::MoveTabRight.palette_action(), Some("move_tab:1"));
+    }
+    #[test]
+    fn space_commands_are_palette_commands() {
+        assert_eq!(Command::EditSpace.palette_action(), Some("edit_space"));
+        assert_eq!(Command::NextSpace.palette_action(), Some("next_space"));
+        assert_eq!(
+            Command::PreviousSpace.palette_action(),
+            Some("previous_space")
+        );
     }
 }

@@ -48,6 +48,7 @@ fontdb = "0.23"
 iconflow = { version = "1", features = [
   "pack-bootstrap",
   "pack-lucide",
+  "pack-phosphor",
   "pack-tabler",
 ] }
 indoc = "2"
