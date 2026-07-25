@@ -139,6 +139,32 @@ mod tests {
     }
 
     #[test]
+    fn vendored_terminfo_advertises_tmux_progress_bar_cap() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let db_dir = ensure_xterm_bootty_terminfo_in(state.path())?;
+
+        let resolved = Command::new("infocmp")
+            .arg("-x")
+            .env("TERMINFO", &db_dir)
+            .arg(XTERM_BOOTTY)
+            .output()?;
+        assert!(
+            resolved.status.success(),
+            "infocmp could not resolve xterm-bootty: {}",
+            String::from_utf8_lossy(&resolved.stderr)
+        );
+        let entry = String::from_utf8_lossy(&resolved.stdout);
+
+        // tmux forwards OSC 9;4 progress only when Spb resolves, and the
+        // trailing ST is easy to mangle when escaping the terminfo source.
+        assert!(
+            entry.contains(r"Spb=\E]9;4;%p1%d;%p2%d\E\\"),
+            "missing Spb: {entry}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn vendored_terminfo_advertises_only_supported_function_keys() -> Result<()> {
         let state = tempfile::tempdir()?;
         let db_dir = ensure_xterm_bootty_terminfo_in(state.path())?;
