@@ -1,61 +1,14 @@
 use std::{
     collections::HashSet,
-    fs,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
-use rusqlite::{Connection, params};
+use rusqlite::params;
+
+use crate::workspace::{WorkspaceStore, open_db};
 
 fn session_group(name: &str) -> &str {
     name.split_once('/').map_or("", |(group, _)| group)
-}
-
-fn load_lines(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-fn legacy_order_paths(config_path: &Path) -> [PathBuf; 2] {
-    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let bootty_legacy = config_dir.join("session-order");
-    let tmux_legacy = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join(".config/tmux/session-order");
-    [bootty_legacy, tmux_legacy]
-}
-
-fn sqlite_order_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("session-order.sqlite3")
-}
-
-fn open_session_order_db(path: &Path) -> rusqlite::Result<Connection> {
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_millis(250))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_groups (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            position INTEGER NOT NULL UNIQUE
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            name TEXT PRIMARY KEY,
-            group_id INTEGER NOT NULL REFERENCES session_groups(id) ON DELETE CASCADE,
-            position INTEGER NOT NULL
-        );",
-    )?;
-    Ok(conn)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,15 +23,16 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn load_sqlite(path: &Path) -> rusqlite::Result<Self> {
-        let conn = open_session_order_db(path)?;
+    fn load_sqlite(path: &Path, binding_id: i64) -> rusqlite::Result<Self> {
+        let conn = open_db(path)?;
         let mut stmt = conn.prepare(
             "SELECT g.id, g.name, s.name
-             FROM session_groups g
-             JOIN sessions s ON s.group_id = g.id
+             FROM workspace_session_groups g
+             JOIN workspace_sessions s ON s.group_id = g.id
+             WHERE g.binding_id = ?1 AND s.binding_id = ?1
              ORDER BY g.position, s.position",
         )?;
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map([binding_id], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -102,17 +56,6 @@ impl SessionStore {
             }
         }
         Ok(store)
-    }
-
-    fn from_flat_list(names: &[String]) -> Self {
-        let mut store = Self::default();
-        let mut seen = HashSet::new();
-        for name in names {
-            if seen.insert(name.clone()) {
-                store.insert_unique(name);
-            }
-        }
-        store
     }
 
     fn ordered_names(&self) -> Vec<String> {
@@ -154,6 +97,17 @@ impl SessionStore {
                 sessions: vec![name.to_owned()],
             });
         }
+    }
+
+    fn rename_session(&mut self, old: &str, new: &str) -> bool {
+        if old == new || self.existing_names().contains(new) {
+            return false;
+        }
+        let Some((entry_index, session_index)) = self.find_session(old) else {
+            return false;
+        };
+        self.entries[entry_index].sessions[session_index] = new.to_owned();
+        true
     }
 
     fn prune(&mut self, alive: &HashSet<&str>) -> bool {
@@ -287,23 +241,45 @@ impl SessionStore {
             })
     }
 
-    fn save_sqlite(&self, path: &Path) -> rusqlite::Result<()> {
-        let mut conn = open_session_order_db(path)?;
+    fn save_sqlite(&self, path: &Path, binding_id: i64) -> rusqlite::Result<()> {
+        let mut conn = open_db(path)?;
         let tx = conn.transaction()?;
-        tx.execute("DELETE FROM sessions", [])?;
-        tx.execute("DELETE FROM session_groups", [])?;
+        tx.execute(
+            "DELETE FROM workspace_sessions WHERE binding_id = ?1",
+            [binding_id],
+        )?;
+        tx.execute(
+            "DELETE FROM workspace_session_groups WHERE binding_id = ?1",
+            [binding_id],
+        )?;
         {
-            let mut insert_group =
-                tx.prepare("INSERT INTO session_groups (name, position) VALUES (?1, ?2)")?;
-            let mut insert_session =
-                tx.prepare("INSERT INTO sessions (name, group_id, position) VALUES (?1, ?2, ?3)")?;
+            let mut insert_group = tx.prepare(
+                "INSERT INTO workspace_session_groups (binding_id, name, position)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut insert_session = tx.prepare(
+                "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
             for (group_position, group) in self.entries.iter().enumerate() {
-                insert_group.execute(params![group.name, group_position as i64])?;
+                insert_group.execute(params![binding_id, group.name, group_position as i64])?;
                 let group_id = tx.last_insert_rowid();
                 for (session_position, session) in group.sessions.iter().enumerate() {
-                    insert_session.execute(params![session, group_id, session_position as i64])?;
+                    insert_session.execute(params![
+                        binding_id,
+                        session,
+                        group_id,
+                        session_position as i64
+                    ])?;
                 }
             }
+        }
+        if self.entries.is_empty() {
+            tx.execute(
+                "INSERT INTO workspace_session_groups (binding_id, name, position)
+                 VALUES (?1, '', 0)",
+                [binding_id],
+            )?;
         }
         tx.commit()
     }
@@ -311,67 +287,81 @@ impl SessionStore {
 
 #[derive(Debug, Clone)]
 pub struct SessionOrderStore {
-    config_path: PathBuf,
     path: PathBuf,
+    binding_id: Option<i64>,
     store: SessionStore,
-    loaded: bool,
+    membership_initialized: bool,
 }
 
 impl SessionOrderStore {
     pub fn for_config_path(config_path: &Path) -> Self {
-        let path = sqlite_order_path(config_path);
-        let store = Self::load_store(config_path, &path);
+        let workspace = WorkspaceStore::for_config_path(config_path);
+        let path = workspace.path().to_path_buf();
+        let binding_id = workspace.binding_id();
+        let (store, membership_initialized) = Self::load_store(&path, binding_id);
         Self {
-            config_path: config_path.to_path_buf(),
-            path,
             store,
-            loaded: true,
+            path,
+            binding_id,
+            membership_initialized,
         }
     }
 
-    pub fn lazy_for_config_path(config_path: &Path) -> Self {
+    pub fn for_binding(config_path: &Path, binding_id: i64) -> Self {
+        let path = crate::workspace::sqlite_path(config_path);
+        let (store, membership_initialized) = Self::load_store(&path, Some(binding_id));
         Self {
-            config_path: config_path.to_path_buf(),
-            path: sqlite_order_path(config_path),
-            store: SessionStore::default(),
-            loaded: false,
+            store,
+            path,
+            binding_id: Some(binding_id),
+            membership_initialized,
         }
     }
 
-    fn load_store(config_path: &Path, path: &Path) -> SessionStore {
-        let mut store = SessionStore::load_sqlite(path).unwrap_or_default();
-        if store == SessionStore::default() {
-            store = Self::load_legacy_store(config_path);
-            if store != SessionStore::default() {
-                let _ = store.save_sqlite(path);
-            }
-        }
-        store
+    fn load_store(path: &Path, binding_id: Option<i64>) -> (SessionStore, bool) {
+        let Some(binding_id) = binding_id else {
+            return (SessionStore::default(), false);
+        };
+        (
+            SessionStore::load_sqlite(path, binding_id).unwrap_or_default(),
+            Self::membership_initialized(path, binding_id).unwrap_or(false),
+        )
     }
 
-    fn ensure_loaded(&mut self) {
-        if self.loaded {
-            return;
-        }
-        self.store = Self::load_store(&self.config_path, &self.path);
-        self.loaded = true;
+    fn membership_initialized(path: &Path, binding_id: i64) -> rusqlite::Result<bool> {
+        let conn = open_db(path)?;
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM workspace_session_groups WHERE binding_id = ?1
+             )",
+            [binding_id],
+            |row| row.get(0),
+        )
     }
 
-    fn load_legacy_store(config_path: &Path) -> SessionStore {
-        for legacy in legacy_order_paths(config_path) {
-            if !legacy.exists() {
-                continue;
-            }
-            return SessionStore::from_flat_list(&load_lines(&legacy));
+    pub fn add_session(&mut self, name: &str) {
+        if self.store.existing_names().insert(name.to_owned()) {
+            self.store.insert_unique(name);
+            self.save();
         }
-        SessionStore::default()
+    }
+
+    pub fn rename_session(&mut self, old: &str, new: &str) -> bool {
+        let renamed = self.store.rename_session(old, new);
+        if renamed {
+            self.save();
+        }
+        renamed
+    }
+
+    pub fn session_names(&self) -> Vec<String> {
+        self.store.ordered_names()
     }
 
     pub fn sync_sessions<'a>(
         &mut self,
         sessions: impl IntoIterator<Item = &'a str>,
     ) -> Vec<String> {
-        self.ensure_loaded();
         let ordered_alive = sessions.into_iter().map(str::to_owned).collect::<Vec<_>>();
         if ordered_alive.is_empty() {
             return Vec::new();
@@ -380,10 +370,10 @@ impl SessionOrderStore {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let mut existing = self.store.existing_names();
+        let existing = self.store.existing_names();
         let mut changed = false;
-        for session in &ordered_alive {
-            if existing.insert(session.clone()) {
+        if !self.membership_initialized && existing.is_empty() {
+            for session in &ordered_alive {
                 self.store.insert_unique(session);
                 changed = true;
             }
@@ -413,20 +403,6 @@ impl SessionOrderStore {
         moved
     }
 
-    pub fn move_block_before<'a>(
-        &mut self,
-        source: &str,
-        target: Option<&str>,
-        sessions: impl IntoIterator<Item = &'a str>,
-    ) -> bool {
-        self.sync_sessions(sessions);
-        let moved = self.store.move_block_before(source, target);
-        if moved {
-            self.save();
-        }
-        moved
-    }
-
     pub fn move_session_before<'a>(
         &mut self,
         source: &str,
@@ -441,19 +417,19 @@ impl SessionOrderStore {
         moved
     }
 
-    fn save(&self) {
-        if let Some(parent) = self.path.parent()
-            && fs::create_dir_all(parent).is_err()
+    fn save(&mut self) {
+        if let Some(binding_id) = self.binding_id
+            && self.store.save_sqlite(&self.path, binding_id).is_ok()
         {
-            return;
+            self.membership_initialized = true;
         }
-        let _ = self.store.save_sqlite(&self.path);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp_config_path(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
@@ -462,6 +438,7 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("bootty-session-order-{name}-{unique}"));
         fs::create_dir_all(&dir).expect("create temp session order dir");
+        fs::write(dir.join("session-order"), "").expect("write empty legacy order");
         dir.join("config.toml")
     }
 
@@ -470,7 +447,7 @@ mod tests {
         let path = temp_config_path("sqlite");
         let mut store = SessionOrderStore::for_config_path(&path);
         store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
-        assert!(store.move_block_before(
+        assert!(store.move_session_before(
             "agents",
             Some("arc/migrations"),
             ["arc/migrations", "arc/readiness", "agents", "bootty"],
@@ -482,7 +459,7 @@ mod tests {
             vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
         );
 
-        let conn = open_session_order_db(&sqlite_order_path(&path)).expect("open session order db");
+        let conn = open_db(&crate::workspace::sqlite_path(&path)).expect("open session order db");
         let journal_mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .expect("query journal mode");
@@ -494,7 +471,7 @@ mod tests {
         let path = temp_config_path("empty-refresh");
         let mut store = SessionOrderStore::for_config_path(&path);
         store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
-        assert!(store.move_block_before(
+        assert!(store.move_session_before(
             "agents",
             Some("arc/migrations"),
             ["arc/migrations", "arc/readiness", "agents", "bootty"],
@@ -506,6 +483,58 @@ mod tests {
         assert_eq!(
             reloaded.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]),
             vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
+        );
+    }
+
+    #[test]
+    fn persisted_binding_sessions_filter_shared_backend_snapshots() {
+        let path = temp_config_path("binding-membership");
+        let workspace = WorkspaceStore::for_config_path(&path);
+        let first_binding = workspace.binding_id().expect("default binding");
+        let conn = open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Second Space"],
+        )
+        .expect("insert second Space");
+        let second_space = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![second_space, "Second Space Binding", "native", 0_i64],
+        )
+        .expect("insert second Space binding");
+        let second_binding = conn.last_insert_rowid();
+
+        let mut first = SessionOrderStore::for_binding(&path, first_binding);
+        let mut second = SessionOrderStore::for_binding(&path, second_binding);
+        first.add_session("first");
+        second.add_session("second");
+
+        assert_eq!(
+            first.sync_sessions(["first", "second"]),
+            vec!["first"],
+            "a binding must expose only its persisted members"
+        );
+        assert_eq!(
+            second.sync_sessions(["first", "second"]),
+            vec!["second"],
+            "a second binding on the same backend must remain isolated"
+        );
+    }
+    #[test]
+    fn rename_session_preserves_its_persisted_position() {
+        let path = temp_config_path("rename-position");
+        let mut store = SessionOrderStore::for_config_path(&path);
+        let sessions = ["first", "project/one", "project/two", "last"];
+        store.sync_sessions(sessions);
+
+        assert!(store.rename_session("project/one", "renamed"));
+
+        let mut reloaded = SessionOrderStore::for_config_path(&path);
+        assert_eq!(
+            reloaded.sync_sessions(["first", "renamed", "project/two", "last"]),
+            vec!["first", "renamed", "project/two", "last"]
         );
     }
 
@@ -573,12 +602,12 @@ mod tests {
     }
 
     #[test]
-    fn move_block_before_reorders_top_level_entries() {
+    fn move_session_before_reorders_top_level_entries() {
         let path = temp_config_path("block");
         let mut store = SessionOrderStore::for_config_path(&path);
         store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
 
-        assert!(store.move_block_before(
+        assert!(store.move_session_before(
             "agents",
             Some("arc/migrations"),
             ["arc/migrations", "arc/readiness", "agents", "bootty"],
@@ -586,6 +615,25 @@ mod tests {
         assert_eq!(
             store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]),
             vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
+        );
+    }
+
+    #[test]
+    fn legacy_order_file_is_imported_into_the_default_binding() {
+        let path = temp_config_path("legacy-file");
+        fs::write(
+            path.parent()
+                .expect("config directory")
+                .join("session-order"),
+            "second\nfirst\n",
+        )
+        .expect("write legacy order");
+
+        let mut store = SessionOrderStore::for_config_path(&path);
+
+        assert_eq!(
+            store.sync_sessions(["first", "second"]),
+            vec!["second", "first"]
         );
     }
 }

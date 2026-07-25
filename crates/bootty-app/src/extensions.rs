@@ -2497,6 +2497,39 @@ mod tests {
         run_module(&module.body)
     }
 
+    #[test]
+    fn footer_meter_track_is_optional() {
+        let items = run_source(
+            r##"return function()
+                return {
+                    bootty.ui.footer_meter({ icon = "openai", color = "#a6e3a1", fill = 0.5 }),
+                    bootty.ui.footer_meter({ icon = "openai", color = "#a6e3a1", track = "#313244", fill = 0.5 }),
+                }
+            end"##,
+        );
+        let rect_fills = |item: &ModuleItem| {
+            item.primitives
+                .iter()
+                .filter_map(|primitive| match primitive {
+                    ModulePrimitive::Rect { fill, .. } => *fill,
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            rect_fills(&items[0]),
+            vec![Color32::from_rgb(0xa6, 0xe3, 0xa1)]
+        );
+        assert_eq!(
+            rect_fills(&items[1]),
+            vec![
+                Color32::from_rgb(0x31, 0x32, 0x44),
+                Color32::from_rgb(0xa6, 0xe3, 0xa1),
+            ]
+        );
+    }
+
     #[cfg(unix)]
     struct PathGuard(std::ffi::OsString);
 
@@ -2792,15 +2825,23 @@ mod tests {
         for provider in ["codex", "claude"] {
             run_cache.codexbar.set_mock_usage(provider, PROBE_JSON);
         }
-        let texts = run_module(&codexbar.body)
-            .into_iter()
-            .map(|item| item.text)
+        let items = run_module(&codexbar.body);
+        let texts = items
+            .iter()
+            .map(|item| item.text.as_str())
             .collect::<Vec<_>>();
 
         assert_eq!(
             texts,
             vec!["codex 5h", "codex 7d", "claude 5h", "claude 7d"]
         );
+        assert!(items.iter().all(|item| {
+            item.primitives
+                .iter()
+                .filter(|primitive| matches!(primitive, ModulePrimitive::Rect { .. }))
+                .count()
+                == 1
+        }));
     }
 
     #[test]

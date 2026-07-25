@@ -28,6 +28,7 @@ either = { version = "1", features = ["use_std"] }
 emath = { version = "0.35", default-features = false, features = ["bytemuck", "serde"] }
 epaint = { version = "0.35", default-features = false, features = ["bytemuck", "default_fonts", "serde"] }
 font-types = { version = "0.11", default-features = false, features = ["bytemuck", "serde", "std"] }
+futures-util = { version = "0.3" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 libc = { version = "0.2", features = ["extra_traits"] }
@@ -129,7 +130,6 @@ zbus_macros = { version = "5", features = ["blocking-api"] }
 
 [target.wasm32-unknown-unknown.dependencies]
 crossbeam-utils = { version = "0.8" }
-futures-util = { version = "0.3" }
 js-sys = { version = "0.3" }
 wasm-bindgen = { version = "0.2" }
 web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "AddEventListenerOptions", "BinaryType", "BlobPropertyBag", "CanvasRenderingContext2d", "Clipboard", "ClipboardEvent", "ClipboardItem", "CompositionEvent", "CssStyleDeclaration", "DataTransfer", "DataTransferItem", "DataTransferItemList", "Document", "DomException", "DomRect", "DragEvent", "EventListener", "ExtSRgb", "File", "FileList", "FocusEvent", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "ImageBitmap", "ImageBitmapOptions", "ImageBitmapRenderingContext", "ImageData", "InputEvent", "IntersectionObserver", "IntersectionObserverEntry", "KeyboardEvent", "Location", "MediaQueryList", "MediaQueryListEvent", "MessageChannel", "MessagePort", "Navigator", "NodeList", "OrientationLockType", "OrientationType", "PageTransitionEvent", "Performance", "PermissionState", "PermissionStatus", "Permissions", "PointerEvent", "PremultiplyAlpha", "ResizeObserver", "ResizeObserverBoxOptions", "ResizeObserverEntry", "ResizeObserverOptions", "ResizeObserverSize", "Screen", "ScreenOrientation", "ShadowRoot", "Storage", "Touch", "TouchEvent", "TouchList", "Url", "VisibilityState", "WebGl2RenderingContext", "WebGlRenderingContext", "WebglDebugRendererInfo", "WheelEvent", "Window", "Worker", "console"] }

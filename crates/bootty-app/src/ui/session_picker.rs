@@ -2,7 +2,10 @@ use bootty_ui::Theme;
 use eframe::egui;
 
 use crate::mux::snapshot::MuxSession;
-use crate::ui::overlay::{self, FloatingWindow, ListRow, ListView, list};
+use crate::ui::{
+    overlay::{self, FloatingWindow, ListRow, ListView, list},
+    session_navigation::{BindingSessionGroup, ScopedSessionTarget},
+};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionPickerDialog {
@@ -15,7 +18,13 @@ pub struct SessionPickerDialog {
 pub enum SessionPickerEvent {
     None,
     Close,
-    ActivateSession(String),
+    ActivateSession(ScopedSessionTarget),
+}
+
+#[derive(Clone, Debug)]
+struct PickerRow {
+    row: ListRow,
+    target: Option<ScopedSessionTarget>,
 }
 
 impl SessionPickerDialog {
@@ -31,18 +40,28 @@ impl SessionPickerDialog {
         &mut self,
         ctx: &egui::Context,
         theme: Theme,
-        sessions: &[MuxSession],
-        selected_session: Option<&str>,
+        groups: &[BindingSessionGroup],
     ) -> SessionPickerEvent {
-        let matches = filtered_session_indices(sessions, &self.filter);
-        self.selected = list::clamp_selection(self.selected, matches.len());
-        let rows = session_rows(sessions, &matches, selected_session);
+        let picker_rows = picker_rows(groups, &self.filter);
+        self.selected = list::clamp_selection(self.selected, picker_rows.len());
+        let rows = picker_rows
+            .iter()
+            .map(|entry| entry.row.clone())
+            .collect::<Vec<_>>();
+        let match_count = picker_rows
+            .iter()
+            .filter(|row| row.target.is_some())
+            .count();
+        let session_count = groups
+            .iter()
+            .map(|group| group.sessions.len())
+            .sum::<usize>();
         let list_max_height = overlay::list_max_height(ctx, 150.0, 520.0);
 
         let result = FloatingWindow::new("session-picker-dialog", "Session Finder")
             .icon("terminal")
             .shortcut_hint([("enter", "select"), ("esc", "close")])
-            .footer(format!("{} / {} sessions", matches.len(), sessions.len()))
+            .footer(format!("{match_count} / {session_count} sessions"))
             .width(overlay::panel_width(ctx, 780.0, 520.0))
             .show(ctx, theme, |ui, palette| {
                 let filter = overlay::filter_field(
@@ -50,7 +69,7 @@ impl SessionPickerDialog {
                     egui::Id::new("session-picker-filter"),
                     &mut self.filter,
                     theme,
-                    "filter sessions...",
+                    "filter sessions or bindings...",
                 );
                 if self.focus_filter {
                     filter.request_focus();
@@ -66,10 +85,9 @@ impl SessionPickerDialog {
             });
 
         if let Some(index) = result.inner
-            && let Some(session_index) = matches.get(index)
-            && let Some(session) = sessions.get(*session_index)
+            && let Some(target) = picker_rows.get(index).and_then(|row| row.target.as_ref())
         {
-            return SessionPickerEvent::ActivateSession(session.id.clone());
+            return SessionPickerEvent::ActivateSession(target.clone());
         }
         if result.escaped || result.clicked_outside {
             return SessionPickerEvent::Close;
@@ -78,61 +96,87 @@ impl SessionPickerDialog {
     }
 }
 
-fn session_rows(
-    sessions: &[MuxSession],
-    matches: &[usize],
-    selected_session: Option<&str>,
-) -> Vec<ListRow> {
-    matches
-        .iter()
-        .filter_map(|&index| {
-            let session = sessions.get(index)?;
-            let current = selected_session.is_some_and(|current| {
-                current == session.id.as_str() || current == session.name.as_str()
+fn picker_rows(groups: &[BindingSessionGroup], filter: &str) -> Vec<PickerRow> {
+    let show_sections = groups.len() > 1;
+    let mut rows = Vec::new();
+    for group in groups {
+        let binding_matches = fuzzy_matches(&group.label, filter);
+        let matching_sessions = group
+            .sessions
+            .iter()
+            .filter(|session| binding_matches || session_matches(session, filter))
+            .collect::<Vec<_>>();
+        if matching_sessions.is_empty() {
+            continue;
+        }
+        if show_sections {
+            rows.push(PickerRow {
+                row: ListRow {
+                    primary: group.label.clone(),
+                    section: true,
+                    ..ListRow::default()
+                },
+                target: None,
             });
-            let trailing = session
-                .anchor
-                .process
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            Some(ListRow {
-                icon: Some("terminal".to_owned()),
-                primary: session.name.clone(),
-                trailing,
-                current,
-                ..ListRow::default()
-            })
-        })
-        .collect()
+        }
+        rows.extend(matching_sessions.into_iter().map(|session| {
+            PickerRow {
+                row: ListRow {
+                    icon: Some("terminal".to_owned()),
+                    primary: session.name.clone(),
+                    trailing: session
+                        .anchor
+                        .process
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned),
+                    current: group.session_is_current(session),
+                    ..ListRow::default()
+                },
+                target: Some(group.target(session)),
+            }
+        }));
+    }
+    rows
 }
 
-fn filtered_session_indices(sessions: &[MuxSession], filter: &str) -> Vec<usize> {
-    sessions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, session)| session_matches(session, filter).then_some(index))
-        .collect()
+fn fuzzy_matches(value: &str, filter: &str) -> bool {
+    let filter = filter.trim();
+    filter.is_empty() || overlay::fuzzy_match(value, filter)
 }
 
 fn session_matches(session: &MuxSession, filter: &str) -> bool {
-    let filter = filter.trim();
-    if filter.is_empty() {
-        return true;
-    }
-    overlay::fuzzy_match(&session.name, filter)
-        || overlay::fuzzy_match(&session.id, filter)
+    fuzzy_matches(&session.name, filter)
+        || overlay::fuzzy_match(&session.id, filter.trim())
         || session
             .anchor
             .process
             .as_deref()
-            .is_some_and(|process| overlay::fuzzy_match(process, filter))
+            .is_some_and(|process| overlay::fuzzy_match(process, filter.trim()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mux::snapshot::MuxPaneAnchor;
+
+    fn test_scope() -> crate::mux::controller::MuxScope {
+        crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(10),
+        )
+    }
+
+    fn group(sessions: Vec<MuxSession>, selected_session: Option<&str>) -> BindingSessionGroup {
+        BindingSessionGroup {
+            scope: test_scope(),
+            label: "Local".to_owned(),
+            sessions,
+            selected_session: selected_session.map(str::to_owned),
+            active: true,
+            can_return_to_last_session: false,
+        }
+    }
 
     fn session(id: &str, name: &str, process: Option<&str>) -> MuxSession {
         MuxSession {
@@ -150,20 +194,77 @@ mod tests {
     }
 
     #[test]
-    fn filters_sessions_by_fuzzy_name_id_or_process() {
-        let sessions = vec![
-            session("s1", "bootty", Some("cargo")),
-            session("s2", "dotfiles", Some("nvim")),
-            session("s3", "blueprints", Some("zsh")),
+    fn filters_sessions_by_fuzzy_name_id_process_or_binding() {
+        let group = group(
+            vec![
+                session("s1", "bootty", Some("cargo")),
+                session("s2", "dotfiles", Some("nvim")),
+                session("s3", "blueprints", Some("zsh")),
+            ],
+            None,
+        );
+        let groups = [group];
+        let matching_ids = |filter: &str| {
+            picker_rows(&groups, filter)
+                .into_iter()
+                .filter_map(|row| row.target.map(|target| target.session_id))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(matching_ids("bty"), vec!["s1"]);
+        assert_eq!(matching_ids("nv"), vec!["s2"]);
+        assert_eq!(matching_ids("s3"), vec!["s3"]);
+        assert_eq!(matching_ids("Local"), vec!["s1", "s2", "s3"]);
+        assert!(matching_ids("missing").is_empty());
+    }
+
+    #[test]
+    fn picker_groups_colliding_session_ids_by_binding_and_marks_only_active_target() {
+        let local_scope = crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(10),
+        );
+        let remote_scope = crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(20),
+        );
+        let groups = vec![
+            BindingSessionGroup {
+                scope: local_scope,
+                label: "Local".to_owned(),
+                sessions: vec![session("$1", "work", Some("zsh"))],
+                selected_session: Some("$1".to_owned()),
+                active: true,
+                can_return_to_last_session: false,
+            },
+            BindingSessionGroup {
+                scope: remote_scope,
+                label: "Remote".to_owned(),
+                sessions: vec![session("$1", "work", Some("ssh"))],
+                selected_session: Some("$1".to_owned()),
+                active: false,
+                can_return_to_last_session: false,
+            },
         ];
 
-        assert_eq!(filtered_session_indices(&sessions, "bty"), vec![0]);
-        assert_eq!(filtered_session_indices(&sessions, "nv"), vec![1]);
-        assert_eq!(filtered_session_indices(&sessions, "s3"), vec![2]);
+        let rows = picker_rows(&groups, "");
+
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0].row.section);
+        assert_eq!(rows[0].row.primary, "Local");
         assert_eq!(
-            filtered_session_indices(&sessions, "missing"),
-            Vec::<usize>::new()
+            rows[1].target.as_ref().map(|target| target.scope),
+            Some(local_scope)
         );
+        assert!(rows[1].row.current);
+        assert!(rows[2].row.section);
+        assert_eq!(rows[2].row.primary, "Remote");
+        assert_eq!(
+            rows[3].target.as_ref().map(|target| target.scope),
+            Some(remote_scope)
+        );
+        assert!(!rows[3].row.current);
+        assert_ne!(rows[1].target, rows[3].target);
     }
 
     #[test]
@@ -172,12 +273,11 @@ mod tests {
             session("s1", "bootty", None),
             session("s2", "dotfiles", None),
         ];
-        let matches = filtered_session_indices(&sessions, "");
 
-        let by_id = session_rows(&sessions, &matches, Some("s1"));
-        assert!(by_id[0].current && !by_id[1].current);
+        let by_id = picker_rows(&[group(sessions.clone(), Some("s1"))], "");
+        assert!(by_id[0].row.current && !by_id[1].row.current);
 
-        let by_name = session_rows(&sessions, &matches, Some("dotfiles"));
-        assert!(!by_name[0].current && by_name[1].current);
+        let by_name = picker_rows(&[group(sessions, Some("dotfiles"))], "");
+        assert!(!by_name[0].row.current && by_name[1].row.current);
     }
 }

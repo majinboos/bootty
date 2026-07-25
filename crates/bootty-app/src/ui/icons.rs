@@ -1,42 +1,9 @@
-//! Semantic icon rendering backed by iconflow's embedded fonts.
-//!
-//! Callers use Bootty's stable semantic enum or icon slug strings; this module
-//! handles compatibility aliases and keeps egui/font details out of extension APIs.
+//! Icon rendering backed by iconflow's embedded fonts.
+
+use std::borrow::Cow;
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, Pos2, RichText};
 use iconflow::{Pack, Size, Style, try_icon};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Icon {
-    Terminal,
-    Editor,
-    Package,
-    GitBranch,
-    Bot,
-    Sparkles,
-}
-
-impl Icon {
-    pub const ALL: [Icon; 6] = [
-        Self::Terminal,
-        Self::Editor,
-        Self::Package,
-        Self::GitBranch,
-        Self::Bot,
-        Self::Sparkles,
-    ];
-
-    fn slug(self) -> &'static str {
-        match self {
-            Self::Terminal => "terminal",
-            Self::Editor => "square-pen",
-            Self::Package => "package",
-            Self::GitBranch => "git-branch",
-            Self::Bot => "bot",
-            Self::Sparkles => "sparkles",
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResolvedIcon {
@@ -46,8 +13,8 @@ pub struct ResolvedIcon {
 
 /// Resolve an icon slug exposed to status/extensions.
 pub fn resolve_slug(slug: &str) -> Option<ResolvedIcon> {
-    let (pack, slug) = icon_pack_and_slug(slug)?;
-    let icon = try_icon(pack, slug, Style::Regular, Size::Regular).ok()?;
+    let (pack, style, slug) = icon_pack_style_and_slug(slug)?;
+    let icon = try_icon(pack, slug.as_ref(), style, Size::Regular).ok()?;
     Some(ResolvedIcon {
         family: icon.family,
         codepoint: icon.codepoint,
@@ -79,17 +46,6 @@ pub fn install_icon_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     add_icon_fonts(&mut fonts);
     ctx.set_fonts(fonts);
-}
-
-/// Paint `icon` centered at `center`, `size` logical pixels square, tinted.
-pub fn paint_icon(
-    painter: &egui::Painter,
-    icon: Icon,
-    center: Pos2,
-    size: f32,
-    tint: egui::Color32,
-) {
-    paint_icon_slug(painter, icon.slug(), center, size, tint);
 }
 
 /// Paint an icon named by `slug` (as exposed to extensions), tinted.
@@ -136,17 +92,26 @@ pub fn icon_glyph(slug: &str) -> Option<(char, &'static str)> {
     Some((char::from_u32(icon.codepoint)?, icon.family))
 }
 
-fn icon_pack_and_slug(slug: &str) -> Option<(Pack, &str)> {
+fn icon_pack_style_and_slug(slug: &str) -> Option<(Pack, Style, Cow<'_, str>)> {
     if let Some((pack, slug)) = slug.split_once(':') {
-        let pack = match pack {
-            "bootstrap" => Pack::Bootstrap,
-            "lucide" => Pack::Lucide,
-            "tabler" => Pack::Tabler,
+        let (pack, style, slug) = match pack {
+            "bootstrap" => (Pack::Bootstrap, Style::Regular, Cow::Borrowed(slug)),
+            "lucide" => (Pack::Lucide, Style::Regular, Cow::Borrowed(slug)),
+            "phosphor" => (
+                Pack::Phosphor,
+                Style::Duotone,
+                Cow::Owned(format!(
+                    "{}-duotone",
+                    slug.strip_suffix("-duotone").unwrap_or(slug)
+                )),
+            ),
+            "tabler" => (Pack::Tabler, Style::Regular, Cow::Borrowed(slug)),
             _ => return None,
         };
-        return Some((pack, slug));
+        return Some((pack, style, slug));
     }
-    Some(compatibility_icon(slug))
+    let (pack, slug) = compatibility_icon(slug);
+    Some((pack, Style::Regular, Cow::Borrowed(slug)))
 }
 
 fn compatibility_icon(slug: &str) -> (Pack, &str) {
@@ -161,18 +126,6 @@ fn compatibility_icon(slug: &str) -> (Pack, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn semantic_icons_resolve_through_iconflow() {
-        for icon in Icon::ALL {
-            assert!(
-                resolve_slug(icon.slug()).is_some(),
-                "semantic icon {:?} ('{}') failed to resolve through iconflow",
-                icon,
-                icon.slug()
-            );
-        }
-    }
 
     #[test]
     fn status_bar_icon_slugs_resolve_for_public_status_api() {
@@ -198,6 +151,21 @@ mod tests {
         for slug in ["openai", "claude", "anthropic", "bootstrap:openai"] {
             assert!(has_slug(slug), "missing provider logo '{slug}' in iconflow");
         }
+    }
+
+    #[test]
+    fn phosphor_slugs_resolve_with_the_duotone_font_variant() {
+        let resolved = resolve_slug("phosphor:alarm").expect("Phosphor alarm");
+        let duotone = try_icon(
+            Pack::Phosphor,
+            "alarm-duotone",
+            Style::Duotone,
+            Size::Regular,
+        )
+        .expect("Phosphor Duotone alarm");
+
+        assert_eq!(resolved.family, duotone.family);
+        assert_eq!(resolved.codepoint, duotone.codepoint);
     }
 
     #[test]

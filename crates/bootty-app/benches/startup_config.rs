@@ -236,14 +236,14 @@ fn bench_session_order(c: &mut Criterion) {
     let move_config_path = move_dir.path("config.toml");
     let mut move_store = SessionOrderStore::for_config_path(&move_config_path);
     move_store.sync_sessions(session_refs.iter().copied());
-    c.bench_function("session_order_move_block_persist_384", |b| {
+    c.bench_function("session_order_move_session_persist_384", |b| {
         b.iter(|| {
-            let moved_up = move_store.move_block_before(
+            let moved_up = move_store.move_session_before(
                 black_box("group-5/session-005"),
                 black_box(Some("group-0/session-000")),
                 black_box(session_refs.iter().copied()),
             );
-            let moved_down = move_store.move_block_before(
+            let moved_down = move_store.move_session_before(
                 black_box("group-5/session-005"),
                 black_box(None),
                 black_box(session_refs.iter().copied()),

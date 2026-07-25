@@ -4,10 +4,11 @@ mod item_primitives;
 mod sidebar_panel;
 mod status_bar;
 
-pub(crate) use sidebar_panel::MACOS_TITLEBAR_BUTTON_SAFE_WIDTH;
+pub(crate) use sidebar_panel::{MACOS_TITLEBAR_BUTTON_SAFE_WIDTH, SPACE_SWITCHER_HEIGHT};
 pub use sidebar_panel::{
-    SessionContextAction, SidebarEvent, SidebarModel, load_app_icon_texture, selected_session_name,
-    show_sidebar, sidebar_rect,
+    SessionContextAction, SidebarEvent, SidebarModel, SidebarSpaceSwipeState, SpaceSwitcherEvent,
+    SpaceSwitcherItem, load_app_icon_texture, selected_session_name, show_sidebar,
+    show_space_switcher, sidebar_rect, take_sidebar_space_swipe,
 };
 pub use status_bar::{
     ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, StatusBarEvent, StatusBarModel, TabContext,

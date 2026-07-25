@@ -23,7 +23,6 @@ use crate::{
     direct_input::{DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input},
     layout::SplitDirection,
     menu::AppMenu,
-    mux::config::selected_backend,
     renderer::TerminalWidget,
     terminal_text::TerminalTextConfig,
     theme::{theme_palette_from_config, theme_tokens},
@@ -62,6 +61,14 @@ fn status_segment_visible(segment: &crate::config::StatusSegment, sidebar_visibl
     !(sidebar_visible && segment.module == "session")
 }
 
+fn sidebar_visible_for_spaces(configured: bool, space_count: usize) -> bool {
+    configured || space_count > 0
+}
+
+fn sidebar_content_height(sidebar_height: f32) -> f32 {
+    (sidebar_height - chrome::SPACE_SWITCHER_HEIGHT).max(0.0)
+}
+
 fn backend_uses_native_layout_renderer(backend: MultiplexerBackendConfig) -> bool {
     matches!(
         backend,
@@ -94,6 +101,23 @@ fn status_bar_background_color(
                 .map(crate::theme::config_color32)
         })
         .unwrap_or(palette.mantle)
+}
+
+fn sidebar_background_color(
+    palette: bootty_ui::ThemePalette,
+    configured: Option<egui::Color32>,
+    space_color: [u8; 3],
+    tint_sidebar: bool,
+) -> egui::Color32 {
+    let background = configured.unwrap_or(palette.mantle);
+    if !tint_sidebar {
+        return background;
+    }
+    egui::Color32::from_rgb(
+        ((u16::from(background.r()) * 7 + u16::from(space_color[0])) / 8) as u8,
+        ((u16::from(background.g()) * 7 + u16::from(space_color[1])) / 8) as u8,
+        ((u16::from(background.b()) * 7 + u16::from(space_color[2])) / 8) as u8,
+    )
 }
 
 /// Pane corner radius (px), clamped so it never exceeds the pane's shorter half-extent.
@@ -307,6 +331,7 @@ pub struct BoottyApp {
     lua_window: Option<(LuaWindowOwner, crate::ui::lua_window::LuaWindowDialog)>,
     keep_awake: Option<keepawake::KeepAwake>,
     terminal_cursor_icon: egui::CursorIcon,
+    sidebar_space_swipe: chrome::SidebarSpaceSwipeState,
 }
 
 impl BoottyApp {
@@ -385,6 +410,7 @@ impl BoottyApp {
             lua_window: None,
             keep_awake: None,
             terminal_cursor_icon: egui::CursorIcon::Default,
+            sidebar_space_swipe: chrome::SidebarSpaceSwipeState::default(),
         })
     }
 
@@ -1151,7 +1177,9 @@ impl BoottyApp {
         let palette =
             theme_palette_from_config(self.state.config(), self.state.active_appearance_variant());
         let chrome_config = self.state.config().chrome.clone();
-        let sidebar = chrome_config.sidebar;
+        let sidebar_configured = chrome_config.sidebar;
+        let sidebar =
+            sidebar_visible_for_spaces(sidebar_configured, self.state.space_summaries().len());
         let top_bar = chrome_config.top_bar;
         let bottom_bar = chrome_config.bottom_bar;
         let configured_sidebar_width = chrome_config.sidebar_width;
@@ -1193,7 +1221,11 @@ impl BoottyApp {
         let tabs_in_notch = notch_context && self.state.config().window.fullscreen_tabs_in_notch;
         let notch_band_color = notch_chrome_color.unwrap_or(palette.base);
         let sidebar_width = if sidebar {
-            configured_sidebar_width
+            if sidebar_configured {
+                configured_sidebar_width
+            } else {
+                configured_sidebar_width.max(MIN_SIDEBAR_WIDTH)
+            }
         } else {
             0.0
         };
@@ -1224,10 +1256,35 @@ impl BoottyApp {
         } else {
             Vec::new()
         };
-        let sidebar_items = crate::ui::sidebar::build_sidebar_items_from_module_items(
-            &sidebar_session_items,
-            self.state.mux().selected_session(),
-        );
+        let spaces = self.state.space_summaries();
+        let active_space_appearance = spaces
+            .iter()
+            .find(|space| space.active)
+            .map(|space| (space.color, space.tint_sidebar))
+            .unwrap_or((crate::workspace::DEFAULT_SPACE_COLOR, false));
+        let space_items = spaces
+            .into_iter()
+            .map(|space| chrome::SpaceSwitcherItem {
+                id: space.id,
+                name: space.name,
+                icon: space.icon,
+                color: space.color,
+                active: space.active,
+            })
+            .collect::<Vec<_>>();
+        let space_transition = self.state.space_transition(std::time::Instant::now());
+        let space_switcher_height = chrome::SPACE_SWITCHER_HEIGHT;
+        let binding_groups = self.state.binding_session_groups();
+        let sidebar_items = if binding_groups.len() > 1 {
+            crate::ui::sidebar::build_binding_sidebar_items(&binding_groups)
+        } else {
+            crate::ui::sidebar::build_sidebar_items_from_module_items(
+                &sidebar_session_items,
+                self.state.mux_scope(),
+                self.state.mux().selected_session(),
+                self.state.mux().previous_selected_session().is_some(),
+            )
+        };
         let sidebar_on_right = matches!(
             self.state.config().sidebar.position,
             crate::config::SidebarPosition::Right
@@ -1407,11 +1464,26 @@ impl BoottyApp {
                     let sidebar_background = notch_chrome_color
                         .or_else(|| sidebar_cfg.background.map(crate::theme::config_color32));
                     let mut sidebar_palette = palette;
-                    if let Some(color) = sidebar_background {
-                        sidebar_palette.base = color;
-                    }
+                    sidebar_palette.base = sidebar_background_color(
+                        palette,
+                        sidebar_background,
+                        active_space_appearance.0,
+                        active_space_appearance.1,
+                    );
                     if let Some(color) = sidebar_cfg.foreground {
                         sidebar_palette.text = crate::theme::config_color32(color);
+                    }
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.painter()
+                        .rect_filled(sidebar_rect, 0.0, sidebar_palette.base);
+                    if let Some(space_id) = chrome::take_sidebar_space_swipe(
+                        ui,
+                        sidebar_rect,
+                        &space_items,
+                        &mut self.sidebar_space_swipe,
+                    ) && self.state.activate_space_from_ui(space_id)
+                    {
+                        ui.ctx().request_repaint();
                     }
                     let title_icon = title_visible.then(|| {
                         chrome::load_app_icon_texture(ui.ctx(), &mut self.app_icon_texture)
@@ -1419,23 +1491,24 @@ impl BoottyApp {
                     if let Some(event) = chrome::show_sidebar(
                         ui,
                         sidebar_palette,
-                        sidebar_rect.height(),
+                        sidebar_content_height(sidebar_rect.height()),
                         SidebarModel {
                             items: &sidebar_items,
                             footer_items: &sidebar_footer_items,
-                            session_count: self.state.mux().sessions().len(),
-                            has_sessions: !self.state.mux().sessions().is_empty(),
+                            session_count: binding_groups
+                                .iter()
+                                .map(|group| group.sessions.len())
+                                .sum(),
+                            has_sessions: binding_groups
+                                .iter()
+                                .any(|group| !group.sessions.is_empty()),
                             title_visible,
                             reserve_titlebar_buttons,
                             title_icon: title_icon.as_ref(),
                             top_inset,
                             border_visible: !fullscreen_chrome,
-                            separator_visible: !fullscreen_chrome,
-                            can_return_to_last_session: self
-                                .state
-                                .mux()
-                                .previous_selected_session()
-                                .is_some(),
+                            border_bottom: false,
+                            separator_visible: false,
                             focused: self.state.sidebar_focused(),
                             hovered_session: self.state.sidebar_hovered_session(),
                             unfocused_dim: self.state.config().chrome.unfocused_sidebar_dim,
@@ -1448,41 +1521,59 @@ impl BoottyApp {
                         },
                     ) {
                         match event {
-                            chrome::SidebarEvent::ActivateSession(session_id) => {
-                                self.state.activate_session_from_ui(&session_id);
+                            chrome::SidebarEvent::ActivateSession(target) => {
+                                self.state.activate_scoped_session_from_ui(&target);
                             }
-                            chrome::SidebarEvent::ContextAction { session_id, action } => {
+                            chrome::SidebarEvent::ContextAction { target, action } => {
                                 let handled = match action {
                                     chrome::SessionContextAction::Activate => {
-                                        self.state.activate_session_from_ui(&session_id);
-                                        true
-                                    }
-                                    chrome::SessionContextAction::NewSession => {
-                                        self.state.open_new_session_dialog_from_ui()
-                                    }
-                                    chrome::SessionContextAction::SwitchSession => {
-                                        self.state.open_session_picker_dialog_from_ui()
+                                        self.state.activate_scoped_session_from_ui(&target)
                                     }
                                     chrome::SessionContextAction::PreviousSession => self
                                         .state
-                                        .activate_relative_session_from_ui(&session_id, -1),
-                                    chrome::SessionContextAction::NextSession => {
-                                        self.state.activate_relative_session_from_ui(&session_id, 1)
-                                    }
-                                    chrome::SessionContextAction::LastSession => {
-                                        self.state.activate_last_session_from_ui()
-                                    }
-                                    chrome::SessionContextAction::Rename => {
-                                        self.state.open_rename_session_dialog_for(&session_id)
-                                    }
-                                    chrome::SessionContextAction::MoveUp => {
-                                        self.state.move_session_from_ui(&session_id, -1)
-                                    }
-                                    chrome::SessionContextAction::MoveDown => {
-                                        self.state.move_session_from_ui(&session_id, 1)
-                                    }
-                                    chrome::SessionContextAction::Ditch => {
-                                        self.state.open_ditch_session_dialog_for(&session_id)
+                                        .activate_relative_scoped_session_from_ui(&target, -1),
+                                    chrome::SessionContextAction::NextSession => self
+                                        .state
+                                        .activate_relative_scoped_session_from_ui(&target, 1),
+                                    action => {
+                                        if !self.state.activate_scoped_session_from_ui(&target) {
+                                            false
+                                        } else {
+                                            match action {
+                                                chrome::SessionContextAction::NewSession => {
+                                                    self.state.open_new_session_dialog_from_ui()
+                                                }
+                                                chrome::SessionContextAction::SwitchSession => {
+                                                    self.state.open_session_picker_dialog_from_ui()
+                                                }
+                                                chrome::SessionContextAction::LastSession => {
+                                                    self.state.activate_last_session_from_ui()
+                                                }
+                                                chrome::SessionContextAction::Rename => {
+                                                    self.state.open_rename_session_dialog_for(
+                                                        &target.session_id,
+                                                    )
+                                                }
+                                                chrome::SessionContextAction::MoveUp => self
+                                                    .state
+                                                    .move_session_from_ui(&target.session_id, -1),
+                                                chrome::SessionContextAction::MoveDown => self
+                                                    .state
+                                                    .move_session_from_ui(&target.session_id, 1),
+                                                chrome::SessionContextAction::Ditch => {
+                                                    self.state.open_ditch_session_dialog_for(
+                                                        &target.session_id,
+                                                    )
+                                                }
+                                                chrome::SessionContextAction::Activate
+                                                | chrome::SessionContextAction::PreviousSession
+                                                | chrome::SessionContextAction::NextSession => {
+                                                    unreachable!(
+                                                        "scoped session actions handled above"
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
                                 };
                                 if handled {
@@ -1502,6 +1593,66 @@ impl BoottyApp {
                                 }
                             }
                         }
+                    }
+                    if let Some((_, _, progress)) = space_transition {
+                        let alpha = ((1.0 - progress) * 180.0) as u8;
+                        let content_rect = Rect::from_min_max(
+                            sidebar_rect.min,
+                            Pos2::new(
+                                sidebar_rect.max.x,
+                                (sidebar_rect.max.y - space_switcher_height)
+                                    .max(sidebar_rect.min.y),
+                            ),
+                        );
+                        ui.painter().rect_filled(
+                            content_rect,
+                            0.0,
+                            egui::Color32::from_rgba_unmultiplied(
+                                sidebar_palette.base.r(),
+                                sidebar_palette.base.g(),
+                                sidebar_palette.base.b(),
+                                alpha,
+                            ),
+                        );
+                        ui.ctx()
+                            .request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                    if let Some(event) = chrome::show_space_switcher(
+                        ui,
+                        sidebar_palette,
+                        &space_items,
+                        space_transition,
+                    ) {
+                        match event {
+                            chrome::SpaceSwitcherEvent::Activate(space_id) => {
+                                self.state.activate_space_from_ui(space_id);
+                            }
+                            chrome::SpaceSwitcherEvent::Create => {
+                                self.state.open_create_space_dialog_from_ui();
+                            }
+                            chrome::SpaceSwitcherEvent::Edit(space_id) => {
+                                self.state.open_edit_space_dialog_from_ui(space_id);
+                            }
+                            chrome::SpaceSwitcherEvent::Close(space_id) => {
+                                self.state.close_space_from_ui(space_id);
+                            }
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    if !self.state.sidebar_focused() {
+                        let alpha = (self
+                            .state
+                            .config()
+                            .chrome
+                            .unfocused_sidebar_dim
+                            .clamp(0.0, 1.0)
+                            * 255.0)
+                            .round() as u8;
+                        ui.painter().rect_filled(
+                            sidebar_rect,
+                            0.0,
+                            egui::Color32::from_black_alpha(alpha),
+                        );
                     }
                 },
             );
@@ -1618,16 +1769,12 @@ impl BoottyApp {
             }
         }
 
-        let terminal_backend = selected_backend(&self.state.config().multiplexer);
-        let terminal_transition_key = self.state.mux().selected_session_anchor().map(|anchor| {
-            let pane_id = anchor.pane_id.as_deref().unwrap_or_default();
-            format!("{terminal_backend:?}:{}:{pane_id}", anchor.session_id)
-        });
+        let terminal_transition_key = self.state.terminal_transition_key();
         // Native-layout backends whose tabs have all been closed have no pane to attach. Paint an
         // empty state instead of the terminal widget, which would otherwise hold the closed
         // terminal's last frame.
         let native_layout_backend =
-            backend_uses_native_layout_renderer(self.state.config().multiplexer.backend);
+            backend_uses_native_layout_renderer(self.state.multiplexer_backend());
         let has_terminal = !native_layout_backend
             || self
                 .state
@@ -1724,18 +1871,20 @@ impl BoottyApp {
         self.state.apply_picker_event(dialog, event);
     }
 
+    fn show_space_editor_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.state.take_space_editor_dialog() else {
+            return;
+        };
+        let event = dialog.show(ctx, self.state.ui_theme());
+        self.state.apply_space_editor_event(dialog, event);
+    }
+
     fn show_session_picker_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.state.take_session_picker_dialog() else {
             return;
         };
-        let sessions = self.state.mux().sessions().to_vec();
-        let selected_session = self.state.mux().selected_session().map(str::to_owned);
-        let event = dialog.show(
-            ctx,
-            self.state.ui_theme(),
-            &sessions,
-            selected_session.as_deref(),
-        );
+        let groups = self.state.binding_session_groups();
+        let event = dialog.show(ctx, self.state.ui_theme(), &groups);
         self.state.apply_session_picker_event(dialog, event);
     }
 
@@ -1989,6 +2138,7 @@ impl eframe::App for BoottyApp {
         });
         if !self.settings_open {
             self.show_new_mux_session_dialog(ui.ctx());
+            self.show_space_editor_dialog(ui.ctx());
             self.show_session_picker_dialog(ui.ctx());
             self.show_rename_session_dialog(ui.ctx());
             self.show_rename_tab_dialog(ui.ctx());
@@ -2285,6 +2435,70 @@ mod tests {
             chrome::STATUS_EDGE_PAD
         );
         assert_eq!(status_bar_left_padding(true, true), chrome::STATUS_EDGE_PAD);
+    }
+
+    #[test]
+    fn multiple_spaces_keep_the_space_switcher_visible_when_sidebar_is_disabled() {
+        assert!(sidebar_visible_for_spaces(false, 1));
+        assert!(sidebar_visible_for_spaces(false, 2));
+        assert!(sidebar_visible_for_spaces(true, 1));
+    }
+
+    #[test]
+    fn space_strip_is_contiguous_with_sidebar_content() {
+        let context = egui::Context::default();
+        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 300.0));
+        let mut rects = None;
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(sidebar_rect),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let (content, _) = ui.allocate_exact_size(
+                            egui::vec2(
+                                sidebar_rect.width(),
+                                sidebar_content_height(sidebar_rect.height()),
+                            ),
+                            egui::Sense::hover(),
+                        );
+                        let (strip, _) = ui.allocate_exact_size(
+                            egui::vec2(sidebar_rect.width(), chrome::SPACE_SWITCHER_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        rects = Some((content, strip));
+                    });
+            },
+        );
+
+        let (content, strip) = rects.expect("sidebar layout is allocated");
+        assert_eq!(content.max.y, strip.min.y);
+        assert_eq!(strip.height(), chrome::SPACE_SWITCHER_HEIGHT);
+    }
+
+    #[test]
+    fn space_strip_uses_the_sidebar_effective_background() {
+        let palette = bootty_ui::ThemePalette::default();
+        let custom = egui::Color32::from_rgb(0x12, 0x34, 0x56);
+        let space_color = [0x80, 0x40, 0x20];
+
+        assert_eq!(
+            sidebar_background_color(palette, None, space_color, false),
+            palette.mantle
+        );
+        assert_eq!(
+            sidebar_background_color(palette, Some(custom), space_color, false),
+            custom
+        );
+        assert_eq!(
+            sidebar_background_color(palette, Some(custom), space_color, true),
+            egui::Color32::from_rgb(0x1F, 0x35, 0x4F)
+        );
     }
 
     #[test]

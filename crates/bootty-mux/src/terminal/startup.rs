@@ -142,7 +142,6 @@ fn startup_placeholder_frame(geometry: TerminalGeometry) -> Arc<RenderFrame> {
         rows: geometry.rows,
         row_dirty: vec![true; geometry.rows as usize],
         row_wraps: vec![false; geometry.rows as usize],
-        row_wrap_continuations: vec![false; geometry.rows as usize],
         ..RenderFrame::default()
     };
     frame.stats.dirty_rows = geometry.rows as usize;

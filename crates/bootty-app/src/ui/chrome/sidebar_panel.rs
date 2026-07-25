@@ -7,10 +7,11 @@ use crate::{
     assets,
     config::ChromeConfig,
     extensions::ModuleItem,
-    mux::snapshot::MuxSession,
+    mux::{controller::SpaceId, snapshot::MuxSession},
     strings::truncate_label,
     ui::{
         icons::paint_icon_slug,
+        session_navigation::ScopedSessionTarget,
         sidebar::{SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree},
     },
 };
@@ -28,10 +29,11 @@ pub struct SidebarModel<'a> {
     pub title_icon: Option<&'a TextureHandle>,
     pub top_inset: f32,
     pub border_visible: bool,
+    pub border_bottom: bool,
     pub separator_visible: bool,
-    pub can_return_to_last_session: bool,
     pub focused: bool,
-    pub hovered_session: Option<&'a str>,
+    pub hovered_session: Option<&'a ScopedSessionTarget>,
+    /// Retained for callers that construct the model; `BoottyApp` dims after the Space strip.
     pub unfocused_dim: f32,
     /// Explicit color overrides from `[sidebar]`; each falls back to a theme-derived tint.
     pub fullscreen: bool,
@@ -42,9 +44,9 @@ pub struct SidebarModel<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarEvent {
-    ActivateSession(String),
+    ActivateSession(ScopedSessionTarget),
     ContextAction {
-        session_id: String,
+        target: ScopedSessionTarget,
         action: SessionContextAction,
     },
     Reorder {
@@ -74,34 +76,313 @@ const SIDEBAR_FOOTER_ITEM_HEIGHT: f32 = 30.0;
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
 const SIDEBAR_PAD_X: f32 = 14.0;
 pub(crate) const MACOS_TITLEBAR_BUTTON_SAFE_WIDTH: f32 = 72.0;
+pub(crate) const SPACE_SWITCHER_HEIGHT: f32 = 44.0;
+const SPACE_SWITCHER_BUTTON_SIZE: f32 = 28.0;
+const SPACE_SWITCHER_BUTTON_GAP: f32 = 4.0;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceSwitcherItem {
+    pub id: SpaceId,
+    pub name: String,
+    pub icon: String,
+    pub color: [u8; 3],
+    pub active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpaceSwitcherEvent {
+    Activate(SpaceId),
+    Create,
+    Edit(SpaceId),
+    Close(SpaceId),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarSpaceSwipeDirection {
+    Negative,
+    Positive,
+}
+
+impl SidebarSpaceSwipeDirection {
+    fn from_delta(delta_x: f32) -> Option<Self> {
+        (delta_x != 0.0).then(|| {
+            if delta_x.is_sign_positive() {
+                Self::Positive
+            } else {
+                Self::Negative
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SidebarSpaceSwipePhase {
+    #[default]
+    Idle,
+    Active {
+        direction: SidebarSpaceSwipeDirection,
+    },
+    AwaitingMomentum {
+        direction: SidebarSpaceSwipeDirection,
+    },
+    Momentum,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SidebarSpaceSwipeState {
+    phase: SidebarSpaceSwipePhase,
+}
+
+pub fn take_sidebar_space_swipe(
+    ui: &mut egui::Ui,
+    sidebar_rect: Rect,
+    spaces: &[SpaceSwitcherItem],
+    state: &mut SidebarSpaceSwipeState,
+) -> Option<SpaceId> {
+    let hovered = ui
+        .input(|input| input.pointer.hover_pos())
+        .is_some_and(|pos| sidebar_rect.contains(pos));
+    ui.input_mut(|input| {
+        let mut selected = None;
+        input.events.retain(|event| {
+            let egui::Event::MouseWheel { delta, phase, .. } = event else {
+                return true;
+            };
+            if !hovered {
+                return true;
+            }
+            let is_zero_delta = delta.x == 0.0 && delta.y == 0.0;
+            if delta.x.abs() <= delta.y.abs()
+                && !(is_zero_delta
+                    && matches!(phase, egui::TouchPhase::End | egui::TouchPhase::Cancel))
+            {
+                return true;
+            }
+            let target = sidebar_space_swipe_target(spaces, delta.x, *phase, state);
+            if selected.is_none() {
+                selected = target;
+            }
+            false
+        });
+        selected
+    })
+}
+
+fn sidebar_space_swipe_target(
+    spaces: &[SpaceSwitcherItem],
+    delta_x: f32,
+    phase: egui::TouchPhase,
+    state: &mut SidebarSpaceSwipeState,
+) -> Option<SpaceId> {
+    match phase {
+        egui::TouchPhase::Cancel => {
+            state.phase = SidebarSpaceSwipePhase::Idle;
+            return None;
+        }
+        egui::TouchPhase::End => {
+            state.phase = match state.phase {
+                SidebarSpaceSwipePhase::Active { direction } => {
+                    SidebarSpaceSwipePhase::AwaitingMomentum { direction }
+                }
+                SidebarSpaceSwipePhase::Momentum => SidebarSpaceSwipePhase::Idle,
+                phase => phase,
+            };
+            return None;
+        }
+        egui::TouchPhase::Start | egui::TouchPhase::Move => {}
+    }
+
+    let direction = SidebarSpaceSwipeDirection::from_delta(delta_x)?;
+    match (phase, state.phase) {
+        (egui::TouchPhase::Start | egui::TouchPhase::Move, SidebarSpaceSwipePhase::Idle) => {
+            state.phase = SidebarSpaceSwipePhase::Active { direction };
+        }
+        (
+            egui::TouchPhase::Start,
+            SidebarSpaceSwipePhase::AwaitingMomentum {
+                direction: previous_direction,
+            },
+        ) if direction == previous_direction => {
+            state.phase = SidebarSpaceSwipePhase::Momentum;
+            return None;
+        }
+        (egui::TouchPhase::Start, SidebarSpaceSwipePhase::AwaitingMomentum { .. }) => {
+            state.phase = SidebarSpaceSwipePhase::Active { direction };
+        }
+        _ => return None,
+    }
+
+    let active = spaces.iter().position(|space| space.active)?;
+    let target = match direction {
+        SidebarSpaceSwipeDirection::Positive => active.checked_sub(1),
+        SidebarSpaceSwipeDirection::Negative => {
+            active.checked_add(1).filter(|index| *index < spaces.len())
+        }
+    }?;
+    Some(spaces[target].id)
+}
+
+pub fn show_space_switcher(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    spaces: &[SpaceSwitcherItem],
+    transition: Option<(SpaceId, SpaceId, f32)>,
+) -> Option<SpaceSwitcherEvent> {
+    let width = ui.available_width().max(0.0);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, SPACE_SWITCHER_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    let item_count = spaces.len() + 1;
+    let group_width = item_count as f32 * SPACE_SWITCHER_BUTTON_SIZE
+        + item_count.saturating_sub(1) as f32 * SPACE_SWITCHER_BUTTON_GAP;
+    let start_x = rect.center().x - group_width * 0.5;
+    let item_center_x = |index: usize| {
+        start_x
+            + index as f32 * (SPACE_SWITCHER_BUTTON_SIZE + SPACE_SWITCHER_BUTTON_GAP)
+            + SPACE_SWITCHER_BUTTON_SIZE * 0.5
+    };
+    if let Some(dot) = space_indicator_dot(rect, spaces, transition, &item_center_x) {
+        painter.circle_filled(dot, 2.0, palette.primary);
+    }
+    let mut event = None;
+    for (index, space) in spaces.iter().enumerate() {
+        let item_rect = space_switcher_button_rect(rect, item_center_x(index));
+        let response = ui
+            .interact(
+                item_rect,
+                ui.id()
+                    .with(("space-switcher", space.id.persistence_value())),
+                egui::Sense::click(),
+            )
+            .on_hover_text(space.name.as_str());
+        if response.hovered() && !space.active {
+            painter.rect_filled(item_rect, 6.0, sidebar_hover_color(palette));
+        }
+        paint_icon_slug(
+            &painter,
+            &space.icon,
+            item_rect.center(),
+            16.0,
+            egui::Color32::from_rgb(space.color[0], space.color[1], space.color[2]),
+        );
+        if event.is_none() && !space.active && response.clicked_by(egui::PointerButton::Primary) {
+            event = Some(SpaceSwitcherEvent::Activate(space.id));
+        }
+        response.context_menu(|ui| {
+            if ui.button("Edit Space").clicked() {
+                event = Some(SpaceSwitcherEvent::Edit(space.id));
+                ui.close();
+            }
+            if ui
+                .add_enabled(spaces.len() > 1, egui::Button::new("Close"))
+                .clicked()
+            {
+                event = Some(SpaceSwitcherEvent::Close(space.id));
+                ui.close();
+            }
+        });
+    }
+    let plus_rect = space_switcher_button_rect(rect, item_center_x(spaces.len()));
+    let response = ui
+        .interact(
+            plus_rect,
+            ui.id().with("space-switcher-create"),
+            egui::Sense::click(),
+        )
+        .on_hover_text("New Space");
+    if response.hovered() {
+        painter.rect_filled(plus_rect, 6.0, sidebar_hover_color(palette));
+    }
+    paint_icon_slug(&painter, "plus", plus_rect.center(), 16.0, palette.subtext);
+    if event.is_none() && response.clicked_by(egui::PointerButton::Primary) {
+        event = Some(SpaceSwitcherEvent::Create);
+    }
+    event
+}
+
+fn space_switcher_button_rect(strip: Rect, center_x: f32) -> Rect {
+    Rect::from_center_size(
+        Pos2::new(center_x, strip.center().y),
+        egui::vec2(SPACE_SWITCHER_BUTTON_SIZE, SPACE_SWITCHER_BUTTON_SIZE),
+    )
+}
+
+fn space_indicator_center(
+    spaces: &[SpaceSwitcherItem],
+    transition: Option<(SpaceId, SpaceId, f32)>,
+    center_x: &impl Fn(usize) -> f32,
+) -> Option<f32> {
+    let active = spaces.iter().position(|space| space.active)?;
+    let Some((from, to, progress)) = transition else {
+        return Some(center_x(active));
+    };
+    let from = spaces.iter().position(|space| space.id == from);
+    let to = spaces.iter().position(|space| space.id == to);
+    match (from, to) {
+        (Some(from), Some(to)) => Some(egui::lerp(center_x(from)..=center_x(to), progress)),
+        _ => Some(center_x(active)),
+    }
+}
+
+fn space_indicator_dot(
+    rect: Rect,
+    spaces: &[SpaceSwitcherItem],
+    transition: Option<(SpaceId, SpaceId, f32)>,
+    center_x: &impl Fn(usize) -> f32,
+) -> Option<Pos2> {
+    Some(Pos2::new(
+        space_indicator_center(spaces, transition, center_x)?,
+        rect.max.y - 4.0,
+    ))
+}
 const MACOS_TITLEBAR_BUTTON_CENTER_Y: f32 = 16.0;
 /// Fraction of a color kept when dimming an unfocused session row; the rest blends to the row
 /// background, so each element fades in its own hue rather than washing toward white.
 const UNFOCUSED_ROW_KEEP: f32 = 0.5;
 
-fn sidebar_session_id<'a>(item: &SidebarItem<'a>) -> Option<&'a str> {
-    matches!(&item.kind, SidebarItemKind::Session { .. })
-        .then_some(item.session_id)
-        .flatten()
+fn sidebar_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
+    if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
+        return None;
+    }
+    Some(ScopedSessionTarget::new(
+        item.session_scope?,
+        item.session_id?,
+    ))
 }
 
-fn sidebar_context_session_id<'a>(item: &SidebarItem<'a>) -> Option<&'a str> {
+fn sidebar_context_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
     item.selectable
-        .then_some(sidebar_session_id(item))
+        .then(|| sidebar_session_target(item))
         .flatten()
 }
 
-fn sidebar_session_ids<'a>(items: &[SidebarItem<'a>]) -> Vec<&'a str> {
-    let mut session_ids = Vec::new();
+fn sidebar_session_targets(items: &[SidebarItem<'_>]) -> Vec<ScopedSessionTarget> {
+    let mut targets = Vec::new();
     for item in items {
-        let Some(session_id) = sidebar_session_id(item) else {
+        let Some(target) = sidebar_session_target(item) else {
             continue;
         };
-        if !session_ids.contains(&session_id) {
-            session_ids.push(session_id);
+        if !targets.contains(&target) {
+            targets.push(target);
         }
     }
-    session_ids
+    targets
+}
+
+fn sidebar_binding_target_position(
+    targets: &[ScopedSessionTarget],
+    target: &ScopedSessionTarget,
+) -> Option<(usize, usize)> {
+    let binding_targets = targets
+        .iter()
+        .filter(|candidate| candidate.scope == target.scope)
+        .collect::<Vec<_>>();
+    let position = binding_targets
+        .iter()
+        .position(|candidate| *candidate == target)?;
+    Some((position, binding_targets.len()))
 }
 
 fn sidebar_title_drag_rect(rect: Rect, reserve_titlebar_buttons: bool) -> Rect {
@@ -141,14 +422,14 @@ pub fn show_sidebar(
     let width = ui.max_rect().width().max(0.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, palette.base);
     if model.border_visible {
-        painter.rect_stroke(
-            rect,
-            0.0,
-            Stroke::new(1.0, border_color),
-            egui::StrokeKind::Inside,
-        );
+        let stroke = Stroke::new(1.0, border_color);
+        painter.line_segment([rect.left_top(), rect.right_top()], stroke);
+        painter.line_segment([rect.left_top(), rect.left_bottom()], stroke);
+        painter.line_segment([rect.right_top(), rect.right_bottom()], stroke);
+        if model.border_bottom {
+            painter.line_segment([rect.left_bottom(), rect.right_bottom()], stroke);
+        }
     }
 
     let header_h = sidebar_header_height(model.title_visible);
@@ -189,7 +470,7 @@ pub fn show_sidebar(
         .take(max_rows)
         .cloned()
         .collect::<Vec<_>>();
-    let session_ids = sidebar_session_ids(model.items);
+    let session_targets = sidebar_session_targets(model.items);
     let preview_labels = sidebar_drag_preview_labels(&items);
     let drag_id = egui::Id::new("mux-sidebar-drag-anchor");
     let mut dragged = ui
@@ -205,7 +486,7 @@ pub fn show_sidebar(
     let pointer_hovered_session = pointer_pos
         .and_then(|pos| sidebar_hovered_row(pos, rect.min.x, list_top, width, max_rows))
         .and_then(|index| items.get(index))
-        .and_then(|item| item.selectable.then_some(item.session_id).flatten());
+        .and_then(sidebar_session_target);
     let suppress_click = dragged.is_some();
 
     let mut event = None;
@@ -214,10 +495,11 @@ pub fn show_sidebar(
             Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
             egui::vec2(width, SIDEBAR_ROW_HEIGHT),
         );
+        let item_target = sidebar_session_target(item);
         let hovered = item.selectable
-            && item.session_id.is_some_and(|session_id| {
-                Some(session_id) == pointer_hovered_session
-                    || model.focused && Some(session_id) == model.hovered_session
+            && item_target.as_ref().is_some_and(|target| {
+                Some(target) == pointer_hovered_session.as_ref()
+                    || model.focused && Some(target) == model.hovered_session
             });
         let response = sidebar_item_row(
             ui,
@@ -248,28 +530,24 @@ pub fn show_sidebar(
             && !suppress_click
             && response.clicked_by(egui::PointerButton::Primary)
             && item.selectable
-            && let Some(session_id) = &item.session_id
+            && let Some(target) = item_target.clone()
         {
-            event = Some(SidebarEvent::ActivateSession((*session_id).to_owned()));
+            event = Some(SidebarEvent::ActivateSession(target));
         }
         if event.is_none()
-            && let Some(session_id) = sidebar_context_session_id(item)
-            && let Some(position) = session_ids
-                .iter()
-                .position(|candidate| *candidate == session_id)
+            && let Some(target) = sidebar_context_session_target(item)
+            && let Some((position, binding_session_count)) =
+                sidebar_binding_target_position(&session_targets, &target)
             && let Some(action) = session_context_action(
                 &response,
                 !item.current,
-                position > 0,
-                position + 1 < session_ids.len(),
-                session_ids.len() > 1,
-                model.can_return_to_last_session,
+                item.reorder_anchor.is_some() && position > 0,
+                item.reorder_anchor.is_some() && position + 1 < binding_session_count,
+                binding_session_count > 1,
+                item.can_return_to_last_session,
             )
         {
-            event = Some(SidebarEvent::ContextAction {
-                session_id: session_id.to_owned(),
-                action,
-            });
+            event = Some(SidebarEvent::ContextAction { target, action });
         }
     }
 
@@ -315,9 +593,6 @@ pub fn show_sidebar(
         palette,
         border_color,
     );
-    if !model.focused {
-        painter.rect_filled(rect, 0.0, dim_overlay_color(model.unfocused_dim));
-    }
     event
 }
 
@@ -625,11 +900,6 @@ fn sidebar_blocks<'a>(items: &'a [SidebarItem<'a>]) -> Vec<SidebarBlock<'a>> {
 
 fn subtle_border(palette: ThemePalette) -> egui::Color32 {
     mix_color(palette.base, palette.text, 0.09)
-}
-
-fn dim_overlay_color(amount: f32) -> egui::Color32 {
-    let alpha = (amount.clamp(0.0, 1.0) * 255.0).round() as u8;
-    egui::Color32::from_black_alpha(alpha)
 }
 
 fn mix_color(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
@@ -1075,10 +1345,28 @@ mod tests {
     use crate::{
         config::ChromeConfig,
         mux::snapshot::MuxSession,
-        ui::sidebar::{
-            SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree, build_visible_sidebar_items,
+        ui::{
+            session_navigation::BindingSessionGroup,
+            sidebar::{
+                SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree,
+                build_binding_sidebar_items, build_visible_sidebar_items,
+            },
         },
     };
+
+    fn test_scope() -> crate::mux::controller::MuxScope {
+        crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(0),
+            crate::mux::controller::BindingId::from_persistence(0),
+        )
+    }
+
+    fn binding_scope(binding_id: i64) -> crate::mux::controller::MuxScope {
+        crate::mux::controller::MuxScope::new(
+            crate::mux::controller::SpaceId::from_persistence(1),
+            crate::mux::controller::BindingId::from_persistence(binding_id),
+        )
+    }
 
     #[test]
     fn sidebar_rect_uses_configured_width_and_can_be_disabled() {
@@ -1119,6 +1407,29 @@ mod tests {
         assert_eq!(
             sidebar_title_drag_rect(rect, true).min.x,
             MACOS_TITLEBAR_BUTTON_SAFE_WIDTH
+        );
+    }
+
+    #[test]
+    fn context_navigation_counts_sessions_within_the_target_binding() {
+        let local_scope = binding_scope(10);
+        let remote_scope = binding_scope(20);
+        let targets = vec![
+            ScopedSessionTarget::new(local_scope, "$1"),
+            ScopedSessionTarget::new(local_scope, "$2"),
+            ScopedSessionTarget::new(remote_scope, "$1"),
+        ];
+
+        assert_eq!(
+            sidebar_binding_target_position(&targets, &ScopedSessionTarget::new(local_scope, "$2"),),
+            Some((1, 2))
+        );
+        assert_eq!(
+            sidebar_binding_target_position(
+                &targets,
+                &ScopedSessionTarget::new(remote_scope, "$1"),
+            ),
+            Some((0, 1))
         );
     }
 
@@ -1184,8 +1495,8 @@ mod tests {
                 title_icon: None,
                 top_inset: 0.0,
                 border_visible: false,
+                border_bottom: false,
                 separator_visible: false,
-                can_return_to_last_session: false,
                 focused: false,
                 hovered_session: None,
                 unfocused_dim: 0.0,
@@ -1195,6 +1506,96 @@ mod tests {
                 border_override: None,
             },
         )
+    }
+
+    #[test]
+    fn sidebar_pointer_activation_preserves_binding_scope_for_colliding_session_ids() {
+        let local_scope = binding_scope(10);
+        let remote_scope = binding_scope(20);
+        let groups = vec![
+            BindingSessionGroup {
+                scope: local_scope,
+                label: "Local".to_owned(),
+                sessions: vec![test_session("$1", "work", true)],
+                selected_session: Some("$1".to_owned()),
+                active: true,
+                can_return_to_last_session: false,
+            },
+            BindingSessionGroup {
+                scope: remote_scope,
+                label: "Remote".to_owned(),
+                sessions: vec![test_session("$1", "work", false)],
+                selected_session: Some("$1".to_owned()),
+                active: false,
+                can_return_to_last_session: false,
+            },
+        ];
+        let items = build_binding_sidebar_items(&groups);
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
+        let show = |events: Vec<egui::Event>| {
+            let mut event = None;
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        event = show_sidebar(
+                            ui,
+                            ThemePalette::default(),
+                            300.0,
+                            SidebarModel {
+                                items: &items,
+                                footer_items: &[],
+                                session_count: 2,
+                                has_sessions: true,
+                                title_visible: false,
+                                reserve_titlebar_buttons: false,
+                                title_icon: None,
+                                top_inset: 0.0,
+                                border_visible: false,
+                                border_bottom: false,
+                                separator_visible: false,
+                                focused: false,
+                                hovered_session: None,
+                                unfocused_dim: 0.0,
+                                fullscreen: false,
+                                hover_override: None,
+                                current_override: None,
+                                border_override: None,
+                            },
+                        );
+                    });
+                },
+            );
+            event
+        };
+        let remote_row = Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 3.5);
+        show(vec![egui::Event::PointerMoved(remote_row)]);
+        show(vec![egui::Event::PointerButton {
+            pos: remote_row,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let event = show(vec![egui::Event::PointerButton {
+            pos: remote_row,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(
+            event,
+            Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
+                remote_scope,
+                "$1",
+            )))
+        );
     }
 
     #[test]
@@ -1213,9 +1614,19 @@ mod tests {
         let duplicate = items[2].clone();
         items.push(duplicate);
 
-        assert_eq!(sidebar_session_ids(&items), vec!["s1", "s2"]);
-        assert_eq!(sidebar_context_session_id(&items[0]), Some("s1"));
-        assert_eq!(sidebar_context_session_id(&items[1]), None);
+        let targets = sidebar_session_targets(&items);
+        assert_eq!(
+            targets,
+            vec![
+                ScopedSessionTarget::new(test_scope(), "s1"),
+                ScopedSessionTarget::new(test_scope(), "s2"),
+            ]
+        );
+        assert_eq!(
+            sidebar_context_session_target(&items[0]),
+            Some(ScopedSessionTarget::new(test_scope(), "s1"))
+        );
+        assert_eq!(sidebar_context_session_target(&items[1]), None);
     }
 
     #[test]
@@ -1242,7 +1653,10 @@ mod tests {
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        let item_id = crate::ui::sidebar::SidebarItemId::Session("s2");
+                        let item_id = crate::ui::sidebar::SidebarItemId::Session {
+                            scope: test_scope(),
+                            id: "s2",
+                        };
                         let id = ui.make_persistent_id(("mux-sidebar-item", &item_id));
                         ui.memory_mut(|memory| memory.request_focus(id));
                         show_test_sidebar(ui, &sessions);
@@ -1346,7 +1760,7 @@ mod tests {
         assert_eq!(
             captured,
             Some(SidebarEvent::ContextAction {
-                session_id: "s2".to_owned(),
+                target: ScopedSessionTarget::new(test_scope(), "s2"),
                 action: SessionContextAction::Activate,
             })
         );
@@ -1359,17 +1773,22 @@ mod tests {
         let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
         let items = vec![
             SidebarItem {
-                id: crate::ui::sidebar::SidebarItemId::Session("s1"),
+                id: crate::ui::sidebar::SidebarItemId::Session {
+                    scope: test_scope(),
+                    id: "s1",
+                },
                 display: SidebarDisplay::Text("alpha"),
                 indent: 0,
                 tree: SidebarTree::None,
                 selectable: true,
                 session_id: Some("s1"),
+                session_scope: Some(test_scope()),
                 reorder_anchor: Some("alpha"),
                 color: egui::Color32::WHITE,
                 dim_color: egui::Color32::GRAY,
                 kind: SidebarItemKind::Session { active: true },
                 current: true,
+                can_return_to_last_session: false,
                 icon: None,
                 primitives: &[],
             },
@@ -1380,11 +1799,13 @@ mod tests {
                 tree: SidebarTree::None,
                 selectable: false,
                 session_id: Some("s1"),
+                session_scope: Some(test_scope()),
                 reorder_anchor: Some("alpha"),
                 color: egui::Color32::WHITE,
                 dim_color: egui::Color32::GRAY,
                 kind: SidebarItemKind::Row,
                 current: true,
+                can_return_to_last_session: false,
                 icon: None,
                 primitives: &[],
             },
@@ -1405,8 +1826,8 @@ mod tests {
                     title_icon: None,
                     top_inset: 0.0,
                     border_visible: false,
+                    border_bottom: false,
                     separator_visible: false,
-                    can_return_to_last_session: false,
                     focused: false,
                     hovered_session: None,
                     unfocused_dim: 0.0,
@@ -1599,5 +2020,527 @@ mod tests {
 
         assert!(with_footer < plain);
         assert_eq!(plain, 33);
+    }
+
+    fn space_swipe_test_items() -> (Vec<SpaceSwitcherItem>, SpaceId) {
+        let second = SpaceSwitcherItem {
+            id: SpaceId::from_persistence(2),
+            name: "Review".to_owned(),
+            icon: "folder".to_owned(),
+            color: [0x7A, 0xA2, 0xF7],
+            active: false,
+        };
+        (
+            vec![
+                SpaceSwitcherItem {
+                    id: SpaceId::from_persistence(1),
+                    name: "Work".to_owned(),
+                    icon: "folder".to_owned(),
+                    color: [0x7A, 0xA2, 0xF7],
+                    active: true,
+                },
+                second.clone(),
+            ],
+            second.id,
+        )
+    }
+
+    fn sidebar_space_swipe_frame(
+        context: &egui::Context,
+        sidebar_rect: Rect,
+        spaces: &[SpaceSwitcherItem],
+        state: &mut SidebarSpaceSwipeState,
+        events: Vec<egui::Event>,
+    ) -> (Option<SpaceId>, Vec<egui::Vec2>) {
+        let mut selected = None;
+        let mut remaining_wheels = Vec::new();
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(sidebar_rect),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    selected = take_sidebar_space_swipe(ui, sidebar_rect, spaces, state);
+                    remaining_wheels = ui.input(|input| {
+                        input
+                            .events
+                            .iter()
+                            .filter_map(|event| match event {
+                                egui::Event::MouseWheel { delta, .. } => Some(*delta),
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                });
+            },
+        );
+        (selected, remaining_wheels)
+    }
+
+    fn wheel(delta: egui::Vec2, phase: egui::TouchPhase) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta,
+            phase,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn horizontal_wheel(phase: egui::TouchPhase) -> egui::Event {
+        wheel(egui::vec2(-12.0, 1.0), phase)
+    }
+
+    #[test]
+    fn sidebar_swipe_repeated_start_events_switch_once() {
+        let (spaces, second_id) = space_swipe_test_items();
+        let context = egui::Context::default();
+        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0));
+        let mut state = SidebarSpaceSwipeState::default();
+
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(sidebar_rect.center()),
+                    horizontal_wheel(egui::TouchPhase::Start),
+                ],
+            )
+            .0,
+            Some(second_id)
+        );
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![horizontal_wheel(egui::TouchPhase::Start)],
+            )
+            .0,
+            None
+        );
+    }
+
+    #[test]
+    fn sidebar_swipe_end_ignores_momentum_move() {
+        let (spaces, second_id) = space_swipe_test_items();
+        let context = egui::Context::default();
+        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0));
+        let mut state = SidebarSpaceSwipeState::default();
+
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(sidebar_rect.center()),
+                    horizontal_wheel(egui::TouchPhase::Move),
+                ],
+            )
+            .0,
+            Some(second_id)
+        );
+        let (selected, remaining_wheels) = sidebar_space_swipe_frame(
+            &context,
+            sidebar_rect,
+            &spaces,
+            &mut state,
+            vec![wheel(egui::Vec2::ZERO, egui::TouchPhase::End)],
+        );
+        assert_eq!(selected, None);
+        assert!(remaining_wheels.is_empty());
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![horizontal_wheel(egui::TouchPhase::Move)],
+            )
+            .0,
+            None
+        );
+    }
+
+    #[test]
+    fn sidebar_swipe_ignores_macos_momentum_and_resets() {
+        let (spaces, second_id) = space_swipe_test_items();
+        let context = egui::Context::default();
+        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0));
+        let mut state = SidebarSpaceSwipeState::default();
+        let mut replay = |events| {
+            sidebar_space_swipe_frame(&context, sidebar_rect, &spaces, &mut state, events).0
+        };
+
+        let targets = [
+            replay(vec![
+                egui::Event::PointerMoved(sidebar_rect.center()),
+                wheel(egui::vec2(-3.0, 1.0), egui::TouchPhase::Start),
+            ]),
+            replay(vec![wheel(egui::vec2(-3.0, 1.0), egui::TouchPhase::Move)]),
+            replay(vec![wheel(egui::Vec2::ZERO, egui::TouchPhase::End)]),
+            replay(vec![wheel(egui::vec2(-21.0, 0.0), egui::TouchPhase::Start)]),
+            replay(vec![wheel(egui::vec2(-21.0, 0.0), egui::TouchPhase::Move)]),
+            replay(vec![wheel(egui::Vec2::ZERO, egui::TouchPhase::End)]),
+        ];
+        assert_eq!(
+            targets.into_iter().flatten().collect::<Vec<_>>(),
+            [second_id]
+        );
+
+        let targets = [
+            replay(vec![wheel(egui::vec2(-3.0, 1.0), egui::TouchPhase::Start)]),
+            replay(vec![wheel(egui::vec2(-3.0, 1.0), egui::TouchPhase::Move)]),
+            replay(vec![wheel(egui::Vec2::ZERO, egui::TouchPhase::End)]),
+            replay(vec![wheel(egui::vec2(-21.0, 0.0), egui::TouchPhase::Start)]),
+            replay(vec![wheel(egui::vec2(-21.0, 0.0), egui::TouchPhase::Move)]),
+            replay(vec![wheel(egui::Vec2::ZERO, egui::TouchPhase::End)]),
+        ];
+        assert_eq!(
+            targets.into_iter().flatten().collect::<Vec<_>>(),
+            [second_id]
+        );
+    }
+
+    #[test]
+    fn sidebar_swipe_opposite_start_after_end_reverses_direction() {
+        let (mut spaces, _) = space_swipe_test_items();
+        let first_id = spaces[0].id;
+        spaces[0].active = false;
+        spaces[1].active = true;
+        let mut state = SidebarSpaceSwipeState::default();
+
+        assert_eq!(
+            sidebar_space_swipe_target(&spaces, -3.0, egui::TouchPhase::Start, &mut state,),
+            None
+        );
+        assert_eq!(
+            sidebar_space_swipe_target(&spaces, 0.0, egui::TouchPhase::End, &mut state),
+            None
+        );
+        assert_eq!(
+            sidebar_space_swipe_target(&spaces, 3.0, egui::TouchPhase::Start, &mut state),
+            Some(first_id)
+        );
+        assert_eq!(
+            state.phase,
+            SidebarSpaceSwipePhase::Active {
+                direction: SidebarSpaceSwipeDirection::Positive,
+            }
+        );
+    }
+
+    #[test]
+    fn sidebar_swipe_cancel_resets_for_the_next_gesture() {
+        let (spaces, second_id) = space_swipe_test_items();
+        let context = egui::Context::default();
+        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0));
+        let mut state = SidebarSpaceSwipeState::default();
+
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![
+                    egui::Event::PointerMoved(sidebar_rect.center()),
+                    horizontal_wheel(egui::TouchPhase::Start),
+                ],
+            )
+            .0,
+            Some(second_id)
+        );
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![wheel(egui::Vec2::ZERO, egui::TouchPhase::Cancel)],
+            )
+            .0,
+            None
+        );
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![horizontal_wheel(egui::TouchPhase::Start)],
+            )
+            .0,
+            Some(second_id)
+        );
+    }
+
+    #[test]
+    fn sidebar_swipe_leaves_vertical_wheel_events_for_the_sidebar() {
+        let (spaces, second_id) = space_swipe_test_items();
+        let context = egui::Context::default();
+        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0));
+        let mut state = SidebarSpaceSwipeState::default();
+        let vertical = egui::vec2(0.0, 12.0);
+
+        let (selected, remaining_wheels) = sidebar_space_swipe_frame(
+            &context,
+            sidebar_rect,
+            &spaces,
+            &mut state,
+            vec![
+                egui::Event::PointerMoved(sidebar_rect.center()),
+                wheel(vertical, egui::TouchPhase::Move),
+            ],
+        );
+
+        assert_eq!(selected, None);
+        assert_eq!(remaining_wheels, vec![vertical]);
+        assert_eq!(
+            sidebar_space_swipe_frame(
+                &context,
+                sidebar_rect,
+                &spaces,
+                &mut state,
+                vec![horizontal_wheel(egui::TouchPhase::Move)],
+            )
+            .0,
+            Some(second_id)
+        );
+    }
+
+    #[test]
+    fn space_switcher_click_activates_a_full_window_space() {
+        let first = SpaceSwitcherItem {
+            id: SpaceId::from_persistence(1),
+            name: "Work".to_owned(),
+            icon: "folder".to_owned(),
+            color: [0x7A, 0xA2, 0xF7],
+            active: true,
+        };
+        let second = SpaceSwitcherItem {
+            id: SpaceId::from_persistence(2),
+            name: "Review".to_owned(),
+            icon: "folder".to_owned(),
+            color: [0x7A, 0xA2, 0xF7],
+            active: false,
+        };
+        let spaces = vec![first, second.clone()];
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 44.0));
+        let show = |events: Vec<egui::Event>| {
+            let mut selected = None;
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            selected =
+                                show_space_switcher(ui, ThemePalette::default(), &spaces, None);
+                        });
+                },
+            );
+            selected
+        };
+        let second_center = Pos2::new(120.0, 22.0);
+        show(vec![egui::Event::PointerMoved(second_center)]);
+        show(vec![egui::Event::PointerButton {
+            pos: second_center,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let selected = show(vec![egui::Event::PointerButton {
+            pos: second_center,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(selected, Some(SpaceSwitcherEvent::Activate(second.id)));
+    }
+
+    #[test]
+    fn space_switcher_plus_emits_create_event() {
+        let spaces = vec![SpaceSwitcherItem {
+            id: SpaceId::from_persistence(1),
+            name: "Work".to_owned(),
+            icon: "folder".to_owned(),
+            color: [0x7A, 0xA2, 0xF7],
+            active: true,
+        }];
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 44.0));
+        let show = |events: Vec<egui::Event>| {
+            let mut event = None;
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            event = show_space_switcher(ui, ThemePalette::default(), &spaces, None);
+                        });
+                },
+            );
+            event
+        };
+        let plus_center = Pos2::new(135.0, 22.0);
+
+        show(vec![egui::Event::PointerMoved(plus_center)]);
+        show(vec![egui::Event::PointerButton {
+            pos: plus_center,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let event = show(vec![egui::Event::PointerButton {
+            pos: plus_center,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+
+        assert_eq!(event, Some(SpaceSwitcherEvent::Create));
+    }
+
+    #[test]
+    fn space_switcher_context_menu_emits_edit_for_clicked_space() {
+        let spaces = vec![
+            SpaceSwitcherItem {
+                id: SpaceId::from_persistence(1),
+                name: "Work".to_owned(),
+                icon: "folder".to_owned(),
+                color: [0x7A, 0xA2, 0xF7],
+                active: true,
+            },
+            SpaceSwitcherItem {
+                id: SpaceId::from_persistence(2),
+                name: "Review".to_owned(),
+                icon: "terminal".to_owned(),
+                color: [0x7A, 0xA2, 0xF7],
+                active: false,
+            },
+        ];
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, SPACE_SWITCHER_HEIGHT));
+        let frame = |events: Vec<egui::Event>, captured: &mut Option<SpaceSwitcherEvent>| {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        if let Some(event) =
+                            show_space_switcher(ui, ThemePalette::default(), &spaces, None)
+                        {
+                            *captured = Some(event);
+                        }
+                    });
+                },
+            );
+        };
+
+        let control = Pos2::new(120.0, SPACE_SWITCHER_HEIGHT * 0.5);
+        let edit = Pos2::new(150.0, 16.0);
+        let mut captured = None;
+        frame(vec![egui::Event::PointerMoved(control)], &mut captured);
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: control,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut captured,
+        );
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: control,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut captured,
+        );
+        frame(vec![egui::Event::PointerMoved(edit)], &mut captured);
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: edit,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut captured,
+        );
+        frame(
+            vec![egui::Event::PointerButton {
+                pos: edit,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            &mut captured,
+        );
+
+        assert_eq!(captured, Some(SpaceSwitcherEvent::Edit(spaces[1].id)));
+    }
+
+    #[test]
+    fn space_switcher_controls_are_centered_in_the_44px_strip() {
+        let strip = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, SPACE_SWITCHER_HEIGHT));
+        let control = space_switcher_button_rect(strip, 120.0);
+        assert_eq!(control.center().y, strip.center().y);
+    }
+
+    #[test]
+    fn space_indicator_is_a_borderless_dot_between_space_controls() {
+        let spaces = vec![
+            SpaceSwitcherItem {
+                id: SpaceId::from_persistence(1),
+                name: "Work".to_owned(),
+                icon: "folder".to_owned(),
+                color: [0x7A, 0xA2, 0xF7],
+                active: false,
+            },
+            SpaceSwitcherItem {
+                id: SpaceId::from_persistence(2),
+                name: "Review".to_owned(),
+                icon: "terminal".to_owned(),
+                color: [0x7A, 0xA2, 0xF7],
+                active: true,
+            },
+        ];
+
+        assert_eq!(
+            space_indicator_dot(
+                Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, SPACE_SWITCHER_HEIGHT)),
+                &spaces,
+                Some((spaces[0].id, spaces[1].id, 0.5)),
+                &|index| index as f32 * 32.0,
+            ),
+            Some(Pos2::new(16.0, SPACE_SWITCHER_HEIGHT - 4.0))
+        );
     }
 }

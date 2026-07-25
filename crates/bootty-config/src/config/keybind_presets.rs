@@ -485,9 +485,8 @@ fn ghostty_layout_keybinds() -> &'static [&'static str] {
     }
 }
 
-// cmux's Cmd+1-9 = workspace (bootty session) wins over Ghostty's Cmd+1-8 = goto_tab; tab
-// selection follows cmux's select_surface on Ctrl+1-9. Cmd+[/] follow Ghostty's goto_split
-// previous/next.
+// cmux's Cmd+1-9 = workspace (bootty session) wins over Ghostty's Cmd+1-8 = goto_tab. Ctrl+1-9
+// are global space selection defaults. Cmd+[/] follow Ghostty's goto_split previous/next.
 pub(super) fn ghostty_layout_keybinds_macos() -> &'static [&'static str] {
     &[
         "cmd+n=new_mux_session",
@@ -506,15 +505,6 @@ pub(super) fn ghostty_layout_keybinds_macos() -> &'static [&'static str] {
         "alt+cmd+ArrowRight=select_pane:right",
         "alt+cmd+ArrowUp=select_pane:up",
         "alt+cmd+ArrowDown=select_pane:down",
-        "ctrl+1=select_tab:1",
-        "ctrl+2=select_tab:2",
-        "ctrl+3=select_tab:3",
-        "ctrl+4=select_tab:4",
-        "ctrl+5=select_tab:5",
-        "ctrl+6=select_tab:6",
-        "ctrl+7=select_tab:7",
-        "ctrl+8=select_tab:8",
-        "ctrl+9=select_tab:9",
         "cmd+1=select_session:1",
         "cmd+2=select_session:2",
         "cmd+3=select_session:3",
@@ -627,7 +617,7 @@ pub(super) fn owned_keybinds(entries: &[&str]) -> Vec<String> {
 }
 
 pub(super) fn preset_global_keybinds(preset: KeybindPreset) -> Vec<String> {
-    match preset {
+    let mut keybinds = match preset {
         // Tmux reuses Bootty's chrome — tmux itself has no opinion outside its prefix table.
         KeybindPreset::Bootty | KeybindPreset::Tmux => {
             let mut keybinds = owned_keybinds(common_keybinds());
@@ -635,7 +625,11 @@ pub(super) fn preset_global_keybinds(preset: KeybindPreset) -> Vec<String> {
             keybinds
         }
         KeybindPreset::Ghostty => owned_keybinds(ghostty_common_keybinds()),
+    };
+    if cfg!(target_os = "macos") {
+        keybinds.extend((1..=9).map(|index| format!("ctrl+{index}=select_space:{index}")));
     }
+    keybinds
 }
 
 pub(super) fn preset_layout_keybinds(preset: KeybindPreset, prefix: Option<&str>) -> Vec<String> {
@@ -669,5 +663,34 @@ pub(super) fn preset_tmux_backend_keybinds(
         // No relay layer. For the Tmux preset the emptiness is load-bearing: an unbound prefix
         // passes through as raw input, so the external tmux handles its own prefix natively.
         KeybindPreset::Ghostty | KeybindPreset::Tmux => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn space_selection_defaults_apply_to_every_preset_on_macos() {
+        for preset in KeybindPreset::ALL {
+            let mut keybinds = preset_global_keybinds(preset);
+            keybinds.extend(preset_layout_keybinds(preset, preset.default_prefix()));
+
+            for index in 1..=9 {
+                let space = format!("ctrl+{index}=select_space:{index}");
+                let ctrl_bindings: Vec<_> = keybinds
+                    .iter()
+                    .filter(|binding| binding.starts_with(&format!("ctrl+{index}=")))
+                    .collect();
+                let session = format!("cmd+{index}=select_session:{index}");
+
+                if cfg!(target_os = "macos") {
+                    assert_eq!(ctrl_bindings, [&space], "{preset:?}");
+                    assert!(keybinds.contains(&session), "{preset:?}");
+                } else {
+                    assert!(ctrl_bindings.is_empty(), "{preset:?}");
+                }
+            }
+        }
     }
 }

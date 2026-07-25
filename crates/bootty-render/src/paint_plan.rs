@@ -802,7 +802,6 @@ mod tests {
             cursor: None,
             row_dirty: vec![true, true],
             row_wraps: vec![false, false],
-            row_wrap_continuations: vec![false, false],
             search_matches: Vec::new(),
             active_search_match: None,
             active_search_match_index: None,

@@ -29,8 +29,6 @@ fn ui_color_config_from_colors(colors: &ColorConfig) -> UiColorConfig {
     UiColorConfig {
         background: colors.background.map(config_color32),
         foreground: colors.foreground.map(config_color32),
-        selection_background: colors.selection_background.map(config_color32),
-        selection_foreground: colors.selection_foreground.map(config_color32),
         palette,
     }
 }

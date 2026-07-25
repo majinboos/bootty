@@ -237,21 +237,16 @@ impl NewMuxSessionDialog {
         }
     }
 
-    /// Discover the project's worktrees and decide what to show next. A directory
-    /// with a single worktree (or no git at all) skips straight to session
-    /// creation; a repo with several worktrees opens the worktree step, defaulting
-    /// to the first worktree that has no session open yet.
+    /// Discover the project's worktrees and decide what to show next. A repository's only
+    /// worktree skips straight to session creation only while it is unused; selecting it again
+    /// opens the worktree chooser with "New worktree" selected.
     fn activate_project(
         &mut self,
         project: ProjectPickerEntry,
         open_cwds: &[String],
     ) -> NewSessionPickerEvent {
         let worktrees = discover_worktree_picker_entries(&project.path);
-        let real: Vec<&WorktreePickerEntry> =
-            worktrees.iter().filter(|entry| !entry.is_new).collect();
-        if let [only] = real.as_slice()
-            && let Some(cwd) = only.path.clone()
-        {
+        if let Some(cwd) = single_unused_worktree_cwd(&worktrees, open_cwds) {
             return NewSessionPickerEvent::CreateSession { cwd };
         }
 
@@ -278,6 +273,21 @@ impl NewMuxSessionDialog {
             NewSessionPickerEvent::Close
         }
     }
+}
+
+fn single_unused_worktree_cwd(
+    entries: &[WorktreePickerEntry],
+    open_cwds: &[String],
+) -> Option<String> {
+    let mut real = entries.iter().filter(|entry| !entry.is_new);
+    let only = real.next()?;
+    if real.next().is_some() {
+        return None;
+    }
+    only.path
+        .as_ref()
+        .filter(|path| !open_cwds.iter().any(|cwd| same_dir(cwd, path)))
+        .cloned()
 }
 
 /// Index of the first worktree without an open session, or 0 ("New worktree")
@@ -395,6 +405,23 @@ mod tests {
             path: Some(path.to_owned()),
             is_new: false,
         }
+    }
+
+    #[test]
+    fn repeated_single_worktree_routes_to_new_worktree_flow() {
+        let entries = vec![new_row(), worktree("/repo")];
+        assert_eq!(
+            single_unused_worktree_cwd(&entries, &[]),
+            Some("/repo".to_owned())
+        );
+        assert_eq!(
+            single_unused_worktree_cwd(&entries, &["/repo".to_owned()]),
+            None
+        );
+        assert_eq!(
+            default_worktree_selection(&entries, &["/repo".to_owned()]),
+            0
+        );
     }
 
     #[test]

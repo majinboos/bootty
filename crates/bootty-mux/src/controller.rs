@@ -4,12 +4,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_config::config::MultiplexerConfig;
+use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
 use crate::{
     RepaintHandle,
     command::MuxCommand,
-    config::{MuxBackendKind, build_backend, selected_backend},
+    config::{build_backend, selected_backend},
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh},
 };
 
@@ -21,7 +21,7 @@ pub struct NewMuxSessionRequest {
     pub cwd: String,
 }
 
-type SessionRefreshSnapshot = std::result::Result<(MuxBackendKind, MuxSnapshot), String>;
+type SessionRefreshSnapshot = std::result::Result<(MultiplexerBackendConfig, MuxSnapshot), String>;
 type SessionRefreshResult = (u64, SessionRefreshSnapshot);
 
 struct SessionRefreshRequest {
@@ -228,21 +228,138 @@ fn order_sessions_by_names(sessions: &[MuxSession], ordered_names: &[String]) ->
             ordered.push(remaining.remove(index));
         }
     }
-    ordered.extend(remaining);
     ordered
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct SpaceId(i64);
+
+impl SpaceId {
+    pub fn from_persistence(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub fn persistence_value(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct BindingId(i64);
+
+impl BindingId {
+    pub fn from_persistence(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub fn persistence_value(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct MuxScope {
+    space_id: SpaceId,
+    binding_id: BindingId,
+}
+
+impl MuxScope {
+    pub fn new(space_id: SpaceId, binding_id: BindingId) -> Self {
+        Self {
+            space_id,
+            binding_id,
+        }
+    }
+
+    pub fn space_id(self) -> SpaceId {
+        self.space_id
+    }
+
+    pub fn binding_id(self) -> BindingId {
+        self.binding_id
+    }
+}
+
+pub struct BindingMuxController {
+    controller: MuxController,
+    last_error: Option<String>,
+    refresh_completed: bool,
+}
+
+impl Default for BindingMuxController {
+    fn default() -> Self {
+        Self {
+            controller: MuxController::new(),
+            last_error: None,
+            refresh_completed: false,
+        }
+    }
+}
+
+impl BindingMuxController {
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    pub fn set_error(&mut self, error: Option<String>) {
+        self.last_error = error;
+    }
+
+    pub fn take_refresh_completed(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_completed)
+    }
+
+    pub fn refresh_sessions(
+        &mut self,
+        repaint: &RepaintHandle,
+        config: &MultiplexerConfig,
+    ) -> Option<String> {
+        let error = self.controller.refresh_sessions(repaint, config);
+        if let Some(error) = &error {
+            self.last_error = Some(error.clone());
+        } else if self.controller.take_refresh_completed() {
+            self.last_error = None;
+            self.refresh_completed = true;
+        }
+        error
+    }
+
+    pub fn poll_command(&mut self) -> Option<Result<(), String>> {
+        let result = self.controller.poll_command();
+        if let Some(result) = &result {
+            self.last_error = result.as_ref().err().cloned();
+        }
+        result
+    }
+}
+
+impl std::ops::Deref for BindingMuxController {
+    type Target = MuxController;
+
+    fn deref(&self) -> &Self::Target {
+        &self.controller
+    }
+}
+
+impl std::ops::DerefMut for BindingMuxController {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.controller
+    }
 }
 
 #[derive(Default)]
 pub struct MuxController {
     sessions: Vec<MuxSession>,
+    backend_session_names: Vec<String>,
     selected_session: Option<String>,
     previous_selected_session: Option<String>,
     selected_window: Option<String>,
     /// The selected session's active window from the previous snapshot, used to detect window
     /// switches made outside bootty so the highlight follows them.
     last_active_window: Option<ActiveWindow>,
-    current_backend: Option<MuxBackendKind>,
+    current_backend: Option<MultiplexerBackendConfig>,
     last_session_refresh: Option<Instant>,
+    refresh_completed: bool,
     session_refresh_generation: u64,
     session_refresh_tx: Option<mpsc::Sender<SessionRefreshRequest>>,
     session_refresh_rx: Option<mpsc::Receiver<SessionRefreshResult>>,
@@ -261,6 +378,10 @@ impl MuxController {
 
     pub fn sessions(&self) -> &[MuxSession] {
         &self.sessions
+    }
+
+    pub fn backend_session_names(&self) -> &[String] {
+        &self.backend_session_names
     }
 
     pub fn selected_session(&self) -> Option<&str> {
@@ -330,10 +451,23 @@ impl MuxController {
 
     pub fn apply_session_order(&mut self, ordered_names: &[String]) {
         self.sessions = order_sessions_by_names(&self.sessions, ordered_names);
+        if self.selected_session.as_deref().is_none_or(|selected| {
+            !self
+                .sessions
+                .iter()
+                .any(|session| session.id == selected || session.name == selected)
+        }) {
+            self.set_selected_session(self.sessions.first().map(|session| session.id.clone()));
+            self.selected_window = None;
+        }
     }
 
     pub fn selected_window(&self) -> Option<&str> {
         self.selected_window.as_deref()
+    }
+
+    fn take_refresh_completed(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_completed)
     }
 
     pub fn refresh_sessions(
@@ -346,7 +480,9 @@ impl MuxController {
                 continue;
             }
             match result {
-                Ok((backend, snapshot)) => self.apply_refreshed_snapshot(backend, snapshot),
+                Ok((backend, snapshot)) => {
+                    self.refresh_completed |= self.apply_refreshed_snapshot(backend, snapshot);
+                }
                 Err(error) => return Some(error),
             }
         }
@@ -358,7 +494,7 @@ impl MuxController {
             return None;
         }
 
-        if selected_backend(config) == MuxBackendKind::Native {
+        if selected_backend(config) == MultiplexerBackendConfig::Native {
             return self.refresh_native_sessions(config);
         }
 
@@ -393,7 +529,8 @@ impl MuxController {
     fn refresh_native_sessions(&mut self, config: &MultiplexerConfig) -> Option<String> {
         match build_backend(config).snapshot() {
             Ok(snapshot) => {
-                self.apply_refreshed_snapshot(MuxBackendKind::Native, snapshot);
+                self.refresh_completed |=
+                    self.apply_refreshed_snapshot(MultiplexerBackendConfig::Native, snapshot);
                 self.last_session_refresh = Some(Instant::now());
                 None
             }
@@ -516,6 +653,9 @@ impl MuxController {
         repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) {
+        if selected_backend(config) != MultiplexerBackendConfig::Native {
+            self.apply_optimistic_session_rename(session_id, &name);
+        }
         let command = MuxCommand::RenameSession {
             session_id: session_id.to_owned(),
             name,
@@ -703,7 +843,7 @@ impl MuxController {
         preferred_window: Option<String>,
     ) -> Result<(), String> {
         let backend_kind = selected_backend(config);
-        if backend_kind != MuxBackendKind::Native {
+        if backend_kind != MultiplexerBackendConfig::Native {
             return Err("not synchronous-native".to_owned());
         }
         let mut backend = build_backend(config);
@@ -717,33 +857,43 @@ impl MuxController {
             .map_err(|error| error.to_string())
     }
 
-    fn apply_refreshed_snapshot(&mut self, backend: MuxBackendKind, snapshot: MuxSnapshot) {
+    fn apply_refreshed_snapshot(
+        &mut self,
+        backend: MultiplexerBackendConfig,
+        snapshot: MuxSnapshot,
+    ) -> bool {
         let same_backend = self.current_backend == Some(backend);
-        if backend == MuxBackendKind::Rmux
+        if backend == MultiplexerBackendConfig::Rmux
             && !snapshot.sessions.is_empty()
             && !sessions_have_renderable_pane(&snapshot.sessions)
         {
-            return;
+            return false;
         }
-        if backend == MuxBackendKind::Rmux
+        if backend == MultiplexerBackendConfig::Rmux
             && same_backend
             && sessions_have_renderable_pane(&self.sessions)
             && !sessions_have_renderable_pane(&snapshot.sessions)
         {
-            return;
+            return false;
         }
         let current_session = same_backend.then(|| self.selected_session.take()).flatten();
         let current_window = same_backend.then(|| self.selected_window.take()).flatten();
         self.apply_snapshot(backend, snapshot, current_session, current_window);
+        true
     }
 
     fn apply_snapshot(
         &mut self,
-        backend: MuxBackendKind,
+        backend: MultiplexerBackendConfig,
         mut snapshot: MuxSnapshot,
         preferred_session: Option<String>,
         preferred_window: Option<String>,
     ) {
+        self.backend_session_names = snapshot
+            .sessions
+            .iter()
+            .map(|session| session.name.clone())
+            .collect();
         let same_backend = self.current_backend == Some(backend);
         if same_backend {
             snapshot.sessions = stable_session_order(&self.sessions, snapshot.sessions);
@@ -759,6 +909,24 @@ impl MuxController {
         self.sessions = snapshot.sessions;
         self.last_active_window =
             active_window_of(&self.sessions, self.selected_session.as_deref());
+    }
+
+    fn apply_optimistic_session_rename(&mut self, session_id: &str, name: &str) {
+        let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id || session.name == session_id)
+        else {
+            return;
+        };
+        let old_name = std::mem::replace(&mut session.name, name.to_owned());
+        if let Some(backend_name) = self
+            .backend_session_names
+            .iter_mut()
+            .find(|backend_name| **backend_name == old_name)
+        {
+            *backend_name = name.to_owned();
+        }
     }
 
     fn apply_optimistic_command_selection(&mut self, command: &MuxCommand) -> Option<String> {
@@ -963,13 +1131,15 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_order_reorders_sessions_by_name_and_appends_new_sessions() {
+    fn apply_session_order_filters_sessions_outside_binding_membership() {
         let mut controller = MuxController {
             sessions: vec![
                 session("$1", "main"),
                 session("$2", "work"),
                 session("$3", "new"),
             ],
+            selected_session: Some("$3".to_owned()),
+            selected_window: Some("@3".to_owned()),
             ..Default::default()
         };
 
@@ -981,8 +1151,58 @@ mod tests {
                 .iter()
                 .map(|session| session.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["work", "main", "new"]
+            vec!["work", "main"]
         );
+        assert_eq!(controller.selected_session(), Some("$2"));
+        assert_eq!(controller.selected_window(), None);
+    }
+
+    #[test]
+    fn optimistic_session_rename_keeps_external_session_visible() {
+        let mut controller = MuxController {
+            sessions: vec![session("$1", "old")],
+            backend_session_names: vec!["old".to_owned()],
+            selected_session: Some("$1".to_owned()),
+            ..Default::default()
+        };
+
+        controller.apply_optimistic_session_rename("$1", "new");
+        controller.apply_session_order(&["new".to_owned()]);
+
+        assert_eq!(controller.sessions()[0].name, "new");
+        assert_eq!(controller.backend_session_names(), &["new".to_owned()]);
+        assert_eq!(controller.selected_session(), Some("$1"));
+    }
+
+    #[test]
+    fn renaming_an_inactive_session_keeps_selection_for_native_and_rmux() {
+        for backend in [
+            MultiplexerBackendConfig::Native,
+            MultiplexerBackendConfig::Rmux,
+        ] {
+            let mut controller = MuxController {
+                sessions: vec![session("$1", "first"), session("$2", "selected")],
+                backend_session_names: vec!["first".to_owned(), "selected".to_owned()],
+                selected_session: Some("$2".to_owned()),
+                ..Default::default()
+            };
+            if backend == MultiplexerBackendConfig::Rmux {
+                controller.apply_optimistic_session_rename("$1", "renamed");
+            }
+            let selected_session = controller.selected_session.clone();
+            controller.apply_snapshot(
+                backend,
+                MuxSnapshot {
+                    sessions: vec![session("$1", "renamed"), session("$2", "selected")],
+                    active_session_id: Some("$1".to_owned()),
+                },
+                selected_session,
+                None,
+            );
+
+            assert_eq!(controller.selected_session(), Some("$2"));
+            assert_eq!(controller.sessions()[0].name, "renamed");
+        }
     }
 
     #[test]
@@ -1173,7 +1393,10 @@ mod tests {
         let error = controller.refresh_sessions(&repaint, &config);
 
         assert_eq!(error, None);
-        assert_eq!(controller.current_backend, Some(MuxBackendKind::Native));
+        assert_eq!(
+            controller.current_backend,
+            Some(MultiplexerBackendConfig::Native)
+        );
         assert!(controller.sessions.is_empty());
         assert!(controller.session_refresh_tx.is_none());
         assert!(controller.session_refresh_rx.is_none());
@@ -1256,12 +1479,12 @@ mod tests {
             selected_session: Some("$1".to_owned()),
             selected_window: Some("@2".to_owned()),
             last_active_window: Some(active_window("$2", "@9")),
-            current_backend: Some(MuxBackendKind::Rmux),
+            current_backend: Some(MultiplexerBackendConfig::Rmux),
             ..Default::default()
         };
 
         controller.apply_refreshed_snapshot(
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             MuxSnapshot {
                 sessions: vec![work],
                 active_session_id: Some("$1".to_owned()),
@@ -1291,12 +1514,12 @@ mod tests {
             sessions: vec![work],
             selected_session: Some("work".to_owned()),
             selected_window: Some("@1".to_owned()),
-            current_backend: Some(MuxBackendKind::Rmux),
+            current_backend: Some(MultiplexerBackendConfig::Rmux),
             ..Default::default()
         };
 
-        controller.apply_refreshed_snapshot(MuxBackendKind::Rmux, MuxSnapshot::default());
-        controller.apply_refreshed_snapshot(MuxBackendKind::Rmux, MuxSnapshot::default());
+        controller.apply_refreshed_snapshot(MultiplexerBackendConfig::Rmux, MuxSnapshot::default());
+        controller.apply_refreshed_snapshot(MultiplexerBackendConfig::Rmux, MuxSnapshot::default());
 
         assert_eq!(controller.selected_session(), Some("work"));
         assert_eq!(controller.selected_window(), Some("@1"));
@@ -1312,7 +1535,7 @@ mod tests {
         paneless.windows = vec![window("@1", 1)];
         paneless.active_window_id = Some("@1".to_owned());
         controller.apply_refreshed_snapshot(
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             MuxSnapshot {
                 sessions: vec![paneless],
                 active_session_id: Some("work".to_owned()),
@@ -1336,7 +1559,7 @@ mod tests {
         let mut controller = MuxController::default();
 
         controller.apply_refreshed_snapshot(
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             MuxSnapshot {
                 sessions: vec![paneless],
                 active_session_id: Some("work".to_owned()),
@@ -1361,7 +1584,7 @@ mod tests {
         work.windows = vec![editor];
 
         controller.apply_refreshed_snapshot(
-            MuxBackendKind::Rmux,
+            MultiplexerBackendConfig::Rmux,
             MuxSnapshot {
                 sessions: vec![work],
                 active_session_id: Some("work".to_owned()),
@@ -1375,6 +1598,83 @@ mod tests {
                 .and_then(|anchor| anchor.pane_id.as_deref()),
             Some("%1")
         );
+    }
+
+    #[test]
+    fn binding_controllers_isolate_overlapping_ids_selection_refresh_and_errors() {
+        let mut first = BindingMuxController::default();
+        let mut second = BindingMuxController::default();
+        let first_snapshot = MuxSnapshot {
+            sessions: vec![session("$1", "first")],
+            active_session_id: Some("$1".to_owned()),
+        };
+        let second_snapshot = MuxSnapshot {
+            sessions: vec![session("$1", "second")],
+            active_session_id: Some("$1".to_owned()),
+        };
+
+        first.apply_refreshed_snapshot(MultiplexerBackendConfig::Tmux, first_snapshot);
+        second.apply_refreshed_snapshot(MultiplexerBackendConfig::Tmux, second_snapshot);
+        first.set_error(Some("first binding failed".to_owned()));
+        first.apply_refreshed_snapshot(MultiplexerBackendConfig::Tmux, MuxSnapshot::default());
+        assert!(first.sessions().is_empty());
+        assert_eq!(second.sessions()[0].name, "second");
+        assert_eq!(second.selected_session(), Some("$1"));
+
+        first.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Tmux,
+            MuxSnapshot {
+                sessions: vec![session("$1", "first-reconnected")],
+                active_session_id: Some("$1".to_owned()),
+            },
+        );
+
+        assert_eq!(first.sessions()[0].name, "first-reconnected");
+        assert_eq!(first.selected_session(), Some("$1"));
+        assert_eq!(second.sessions()[0].name, "second");
+        assert_eq!(first.last_error(), Some("first binding failed"));
+        assert_eq!(second.last_error(), None);
+    }
+    #[test]
+    fn successful_binding_refresh_clears_only_that_bindings_error() {
+        let mut first = BindingMuxController::default();
+        let mut second = BindingMuxController::default();
+        first.set_error(Some("stale first error".to_owned()));
+        second.set_error(Some("second remains failed".to_owned()));
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+
+        assert_eq!(
+            first.refresh_sessions(&repaint, &MultiplexerConfig::default()),
+            None
+        );
+
+        assert_eq!(first.last_error(), None);
+        assert_eq!(second.last_error(), Some("second remains failed"));
+    }
+
+    #[test]
+    fn binding_refresh_completion_is_available_once() {
+        let (refresh_tx, refresh_rx) = std::sync::mpsc::channel();
+        refresh_tx
+            .send((
+                1,
+                Ok((MultiplexerBackendConfig::Rmux, MuxSnapshot::default())),
+            ))
+            .expect("send completed refresh");
+        let mut binding = BindingMuxController::default();
+        binding.controller.session_refresh_generation = 1;
+        binding.controller.session_refresh_rx = Some(refresh_rx);
+        binding.controller.session_refresh_pending = true;
+        binding.controller.last_session_refresh = Some(Instant::now());
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let config = MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Rmux,
+            ..Default::default()
+        };
+
+        assert_eq!(binding.refresh_sessions(&repaint, &config), None);
+        assert!(binding.take_refresh_completed());
+        assert!(!binding.take_refresh_completed());
     }
 
     fn active_window(session_id: &str, window_id: &str) -> ActiveWindow {

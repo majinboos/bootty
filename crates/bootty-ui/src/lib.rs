@@ -1,25 +1,10 @@
-use eframe::egui::{self, Color32, CornerRadius, Stroke, Ui, Widget, WidgetText};
+use eframe::egui::{self, Color32, CornerRadius, Stroke, Ui, Widget};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UiColorConfig {
     pub background: Option<Color32>,
     pub foreground: Option<Color32>,
-    pub selection_background: Option<Color32>,
-    pub selection_foreground: Option<Color32>,
     pub palette: [Option<Color32>; 16],
-}
-
-impl UiColorConfig {
-    #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            background: None,
-            foreground: None,
-            selection_background: None,
-            selection_foreground: None,
-            palette: [None; 16],
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,48 +105,6 @@ impl Theme {
     #[must_use]
     pub const fn new(palette: ThemePalette) -> Self {
         Self { palette }
-    }
-}
-
-pub struct ThemedUi<'a> {
-    ui: &'a mut Ui,
-    theme: Theme,
-}
-
-impl<'a> ThemedUi<'a> {
-    #[must_use]
-    pub fn new(ui: &'a mut Ui, theme: Theme) -> Self {
-        Self { ui, theme }
-    }
-
-    pub fn raw(&mut self) -> &mut Ui {
-        self.ui
-    }
-
-    #[must_use]
-    pub const fn theme(&self) -> Theme {
-        self.theme
-    }
-
-    #[must_use]
-    pub const fn palette(&self) -> ThemePalette {
-        self.theme.palette
-    }
-
-    pub fn label(&mut self, text: impl Into<WidgetText>) -> egui::Response {
-        self.ui.label(text)
-    }
-
-    pub fn button(&mut self, label: &str, selected: bool) -> bool {
-        themed_button(self.ui, label, self.theme, selected).clicked()
-    }
-
-    pub fn text_edit_singleline_with(
-        &mut self,
-        buf: &mut String,
-        configure: impl for<'b> FnOnce(egui::TextEdit<'b>) -> egui::TextEdit<'b>,
-    ) -> egui::Response {
-        themed_text_edit_singleline(self.ui, buf, self.theme, configure)
     }
 }
 
@@ -366,8 +309,6 @@ mod tests {
         let palette = ThemePalette::from_config(UiColorConfig {
             background: Some(Color32::from_rgb(1, 2, 3)),
             foreground: Some(Color32::from_rgb(240, 241, 242)),
-            selection_background: Some(Color32::from_rgb(20, 21, 22)),
-            selection_foreground: None,
             palette: [
                 None,
                 Some(Color32::from_rgb(100, 0, 0)),
