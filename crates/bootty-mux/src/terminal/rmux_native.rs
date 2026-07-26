@@ -46,7 +46,6 @@ const RMUX_MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const RMUX_MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
 const RMUX_WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 const RMUX_INITIAL_FRAME_AGE: Duration = Duration::from_millis(16);
-const RMUX_RESTORE_MAX_SCROLLBACK_LINES: usize = 10_000;
 
 pub(super) struct RmuxNativeTerminal {
     command_tx: mpsc::Sender<RmuxTerminalCommand>,
@@ -866,7 +865,6 @@ impl RmuxWorker {
                         collected_chunks += 1;
                         if let Some(bytes) = pane_output_chunk_bytes(chunk) {
                             collected_bytes += bytes.len();
-                            self.discard_pending_restore_output();
                             self.push_pending_output(bytes);
                         }
                     }
@@ -934,33 +932,14 @@ impl RmuxWorker {
                 RMUX_MAX_DRAIN_TIME_US,
             )
         };
-        let mut stats = {
-            let engine = &mut self.engine;
-            drain_rmux_output_backlog_with_limits(
-                &mut self.pending_output,
-                max_bytes,
-                max_chunks,
-                max_time_us,
-                |bytes| engine.write_vt(bytes),
-            )
-        };
-        if stats.bytes == 0
-            && (!self.force_next_frame_publish || self.waiting_initial_remote_frame)
-            && self.pending_output.is_empty()
-            && !self.pending_restore_output.is_empty()
-        {
-            let engine = &mut self.engine;
-            let restore_stats = drain_rmux_output_backlog_with_limits(
-                &mut self.pending_restore_output,
-                RMUX_RESTORE_DRAIN_BYTES_PER_TICK,
-                RMUX_RESTORE_DRAIN_CHUNKS_PER_TICK,
-                RMUX_RESTORE_DRAIN_TIME_US,
-                |bytes| engine.write_vt(bytes),
-            );
-            stats.chunks = stats.chunks.saturating_add(restore_stats.chunks);
-            stats.bytes = stats.bytes.saturating_add(restore_stats.bytes);
-            stats.elapsed_us = stats.elapsed_us.saturating_add(restore_stats.elapsed_us);
-        }
+        let stats = drain_rmux_pending_output(
+            &mut self.engine,
+            &mut self.pending_restore_output,
+            &mut self.pending_output,
+            max_bytes,
+            max_chunks,
+            max_time_us,
+        );
         if stats.bytes > 0 && self.scroll_bottom_after_output {
             self.engine.scroll_viewport_bottom();
         }
@@ -1149,7 +1128,29 @@ fn rmux_restore_lines(max_scrollback_bytes: usize, viewport_rows: u16) -> usize 
         return viewport_rows;
     }
     let scrollback_rows = max_scrollback_bytes.div_ceil(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE);
-    viewport_rows.saturating_add(scrollback_rows.min(RMUX_RESTORE_MAX_SCROLLBACK_LINES))
+    viewport_rows.saturating_add(scrollback_rows)
+}
+
+fn drain_rmux_pending_output(
+    engine: &mut TerminalEngine,
+    restore: &mut RmuxOutputBacklog,
+    live: &mut RmuxOutputBacklog,
+    max_bytes: usize,
+    max_chunks: usize,
+    max_time_us: u128,
+) -> DrainStats {
+    if !restore.is_empty() {
+        return drain_rmux_output_backlog_with_limits(
+            restore,
+            RMUX_RESTORE_DRAIN_BYTES_PER_TICK,
+            RMUX_RESTORE_DRAIN_CHUNKS_PER_TICK,
+            RMUX_RESTORE_DRAIN_TIME_US,
+            |bytes| engine.write_vt(bytes),
+        );
+    }
+    drain_rmux_output_backlog_with_limits(live, max_bytes, max_chunks, max_time_us, |bytes| {
+        engine.write_vt(bytes)
+    })
 }
 
 fn drain_rmux_output_backlog_with_limits(
@@ -1245,15 +1246,44 @@ mod tests {
     }
 
     #[test]
-    fn rmux_restore_lines_converts_scrollback_bytes_to_bounded_rows() {
+    fn rmux_restore_drains_before_live_output() {
+        let mut engine = TerminalEngine::new(test_geometry()).unwrap();
+        let mut restore = RmuxOutputBacklog::with_capacity(1);
+        restore.push_back(b"RESTORED\r\n".to_vec());
+        let mut live = RmuxOutputBacklog::with_capacity(1);
+        live.push_back(b"LIVE\r\n".to_vec());
+
+        drain_rmux_pending_output(
+            &mut engine,
+            &mut restore,
+            &mut live,
+            usize::MAX,
+            usize::MAX,
+            1_000_000,
+        );
+
+        assert!(restore.is_empty());
+        assert_eq!(live.len(), 6);
+        let text = engine
+            .extract_frame()
+            .unwrap()
+            .text
+            .iter()
+            .collect::<String>();
+        assert!(text.contains("RESTORED"));
+        assert!(!text.contains("LIVE"));
+    }
+
+    #[test]
+    fn rmux_restore_lines_honors_configured_scrollback_budget() {
         assert_eq!(rmux_restore_lines(0, 24), 24);
         assert_eq!(
             rmux_restore_lines(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE * 2, 24),
             26
         );
         assert_eq!(
-            rmux_restore_lines(usize::MAX, 24),
-            RMUX_RESTORE_MAX_SCROLLBACK_LINES + 24
+            rmux_restore_lines(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE * 20_000, 24),
+            20_024
         );
     }
 

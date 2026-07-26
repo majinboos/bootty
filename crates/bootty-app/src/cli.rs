@@ -79,6 +79,7 @@ mod tests {
             MultiplexerBackendConfig, SidebarPosition, WindowDecoration, WindowFullscreen,
         },
     };
+    use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
     use clap::{CommandFactory, Parser};
     use indoc::indoc;
 
@@ -335,7 +336,10 @@ mod tests {
         );
         assert_eq!(config.session.term, "xterm-test");
         assert_eq!(config.session.colorterm, "24bit");
-        assert_eq!(config.session.max_scrollback, 1234);
+        assert_eq!(
+            config.session.max_scrollback,
+            1234 * NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE
+        );
         assert!(!config.session.glyph_protocol);
         assert_eq!(
             config.input.macos_option_as_alt,
