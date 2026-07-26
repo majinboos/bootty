@@ -85,6 +85,19 @@ fn app_state(sidebar: bool) -> AppState {
     AppState::new(config, repaint, None, None).expect("app state")
 }
 
+fn app_state_with_spaces(count: usize) -> AppState {
+    let mut state = app_state(false);
+    for index in 1..count {
+        assert!(state.create_space_from_ui(
+            &format!("Benchmark Space {index}"),
+            "folder",
+            [0x7a, 0xa2, 0xf7],
+            false,
+        ));
+    }
+    state
+}
+
 fn frame_inputs_at(
     now: Instant,
     events: Vec<egui::Event>,
@@ -334,6 +347,20 @@ fn bench_app_state_update(c: &mut Criterion) {
             black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
         })
     });
+
+    for spaces in [8, 32] {
+        c.bench_function(
+            &format!("app_state_update_idle_frame_{spaces}_spaces"),
+            |b| {
+                let mut state = app_state_with_spaces(spaces);
+                let now = Instant::now();
+                black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
+                b.iter(|| {
+                    black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
+                })
+            },
+        );
+    }
 }
 
 fn bench_egui_app_frames(c: &mut Criterion) {

@@ -65,7 +65,8 @@ regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_spanned = { version = "1" }
-syn = { version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["full"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_edit = { version = "0.25", features = ["serde"] }
 toml_parser = { version = "1" }
@@ -76,6 +77,7 @@ winnow = { version = "1" }
 arboard = { version = "3" }
 bitflags = { version = "2", default-features = false, features = ["serde"] }
 block2 = { version = "0.6" }
+core-foundation-sys = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
@@ -87,7 +89,7 @@ num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics", "std"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSException", "NSFileWrapper", "NSFormatter", "NSGeometry", "NSItemProvider", "NSKeyValueObserving", "NSLocale", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSSet", "NSString", "NSThread", "NSURL", "NSUndoManager", "NSUserActivity", "NSValue", "NSZone", "block2", "objc2-core-foundation", "std"] }
-rustix = { version = "1", features = ["event", "fs", "net", "process", "termios"] }
+rustix = { version = "1", features = ["event", "net", "process", "pty", "runtime", "termios", "thread"] }
 simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 wgpu = { version = "29", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
@@ -96,7 +98,7 @@ wgpu-hal = { version = "29", default-features = false, features = ["metal", "por
 
 [target.aarch64-apple-darwin.build-dependencies]
 indexmap = { version = "2" }
-syn = { version = "2", default-features = false, features = ["fold"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = false, features = ["fold"] }
 
 [target.aarch64-unknown-linux-gnu.dependencies]
 ahash = { version = "0.8" }
@@ -107,8 +109,8 @@ getrandom = { version = "0.3", default-features = false, features = ["std"] }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
-rustix = { version = "1", features = ["event", "net", "pipe", "process", "shm", "system", "termios", "time"] }
-syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
 wgpu = { version = "29", default-features = false, features = ["gles", "parking_lot", "std", "vulkan", "wgsl"] }
@@ -125,7 +127,8 @@ fastrand = { version = "2" }
 indexmap = { version = "2" }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
-syn = { version = "2", default-features = false, features = ["fold"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = false, features = ["visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = false, features = ["fold"] }
 zbus_macros = { version = "5", features = ["blocking-api"] }
 
 [target.wasm32-unknown-unknown.dependencies]
@@ -139,6 +142,7 @@ wgpu = { version = "29", default-features = false, features = ["parking_lot", "s
 arboard = { version = "3" }
 bitflags = { version = "2", default-features = false, features = ["serde"] }
 block2 = { version = "0.6" }
+core-foundation-sys = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
@@ -150,7 +154,7 @@ num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics", "std"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSException", "NSFileWrapper", "NSFormatter", "NSGeometry", "NSItemProvider", "NSKeyValueObserving", "NSLocale", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSSet", "NSString", "NSThread", "NSURL", "NSUndoManager", "NSUserActivity", "NSValue", "NSZone", "block2", "objc2-core-foundation", "std"] }
-rustix = { version = "1", features = ["event", "fs", "net", "process", "termios"] }
+rustix = { version = "1", features = ["event", "net", "process", "pty", "runtime", "termios", "thread"] }
 simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 wgpu = { version = "29", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
@@ -159,7 +163,7 @@ wgpu-hal = { version = "29", default-features = false, features = ["metal", "por
 
 [target.x86_64-apple-darwin.build-dependencies]
 indexmap = { version = "2" }
-syn = { version = "2", default-features = false, features = ["fold"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = false, features = ["fold"] }
 
 [target.x86_64-pc-windows-gnu.dependencies]
 arboard = { version = "3" }
@@ -177,7 +181,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [target.x86_64-pc-windows-gnu.build-dependencies]
 indexmap = { version = "2" }
-syn = { version = "2", default-features = false, features = ["fold"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = false, features = ["fold"] }
 
 [target.x86_64-pc-windows-msvc.dependencies]
 arboard = { version = "3" }
@@ -196,7 +200,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 [target.x86_64-pc-windows-msvc.build-dependencies]
 indexmap = { version = "2" }
 libc = { version = "0.2", features = ["extra_traits"] }
-syn = { version = "2", default-features = false, features = ["fold"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = false, features = ["fold"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 ahash = { version = "0.8" }
@@ -207,8 +211,8 @@ getrandom = { version = "0.3", default-features = false, features = ["std"] }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
-rustix = { version = "1", features = ["event", "net", "pipe", "process", "shm", "system", "termios", "time"] }
-syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
 wgpu = { version = "29", default-features = false, features = ["gles", "parking_lot", "std", "vulkan", "wgsl"] }
@@ -225,7 +229,8 @@ fastrand = { version = "2" }
 indexmap = { version = "2" }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
-syn = { version = "2", default-features = false, features = ["fold"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = false, features = ["visit-mut"] }
+syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = false, features = ["fold"] }
 zbus_macros = { version = "5", features = ["blocking-api"] }
 
 ### END HAKARI SECTION

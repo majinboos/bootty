@@ -9,7 +9,7 @@ use crate::{
         CursorCommand, SpriteCommandBatch, TerminalRenderCommand, TerminalRenderFrame, TextCommand,
     },
     terminal_sprite::{WgpuSpriteBackend, WgpuSpriteVertex},
-    terminal_text_atlas::{GlyphAtlasFormat, TextAtlasBuilder, TexturedGlyphQuad},
+    terminal_text_atlas::{GlyphAtlasEntry, GlyphAtlasFormat, TextAtlasBuilder, TexturedGlyphQuad},
 };
 use eframe::{egui, egui_wgpu, wgpu};
 use wgpu::util::DeviceExt;
@@ -431,6 +431,7 @@ pub struct TerminalWgpuRenderer {
     prepared_frame_cache: Option<PreparedTerminalFrameCache>,
     prepared_frame_cache_cooldown: u8,
     text_linear_filter: bool,
+    last_text_upload_bytes: usize,
 }
 
 impl TerminalWgpuRenderer {
@@ -480,6 +481,7 @@ impl TerminalWgpuRenderer {
             prepared_frame_cache: None,
             prepared_frame_cache_cooldown: 0,
             text_linear_filter: false,
+            last_text_upload_bytes: 0,
         }
     }
 
@@ -818,12 +820,17 @@ impl TerminalWgpuRenderer {
         vertex_count
     }
 
+    pub fn last_text_upload_bytes(&self) -> usize {
+        self.last_text_upload_bytes
+    }
+
     fn prepare_text_texture(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         text_builder: &TextAtlasBuilder,
     ) {
+        self.last_text_upload_bytes = 0;
         let (width, height) = text_builder.atlas_size();
         let format = text_builder.atlas_format();
         let modified_count = text_builder.atlas_modified_count();
@@ -854,26 +861,50 @@ impl TerminalWgpuRenderer {
         if texture.modified_count == modified_count {
             return;
         }
+        let region = if needs_texture {
+            GlyphAtlasEntry {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }
+        } else {
+            let Some(region) = text_builder.atlas_dirty_rect_since(texture.modified_count) else {
+                texture.modified_count = modified_count;
+                return;
+            };
+            region
+        };
+        let depth = format.depth();
+        let bytes_per_row = width * depth;
+        let offset = ((region.y * width + region.x) * depth) as usize;
+        let byte_len = ((region.height - 1) * bytes_per_row + region.width * depth) as usize;
+        let pixels = &text_builder.atlas_pixels()[offset..offset + byte_len];
 
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture.texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: region.x,
+                    y: region.y,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
-            text_builder.atlas_pixels(),
+            pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width * format.depth()),
-                rows_per_image: Some(height),
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(region.height),
             },
             wgpu::Extent3d {
-                width,
-                height,
+                width: region.width,
+                height: region.height,
                 depth_or_array_layers: 1,
             },
         );
+        self.last_text_upload_bytes = (region.width * region.height * depth) as usize;
         texture.modified_count = modified_count;
     }
 }

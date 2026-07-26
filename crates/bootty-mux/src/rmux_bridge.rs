@@ -1,7 +1,6 @@
 use std::{
     env,
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -13,6 +12,9 @@ use std::{
 
 use anyhow::{Context, Result};
 use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TERMINAL_TERM};
+use rmux_proto::{
+    LastWindowRequest, RenameSessionRequest, Request, SwapWindowRequest, WindowTarget,
+};
 use rmux_sdk::{
     EnsureSession, EnsureSessionPolicy, Pane, PaneAttributes, PaneCell, PaneColor, PaneCursor,
     PaneId, PaneOutputChunk, PaneOutputStart, PaneSnapshot, Rmux, RmuxEndpoint, SessionName,
@@ -23,7 +25,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::{
     command::{MuxCommand, MuxSplitDirection},
-    rmux::{RmuxWindowRow, list_pane_rows, list_window_rows, rmux_cmd_checked, session_from_rows},
+    rmux::{
+        RmuxWindowRow, list_pane_rows, list_window_rows, rmux_request_checked, session_from_rows,
+    },
     snapshot::MuxSnapshot,
 };
 
@@ -211,10 +215,8 @@ pub(crate) fn open_rmux_pane_io(
 }
 
 pub(crate) async fn connect_bootty_rmux() -> Result<Rmux> {
-    ensure_rmux_sdk_daemon_binary();
-    let endpoint = rmux_ipc::default_endpoint()
-        .context("resolve default rmux endpoint")?
-        .into_path();
+    ensure_rmux_sdk_daemon_binary()?;
+    let endpoint = crate::bootty_rmux_endpoint_path().context("resolve Bootty rmux endpoint")?;
     let endpoint = RmuxEndpoint::UnixSocket(endpoint);
     Rmux::builder()
         .endpoint(endpoint)
@@ -223,64 +225,56 @@ pub(crate) async fn connect_bootty_rmux() -> Result<Rmux> {
         .map_err(Into::into)
 }
 
-fn ensure_rmux_sdk_daemon_binary() {
-    static RESOLVED: OnceLock<()> = OnceLock::new();
-    RESOLVED.get_or_init(|| {
-        if env::var_os(rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV).is_some() {
-            return;
-        }
-        let Some(binary) = resolve_rmux_sdk_daemon_binary(
-            env::var_os("PATH").as_deref(),
-            env::var_os("CARGO_HOME").as_deref(),
-            env::var_os("HOME").as_deref(),
-        ) else {
-            return;
-        };
-        // rmux-sdk 0.8 exposes the command binary only through this process
-        // environment variable; set it once before Bootty starts rmux workers.
-        unsafe {
-            env::set_var(
-                rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV,
-                binary,
-            );
-        }
-    });
-}
-
-fn resolve_rmux_sdk_daemon_binary(
-    path: Option<&OsStr>,
-    cargo_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-) -> Option<OsString> {
-    path.into_iter()
-        .flat_map(env::split_paths)
-        .map(|dir| dir.join("rmux"))
-        .find(|candidate| candidate.is_file() && !is_mise_shim(candidate))
-        .or_else(|| fallback_rmux_binary(cargo_home, home))
-        .map(PathBuf::into_os_string)
-}
-
-fn fallback_rmux_binary(cargo_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
-    cargo_home
-        .map(PathBuf::from)
-        .map(|path| path.join("bin").join("rmux"))
-        .filter(|candidate| candidate.is_file())
-        .or_else(|| {
-            home.map(PathBuf::from)
-                .map(|path| path.join(".cargo").join("bin").join("rmux"))
-                .filter(|candidate| candidate.is_file())
+pub fn run_embedded_rmux_daemon() -> Result<Option<i32>> {
+    let arguments = env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(unix)]
+    if let Some(code) = rmux_server::run_internal_fifo_reader_helper(arguments.clone()) {
+        return Ok(Some(code));
+    }
+    if arguments
+        .first()
+        .is_none_or(|argument| argument != rmux_client::INTERNAL_DAEMON_FLAG)
+    {
+        return Ok(None);
+    }
+    let socket = arguments
+        .get(1)
+        .context("rmux daemon invocation omitted endpoint")?;
+    let config = rmux_server::DaemonConfig::new(socket.into());
+    Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("create embedded rmux daemon runtime")?
+        .block_on(async {
+            rmux_server::ServerDaemon::new(config)
+                .bind()
+                .await?
+                .wait()
+                .await
         })
+        .context("run embedded rmux daemon")?;
+    Ok(Some(0))
 }
 
-fn is_mise_shim(path: &Path) -> bool {
-    path.parent()
-        .and_then(Path::file_name)
-        .is_some_and(|name| name == "shims")
-        && path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .is_some_and(|name| name == "mise")
+fn ensure_rmux_sdk_daemon_binary() -> Result<()> {
+    static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    RESOLVED
+        .get_or_init(|| {
+            if env::var_os(rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV).is_some() {
+                return Ok(());
+            }
+            let binary = env::current_exe().map_err(|error| error.to_string())?;
+            // SAFETY: rmux workers are started only after this one-time initialization.
+            unsafe {
+                env::set_var(
+                    rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV,
+                    binary,
+                );
+            }
+            Ok(())
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
 }
 
 fn request_control_sync<T>(
@@ -537,7 +531,7 @@ impl RmuxBridgeState {
         let name = SessionName::new(session_name).context("invalid rmux session name")?;
         rmux.ensure_session(
             EnsureSession::named(name)
-                .policy(EnsureSessionPolicy::CreateOnly)
+                .policy(EnsureSessionPolicy::CreateOrReuse)
                 .detached(true)
                 .working_directory(cwd)
                 .size(TerminalSizeSpec::new(80, 24))
@@ -548,16 +542,11 @@ impl RmuxBridgeState {
     }
 
     async fn rename_session(&mut self, session_name: &str, name: &str) -> Result<()> {
-        let rmux = self.rmux().await?;
-        rmux_cmd_checked(
-            rmux,
-            vec![
-                "rename-session".to_owned(),
-                "-t".to_owned(),
-                session_name.to_owned(),
-                name.to_owned(),
-            ],
-        )
+        self.rmux().await?;
+        rmux_request_checked(Request::RenameSession(RenameSessionRequest {
+            target: SessionName::new(session_name).context("invalid rmux session name")?,
+            new_name: SessionName::new(name).context("invalid rmux session name")?,
+        }))
         .await
     }
 
@@ -621,15 +610,10 @@ impl RmuxBridgeState {
     }
 
     async fn activate_last_window(&mut self, session_name: &str) -> Result<()> {
-        let rmux = self.rmux().await?;
-        rmux_cmd_checked(
-            rmux,
-            vec![
-                "last-window".to_owned(),
-                "-t".to_owned(),
-                session_name.to_owned(),
-            ],
-        )
+        self.rmux().await?;
+        rmux_request_checked(Request::LastWindow(LastWindowRequest {
+            target: SessionName::new(session_name).context("invalid rmux session name")?,
+        }))
         .await
     }
 
@@ -654,32 +638,23 @@ impl RmuxBridgeState {
         window_id: Option<&str>,
         delta: i32,
     ) -> Result<()> {
-        if let Some(window_id) = window_id {
-            let Some((session_name, index)) =
-                self.window_index_by_id(session_name, window_id).await?
-            else {
-                anyhow::bail!("rmux window {window_id} not found in session {session_name}");
-            };
-            self.window(&session_name, index).await?.select().await?;
+        let rows = self.window_rows(session_name).await?;
+        let source = window_id
+            .and_then(|window_id| rows.iter().position(|window| window.id == window_id))
+            .or_else(|| rows.iter().position(|window| window.active))
+            .context("rmux move window requires an active target")?;
+        let target = (source as i32 + delta).clamp(0, rows.len() as i32 - 1) as usize;
+        if source == target {
+            return Ok(());
         }
-        let rmux = self.rmux().await?;
-        let target = if delta > 0 { "+1" } else { "-1" };
-        for _ in 0..delta.unsigned_abs() {
-            rmux_cmd_checked(
-                rmux,
-                vec!["swap-window".to_owned(), "-t".to_owned(), target.to_owned()],
-            )
-            .await?;
-            rmux_cmd_checked(
-                rmux,
-                vec![
-                    "select-window".to_owned(),
-                    "-t".to_owned(),
-                    target.to_owned(),
-                ],
-            )
-            .await?;
-        }
+        self.rmux().await?;
+        let session = SessionName::new(session_name).context("invalid rmux session name")?;
+        rmux_request_checked(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(session.clone(), rows[source].index),
+            target: WindowTarget::with_window(session, rows[target].index),
+            detached: false,
+        }))
+        .await?;
         Ok(())
     }
 
@@ -898,7 +873,9 @@ async fn run_pane_io_inner(
     let rmux = connect_bootty_rmux().await?;
     let pane = pane_for_target(&rmux, &target).await?;
     replay_retained_kitty_keyboard_protocol(&pane, output_tx).await?;
-    let mut output_stream = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
+    let mut output_stream = pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await?;
     let restore_valid = Arc::new(AtomicBool::new(true));
     start_restore_capture(
         target.clone(),
@@ -1202,46 +1179,6 @@ mod tests {
                 format!("TERM_PROGRAM_VERSION={TERMINAL_PROGRAM_VERSION}"),
             ]
         );
-    }
-
-    #[test]
-    fn rmux_sdk_daemon_binary_skips_mise_shim_when_real_binary_is_later_on_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shim_dir = dir.path().join("mise").join("shims");
-        let bin_dir = dir.path().join("bin");
-        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
-        std::fs::write(shim_dir.join("rmux"), "").expect("write shim");
-        let real = bin_dir.join("rmux");
-        std::fs::write(&real, "").expect("write real binary");
-        let path = env::join_paths([shim_dir, bin_dir]).expect("join path");
-
-        let resolved = resolve_rmux_sdk_daemon_binary(Some(path.as_os_str()), None, None)
-            .expect("real rmux should resolve");
-
-        assert_eq!(PathBuf::from(resolved), real);
-    }
-
-    #[test]
-    fn rmux_sdk_daemon_binary_falls_back_to_cargo_bin_when_path_only_has_mise_shim() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let shim_dir = dir.path().join("mise").join("shims");
-        let cargo_home = dir.path().join("cargo");
-        let cargo_bin = cargo_home.join("bin");
-        std::fs::create_dir_all(&shim_dir).expect("create shim dir");
-        std::fs::create_dir_all(&cargo_bin).expect("create cargo bin");
-        std::fs::write(shim_dir.join("rmux"), "").expect("write shim");
-        let real = cargo_bin.join("rmux");
-        std::fs::write(&real, "").expect("write real binary");
-
-        let resolved = resolve_rmux_sdk_daemon_binary(
-            Some(shim_dir.as_os_str()),
-            Some(cargo_home.as_os_str()),
-            None,
-        )
-        .expect("cargo rmux should resolve");
-
-        assert_eq!(PathBuf::from(resolved), real);
     }
 
     #[test]

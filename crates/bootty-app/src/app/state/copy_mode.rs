@@ -237,6 +237,7 @@ pub(super) fn copy_mode_action_for_egui_key(
         egui::Key::B => copy_mode_motion(TerminalCopyModeMotion::PreviousWord),
         egui::Key::E => copy_mode_motion(TerminalCopyModeMotion::NextWordEnd),
         egui::Key::V => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelection),
+        egui::Key::O => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelectionEnd),
         egui::Key::Y => copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel),
         egui::Key::Q => copy_mode_terminal_action(TerminalCopyModeAction::Cancel),
         egui::Key::Num0 => copy_mode_motion(TerminalCopyModeMotion::StartOfLine),
@@ -356,6 +357,7 @@ fn copy_mode_terminal_key_action(key: TerminalKey) -> Option<CopyModeKeyAction> 
         TerminalKey::B => copy_mode_motion(TerminalCopyModeMotion::PreviousWord),
         TerminalKey::E => copy_mode_motion(TerminalCopyModeMotion::NextWordEnd),
         TerminalKey::V => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelection),
+        TerminalKey::O => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelectionEnd),
         TerminalKey::Y => copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel),
         TerminalKey::Q => copy_mode_terminal_action(TerminalCopyModeAction::Cancel),
         TerminalKey::Digit0 | TerminalKey::Numpad0 => {
@@ -397,6 +399,7 @@ pub(super) fn copy_mode_action_for_char(ch: char) -> Option<CopyModeKeyAction> {
         'N' => Some(CopyModeKeyAction::SearchRepeat(
             CopyModeSearchRepeat::OppositeDirection,
         )),
+        'o' => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelectionEnd),
         'q' => copy_mode_terminal_action(TerminalCopyModeAction::Cancel),
         'v' => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelection),
         'V' => copy_mode_terminal_action(TerminalCopyModeAction::SelectLine),

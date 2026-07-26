@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rmux_proto::{ListPanesRequest, ListWindowsRequest, Request, Response};
 use rmux_sdk::{Rmux, SessionName};
 
 use crate::rmux_bridge::{resize_rmux_window, rmux_execute, rmux_snapshot};
@@ -296,63 +297,59 @@ pub(crate) struct RmuxPaneRow {
 }
 
 pub(crate) async fn list_window_rows(
-    rmux: &Rmux,
+    _rmux: &Rmux,
     name: &SessionName,
 ) -> Result<Vec<RmuxWindowRow>> {
-    let session_name = name.to_string();
-    let output = rmux_cmd_stdout(
-        rmux,
-        [
-            "list-windows",
-            "-t",
-            session_name.as_str(),
-            "-F",
-            RMUX_WINDOW_FORMAT,
-        ],
-    )
+    let response = rmux_request(Request::ListWindows(Box::new(ListWindowsRequest {
+        target: name.clone(),
+        format: Some(RMUX_WINDOW_FORMAT.to_owned()),
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })))
     .await?;
-    output.lines().map(parse_window_row).collect()
+    let Response::ListWindows(response) = response else {
+        anyhow::bail!("rmux returned an unexpected list-windows response");
+    };
+    String::from_utf8_lossy(&response.output.stdout)
+        .lines()
+        .map(parse_window_row)
+        .collect()
 }
 
-pub(crate) async fn list_pane_rows(rmux: &Rmux, name: &SessionName) -> Result<Vec<RmuxPaneRow>> {
-    let session_name = name.to_string();
-    let output = rmux_cmd_stdout(
-        rmux,
-        [
-            "list-panes",
-            "-s",
-            "-t",
-            session_name.as_str(),
-            "-F",
-            RMUX_PANE_FORMAT,
-        ],
-    )
+pub(crate) async fn list_pane_rows(_rmux: &Rmux, name: &SessionName) -> Result<Vec<RmuxPaneRow>> {
+    let response = rmux_request(Request::ListPanes(Box::new(ListPanesRequest {
+        target: name.clone(),
+        target_window_index: None,
+        format: Some(RMUX_PANE_FORMAT.to_owned()),
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })))
     .await?;
-    output.lines().map(parse_pane_row).collect()
+    let Response::ListPanes(response) = response else {
+        anyhow::bail!("rmux returned an unexpected list-panes response");
+    };
+    String::from_utf8_lossy(&response.output.stdout)
+        .lines()
+        .map(parse_pane_row)
+        .collect()
 }
 
-pub(crate) async fn rmux_cmd_checked(rmux: &Rmux, args: Vec<String>) -> Result<()> {
-    let run = rmux.cmd(args).await?;
-    anyhow::ensure!(
-        run.exit == Some(0),
-        "rmux command exited {:?}: {}",
-        run.exit,
-        String::from_utf8_lossy(&run.stderr)
-    );
-    Ok(())
+pub(crate) async fn rmux_request(request: Request) -> Result<Response> {
+    let endpoint = crate::bootty_rmux_endpoint_path().context("resolve Bootty rmux endpoint")?;
+    let response =
+        tokio::task::spawn_blocking(move || rmux_client::connect(&endpoint)?.roundtrip(&request))
+            .await
+            .context("join rmux request")??;
+    if let Response::Error(error) = response {
+        anyhow::bail!("rmux request failed: {}", error.error);
+    }
+    Ok(response)
 }
-async fn rmux_cmd_stdout<'a>(
-    rmux: &Rmux,
-    args: impl IntoIterator<Item = &'a str>,
-) -> Result<String> {
-    let run = rmux.cmd(args).await?;
-    anyhow::ensure!(
-        run.exit == Some(0),
-        "rmux command exited {:?}: {}",
-        run.exit,
-        String::from_utf8_lossy(&run.stderr)
-    );
-    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+
+pub(crate) async fn rmux_request_checked(request: Request) -> Result<()> {
+    rmux_request(request).await.map(|_| ())
 }
 
 fn parse_window_row(line: &str) -> Result<RmuxWindowRow> {

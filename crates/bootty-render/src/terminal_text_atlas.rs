@@ -296,6 +296,7 @@ pub struct GlyphAtlas {
     entries: HashMap<GlyphAtlasKey, GlyphAtlasRecord>,
     pixels: Vec<u8>,
     modified: u64,
+    dirty_regions: Vec<(u64, GlyphAtlasEntry)>,
     next_x: u32,
     next_y: u32,
     row_height: u32,
@@ -343,6 +344,7 @@ impl GlyphAtlas {
             next_y: 1,
             row_height: 0,
             modified: 0,
+            dirty_regions: Vec::new(),
             resized: 0,
             no_fit_at_least: None,
         })
@@ -552,6 +554,7 @@ impl GlyphAtlas {
             alpha,
         );
         self.modified = self.modified.saturating_add(1);
+        self.dirty_regions.push((self.modified, entry));
     }
 
     pub fn set_from_larger(
@@ -577,6 +580,7 @@ impl GlyphAtlas {
             },
         );
         self.modified = self.modified.saturating_add(1);
+        self.dirty_regions.push((self.modified, entry));
     }
 
     pub fn grow(&mut self, width: u32, height: u32) {
@@ -656,6 +660,15 @@ impl GlyphAtlas {
     pub fn modified_count(&self) -> u64 {
         self.modified
     }
+    pub fn dirty_rect_since(&self, modified: u64) -> Option<GlyphAtlasEntry> {
+        let start = self
+            .dirty_regions
+            .partition_point(|(version, _)| *version <= modified);
+        self.dirty_regions[start..]
+            .iter()
+            .map(|(_, entry)| *entry)
+            .reduce(union_atlas_entries)
+    }
 
     pub fn resized_count(&self) -> u64 {
         self.resized
@@ -663,6 +676,25 @@ impl GlyphAtlas {
 
     pub fn format(&self) -> GlyphAtlasFormat {
         self.format
+    }
+}
+
+fn union_atlas_entries(left: GlyphAtlasEntry, right: GlyphAtlasEntry) -> GlyphAtlasEntry {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let max_x = left
+        .x
+        .saturating_add(left.width)
+        .max(right.x.saturating_add(right.width));
+    let max_y = left
+        .y
+        .saturating_add(left.height)
+        .max(right.y.saturating_add(right.height));
+    GlyphAtlasEntry {
+        x,
+        y,
+        width: max_x - x,
+        height: max_y - y,
     }
 }
 
@@ -1253,6 +1285,9 @@ impl TextAtlasBuilder {
     pub fn atlas_modified_count(&self) -> u64 {
         self.atlas.modified_count()
     }
+    pub fn atlas_dirty_rect_since(&self, modified: u64) -> Option<GlyphAtlasEntry> {
+        self.atlas.dirty_rect_since(modified)
+    }
 
     pub fn atlas_resized_count(&self) -> u64 {
         self.atlas.resized_count()
@@ -1529,6 +1564,46 @@ impl FontLibrary {
                 color: false,
             };
         }
+        let scale = PxScale::from((font_size * pixels_per_point).max(1.0));
+        let primary_metrics = self.font_for_face(face).map(|font| {
+            self.font_face_metrics_for(face, &font, scale, constraint_cells, width, height)
+        });
+        if let Some(metrics) = primary_metrics {
+            if format == GlyphAtlasFormat::Rgba
+                && is_color_emoji_cluster(cluster)
+                && let Some(pixels) = coretext::rasterize_color_cluster(
+                    face,
+                    cluster,
+                    font_size * pixels_per_point,
+                    metrics,
+                    constraint_cells,
+                    width,
+                    height,
+                )
+            {
+                return RasterizedCluster {
+                    pixels,
+                    color: true,
+                };
+            }
+            let cluster_uses_private_codepoint = cluster.text.chars().any(is_private_use);
+            if !cluster_uses_private_codepoint
+                && let Some(alpha) = coretext::rasterize_symbol_cluster(
+                    face,
+                    cluster,
+                    font_size * pixels_per_point,
+                    metrics,
+                    constraint_cells,
+                    width,
+                    height,
+                )
+            {
+                return RasterizedCluster {
+                    pixels: alpha_to_atlas_pixels(format, alpha),
+                    color: false,
+                };
+            }
+        }
         let Some(font) = self.font_for_cluster(face, cluster, font_size * pixels_per_point) else {
             return RasterizedCluster {
                 pixels: alpha_to_atlas_pixels(
@@ -1538,47 +1613,9 @@ impl FontLibrary {
                 color: false,
             };
         };
-        let scale = PxScale::from((font_size * pixels_per_point).max(1.0));
         let scaled = font.as_scaled(scale);
-        let metrics = if let Some(metrics_font) = self.font_for_face(face) {
-            self.font_face_metrics_for(face, &metrics_font, scale, constraint_cells, width, height)
-        } else {
-            font_face_metrics(&font, scale, constraint_cells, width, height)
-        };
-        if format == GlyphAtlasFormat::Rgba
-            && is_color_emoji_cluster(cluster)
-            && let Some(pixels) = coretext::rasterize_color_cluster(
-                face,
-                cluster,
-                font_size * pixels_per_point,
-                metrics,
-                constraint_cells,
-                width,
-                height,
-            )
-        {
-            return RasterizedCluster {
-                pixels,
-                color: true,
-            };
-        }
-        let cluster_uses_private_codepoint = cluster.text.chars().any(is_private_use);
-        if !cluster_uses_private_codepoint
-            && let Some(alpha) = coretext::rasterize_symbol_cluster(
-                face,
-                cluster,
-                font_size * pixels_per_point,
-                metrics,
-                constraint_cells,
-                width,
-                height,
-            )
-        {
-            return RasterizedCluster {
-                pixels: alpha_to_atlas_pixels(format, alpha),
-                color: false,
-            };
-        }
+        let metrics = primary_metrics
+            .unwrap_or_else(|| font_face_metrics(&font, scale, constraint_cells, width, height));
         let baseline = ((height as f32 - scaled.height()) * 0.5).max(0.0) + scaled.ascent();
         let mut pen_x = 0.0_f32;
         let mut alpha = vec![0; (width * height) as usize];

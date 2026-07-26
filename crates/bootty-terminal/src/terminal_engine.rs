@@ -241,6 +241,7 @@ pub enum TerminalCopyModeAction {
     BeginSelection,
     ToggleSelection,
     SelectLine,
+    ToggleSelectionEnd,
     ToggleRectangle,
     CopySelectionAndCancel,
     CopyEndOfLineAndCancel,
@@ -295,6 +296,7 @@ struct CopyModeState {
     cursor: PointCoordinate,
     anchor: Option<PointCoordinate>,
     rectangle: bool,
+    linewise: bool,
     desired_col: u16,
 }
 
@@ -2175,6 +2177,7 @@ impl TerminalEngine {
             cursor,
             anchor: None,
             rectangle: false,
+            linewise: false,
             desired_col: cursor.x,
         });
         self.terminal.set_selection(None)?;
@@ -2212,6 +2215,7 @@ impl TerminalEngine {
             TerminalCopyModeAction::BeginSelection => self.begin_copy_mode_selection(false)?,
             TerminalCopyModeAction::ToggleSelection => self.toggle_copy_mode_selection()?,
             TerminalCopyModeAction::SelectLine => self.select_copy_mode_line()?,
+            TerminalCopyModeAction::ToggleSelectionEnd => self.toggle_copy_mode_selection_end()?,
             TerminalCopyModeAction::ToggleRectangle => self.toggle_copy_mode_rectangle()?,
             TerminalCopyModeAction::Search { query, direction } => {
                 let found = self.search_copy_mode_query(&query, direction)?;
@@ -2304,6 +2308,7 @@ impl TerminalEngine {
         if let Some(state) = &mut self.copy_mode {
             state.anchor = Some(point);
             state.rectangle = rectangle;
+            state.linewise = false;
         }
         self.sync_copy_mode_selection()?;
         self.mark_content_changed();
@@ -2326,6 +2331,7 @@ impl TerminalEngine {
         if let Some(state) = &mut self.copy_mode {
             state.anchor = None;
             state.rectangle = false;
+            state.linewise = false;
         }
         self.terminal.set_selection(None)?;
         self.mark_content_changed();
@@ -2350,6 +2356,7 @@ impl TerminalEngine {
         }
         if let Some(state) = &mut self.copy_mode {
             state.rectangle = !state.rectangle;
+            state.linewise = false;
         }
         self.sync_copy_mode_selection()?;
         self.mark_content_changed();
@@ -2365,12 +2372,26 @@ impl TerminalEngine {
         if let Some(state) = &mut self.copy_mode {
             state.anchor = Some(start);
             state.rectangle = false;
+            state.linewise = true;
             state.cursor = point;
             state.desired_col = point.x;
         }
         self.ensure_copy_mode_cursor_visible()?;
         self.sync_copy_mode_selection()?;
         self.mark_content_changed();
+        Ok(())
+    }
+
+    fn toggle_copy_mode_selection_end(&mut self) -> Result<()> {
+        if let Some(state) = &mut self.copy_mode
+            && let Some(anchor) = &mut state.anchor
+        {
+            std::mem::swap(anchor, &mut state.cursor);
+            state.desired_col = state.cursor.x;
+            self.ensure_copy_mode_cursor_visible()?;
+            self.sync_copy_mode_selection()?;
+            self.mark_content_changed();
+        }
         Ok(())
     }
 
@@ -2712,8 +2733,21 @@ impl TerminalEngine {
             self.terminal.set_selection(None)?;
             return Ok(());
         };
-        let start = self.terminal.grid_ref(Point::Screen(anchor))?;
-        let end = self.terminal.grid_ref(Point::Screen(state.cursor))?;
+        let (start_point, end_point) = if state.linewise {
+            let start_y = anchor.y.min(state.cursor.y);
+            let end_y = anchor.y.max(state.cursor.y);
+            (
+                PointCoordinate { x: 0, y: start_y },
+                PointCoordinate {
+                    x: self.screen_row_end_col(end_y)?,
+                    y: end_y,
+                },
+            )
+        } else {
+            (anchor, state.cursor)
+        };
+        let start = self.terminal.grid_ref(Point::Screen(start_point))?;
+        let end = self.terminal.grid_ref(Point::Screen(end_point))?;
         let selection = Selection::new(start, end, state.rectangle);
         self.terminal.set_selection(Some(&selection))?;
         Ok(())

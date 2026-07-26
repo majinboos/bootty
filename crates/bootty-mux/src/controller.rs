@@ -350,6 +350,7 @@ impl std::ops::DerefMut for BindingMuxController {
 #[derive(Default)]
 pub struct MuxController {
     sessions: Vec<MuxSession>,
+    all_sessions: Vec<MuxSession>,
     backend_session_names: Vec<String>,
     selected_session: Option<String>,
     previous_selected_session: Option<String>,
@@ -376,8 +377,21 @@ impl MuxController {
         }
     }
 
+    pub fn refresh_on_next_frame(&mut self) {
+        self.current_backend = None;
+        self.last_session_refresh = Some(Instant::now() - MUX_SESSION_REFRESH_INTERVAL);
+    }
+
     pub fn sessions(&self) -> &[MuxSession] {
         &self.sessions
+    }
+
+    pub fn all_sessions(&self) -> &[MuxSession] {
+        if self.all_sessions.is_empty() {
+            &self.sessions
+        } else {
+            &self.all_sessions
+        }
     }
 
     pub fn backend_session_names(&self) -> &[String] {
@@ -450,7 +464,7 @@ impl MuxController {
     }
 
     pub fn apply_session_order(&mut self, ordered_names: &[String]) {
-        self.sessions = order_sessions_by_names(&self.sessions, ordered_names);
+        self.sessions = order_sessions_by_names(self.all_sessions(), ordered_names);
         if self.selected_session.as_deref().is_none_or(|selected| {
             !self
                 .sessions
@@ -487,6 +501,7 @@ impl MuxController {
             }
         }
 
+        let backend = selected_backend(config);
         if self
             .last_session_refresh
             .is_some_and(|last| last.elapsed() < MUX_SESSION_REFRESH_INTERVAL)
@@ -494,7 +509,7 @@ impl MuxController {
             return None;
         }
 
-        if selected_backend(config) == MultiplexerBackendConfig::Native {
+        if backend == MultiplexerBackendConfig::Native {
             return self.refresh_native_sessions(config);
         }
 
@@ -906,7 +921,8 @@ impl MuxController {
             &snapshot,
         );
         self.current_backend = Some(backend);
-        self.sessions = snapshot.sessions;
+        self.all_sessions = snapshot.sessions;
+        self.sessions = self.all_sessions.clone();
         self.last_active_window =
             active_window_of(&self.sessions, self.selected_session.as_deref());
     }
@@ -1138,6 +1154,11 @@ mod tests {
                 session("$2", "work"),
                 session("$3", "new"),
             ],
+            all_sessions: vec![
+                session("$1", "main"),
+                session("$2", "work"),
+                session("$3", "new"),
+            ],
             selected_session: Some("$3".to_owned()),
             selected_window: Some("@3".to_owned()),
             ..Default::default()
@@ -1155,6 +1176,16 @@ mod tests {
         );
         assert_eq!(controller.selected_session(), Some("$2"));
         assert_eq!(controller.selected_window(), None);
+
+        controller.apply_session_order(&["work".to_owned(), "main".to_owned(), "new".to_owned()]);
+        assert_eq!(
+            controller
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work", "main", "new"]
+        );
     }
 
     #[test]

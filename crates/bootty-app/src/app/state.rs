@@ -1538,6 +1538,19 @@ impl AppState {
                 target.inactive_bindings,
             ),
         };
+        if !self.binding.session_order.session_names().is_empty() {
+            self.binding.mux.refresh_on_next_frame();
+            let active_config = self.binding.multiplexer.clone();
+            let _ = self
+                .binding
+                .mux
+                .refresh_sessions(&self.repaint, &active_config);
+            self.sync_session_order();
+            if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
+                self.binding.persisted_sessions_restored = false;
+                self.binding.restore_persisted_sessions(&self.repaint);
+            }
+        }
         let previous_space_id = current.id;
         self.inactive_spaces.push(current);
         self.inactive_spaces.sort_by_key(|space| space.position);
@@ -1590,10 +1603,29 @@ impl AppState {
                 } else {
                     binding.label.clone()
                 };
+                let attached = binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .map(|session| session.id.as_str())
+                    .collect::<HashSet<_>>();
+                let sessions = binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .chain(
+                        binding
+                            .mux
+                            .all_sessions()
+                            .iter()
+                            .filter(|session| !attached.contains(session.id.as_str())),
+                    )
+                    .cloned()
+                    .collect();
                 BindingSessionGroup {
                     scope: binding.scope,
                     label,
-                    sessions: binding.mux.sessions().to_vec(),
+                    sessions,
                     selected_session: binding.mux.selected_session().map(str::to_owned),
                     active: binding.scope == self.binding.scope,
                     can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
@@ -2020,6 +2052,12 @@ impl AppState {
             .values()
             .chain(self.binding.unscoped_terminal_progress.iter())
             .any(|progress| progress.state == TerminalProgressState::Indeterminate)
+            || self.binding.mux.sessions().iter().any(|session| {
+                session
+                    .windows
+                    .iter()
+                    .any(|window| self.window_has_indeterminate_progress(window))
+            })
     }
 
     pub(crate) fn window_has_indeterminate_progress(&self, window: &MuxWindow) -> bool {
@@ -2266,6 +2304,19 @@ impl AppState {
             self.prepare_native_terminal_transition(&mut target_binding);
             let current_binding = std::mem::replace(&mut self.binding, target_binding);
             self.inactive_bindings.insert(index, current_binding);
+            if !self.binding.session_order.session_names().is_empty() {
+                self.binding.mux.refresh_on_next_frame();
+                let active_config = self.binding.multiplexer.clone();
+                let _ = self
+                    .binding
+                    .mux
+                    .refresh_sessions(&self.repaint, &active_config);
+                self.sync_session_order();
+                if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
+                    self.binding.persisted_sessions_restored = false;
+                    self.binding.restore_persisted_sessions(&self.repaint);
+                }
+            }
             self.app_key_bindings = app_key_bindings;
             self.terminal_surface = None;
             self.last_pane_area = None;
@@ -2625,6 +2676,9 @@ impl AppState {
     }
 
     fn sync_generated_session_names(&mut self) {
+        if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
+            return;
+        }
         let sessions = self.binding.mux.sessions().to_vec();
         if !self.generated_names_need_sync(&sessions) {
             return;
@@ -2891,6 +2945,30 @@ impl AppState {
         }
     }
 
+    pub fn detach_scoped_session_from_space(&mut self, target: &ScopedSessionTarget) -> bool {
+        let Some(binding) = self
+            .binding_runtimes_mut()
+            .find(|binding| binding.scope == target.scope)
+        else {
+            return false;
+        };
+        let Some(name) = binding
+            .mux
+            .all_sessions()
+            .iter()
+            .find(|session| session.id == target.session_id || session.name == target.session_id)
+            .map(|session| session.name.clone())
+        else {
+            return false;
+        };
+        if !binding.session_order.remove_session(&name) {
+            return false;
+        }
+        binding.sync_session_order();
+        (self.repaint)();
+        true
+    }
+
     pub fn take_session_picker_dialog(&mut self) -> Option<SessionPickerDialog> {
         self.session_picker_dialog.take()
     }
@@ -2909,6 +2987,21 @@ impl AppState {
             }
             SessionPickerEvent::ActivateSession(target) => {
                 self.input_focus = InputFocus::Terminal;
+                if let Some(binding) = self
+                    .binding_runtimes_mut()
+                    .find(|binding| binding.scope == target.scope)
+                    && let Some(name) = binding
+                        .mux
+                        .all_sessions()
+                        .iter()
+                        .find(|session| {
+                            session.id == target.session_id || session.name == target.session_id
+                        })
+                        .map(|session| session.name.clone())
+                {
+                    binding.session_order.add_session(&name);
+                    binding.sync_session_order();
+                }
                 self.activate_scoped_session_from_ui(&target);
             }
         }
@@ -3620,23 +3713,15 @@ impl AppState {
             .mux
             .refresh_sessions(&self.repaint, &active_config);
         self.binding.restore_persisted_sessions(&self.repaint);
-        let mut schedule_mux_refresh = mux_refresh_repaint_after(&active_config).is_some();
+        let schedule_mux_refresh = mux_refresh_repaint_after(&active_config).is_some();
         for binding in &mut self.inactive_bindings {
-            let _ = binding
-                .mux
-                .refresh_sessions(&self.repaint, &binding.multiplexer);
             binding.restore_persisted_sessions(&self.repaint);
             binding.sync_session_order();
-            schedule_mux_refresh |= mux_refresh_repaint_after(&binding.multiplexer).is_some();
         }
         for space in &mut self.inactive_spaces {
             for binding in space.bindings_mut() {
-                let _ = binding
-                    .mux
-                    .refresh_sessions(&self.repaint, &binding.multiplexer);
                 binding.restore_persisted_sessions(&self.repaint);
                 binding.sync_session_order();
-                schedule_mux_refresh |= mux_refresh_repaint_after(&binding.multiplexer).is_some();
             }
         }
         if schedule_mux_refresh {
@@ -3695,9 +3780,17 @@ impl AppState {
             cursor_blinking: renderer_metrics.cursor_blinking,
             input_commands,
         });
-        effects.push(AppEffect::RepaintAfter(
-            repaint.after.min(CONFIG_HOT_RELOAD_INTERVAL),
-        ));
+        let repaint_after = repaint.after.min(CONFIG_HOT_RELOAD_INTERVAL);
+        if repaint_after.is_zero() {
+            if !effects
+                .iter()
+                .any(|effect| matches!(effect, AppEffect::RequestRepaint))
+            {
+                effects.push(AppEffect::RequestRepaint);
+            }
+        } else {
+            effects.push(AppEffect::RepaintAfter(repaint_after));
+        }
         effects
     }
 
@@ -5803,6 +5896,20 @@ mod tests {
             terminal(TerminalCopyModeAction::ToggleSelection)
         );
         assert_eq!(
+            copy_mode_action_for_char('o'),
+            terminal(TerminalCopyModeAction::ToggleSelectionEnd)
+        );
+        assert_eq!(
+            copy_mode_action_for_input(KeyInput {
+                key: TerminalKey::O,
+                mods: crate::terminal::KeyMods::default(),
+                repeat: false,
+                utf8: Some("o"),
+                unshifted: Some('o'),
+            }),
+            terminal(TerminalCopyModeAction::ToggleSelectionEnd)
+        );
+        assert_eq!(
             copy_mode_action_for_char('$'),
             terminal(TerminalCopyModeAction::Move(
                 TerminalCopyModeMotion::EndOfLine
@@ -6603,6 +6710,17 @@ mod tests {
             !state.generated_names_need_sync(&moved),
             "reconciliation must settle again once the session set stops changing"
         );
+    }
+
+    #[test]
+    fn rmux_skips_generated_name_reconciliation() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Rmux;
+        });
+
+        state.sync_generated_session_names();
+
+        assert_eq!(state.binding.generated_names_signature, None);
     }
 
     fn test_state_with_config(mutate: impl FnOnce(&mut BoottyConfig)) -> AppState {
