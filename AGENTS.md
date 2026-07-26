@@ -1,5 +1,8 @@
 # Bootty
 
+PR flow: create a feature branch before committing, open a PR when requested, and merge only with explicit user instruction.
+After a merge, sync local `main`; never commit directly to `main`.
+
 ## Run Modes
 
 - Full app: `cargo run -p bootty-app --bin bootty`
