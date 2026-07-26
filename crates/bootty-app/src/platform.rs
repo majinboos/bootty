@@ -1,14 +1,15 @@
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use anyhow::Result;
+use eframe::egui::CursorIcon;
 #[cfg(target_os = "macos")]
 use objc2::runtime::NSObjectProtocol;
 #[cfg(target_os = "macos")]
 use objc2::{MainThreadMarker, sel};
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSApplication, NSScreen, NSTitlebarSeparatorStyle, NSWindow};
+use objc2_app_kit::{NSApplication, NSCursor, NSScreen, NSTitlebarSeparatorStyle, NSWindow};
 
 use crate::config::{BoottyConfig, MacosTitlebarStyle, WindowConfig};
 
@@ -80,6 +81,41 @@ fn read_clipboard_file_paths() -> Option<Vec<PathBuf>> {
 fn read_clipboard_file_paths() -> Option<Vec<PathBuf>> {
     None
 }
+
+#[cfg(target_os = "macos")]
+static MACOS_CURSOR_ICON: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(target_os = "macos")]
+pub fn set_macos_cursor_icon(icon: CursorIcon) {
+    MACOS_CURSOR_ICON.store(
+        match icon {
+            CursorIcon::Text => 1,
+            CursorIcon::PointingHand => 2,
+            CursorIcon::ResizeHorizontal => 3,
+            CursorIcon::ResizeVertical => 4,
+            _ => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_macos_cursor_icon(_icon: CursorIcon) {}
+
+#[cfg(target_os = "macos")]
+pub fn reapply_macos_cursor_icon() {
+    let cursor = match MACOS_CURSOR_ICON.load(Ordering::Relaxed) {
+        1 => NSCursor::IBeamCursor(),
+        2 => NSCursor::pointingHandCursor(),
+        3 => NSCursor::columnResizeCursor(),
+        4 => NSCursor::rowResizeCursor(),
+        _ => return,
+    };
+    cursor.set();
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn reapply_macos_cursor_icon() {}
 
 pub fn apply_macos_non_native_fullscreen_presentation(window: &WindowConfig) -> bool {
     set_macos_non_native_fullscreen_presentation(

@@ -42,6 +42,7 @@ pub fn run(options: eframe::NativeOptions, config: BoottyConfig) -> Result<()> {
         direct_input_tx,
         modifier_side_tx,
         input_state: NativeInputState::default(),
+        cursor_needs_reapply: false,
     };
 
     event_loop.run_app(&mut app).context("run bootty")
@@ -52,6 +53,7 @@ struct BoottyNativeHost<'app> {
     direct_input_tx: mpsc::Sender<DirectKeyInput>,
     modifier_side_tx: mpsc::Sender<ModifierSideState>,
     input_state: NativeInputState,
+    cursor_needs_reapply: bool,
 }
 
 #[derive(Default)]
@@ -109,6 +111,7 @@ impl ApplicationHandler<UserEvent> for BoottyNativeHost<'_> {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        self.cursor_needs_reapply |= matches!(event, WindowEvent::CursorMoved { .. });
         match &event {
             WindowEvent::ModifiersChanged(modifiers) => {
                 if let Some(side_state) =
@@ -156,6 +159,9 @@ impl ApplicationHandler<UserEvent> for BoottyNativeHost<'_> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.inner.about_to_wait(event_loop);
+        if std::mem::take(&mut self.cursor_needs_reapply) {
+            crate::platform::reapply_macos_cursor_icon();
+        }
     }
 
     fn suspended(&mut self, event_loop: &ActiveEventLoop) {

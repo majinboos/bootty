@@ -408,7 +408,7 @@ impl BoottyApp {
             extension_theme,
             lua_window: None,
             keep_awake: None,
-            terminal_cursor_icon: egui::CursorIcon::Default,
+            terminal_cursor_icon: egui::CursorIcon::Text,
             sidebar_space_swipe: chrome::SidebarSpaceSwipeState::default(),
         })
     }
@@ -2112,7 +2112,6 @@ impl eframe::App for BoottyApp {
         if self.state.has_indeterminate_terminal_progress() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
-        ctx.set_cursor_icon(self.terminal_cursor_icon);
 
         if crate::menu::settings_requested() {
             self.open_settings(ctx);
@@ -2150,6 +2149,8 @@ impl eframe::App for BoottyApp {
             self.show_theme_picker_dialog(ui.ctx());
             self.drive_lua_windows(ui.ctx());
         }
+        let cursor_icon = ui.ctx().output(|output| output.cursor_icon);
+        crate::platform::set_macos_cursor_icon(cursor_icon);
     }
 }
 

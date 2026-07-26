@@ -1010,7 +1010,7 @@ impl AppState {
             terminal_selection: TerminalSelectionRouter::default(),
             wheel_scroll_state: WheelScrollState::default(),
             modifier_remaps,
-            terminal_cursor_icon: egui::CursorIcon::Default,
+            terminal_cursor_icon: egui::CursorIcon::Text,
             mouse_pointer_hidden_while_typing: false,
             last_mouse_hover_pos: None,
             macos_option_as_alt,

@@ -61,6 +61,7 @@ muda = "0.19"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSApplication",
+  "NSCursor",
   "NSScreen",
   "NSPasteboard",
   "NSPasteboardItem",

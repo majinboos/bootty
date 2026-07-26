@@ -16,7 +16,7 @@ use crate::{
     },
     paint_plan::{CursorBlinkPhase, PaintPlanner, TerminalPaintPlan},
     scheduler::CURSOR_BLINK_REFRESH_INTERVAL,
-    terminal::{CursorSnapshot, RenderFrame},
+    terminal::{CursorSnapshot, RenderCell, RenderFrame},
     terminal_image::KittyImageFrame,
     terminal_render::{RenderFramePool, TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
@@ -49,6 +49,7 @@ impl TerminalWidget {
     pub fn new(target_format: Option<wgpu::TextureFormat>) -> Self {
         Self {
             target_format,
+            terminal_cursor_icon: egui::CursorIcon::Text,
             ..Self::default()
         }
     }
@@ -216,12 +217,12 @@ impl TerminalWidget {
             .and_then(|pos| hyperlink_at(frame, surface, self.view.inverse_point(pos)));
 
         if let Some(url) = hovered_link {
-            ui.set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             if response.clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         } else if response.hovered() {
-            ui.set_cursor_icon(self.terminal_cursor_icon);
+            ui.ctx().set_cursor_icon(self.terminal_cursor_icon);
         }
     }
 
@@ -743,11 +744,42 @@ fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Opt
     if point.x >= frame.cols || point.y >= frame.rows {
         return None;
     }
-    frame
+    let hyperlink = frame
         .cells
         .iter()
         .find(|cell| cell.x == point.x && cell.y == point.y)
-        .and_then(|cell| cell.hyperlink.clone())
+        .and_then(|cell| cell.hyperlink.clone());
+    hyperlink.or_else(|| plain_url_at(frame, point.x, point.y))
+}
+
+fn plain_url_at(frame: &RenderFrame, x: u16, y: u16) -> Option<String> {
+    let row = frame
+        .cells
+        .iter()
+        .filter(|cell| cell.y == y)
+        .collect::<Vec<_>>();
+    let hovered = row.iter().position(|cell| cell.x == x)?;
+    let is_token = |cell: &&RenderCell| frame.cell_text(cell).iter().all(|ch| !ch.is_whitespace());
+    let start = (0..=hovered)
+        .rev()
+        .take_while(|index| is_token(&row[*index]))
+        .last()
+        .unwrap_or(hovered);
+    let end = (hovered..row.len())
+        .take_while(|index| is_token(&row[*index]))
+        .last()
+        .unwrap_or(hovered);
+    let token = row[start..=end]
+        .iter()
+        .flat_map(|cell| frame.cell_text(cell))
+        .collect::<String>();
+    let path = token.trim_matches(|ch| {
+        matches!(
+            ch,
+            '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+        )
+    });
+    (path.starts_with("http://") || path.starts_with("https://")).then(|| path.to_owned())
 }
 
 #[derive(Default)]
@@ -932,6 +964,14 @@ mod tests {
     }
 
     #[test]
+    fn new_widget_uses_text_cursor() {
+        assert_eq!(
+            TerminalWidget::new(None).terminal_cursor_icon,
+            egui::CursorIcon::Text
+        );
+    }
+
+    #[test]
     fn hyperlink_at_maps_pointer_to_osc8_cell_uri() {
         let surface = TerminalSurface::for_size(
             Vec2::new(40.0, 20.0),
@@ -960,6 +1000,73 @@ mod tests {
             Some("https://example.com")
         );
         assert_eq!(hyperlink_at(&frame, surface, Pos2::new(5.0, 10.0)), None);
+    }
+
+    #[test]
+    fn hyperlink_at_ignores_plain_absolute_file_path() {
+        let path = "/var/folders/example/pi-clipboard.png";
+        let surface = TerminalSurface::for_size(
+            Vec2::new(path.len() as f32 * 10.0, 20.0),
+            CellMetrics::new(10.0, 20.0),
+            TerminalPadding::default(),
+        );
+        let frame = RenderFrame {
+            cols: path.len() as u16,
+            rows: 1,
+            cells: path
+                .chars()
+                .enumerate()
+                .map(|(x, _)| RenderCell {
+                    x: x as u16,
+                    y: 0,
+                    text_start: x,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                })
+                .collect(),
+            text: path.chars().collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(hyperlink_at(&frame, surface, Pos2::new(155.0, 10.0)), None);
+    }
+
+    #[test]
+    fn hyperlink_at_maps_plain_https_url() {
+        let url = "https://github.com/majindotboo/bootty/pull/37";
+        let surface = TerminalSurface::for_size(
+            Vec2::new(url.len() as f32 * 10.0, 20.0),
+            CellMetrics::new(10.0, 20.0),
+            TerminalPadding::default(),
+        );
+        let frame = RenderFrame {
+            cols: url.len() as u16,
+            rows: 1,
+            cells: url
+                .chars()
+                .enumerate()
+                .map(|(x, _)| RenderCell {
+                    x: x as u16,
+                    y: 0,
+                    text_start: x,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                })
+                .collect(),
+            text: url.chars().collect(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            hyperlink_at(&frame, surface, Pos2::new(155.0, 10.0)).as_deref(),
+            Some(url)
+        );
     }
 
     #[test]
