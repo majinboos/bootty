@@ -360,6 +360,7 @@ pub struct InputConfig {
     pub modifier_remap: Vec<String>,
     pub macos_option_as_alt: MacosOptionAsAltConfig,
     pub hide_mouse_pointer_while_typing: bool,
+    pub copy_on_select: bool,
     pub preset: KeybindPreset,
     /// Leader trigger for the active preset's prefixed chords. `None` uses the preset's own
     /// default; ignored by presets without a prefix concept (Ghostty).
@@ -445,6 +446,7 @@ struct InputPatch {
     modifier_remap: Option<Vec<String>>,
     macos_option_as_alt: Option<MacosOptionAsAltConfig>,
     hide_mouse_pointer_while_typing: Option<bool>,
+    copy_on_select: Option<bool>,
     preset: Option<KeybindPreset>,
     prefix: Option<String>,
     keybind: Option<Vec<String>>,
@@ -961,6 +963,7 @@ impl Default for InputConfig {
             modifier_remap: Vec::new(),
             macos_option_as_alt: MacosOptionAsAltConfig::default(),
             hide_mouse_pointer_while_typing: true,
+            copy_on_select: false,
             preset: KeybindPreset::default(),
             prefix: None,
             keybind: Vec::new(),
@@ -1693,6 +1696,7 @@ fn apply_partial_input(input: &mut InputConfig, partial: InputPatch) {
         &mut input.hide_mouse_pointer_while_typing,
         partial.hide_mouse_pointer_while_typing,
     );
+    apply_value(&mut input.copy_on_select, partial.copy_on_select);
     apply_value(&mut input.preset, partial.preset);
     apply_present(&mut input.prefix, partial.prefix);
     // Preset and prefix select which built-in default arrays the user's keybind rows layer

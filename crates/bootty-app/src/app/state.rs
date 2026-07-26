@@ -4319,6 +4319,8 @@ impl AppState {
     ) -> usize {
         let count = actions.len();
         for action in actions {
+            let copy_on_select = self.config().input.copy_on_select
+                && matches!(&action, TerminalSelectionAction::End(_));
             let result = match action {
                 TerminalSelectionAction::Begin(event) => {
                     TerminalRenderSource::begin_selection(self.binding.terminal.as_mut(), event)
@@ -4337,7 +4339,12 @@ impl AppState {
                 }
             };
             match result {
-                Ok(()) => effects.push(AppEffect::RequestRepaint),
+                Ok(()) => {
+                    effects.push(AppEffect::RequestRepaint);
+                    if copy_on_select {
+                        self.copy_terminal_selection_if_any();
+                    }
+                }
                 Err(error) => self.last_error = Some(error.to_string()),
             }
         }
