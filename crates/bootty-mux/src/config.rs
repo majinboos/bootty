@@ -64,30 +64,64 @@ mod tests {
     }
 
     #[test]
-    fn adapters_publish_backend_neutral_capability_declarations() {
+    fn adapters_publish_exact_backend_neutral_capability_matrix() {
         let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
-        for (backend, supported, unsupported) in [
-            (
-                MultiplexerBackendConfig::Native,
-                BindingOperation::SplitPane,
-                BindingOperation::TogglePaneZoom,
-            ),
-            (
-                MultiplexerBackendConfig::Rmux,
-                BindingOperation::SplitPane,
-                BindingOperation::NavigatePane,
-            ),
-            (
-                MultiplexerBackendConfig::Tmux,
-                BindingOperation::TogglePaneZoom,
-                BindingOperation::CreateProjectSession,
-            ),
-            (
-                MultiplexerBackendConfig::Zellij,
-                BindingOperation::CreateProjectSession,
-                BindingOperation::SplitPane,
-            ),
+        for backend in [
+            MultiplexerBackendConfig::Native,
+            MultiplexerBackendConfig::Rmux,
+            MultiplexerBackendConfig::Tmux,
+            MultiplexerBackendConfig::Zellij,
         ] {
+            let expected = match backend {
+                MultiplexerBackendConfig::Native => vec![
+                    BindingOperation::ActivateWindow,
+                    BindingOperation::CreateWindow,
+                    BindingOperation::RenameWindow,
+                    BindingOperation::NavigateWindow,
+                    BindingOperation::MoveWindow,
+                    BindingOperation::SplitPane,
+                    BindingOperation::NavigatePane,
+                    BindingOperation::ClosePane,
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+                MultiplexerBackendConfig::Rmux => vec![
+                    BindingOperation::ActivateWindow,
+                    BindingOperation::CreateWindow,
+                    BindingOperation::RenameWindow,
+                    BindingOperation::NavigateWindow,
+                    BindingOperation::MoveWindow,
+                    BindingOperation::SplitPane,
+                    BindingOperation::ClosePane,
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+                MultiplexerBackendConfig::Tmux => vec![
+                    BindingOperation::ActivateWindow,
+                    BindingOperation::CreateWindow,
+                    BindingOperation::RenameWindow,
+                    BindingOperation::NavigateWindow,
+                    BindingOperation::MoveWindow,
+                    BindingOperation::SplitPane,
+                    BindingOperation::NavigatePane,
+                    BindingOperation::ClosePane,
+                    BindingOperation::TogglePaneZoom,
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+                MultiplexerBackendConfig::Zellij => vec![
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+            };
             let config = MultiplexerConfig {
                 backend,
                 ..Default::default()
@@ -95,10 +129,7 @@ mod tests {
             let descriptor = build_backend(&config).capabilities(scope);
 
             assert_eq!(descriptor.scope(), scope);
-            assert!(descriptor.supports(supported));
-            if backend != MultiplexerBackendConfig::Tmux {
-                assert!(!descriptor.supports(unsupported));
-            }
+            assert_eq!(descriptor.operations().collect::<Vec<_>>(), expected);
         }
     }
 }

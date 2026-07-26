@@ -183,6 +183,22 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_descriptor_version_is_stale_and_does_not_run() {
+        let descriptor =
+            BindingCapabilityDescriptor::new(scope(1, 1), [BindingOperation::SplitPane]);
+        let mut request = descriptor.request(BindingOperation::SplitPane);
+        request.descriptor_version += 1;
+        let mut calls = 0;
+
+        let outcome = descriptor.invoke(request, BindingOperationAvailability::Available, || {
+            calls += 1
+        });
+
+        assert_eq!(outcome, BindingOperationOutcome::Stale);
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
     fn descriptor_round_trips_with_its_version_and_scope() {
         let descriptor = BindingCapabilityDescriptor::new(
             scope(2, 3),
