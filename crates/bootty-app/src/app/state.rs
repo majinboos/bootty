@@ -924,7 +924,7 @@ impl AppState {
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
-        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let workspace = WorkspaceStore::try_for_config_path(&config.config_path)?;
         let selected_space_id = workspace
             .selected_space(PRIMARY_WINDOW_STATE_KEY)
             .ok()

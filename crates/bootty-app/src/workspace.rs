@@ -112,10 +112,17 @@ pub(crate) struct WorkspaceStore {
 }
 
 impl WorkspaceStore {
-    pub(crate) fn for_config_path(config_path: &Path) -> Self {
+    pub(crate) fn try_for_config_path(config_path: &Path) -> rusqlite::Result<Self> {
         let path = sqlite_path(config_path);
-        let spaces = Self::load_or_migrate(&path).unwrap_or_default();
-        Self { path, spaces }
+        let spaces = Self::load_or_migrate(&path)?;
+        Ok(Self { path, spaces })
+    }
+
+    pub(crate) fn for_config_path(config_path: &Path) -> Self {
+        Self::try_for_config_path(config_path).unwrap_or_else(|_| Self {
+            path: sqlite_path(config_path),
+            spaces: Vec::new(),
+        })
     }
 
     pub(crate) fn binding(&self) -> Option<&WorkspaceBinding> {
@@ -1400,6 +1407,7 @@ mod tests {
         drop(conn);
 
         assert!(WorkspaceStore::load_or_migrate(&path).is_err());
+        assert!(WorkspaceStore::try_for_config_path(&config_path).is_err());
         let conn = open_db(&path).expect("reopen workspace database");
         let after: i64 = conn
             .query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
