@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 
 use super::{
     backend::MuxBackend,
+    capability::{BindingCapabilityDescriptor, BindingOperation},
     command::{MuxCommand, MuxDirection, MuxSplitDirection},
+    controller::MuxScope,
     process::{CommandRunner, SystemCommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
 };
@@ -92,6 +94,27 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
             return Ok(MuxSnapshot::default());
         };
         parse_tmux_snapshot(&sessions, &panes)
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(
+            scope,
+            [
+                BindingOperation::ActivateWindow,
+                BindingOperation::CreateWindow,
+                BindingOperation::RenameWindow,
+                BindingOperation::NavigateWindow,
+                BindingOperation::MoveWindow,
+                BindingOperation::SplitPane,
+                BindingOperation::NavigatePane,
+                BindingOperation::ClosePane,
+                BindingOperation::TogglePaneZoom,
+                BindingOperation::CreateProjectSession,
+                BindingOperation::CreateWorktreeSession,
+                BindingOperation::RenameSession,
+                BindingOperation::DitchSession,
+            ],
+        )
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {

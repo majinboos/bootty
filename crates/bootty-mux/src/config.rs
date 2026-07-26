@@ -24,6 +24,10 @@ pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        capability::BindingOperation,
+        controller::{BindingId, MuxScope, SpaceId},
+    };
     use bootty_config::config::MultiplexerConfig;
 
     #[test]
@@ -56,6 +60,45 @@ mod tests {
             };
 
             assert_eq!(selected_backend(&config), expected);
+        }
+    }
+
+    #[test]
+    fn adapters_publish_backend_neutral_capability_declarations() {
+        let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+        for (backend, supported, unsupported) in [
+            (
+                MultiplexerBackendConfig::Native,
+                BindingOperation::SplitPane,
+                BindingOperation::TogglePaneZoom,
+            ),
+            (
+                MultiplexerBackendConfig::Rmux,
+                BindingOperation::SplitPane,
+                BindingOperation::NavigatePane,
+            ),
+            (
+                MultiplexerBackendConfig::Tmux,
+                BindingOperation::TogglePaneZoom,
+                BindingOperation::CreateProjectSession,
+            ),
+            (
+                MultiplexerBackendConfig::Zellij,
+                BindingOperation::CreateProjectSession,
+                BindingOperation::SplitPane,
+            ),
+        ] {
+            let config = MultiplexerConfig {
+                backend,
+                ..Default::default()
+            };
+            let descriptor = build_backend(&config).capabilities(scope);
+
+            assert_eq!(descriptor.scope(), scope);
+            assert!(descriptor.supports(supported));
+            if backend != MultiplexerBackendConfig::Tmux {
+                assert!(!descriptor.supports(unsupported));
+            }
         }
     }
 }

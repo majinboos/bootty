@@ -2,7 +2,9 @@ use anyhow::Result;
 
 use super::{
     backend::MuxBackend,
+    capability::{BindingCapabilityDescriptor, BindingOperation},
     command::MuxCommand,
+    controller::MuxScope,
     process::{CommandRunner, SystemCommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot},
 };
@@ -47,6 +49,18 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
     fn snapshot(&self) -> Result<MuxSnapshot> {
         let output = self.run(&["list-sessions", "--short", "--no-formatting"])?;
         Ok(parse_zellij_snapshot(&output))
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(
+            scope,
+            [
+                BindingOperation::CreateProjectSession,
+                BindingOperation::CreateWorktreeSession,
+                BindingOperation::RenameSession,
+                BindingOperation::DitchSession,
+            ],
+        )
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {

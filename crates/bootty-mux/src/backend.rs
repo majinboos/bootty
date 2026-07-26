@@ -1,7 +1,11 @@
 use anyhow::Result;
 
 use super::{
-    capability::BindingCapabilityDescriptor, command::MuxCommand, controller::MuxScope,
+    capability::{
+        BindingCapabilityDescriptor, BindingOperationAvailability, BindingOperationOutcome,
+    },
+    command::MuxCommand,
+    controller::MuxScope,
     snapshot::MuxSnapshot,
 };
 
@@ -11,6 +15,19 @@ pub trait MuxBackend {
 
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
         BindingCapabilityDescriptor::new(scope, [])
+    }
+
+    fn execute_checked(
+        &mut self,
+        scope: MuxScope,
+        command: MuxCommand,
+    ) -> BindingOperationOutcome<Result<()>> {
+        let descriptor = self.capabilities(scope);
+        descriptor.invoke(
+            descriptor.request(command.operation()),
+            BindingOperationAvailability::Available,
+            || self.execute(command),
+        )
     }
 }
 
@@ -106,5 +123,20 @@ mod tests {
         assert_eq!(descriptor.version(), BINDING_CAPABILITY_DESCRIPTOR_VERSION);
         assert_eq!(descriptor.scope(), scope);
         assert!(!descriptor.supports(BindingOperation::SplitPane));
+    }
+
+    #[test]
+    fn checked_execution_does_not_mutate_an_unsupported_backend() {
+        let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+        let mut backend = FakeBackend::default();
+        let outcome = backend.execute_checked(
+            scope,
+            MuxCommand::DitchSession {
+                session_id: "project".to_owned(),
+            },
+        );
+
+        assert!(matches!(outcome, BindingOperationOutcome::Unsupported));
+        assert!(backend.commands.is_empty());
     }
 }

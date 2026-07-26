@@ -1,3 +1,5 @@
+use crate::capability::BindingOperation;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuxDirection {
     Left,
@@ -99,4 +101,31 @@ pub enum MuxCommand {
     DitchSession {
         session_id: String,
     },
+}
+
+impl MuxCommand {
+    pub fn operation(&self) -> BindingOperation {
+        match self {
+            Self::ActivateWindow { .. } => BindingOperation::ActivateWindow,
+            Self::NewWindow { .. } => BindingOperation::CreateWindow,
+            Self::RenameWindow { .. } => BindingOperation::RenameWindow,
+            Self::ActivateNextWindow { .. }
+            | Self::ActivatePreviousWindow { .. }
+            | Self::ActivateLastWindow { .. }
+            | Self::ActivateWindowIndex { .. } => BindingOperation::NavigateWindow,
+            Self::MoveWindow { .. } | Self::MoveWindowPreservingSelection { .. } => {
+                BindingOperation::MoveWindow
+            }
+            Self::SplitPane { .. } => BindingOperation::SplitPane,
+            Self::SelectPane { .. }
+            | Self::SelectNextPane { .. }
+            | Self::SelectPreviousPane { .. } => BindingOperation::NavigatePane,
+            Self::KillPane { .. } | Self::ClosePane { .. } => BindingOperation::ClosePane,
+            Self::TogglePaneZoom { .. } => BindingOperation::TogglePaneZoom,
+            Self::CreateProjectSession { .. } => BindingOperation::CreateProjectSession,
+            Self::CreateWorktreeSession { .. } => BindingOperation::CreateWorktreeSession,
+            Self::RenameSession { .. } => BindingOperation::RenameSession,
+            Self::DitchSession { .. } => BindingOperation::DitchSession,
+        }
+    }
 }
