@@ -2841,6 +2841,7 @@ impl AppState {
             &self.repaint,
             &mux_config,
         );
+        self.input_focus = InputFocus::Terminal;
     }
 
     fn session_root(cwd: &str) -> String {
@@ -6656,6 +6657,16 @@ mod tests {
             active_window_id: None,
             windows: Vec::new(),
         }
+    }
+
+    #[test]
+    fn creating_a_session_focuses_the_terminal() {
+        let mut state = test_state();
+        state.input_focus = InputFocus::Sidebar;
+
+        state.create_project_session_for_cwd(std::env::temp_dir().to_string_lossy().into_owned());
+
+        assert_eq!(state.input_focus, InputFocus::Terminal);
     }
 
     #[test]
