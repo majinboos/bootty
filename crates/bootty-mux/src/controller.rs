@@ -5,6 +5,7 @@ use std::{
 };
 
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     RepaintHandle,
@@ -231,7 +232,7 @@ fn order_sessions_by_names(sessions: &[MuxSession], ordered_names: &[String]) ->
     ordered
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct SpaceId(i64);
 
 impl SpaceId {
@@ -244,7 +245,7 @@ impl SpaceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct BindingId(i64);
 
 impl BindingId {
@@ -257,7 +258,7 @@ impl BindingId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct MuxScope {
     space_id: SpaceId,
     binding_id: BindingId,

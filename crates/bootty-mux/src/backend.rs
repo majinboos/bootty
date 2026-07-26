@@ -1,16 +1,27 @@
 use anyhow::Result;
 
-use super::{command::MuxCommand, snapshot::MuxSnapshot};
+use super::{
+    capability::BindingCapabilityDescriptor, command::MuxCommand, controller::MuxScope,
+    snapshot::MuxSnapshot,
+};
 
 pub trait MuxBackend {
     fn snapshot(&self) -> Result<MuxSnapshot>;
     fn execute(&mut self, command: MuxCommand) -> Result<()>;
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(scope, [])
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::{MuxPaneAnchor, MuxSession};
+    use crate::{
+        capability::{BINDING_CAPABILITY_DESCRIPTOR_VERSION, BindingOperation},
+        controller::{BindingId, SpaceId},
+        snapshot::{MuxPaneAnchor, MuxSession},
+    };
 
     #[derive(Default)]
     struct FakeBackend {
@@ -85,5 +96,15 @@ mod tests {
         }
 
         assert_eq!(backend.commands, commands);
+    }
+
+    #[test]
+    fn every_backend_has_a_scoped_default_capability_descriptor() {
+        let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+        let descriptor = FakeBackend::default().capabilities(scope);
+
+        assert_eq!(descriptor.version(), BINDING_CAPABILITY_DESCRIPTOR_VERSION);
+        assert_eq!(descriptor.scope(), scope);
+        assert!(!descriptor.supports(BindingOperation::SplitPane));
     }
 }

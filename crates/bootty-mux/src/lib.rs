@@ -12,6 +12,7 @@ fn bootty_rmux_endpoint_path() -> anyhow::Result<std::path::PathBuf> {
 }
 
 pub mod backend;
+pub mod capability;
 pub mod command;
 pub mod config;
 pub mod controller;
