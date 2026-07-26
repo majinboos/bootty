@@ -10,6 +10,7 @@ use bootty_config::{
     },
 };
 use bootty_render::terminal_text::FontFeature;
+use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
 use clap::{Args, ValueEnum};
 
 #[derive(Debug, Default, Args)]
@@ -467,7 +468,8 @@ impl ConfigOverrides {
             config.session.colorterm.clone_from(colorterm);
         }
         if let Some(max_scrollback) = self.max_scrollback {
-            config.session.max_scrollback = max_scrollback;
+            config.session.max_scrollback =
+                max_scrollback.saturating_mul(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE);
         }
         if let Some(glyph_protocol) = bool_override(self.glyph_protocol, self.no_glyph_protocol) {
             config.session.glyph_protocol = glyph_protocol;

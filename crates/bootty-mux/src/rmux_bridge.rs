@@ -1,11 +1,7 @@
 use std::{
     env,
     path::Path,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{OnceLock, mpsc},
     thread,
     time::Duration,
 };
@@ -21,7 +17,7 @@ use rmux_sdk::{
     SplitDirection as SdkSplitDirection, TerminalSizeSpec, WindowRef,
 };
 use tokio::runtime::Builder;
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::{
     command::{MuxCommand, MuxSplitDirection},
@@ -873,35 +869,44 @@ async fn run_pane_io_inner(
     let rmux = connect_bootty_rmux().await?;
     let pane = pane_for_target(&rmux, &target).await?;
     replay_retained_kitty_keyboard_protocol(&pane, output_tx).await?;
-    let mut output_stream = pane
-        .output_stream_starting_at(PaneOutputStart::Oldest)
-        .await?;
-    let restore_valid = Arc::new(AtomicBool::new(true));
-    start_restore_capture(
-        target.clone(),
-        max_scrollback,
-        output_tx.clone(),
-        Arc::clone(&restore_valid),
-    );
-    let mut restore_started = true;
+    let mut output_stream = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
+    let mut restore_rx = start_restore_capture(target.clone(), max_scrollback);
+    let mut restore_pending = true;
+    let mut buffered_chunks = Vec::new();
     let mut output_poll_delay = RMUX_OUTPUT_POLL_MIN_DELAY;
 
     loop {
         tokio::select! {
+            restore = &mut restore_rx, if restore_pending => {
+                restore_pending = false;
+                if let Ok(Some(bytes)) = restore
+                    && !bytes.is_empty()
+                    && output_tx.send(RmuxPaneEvent::Capture(bytes)).is_err()
+                {
+                    break;
+                }
+                if !buffered_chunks.is_empty()
+                    && output_tx
+                        .send(RmuxPaneEvent::Chunks(std::mem::take(&mut buffered_chunks)))
+                        .is_err()
+                {
+                    break;
+                }
+            }
             _ = tokio::time::sleep(output_poll_delay) => {
                 let chunks = output_stream.poll_once().await?;
                 if chunks.is_empty() {
                     output_poll_delay = (output_poll_delay * 2).min(RMUX_OUTPUT_POLL_MAX_DELAY);
                 } else {
-                    restore_valid.store(false, Ordering::Relaxed);
                     output_poll_delay = RMUX_OUTPUT_POLL_MIN_DELAY;
-                    if output_tx.send(RmuxPaneEvent::Chunks(chunks)).is_err() {
+                    if restore_pending {
+                        buffered_chunks.extend(chunks);
+                    } else if output_tx.send(RmuxPaneEvent::Chunks(chunks)).is_err() {
                         break;
                     }
                 }
             }
             Some(mut text) = input_rx.recv() => {
-                restore_valid.store(false, Ordering::Relaxed);
                 while let Ok(next) = input_rx.try_recv() {
                     text.push_str(&next);
                 }
@@ -921,15 +926,6 @@ async fn run_pane_io_inner(
                 let _ = result_tx.send(result);
                 if ok {
                     output_poll_delay = RMUX_OUTPUT_POLL_MIN_DELAY;
-                    if !restore_started {
-                        restore_started = true;
-                        start_restore_capture(
-                            target.clone(),
-                            max_scrollback,
-                            output_tx.clone(),
-                            Arc::clone(&restore_valid),
-                        );
-                    }
                 }
             }
             else => break,
@@ -941,23 +937,18 @@ async fn run_pane_io_inner(
 fn start_restore_capture(
     target: RmuxPaneTarget,
     max_scrollback: usize,
-    output_tx: mpsc::Sender<RmuxPaneEvent>,
-    restore_valid: Arc<AtomicBool>,
-) {
+) -> oneshot::Receiver<Option<Vec<u8>>> {
+    let (result_tx, result_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let Ok(rmux) = connect_bootty_rmux().await else {
-            return;
-        };
-        let Ok(pane) = pane_for_target(&rmux, &target).await else {
-            return;
-        };
-        let Ok(bytes) = restore_capture(&pane, max_scrollback).await else {
-            return;
-        };
-        if !bytes.is_empty() && restore_valid.load(Ordering::Relaxed) {
-            let _ = output_tx.send(RmuxPaneEvent::Capture(bytes));
+        let bytes = async {
+            let rmux = connect_bootty_rmux().await.ok()?;
+            let pane = pane_for_target(&rmux, &target).await.ok()?;
+            restore_capture(&pane, max_scrollback).await.ok()
         }
+        .await;
+        let _ = result_tx.send(bytes);
     });
+    result_rx
 }
 
 async fn restore_capture(pane: &Pane, max_scrollback: usize) -> Result<Vec<u8>> {
@@ -970,9 +961,17 @@ async fn restore_capture(pane: &Pane, max_scrollback: usize) -> Result<Vec<u8>> 
         .await?;
     let mut stdout = capture.stdout;
     if let Ok(snapshot) = pane.snapshot().await {
-        append_restore_snapshot_visible(&mut stdout, &snapshot);
+        append_restore_snapshot(&mut stdout, &snapshot);
     }
     Ok(stdout)
+}
+
+fn append_restore_snapshot(bytes: &mut Vec<u8>, snapshot: &PaneSnapshot) {
+    if bytes.windows(4).any(|window| window == b"\x1b]8;") {
+        append_restore_cursor_position(bytes, snapshot.cursor);
+    } else {
+        append_restore_snapshot_visible(bytes, snapshot);
+    }
 }
 
 fn append_restore_snapshot_visible(bytes: &mut Vec<u8>, snapshot: &PaneSnapshot) {
@@ -1226,6 +1225,29 @@ mod tests {
             b"history\r\n\x1b[?25l\x1b[H\x1b[J\x1b[1;1H\x1b[0ma\x1b[1;2H\x1b[0mb\x1b[2;1H\x1b[0mc\x1b[2;2H\x1b[0md\x1b[2;3H\x1b[0me\x1b[0m\x1b[2;3H\x1b[?25h"
         );
     }
+    #[test]
+    fn restore_snapshot_keeps_captured_hyperlinks() {
+        let snapshot = PaneSnapshot::new(
+            4,
+            1,
+            vec![
+                rmux_sdk::PaneCell::new(rmux_sdk::PaneGlyph::new("l", 1)),
+                rmux_sdk::PaneCell::new(rmux_sdk::PaneGlyph::new("i", 1)),
+                rmux_sdk::PaneCell::new(rmux_sdk::PaneGlyph::new("n", 1)),
+                rmux_sdk::PaneCell::new(rmux_sdk::PaneGlyph::new("k", 1)),
+            ],
+            PaneCursor::new(0, 3, true, 0),
+        )
+        .unwrap();
+        let mut bytes = b"\x1b]8;;file:///tmp/example.png\x1b\\link\x1b]8;;\x1b\\".to_vec();
+
+        append_restore_snapshot(&mut bytes, &snapshot);
+
+        assert!(bytes.windows(4).any(|window| window == b"\x1b]8;"));
+        assert!(!bytes.windows(6).any(|window| window == b"\x1b[H\x1b[J"));
+        assert!(bytes.ends_with(b"\x1b[1;4H\x1b[?25h"));
+    }
+
     #[test]
     fn restore_snapshot_visible_preserves_cell_color_and_attributes() {
         let mut styled = PaneCell::new(rmux_sdk::PaneGlyph::new("x", 1));

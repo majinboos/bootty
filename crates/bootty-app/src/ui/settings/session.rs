@@ -1,8 +1,19 @@
 use std::path::PathBuf;
 
+use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
 use eframe::egui;
 
 use super::SettingsWindow;
+
+const MAX_SCROLLBACK_ROWS: i64 = 10_000_000;
+
+fn scrollback_rows(bytes: usize) -> i64 {
+    bytes.div_ceil(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE) as i64
+}
+
+fn scrollback_bytes(rows: i64) -> usize {
+    (rows.max(0) as usize).saturating_mul(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE)
+}
 
 pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
     let palette = win.palette;
@@ -90,20 +101,20 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
         ui,
         palette,
         "Max scrollback",
-        "Lines retained per pane. 0 disables scrollback.",
+        "Lines retained per pane. 0 disables scrollback. Applies to new panes.",
         |ui| {
-            let mut scrollback = win.config.session.max_scrollback as i64;
+            let mut rows = scrollback_rows(win.config.session.max_scrollback);
             if ui
                 .add(
-                    egui::DragValue::new(&mut scrollback)
-                        .speed(100.0)
-                        .range(0..=1_000_000),
+                    egui::DragValue::new(&mut rows)
+                        .speed(1_000.0)
+                        .range(0..=MAX_SCROLLBACK_ROWS),
                 )
                 .changed()
             {
-                let value = scrollback.max(0);
-                win.config.session.max_scrollback = value as usize;
-                win.set_i64(&["session", "max-scrollback"], value);
+                let bytes = scrollback_bytes(rows);
+                win.config.session.max_scrollback = bytes;
+                win.set_i64(&["session", "max-scrollback"], bytes as i64);
             }
         },
     );
@@ -173,4 +184,15 @@ fn text_field(
     hint: &str,
 ) -> egui::Response {
     super::settings_text_edit(ui, palette, value, hint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrollback_settings_convert_rows_to_terminal_budget() {
+        assert_eq!(scrollback_rows(320_000_000), 1_000_000);
+        assert_eq!(scrollback_bytes(1_000_000), 320_000_000);
+    }
 }
