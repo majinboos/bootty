@@ -598,6 +598,7 @@ fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig
 }
 
 pub struct AppState {
+    window_state_key: String,
     binding: BindingRuntime,
     inactive_bindings: Vec<BindingRuntime>,
     active_space_id: SpaceId,
@@ -924,11 +925,24 @@ impl AppState {
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
+        Self::new_for_window(
+            config,
+            PRIMARY_WINDOW_STATE_KEY.to_owned(),
+            repaint,
+            direct_input_rx,
+            modifier_side_rx,
+        )
+    }
+
+    pub fn new_for_window(
+        config: BoottyConfig,
+        window_state_key: String,
+        repaint: RepaintHandle,
+        direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
+        modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
+    ) -> Result<Self> {
         let workspace = WorkspaceStore::try_for_config_path(&config.config_path)?;
-        let selected_space_id = workspace
-            .selected_space(PRIMARY_WINDOW_STATE_KEY)
-            .ok()
-            .flatten();
+        let selected_space_id = workspace.selected_space(&window_state_key).ok().flatten();
         let modifier_remaps = config.input.modifier_remaps()?;
         let macos_option_as_alt = config.input.macos_option_as_alt.into();
         let sidebar_key_bindings =
@@ -978,6 +992,7 @@ impl AppState {
             binding,
             inactive_bindings,
         } = active_space;
+        workspace.set_selected_space(&window_state_key, active_space_id)?;
         let inactive_spaces = spaces;
         let keybinds = config
             .input
@@ -993,6 +1008,7 @@ impl AppState {
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
 
         Ok(Self {
+            window_state_key,
             binding,
             inactive_bindings,
             active_space_id,
@@ -1592,7 +1608,7 @@ impl AppState {
             started: Instant::now(),
         });
         if let Err(error) =
-            workspace.set_selected_space(PRIMARY_WINDOW_STATE_KEY, self.active_space_id)
+            workspace.set_selected_space(&self.window_state_key, self.active_space_id)
         {
             self.last_error = Some(error.to_string());
         }
@@ -7586,9 +7602,22 @@ mod tests {
         )
         .expect("insert second space binding");
         let repaint: RepaintHandle = std::sync::Arc::new(|| {});
-        let other_window =
-            AppState::new(config.clone(), repaint.clone(), None, None).expect("other state");
-        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let other_window = AppState::new_for_window(
+            config.clone(),
+            "window-a".to_owned(),
+            repaint.clone(),
+            None,
+            None,
+        )
+        .expect("other state");
+        let mut state = AppState::new_for_window(
+            config.clone(),
+            "window-b".to_owned(),
+            repaint.clone(),
+            None,
+            None,
+        )
+        .expect("state");
         let first_scope = state.binding.scope;
         let first_config = state.binding.multiplexer.clone();
         state.binding.mux.create_project_session(
@@ -7676,6 +7705,16 @@ mod tests {
                 .any(|session| session.id == "$1")
         );
         assert_eq!(other_window.active_space_id(), first_space);
+        let persisted = WorkspaceStore::try_for_config_path(&config.config_path)
+            .expect("reopen workspace selection");
+        assert_eq!(
+            persisted.selected_space("window-a").expect("window a"),
+            Some(first_space)
+        );
+        assert_eq!(
+            persisted.selected_space("window-b").expect("window b"),
+            Some(second_space)
+        );
         assert!(state.binding.mux.poll_command().is_none());
         assert!(
             state

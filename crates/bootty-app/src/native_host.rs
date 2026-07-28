@@ -17,7 +17,11 @@ use crate::{
     platform::disable_automatic_window_tabbing,
 };
 
-pub fn run(options: eframe::NativeOptions, config: BoottyConfig) -> Result<()> {
+pub fn run(
+    options: eframe::NativeOptions,
+    config: BoottyConfig,
+    window_state_key: String,
+) -> Result<()> {
     // Must run before any window is created (the flag is read at window-creation time), otherwise
     // macOS automatic window tabbing keeps the Cmd+T key equivalent and the keypress never reaches
     // the app.
@@ -32,6 +36,7 @@ pub fn run(options: eframe::NativeOptions, config: BoottyConfig) -> Result<()> {
         Ok(Box::new(BoottyApp::new_with_direct_input(
             cc,
             config,
+            window_state_key,
             direct_input_rx,
             modifier_side_rx,
         )?) as Box<dyn eframe::App>)

@@ -24,6 +24,10 @@ pub struct Cli {
     #[arg(long, conflicts_with = "config")]
     defaults: bool,
 
+    /// Stable persistence identity for this application window.
+    #[arg(long, default_value = "main", hide = true)]
+    window_state_key: String,
+
     #[command(flatten)]
     overrides: ConfigOverrides,
 }
@@ -37,6 +41,10 @@ impl Cli {
         let mut config = load_config_from_path(&path)?;
         self.overrides.apply(&mut config)?;
         Ok(config)
+    }
+
+    pub fn window_state_key(&self) -> &str {
+        &self.window_state_key
     }
 
     fn selected_config_path(&self) -> PathBuf {
