@@ -5321,13 +5321,39 @@ impl AppState {
         if self.terminal_copy_mode_active() {
             return self.search_copy_mode_terminal(query, direction);
         }
-        match self.binding.terminal.search_viewport(query, direction) {
-            Ok(found) => self.terminal_find_result_from_frame(found),
+        match self.search_focused_terminal_runtime(query, direction) {
+            Ok(result) => result,
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 TerminalFindResult::default()
             }
         }
+    }
+
+    fn search_focused_terminal_runtime(
+        &mut self,
+        query: &str,
+        direction: TerminalSearchDirection,
+    ) -> Result<TerminalFindResult> {
+        if let Some(pane_id) = self.focused_pane()
+            && let Some(source) = self.binding.terminal.focused_render_source(&pane_id)
+        {
+            let found = source.search_viewport(query, direction)?;
+            let frame = source.extract_frame()?;
+            return Ok(TerminalFindResult {
+                found,
+                active_index: frame.active_search_match_index,
+                match_count: frame.search_match_count,
+            });
+        }
+
+        let found = self.binding.terminal.search_viewport(query, direction)?;
+        let frame = self.binding.terminal.extract_frame()?;
+        Ok(TerminalFindResult {
+            found,
+            active_index: frame.active_search_match_index,
+            match_count: frame.search_match_count,
+        })
     }
 
     fn search_copy_mode_terminal(

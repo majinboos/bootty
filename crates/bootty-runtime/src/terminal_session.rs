@@ -172,6 +172,18 @@ impl PublishedFrame {
     }
 }
 
+fn search_and_publish_frame(
+    engine: &mut TerminalEngine,
+    latest_frame: &PublishedFrame,
+    query: &str,
+    direction: TerminalSearchDirection,
+) -> Result<bool> {
+    let found = engine.search_viewport(query, direction)?;
+    let frame = engine.extract_frame()?;
+    latest_frame.publish(frame)?;
+    Ok(found)
+}
+
 type SelectionFormatResponse = std::result::Result<Option<Vec<u8>>, String>;
 type MouseTrackingResponse = std::result::Result<bool, String>;
 type SearchViewportResponse = std::result::Result<bool, String>;
@@ -881,12 +893,18 @@ impl TerminalWorker {
                     direction,
                     done,
                 } => {
-                    self.mark_input_fast_path();
-                    let response = self
-                        .engine
-                        .search_viewport(&query, direction)
-                        .map_err(|error| error.to_string());
-                    stats.terminal_changed = true;
+                    let response = search_and_publish_frame(
+                        &mut self.engine,
+                        &self.latest_frame,
+                        &query,
+                        direction,
+                    )
+                    .map_err(|error| error.to_string());
+                    if response.is_ok() {
+                        self.force_next_frame_publish = false;
+                        self.has_unpublished_frame = false;
+                        (self.repaint_wakeup)();
+                    }
                     let _ = done.send(response);
                 }
                 TerminalCommand::IsMouseTracking(done) => {
@@ -1701,6 +1719,32 @@ fn parse_user_shell_output(output: &str) -> Option<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn search_response_publishes_matching_frame_before_returning() -> Result<()> {
+        let mut engine = TerminalEngine::new(TerminalGeometry {
+            cols: 20,
+            rows: 8,
+            cell_width: 10,
+            cell_height: 20,
+        })?;
+        engine.write_vt(b"RIGHTONLY\r\nRIGHTONLY");
+        let published = PublishedFrame::new();
+        published.publish(engine.extract_frame()?)?;
+
+        assert!(search_and_publish_frame(
+            &mut engine,
+            &published,
+            "RIGHTONLY",
+            TerminalSearchDirection::Current,
+        )?);
+
+        let frame = published.load()?;
+        assert_eq!(frame.search_match_count, 2);
+        assert_eq!(frame.active_search_match_index, Some(1));
+        assert_eq!(frame.search_matches.len(), 2);
+        Ok(())
+    }
 
     #[test]
     fn drain_budget_limits_bytes_per_frame() {

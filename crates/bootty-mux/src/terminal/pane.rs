@@ -702,6 +702,22 @@ impl BackendPaneTerminal {
         Some(&mut **terminal)
     }
 
+    /// The requested pane's runtime, including the focused/input pane.
+    pub fn focused_render_source(
+        &mut self,
+        pane_id: &str,
+    ) -> Option<&mut (dyn TerminalRuntime + '_)> {
+        if self
+            .active_target
+            .as_ref()
+            .map(ScopedMuxPaneTarget::input_selector)
+            == Some(pane_id)
+        {
+            return Some(&mut *self.terminal);
+        }
+        self.render_source_for_pane(pane_id)
+    }
+
     /// The focused pane's id (the deref/input runtime), if any.
     pub fn focused_pane_id(&self) -> Option<&str> {
         self.active_target
