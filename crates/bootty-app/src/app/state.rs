@@ -4699,6 +4699,9 @@ impl AppState {
         if !self.direct_terminal_input_enabled() {
             return 0;
         }
+        if paths.is_empty() {
+            return 0;
+        }
         let text = match local_file_handoff(&paths) {
             LocalFileHandoff::Ready(text) => text,
             LocalFileHandoff::Rejected(message) => {
@@ -9823,6 +9826,11 @@ mod tests {
             local_file_handoff(&[file.path().to_path_buf()]),
             LocalFileHandoff::Ready(_)
         ));
+
+        let mut state = test_state();
+        state.last_error = None;
+        assert_eq!(state.handle_dropped_file_paths(Vec::new()), 0);
+        assert_eq!(state.last_error(), None);
     }
 
     #[test]
