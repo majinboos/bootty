@@ -387,7 +387,7 @@ impl BindingRuntime {
             terminal,
             terminal_side_effect_tx,
             terminal_side_effect_rx,
-            mux: BindingMuxController::default(),
+            mux: BindingMuxController::new(scope),
             session_order: SessionOrderStore::for_binding(
                 &config.config_path,
                 scope.binding_id().persistence_value(),

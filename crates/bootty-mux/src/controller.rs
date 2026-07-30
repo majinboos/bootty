@@ -5,9 +5,12 @@ use std::{
 };
 
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     RepaintHandle,
+    backend::MuxBackend,
+    capability::BindingOperationOutcome,
     command::MuxCommand,
     config::{build_backend, selected_backend},
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh},
@@ -37,9 +40,26 @@ struct MuxCommandCompletion {
 }
 
 struct MuxCommandJob {
+    scope: Option<MuxScope>,
     config: MultiplexerConfig,
     command: MuxCommand,
     completion: MuxCommandCompletion,
+}
+
+fn execute_backend_command(
+    backend: &mut dyn MuxBackend,
+    scope: Option<MuxScope>,
+    command: MuxCommand,
+) -> Result<(), String> {
+    let Some(scope) = scope else {
+        return backend.execute(command).map_err(|error| error.to_string());
+    };
+    match backend.execute_checked(scope, command) {
+        BindingOperationOutcome::Supported(result) => result.map_err(|error| error.to_string()),
+        BindingOperationOutcome::Unsupported => Err("mux operation is unsupported".to_owned()),
+        BindingOperationOutcome::Unavailable => Err("mux operation is unavailable".to_owned()),
+        BindingOperationOutcome::Stale => Err("mux operation capability is stale".to_owned()),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,7 +251,7 @@ fn order_sessions_by_names(sessions: &[MuxSession], ordered_names: &[String]) ->
     ordered
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct SpaceId(i64);
 
 impl SpaceId {
@@ -244,7 +264,7 @@ impl SpaceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct BindingId(i64);
 
 impl BindingId {
@@ -257,7 +277,7 @@ impl BindingId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 pub struct MuxScope {
     space_id: SpaceId,
     binding_id: BindingId,
@@ -288,15 +308,26 @@ pub struct BindingMuxController {
 
 impl Default for BindingMuxController {
     fn default() -> Self {
+        Self::new_unscoped()
+    }
+}
+
+impl BindingMuxController {
+    pub fn new(scope: MuxScope) -> Self {
+        Self {
+            controller: MuxController::with_scope(scope),
+            last_error: None,
+            refresh_completed: false,
+        }
+    }
+
+    fn new_unscoped() -> Self {
         Self {
             controller: MuxController::new(),
             last_error: None,
             refresh_completed: false,
         }
     }
-}
-
-impl BindingMuxController {
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -349,6 +380,7 @@ impl std::ops::DerefMut for BindingMuxController {
 
 #[derive(Default)]
 pub struct MuxController {
+    scope: Option<MuxScope>,
     sessions: Vec<MuxSession>,
     all_sessions: Vec<MuxSession>,
     backend_session_names: Vec<String>,
@@ -374,6 +406,13 @@ impl MuxController {
         Self {
             last_session_refresh: Some(Instant::now() - Duration::from_secs(2)),
             ..Default::default()
+        }
+    }
+
+    fn with_scope(scope: MuxScope) -> Self {
+        Self {
+            scope: Some(scope),
+            ..Self::new()
         }
     }
 
@@ -867,14 +906,12 @@ impl MuxController {
             return Err("not synchronous-native".to_owned());
         }
         let mut backend = build_backend(config);
-        backend
-            .execute(command)
-            .and_then(|()| backend.snapshot())
+        execute_backend_command(backend.as_mut(), self.scope, command)
+            .and_then(|()| backend.snapshot().map_err(|error| error.to_string()))
             .map(|snapshot| {
                 self.apply_snapshot(backend_kind, snapshot, preferred_session, preferred_window);
                 self.last_session_refresh = Some(Instant::now() - MUX_SESSION_REFRESH_INTERVAL);
             })
-            .map_err(|error| error.to_string())
     }
 
     fn apply_refreshed_snapshot(
@@ -973,10 +1010,8 @@ impl MuxController {
         thread::spawn(move || {
             while let Ok(job) = request_rx.recv() {
                 let mut backend = build_backend(&job.config);
-                let result = backend
-                    .execute(job.command)
-                    .map(|()| job.completion)
-                    .map_err(|error| error.to_string());
+                let result = execute_backend_command(backend.as_mut(), job.scope, job.command)
+                    .map(|()| job.completion);
                 if result_tx.send(result).is_err() {
                     break;
                 }
@@ -996,6 +1031,7 @@ impl MuxController {
     ) {
         self.ensure_command_worker(repaint);
         let job = MuxCommandJob {
+            scope: self.scope,
             config: config.clone(),
             command,
             completion,

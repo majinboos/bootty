@@ -6,7 +6,9 @@ use crate::rmux_bridge::{resize_rmux_window, rmux_execute, rmux_snapshot};
 
 use super::{
     backend::MuxBackend,
+    capability::{BindingCapabilityDescriptor, BindingOperation},
     command::{MuxCommand, MuxSplitDirection},
+    controller::MuxScope,
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxPaneSplitDirection, MuxSession, MuxSnapshot, MuxWindow,
     },
@@ -66,6 +68,25 @@ impl<C> RmuxBackend<C> {
 impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
     fn snapshot(&self) -> Result<MuxSnapshot> {
         self.client.snapshot()
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(
+            scope,
+            [
+                BindingOperation::ActivateWindow,
+                BindingOperation::CreateWindow,
+                BindingOperation::RenameWindow,
+                BindingOperation::NavigateWindow,
+                BindingOperation::MoveWindow,
+                BindingOperation::SplitPane,
+                BindingOperation::ClosePane,
+                BindingOperation::CreateProjectSession,
+                BindingOperation::CreateWorktreeSession,
+                BindingOperation::RenameSession,
+                BindingOperation::DitchSession,
+            ],
+        )
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {

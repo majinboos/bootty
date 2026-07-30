@@ -24,6 +24,10 @@ pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        capability::BindingOperation,
+        controller::{BindingId, MuxScope, SpaceId},
+    };
     use bootty_config::config::MultiplexerConfig;
 
     #[test]
@@ -56,6 +60,76 @@ mod tests {
             };
 
             assert_eq!(selected_backend(&config), expected);
+        }
+    }
+
+    #[test]
+    fn adapters_publish_exact_backend_neutral_capability_matrix() {
+        let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+        for backend in [
+            MultiplexerBackendConfig::Native,
+            MultiplexerBackendConfig::Rmux,
+            MultiplexerBackendConfig::Tmux,
+            MultiplexerBackendConfig::Zellij,
+        ] {
+            let expected = match backend {
+                MultiplexerBackendConfig::Native => vec![
+                    BindingOperation::ActivateWindow,
+                    BindingOperation::CreateWindow,
+                    BindingOperation::RenameWindow,
+                    BindingOperation::NavigateWindow,
+                    BindingOperation::MoveWindow,
+                    BindingOperation::SplitPane,
+                    BindingOperation::NavigatePane,
+                    BindingOperation::ClosePane,
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+                MultiplexerBackendConfig::Rmux => vec![
+                    BindingOperation::ActivateWindow,
+                    BindingOperation::CreateWindow,
+                    BindingOperation::RenameWindow,
+                    BindingOperation::NavigateWindow,
+                    BindingOperation::MoveWindow,
+                    BindingOperation::SplitPane,
+                    BindingOperation::ClosePane,
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+                MultiplexerBackendConfig::Tmux => vec![
+                    BindingOperation::ActivateWindow,
+                    BindingOperation::CreateWindow,
+                    BindingOperation::RenameWindow,
+                    BindingOperation::NavigateWindow,
+                    BindingOperation::MoveWindow,
+                    BindingOperation::SplitPane,
+                    BindingOperation::NavigatePane,
+                    BindingOperation::ClosePane,
+                    BindingOperation::TogglePaneZoom,
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+                MultiplexerBackendConfig::Zellij => vec![
+                    BindingOperation::CreateProjectSession,
+                    BindingOperation::CreateWorktreeSession,
+                    BindingOperation::RenameSession,
+                    BindingOperation::DitchSession,
+                ],
+            };
+            let config = MultiplexerConfig {
+                backend,
+                ..Default::default()
+            };
+            let descriptor = build_backend(&config).capabilities(scope);
+
+            assert_eq!(descriptor.scope(), scope);
+            assert_eq!(descriptor.operations().collect::<Vec<_>>(), expected);
         }
     }
 }

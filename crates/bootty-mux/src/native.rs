@@ -7,7 +7,9 @@ use anyhow::Result;
 
 use super::{
     backend::MuxBackend,
+    capability::{BindingCapabilityDescriptor, BindingOperation},
     command::MuxCommand,
+    controller::MuxScope,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
 };
 
@@ -488,6 +490,26 @@ impl MuxBackend for NativeBackend {
             .lock()
             .map(|state| state.snapshot())
             .map_err(|_| anyhow::anyhow!("native mux state lock poisoned"))
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(
+            scope,
+            [
+                BindingOperation::ActivateWindow,
+                BindingOperation::CreateWindow,
+                BindingOperation::RenameWindow,
+                BindingOperation::NavigateWindow,
+                BindingOperation::MoveWindow,
+                BindingOperation::SplitPane,
+                BindingOperation::NavigatePane,
+                BindingOperation::ClosePane,
+                BindingOperation::CreateProjectSession,
+                BindingOperation::CreateWorktreeSession,
+                BindingOperation::RenameSession,
+                BindingOperation::DitchSession,
+            ],
+        )
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
