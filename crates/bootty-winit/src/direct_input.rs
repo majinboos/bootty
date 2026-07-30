@@ -63,6 +63,7 @@ pub fn direct_key_input_from_winit_code_with_remaps(
     let suppress_egui_key = collapsed_egui_key_for_direct_code(code)
         .or_else(|| side_sensitive_egui_key_for_direct_code(code, modifiers, side_state))
         .or_else(|| command_egui_key_for_direct_code(code, modifiers, side_state))
+        .or_else(|| linux_terminal_shortcut_egui_key_for_direct_code(code, modifiers))
         .or_else(|| windows_terminal_shortcut_egui_key_for_direct_code(code, modifiers))
         .or_else(|| modifier_egui_key_for_direct_code(code))?;
     let mut input = bare_terminal_key_input(code, modifiers, repeat)?;
@@ -141,6 +142,22 @@ fn side_sensitive_egui_key_for_direct_code(
     if code == KeyCode::Tab && modifiers.shift_key() && side_state.has_right_shift() {
         return Some(Some(egui::Key::Tab));
     }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminal_shortcut_egui_key_for_direct_code(
+    code: KeyCode,
+    modifiers: ModifiersState,
+) -> Option<Option<egui::Key>> {
+    (code == KeyCode::KeyC && modifiers.control_key()).then_some(Some(egui::Key::C))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_terminal_shortcut_egui_key_for_direct_code(
+    _code: KeyCode,
+    _modifiers: ModifiersState,
+) -> Option<Option<egui::Key>> {
     None
 }
 
@@ -437,6 +454,28 @@ mod tests {
             }
         );
         assert_eq!(direct.suppress_egui_key, Some(egui::Key::B));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_input_preserves_ctrl_c_for_terminal_bindings() {
+        let direct = direct_key_input_from_winit_code(
+            KeyCode::KeyC,
+            ModifiersState::CONTROL,
+            ModifierSideState::default(),
+            false,
+        )
+        .expect("ctrl+c maps to direct terminal input");
+
+        assert_eq!(direct.input.key, TerminalKey::C);
+        assert_eq!(
+            direct.input.mods,
+            KeyMods {
+                ctrl: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(direct.suppress_egui_key, Some(egui::Key::C));
     }
 
     #[cfg(windows)]
