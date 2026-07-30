@@ -129,6 +129,26 @@ pub struct FrameInputs {
     pub terminal_view_transform: ViewTransform,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalFileHandoff {
+    Ready(String),
+    Rejected(&'static str),
+}
+
+fn local_file_handoff(paths: &[PathBuf]) -> LocalFileHandoff {
+    if paths.is_empty() {
+        return LocalFileHandoff::Rejected("file handoff ignored: no local files");
+    }
+    if paths.iter().any(|path| !path.exists()) {
+        return LocalFileHandoff::Rejected("file handoff rejected: local path is unavailable");
+    }
+    bootty_winit::file_paths::format_file_paths_for_paste(paths.iter().map(PathBuf::as_path))
+        .map(LocalFileHandoff::Ready)
+        .unwrap_or(LocalFileHandoff::Rejected(
+            "file handoff rejected: unsupported local path",
+        ))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ViewportSnapshot {
     pub fullscreen: bool,
@@ -4679,10 +4699,15 @@ impl AppState {
         if !self.direct_terminal_input_enabled() {
             return 0;
         }
-        let Some(text) = bootty_winit::file_paths::format_file_paths_for_paste(
-            paths.iter().map(PathBuf::as_path),
-        ) else {
+        if paths.is_empty() {
             return 0;
+        }
+        let text = match local_file_handoff(&paths) {
+            LocalFileHandoff::Ready(text) => text,
+            LocalFileHandoff::Rejected(message) => {
+                self.last_error = Some(message.to_owned());
+                return 0;
+            }
         };
         if let Err(error) = self.binding.terminal.write_paste(&text) {
             self.last_error = Some(error.to_string());
@@ -9783,6 +9808,29 @@ mod tests {
             effects.as_slice(),
             [AppEffect::SetTerminalTextConfig(_)]
         ));
+    }
+
+    #[test]
+    fn local_file_handoff_is_typed_and_non_mutating_on_rejection() {
+        assert_eq!(
+            local_file_handoff(&[]),
+            LocalFileHandoff::Rejected("file handoff ignored: no local files")
+        );
+        assert_eq!(
+            local_file_handoff(&[PathBuf::from("/definitely/missing/bootty-handoff")]),
+            LocalFileHandoff::Rejected("file handoff rejected: local path is unavailable")
+        );
+
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        assert!(matches!(
+            local_file_handoff(&[file.path().to_path_buf()]),
+            LocalFileHandoff::Ready(_)
+        ));
+
+        let mut state = test_state();
+        state.last_error = None;
+        assert_eq!(state.handle_dropped_file_paths(Vec::new()), 0);
+        assert_eq!(state.last_error(), None);
     }
 
     #[test]
