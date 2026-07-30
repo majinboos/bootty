@@ -7,12 +7,17 @@ use std::{
 
 use anyhow::{Context, Result};
 use bootty_config::config::{BoottyConfig, default_config_path, load_config_from_path};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 mod config_overrides;
 
 use config_overrides::ConfigOverrides;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+pub enum Command {
+    /// Download and install the latest Bootty release.
+    Update,
+}
 #[derive(Debug, Parser)]
 #[command(name = "bootty", version, about = "Bootty terminal emulator")]
 pub struct Cli {
@@ -30,6 +35,9 @@ pub struct Cli {
 
     #[command(flatten)]
     overrides: ConfigOverrides,
+
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
 impl Cli {
@@ -45,6 +53,10 @@ impl Cli {
 
     pub fn window_state_key(&self) -> &str {
         &self.window_state_key
+    }
+
+    pub fn subcommand(&self) -> Option<Command> {
+        self.command
     }
 
     fn selected_config_path(&self) -> PathBuf {
@@ -91,11 +103,18 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use indoc::indoc;
 
-    use super::Cli;
+    use super::{Cli, Command};
 
     #[test]
     fn clap_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn update_subcommand_is_parsed() {
+        let cli = Cli::try_parse_from(["bootty", "update"]).unwrap();
+
+        assert_eq!(cli.subcommand(), Some(Command::Update));
     }
 
     #[test]

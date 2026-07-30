@@ -41,9 +41,10 @@ mise run build --fast     # dynamic build with --profile fast-release
 mise run install --fast   # dynamic install using --profile fast-release
 ```
 
-The CI workflow runs full Rust validation on pull requests and pushes, then
-uploads native macOS, Windows, and Linux app artifacts for pushes to `main` and
-manual workflow runs.
+The CI workflow runs full Rust validation on pull requests and pushes. Pushing
+a version tag matching `Cargo.toml` creates a GitHub Release with native macOS,
+Windows, and Linux bundles. Installed Bootty releases check for updates on
+startup; use `bootty update` to update explicitly. See `docs/releases.md`.
 
 ## Website
 
@@ -73,3 +74,4 @@ cargo bench -p bootty-app --bench paint_plan -- --noplot
 - Benchmark reports and measured findings: `docs/benchmark-report.md`
 - Built-in theme provenance: `docs/built-in-themes.md`
 - `libghostty-rs` dependency boundary: `docs/libghostty-rs.md`
+- Release publishing and verified updates: `docs/releases.md`

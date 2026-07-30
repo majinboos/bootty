@@ -27,6 +27,7 @@ egui = { version = "0.35", features = ["bytemuck", "serde"] }
 either = { version = "1", features = ["use_std"] }
 emath = { version = "0.35", default-features = false, features = ["bytemuck", "serde"] }
 epaint = { version = "0.35", default-features = false, features = ["bytemuck", "default_fonts", "serde"] }
+flate2 = { version = "1", features = ["zlib-rs"] }
 font-types = { version = "0.11", default-features = false, features = ["bytemuck", "serde", "std"] }
 futures-util = { version = "0.3" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
@@ -34,6 +35,7 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 libc = { version = "0.2", features = ["extra_traits"] }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 memchr = { version = "2" }
+miniz_oxide = { version = "0.8", features = ["simd"] }
 num-traits = { version = "0.2" }
 once_cell = { version = "1" }
 parking_lot = { version = "0.12", features = ["arc_lock"] }
@@ -43,6 +45,7 @@ regex-automata = { version = "0.4", default-features = false, features = ["dfa",
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_spanned = { version = "1" }
+simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = { version = "2" }
@@ -83,15 +86,15 @@ dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "b
 errno = { version = "0.3" }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 indexmap = { version = "2" }
-miniz_oxide = { version = "0.8", features = ["simd"] }
 naga = { version = "29", features = ["msl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSControl", "NSCursor", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics", "std"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSException", "NSFileWrapper", "NSFormatter", "NSGeometry", "NSItemProvider", "NSKeyValueObserving", "NSLocale", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSSet", "NSString", "NSThread", "NSURL", "NSUndoManager", "NSUserActivity", "NSValue", "NSZone", "block2", "objc2-core-foundation", "std"] }
+percent-encoding = { version = "2" }
 rustix = { version = "1", features = ["event", "net", "process", "pty", "runtime", "termios", "thread"] }
-simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 wgpu = { version = "29", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "29", features = ["metal", "portable-atomic", "renderdoc", "wgsl"] }
 wgpu-hal = { version = "29", default-features = false, features = ["metal", "portable-atomic"] }
@@ -111,6 +114,7 @@ naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
 wgpu = { version = "29", default-features = false, features = ["gles", "parking_lot", "std", "vulkan", "wgsl"] }
@@ -133,7 +137,7 @@ zbus_macros = { version = "5", features = ["blocking-api"] }
 
 [target.wasm32-unknown-unknown.dependencies]
 crossbeam-utils = { version = "0.8" }
-js-sys = { version = "0.3" }
+time = { version = "0.3", features = ["formatting", "parsing", "wasm-bindgen"] }
 wasm-bindgen = { version = "0.2" }
 web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "AddEventListenerOptions", "BinaryType", "BlobPropertyBag", "CanvasRenderingContext2d", "Clipboard", "ClipboardEvent", "ClipboardItem", "CompositionEvent", "CssStyleDeclaration", "DataTransfer", "DataTransferItem", "DataTransferItemList", "Document", "DomException", "DomRect", "DragEvent", "EventListener", "ExtSRgb", "File", "FileList", "FocusEvent", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "ImageBitmap", "ImageBitmapOptions", "ImageBitmapRenderingContext", "ImageData", "InputEvent", "IntersectionObserver", "IntersectionObserverEntry", "KeyboardEvent", "Location", "MediaQueryList", "MediaQueryListEvent", "MessageChannel", "MessagePort", "Navigator", "NodeList", "OrientationLockType", "OrientationType", "PageTransitionEvent", "Performance", "PermissionState", "PermissionStatus", "Permissions", "PointerEvent", "PremultiplyAlpha", "ResizeObserver", "ResizeObserverBoxOptions", "ResizeObserverEntry", "ResizeObserverOptions", "ResizeObserverSize", "Screen", "ScreenOrientation", "ShadowRoot", "Storage", "Touch", "TouchEvent", "TouchList", "Url", "VisibilityState", "WebGl2RenderingContext", "WebGlRenderingContext", "WebglDebugRendererInfo", "WheelEvent", "Window", "Worker", "console"] }
 wgpu = { version = "29", default-features = false, features = ["parking_lot", "std", "wgsl"] }
@@ -148,15 +152,15 @@ dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "b
 errno = { version = "0.3" }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 indexmap = { version = "2" }
-miniz_oxide = { version = "0.8", features = ["simd"] }
 naga = { version = "29", features = ["msl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSControl", "NSCursor", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics", "std"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSException", "NSFileWrapper", "NSFormatter", "NSGeometry", "NSItemProvider", "NSKeyValueObserving", "NSLocale", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSSet", "NSString", "NSThread", "NSURL", "NSUndoManager", "NSUserActivity", "NSValue", "NSZone", "block2", "objc2-core-foundation", "std"] }
+percent-encoding = { version = "2" }
 rustix = { version = "1", features = ["event", "net", "process", "pty", "runtime", "termios", "thread"] }
-simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 wgpu = { version = "29", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "29", features = ["metal", "portable-atomic", "renderdoc", "wgsl"] }
 wgpu-hal = { version = "29", default-features = false, features = ["metal", "portable-atomic"] }
@@ -170,6 +174,8 @@ arboard = { version = "3" }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["hlsl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+percent-encoding = { version = "2" }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 wgpu = { version = "29", default-features = false, features = ["dx12", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "29", features = ["dx12", "portable-atomic", "renderdoc", "wgsl"] }
 wgpu-core-deps-windows-linux-android = { version = "29", default-features = false, features = ["dx12", "renderdoc"] }
@@ -177,7 +183,8 @@ wgpu-hal = { version = "29", default-features = false, features = ["dx12", "port
 winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "evntrace", "fileapi", "handleapi", "impl-debug", "impl-default", "in6addr", "inaddr", "minwinbase", "minwindef", "namedpipeapi", "ntsecapi", "processenv", "processthreadsapi", "synchapi", "sysinfoapi", "timezoneapi", "windef", "winerror", "winioctl", "winnt", "winreg", "winsock2", "winuser"] }
 windows = { version = "0.62", features = ["Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Wdk_System_Threading", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Globalization", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D_Dxc", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_DirectComposition", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows-core = { version = "0.62" }
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Wdk_System_Threading", "Win32_Devices_Communication", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Devices_HumanInterfaceDevice", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Environment", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Accessibility", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Pointer", "Win32_UI_Input_Touch", "Win32_UI_Shell", "Win32_UI_TextServices", "Win32_UI_WindowsAndMessaging"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Wdk_System_Threading", "Win32_Devices_Communication", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.x86_64-pc-windows-gnu.build-dependencies]
 indexmap = { version = "2" }
@@ -188,6 +195,8 @@ arboard = { version = "3" }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["hlsl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+percent-encoding = { version = "2" }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 wgpu = { version = "29", default-features = false, features = ["dx12", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "29", features = ["dx12", "portable-atomic", "renderdoc", "wgsl"] }
 wgpu-core-deps-windows-linux-android = { version = "29", default-features = false, features = ["dx12", "renderdoc"] }
@@ -195,7 +204,8 @@ wgpu-hal = { version = "29", default-features = false, features = ["dx12", "port
 winapi = { version = "0.3", default-features = false, features = ["cfg", "consoleapi", "evntrace", "fileapi", "handleapi", "impl-debug", "impl-default", "in6addr", "inaddr", "minwinbase", "minwindef", "namedpipeapi", "ntsecapi", "processenv", "processthreadsapi", "synchapi", "sysinfoapi", "timezoneapi", "windef", "winerror", "winioctl", "winnt", "winreg", "winsock2", "winuser"] }
 windows = { version = "0.62", features = ["Wdk_System_SystemInformation", "Wdk_System_SystemServices", "Wdk_System_Threading", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Globalization", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D_Dxc", "Win32_Graphics_Direct3D_Fxc", "Win32_Graphics_DirectComposition", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi", "Win32_Security_Authorization", "Win32_System_Com", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Performance", "Win32_System_Power", "Win32_System_ProcessStatus", "Win32_System_Registry", "Win32_System_RemoteDesktop", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Variant", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows-core = { version = "0.62" }
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Wdk_System_Threading", "Win32_Devices_Communication", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Win32_Devices_HumanInterfaceDevice", "Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Environment", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Accessibility", "Win32_UI_Controls", "Win32_UI_HiDpi", "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Pointer", "Win32_UI_Input_Touch", "Win32_UI_Shell", "Win32_UI_TextServices", "Win32_UI_WindowsAndMessaging"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Wdk_System_Threading", "Win32_Devices_Communication", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Graphics_Gdi", "Win32_Networking_WinSock", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_Power", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.x86_64-pc-windows-msvc.build-dependencies]
 indexmap = { version = "2" }
@@ -213,6 +223,7 @@ naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
 wgpu = { version = "29", default-features = false, features = ["gles", "parking_lot", "std", "vulkan", "wgsl"] }
