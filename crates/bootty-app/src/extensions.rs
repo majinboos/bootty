@@ -173,6 +173,7 @@ pub struct SessionView {
     pub progress: Option<u8>,
     pub progress_indeterminate: bool,
     pub progresses: Vec<SessionProgressView>,
+    pub ports: Vec<u16>,
 }
 
 /// Mux state shared with the worker thread so modules can render it.
@@ -1921,6 +1922,11 @@ fn setup_lua(
                         progresses.set(progress_index + 1, progress_entry)?;
                     }
                     entry.set("progresses", progresses)?;
+                    let ports = lua.create_table()?;
+                    for (port_index, port) in session.ports.iter().enumerate() {
+                        ports.set(port_index + 1, *port)?;
+                    }
+                    entry.set("ports", ports)?;
                     if let Some(value) = &session.cwd {
                         entry.set("cwd", value.as_str())?;
                     }
@@ -3140,9 +3146,10 @@ mod tests {
                 id: "plain".to_owned(),
                 name: "bootty".to_owned(),
                 selected: true,
-                cwd: Some(cwd),
+                cwd: Some(cwd.clone()),
                 color: Some("#89b4fa".to_owned()),
                 dim_color: Some("#455a7d".to_owned()),
+                ports: vec![8080, 3000],
                 ..SessionView::default()
             }],
             ..MuxView::default()
@@ -3164,6 +3171,22 @@ mod tests {
 
         assert_eq!(first.len(), rerendered.len());
         assert!(keys.contains(&"plain:branch"));
+        assert!(keys.contains(&"plain:cwd"));
+        assert!(keys.contains(&"plain:ports"));
+        assert_eq!(
+            rerendered
+                .iter()
+                .find(|item| item.key.as_deref() == Some("plain:cwd"))
+                .map(|item| item.text.as_str()),
+            Some(cwd.as_str())
+        );
+        assert_eq!(
+            rerendered
+                .iter()
+                .find(|item| item.key.as_deref() == Some("plain:ports"))
+                .map(|item| item.text.as_str()),
+            Some("8080, 3000")
+        );
         assert!(!keys.contains(&"plain:status"));
         assert!(!keys.contains(&"plain:progress"));
     }
@@ -3438,6 +3461,7 @@ mod tests {
                         indeterminate: false,
                     },
                 ],
+                ports: vec![8040, 3000],
             }],
             ..MuxView::default()
         }));
@@ -3446,7 +3470,7 @@ mod tests {
             .load(
                 r#"return function() local s = bootty.sessions()[1]
                    local p = s.progresses
-                   return { kind = 'session', text = s.name .. ':' .. s.cwd .. ':' .. p[1].process .. ':' .. p[2].value,
+                   return { kind = 'session', text = s.name .. ':' .. s.cwd .. ':' .. p[1].process .. ':' .. p[2].value .. ':' .. s.ports[1],
                    session_id = s.id, fg = s.color } end"#,
             )
             .eval::<Value>()
@@ -3455,7 +3479,7 @@ mod tests {
         let items = run_module(&module.body);
 
         assert_eq!(items[0].kind.as_deref(), Some("session"));
-        assert_eq!(items[0].text, "work/api:/tmp/work/api:pi:42");
+        assert_eq!(items[0].text, "work/api:/tmp/work/api:pi:42:8040");
         assert_eq!(items[0].session_id.as_deref(), Some("$1"));
         assert_eq!(items[0].fg, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));
     }

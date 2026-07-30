@@ -745,6 +745,7 @@ impl BoottyApp {
                     progress,
                     progress_indeterminate,
                     progresses,
+                    ports: self.state.session_ports(session),
                 }
             })
             .collect()
