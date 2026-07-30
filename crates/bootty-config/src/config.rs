@@ -50,6 +50,7 @@ pub struct BoottyConfig {
     pub diagnostics: DiagnosticsConfig,
     pub window: WindowConfig,
     pub config_path: PathBuf,
+    pub compatibility_warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1207,6 +1208,7 @@ impl Default for BoottyConfig {
                 macos_titlebar_style: MacosTitlebarStyle::default(),
             },
             config_path: default_config_path(),
+            compatibility_warnings: Vec::new(),
         }
     }
 }
@@ -1285,14 +1287,17 @@ pub fn load_config_from_path(path: impl AsRef<Path>) -> ConfigResult<BoottyConfi
 
     let mut stack = Vec::new();
     let mut loaded = HashSet::new();
-    let document = load_merged_config_document(path, &mut stack, &mut loaded)?;
+    let mut document = load_merged_config_document(path, &mut stack, &mut loaded)?;
+    let compatibility_warnings = take_ghostty_compatibility_warnings(&mut document);
     let raw = parse_raw_config_document(document, path)?;
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    ConfigResolver {
+    let mut config = ConfigResolver {
         path: path.to_path_buf(),
         config_dir,
     }
-    .resolve(raw)
+    .resolve(raw)?;
+    config.compatibility_warnings = compatibility_warnings;
+    Ok(config)
 }
 
 pub fn config_file_snapshot(path: impl AsRef<Path>) -> ConfigResult<ConfigFileSnapshot> {
@@ -1413,6 +1418,31 @@ fn merge_toml_table_like(target: &mut dyn TableLike, overlay: &dyn TableLike) {
     }
 }
 
+const GHOSTTY_COMPATIBILITY_KEYS: &[&str] = &[
+    "background-opacity",
+    "background-blur-radius",
+    "window-padding-x",
+    "window-padding-y",
+    "window-padding-balance",
+    "window-save-state",
+    "shell-integration",
+    "shell-integration-features",
+    "copy-on-select",
+    "confirm-close-surface",
+    "quit-after-last-window-closed",
+];
+
+fn take_ghostty_compatibility_warnings(document: &mut DocumentMut) -> Vec<String> {
+    GHOSTTY_COMPATIBILITY_KEYS
+        .iter()
+        .filter_map(|key| {
+            document
+                .as_table_mut()
+                .remove(key)
+                .map(|_| format!("unsupported Ghostty compatibility key ignored: {key}"))
+        })
+        .collect()
+}
 fn parse_raw_config_document(document: DocumentMut, path: &Path) -> ConfigResult<RawConfig> {
     toml_edit::de::from_document(document).map_err(|error| {
         ConfigLoadError::new(format!(
@@ -1446,12 +1476,14 @@ fn config_document_includes(document: &DocumentMut, path: &Path) -> ConfigResult
 }
 
 fn parse_raw_config_source(source: &str, path: &Path) -> ConfigResult<RawConfig> {
-    toml_edit::de::from_str(source).map_err(|error| {
+    let mut document = source.parse::<DocumentMut>().map_err(|error| {
         ConfigLoadError::new(format!(
             "failed to parse config file {}: {error}",
             path.display()
         ))
-    })
+    })?;
+    take_ghostty_compatibility_warnings(&mut document);
+    parse_raw_config_document(document, path)
 }
 
 fn collect_config_paths(

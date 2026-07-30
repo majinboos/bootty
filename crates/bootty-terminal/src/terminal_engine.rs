@@ -171,6 +171,7 @@ pub enum TerminalSideEffect {
     KittyTextSizing(String),
     ConEmuControl(String),
     ConEmuProgress { state: String, value: Option<u8> },
+    Iterm2UserVarPorts(Vec<u16>),
     Iterm2Control(String),
     Iterm2File(String),
     OpenUrl(String),
@@ -735,6 +736,25 @@ fn osc52_payload_text(payload: &[u8]) -> Option<Result<String, String>> {
         .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
         .ok()?;
     String::from_utf8(bytes).ok().map(Ok)
+}
+
+fn iterm2_user_var_ports(value: &str) -> Option<Vec<u16>> {
+    let (name, encoded) = value.split_once('=')?;
+    if name != "bootty_ports" {
+        return None;
+    }
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
+        .ok()?;
+    let csv = std::str::from_utf8(&bytes).ok()?;
+    if csv.is_empty() {
+        return Some(Vec::new());
+    }
+    csv.split(',')
+        .map(|port| port.trim().parse::<u16>())
+        .collect::<Result<_, _>>()
+        .ok()
 }
 
 fn split_osc_payload(payload: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -1918,10 +1938,18 @@ impl TerminalEngine {
                     .side_effects
                     .push(TerminalSideEffect::Iterm2Control(data.to_owned())),
             },
+            "SetUserVar" => {
+                if let Some(ports) = iterm2_user_var_ports(value) {
+                    self.side_effects
+                        .push(TerminalSideEffect::Iterm2UserVarPorts(ports));
+                } else {
+                    self.side_effects
+                        .push(TerminalSideEffect::Iterm2Control(data.to_owned()));
+                }
+            }
             "SetBadgeFormat"
             | "SetProfile"
             | "SetKeyLabel"
-            | "SetUserVar"
             | "RemoteHost"
             | "ShellIntegrationVersion"
             | "SetColors"

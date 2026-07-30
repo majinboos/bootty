@@ -347,6 +347,8 @@ struct BindingRuntime {
     terminal_tab_titles: HashMap<ScopedWindowId, String>,
     terminal_progress: HashMap<ScopedPaneId, TerminalProgress>,
     unscoped_terminal_progress: Option<TerminalProgress>,
+    terminal_ports: HashMap<ScopedPaneId, Vec<u16>>,
+    unscoped_terminal_ports: Vec<u16>,
     persisted_sessions_restored: bool,
 }
 
@@ -403,6 +405,8 @@ impl BindingRuntime {
             custom_tab_names: HashSet::new(),
             terminal_tab_titles: HashMap::new(),
             terminal_progress: HashMap::new(),
+            terminal_ports: HashMap::new(),
+            unscoped_terminal_ports: Vec::new(),
             unscoped_terminal_progress: None,
             persisted_sessions_restored: false,
         }
@@ -2099,6 +2103,38 @@ impl AppState {
             .copied()
     }
 
+    pub(crate) fn pane_ports(&self, pane_id: &str) -> Option<&[u16]> {
+        self.binding
+            .terminal_ports
+            .get(&self.pane_cache_key(pane_id))
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn session_ports(&self, session: &MuxSession) -> Vec<u16> {
+        let selected = self.binding.mux.selected_session();
+        let mut ports =
+            if selected == Some(session.id.as_str()) || selected == Some(session.name.as_str()) {
+                self.binding.unscoped_terminal_ports.clone()
+            } else {
+                Vec::new()
+            };
+        for pane in session
+            .windows
+            .iter()
+            .flat_map(|window| window.panes.iter().chain(std::iter::once(&window.anchor)))
+            .filter_map(|pane| pane.pane_id.as_deref())
+        {
+            if let Some(reported) = self.pane_ports(pane) {
+                for port in reported {
+                    if !ports.contains(port) {
+                        ports.push(*port);
+                    }
+                }
+            }
+        }
+        ports
+    }
+
     pub(crate) fn has_indeterminate_terminal_progress(&self) -> bool {
         self.binding
             .terminal_progress
@@ -3460,6 +3496,10 @@ impl AppState {
                 self.apply_terminal_progress(source_pane_id.as_deref(), state, value);
                 effects.push(AppEffect::RequestRepaint);
             }
+            TerminalSideEffect::Iterm2UserVarPorts(ports) => {
+                self.apply_terminal_ports(source_pane_id.as_deref(), ports);
+                effects.push(AppEffect::RequestRepaint);
+            }
             TerminalSideEffect::SemanticPrompt(_)
             | TerminalSideEffect::KittyTextSizing(_)
             | TerminalSideEffect::ConEmuControl(_)
@@ -3499,6 +3539,16 @@ impl AppState {
                 }
             }
             None => self.binding.unscoped_terminal_progress = progress,
+        }
+    }
+
+    fn apply_terminal_ports(&mut self, source_pane_id: Option<&str>, ports: Vec<u16>) {
+        match source_pane_id {
+            Some(pane_id) => {
+                let key = self.pane_cache_key(pane_id);
+                self.binding.terminal_ports.insert(key, ports);
+            }
+            None => self.binding.unscoped_terminal_ports = ports,
         }
     }
 
@@ -4115,6 +4165,8 @@ impl AppState {
                 return false;
             }
         };
+        let compatibility_warning = (!next.compatibility_warnings.is_empty())
+            .then(|| next.compatibility_warnings.join("; "));
         let modifier_remaps = match next.input.modifier_remaps() {
             Ok(remaps) => remaps,
             Err(error) => {
@@ -4219,13 +4271,15 @@ impl AppState {
         self.binding.pending_generated_names.clear();
         self.binding.session_order = SessionOrderStore::for_binding(&config_path, binding_id);
         self.sync_session_order();
-        self.last_error = if self.has_new_session_config_changes {
-            Some(
+        self.last_error = match (self.has_new_session_config_changes, compatibility_warning) {
+            (true, Some(warning)) => Some(format!(
+                "config reloaded; session/window settings require a new window or restart; {warning}"
+            )),
+            (true, None) => Some(
                 "config reloaded; session/window settings require a new window or restart"
                     .to_owned(),
-            )
-        } else {
-            None
+            ),
+            (false, warning) => warning,
         };
         effects.push(AppEffect::RequestRepaint);
         true
@@ -9519,6 +9573,70 @@ mod tests {
     }
 
     #[test]
+    fn scoped_terminal_ports_ignore_other_bindings_and_stay_with_the_source_pane() {
+        let mut state = test_state();
+        let mux_config = state.config().multiplexer.clone();
+        let session_id = format!("ports-tab-{}", unique_test_id());
+        state.binding.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: session_id.clone(),
+                cwd: "repo".to_owned(),
+            },
+            &state.repaint,
+            &mux_config,
+        );
+        let pane_id = state.binding.mux.selected_session_windows()[0]
+            .anchor
+            .pane_id
+            .clone()
+            .expect("native tab should have a source pane id");
+        let other_scope = MuxScope::new(
+            SpaceId::from_persistence(99),
+            BindingId::from_persistence(99),
+        );
+
+        state.apply_terminal_side_effect_event(
+            TerminalSideEffectEvent::new(
+                Some(crate::mux::terminal::encode_scoped_pane_id(
+                    other_scope,
+                    &pane_id,
+                )),
+                TerminalSideEffect::Iterm2UserVarPorts(vec![3000]),
+            ),
+            &mut Vec::new(),
+            8.0,
+            16.0,
+            1.0,
+        );
+        assert_eq!(state.pane_ports(&pane_id), None);
+
+        state.apply_terminal_side_effect_event(
+            TerminalSideEffectEvent::new(
+                Some(crate::mux::terminal::encode_scoped_pane_id(
+                    state.binding.scope,
+                    &pane_id,
+                )),
+                TerminalSideEffect::Iterm2UserVarPorts(vec![8080, 3000]),
+            ),
+            &mut Vec::new(),
+            8.0,
+            16.0,
+            1.0,
+        );
+
+        assert_eq!(state.pane_ports(&pane_id), Some([8080, 3000].as_slice()));
+        let session = state
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("created session")
+            .clone();
+        assert_eq!(state.session_ports(&session), vec![8080, 3000]);
+    }
+
+    #[test]
     fn manually_renamed_tab_ignores_terminal_title_renames() {
         let mut state = test_state();
         let mux_config = state.config().multiplexer.clone();
@@ -9710,5 +9828,35 @@ mod tests {
             "{effects:?}"
         );
         assert_eq!(state.config().window.title, "renamed");
+    }
+
+    #[test]
+    fn reload_applies_valid_font_with_ignored_ghostty_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").expect("write empty config");
+        let config = BoottyConfig {
+            config_path: path.clone(),
+            ..BoottyConfig::default()
+        };
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+
+        std::fs::write(&path, "background-opacity = 0.9\n[font]\nsize = 17.0\n")
+            .expect("write config");
+        let mut effects = Vec::new();
+
+        assert!(state.reload_config(&mut effects));
+        assert_eq!(state.config().font.size, 17.0);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, AppEffect::SetTerminalTextConfig(_)))
+        );
+        assert!(
+            state
+                .last_error()
+                .is_some_and(|error| error.contains("background-opacity"))
+        );
     }
 }

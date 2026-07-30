@@ -382,6 +382,7 @@ local function refreshed_session_facts(session)
 	return {
 		display_process = agent_name or process,
 		branch = git_branch(session.cwd),
+		branch_status = "current",
 		diff_added = diff_added,
 		diff_removed = diff_removed,
 		agent_name = agent_name,
@@ -430,8 +431,9 @@ local function refresh_one_session(sessions)
 	end
 	local previous = FACTS_CACHE[session.id]
 	local refreshed = refreshed_session_facts(session)
-	if previous and refreshed.branch == nil then
-		refreshed.branch = previous.branch
+	if refreshed.branch == nil then
+		refreshed.branch_status = if previous and previous.branch then "stale" else "unknown"
+		refreshed.branch = if previous then previous.branch else nil
 	end
 	FACTS_CACHE[session.id] = refreshed
 end
@@ -459,8 +461,8 @@ local function session_right(_, facts)
 	return {}
 end
 
-local function session_details(_, facts)
-	return {
+local function session_details(ctx, facts)
+	local rows = {
 		{
 			key = "agent",
 			icon = if facts.agent_style then facts.agent_style.icon else nil,
@@ -469,8 +471,29 @@ local function session_details(_, facts)
 			right = if facts.agent_detail then cycled_activity(facts) else nil,
 			right_color = if facts.agent_detail then activity_color(facts) else nil,
 		},
-		{ key = "branch", icon = "git-branch", label = facts.branch, color = MUTED_COLOR },
+		{
+			key = "cwd",
+			icon = "folder",
+			label = ctx.session.cwd or "unknown",
+			color = MUTED_COLOR,
+		},
+		{
+			key = "branch",
+			icon = "git-branch",
+			label = facts.branch or "unknown",
+			right = if facts.branch_status ~= "current" then facts.branch_status else nil,
+			color = MUTED_COLOR,
+		},
 	}
+	if #ctx.session.ports > 0 then
+		rows[#rows + 1] = {
+			key = "ports",
+			icon = "plug",
+			label = table.concat(ctx.session.ports, ", "),
+			color = MUTED_COLOR,
+		}
+	end
+	return rows
 end
 
 
