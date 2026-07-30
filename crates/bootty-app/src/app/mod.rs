@@ -339,21 +339,29 @@ impl BoottyApp {
     }
 
     pub fn new_with_config(cc: &eframe::CreationContext<'_>, config: BoottyConfig) -> Result<Self> {
-        Self::new_inner(cc, config, None, None)
+        Self::new_inner(cc, config, "main".to_owned(), None, None)
     }
 
     pub fn new_with_direct_input(
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
+        window_state_key: String,
         direct_input_rx: mpsc::Receiver<DirectKeyInput>,
         modifier_side_rx: mpsc::Receiver<ModifierSideState>,
     ) -> Result<Self> {
-        Self::new_inner(cc, config, Some(direct_input_rx), Some(modifier_side_rx))
+        Self::new_inner(
+            cc,
+            config,
+            window_state_key,
+            Some(direct_input_rx),
+            Some(modifier_side_rx),
+        )
     }
 
     fn new_inner(
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
+        window_state_key: String,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
@@ -393,7 +401,13 @@ impl BoottyApp {
         );
 
         Ok(Self {
-            state: AppState::new(config.clone(), repaint, direct_input_rx, modifier_side_rx)?,
+            state: AppState::new_for_window(
+                config.clone(),
+                window_state_key,
+                repaint,
+                direct_input_rx,
+                modifier_side_rx,
+            )?,
             terminal_widget,
             pane_widgets: HashMap::new(),
             focused_widget_key: None,

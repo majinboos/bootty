@@ -104,6 +104,8 @@ use crate::terminal::{KeyInput, TerminalKey};
 #[cfg(test)]
 use bootty_terminal::terminal_engine::TerminalCopyModeMotion;
 
+const PRIMARY_WINDOW_STATE_KEY: &str = "main";
+
 fn mux_refresh_repaint_after(config: &crate::config::MultiplexerConfig) -> Option<Duration> {
     (selected_backend(config) != MultiplexerBackendConfig::Native)
         .then_some(MUX_SESSION_REFRESH_INTERVAL)
@@ -520,14 +522,26 @@ impl SpaceRuntime {
             .bindings()
             .iter()
             .map(|workspace_binding| {
-                binding_runtime_for_multiplexer(
+                let mut runtime = binding_runtime_for_multiplexer(
                     config,
                     workspace_binding.mux_scope(),
                     workspace_binding.name().to_owned(),
                     workspace_binding.backend_override(),
                     variant,
                     repaint.clone(),
-                )
+                );
+                if workspace_binding.unavailable() {
+                    runtime.mux.set_error(Some(
+                        "binding unavailable; reconnect to restore it".to_owned(),
+                    ));
+                }
+                if let Some(selection) = workspace_binding.selection() {
+                    runtime.mux.restore_selection(
+                        selection.session_id().to_owned(),
+                        selection.window_id().map(str::to_owned),
+                    );
+                }
+                runtime
             })
             .collect::<Vec<_>>();
         if bindings.is_empty() {
@@ -584,6 +598,7 @@ fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig
 }
 
 pub struct AppState {
+    window_state_key: String,
     binding: BindingRuntime,
     inactive_bindings: Vec<BindingRuntime>,
     active_space_id: SpaceId,
@@ -910,7 +925,24 @@ impl AppState {
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
-        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        Self::new_for_window(
+            config,
+            PRIMARY_WINDOW_STATE_KEY.to_owned(),
+            repaint,
+            direct_input_rx,
+            modifier_side_rx,
+        )
+    }
+
+    pub fn new_for_window(
+        config: BoottyConfig,
+        window_state_key: String,
+        repaint: RepaintHandle,
+        direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
+        modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
+    ) -> Result<Self> {
+        let workspace = WorkspaceStore::try_for_config_path(&config.config_path)?;
+        let selected_space_id = workspace.selected_space(&window_state_key).ok().flatten();
         let modifier_remaps = config.input.modifier_remaps()?;
         let macos_option_as_alt = config.input.macos_option_as_alt.into();
         let sidebar_key_bindings =
@@ -946,7 +978,10 @@ impl AppState {
                 inactive_bindings: Vec::new(),
             });
         }
-        let active_space = spaces.remove(0);
+        let active_index = selected_space_id
+            .and_then(|id| spaces.iter().position(|space| space.id == id))
+            .unwrap_or(0);
+        let active_space = spaces.remove(active_index);
         let SpaceRuntime {
             id: active_space_id,
             name: active_space_name,
@@ -957,6 +992,7 @@ impl AppState {
             binding,
             inactive_bindings,
         } = active_space;
+        workspace.set_selected_space(&window_state_key, active_space_id)?;
         let inactive_spaces = spaces;
         let keybinds = config
             .input
@@ -972,6 +1008,7 @@ impl AppState {
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
 
         Ok(Self {
+            window_state_key,
             binding,
             inactive_bindings,
             active_space_id,
@@ -1509,6 +1546,17 @@ impl AppState {
                 return false;
             }
         };
+        let mut workspace = WorkspaceStore::for_config_path(&self.config().config_path);
+        let selected_session = self.binding.mux.selected_session().map(str::to_owned);
+        let selected_window = self.binding.mux.selected_window().map(str::to_owned);
+        if let Err(error) = workspace.set_binding_restore_state(
+            self.binding.scope,
+            self.binding.mux.last_error().is_some(),
+            selected_session.as_deref(),
+            selected_window.as_deref(),
+        ) {
+            self.last_error = Some(error.to_string());
+        }
         self.binding.terminal.deactivate_backend_side_effects();
         let mut target = self.inactive_spaces.remove(index);
         self.binding.discard_terminal_side_effects();
@@ -1559,6 +1607,11 @@ impl AppState {
             to: self.active_space_id,
             started: Instant::now(),
         });
+        if let Err(error) =
+            workspace.set_selected_space(&self.window_state_key, self.active_space_id)
+        {
+            self.last_error = Some(error.to_string());
+        }
         self.app_key_bindings = app_key_bindings;
         self.terminal_surface = None;
         self.last_pane_area = None;
@@ -7116,7 +7169,7 @@ mod tests {
         );
 
         drop(state);
-        let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
+        let reopened = AppState::new(config, repaint, None, None).expect("reopened state");
         assert_eq!(
             reopened
                 .space_summaries()
@@ -7125,7 +7178,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Default Space", "Review"]
         );
-        assert!(reopened.activate_space_from_ui(review_space));
         assert_eq!(reopened.active_space_id(), review_space);
         assert_eq!(reopened.mux_scope().space_id(), review_space);
     }
@@ -7214,7 +7266,7 @@ mod tests {
                 }),
             Some(("Planning", "calendar", [4, 5, 6], false))
         );
-        assert!(reopened.activate_space_from_ui(review_space));
+        assert_eq!(reopened.active_space_id(), review_space);
         assert_eq!(
             reopened.multiplexer_backend(),
             MultiplexerBackendConfig::Zellij
@@ -7258,7 +7310,12 @@ mod tests {
 
         config.multiplexer.backend = MultiplexerBackendConfig::Tmux;
         let mut reopened = AppState::new(config, repaint, None, None).expect("tmux state");
-        assert_eq!(reopened.active_space_id(), default_space);
+        assert_eq!(reopened.active_space_id(), override_space);
+        assert_eq!(
+            reopened.multiplexer_backend(),
+            MultiplexerBackendConfig::Native
+        );
+        assert!(reopened.activate_space_from_ui(default_space));
         assert_eq!(
             reopened.multiplexer_backend(),
             MultiplexerBackendConfig::Tmux
@@ -7344,9 +7401,9 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![first_session.id.as_str()]
+            vec![second_session.id.as_str()]
         );
-        assert!(reopened.activate_space_from_ui(second_space));
+        assert!(reopened.activate_space_from_ui(first_space));
         assert_eq!(
             reopened
                 .binding
@@ -7355,9 +7412,9 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            vec![second_session.id.as_str()]
+            vec![first_session.id.as_str()]
         );
-        assert!(reopened.activate_space_from_ui(first_space));
+        assert!(reopened.activate_space_from_ui(second_space));
     }
 
     #[test]
@@ -7408,7 +7465,7 @@ mod tests {
 
         drop(state);
         let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
-        assert!(reopened.activate_space_from_ui(empty_space));
+        assert_eq!(reopened.active_space_id(), empty_space);
         reopened.update_frame(test_frame_inputs(Vec::new(), None));
         assert!(reopened.binding.mux.sessions().is_empty());
     }
@@ -7545,9 +7602,22 @@ mod tests {
         )
         .expect("insert second space binding");
         let repaint: RepaintHandle = std::sync::Arc::new(|| {});
-        let other_window =
-            AppState::new(config.clone(), repaint.clone(), None, None).expect("other state");
-        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let other_window = AppState::new_for_window(
+            config.clone(),
+            "window-a".to_owned(),
+            repaint.clone(),
+            None,
+            None,
+        )
+        .expect("other state");
+        let mut state = AppState::new_for_window(
+            config.clone(),
+            "window-b".to_owned(),
+            repaint.clone(),
+            None,
+            None,
+        )
+        .expect("state");
         let first_scope = state.binding.scope;
         let first_config = state.binding.multiplexer.clone();
         state.binding.mux.create_project_session(
@@ -7635,6 +7705,16 @@ mod tests {
                 .any(|session| session.id == "$1")
         );
         assert_eq!(other_window.active_space_id(), first_space);
+        let persisted = WorkspaceStore::try_for_config_path(&config.config_path)
+            .expect("reopen workspace selection");
+        assert_eq!(
+            persisted.selected_space("window-a").expect("window a"),
+            Some(first_space)
+        );
+        assert_eq!(
+            persisted.selected_space("window-b").expect("window b"),
+            Some(second_space)
+        );
         assert!(state.binding.mux.poll_command().is_none());
         assert!(
             state
@@ -7716,12 +7796,12 @@ mod tests {
                 .mux
                 .sessions()
                 .iter()
-                .map(|session| session.name.as_str())
+                .map(|session| session.name.clone())
                 .collect::<Vec<_>>(),
-            vec![first_name.as_str()]
+            second_names
         );
 
-        assert!(reopened.activate_space_from_ui(second_space));
+        assert!(reopened.activate_space_from_ui(first_space));
         reopened.update_frame(test_frame_inputs(Vec::new(), None));
         assert_eq!(
             reopened
@@ -7729,9 +7809,9 @@ mod tests {
                 .mux
                 .sessions()
                 .iter()
-                .map(|session| session.name.clone())
+                .map(|session| session.name.as_str())
                 .collect::<Vec<_>>(),
-            second_names
+            vec![first_name.as_str()]
         );
     }
 

@@ -15,8 +15,9 @@ fn main() -> Result<()> {
     bootty_app::shell_env::hydrate_from_login_shell();
 
     let cli = bootty_app::cli::Cli::parse();
+    let window_state_key = cli.window_state_key().to_owned();
     let config = cli.load_config()?;
     let options = bootty_app::platform::native_options_for_config(&config);
 
-    bootty_app::native_host::run(options, config)
+    bootty_app::native_host::run(options, config, window_state_key)
 }

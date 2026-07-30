@@ -11,6 +11,7 @@ use crate::{
     mux::controller::{BindingId, MuxScope, SpaceId},
 };
 
+const WORKSPACE_SNAPSHOT_REVISION: i64 = 1;
 const DEFAULT_SPACE_NAME: &str = "Default Space";
 pub(crate) const DEFAULT_SPACE_ICON: &str = "folder";
 pub(crate) const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
@@ -22,6 +23,8 @@ pub(crate) struct WorkspaceBinding {
     scope: MuxScope,
     name: String,
     backend_override: Option<MultiplexerBackendConfig>,
+    unavailable: bool,
+    selection: Option<WorkspaceBindingSelection>,
 }
 
 impl WorkspaceBinding {
@@ -36,8 +39,31 @@ impl WorkspaceBinding {
     pub(crate) fn mux_scope(&self) -> MuxScope {
         self.scope
     }
+
+    pub(crate) fn unavailable(&self) -> bool {
+        self.unavailable
+    }
+
+    pub(crate) fn selection(&self) -> Option<&WorkspaceBindingSelection> {
+        self.selection.as_ref()
+    }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceBindingSelection {
+    session_id: String,
+    window_id: Option<String>,
+}
+
+impl WorkspaceBindingSelection {
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn window_id(&self) -> Option<&str> {
+        self.window_id.as_deref()
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceSpace {
     id: SpaceId,
@@ -86,10 +112,17 @@ pub(crate) struct WorkspaceStore {
 }
 
 impl WorkspaceStore {
-    pub(crate) fn for_config_path(config_path: &Path) -> Self {
+    pub(crate) fn try_for_config_path(config_path: &Path) -> rusqlite::Result<Self> {
         let path = sqlite_path(config_path);
-        let spaces = Self::load_or_migrate(&path).unwrap_or_default();
-        Self { path, spaces }
+        let spaces = Self::load_or_migrate(&path)?;
+        Ok(Self { path, spaces })
+    }
+
+    pub(crate) fn for_config_path(config_path: &Path) -> Self {
+        Self::try_for_config_path(config_path).unwrap_or_else(|_| Self {
+            path: sqlite_path(config_path),
+            spaces: Vec::new(),
+        })
     }
 
     pub(crate) fn binding(&self) -> Option<&WorkspaceBinding> {
@@ -190,6 +223,8 @@ impl WorkspaceStore {
                 ),
                 name: DEFAULT_BINDING_NAME.to_owned(),
                 backend_override,
+                unavailable: false,
+                selection: None,
             }],
         };
         self.spaces.push(space.clone());
@@ -267,6 +302,73 @@ impl WorkspaceStore {
         Ok(true)
     }
 
+    pub(crate) fn selected_space(&self, window_key: &str) -> rusqlite::Result<Option<SpaceId>> {
+        let conn = open_db(&self.path)?;
+        conn.query_row(
+            "SELECT selected_space_id FROM workspace_window_state WHERE window_key = ?1",
+            [window_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.map(SpaceId::from_persistence))
+    }
+
+    pub(crate) fn set_selected_space(
+        &self,
+        window_key: &str,
+        space_id: SpaceId,
+    ) -> rusqlite::Result<()> {
+        let conn = open_db(&self.path)?;
+        conn.execute(
+            "INSERT INTO workspace_window_state (window_key, selected_space_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(window_key) DO UPDATE SET selected_space_id = excluded.selected_space_id",
+            params![window_key, space_id.persistence_value()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn set_binding_restore_state(
+        &mut self,
+        scope: MuxScope,
+        unavailable: bool,
+        session_id: Option<&str>,
+        window_id: Option<&str>,
+    ) -> rusqlite::Result<bool> {
+        let conn = open_db(&self.path)?;
+        let changed = conn.execute(
+            "UPDATE workspace_bindings
+             SET unavailable = ?1, selected_session_id = ?2, selected_window_id = ?3
+             WHERE id = ?4 AND space_id = ?5",
+            params![
+                i64::from(unavailable),
+                session_id,
+                window_id,
+                scope.binding_id().persistence_value(),
+                scope.space_id().persistence_value(),
+            ],
+        )? != 0;
+        if changed
+            && let Some(binding) = self
+                .spaces
+                .iter_mut()
+                .find(|space| space.id == scope.space_id())
+                .and_then(|space| {
+                    space
+                        .bindings
+                        .iter_mut()
+                        .find(|binding| binding.scope == scope)
+                })
+        {
+            binding.unavailable = unavailable;
+            binding.selection = session_id.map(|session_id| WorkspaceBindingSelection {
+                session_id: session_id.to_owned(),
+                window_id: window_id.map(str::to_owned),
+            });
+        }
+        Ok(changed)
+    }
+
     fn unique_space_name<'a>(
         existing: impl IntoIterator<Item = &'a str>,
         requested: &str,
@@ -293,12 +395,17 @@ impl WorkspaceStore {
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
         let mut conn = open_db(path)?;
+        let revision: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if revision > WORKSPACE_SNAPSHOT_REVISION {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
         migrate_workspace_binding_cardinality(&conn)?;
         let tx = conn.transaction()?;
         create_workspace_schema(&tx)?;
         migrate_workspace_space_icons(&tx)?;
         migrate_workspace_space_appearance(&tx)?;
         migrate_workspace_session_name_metadata(&tx)?;
+        migrate_workspace_snapshot_state(&tx)?;
         let space_count = tx.query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
             row.get::<_, i64>(0)
         })?;
@@ -308,6 +415,7 @@ impl WorkspaceStore {
             create_missing_space_bindings(&tx)?;
         }
         let spaces = load_spaces(&tx)?;
+        tx.pragma_update(None, "user_version", WORKSPACE_SNAPSHOT_REVISION)?;
         tx.commit()?;
         Ok(spaces)
     }
@@ -389,7 +497,10 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
             backend TEXT NOT NULL,
-            hide_tmux_status INTEGER NOT NULL
+            hide_tmux_status INTEGER NOT NULL,
+            unavailable INTEGER NOT NULL DEFAULT 0,
+            selected_session_id TEXT,
+            selected_window_id TEXT
         );
         CREATE TABLE IF NOT EXISTS workspace_session_groups (
             id INTEGER PRIMARY KEY,
@@ -414,6 +525,10 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             session_name TEXT NOT NULL DEFAULT '',
             explicit INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(binding_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS workspace_window_state (
+            window_key TEXT PRIMARY KEY,
+            selected_space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE
         );",
     )
 }
@@ -472,6 +587,34 @@ fn migrate_workspace_session_name_metadata(tx: &Transaction<'_>) -> rusqlite::Re
     Ok(())
 }
 
+fn migrate_workspace_snapshot_state(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let mut statement = tx.prepare("PRAGMA table_info(workspace_bindings)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<HashSet<_>>>()?;
+    drop(statement);
+    if !columns.contains("unavailable") {
+        tx.execute(
+            "ALTER TABLE workspace_bindings
+             ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !columns.contains("selected_session_id") {
+        tx.execute(
+            "ALTER TABLE workspace_bindings ADD COLUMN selected_session_id TEXT",
+            [],
+        )?;
+    }
+    if !columns.contains("selected_window_id") {
+        tx.execute(
+            "ALTER TABLE workspace_bindings ADD COLUMN selected_window_id TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn create_missing_space_bindings(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
@@ -488,7 +631,8 @@ fn create_missing_space_bindings(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
     let mut statement = tx.prepare(
         "SELECT s.id, s.name, s.icon, s.color, s.tint_sidebar, s.position,
-                b.id, b.name, b.backend, b.hide_tmux_status
+                b.id, b.name, b.backend, b.hide_tmux_status, b.unavailable,
+                b.selected_session_id, b.selected_window_id
          FROM workspace_spaces s
          JOIN workspace_bindings b ON b.space_id = s.id
          ORDER BY s.position, s.id, b.id",
@@ -509,6 +653,13 @@ fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
                 ),
                 name: row.get(7)?,
                 backend_override: backend_from_storage(&row.get::<_, String>(8)?),
+                unavailable: row.get::<_, i64>(10)? != 0,
+                selection: row.get::<_, Option<String>>(11)?.map(|session_id| {
+                    WorkspaceBindingSelection {
+                        session_id,
+                        window_id: row.get::<_, Option<String>>(12).unwrap_or_default(),
+                    }
+                }),
             },
         ))
     })?;
@@ -565,6 +716,8 @@ fn create_default_binding(tx: &Transaction<'_>, path: &Path) -> rusqlite::Result
         ),
         name: DEFAULT_BINDING_NAME.to_owned(),
         backend_override: None,
+        unavailable: false,
+        selection: None,
     })
 }
 
@@ -1164,5 +1317,103 @@ mod tests {
 
         assert_eq!(scoped_name, "project/main");
         assert_eq!(generated_name, "project/main");
+    }
+
+    #[test]
+    fn host_snapshot_round_trips_window_and_binding_selection() {
+        let config_path = temp_config_path("host-snapshot");
+        let mut store = WorkspaceStore::for_config_path(&config_path);
+        let first = store.spaces()[0].id();
+        let second = store
+            .create_space(
+                "Review",
+                DEFAULT_SPACE_ICON,
+                DEFAULT_SPACE_COLOR,
+                false,
+                Some(MultiplexerBackendConfig::Tmux),
+                &MultiplexerConfig::default(),
+            )
+            .expect("create second space")
+            .expect("space");
+        let scope = second.bindings()[0].mux_scope();
+
+        store
+            .set_selected_space("window-a", second.id())
+            .expect("select second space");
+        store
+            .set_selected_space("window-b", first)
+            .expect("select first space");
+        assert!(
+            store
+                .set_binding_restore_state(scope, true, Some("$review"), Some("@2"))
+                .expect("persist binding state")
+        );
+
+        let reopened = WorkspaceStore::for_config_path(&config_path);
+        assert_eq!(
+            reopened.selected_space("window-a").expect("window a"),
+            Some(second.id())
+        );
+        assert_eq!(
+            reopened.selected_space("window-b").expect("window b"),
+            Some(first)
+        );
+        let binding = &reopened.spaces()[1].bindings()[0];
+        assert!(binding.unavailable());
+        let selection = binding.selection().expect("selection");
+        assert_eq!(selection.session_id(), "$review");
+        assert_eq!(selection.window_id(), Some("@2"));
+    }
+
+    #[test]
+    fn unavailable_binding_metadata_survives_reopen_and_reconnect() {
+        let config_path = temp_config_path("unavailable");
+        let mut store = WorkspaceStore::for_config_path(&config_path);
+        let scope = store.binding().expect("binding").mux_scope();
+        store
+            .set_binding_restore_state(scope, true, Some("$1"), None)
+            .expect("mark unavailable");
+
+        let mut reopened = WorkspaceStore::for_config_path(&config_path);
+        assert!(reopened.binding().expect("binding").unavailable());
+        reopened
+            .set_binding_restore_state(scope, false, Some("$1"), Some("@1"))
+            .expect("mark available");
+
+        let restored = WorkspaceStore::for_config_path(&config_path);
+        let binding = restored.binding().expect("binding");
+        assert!(!binding.unavailable());
+        assert_eq!(
+            binding
+                .selection()
+                .and_then(WorkspaceBindingSelection::window_id),
+            Some("@1")
+        );
+    }
+
+    #[test]
+    fn future_snapshot_revision_fails_without_mutating_the_database() {
+        let config_path = temp_config_path("future-revision");
+        let store = WorkspaceStore::for_config_path(&config_path);
+        let path = store.path().to_path_buf();
+        let conn = open_db(&path).expect("open workspace database");
+        conn.pragma_update(None, "user_version", WORKSPACE_SNAPSHOT_REVISION + 1)
+            .expect("set future revision");
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
+                row.get(0)
+            })
+            .expect("space count");
+        drop(conn);
+
+        assert!(WorkspaceStore::load_or_migrate(&path).is_err());
+        assert!(WorkspaceStore::try_for_config_path(&config_path).is_err());
+        let conn = open_db(&path).expect("reopen workspace database");
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
+                row.get(0)
+            })
+            .expect("space count");
+        assert_eq!(after, before);
     }
 }

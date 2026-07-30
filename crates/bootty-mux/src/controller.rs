@@ -402,6 +402,11 @@ impl MuxController {
         self.selected_session.as_deref()
     }
 
+    pub fn restore_selection(&mut self, session_id: String, window_id: Option<String>) {
+        self.selected_session = Some(session_id);
+        self.selected_window = window_id;
+    }
+
     pub fn previous_selected_session(&self) -> Option<&str> {
         let selected = self.previous_selected_session.as_deref()?;
         self.sessions
