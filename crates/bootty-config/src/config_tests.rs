@@ -826,6 +826,18 @@ fn input_hide_mouse_pointer_while_typing_defaults_on_and_can_be_disabled() {
 }
 
 #[test]
+fn input_copy_on_select_defaults_off_and_can_be_enabled() {
+    assert!(!BoottyConfig::default().input.copy_on_select);
+
+    let config = load_config_source(indoc! {r#"
+        [input]
+        copy-on-select = true
+    "#});
+
+    assert!(config.input.copy_on_select);
+}
+
+#[test]
 fn config_maps_macos_option_as_alt_to_terminal_session_config() {
     let config = load_config_source(indoc! {r#"
         [input]

@@ -185,6 +185,9 @@ sidebar-keybind = [
 # Hide the mouse pointer after terminal typing; moving the pointer shows it again.
 hide-mouse-pointer-while-typing = true
 
+# Copy a completed mouse selection to the system clipboard.
+copy-on-select = false
+
 # macOS Option-as-Meta behavior. Values: none, left, right, both.
 macos-option-as-alt = "both"
 

@@ -12,7 +12,8 @@ use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
 use bootty_terminal::{
     terminal_engine::{
         TerminalColorConfig, TerminalCopyModeAction, TerminalCopyModeOutcome, TerminalCursorConfig,
-        TerminalFeatureConfig, TerminalSelectionEvent, TerminalSelectionFormat,
+        TerminalFeatureConfig, TerminalSearchDirection, TerminalSelectionEvent,
+        TerminalSelectionFormat,
     },
     terminal_frame::RenderFrame,
     terminal_input_model::{KeyInput, MouseInput},
@@ -240,6 +241,14 @@ impl TerminalRenderSource for StartingNativeTerminal {
             terminal.handle_copy_mode_action(action)
         } else {
             Ok(TerminalCopyModeOutcome::default())
+        }
+    }
+
+    fn search_viewport(&mut self, query: &str, direction: TerminalSearchDirection) -> Result<bool> {
+        if let Some(terminal) = self.ready_terminal()? {
+            terminal.search_viewport(query, direction)
+        } else {
+            Ok(false)
         }
     }
 

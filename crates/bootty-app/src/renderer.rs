@@ -217,8 +217,13 @@ impl TerminalWidget {
             .and_then(|pos| hyperlink_at(frame, surface, self.view.inverse_point(pos)));
 
         if let Some(url) = hovered_link {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            if response.clicked() {
+            let modifiers = ui.input(|input| input.modifiers);
+            ui.ctx().set_cursor_icon(if modifiers.command {
+                egui::CursorIcon::PointingHand
+            } else {
+                self.terminal_cursor_icon
+            });
+            if hyperlink_activation_requested(response.clicked(), modifiers) {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(url));
             }
         } else if response.hovered() {
@@ -736,6 +741,10 @@ impl ScrollbarVisibility {
     }
 }
 
+fn hyperlink_activation_requested(clicked: bool, modifiers: egui::Modifiers) -> bool {
+    clicked && modifiers.command
+}
+
 fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Option<String> {
     if !surface.rect.contains(pos) {
         return None;
@@ -1000,6 +1009,25 @@ mod tests {
             Some("https://example.com")
         );
         assert_eq!(hyperlink_at(&frame, surface, Pos2::new(5.0, 10.0)), None);
+    }
+
+    #[test]
+    fn hyperlink_activation_requires_platform_command_click() {
+        assert!(!hyperlink_activation_requested(true, egui::Modifiers::NONE));
+        assert!(hyperlink_activation_requested(
+            true,
+            egui::Modifiers {
+                command: true,
+                ..egui::Modifiers::NONE
+            }
+        ));
+        assert!(!hyperlink_activation_requested(
+            false,
+            egui::Modifiers {
+                command: true,
+                ..egui::Modifiers::NONE
+            }
+        ));
     }
 
     #[test]
