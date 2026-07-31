@@ -509,6 +509,9 @@ impl MuxController {
 
     pub fn apply_session_order(&mut self, ordered_names: &[String]) {
         self.sessions = order_sessions_by_names(self.all_sessions(), ordered_names);
+        if self.sessions.is_empty() {
+            return;
+        }
         if self.selected_session.as_deref().is_none_or(|selected| {
             !self
                 .sessions
@@ -933,8 +936,13 @@ impl MuxController {
         {
             return false;
         }
-        let current_session = same_backend.then(|| self.selected_session.take()).flatten();
-        let current_window = same_backend.then(|| self.selected_window.take()).flatten();
+        let keep_selection = same_backend || self.current_backend.is_none();
+        let current_session = keep_selection
+            .then(|| self.selected_session.take())
+            .flatten();
+        let current_window = keep_selection
+            .then(|| self.selected_window.take())
+            .flatten();
         self.apply_snapshot(backend, snapshot, current_session, current_window);
         true
     }
@@ -1451,6 +1459,23 @@ mod tests {
 
         assert_eq!(controller.selected_session(), Some("$1"));
         assert_eq!(controller.selected_window(), Some("@2"));
+    }
+
+    #[test]
+    fn initial_refresh_keeps_restored_session_selection() {
+        let mut controller = MuxController::new();
+        controller.restore_selection("$2".to_owned(), None);
+        controller.apply_session_order(&[]);
+
+        controller.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Tmux,
+            MuxSnapshot {
+                sessions: vec![session("$1", "first"), session("$2", "last-focused")],
+                active_session_id: Some("$1".to_owned()),
+            },
+        );
+
+        assert_eq!(controller.selected_session(), Some("$2"));
     }
 
     #[test]

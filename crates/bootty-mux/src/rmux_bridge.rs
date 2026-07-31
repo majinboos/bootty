@@ -29,8 +29,9 @@ use crate::{
 
 const RMUX_OUTPUT_POLL_MIN_DELAY: Duration = Duration::from_millis(1);
 const RMUX_OUTPUT_POLL_MAX_DELAY: Duration = Duration::from_millis(16);
-const RMUX_KEYBOARD_PROTOCOL_BOOTSTRAP_POLLS: usize = 4;
 const RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES: usize = 64;
+const RMUX_KEYBOARD_PROTOCOL_OPTION: &str = "@bootty-keyboard-protocol";
+const RMUX_BRACKETED_PASTE_OPTION: &str = "@bootty-bracketed-paste";
 
 const TERM_ENV: &str = "TERM";
 const COLORTERM_ENV: &str = "COLORTERM";
@@ -648,7 +649,7 @@ impl RmuxBridgeState {
         rmux_request_checked(Request::SwapWindow(SwapWindowRequest {
             source: WindowTarget::with_window(session.clone(), rows[source].index),
             target: WindowTarget::with_window(session, rows[target].index),
-            detached: false,
+            detached: true,
         }))
         .await?;
         Ok(())
@@ -810,7 +811,9 @@ async fn replay_retained_kitty_keyboard_protocol(
         .output_stream_starting_at(PaneOutputStart::Oldest)
         .await?;
     let mut tail = Vec::new();
-    for _ in 0..RMUX_KEYBOARD_PROTOCOL_BOOTSTRAP_POLLS {
+    let mut keyboard_protocol = None;
+    let mut bracketed_paste = None;
+    loop {
         let chunks = output_stream.poll_once().await?;
         if chunks.is_empty() {
             break;
@@ -820,17 +823,59 @@ async fn replay_retained_kitty_keyboard_protocol(
                 continue;
             };
             tail.extend_from_slice(&bytes);
-            if let Some(sequence) = kitty_keyboard_protocol_query(&tail) {
-                let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(sequence));
-                return Ok(());
-            }
+            keyboard_protocol = kitty_keyboard_protocol_query(&tail).or(keyboard_protocol);
+            bracketed_paste = bracketed_paste_mode(&tail).or(bracketed_paste);
             if tail.len() > RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES {
                 let start = tail.len() - RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES;
                 tail.drain(..start);
             }
         }
     }
+    if let Some(enabled) = bracketed_paste {
+        let _ = pane
+            .set_option(RMUX_BRACKETED_PASTE_OPTION, if enabled { "1" } else { "0" })
+            .await;
+    }
+    if let Some(sequence) = keyboard_protocol {
+        if let Some(flags) = kitty_keyboard_protocol_flags(&sequence) {
+            let _ = pane.set_option(RMUX_KEYBOARD_PROTOCOL_OPTION, flags).await;
+        }
+        let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(sequence));
+    }
     Ok(())
+}
+
+fn kitty_keyboard_protocol_flags(sequence: &[u8]) -> Option<String> {
+    let flags = sequence.strip_prefix(b"\x1b[>")?;
+    let end = flags.iter().position(|byte| *byte == b'u')?;
+    flags[..end]
+        .iter()
+        .all(u8::is_ascii_digit)
+        .then(|| String::from_utf8_lossy(&flags[..end]).into_owned())
+}
+
+pub(crate) fn restored_terminal_protocol(flags: &str, bracketed_paste: bool) -> Vec<u8> {
+    format!(
+        "\x1b[>{flags}u{}",
+        if bracketed_paste { "\x1b[?2004h" } else { "" }
+    )
+    .into_bytes()
+}
+
+fn bracketed_paste_mode(bytes: &[u8]) -> Option<bool> {
+    let enabled = bytes
+        .windows(8)
+        .rposition(|window| window == b"\x1b[?2004h")
+        .map(|index| (index, true));
+    let disabled = bytes
+        .windows(8)
+        .rposition(|window| window == b"\x1b[?2004l")
+        .map(|index| (index, false));
+    enabled
+        .into_iter()
+        .chain(disabled)
+        .max_by_key(|(index, _)| *index)
+        .map(|(_, enabled)| enabled)
 }
 
 fn kitty_keyboard_protocol_query(bytes: &[u8]) -> Option<Vec<u8>> {
@@ -868,12 +913,27 @@ async fn run_pane_io_inner(
     target.session_name()?;
     let rmux = connect_bootty_rmux().await?;
     let pane = pane_for_target(&rmux, &target).await?;
-    replay_retained_kitty_keyboard_protocol(&pane, output_tx).await?;
+    if let Ok(Some(flags)) = pane.option(RMUX_KEYBOARD_PROTOCOL_OPTION).await {
+        let bracketed_paste = pane
+            .option(RMUX_BRACKETED_PASTE_OPTION)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1");
+        let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(restored_terminal_protocol(
+            &flags,
+            bracketed_paste,
+        )));
+    } else {
+        replay_retained_kitty_keyboard_protocol(&pane, output_tx).await?;
+    }
     let mut output_stream = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
     let mut restore_rx = start_restore_capture(target.clone(), max_scrollback);
     let mut restore_pending = true;
     let mut buffered_chunks = Vec::new();
     let mut output_poll_delay = RMUX_OUTPUT_POLL_MIN_DELAY;
+    let mut terminal_protocol_tail = Vec::new();
 
     loop {
         tokio::select! {
@@ -899,6 +959,34 @@ async fn run_pane_io_inner(
                     output_poll_delay = (output_poll_delay * 2).min(RMUX_OUTPUT_POLL_MAX_DELAY);
                 } else {
                     output_poll_delay = RMUX_OUTPUT_POLL_MIN_DELAY;
+                    for chunk in &chunks {
+                        if let PaneOutputChunk::Bytes { bytes, .. } = chunk {
+                            terminal_protocol_tail.extend_from_slice(bytes);
+                            if let Some(sequence) =
+                                kitty_keyboard_protocol_query(&terminal_protocol_tail)
+                                && let Some(flags) = kitty_keyboard_protocol_flags(&sequence)
+                            {
+                                let _ = pane
+                                    .set_option(RMUX_KEYBOARD_PROTOCOL_OPTION, flags)
+                                    .await;
+                            }
+                            if let Some(enabled) = bracketed_paste_mode(&terminal_protocol_tail) {
+                                let _ = pane
+                                    .set_option(
+                                        RMUX_BRACKETED_PASTE_OPTION,
+                                        if enabled { "1" } else { "0" },
+                                    )
+                                    .await;
+                            }
+                            if terminal_protocol_tail.len()
+                                > RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES
+                            {
+                                let start = terminal_protocol_tail.len()
+                                    - RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES;
+                                terminal_protocol_tail.drain(..start);
+                            }
+                        }
+                    }
                     if restore_pending {
                         buffered_chunks.extend(chunks);
                     } else if output_tx.send(RmuxPaneEvent::Chunks(chunks)).is_err() {
@@ -1284,6 +1372,16 @@ mod tests {
             kitty_keyboard_protocol_query(b"prompt\x1b[>7u\x1b[?u\x1b[c"),
             Some(b"\x1b[>7u\x1b[?u".to_vec())
         );
+        assert_eq!(
+            kitty_keyboard_protocol_flags(b"\x1b[>7u\x1b[?u"),
+            Some("7".to_owned())
+        );
+        assert_eq!(
+            restored_terminal_protocol("7", true),
+            b"\x1b[>7u\x1b[?2004h".to_vec()
+        );
+        assert_eq!(bracketed_paste_mode(b"\x1b[?2004h"), Some(true));
+        assert_eq!(bracketed_paste_mode(b"\x1b[?2004h\x1b[?2004l"), Some(false));
         assert_eq!(kitty_keyboard_protocol_query(b"\x1b[>7u\x1b[?"), None);
         assert_eq!(kitty_keyboard_protocol_query(b"\x1b[>xu\x1b[?u"), None);
     }
