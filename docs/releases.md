@@ -16,14 +16,14 @@ The updater verifies the release asset through GitHub's release checksum before 
 
 ## Publish a release
 
-1. Update the workspace version in `Cargo.toml`.
-2. Create and push the matching `v<version>` tag:
+Run one command from a clean, synced `main` branch:
 
-   ```sh
-   git tag v0.1.0
-   git push origin v0.1.0
-   ```
+```sh
+mise run release -- patch
+```
+
+Use `minor` or `major` instead of `patch` when needed. The command creates the version-bump PR and enables auto-merge. Once CI merges it, GitHub tags that commit and runs the release workflow.
 
 The release workflow rejects a tag that does not match `Cargo.toml`. After packaging succeeds for every supported platform, it creates a GitHub Release, uploads target-named bundles for the updater, generates `SHA256SUMS`, and publishes generated release notes.
 
-The tag is the release boundary. Push a corrected version instead of replacing an existing release tag.
+Release tags are immutable. Publish a corrected version instead of replacing an existing tag.
