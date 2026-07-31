@@ -9793,6 +9793,21 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_toggle_sidebar_visibility_runs_on_next_frame() {
+        let mut state = test_state();
+        let before = state.config().chrome.sidebar;
+        state.apply_command_palette_event(
+            CommandPaletteDialog::open(&[]),
+            CommandPaletteEvent::Run("toggle_sidebar_visibility"),
+        );
+
+        assert_eq!(state.config().chrome.sidebar, before);
+        let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert_eq!(state.config().chrome.sidebar, !before);
+        assert!(effects.contains(&AppEffect::RequestRepaint));
+    }
+
+    #[test]
     fn font_size_decrease_clamps_at_one_and_emits_text_config() {
         let mut state = test_state();
         let mut effects = Vec::new();

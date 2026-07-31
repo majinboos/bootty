@@ -47,6 +47,7 @@ const CODEXBAR_SERVER_PORT: u16 = 17_613;
 const CODEXBAR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_COLOR: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
 const EXTENSION_UI_PRELUDE: &str = include_str!("extension_ui.luau");
+const SIDEBAR_FACTS_PRELUDE: &str = include_str!("sidebar_session_facts.luau");
 
 const BUILTIN_STATUS_EXTENSIONS: &[(&str, &str)] = &[
     ("windows", include_str!("status_defaults/windows.luau")),
@@ -182,6 +183,7 @@ pub struct MuxView {
     pub windows: Vec<WindowView>,
     pub sessions: Vec<SessionView>,
     pub session: Option<String>,
+    pub sidebar_visible: bool,
     /// The active session's sidebar accent color as `#rrggbb`, so modules can
     /// match the bar to the session like the sidebar does.
     pub session_color: Option<String>,
@@ -1075,13 +1077,14 @@ impl ExtensionHost {
     }
 
     /// Publishes the latest mux snapshot for modules to render. Cheap; the UI calls it per frame.
-    /// A change to keep-awake state, session order/set, or window order/set wakes the worker to
-    /// re-render right away; selection-only changes don't, since the UI reflects those natively.
+    /// Changes that affect module visibility or slow-changing module output wake the worker
+    /// immediately; selection-only changes don't, since the UI reflects those natively.
     pub fn update_mux(&self, view: MuxView) {
         if let Ok(mut current) = self.mux.write()
             && *current != view
         {
-            let should_force_render = current.keep_awake != view.keep_awake
+            let should_force_render = current.sidebar_visible != view.sidebar_visible
+                || current.keep_awake != view.keep_awake
                 || current
                     .sessions
                     .iter()
@@ -1326,10 +1329,29 @@ fn prune_removed_items(
     map.retain(|name, _| module_names.contains(name));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleKind {
+    Sidebar,
+    Status,
+}
+
+impl ModuleKind {
+    fn builtins(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Sidebar => BUILTIN_SIDEBAR_EXTENSIONS,
+            Self::Status => BUILTIN_STATUS_EXTENSIONS,
+        }
+    }
+}
+
 /// Module names available to reference from a segment: built-ins plus user `*.lua` / `*.luau`
 /// files. Sorted and de-duplicated for settings.
 pub fn available_module_names(dir: &Path) -> Vec<String> {
-    available_module_names_with_builtins(dir, BUILTIN_STATUS_EXTENSIONS)
+    module_names(dir, ModuleKind::Status)
+}
+
+pub fn module_names(dir: &Path, kind: ModuleKind) -> Vec<String> {
+    available_module_names_with_builtins(dir, kind.builtins())
 }
 
 fn available_module_names_with_builtins(
@@ -1351,6 +1373,81 @@ fn available_module_names_with_builtins(
         }
     }
     names.into_iter().collect()
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleSource {
+    pub source: String,
+    pub path: PathBuf,
+    pub customized: bool,
+    pub has_builtin: bool,
+}
+
+pub fn module_source(dir: &Path, kind: ModuleKind, name: &str) -> Option<ModuleSource> {
+    let builtin = kind
+        .builtins()
+        .iter()
+        .find_map(|(candidate, source)| (*candidate == name).then_some(*source));
+    let path = user_module_path(dir, name).unwrap_or_else(|| dir.join(format!("{name}.luau")));
+    match std::fs::read_to_string(&path) {
+        Ok(source) => Some(ModuleSource {
+            source,
+            path,
+            customized: true,
+            has_builtin: builtin.is_some(),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            builtin.map(|source| ModuleSource {
+                source: source.to_owned(),
+                path,
+                customized: false,
+                has_builtin: true,
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+pub fn valid_module_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+pub fn save_module(
+    dir: &Path,
+    _kind: ModuleKind,
+    name: &str,
+    source: &str,
+) -> std::io::Result<PathBuf> {
+    if !valid_module_name(name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid module name",
+        ));
+    }
+    std::fs::create_dir_all(dir)?;
+    let path = user_module_path(dir, name).unwrap_or_else(|| dir.join(format!("{name}.luau")));
+    std::fs::write(&path, source)?;
+    Ok(path)
+}
+
+pub fn reset_module(dir: &Path, name: &str) -> std::io::Result<()> {
+    for extension in ["luau", "lua"] {
+        match std::fs::remove_file(dir.join(format!("{name}.{extension}"))) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn user_module_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    ["luau", "lua"]
+        .into_iter()
+        .map(|extension| dir.join(format!("{name}.{extension}")))
+        .find(|path| path.is_file())
 }
 
 /// Sorted (path, mtime) of module files, so a reload can detect added/edited/removed files cheaply.
@@ -1847,6 +1944,36 @@ fn setup_lua(
             run_shell_cache.run(&cmd).map_err(mlua::Error::external)
         })?,
     )?;
+    let shell_table = lua.create_table()?;
+    let shell_run_cache = Arc::clone(&run_cache);
+    shell_table.set(
+        "run",
+        lua.create_function(move |_, cmd: String| {
+            shell_run_cache.run(&cmd).map_err(mlua::Error::external)
+        })?,
+    )?;
+    shell_table.set(
+        "quote",
+        lua.create_function(|_, value: String| Ok(platform_shell_quote(&value)))?,
+    )?;
+    shell_table.set(
+        "stderr_null",
+        if cfg!(windows) {
+            "2>nul"
+        } else {
+            "2>/dev/null"
+        },
+    )?;
+    shell_table.set_readonly(true);
+    bootty.set("shell", shell_table)?;
+
+    let path_table = lua.create_table()?;
+    path_table.set(
+        "display",
+        lua.create_function(|_, value: String| Ok(crate::strings::display_path(&value)))?,
+    )?;
+    path_table.set_readonly(true);
+    bootty.set("path", path_table)?;
 
     let codexbar_cache = Arc::clone(&run_cache);
     bootty.set(
@@ -2073,6 +2200,22 @@ fn setup_lua(
     )?;
     ui_table.set_readonly(true);
     bootty.set("ui", ui_table)?;
+    let sidebar_table: Table = lua
+        .load(SIDEBAR_FACTS_PRELUDE)
+        .set_name("bootty.sidebar")
+        .eval()?;
+    let sidebar_mux = Arc::clone(&mux);
+    sidebar_table.set(
+        "visible",
+        lua.create_function(move |_, ()| {
+            Ok(sidebar_mux
+                .read()
+                .map(|view| view.sidebar_visible)
+                .unwrap_or(false))
+        })?,
+    )?;
+    sidebar_table.set_readonly(true);
+    bootty.set("sidebar", sidebar_table)?;
 
     // Palette tokens so modules style with theme colors: `fg = bootty.theme.accent`.
     let theme_table = lua.create_table()?;
@@ -2585,6 +2728,33 @@ mod tests {
             BUILTIN_SIDEBAR_EXTENSIONS,
             &["sessions", "codexbar"],
         );
+    }
+
+    #[test]
+    fn built_in_session_only_renders_when_sidebar_is_hidden() {
+        let mux = Arc::new(RwLock::new(MuxView {
+            session: Some("work/api".to_owned()),
+            sidebar_visible: true,
+            ..MuxView::default()
+        }));
+        let lua = setup_lua(
+            &[("accent".to_owned(), "#89b4fa".to_owned())],
+            Arc::clone(&mux),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        )
+        .expect("setup lua");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = load_modules(&lua, dir.path(), BUILTIN_STATUS_EXTENSIONS);
+        let session = modules
+            .iter()
+            .find(|module| module.name == "session")
+            .expect("session module");
+
+        assert!(run_module(&session.body).is_empty());
+        mux.write().expect("mux").sidebar_visible = false;
+        assert_eq!(run_module(&session.body)[0].text, "work/api");
     }
 
     #[test]
@@ -3141,6 +3311,7 @@ mod tests {
             .expect("current dir")
             .to_string_lossy()
             .into_owned();
+        let display_cwd = crate::strings::display_path(&cwd);
         let mux: Arc<RwLock<MuxView>> = Arc::new(RwLock::new(MuxView {
             sessions: vec![SessionView {
                 id: "plain".to_owned(),
@@ -3178,7 +3349,7 @@ mod tests {
                 .iter()
                 .find(|item| item.key.as_deref() == Some("plain:cwd"))
                 .map(|item| item.text.as_str()),
-            Some(cwd.as_str())
+            Some(display_cwd.as_str())
         );
         assert_eq!(
             rerendered
@@ -3902,7 +4073,55 @@ mod tests {
         assert!(names.contains(&"custom".to_owned()));
         assert!(!names.contains(&"ignored".to_owned()));
         assert!(!names.contains(&"folder".to_owned()));
+
         assert!(names.contains(&"clock".to_owned()));
+        let sidebar_names = module_names(dir.path(), ModuleKind::Sidebar);
+        assert!(sidebar_names.contains(&"custom".to_owned()));
+        assert!(sidebar_names.contains(&"sessions".to_owned()));
+    }
+
+    #[test]
+    fn module_names_reject_paths_and_accept_safe_stems() {
+        assert!(valid_module_name("my-module_2"));
+        assert!(!valid_module_name(""));
+        assert!(!valid_module_name("../module"));
+        assert!(!valid_module_name("module.lua"));
+    }
+
+    #[test]
+    fn creating_user_module_makes_it_discoverable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        save_module(
+            dir.path(),
+            ModuleKind::Status,
+            "custom-status",
+            "return { render = function() return {} end }",
+        )
+        .expect("create module");
+
+        let source =
+            module_source(dir.path(), ModuleKind::Status, "custom-status").expect("module source");
+        assert!(source.customized);
+        assert!(!source.has_builtin);
+        assert!(module_names(dir.path(), ModuleKind::Status).contains(&"custom-status".to_owned()));
+    }
+    #[test]
+    fn editing_builtin_sidebar_module_creates_a_user_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let builtin = module_source(dir.path(), ModuleKind::Sidebar, "sessions")
+            .expect("builtin sessions source");
+        assert!(!builtin.customized);
+
+        let edited = format!("{}\n-- customized", builtin.source);
+        let path = save_module(dir.path(), ModuleKind::Sidebar, "sessions", &edited)
+            .expect("save sidebar override");
+        let loaded = module_source(dir.path(), ModuleKind::Sidebar, "sessions")
+            .expect("custom sessions source");
+
+        assert_eq!(path, dir.path().join("sessions.luau"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), edited);
+        assert!(loaded.customized);
+        assert_eq!(loaded.source, edited);
     }
 
     #[cfg(unix)]

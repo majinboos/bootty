@@ -120,7 +120,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
     super::settings_notice(
         ui,
         palette.muted,
-        "Segments can use built-ins or Luau files from the config/status directory.",
+        "Arrange module instances, edit their sources, or create a new module here.",
     );
     ui.add_space(6.0);
 
@@ -238,7 +238,6 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
         }
         changed = true;
     }
-    ui.memory_mut(|memory| memory.data.insert_temp(selected_id, selected));
 
     ui.add_space(8.0);
     if super::settings_button(ui, palette, "+ Add segment").clicked() {
@@ -255,18 +254,31 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
             });
         changed = true;
     }
+    if let Some(module) =
+        super::modules::new_module_ui(win, ui, crate::extensions::ModuleKind::Status)
+    {
+        let segments = position.segments_mut(&mut win.config.chrome);
+        segments.push(StatusSegment {
+            align: SegmentAlign::Left,
+            module,
+            ..StatusSegment::default()
+        });
+        selected = segments.len() - 1;
+        changed = true;
+    }
 
     if changed {
         win.set_status_segments(position);
     }
-
-    if !available.is_empty() {
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new(format!("Available modules: {}", available.join(", ")))
-                .color(palette.muted)
-                .size(12.0),
-        );
+    ui.memory_mut(|memory| memory.data.insert_temp(selected_id, selected));
+    if let Some(module) = position
+        .segments(&win.config.chrome)
+        .get(selected)
+        .map(|segment| segment.module.clone())
+    {
+        ui.add_space(16.0);
+        super::section(ui, palette, "SOURCE");
+        super::modules::source_editor(win, ui, crate::extensions::ModuleKind::Status, &module);
     }
 }
 

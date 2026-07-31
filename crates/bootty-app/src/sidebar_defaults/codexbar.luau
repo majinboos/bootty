@@ -107,6 +107,7 @@ local function usage_item(provider, label, window)
 		text_color = TEXT_COLOR,
 		muted_color = MUTED_COLOR,
 		color = color,
+		track = bootty.theme.border,
 		fill = remaining_pct / 100,
 		pace = pace,
 		pace_color = pace_color,
