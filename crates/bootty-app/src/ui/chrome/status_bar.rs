@@ -1192,7 +1192,7 @@ fn draw_items(
         }
 
         if let (Some(resp), Some(action)) = (response.as_ref(), item.action.as_deref())
-            && resp.clicked()
+            && resp.clicked_by(egui::PointerButton::Primary)
             && !input.suppress_click
         {
             input.clicked = Some(action.to_owned());
@@ -1706,6 +1706,85 @@ mod tests {
             ..ResolvedItem::default()
         };
         vec![cell(index), cell(name)]
+    }
+
+    fn show_test_status_bar(
+        ui: &mut egui::Ui,
+        segments: &[ResolvedSegment],
+        interaction_id: &'static str,
+    ) -> Option<StatusBarEvent> {
+        show_status_bar(
+            ui,
+            ThemePalette::default(),
+            StatusBarModel {
+                segments,
+                tab_context: None,
+                background: ThemePalette::default().base,
+                left_padding: STATUS_EDGE_PAD,
+                row_height: 30.0,
+                notch_x: None,
+                tab_rows: 1,
+                interaction_id,
+            },
+        )
+    }
+
+    #[test]
+    fn status_window_tabs_ignore_keyboard_activation_keys() {
+        for key in [egui::Key::Enter, egui::Key::Space] {
+            let context = egui::Context::default();
+            crate::ui::icons::install_icon_fonts(&context);
+            let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 30.0));
+            let segments = [ResolvedSegment {
+                align: SegmentAlign::Left,
+                source_slot: 0,
+                items: window_tab("@1", "1", "alpha"),
+            }];
+
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let id = status_item_id(
+                            "status-bar-keyboard-test",
+                            None,
+                            &segments[0],
+                            segments[0].source_slot,
+                            &segments[0].items[0],
+                            0,
+                            "@1",
+                        );
+                        ui.memory_mut(|memory| memory.request_focus(id));
+                        show_test_status_bar(ui, &segments, "status-bar-keyboard-test");
+                    });
+                },
+            );
+
+            let mut event = None;
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        event = show_test_status_bar(ui, &segments, "status-bar-keyboard-test");
+                    });
+                },
+            );
+
+            assert_eq!(event, None);
+        }
     }
 
     #[test]
