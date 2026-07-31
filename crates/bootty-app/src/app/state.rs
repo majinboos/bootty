@@ -5564,9 +5564,15 @@ impl AppState {
         }
         .max(1.0);
         self.config_state.current_mut().font.size = next_size;
-        effects.push(AppEffect::SetTerminalTextConfig(
-            self.config().font.terminal_text_config(),
-        ));
+        let text_config = self.config().font.terminal_text_config();
+        if let Some(existing) = effects.iter_mut().rev().find_map(|effect| match effect {
+            AppEffect::SetTerminalTextConfig(existing) => Some(existing),
+            _ => None,
+        }) {
+            *existing = text_config;
+        } else {
+            effects.push(AppEffect::SetTerminalTextConfig(text_config));
+        }
     }
 }
 
@@ -9854,6 +9860,30 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [AppEffect::SetTerminalTextConfig(_)]
+        ));
+    }
+    #[test]
+    fn repeated_font_size_steps_coalesce_renderer_reconfiguration() {
+        let mut state = test_state();
+        let initial_size = state.config().font.size;
+        let mut effects = Vec::new();
+
+        state.apply_keybind_action(
+            KeybindAction::Font(FontSizeAction::Increase(0.25)),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+        state.apply_keybind_action(
+            KeybindAction::Font(FontSizeAction::Increase(0.25)),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+
+        assert_eq!(state.config().font.size, initial_size + 0.5);
+        assert!(matches!(
+            effects.as_slice(),
+            [AppEffect::SetTerminalTextConfig(config)]
+                if config.font_size == initial_size + 0.5
         ));
     }
 

@@ -139,6 +139,8 @@ keybind = [
   "cmd+==increase_font_size:1",
   "cmd++=increase_font_size:1",
   "cmd+0=reset_font_size",
+  "alt+scroll_up=increase_font_size:0.25",
+  "alt+scroll_down=decrease_font_size:0.25",
   "performable:cmd+v=paste_from_clipboard",
   "shift+Enter=text:\\n",
   "cmd+alt+n=new_window",

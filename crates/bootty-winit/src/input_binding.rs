@@ -276,6 +276,8 @@ impl FromStr for BindingTrigger {
 pub enum BindingKey {
     Unicode(char),
     Physical(TerminalKey),
+    ScrollUp,
+    ScrollDown,
     CatchAll,
 }
 
@@ -286,6 +288,12 @@ impl BindingKey {
         }
         if let Some(key) = parse_physical_key(input)? {
             return Ok(Self::Physical(key));
+        }
+        if input.eq_ignore_ascii_case("scroll_up") {
+            return Ok(Self::ScrollUp);
+        }
+        if input.eq_ignore_ascii_case("scroll_down") {
+            return Ok(Self::ScrollDown);
         }
         if input.eq_ignore_ascii_case("space") {
             return Ok(Self::Unicode(' '));
@@ -316,6 +324,8 @@ impl BindingKey {
                     let _ = write!(output, "{key:?}");
                 }
             },
+            Self::ScrollUp => output.push_str("scroll_up"),
+            Self::ScrollDown => output.push_str("scroll_down"),
             Self::CatchAll => output.push_str("catch_all"),
         }
     }
@@ -324,6 +334,8 @@ impl BindingKey {
         match self {
             Self::Unicode(ch) => i32::try_from(u32::from(*ch)).unwrap_or(i32::MAX),
             Self::Physical(key) => *key as i32,
+            Self::ScrollUp => i32::MAX - 2,
+            Self::ScrollDown => i32::MAX - 1,
             Self::CatchAll => i32::MAX,
         }
     }
@@ -1156,6 +1168,22 @@ mod tests {
                     ..Default::default()
                 },
                 BindingKey::Unicode('+'),
+            ),
+            (
+                "alt+scroll_up=ignore",
+                BindingMods {
+                    alt: true,
+                    ..Default::default()
+                },
+                BindingKey::ScrollUp,
+            ),
+            (
+                "alt+scroll_down=ignore",
+                BindingMods {
+                    alt: true,
+                    ..Default::default()
+                },
+                BindingKey::ScrollDown,
             ),
         ] {
             assert_eq!(
