@@ -166,8 +166,8 @@ impl TerminalWidget {
         // Match the grid rect the renderer projects through, so pinch/pan math agrees with it.
         self.last_surface = Some(surface.grid_rect(frame.cols, frame.rows));
         self.handle_scrollbar_interaction(ui, widget_id, surface, frame.as_ref(), terminal)?;
-        self.handle_hyperlink_interaction(ui, surface, frame.as_ref(), &response);
         self.paint(ui, surface, &frame)?;
+        self.handle_hyperlink_interaction(ui, surface, frame.as_ref(), &response);
         self.metrics.render_state_update_us = frame.stats.render_state_update_us;
         self.metrics.frame_extraction_us = frame.stats.extraction_us;
         self.metrics.cells = frame.stats.cells;
@@ -216,15 +216,24 @@ impl TerminalWidget {
             .flatten()
             .and_then(|pos| hyperlink_at(frame, surface, self.view.inverse_point(pos)));
 
-        if let Some(url) = hovered_link {
+        if let Some(link) = hovered_link {
             let modifiers = ui.input(|input| input.modifiers);
             ui.ctx().set_cursor_icon(if modifiers.command {
                 egui::CursorIcon::PointingHand
             } else {
                 self.terminal_cursor_icon
             });
+            let rect = transformed_surface_rect(
+                surface.run_rect(link.start_col, link.row, link.cells),
+                self.view,
+            );
+            ui.painter().hline(
+                rect.x_range(),
+                rect.max.y - 1.0,
+                egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+            );
             if hyperlink_activation_requested(response.clicked(), modifiers) {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                ui.ctx().open_url(egui::OpenUrl::new_tab(link.url));
             }
         } else if response.hovered() {
             ui.ctx().set_cursor_icon(self.terminal_cursor_icon);
@@ -745,7 +754,15 @@ fn hyperlink_activation_requested(clicked: bool, modifiers: egui::Modifiers) -> 
     clicked && modifiers.command
 }
 
-fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Option<String> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HoveredLink {
+    url: String,
+    row: u16,
+    start_col: u16,
+    cells: u16,
+}
+
+fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Option<HoveredLink> {
     if !surface.rect.contains(pos) {
         return None;
     }
@@ -753,42 +770,70 @@ fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Opt
     if point.x >= frame.cols || point.y >= frame.rows {
         return None;
     }
-    let hyperlink = frame
-        .cells
-        .iter()
-        .find(|cell| cell.x == point.x && cell.y == point.y)
-        .and_then(|cell| cell.hyperlink.clone());
-    hyperlink.or_else(|| plain_url_at(frame, point.x, point.y))
-}
-
-fn plain_url_at(frame: &RenderFrame, x: u16, y: u16) -> Option<String> {
     let row = frame
         .cells
         .iter()
-        .filter(|cell| cell.y == y)
+        .filter(|cell| cell.y == point.y)
         .collect::<Vec<_>>();
-    let hovered = row.iter().position(|cell| cell.x == x)?;
-    let is_token = |cell: &&RenderCell| frame.cell_text(cell).iter().all(|ch| !ch.is_whitespace());
+    let hovered = row.iter().position(|cell| cell.x == point.x)?;
+    osc8_link_at(&row, hovered).or_else(|| plain_url_at(frame, &row, hovered))
+}
+
+fn osc8_link_at(row: &[&RenderCell], hovered: usize) -> Option<HoveredLink> {
+    let url = row[hovered].hyperlink.clone()?;
+    let same_link = |cell: &&RenderCell| cell.hyperlink.as_deref() == Some(url.as_str());
     let start = (0..=hovered)
+        .rev()
+        .take_while(|index| same_link(&row[*index]))
+        .last()
+        .unwrap_or(hovered);
+    let end = (hovered..row.len())
+        .take_while(|index| same_link(&row[*index]))
+        .last()
+        .unwrap_or(hovered);
+    Some(link_over_run(url, row, start, end))
+}
+
+fn plain_url_at(frame: &RenderFrame, row: &[&RenderCell], hovered: usize) -> Option<HoveredLink> {
+    let is_token = |cell: &&RenderCell| frame.cell_text(cell).iter().all(|ch| !ch.is_whitespace());
+    let mut start = (0..=hovered)
         .rev()
         .take_while(|index| is_token(&row[*index]))
         .last()
         .unwrap_or(hovered);
-    let end = (hovered..row.len())
+    let mut end = (hovered..row.len())
         .take_while(|index| is_token(&row[*index]))
         .last()
         .unwrap_or(hovered);
-    let token = row[start..=end]
+    let is_edge_punctuation = |cell: &&RenderCell| {
+        frame.cell_text(cell).iter().all(|ch| {
+            matches!(
+                ch,
+                '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
+            )
+        })
+    };
+    while start < end && is_edge_punctuation(&row[start]) {
+        start += 1;
+    }
+    while end > start && is_edge_punctuation(&row[end]) {
+        end -= 1;
+    }
+    let url = row[start..=end]
         .iter()
         .flat_map(|cell| frame.cell_text(cell))
         .collect::<String>();
-    let path = token.trim_matches(|ch| {
-        matches!(
-            ch,
-            '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-        )
-    });
-    (path.starts_with("http://") || path.starts_with("https://")).then(|| path.to_owned())
+    (url.starts_with("http://") || url.starts_with("https://"))
+        .then(|| link_over_run(url, row, start, end))
+}
+
+fn link_over_run(url: String, row: &[&RenderCell], start: usize, end: usize) -> HoveredLink {
+    HoveredLink {
+        url,
+        row: row[start].y,
+        start_col: row[start].x,
+        cells: row[end].x - row[start].x + 1,
+    }
 }
 
 #[derive(Default)]
@@ -1005,10 +1050,82 @@ mod tests {
         };
 
         assert_eq!(
-            hyperlink_at(&frame, surface, Pos2::new(15.0, 10.0)).as_deref(),
-            Some("https://example.com")
+            hyperlink_at(&frame, surface, Pos2::new(15.0, 10.0)),
+            Some(HoveredLink {
+                url: "https://example.com".to_owned(),
+                row: 0,
+                start_col: 1,
+                cells: 1,
+            })
         );
         assert_eq!(hyperlink_at(&frame, surface, Pos2::new(5.0, 10.0)), None);
+    }
+
+    fn link_test_frame(text: &str, link: Option<(std::ops::Range<usize>, &str)>) -> RenderFrame {
+        RenderFrame {
+            cols: text.chars().count() as u16,
+            rows: 1,
+            cells: text
+                .chars()
+                .enumerate()
+                .map(|(x, _)| RenderCell {
+                    x: x as u16,
+                    y: 0,
+                    text_start: x,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: link
+                        .as_ref()
+                        .filter(|(range, _)| range.contains(&x))
+                        .map(|(_, url)| (*url).to_owned()),
+                })
+                .collect(),
+            text: text.chars().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn link_test_surface(text: &str) -> TerminalSurface {
+        TerminalSurface::for_size(
+            Vec2::new(text.chars().count() as f32 * 10.0, 20.0),
+            CellMetrics::new(10.0, 20.0),
+            TerminalPadding::default(),
+        )
+    }
+
+    #[test]
+    fn osc8_link_extent_covers_only_the_labelled_run() {
+        let text = "see label here";
+        let frame = link_test_frame(text, Some((4..9, "https://example.com")));
+
+        assert_eq!(
+            hyperlink_at(&frame, link_test_surface(text), Pos2::new(65.0, 10.0)),
+            Some(HoveredLink {
+                url: "https://example.com".to_owned(),
+                row: 0,
+                start_col: 4,
+                cells: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn plain_url_extent_excludes_wrapping_punctuation() {
+        let url = "https://example.com";
+        let text = format!("({url}),");
+        let frame = link_test_frame(&text, None);
+
+        assert_eq!(
+            hyperlink_at(&frame, link_test_surface(&text), Pos2::new(55.0, 10.0)),
+            Some(HoveredLink {
+                url: url.to_owned(),
+                row: 0,
+                start_col: 1,
+                cells: url.len() as u16,
+            })
+        );
     }
 
     #[test]
@@ -1092,8 +1209,13 @@ mod tests {
         };
 
         assert_eq!(
-            hyperlink_at(&frame, surface, Pos2::new(155.0, 10.0)).as_deref(),
-            Some(url)
+            hyperlink_at(&frame, surface, Pos2::new(155.0, 10.0)),
+            Some(HoveredLink {
+                url: url.to_owned(),
+                row: 0,
+                start_col: 0,
+                cells: url.len() as u16,
+            })
         );
     }
 
