@@ -18,14 +18,15 @@ pub fn automatic_update() -> Result<UpdateResult> {
     if std::env::var_os(SKIP_AUTOMATIC_UPDATE).is_some() {
         return Ok(UpdateResult::Skipped);
     }
-    let executable = std::env::current_exe().context("resolve the Bootty executable path")?;
-    if is_development_binary(&executable) {
-        return Ok(UpdateResult::Skipped);
-    }
     update(false)
 }
 
 pub fn update(show_output: bool) -> Result<UpdateResult> {
+    let executable = std::env::current_exe().context("resolve the Bootty executable path")?;
+    if is_development_binary(&executable) {
+        return Ok(UpdateResult::Skipped);
+    }
+
     #[cfg(target_os = "linux")]
     {
         let status = self_update::backends::github::Update::configure()
@@ -57,7 +58,7 @@ pub fn update(show_output: bool) -> Result<UpdateResult> {
             .repo_owner(REPOSITORY_OWNER)
             .repo_name(REPOSITORY_NAME)
             .bin_name(BINARY_NAME)
-            .bundle_path_in_archive("Bootty.app")
+            .bin_path_in_archive("Bootty.app/Contents/MacOS/bootty")
             .current_version(env!("CARGO_PKG_VERSION"))
             .no_confirm(true)
             .show_output(show_output)
@@ -100,20 +101,29 @@ pub fn restart_after_update() -> Result<()> {
 }
 
 fn is_development_binary(executable: &Path) -> bool {
-    executable.ancestors().any(|path| path.ends_with("target"))
+    executable
+        .ancestors()
+        .any(|path| path.ends_with("target") || path.join(".rustc_info.json").is_file())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{fs, path::Path};
 
     use super::is_development_binary;
 
     #[test]
-    fn development_binaries_skip_automatic_updates() {
+    fn development_binaries_skip_updates() {
         assert!(is_development_binary(Path::new(
             "/repo/target/debug/bootty"
         )));
+
+        let custom_target = tempfile::tempdir().unwrap();
+        fs::write(custom_target.path().join(".rustc_info.json"), "").unwrap();
+        assert!(is_development_binary(
+            &custom_target.path().join("debug/bootty")
+        ));
+
         assert!(!is_development_binary(Path::new(
             "/home/user/.local/bin/bootty"
         )));
