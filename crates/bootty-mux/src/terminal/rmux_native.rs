@@ -150,6 +150,13 @@ struct RmuxWorkerConfig {
     repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     waiting_initial_remote_frame: bool,
 }
+struct RmuxWorkerClosedGuard(Arc<AtomicBool>);
+
+impl Drop for RmuxWorkerClosedGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 struct RmuxWorker {
     pane_io: RmuxPaneIo,
@@ -520,6 +527,7 @@ impl Drop for RmuxNativeTerminal {
 fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
+        let _closed_guard = RmuxWorkerClosedGuard(Arc::clone(&config.closed));
         let (engine_input_tx, engine_input_rx) = mpsc::channel();
         let mut engine = match TerminalEngine::new_with_terminal_options(
             config.geometry,
@@ -1192,6 +1200,15 @@ fn drain_rmux_output_backlog_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_exit_marks_terminal_closed() {
+        let closed = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = RmuxWorkerClosedGuard(Arc::clone(&closed));
+        }
+
+        assert!(closed.load(Ordering::Relaxed));
+    }
 
     fn test_geometry() -> TerminalGeometry {
         TerminalGeometry {

@@ -1550,6 +1550,25 @@ impl AppState {
         self.activate_space_from_ui(target.id)
     }
 
+    fn persist_active_binding_restore_state(&mut self) {
+        let selected_session = self.binding.mux.selected_session().map(str::to_owned);
+        let selected_window = self.binding.mux.selected_window().map(str::to_owned);
+        let mut workspace = WorkspaceStore::for_config_path(&self.config().config_path);
+        if let Err(error) = workspace.set_binding_restore_state(
+            self.binding.scope,
+            self.binding.mux.last_error().is_some(),
+            selected_session.as_deref(),
+            selected_window.as_deref(),
+        ) {
+            self.last_error = Some(error.to_string());
+        }
+    }
+    fn persist_rmux_restore_state(&mut self) {
+        if selected_backend(&self.binding.multiplexer) == MultiplexerBackendConfig::Rmux {
+            self.persist_active_binding_restore_state();
+        }
+    }
+
     pub fn activate_space_from_ui(&mut self, space_id: SpaceId) -> bool {
         if space_id == self.active_space_id {
             return false;
@@ -1570,17 +1589,7 @@ impl AppState {
                 return false;
             }
         };
-        let mut workspace = WorkspaceStore::for_config_path(&self.config().config_path);
-        let selected_session = self.binding.mux.selected_session().map(str::to_owned);
-        let selected_window = self.binding.mux.selected_window().map(str::to_owned);
-        if let Err(error) = workspace.set_binding_restore_state(
-            self.binding.scope,
-            self.binding.mux.last_error().is_some(),
-            selected_session.as_deref(),
-            selected_window.as_deref(),
-        ) {
-            self.last_error = Some(error.to_string());
-        }
+        self.persist_active_binding_restore_state();
         self.binding.terminal.deactivate_backend_side_effects();
         let mut target = self.inactive_spaces.remove(index);
         self.binding.discard_terminal_side_effects();
@@ -1631,6 +1640,7 @@ impl AppState {
             to: self.active_space_id,
             started: Instant::now(),
         });
+        let workspace = WorkspaceStore::for_config_path(&self.config().config_path);
         if let Err(error) =
             workspace.set_selected_space(&self.window_state_key, self.active_space_id)
         {
@@ -2431,6 +2441,7 @@ impl AppState {
             self.last_pane_area = None;
         }
         self.binding.mux.activate_session(&target.session_id);
+        self.persist_rmux_restore_state();
         self.sync_native_layout_terminal_now();
         self.sidebar_hovered_session = Some(target.clone());
         (self.repaint)();
@@ -2485,6 +2496,7 @@ impl AppState {
         self.binding
             .mux
             .activate_window(session_id, window_id, &self.repaint, &mux_config);
+        self.persist_rmux_restore_state();
         self.sync_native_layout_terminal_now();
     }
 
@@ -2950,6 +2962,7 @@ impl AppState {
             &self.repaint,
             &mux_config,
         );
+        self.persist_rmux_restore_state();
         self.input_focus = InputFocus::Terminal;
     }
 
@@ -5279,6 +5292,7 @@ impl AppState {
         // reach the command builder's `unreachable!` for these Bootty-owned actions and panic.
         if let Some(target) = target {
             self.binding.mux.activate_session(&target);
+            self.persist_rmux_restore_state();
             self.sync_native_layout_terminal_now();
         }
         true
@@ -6851,6 +6865,24 @@ mod tests {
         assert_eq!(
             persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, true, false),
             PersistedSessionRestoreDecision::Restore
+        );
+    }
+    #[test]
+    fn rmux_session_activation_persists_last_focused_session() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Rmux;
+        });
+        let config_path = state.config().config_path.clone();
+
+        state.activate_session_from_ui("last-focused");
+
+        let workspace = WorkspaceStore::for_config_path(&config_path);
+        assert_eq!(
+            workspace
+                .binding()
+                .and_then(|binding| binding.selection())
+                .map(|selection| selection.session_id()),
+            Some("last-focused")
         );
     }
 
