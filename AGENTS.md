@@ -1,7 +1,17 @@
 # Bootty
 
-PR flow: create a feature branch before committing, open a PR when requested, and merge only with explicit user instruction.
-After a merge, sync local `main`; never commit directly to `main`.
+## Branch and PR Flow
+
+- Before editing, run `gh stack view --short` and identify the intended parent.
+- Independent work starts from `main` with a new `gh stack` branch.
+- Work that depends on an open PR starts from that PR's branch, then uses
+  `gh stack add <branch>` before any edits or commits.
+- Create the branch first; never let an existing checkout or dirty worktree
+  accidentally choose the PR base.
+- Before submitting, verify the full chain is exactly
+  `main <- dependency PRs <- new PRs`.
+- Open PRs only when requested. Merge only with explicit user instruction.
+- After a merge, sync local `main`. Never commit directly to `main`.
 
 ## Run Modes
 
