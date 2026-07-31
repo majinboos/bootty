@@ -6,6 +6,7 @@
 mod appearance;
 mod font;
 mod keybinds;
+mod modules;
 mod session;
 mod status_bar;
 mod window;
@@ -141,6 +142,29 @@ const PAGE_META: [PageMeta; 10] = [
             "selected",
             "hover",
             "border",
+            "modules",
+            "luau",
+            "source",
+        ],
+    },
+    PageMeta {
+        page: SettingsPage::Status,
+        group: "Core",
+        label: "Status Bar",
+        icon: "activity",
+        title: "Status Bar",
+        terms: &[
+            "status",
+            "modules",
+            "segments",
+            "clock",
+            "sysinfo",
+            "alignment",
+            "icon",
+            "foreground",
+            "background",
+            "luau",
+            "source",
         ],
     },
     PageMeta {
@@ -158,24 +182,6 @@ const PAGE_META: [PageMeta; 10] = [
             "colorterm",
             "scrollback",
             "glyph protocol",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Status,
-        group: "Terminal",
-        label: "Status",
-        icon: "activity",
-        title: "Status",
-        terms: &[
-            "status",
-            "modules",
-            "segments",
-            "clock",
-            "sysinfo",
-            "alignment",
-            "icon",
-            "foreground",
-            "background",
         ],
     },
     PageMeta {
@@ -270,6 +276,7 @@ pub struct SettingsSurface {
     /// The global style captured when settings opened, restored on close so the
     /// settings-only widget overrides don't leak into the main UI's popups.
     base_style: Option<egui::Style>,
+    module_editor: modules::EditorState,
 }
 
 pub(super) type SettingsWindow = SettingsSurface;
@@ -298,7 +305,12 @@ impl SettingsSurface {
             last_write_error: None,
             pending_keybind_focus: None,
             base_style: None,
+            module_editor: modules::EditorState::default(),
         }
+    }
+
+    pub fn is_recording_keybind(&self) -> bool {
+        self.keybind_capture.is_some() || self.prefix_capture
     }
 
     /// Jump to the keybindings page focused on `action` (in the Global list),
@@ -584,8 +596,10 @@ impl SettingsSurface {
                                 );
                             }
                             let max_width = match self.page {
-                                SettingsPage::Keys | SettingsPage::Status => 1040.0,
-                                SettingsPage::Appearance | SettingsPage::Sidebar => 860.0,
+                                SettingsPage::Keys
+                                | SettingsPage::Status
+                                | SettingsPage::Sidebar => 1040.0,
+                                SettingsPage::Appearance => 860.0,
                                 _ => 780.0,
                             };
                             let content_width = ui.available_width().min(max_width);
@@ -676,6 +690,7 @@ impl SettingsSurface {
             path_row(ui, self.palette, "Config directory", parent);
             path_row(ui, self.palette, "Themes directory", &parent.join("themes"));
             path_row(ui, self.palette, "Status modules", &parent.join("status"));
+            path_row(ui, self.palette, "Sidebar modules", &parent.join("sidebar"));
         }
         section(ui, self.palette, "RELOAD");
         let status = self
@@ -755,6 +770,7 @@ impl SettingsSurface {
             self.keybind_loaded_scope = None;
             self.keybind_capture = None;
         }
+        modules::sidebar_ui(self, ui);
     }
 
     fn diagnostics_ui(&mut self, ui: &mut egui::Ui) {
@@ -859,6 +875,11 @@ impl SettingsSurface {
             array.push(value.as_str());
         }
         self.write(move |document| document.set_item(path, bootty_config::toml_edit::value(array)));
+    }
+
+    fn set_sidebar_modules(&mut self) {
+        let modules = self.config.sidebar.modules.clone();
+        self.set_strings(&["sidebar", "modules"], &modules);
     }
 
     fn contains_config_value(&self, path: &[&str]) -> bool {
@@ -2189,15 +2210,15 @@ mod tests {
                 SettingsPage::Appearance,
                 SettingsPage::Window,
                 SettingsPage::Sidebar,
-                SettingsPage::Shell,
                 SettingsPage::Status,
+                SettingsPage::Shell,
                 SettingsPage::Keys,
                 SettingsPage::Config,
                 SettingsPage::Diagnostics,
             ]
         );
         assert_eq!(PAGE_META[0].group, "Core");
-        assert_eq!(PAGE_META[5].group, "Terminal");
+        assert_eq!(PAGE_META[6].group, "Terminal");
         assert_eq!(PAGE_META[8].group, "Advanced");
     }
 

@@ -57,12 +57,8 @@ const EGUI_SYMBOL_FALLBACK_FAMILIES: &[&str] = &[
 ];
 const EGUI_SYMBOL_FALLBACK_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-fn status_segment_visible(segment: &crate::config::StatusSegment, sidebar_visible: bool) -> bool {
-    !(sidebar_visible && segment.module == "session")
-}
-
-fn sidebar_visible_for_spaces(configured: bool, space_count: usize) -> bool {
-    configured || space_count > 0
+fn sidebar_visible_for_spaces(configured: bool, _space_count: usize) -> bool {
+    configured
 }
 
 fn sidebar_content_height(sidebar_height: f32) -> f32 {
@@ -543,9 +539,8 @@ impl BoottyApp {
     fn resolve_status_segments(
         &self,
         segments: &[crate::config::StatusSegment],
-        sidebar_visible: bool,
     ) -> Vec<chrome::ResolvedSegment> {
-        let mux_view = self.current_extension_mux_view();
+        let mux_view = self.current_extension_mux_view(self.state.config().chrome.sidebar);
         let palette = self.state.ui_theme().palette;
         let windows_theme = crate::extensions::BuiltinWindowsTheme {
             accent: palette.accent,
@@ -559,7 +554,6 @@ impl BoottyApp {
         segments
             .iter()
             .enumerate()
-            .filter(|(_, segment)| status_segment_visible(segment, sidebar_visible))
             .filter_map(|(source_slot, segment)| {
                 let seg_fg = segment.fg.map(crate::theme::config_color32);
                 let seg_bg = segment.bg.map(crate::theme::config_color32);
@@ -598,7 +592,7 @@ impl BoottyApp {
             .collect()
     }
 
-    fn current_extension_mux_view(&self) -> crate::extensions::MuxView {
+    fn current_extension_mux_view(&self, sidebar_visible: bool) -> crate::extensions::MuxView {
         let selected = self.state.mux().selected_window();
         let mut windows = self
             .state
@@ -645,6 +639,7 @@ impl BoottyApp {
             windows,
             sessions,
             session,
+            sidebar_visible,
             session_color,
             keep_awake: self.keep_awake.is_some(),
         }
@@ -765,18 +760,17 @@ impl BoottyApp {
                 .into_iter()
                 .chain(bottom_bar_visible.then_some(chrome.bottom_segments.as_slice()))
                 .flatten()
-                .filter(|segment| status_segment_visible(segment, sidebar_visible))
                 .map(|segment| segment.module.clone()),
         );
 
-        if sidebar_visible {
-            self.sidebar_extensions
-                .set_active([String::from("sessions"), String::from("codexbar")]);
-        } else {
-            self.sidebar_extensions.set_active(Vec::new());
-        }
+        self.sidebar_extensions.set_active(
+            sidebar_visible
+                .then_some(self.state.config().sidebar.modules.iter().cloned())
+                .into_iter()
+                .flatten(),
+        );
 
-        let view = self.current_extension_mux_view();
+        let view = self.current_extension_mux_view(sidebar_visible);
         self.status_extensions.update_mux(view.clone());
         self.sidebar_extensions.update_mux(view);
     }
@@ -1260,15 +1254,21 @@ impl BoottyApp {
                 .reorder_session_before(&reorder.source, reorder.before.as_deref());
         }
         self.publish_extension_mux_view(sidebar, top_bar, bottom_bar);
-        let sidebar_session_items = if sidebar {
-            self.sidebar_extensions.items("sessions")
+        let (sidebar_module_items, sidebar_footer_items) = if sidebar {
+            let mut body = Vec::new();
+            let mut footer = Vec::new();
+            for name in &self.state.config().sidebar.modules {
+                for item in self.sidebar_extensions.items(name) {
+                    if item.kind.as_deref() == Some("footer") {
+                        footer.push(item);
+                    } else {
+                        body.push(item);
+                    }
+                }
+            }
+            (body, footer)
         } else {
-            Vec::new()
-        };
-        let sidebar_footer_items = if sidebar {
-            self.sidebar_extensions.items("codexbar")
-        } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         let spaces = self.state.space_summaries();
         let active_space_appearance = spaces
@@ -1293,7 +1293,7 @@ impl BoottyApp {
             crate::ui::sidebar::build_binding_sidebar_items(&binding_groups)
         } else {
             crate::ui::sidebar::build_sidebar_items_from_module_items(
-                &sidebar_session_items,
+                &sidebar_module_items,
                 self.state.mux_scope(),
                 self.state.mux().selected_session(),
                 self.state.mux().previous_selected_session().is_some(),
@@ -1343,12 +1343,12 @@ impl BoottyApp {
         };
         let status_left_padding = status_bar_left_padding(sidebar, sidebar_on_right);
         let top_segments = if top_bar {
-            self.resolve_status_segments(&chrome_config.top_segments, sidebar)
+            self.resolve_status_segments(&chrome_config.top_segments)
         } else {
             Vec::new()
         };
         let bottom_segments = if bottom_bar {
-            self.resolve_status_segments(&chrome_config.bottom_segments, sidebar)
+            self.resolve_status_segments(&chrome_config.bottom_segments)
         } else {
             Vec::new()
         };
@@ -2038,17 +2038,25 @@ impl BoottyApp {
     }
 }
 
+fn suppress_settings_recorder_duplicates(
+    events: &mut Vec<egui::Event>,
+    direct_inputs: &[crate::direct_input::DirectKeyInput],
+    recording: bool,
+) {
+    if recording {
+        suppress_egui_events_for_direct_input(events, direct_inputs);
+    }
+}
+
 impl eframe::App for BoottyApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.state.drain_direct_input();
         self.state.set_lua_window_open(self.lua_window.is_some());
         if self.settings_open {
-            // Drop egui key events that have a direct-input counterpart so the keybind recorder reads
-            // each cmd-chord once — from the direct path (which keeps full modifiers) rather than
-            // also from egui (or its collapsed copy/cut/paste).
-            suppress_egui_events_for_direct_input(
+            suppress_settings_recorder_duplicates(
                 &mut raw_input.events,
                 self.state.pending_direct_input(),
+                self.settings.is_recording_keybind(),
             );
             return;
         }
@@ -2351,6 +2359,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_editor_keeps_command_shortcuts_outside_keybind_recording() {
+        use winit::keyboard::{KeyCode, ModifiersState};
+
+        let direct_inputs = [KeyCode::Backspace, KeyCode::Slash]
+            .into_iter()
+            .map(|key| {
+                crate::direct_input::direct_key_input_from_winit_code(
+                    key,
+                    ModifiersState::SUPER,
+                    ModifierSideState::default(),
+                    false,
+                )
+                .expect("direct command input")
+            })
+            .collect::<Vec<_>>();
+        let command = egui::Modifiers {
+            command: true,
+            mac_cmd: true,
+            ..Default::default()
+        };
+        let editor_events = || {
+            [egui::Key::Backspace, egui::Key::Slash]
+                .into_iter()
+                .map(|key| egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: command,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut events = editor_events();
+        suppress_settings_recorder_duplicates(&mut events, &direct_inputs, false);
+        assert_eq!(events.len(), 2);
+
+        suppress_settings_recorder_duplicates(&mut events, &direct_inputs, true);
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn indeterminate_progress_bounces_across_the_full_track() {
         assert_eq!(indeterminate_progress_left(100.0, 0.0), 0.0);
         assert_eq!(indeterminate_progress_left(100.0, 0.75), 75.0);
@@ -2436,25 +2486,6 @@ mod tests {
     }
 
     #[test]
-    fn session_status_segment_tracks_sidebar_visibility() {
-        let segment = crate::config::StatusSegment {
-            module: "session".to_owned(),
-            ..Default::default()
-        };
-        assert!(!status_segment_visible(&segment, true));
-        assert!(status_segment_visible(&segment, false));
-    }
-
-    #[test]
-    fn non_session_status_segments_remain_visible_with_sidebar() {
-        let segment = crate::config::StatusSegment {
-            module: "windows".to_owned(),
-            ..Default::default()
-        };
-        assert!(status_segment_visible(&segment, true));
-    }
-
-    #[test]
     fn status_bar_background_defaults_to_sidebar_background_default() {
         let palette = bootty_ui::ThemePalette::default();
         let chrome = crate::config::ChromeConfig::default();
@@ -2499,9 +2530,9 @@ mod tests {
     }
 
     #[test]
-    fn multiple_spaces_keep_the_space_switcher_visible_when_sidebar_is_disabled() {
-        assert!(sidebar_visible_for_spaces(false, 1));
-        assert!(sidebar_visible_for_spaces(false, 2));
+    fn sidebar_visibility_respects_the_toggle_when_spaces_exist() {
+        assert!(!sidebar_visible_for_spaces(false, 1));
+        assert!(!sidebar_visible_for_spaces(false, 2));
         assert!(sidebar_visible_for_spaces(true, 1));
     }
 

@@ -246,7 +246,7 @@ struct ChromePatch {
 
 /// Sidebar placement and color overrides. Colors layer on top of the active theme; an unset slot
 /// falls back to the theme-derived value.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarConfig {
     pub position: SidebarPosition,
     pub background: Option<Color>,
@@ -254,6 +254,22 @@ pub struct SidebarConfig {
     pub selected: Option<Color>,
     pub hover: Option<Color>,
     pub border: Option<Color>,
+    /// Ordered sidebar modules. User files use their stem under `<config>/sidebar/`.
+    pub modules: Vec<String>,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            position: SidebarPosition::Left,
+            background: None,
+            foreground: None,
+            selected: None,
+            hover: None,
+            border: None,
+            modules: vec!["sessions".to_owned(), "codexbar".to_owned()],
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -277,6 +293,7 @@ struct SidebarPatch {
     #[serde(rename = "fullscreen-hover")]
     _fullscreen_hover: Option<Color>,
     border: Option<Color>,
+    modules: Option<Vec<String>>,
 }
 
 /// One status-bar segment: a Luau module (builtin default or user file) plus optional style. The
@@ -1714,6 +1731,7 @@ fn apply_partial_sidebar(sidebar: &mut SidebarConfig, partial: SidebarPatch) {
     apply_present(&mut sidebar.selected, partial.selected);
     apply_present(&mut sidebar.hover, partial.hover);
     apply_present(&mut sidebar.border, partial.border);
+    apply_value(&mut sidebar.modules, partial.modules);
 }
 
 fn apply_partial_multiplexer(multiplexer: &mut MultiplexerConfig, partial: MultiplexerPatch) {

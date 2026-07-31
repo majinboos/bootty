@@ -241,6 +241,18 @@ fn defaults_put_current_status_modules_in_visible_top_bar() {
 }
 
 #[test]
+fn sidebar_modules_default_and_override_in_order() {
+    let defaults = load_config_source("");
+    assert_eq!(defaults.sidebar.modules, ["sessions", "codexbar"]);
+
+    let configured = load_config_source(indoc! {r#"
+        [sidebar]
+        modules = ["custom", "sessions"]
+    "#});
+    assert_eq!(configured.sidebar.modules, ["custom", "sessions"]);
+}
+
+#[test]
 fn chrome_bars_configure_visibility_and_modules_independently() {
     let config = load_config_source(indoc! {r#"
         [chrome]

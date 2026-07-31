@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 
 pub fn display_path(path: &str) -> String {
-    if let Some(home) = home_dir() {
-        let home = home.to_string_lossy();
-        if let Some(rest) = path.strip_prefix(home.as_ref()) {
-            return format!("~{rest}");
-        }
+    let path = Path::new(path);
+    if let Some(home) = home_dir()
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        return Path::new("~").join(relative).display().to_string();
     }
-    path.to_owned()
+    path.display().to_string()
 }
 
 pub fn session_name_for_path(path: &str) -> String {
@@ -171,6 +171,24 @@ mod tests {
         assert_eq!(
             unique_session_name("bootty/main", ["other/main"]),
             "bootty/main"
+        );
+    }
+
+    #[test]
+    fn display_path_contracts_home_without_contracting_lookalike_prefixes() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let child = home.join("src");
+        let lookalike = PathBuf::from(format!("{}-backup", home.display()));
+
+        assert_eq!(
+            display_path(&child.to_string_lossy()),
+            Path::new("~").join("src").display().to_string()
+        );
+        assert_eq!(
+            display_path(&lookalike.to_string_lossy()),
+            lookalike.display().to_string()
         );
     }
 
