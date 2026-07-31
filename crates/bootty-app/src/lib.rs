@@ -29,5 +29,6 @@ pub mod strings;
 pub mod terminal;
 pub mod theme;
 pub mod ui;
+pub mod update;
 pub(crate) mod workspace;
 pub mod worktree_catalog;
