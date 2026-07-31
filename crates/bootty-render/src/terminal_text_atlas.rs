@@ -390,6 +390,10 @@ impl GlyphAtlas {
         while reserved.is_none() && self.grow_for_glyph(width, height) {
             reserved = self.reserve(width, height);
         }
+        if reserved.is_none() && width + 2 <= self.width && height + 2 <= self.height {
+            self.recycle();
+            reserved = self.reserve(width, height);
+        }
         let mut entry = reserved.unwrap_or(GlyphAtlasEntry {
             x: 0,
             y: 0,
@@ -624,6 +628,20 @@ impl GlyphAtlas {
         Ok(())
     }
 
+    fn recycle(&mut self) {
+        self.allocations.clear();
+        self.entries.clear();
+        self.pixels.fill(0);
+        self.dirty_regions.clear();
+        self.next_x = 1;
+        self.next_y = 1;
+        self.row_height = 0;
+        self.no_fit_at_least = None;
+        self.modified = self.modified.saturating_add(1);
+        // Same-size recycle still invalidates every cached UV and GPU texture.
+        self.resized = self.resized.saturating_add(1);
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -712,6 +730,7 @@ struct AsciiGlyphAtlasRecord {
     pixels_per_point_bits: u32,
     width: u32,
     height: u32,
+    atlas_resized_count: u64,
     record: GlyphAtlasRecord,
 }
 
@@ -1124,12 +1143,14 @@ impl TextAtlasBuilder {
         let font_size_bits = request.command.font_size.to_bits();
         let pixels_per_point_bits = request.pixels_per_point.to_bits();
         let cache_index = usize::from(ch);
+        let atlas_resized_count = self.atlas.resized_count();
         if let Some(cached) = &self.ascii_glyph_cache[cache_index]
             && cached.face == request.face_key
             && cached.font_size_bits == font_size_bits
             && cached.pixels_per_point_bits == pixels_per_point_bits
             && cached.width == request.glyph_width
             && cached.height == request.glyph_height
+            && cached.atlas_resized_count == atlas_resized_count
         {
             return (cached.record.entry, cached.record.is_color_glyph);
         }
@@ -1144,6 +1165,7 @@ impl TextAtlasBuilder {
             pixels_per_point_bits,
             width,
             height,
+            atlas_resized_count: self.atlas.resized_count(),
             record: GlyphAtlasRecord {
                 entry,
                 is_color_glyph,

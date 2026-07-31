@@ -350,6 +350,51 @@ fn glyph_atlas_grows_to_fit_instead_of_dropping_glyphs() {
 }
 
 #[test]
+fn glyph_atlas_recycles_at_the_size_cap_instead_of_dropping_glyphs() {
+    let mut atlas = GlyphAtlas::new(4096, 4096);
+    let face = GlyphAtlasFaceKey::new(regular_face("Maple Mono", &[]));
+    let mut first_key = None;
+
+    for i in 0..5 {
+        let key = GlyphAtlasKey {
+            face: face.clone(),
+            text: GlyphAtlasTextKey::new(format!("large-{i}")),
+            font_size_bits: 16.0_f32.to_bits(),
+            pixels_per_point_bits: 2.0_f32.to_bits(),
+            width: 2046,
+            height: 2046,
+        };
+        if i == 0 {
+            first_key = Some(key.clone());
+        }
+        let entry = atlas.insert_or_get_with(key, 2046, 2046, || vec![255; 2046 * 2046]);
+        assert_eq!(
+            (entry.width, entry.height),
+            (2046, 2046),
+            "glyph {i} was dropped after the atlas reached its size cap"
+        );
+    }
+
+    assert!(atlas.get(&first_key.expect("first key")).is_none());
+    assert_eq!(atlas.len(), 1);
+    assert_eq!(atlas.resized_count(), 1);
+}
+
+#[test]
+fn ascii_glyph_cache_refreshes_after_atlas_recycle() {
+    let mut builder = TextAtlasBuilder::new(64, 64);
+    let command = text_command("A");
+
+    assert_eq!(builder.prepare_text_command(&command, 1.0).len(), 1);
+    assert_eq!(builder.atlas.len(), 1);
+    builder.atlas.recycle();
+    assert!(builder.atlas.is_empty());
+
+    assert_eq!(builder.prepare_text_command(&command, 1.0).len(), 1);
+    assert_eq!(builder.atlas.len(), 1);
+}
+
+#[test]
 fn sprite_quad_uvs_sample_texel_centers_not_transparent_atlas_gutters() {
     let mut builder = TextAtlasBuilder::new_rgba(64, 64);
     let rect = SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0);
