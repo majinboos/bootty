@@ -2202,9 +2202,18 @@ fn suppress_terminal_payload_for_settings(
 fn take_scroll_for_pan(events: &mut Vec<egui::Event>, line_height: f32) -> Vec2 {
     let mut pan = Vec2::ZERO;
     events.retain(|event| {
-        let egui::Event::MouseWheel { unit, delta, .. } = event else {
+        let egui::Event::MouseWheel {
+            unit,
+            delta,
+            modifiers,
+            ..
+        } = event
+        else {
             return true;
         };
+        if modifiers.alt {
+            return true;
+        }
         let scale = match unit {
             egui::MouseWheelUnit::Point => 1.0,
             egui::MouseWheelUnit::Line => line_height,
@@ -2620,6 +2629,37 @@ mod tests {
 
         assert!(events.is_empty());
         assert!(drops.is_empty());
+    }
+    #[test]
+    fn zoom_pan_leaves_modified_scroll_for_keybindings() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let mut events = vec![
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            },
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, 1.0),
+                modifiers: alt,
+                phase: egui::TouchPhase::Move,
+            },
+        ];
+
+        assert_eq!(
+            take_scroll_for_pan(&mut events, 22.0),
+            egui::vec2(0.0, 22.0)
+        );
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            egui::Event::MouseWheel { modifiers, .. } if *modifiers == alt
+        ));
     }
 
     #[test]

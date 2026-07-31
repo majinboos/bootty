@@ -398,6 +398,54 @@ fn bench_wgpu_prepare(c: &mut Criterion) {
         });
     }
 }
+fn bench_wgpu_zoom_prepare(c: &mut Criterion) {
+    let context = create_wgpu_bench_context();
+    let frame = ascii_dirty_text_frame(0);
+    let mut renderer = TerminalWgpuRenderer::new(&context.device, context.format);
+    let steady_view = ViewTransform {
+        zoom: 1.5,
+        pan_x: 0.0,
+        pan_y: 0.0,
+    };
+    black_box(renderer.prepare_terminal_frame(
+        &context.device,
+        &context.queue,
+        &frame,
+        1.0,
+        steady_view,
+    ));
+
+    c.bench_function("wgpu_prepare_zoom_steady_ascii_text_240x90", |b| {
+        b.iter(|| {
+            black_box(renderer.prepare_terminal_frame(
+                &context.device,
+                &context.queue,
+                &frame,
+                1.0,
+                steady_view,
+            ))
+        })
+    });
+
+    let mut tick = 0_u32;
+    c.bench_function("wgpu_prepare_zoom_churn_ascii_text_240x90", |b| {
+        b.iter(|| {
+            tick = tick.wrapping_add(1);
+            let zoom = 1.1 + (tick % 64) as f32 * (0.8 / 63.0);
+            black_box(renderer.prepare_terminal_frame(
+                &context.device,
+                &context.queue,
+                &frame,
+                1.0,
+                ViewTransform {
+                    zoom,
+                    pan_x: 0.0,
+                    pan_y: 0.0,
+                },
+            ))
+        })
+    });
+}
 fn bench_wgpu_dirty_text_prepare(c: &mut Criterion) {
     let context = create_wgpu_bench_context();
     let frames = (0..16).map(ascii_dirty_text_frame).collect::<Vec<_>>();
@@ -658,6 +706,7 @@ name = benches;
 config = Criterion::default().noise_threshold(0.15);
 targets =
     bench_wgpu_prepare,
+    bench_wgpu_zoom_prepare,
     bench_wgpu_dirty_text_prepare,
     bench_wgpu_scroll_text_prepare,
     bench_terminal_text_draws_dirty_ascii,

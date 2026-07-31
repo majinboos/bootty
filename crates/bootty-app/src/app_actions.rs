@@ -195,6 +195,18 @@ impl AppKeyBindings {
             modifier_sides,
         ))
     }
+    pub fn action_for_scroll_with_modifier_sides(
+        &mut self,
+        up: bool,
+        modifiers: egui::Modifiers,
+        modifier_sides: ModifierSideState,
+    ) -> Option<KeybindAction> {
+        self.action_for_candidates(binding_triggers_for_egui_scroll_with_modifier_sides(
+            up,
+            modifiers,
+            modifier_sides,
+        ))
+    }
 
     pub fn action_for_input(&mut self, input: KeyInput) -> Option<KeybindAction> {
         self.action_for_candidates(binding_triggers_for_key_input(input))
@@ -324,6 +336,13 @@ pub fn split_app_actions_for_bindings_with_modifier_sides(
             } => app_key_bindings
                 .action_for_key_with_modifier_sides(*key, *modifiers, modifier_sides)
                 .or_else(|| builtin_app_action_for_key(*key, *modifiers)),
+            egui::Event::MouseWheel {
+                delta, modifiers, ..
+            } if delta.y != 0.0 => app_key_bindings.action_for_scroll_with_modifier_sides(
+                delta.y > 0.0,
+                *modifiers,
+                modifier_sides,
+            ),
             _ => None,
         };
         if let Some(action) = action {
@@ -578,6 +597,31 @@ fn binding_triggers_for_egui_key_with_modifier_sides(
     };
     binding_triggers_for_key_input(input)
 }
+fn binding_triggers_for_egui_scroll_with_modifier_sides(
+    up: bool,
+    modifiers: egui::Modifiers,
+    modifier_sides: ModifierSideState,
+) -> Vec<BindingTrigger> {
+    let input = KeyInput {
+        key: TerminalKey::A,
+        mods: key_mods_for_egui_binding(modifiers, modifier_sides),
+        repeat: false,
+        utf8: None,
+        unshifted: None,
+    };
+    let key = if up {
+        BindingKey::ScrollUp
+    } else {
+        BindingKey::ScrollDown
+    };
+    BindingTrigger::input_mod_candidates(input)
+        .into_iter()
+        .map(|mods| BindingTrigger {
+            mods,
+            key: key.clone(),
+        })
+        .collect()
+}
 
 fn key_mods_for_egui_binding(
     modifiers: egui::Modifiers,
@@ -740,6 +784,36 @@ mod tests {
                 }
             ),
             Some(KeybindAction::App(AppAction::SessionPicker))
+        );
+    }
+    #[test]
+    fn app_keybindings_route_modified_scroll_to_fractional_font_steps() {
+        let mut bindings = AppKeyBindings::from_keybinds(&[
+            "alt+scroll_up=increase_font_size:0.25".to_owned(),
+            "alt+scroll_down=decrease_font_size:0.25".to_owned(),
+        ])
+        .unwrap();
+        let modifiers = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let wheel = |delta_y| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, delta_y),
+            modifiers,
+            phase: egui::TouchPhase::Move,
+        };
+
+        let (terminal_events, actions) =
+            split_app_actions_for_bindings(&mut bindings, vec![wheel(2.0), wheel(-2.0)]);
+
+        assert!(terminal_events.is_empty());
+        assert_eq!(
+            actions,
+            vec![
+                KeybindAction::Font(FontSizeAction::Increase(0.25)),
+                KeybindAction::Font(FontSizeAction::Decrease(0.25)),
+            ]
         );
     }
 

@@ -188,6 +188,8 @@ lifecycle, fullscreen/sidebar chrome, mux session navigation, native tab/pane
 actions, and terminal scroll actions. `[input].sidebar-keybind` is sidebar-local
 and supports `ignore`, `previous_session`, `next_session`, `activate_session`,
 and `focus_terminal`.
+Wheel triggers use `scroll_up` and `scroll_down`; the default `alt+scroll`
+bindings adjust font size in quarter-point steps.
 
 Reload validates the full effective config first. If parsing, theme resolution,
 modifier remap parsing, keybind parsing, or live terminal color/cursor
