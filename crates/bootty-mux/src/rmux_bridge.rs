@@ -998,6 +998,16 @@ async fn run_pane_io_inner(
                 while let Ok(next) = input_rx.try_recv() {
                     text.push_str(&next);
                 }
+                if restore_pending {
+                    restore_pending = false;
+                    if !buffered_chunks.is_empty()
+                        && output_tx
+                            .send(RmuxPaneEvent::Chunks(std::mem::take(&mut buffered_chunks)))
+                            .is_err()
+                    {
+                        break;
+                    }
+                }
                 let result = pane.send_text(&text).await.map_err(|error| error.to_string());
                 let ok = result.is_ok();
                 let _ = result_tx.send(result);
