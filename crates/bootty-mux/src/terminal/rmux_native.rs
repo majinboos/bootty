@@ -1368,6 +1368,254 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires chafa and an isolated RMUX_TMPDIR"]
+    fn rmux_live_chafa_renders_kitty_image() -> Result<()> {
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
+
+        let client = SdkRmuxClient::new();
+        let session = format!("bootty-image-{}", std::process::id());
+        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        client.ensure_session(&session, &cwd)?;
+        let snapshot = client.snapshot()?;
+        let pane_id = snapshot
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == session)
+            .and_then(|session| session.windows.first())
+            .and_then(|window| window.panes.first())
+            .and_then(|pane| pane.pane_id.clone())
+            .context("image pane should exist")?;
+        let target = MuxPaneTarget::Pane {
+            session_id: session,
+            pane_id,
+            cwd: None,
+        };
+        let geometry = TerminalGeometry {
+            cols: 206,
+            rows: 52,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let mut terminal =
+            RmuxNativeTerminal::new(target, geometry, test_config(), Arc::new(|| {}))?;
+        terminal.write_input(b"printf '\\nBOOTTY_%s\\n' READY\r")?;
+        let ready_deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            terminal.drain_pty();
+            terminal.check_worker_error()?;
+            let frame = terminal.extract_frame()?;
+            if frame
+                .text
+                .iter()
+                .collect::<String>()
+                .contains("BOOTTY_READY")
+            {
+                break;
+            }
+            if Instant::now() >= ready_deadline {
+                anyhow::bail!("rmux shell did not become ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let image = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../bootty-app/assets/bootty-mascot.png");
+        terminal.write_input(
+            format!(
+                "chafa --format kitty '{}'; printf '\\nBOOTTY_%s\\n' CHAFA_DONE\r",
+                image.display()
+            )
+            .as_bytes(),
+        )?;
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            terminal.drain_pty();
+            terminal.check_worker_error()?;
+            let frame = terminal.extract_frame()?;
+            let text = frame.text.iter().collect::<String>();
+            if text.contains("BOOTTY_CHAFA_DONE") {
+                let placement = frame
+                    .images
+                    .placements
+                    .first()
+                    .context("chafa completed without a persistent image placement")?;
+                anyhow::ensure!(
+                    placement.data.len()
+                        == placement.image_width as usize * placement.image_height as usize * 4,
+                    "chafa image payload is incomplete"
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("chafa did not complete; terminal text: {text:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    fn rmux_live_two_processes_receive_the_same_pane_output() -> Result<()> {
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
+
+        let client = SdkRmuxClient::new();
+        let session = format!("bootty-shared-output-{}", std::process::id());
+        let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+        client.ensure_session(&session, &cwd)?;
+        let snapshot = client.snapshot()?;
+        let pane_id = snapshot
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == session)
+            .and_then(|session| session.windows.first())
+            .and_then(|window| window.panes.first())
+            .and_then(|pane| pane.pane_id.clone())
+            .context("shared output pane should exist")?;
+        let root = std::env::temp_dir();
+        let first_ready = root.join(format!("bootty-shared-first-{}", std::process::id()));
+        let second_ready = root.join(format!("bootty-shared-second-{}", std::process::id()));
+        let first_tmp = root.join(format!("bootty-shared-first-tmp-{}", std::process::id()));
+        let second_tmp = root.join(format!("bootty-shared-second-tmp-{}", std::process::id()));
+        std::fs::create_dir_all(&first_tmp)?;
+        std::fs::create_dir_all(&second_tmp)?;
+        let first_marker = format!("BOOTTY_SHARED_OUTPUT_{}", std::process::id());
+        let second_marker = format!("BOOTTY_SHARED_AFTER_DROP_{}", std::process::id());
+        let first = spawn_shared_output_child(
+            &session,
+            &pane_id,
+            &first_ready,
+            &first_tmp,
+            &first_marker,
+            None,
+        )?;
+        let second = spawn_shared_output_child(
+            &session,
+            &pane_id,
+            &second_ready,
+            &second_tmp,
+            &first_marker,
+            Some(&second_marker),
+        )?;
+        wait_for_shared_output_children(&first_ready, &second_ready)?;
+
+        rmux_live_send_text(&session, &pane_id, &format!("printf '{first_marker}\\n'\r"))?;
+        let first_output = first.wait_with_output()?;
+        anyhow::ensure!(
+            first_output.status.success(),
+            "first Bootty process missed shared output:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&first_output.stdout),
+            String::from_utf8_lossy(&first_output.stderr)
+        );
+
+        rmux_live_send_text(
+            &session,
+            &pane_id,
+            &format!("printf '{second_marker}\\n'\r"),
+        )?;
+        let second_output = second.wait_with_output()?;
+        anyhow::ensure!(
+            second_output.status.success(),
+            "remaining Bootty process froze after the first exited:\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&second_output.stdout),
+            String::from_utf8_lossy(&second_output.stderr)
+        );
+
+        let _ = std::fs::remove_file(first_ready);
+        let _ = std::fs::remove_file(second_ready);
+        let _ = std::fs::remove_dir(first_tmp);
+        let _ = std::fs::remove_dir(second_tmp);
+        client.kill_session(&session)?;
+        Ok(())
+    }
+
+    fn spawn_shared_output_child(
+        session: &str,
+        pane_id: &str,
+        ready: &std::path::Path,
+        tmpdir: &std::path::Path,
+        first_marker: &str,
+        second_marker: Option<&str>,
+    ) -> Result<std::process::Child> {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "terminal::rmux_native::tests::rmux_live_shared_output_process_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("BOOTTY_SHARED_SESSION", session)
+            .env("BOOTTY_SHARED_PANE", pane_id)
+            .env("BOOTTY_SHARED_READY", ready)
+            .env("TMPDIR", tmpdir)
+            .env("BOOTTY_SHARED_FIRST_MARKER", first_marker)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(marker) = second_marker {
+            command.env("BOOTTY_SHARED_SECOND_MARKER", marker);
+        }
+        Ok(command.spawn()?)
+    }
+
+    fn wait_for_shared_output_children(
+        first: &std::path::Path,
+        second: &std::path::Path,
+    ) -> Result<()> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !first.exists() || !second.exists() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("two Bootty processes did not initialize their rmux terminals");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "spawned by rmux_live_two_processes_receive_the_same_pane_output"]
+    fn rmux_live_shared_output_process_child() -> Result<()> {
+        let Ok(session) = std::env::var("BOOTTY_SHARED_SESSION") else {
+            return Ok(());
+        };
+        let pane_id = std::env::var("BOOTTY_SHARED_PANE")?;
+        let ready = std::env::var("BOOTTY_SHARED_READY")?;
+        let first_marker = std::env::var("BOOTTY_SHARED_FIRST_MARKER")?;
+        let target = MuxPaneTarget::Pane {
+            session_id: session,
+            pane_id,
+            cwd: None,
+        };
+        let mut terminal =
+            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::write(ready, b"ready")?;
+        wait_terminal_frame_contains(&mut terminal, &first_marker)?;
+        if let Ok(marker) = std::env::var("BOOTTY_SHARED_SECOND_MARKER") {
+            wait_terminal_frame_contains(&mut terminal, &marker)?;
+        }
+        Ok(())
+    }
+
+    fn wait_terminal_frame_contains(terminal: &mut RmuxNativeTerminal, marker: &str) -> Result<()> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            terminal.drain_pty();
+            terminal.check_worker_error()?;
+            let text = terminal.extract_frame()?.text.iter().collect::<String>();
+            if text.contains(marker) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("terminal process did not receive {marker:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
     #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
     fn rmux_live_ctrl_c_key_interrupts_foreground_process() -> Result<()> {
         std::env::var_os("RMUX_TMPDIR")

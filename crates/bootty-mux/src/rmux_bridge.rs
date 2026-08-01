@@ -1,6 +1,12 @@
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::{
+    collections::hash_map::DefaultHasher,
     env,
-    path::Path,
+    fs::{File, OpenOptions, TryLockError},
+    hash::{Hash, Hasher},
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
     sync::{OnceLock, mpsc},
     thread,
     time::Duration,
@@ -9,7 +15,8 @@ use std::{
 use anyhow::{Context, Result};
 use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TERMINAL_TERM};
 use rmux_proto::{
-    LastWindowRequest, RenameSessionRequest, Request, SwapWindowRequest, WindowTarget,
+    LastWindowRequest, PaneTarget, RenameSessionRequest, Request, Response, SwapWindowRequest,
+    WindowTarget,
 };
 use rmux_sdk::{
     EnsureSession, EnsureSessionPolicy, Pane, PaneAttributes, PaneCell, PaneColor, PaneCursor,
@@ -917,6 +924,145 @@ fn send_restored_output(
         .is_ok()
 }
 
+struct RmuxLiveOutput {
+    file: File,
+    lock_file: File,
+    endpoint: PathBuf,
+    pipe_target: PaneTarget,
+    path: PathBuf,
+    sequence: u64,
+}
+
+impl RmuxLiveOutput {
+    async fn open(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<Self> {
+        let pipe_target = pane_pipe_target(rmux, target).await?;
+        let endpoint = crate::bootty_rmux_endpoint_path()?;
+        let (path, lock_path) = rmux_pipe_paths(&endpoint, &pipe_target);
+        let lock_file = open_private_file(&lock_path)?;
+        let first_reader = match lock_file.try_lock() {
+            Ok(()) => true,
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Error(error)) => return Err(error).context("lock rmux output pipe"),
+        };
+
+        if !first_reader {
+            lock_file
+                .lock_shared()
+                .context("share rmux output pipe lock")?;
+        }
+        let existed = path.exists();
+        let mut file = open_private_file(&path)?;
+        if first_reader {
+            file.set_len(0)?;
+            set_rmux_pipe(
+                &endpoint,
+                &pipe_target,
+                Some(format!(
+                    "cat >> {}",
+                    crate::tmux_protocol::shell_quote(&path.to_string_lossy())
+                )),
+            )?;
+            lock_file.unlock()?;
+            lock_file
+                .lock_shared()
+                .context("share rmux output pipe lock")?;
+        } else if !existed {
+            set_rmux_pipe(
+                &endpoint,
+                &pipe_target,
+                Some(format!(
+                    "cat >> {}",
+                    crate::tmux_protocol::shell_quote(&path.to_string_lossy())
+                )),
+            )?;
+        }
+        file.seek(SeekFrom::End(0))?;
+
+        Ok(Self {
+            file,
+            lock_file,
+            endpoint,
+            pipe_target,
+            path,
+            sequence: 0,
+        })
+    }
+
+    fn poll_once(&mut self) -> Result<Vec<PaneOutputChunk>> {
+        let mut bytes = Vec::new();
+        self.file.read_to_end(&mut bytes)?;
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sequence = self.sequence;
+        self.sequence = self.sequence.saturating_add(1);
+        Ok(vec![PaneOutputChunk::Bytes { sequence, bytes }])
+    }
+}
+
+impl Drop for RmuxLiveOutput {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+        if self.lock_file.try_lock().is_ok() {
+            let _ = set_rmux_pipe(&self.endpoint, &self.pipe_target, None);
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn open_private_file(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .with_context(|| format!("open rmux output file {}", path.display()))
+}
+
+fn set_rmux_pipe(endpoint: &Path, target: &PaneTarget, command: Option<String>) -> Result<()> {
+    match rmux_client::connect(endpoint)?.pipe_pane(target.clone(), false, true, false, command)? {
+        Response::PipePane(_) => Ok(()),
+        Response::Error(error) => Err(anyhow::anyhow!(error.error)),
+        response => anyhow::bail!("unexpected rmux pipe-pane response: {response:?}"),
+    }
+}
+
+fn rmux_pipe_paths(endpoint: &Path, target: &PaneTarget) -> (PathBuf, PathBuf) {
+    let mut hasher = DefaultHasher::new();
+    endpoint.hash(&mut hasher);
+    target.hash(&mut hasher);
+    let id = hasher.finish();
+    let root = endpoint.parent().unwrap_or_else(|| Path::new("."));
+    (
+        root.join(format!("bootty-rmux-output-{id:016x}")),
+        root.join(format!("bootty-rmux-output-{id:016x}.lock")),
+    )
+}
+
+async fn pane_pipe_target(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<PaneTarget> {
+    let session_name = target.session_name()?;
+    let pane_id = target
+        .pane_id()
+        .context("rmux pane id required for output pipe")?;
+    let pane = list_pane_rows(rmux, &session_name)
+        .await?
+        .into_iter()
+        .find(|pane| pane.pane_id == pane_id.to_string())
+        .context("rmux output pipe pane not found")?;
+    let window_index = list_window_rows(rmux, &session_name)
+        .await?
+        .into_iter()
+        .find(|window| window.id == pane.window_id)
+        .map(|window| window.index)
+        .context("rmux output pipe window not found")?;
+    Ok(PaneTarget::with_window(
+        session_name,
+        window_index,
+        pane.index,
+    ))
+}
+
 async fn run_pane_io_inner(
     target: RmuxPaneTarget,
     max_scrollback: usize,
@@ -943,7 +1089,7 @@ async fn run_pane_io_inner(
     } else {
         replay_retained_kitty_keyboard_protocol(&pane, output_tx).await?;
     }
-    let mut output_stream = pane.output_stream_starting_at(PaneOutputStart::Now).await?;
+    let mut live_output = RmuxLiveOutput::open(&rmux, &target).await?;
     let mut restore_rx = start_restore_capture(target.clone(), max_scrollback);
     let mut restore_pending = true;
     let mut buffered_chunks = Vec::new();
@@ -963,7 +1109,7 @@ async fn run_pane_io_inner(
                 }
             }
             _ = tokio::time::sleep(output_poll_delay) => {
-                let chunks = output_stream.poll_once().await?;
+                let chunks = live_output.poll_once()?;
                 if chunks.is_empty() {
                     output_poll_delay = (output_poll_delay * 2).min(RMUX_OUTPUT_POLL_MAX_DELAY);
                 } else {
