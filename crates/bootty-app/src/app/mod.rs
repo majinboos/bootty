@@ -1028,13 +1028,9 @@ impl BoottyApp {
                 })
             };
             match result {
-                Some(Ok(surface)) => {
-                    if is_focused {
-                        state.record_surface(surface);
-                    }
-                }
+                Some(Ok(surface)) if is_focused => state.record_surface(surface),
+                Some(Ok(_)) | None => {}
                 Some(Err(error)) => state.record_render_error(error),
-                None => {}
             }
             let corner = pane_corner_radius(*rect, corner_radius_px);
             if !is_focused && inactive_dim > 0.0 {
