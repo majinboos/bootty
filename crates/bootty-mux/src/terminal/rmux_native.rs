@@ -162,7 +162,6 @@ struct RmuxWorker {
     pane_io: RmuxPaneIo,
     geometry: TerminalGeometry,
     engine: TerminalEngine,
-    engine_input_rx: mpsc::Receiver<Vec<u8>>,
     command_rx: mpsc::Receiver<RmuxTerminalCommand>,
     pending_command: Option<RmuxTerminalCommand>,
     latest_frame: Arc<RmuxPublishedFrame>,
@@ -528,8 +527,7 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let _closed_guard = RmuxWorkerClosedGuard(Arc::clone(&config.closed));
-        let (engine_input_tx, engine_input_rx) = mpsc::channel();
-        let mut engine = match TerminalEngine::new_with_terminal_options(
+        let engine = match TerminalEngine::new_with_terminal_options(
             config.geometry,
             config.terminal_config.colors,
             config.terminal_config.cursor,
@@ -543,17 +541,10 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
                 return;
             }
         };
-        if let Err(error) = engine.on_pty_write(move |_terminal, bytes| {
-            let _ = engine_input_tx.send(bytes.to_vec());
-        }) {
-            let _ = startup_tx.send(Err(error.to_string()));
-            return;
-        }
         let worker = RmuxWorker {
             pane_io: config.pane_io,
             geometry: config.geometry,
             engine,
-            engine_input_rx,
             command_rx: config.command_rx,
             latest_frame: config.latest_frame,
             latest_drain: config.latest_drain,
@@ -600,7 +591,6 @@ impl RmuxWorker {
             }
             terminal_changed |= stats.bytes > 0;
             did_work |= stats.bytes > 0;
-            terminal_changed |= self.drain_engine_input();
             self.drain_input_results();
             self.forward_side_effects();
 
@@ -958,15 +948,6 @@ impl RmuxWorker {
             self.update_pending_output_len();
         }
         stats
-    }
-
-    fn drain_engine_input(&mut self) -> bool {
-        let mut did_work = false;
-        while let Ok(bytes) = self.engine_input_rx.try_recv() {
-            did_work = true;
-            self.write_literal_input(&bytes);
-        }
-        did_work
     }
 
     fn drain_input_results(&mut self) {
