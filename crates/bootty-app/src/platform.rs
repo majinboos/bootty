@@ -372,24 +372,6 @@ pub fn disable_automatic_window_tabbing() {
 pub fn disable_automatic_window_tabbing() {}
 
 #[cfg(target_os = "macos")]
-pub fn sidebar_shortcut_hints() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("cmd+1-9", "session"),
-        ("cmd+shift+n/p", "nav"),
-        ("cmd+n", "new"),
-    ]
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn sidebar_shortcut_hints() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("ctrl+shift+1-9", "session"),
-        ("ctrl+shift+]/[", "nav"),
-        ("ctrl+shift+n", "new"),
-    ]
-}
-
-#[cfg(target_os = "macos")]
 pub fn new_tab_shortcut_trigger() -> &'static str {
     "cmd+t"
 }

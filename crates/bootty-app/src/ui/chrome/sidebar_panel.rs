@@ -71,7 +71,7 @@ pub enum SessionContextAction {
 }
 
 const SIDEBAR_HEADER_HEIGHT: f32 = 44.0;
-const SIDEBAR_FOOTER_BASE_HEIGHT: f32 = 44.0;
+const SIDEBAR_FOOTER_BASE_HEIGHT: f32 = 14.0;
 const SIDEBAR_MAX_FOOTER_ITEMS: usize = 4;
 const SIDEBAR_FOOTER_ITEM_HEIGHT: f32 = 30.0;
 const SIDEBAR_ROW_HEIGHT: f32 = 24.0;
@@ -1296,21 +1296,6 @@ fn paint_sidebar_footer(
         }
         row_y += SIDEBAR_FOOTER_ITEM_HEIGHT;
     }
-
-    let shortcut_color = readable_color(palette.base, palette.muted);
-    let galley = crate::ui::keycaps::shortcut_hint_galley_from_painter(
-        &painter,
-        palette,
-        crate::platform::sidebar_shortcut_hints(),
-        shortcut_color,
-        rect.width() - 28.0,
-        11.0,
-    );
-    painter.galley(
-        Pos2::new(rect.min.x + 14.0, rect.max.y - 18.0 - galley.size().y * 0.5),
-        galley,
-        shortcut_color,
-    );
 }
 
 fn paint_footer_fallback(
@@ -2023,7 +2008,7 @@ mod tests {
         let with_footer = sidebar_session_row_capacity(900.0, 0.0, true, 2);
 
         assert!(with_footer < plain);
-        assert_eq!(plain, 33);
+        assert_eq!(plain, 35);
     }
 
     fn space_swipe_test_items() -> (Vec<SpaceSwitcherItem>, SpaceId) {
