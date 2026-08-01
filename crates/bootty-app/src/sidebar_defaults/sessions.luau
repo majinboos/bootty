@@ -13,7 +13,7 @@ local function session_right(_, enriched)
 		return {
 			ui.text(
 				"+" .. tostring(enriched.diff_added),
-				{ x = 1, x_px = -46, color = SUCCESS_COLOR, align = "right_center", size = 12 }
+				{ x = 1, x_px = -62, color = SUCCESS_COLOR, align = "right_center", size = 12 }
 			),
 			ui.text(
 				"-" .. tostring(enriched.diff_removed),
