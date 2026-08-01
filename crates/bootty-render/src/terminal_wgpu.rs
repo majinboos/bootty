@@ -278,7 +278,7 @@ impl egui_wgpu::CallbackTrait for TerminalRenderCallback {
 
     fn paint(
         &self,
-        info: egui::epaint::PaintCallbackInfo,
+        _info: egui::epaint::PaintCallbackInfo,
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
@@ -286,10 +286,6 @@ impl egui_wgpu::CallbackTrait for TerminalRenderCallback {
             return;
         };
         if let Some(renderer) = cache.renderers.get(&self.key) {
-            if self.view != ViewTransform::IDENTITY {
-                let [x, y, width, height] = terminal_viewport(&info, self.view);
-                render_pass.set_viewport(x, y, width, height, 0.0, 1.0);
-            }
             renderer.paint(render_pass);
         };
     }
@@ -329,15 +325,6 @@ fn terminal_callback_key(
         max_x: surface.max_x.to_bits(),
         max_y: surface.max_y.to_bits(),
     }
-}
-fn terminal_viewport(info: &egui::epaint::PaintCallbackInfo, view: ViewTransform) -> [f32; 4] {
-    let pixels_per_point = info.pixels_per_point;
-    [
-        (info.viewport.min.x * view.zoom + view.pan_x) * pixels_per_point,
-        (info.viewport.min.y * view.zoom + view.pan_y) * pixels_per_point,
-        info.viewport.width() * view.zoom * pixels_per_point,
-        info.viewport.height() * view.zoom * pixels_per_point,
-    ]
 }
 
 struct TerminalBackgroundFrameResources {
@@ -414,6 +401,7 @@ enum ActiveTerminalPipeline {
 struct PreparedTerminalFrameCache {
     frame: TerminalRenderFrame,
     pixels_per_point_bits: u32,
+    view_bits: [u32; 3],
     // Atlas growth shifts every glyph's UVs, so a stale count must invalidate the cached vertices.
     atlas_resized_count: u64,
     vertex_count: u32,
@@ -533,8 +521,13 @@ impl TerminalWgpuRenderer {
         let raster_ppp = text_raster_pixels_per_point(pixels_per_point, view);
         // Set before the cache early-return so `paint` always picks the right sampler.
         self.text_linear_filter = text_uses_linear_filter(pixels_per_point, view, raster_ppp);
-        let render_surface = frame.surface;
+        let render_surface = view.applied_to(frame.surface);
         let pixels_per_point_bits = raster_ppp.to_bits();
+        let view_bits = [
+            view.zoom.to_bits(),
+            view.pan_x.to_bits(),
+            view.pan_y.to_bits(),
+        ];
         let mut atlas_resized_count = text_builder.atlas_resized_count();
         let mut update_frame_cache = true;
         if self.prepared_frame_cache_cooldown > 0 {
@@ -542,6 +535,7 @@ impl TerminalWgpuRenderer {
             update_frame_cache = self.prepared_frame_cache_cooldown == 0;
         } else if let Some(cache) = &self.prepared_frame_cache {
             if cache.pixels_per_point_bits == pixels_per_point_bits
+                && cache.view_bits == view_bits
                 && cache.atlas_resized_count == atlas_resized_count
                 && cache.frame == *frame
             {
@@ -682,6 +676,7 @@ impl TerminalWgpuRenderer {
                 self.prepared_frame_cache = Some(PreparedTerminalFrameCache {
                     frame: frame.clone(),
                     pixels_per_point_bits,
+                    view_bits,
                     atlas_resized_count,
                     vertex_count,
                 });
