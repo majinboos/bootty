@@ -669,6 +669,7 @@ impl TerminalWgpuRenderer {
             let vertex_count = image_vertex_count + background_vertex_count + text_vertex_count;
             let grew_during_build = text_builder.atlas_resized_count() != atlas_resized_count;
             if grew_during_build && build_attempt < 2 {
+                text_builder.reset_atlas_for_frame_rebuild();
                 atlas_resized_count = text_builder.atlas_resized_count();
                 continue;
             }
