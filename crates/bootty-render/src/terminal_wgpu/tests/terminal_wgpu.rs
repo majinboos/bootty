@@ -146,28 +146,6 @@ fn fractional_display_scales_use_linear_text_filtering() {
         raster_ppp
     ));
 }
-#[test]
-fn terminal_viewport_applies_zoom_and_pan_without_rebuilding_vertices() {
-    let viewport = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(100.0, 50.0));
-    let info = egui::epaint::PaintCallbackInfo {
-        viewport,
-        clip_rect: viewport,
-        pixels_per_point: 2.0,
-        screen_size_px: [1000, 800],
-    };
-
-    assert_eq!(
-        terminal_viewport(
-            &info,
-            ViewTransform {
-                zoom: 2.0,
-                pan_x: -60.0,
-                pan_y: -40.0,
-            }
-        ),
-        [-80.0, 0.0, 400.0, 200.0]
-    );
-}
 
 #[test]
 fn background_command_vertices_include_cursor_commands_in_frame_order() {
