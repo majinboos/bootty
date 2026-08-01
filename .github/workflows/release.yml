@@ -4,9 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish
+        required: true
+        type: string
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -16,6 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   package:
@@ -47,10 +54,12 @@ jobs:
             release-asset: bootty-x86_64-unknown-linux-gnu.tar.gz
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Verify release tag
         shell: bash
-        run: test "v$(awk '$0 == "[workspace.package]" { in_workspace_package = 1; next } /^\[/ { in_workspace_package = 0 } in_workspace_package && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)" = "$GITHUB_REF_NAME"
+        run: test "v$(awk '$0 == "[workspace.package]" { in_workspace_package = 1; next } /^\[/ { in_workspace_package = 0 } in_workspace_package && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)" = "$RELEASE_TAG"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -135,4 +144,4 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --generate-notes --title "$GITHUB_REF_NAME"
+        run: gh release create "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --generate-notes --title "$RELEASE_TAG"
