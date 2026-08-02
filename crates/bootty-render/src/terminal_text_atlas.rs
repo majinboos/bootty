@@ -835,6 +835,9 @@ impl TextAtlasBuilder {
             self.prepared_text_frame_active = false;
         }
     }
+    pub(crate) fn reset_atlas_for_frame_rebuild(&mut self) {
+        self.atlas.recycle();
+    }
 
     pub fn prepare_text_command(
         &mut self,

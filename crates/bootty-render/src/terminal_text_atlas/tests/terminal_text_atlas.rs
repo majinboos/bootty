@@ -448,6 +448,23 @@ fn prepared_text_frame_cache_refreshes_uvs_after_atlas_resize() {
 }
 
 #[test]
+fn frame_rebuild_reset_discards_residual_glyphs_and_cached_uvs() {
+    let mut builder = TextAtlasBuilder::new(64, 64);
+    let command = text_command("x");
+    let first = builder.prepare_text_command(&command, 1.0);
+    let old_resized_count = builder.atlas_resized_count();
+
+    builder.reset_atlas_for_frame_rebuild();
+
+    assert!(builder.atlas.is_empty());
+    assert!(builder.atlas_resized_count() > old_resized_count);
+    let rebuilt = builder.prepare_text_command(&command, 1.0);
+    assert_eq!(rebuilt.len(), 1);
+    assert_eq!(builder.atlas.len(), 1);
+    assert_eq!(rebuilt[0].rect, first[0].rect);
+}
+
+#[test]
 fn atlas_rasterizer_bold_text_has_more_coverage_than_regular_text() {
     let mut library = bootty_font_library(&["MapleMono-wght.ttf"]);
     let regular_face = regular_face("Maple Mono", &[]);
