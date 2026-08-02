@@ -223,7 +223,12 @@ case "$(uname -s)" in
 PLIST
 
     if command -v codesign >/dev/null 2>&1; then
-      codesign --force --deep --sign - "$BUNDLE_DIR"
+      if [[ -d "$CONTENTS_DIR/Frameworks" ]]; then
+        find "$CONTENTS_DIR/Frameworks" -type f -name '*.dylib' -exec codesign --force --sign - {} \;
+      fi
+      codesign --force --sign - \
+        --requirements '=designated => identifier "dev.bootty.desktop"' \
+        "$BUNDLE_DIR"
     fi
 
     (cd "$DIST_DIR" && zip -qry "$APP_NAME-macos-$ARCH.app.zip" "$APP_NAME.app")
