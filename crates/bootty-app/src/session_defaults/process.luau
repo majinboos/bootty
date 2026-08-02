@@ -12,11 +12,20 @@ return {
 			sessions = sessions,
 			facts = facts.get,
 			render = function(_, enriched)
-				if enriched.diff_added and enriched.diff_removed then
-					return nil
-				end
 				if not enriched.display_process or enriched.display_process == "" then
 					return nil
+				end
+				if enriched.diff_added and enriched.diff_removed then
+					return {
+						details = {
+							{
+								key = "process",
+								icon = "terminal",
+								label = enriched.display_process,
+								color = bootty.theme.subtext,
+							},
+						},
+					}
 				end
 				return {
 					summary = {

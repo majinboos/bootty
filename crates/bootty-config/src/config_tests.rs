@@ -256,6 +256,7 @@ fn sidebar_modules_default_and_override_in_order() {
             "progress"
         ]
     );
+    assert!(!defaults.sidebar.session_modules_configured);
 
     let configured = load_config_source(indoc! {r#"
         [sidebar]
@@ -263,6 +264,7 @@ fn sidebar_modules_default_and_override_in_order() {
         session-modules = ["directory", "progress"]
     "#});
     assert_eq!(configured.sidebar.modules, ["custom", "sessions"]);
+    assert!(configured.sidebar.session_modules_configured);
     assert_eq!(
         configured.sidebar.session_modules,
         ["directory", "progress"]

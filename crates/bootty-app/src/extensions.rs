@@ -48,6 +48,7 @@ const CODEXBAR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_COLOR: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
 const EXTENSION_UI_PRELUDE: &str = include_str!("extension_ui.luau");
 const SIDEBAR_FACTS_PRELUDE: &str = include_str!("sidebar_session_facts.luau");
+const SESSION_MODULE_PREFIX: &str = "session:";
 
 const BUILTIN_STATUS_EXTENSIONS: &[(&str, &str)] = &[
     ("windows", include_str!("status_defaults/windows.luau")),
@@ -70,6 +71,9 @@ const BUILTIN_SESSION_EXTENSIONS: &[(&str, &str)] = &[
     ("ports", include_str!("session_defaults/ports.luau")),
     ("progress", include_str!("session_defaults/progress.luau")),
 ];
+pub fn session_module_key(name: &str) -> String {
+    format!("{SESSION_MODULE_PREFIX}{name}")
+}
 
 /// One renderable element a Lua/Luau module produced.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1002,7 +1006,7 @@ impl ExtensionHost {
                 ModuleCatalog {
                     dir: session_dir,
                     builtins: BUILTIN_SESSION_EXTENSIONS,
-                    prefix: "session:",
+                    prefix: SESSION_MODULE_PREFIX,
                 },
             ],
             ctx,
@@ -1108,6 +1112,12 @@ impl ExtensionHost {
     #[must_use]
     pub fn has_user_module(&self, name: &str) -> bool {
         user_module_exists(&self.dir, name)
+    }
+    #[must_use]
+    pub fn has_legacy_sessions_module(&self) -> bool {
+        user_module_path(&self.dir, "sessions")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|source| source.contains("bootty.sidebar.session_facts"))
     }
 
     #[must_use]
@@ -1409,7 +1419,7 @@ impl ModuleKind {
         }
     }
 }
-fn preview_run_cache(module_name: &str) -> Arc<RunCache> {
+fn preview_run_cache() -> Arc<RunCache> {
     let cache = Arc::new(RunCache::default());
     cache.set_mode(RunMode::Cached);
     let stderr_null = if cfg!(windows) {
@@ -1437,11 +1447,7 @@ fn preview_run_cache(module_name: &str) -> Arc<RunCache> {
         ),
         (
             format!("git -C {cwd} diff HEAD --numstat {stderr_null}"),
-            if module_name == "process" {
-                ""
-            } else {
-                "12\t3\tcrates/bootty-app/src/ui/settings/modules.rs"
-            },
+            "12\t3\tcrates/bootty-app/src/ui/settings/modules.rs",
         ),
         (
             format!("ps -axo pid=,ppid=,comm=,args= {stderr_null}"),
@@ -1496,7 +1502,7 @@ pub fn preview_module_source(
         battery_time_to_empty_secs: Some(9_000.0),
         battery_time_to_full_secs: None,
     }));
-    let run_cache = preview_run_cache(name);
+    let run_cache = preview_run_cache();
     let result = setup_lua(theme, mux, metrics, Arc::default(), run_cache).and_then(|lua| {
         let deadline = Instant::now() + Duration::from_millis(50);
         lua.set_interrupt(move |_| {
@@ -2986,6 +2992,14 @@ mod tests {
                 items.iter().all(|item| item.fg != Some(ERROR_COLOR)),
                 "{name} preview failed: {items:?}"
             );
+            if *name == "process" {
+                assert!(
+                    items
+                        .iter()
+                        .any(|item| item.key.as_deref() == Some("$1:process")),
+                    "dirty session process should remain visible"
+                );
+            }
         }
     }
 

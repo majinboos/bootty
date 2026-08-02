@@ -883,6 +883,7 @@ impl SettingsSurface {
     }
 
     fn set_session_modules(&mut self) {
+        self.config.sidebar.session_modules_configured = true;
         let modules = self.config.sidebar.session_modules.clone();
         self.set_strings(&["sidebar", "session-modules"], &modules);
     }

@@ -357,33 +357,21 @@ fn segment_detail_panel(
                         .color(palette.muted)
                         .size(11.0),
                 );
-                let icons = crate::ui::space::space_icon_inventory();
-                let options = icons.iter().map(String::as_str).collect::<Vec<_>>();
-                let icon = segment.icon.clone();
-                let current = icon
-                    .as_ref()
-                    .and_then(|icon| options.iter().position(|option| *option == icon));
-                columns[0].horizontal(|ui| {
-                    let width = (ui.available_width() - 40.0).max(80.0);
-                    if let Some(choice) = super::searchable_combo(
-                        ui,
-                        palette,
-                        &format!("{}_icon_{}", position.segment_key(), ctx.index),
-                        icon.as_deref().unwrap_or("Choose icon…"),
-                        width,
-                        &options,
-                        current,
-                    ) {
-                        segment.icon = Some(options[choice].to_owned());
-                        *ctx.changed = true;
-                    }
-                    if segment.icon.is_some()
-                        && super::settings_icon_button(ui, palette, "x", "Clear icon").clicked()
-                    {
-                        segment.icon = None;
-                        *ctx.changed = true;
-                    }
-                });
+                let mut icon = segment.icon.clone().unwrap_or_default();
+                let width = columns[0].available_width();
+                if super::settings_text_edit_width(
+                    &mut columns[0],
+                    palette,
+                    &mut icon,
+                    "lucide slug or glyph",
+                    width,
+                )
+                .changed()
+                {
+                    let icon = icon.trim();
+                    segment.icon = (!icon.is_empty()).then(|| icon.to_owned());
+                    *ctx.changed = true;
+                }
 
                 *ctx.changed |= optional_color(
                     &mut columns[1],

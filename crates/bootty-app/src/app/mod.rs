@@ -764,14 +764,17 @@ impl BoottyApp {
         );
 
         let sidebar_config = &self.state.config().sidebar;
+        let session_modules = effective_session_modules(
+            sidebar_config,
+            self.sidebar_extensions.has_legacy_sessions_module(),
+        );
         self.sidebar_extensions.set_active(
             sidebar_visible
                 .then_some(
                     sidebar_config.modules.iter().cloned().chain(
-                        sidebar_config
-                            .session_modules
+                        session_modules
                             .iter()
-                            .map(|name| format!("session:{name}")),
+                            .map(|name| crate::extensions::session_module_key(name)),
                     ),
                 )
                 .into_iter()
@@ -1270,14 +1273,16 @@ impl BoottyApp {
                     }
                 }
             }
+            let session_modules = effective_session_modules(
+                &self.state.config().sidebar,
+                self.sidebar_extensions.has_legacy_sessions_module(),
+            );
             body = compose_session_module_items(
                 body,
-                self.state
-                    .config()
-                    .sidebar
-                    .session_modules
-                    .iter()
-                    .flat_map(|name| self.sidebar_extensions.items(&format!("session:{name}"))),
+                session_modules.iter().flat_map(|name| {
+                    self.sidebar_extensions
+                        .items(&crate::extensions::session_module_key(name))
+                }),
             );
             (body, footer)
         } else {
@@ -2051,6 +2056,17 @@ impl BoottyApp {
     }
 }
 
+fn effective_session_modules(
+    sidebar: &crate::config::SidebarConfig,
+    legacy_sessions_override: bool,
+) -> &[String] {
+    if legacy_sessions_override && !sidebar.session_modules_configured {
+        &[]
+    } else {
+        &sidebar.session_modules
+    }
+}
+
 pub(crate) fn compose_session_module_items(
     base: Vec<crate::extensions::ModuleItem>,
     components: impl IntoIterator<Item = crate::extensions::ModuleItem>,
@@ -2424,11 +2440,22 @@ fn egui_font_name(family: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::{ModuleCoord, ModuleItem, ModulePrimitive};
+
+    #[test]
+    fn legacy_sessions_override_keeps_embedded_details_without_duplicates() {
+        let mut sidebar = crate::config::SidebarConfig::default();
+        assert!(effective_session_modules(&sidebar, true).is_empty());
+
+        sidebar.session_modules_configured = true;
+        assert_eq!(
+            effective_session_modules(&sidebar, true),
+            sidebar.session_modules
+        );
+    }
 
     #[test]
     fn session_modules_merge_summary_primitives_and_interleave_rows() {
-        use crate::extensions::{ModuleCoord, ModuleItem, ModulePrimitive};
-
         let base = vec![
             ModuleItem {
                 kind: Some("group".to_owned()),

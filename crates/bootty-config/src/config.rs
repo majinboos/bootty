@@ -257,6 +257,8 @@ pub struct SidebarConfig {
     /// Ordered modules rendered for every session. User files use their stem under
     /// `<config>/session/`.
     pub session_modules: Vec<String>,
+    /// Whether `session-modules` was explicitly present in loaded configuration.
+    pub session_modules_configured: bool,
     /// Ordered modules that compose the overall sidebar. User files use their stem under
     /// `<config>/sidebar/`.
     pub modules: Vec<String>,
@@ -280,6 +282,7 @@ impl Default for SidebarConfig {
                 "ports".to_owned(),
                 "progress".to_owned(),
             ],
+            session_modules_configured: false,
             modules: vec!["sessions".to_owned(), "codexbar".to_owned()],
         }
     }
@@ -1745,7 +1748,10 @@ fn apply_partial_sidebar(sidebar: &mut SidebarConfig, partial: SidebarPatch) {
     apply_present(&mut sidebar.selected, partial.selected);
     apply_present(&mut sidebar.hover, partial.hover);
     apply_present(&mut sidebar.border, partial.border);
-    apply_value(&mut sidebar.session_modules, partial.session_modules);
+    if let Some(modules) = partial.session_modules {
+        sidebar.session_modules = modules;
+        sidebar.session_modules_configured = true;
+    }
     apply_value(&mut sidebar.modules, partial.modules);
 }
 

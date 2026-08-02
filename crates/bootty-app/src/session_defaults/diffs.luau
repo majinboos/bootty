@@ -16,16 +16,10 @@ return {
 					return nil
 				end
 				return {
-					summary = {
-						ui.text(
-							"+" .. tostring(enriched.diff_added),
-							{ x = 1, x_px = -62, color = bootty.theme.success, align = "right_center", size = 12 }
-						),
-						ui.text(
-							"-" .. tostring(enriched.diff_removed),
-							{ x = 1, x_px = -12, color = bootty.theme.destructive, align = "right_center", size = 12 }
-						),
-					},
+					summary = ui.diff_summary(enriched.diff_added, enriched.diff_removed, {
+						success = bootty.theme.success,
+						destructive = bootty.theme.destructive,
+					}),
 				}
 			end,
 		})
