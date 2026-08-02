@@ -926,10 +926,11 @@ fn send_restored_output(
 
 struct RmuxLiveOutput {
     file: File,
-    lock_file: File,
+    reader_lock: File,
     endpoint: PathBuf,
     pipe_target: PaneTarget,
     path: PathBuf,
+    init_lock_path: PathBuf,
     sequence: u64,
 }
 
@@ -937,23 +938,24 @@ impl RmuxLiveOutput {
     async fn open(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<Self> {
         let pipe_target = pane_pipe_target(rmux, target).await?;
         let endpoint = crate::bootty_rmux_endpoint_path()?;
-        let (path, lock_path) = rmux_pipe_paths(&endpoint, &pipe_target);
-        let lock_file = open_private_file(&lock_path)?;
-        let first_reader = match lock_file.try_lock() {
+        let (path, init_lock_path, reader_lock_path) = rmux_pipe_paths(&endpoint, &pipe_target);
+        let init_lock = open_private_file(&init_lock_path)?;
+        init_lock
+            .lock()
+            .context("lock rmux output initialization")?;
+        let reader_lock = open_private_file(&reader_lock_path)?;
+        let first_reader = match reader_lock.try_lock() {
             Ok(()) => true,
             Err(TryLockError::WouldBlock) => false,
-            Err(TryLockError::Error(error)) => return Err(error).context("lock rmux output pipe"),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("lock rmux output readers");
+            }
         };
 
-        if !first_reader {
-            lock_file
-                .lock_shared()
-                .context("share rmux output pipe lock")?;
-        }
-        let existed = path.exists();
         let mut file = open_private_file(&path)?;
         if first_reader {
             file.set_len(0)?;
+            file.seek(SeekFrom::Start(0))?;
             set_rmux_pipe(
                 &endpoint,
                 &pipe_target,
@@ -962,28 +964,22 @@ impl RmuxLiveOutput {
                     crate::tmux_protocol::shell_quote(&path.to_string_lossy())
                 )),
             )?;
-            lock_file.unlock()?;
-            lock_file
-                .lock_shared()
-                .context("share rmux output pipe lock")?;
-        } else if !existed {
-            set_rmux_pipe(
-                &endpoint,
-                &pipe_target,
-                Some(format!(
-                    "cat >> {}",
-                    crate::tmux_protocol::shell_quote(&path.to_string_lossy())
-                )),
-            )?;
+            reader_lock.unlock()?;
+        } else {
+            file.seek(SeekFrom::End(0))?;
         }
-        file.seek(SeekFrom::End(0))?;
+        reader_lock
+            .lock_shared()
+            .context("share rmux output reader lock")?;
+        init_lock.unlock()?;
 
         Ok(Self {
             file,
-            lock_file,
+            reader_lock,
             endpoint,
             pipe_target,
             path,
+            init_lock_path,
             sequence: 0,
         })
     }
@@ -1002,11 +998,19 @@ impl RmuxLiveOutput {
 
 impl Drop for RmuxLiveOutput {
     fn drop(&mut self) {
-        let _ = self.lock_file.unlock();
-        if self.lock_file.try_lock().is_ok() {
+        let Ok(init_lock) = open_private_file(&self.init_lock_path) else {
+            return;
+        };
+        if init_lock.lock().is_err() {
+            return;
+        }
+        let _ = self.reader_lock.unlock();
+        if self.reader_lock.try_lock().is_ok() {
             let _ = set_rmux_pipe(&self.endpoint, &self.pipe_target, None);
             let _ = std::fs::remove_file(&self.path);
+            let _ = self.reader_lock.unlock();
         }
+        let _ = init_lock.unlock();
     }
 }
 
@@ -1028,7 +1032,7 @@ fn set_rmux_pipe(endpoint: &Path, target: &PaneTarget, command: Option<String>) 
     }
 }
 
-fn rmux_pipe_paths(endpoint: &Path, target: &PaneTarget) -> (PathBuf, PathBuf) {
+fn rmux_pipe_paths(endpoint: &Path, target: &PaneTarget) -> (PathBuf, PathBuf, PathBuf) {
     let mut hasher = DefaultHasher::new();
     endpoint.hash(&mut hasher);
     target.hash(&mut hasher);
@@ -1036,7 +1040,8 @@ fn rmux_pipe_paths(endpoint: &Path, target: &PaneTarget) -> (PathBuf, PathBuf) {
     let root = endpoint.parent().unwrap_or_else(|| Path::new("."));
     (
         root.join(format!("bootty-rmux-output-{id:016x}")),
-        root.join(format!("bootty-rmux-output-{id:016x}.lock")),
+        root.join(format!("bootty-rmux-output-{id:016x}.init.lock")),
+        root.join(format!("bootty-rmux-output-{id:016x}.readers.lock")),
     )
 }
 
