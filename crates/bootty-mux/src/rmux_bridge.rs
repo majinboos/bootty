@@ -118,7 +118,10 @@ impl RmuxPaneTarget {
 }
 
 pub(crate) enum RmuxPaneEvent {
-    Capture(Vec<u8>),
+    Restore {
+        buffered_chunks: Vec<PaneOutputChunk>,
+        capture: Vec<u8>,
+    },
     Chunks(Vec<PaneOutputChunk>),
     KeyboardProtocol(Vec<u8>),
 
@@ -914,13 +917,11 @@ fn send_restored_output(
     output_tx: &mpsc::Sender<RmuxPaneEvent>,
     buffered_chunks: &mut Vec<PaneOutputChunk>,
 ) -> bool {
-    if capture.is_some_and(|bytes| {
-        !bytes.is_empty() && output_tx.send(RmuxPaneEvent::Capture(bytes)).is_err()
-    }) {
-        return false;
-    }
     output_tx
-        .send(RmuxPaneEvent::Chunks(std::mem::take(buffered_chunks)))
+        .send(RmuxPaneEvent::Restore {
+            buffered_chunks: std::mem::take(buffered_chunks),
+            capture: capture.unwrap_or_default(),
+        })
         .is_ok()
 }
 
@@ -1564,6 +1565,30 @@ mod tests {
             &output_tx,
             &mut buffered_chunks
         ));
+    }
+
+    #[test]
+    fn restored_output_applies_capture_after_buffered_live_output() {
+        let (output_tx, output_rx) = mpsc::channel();
+        let mut buffered_chunks = vec![PaneOutputChunk::Bytes {
+            sequence: 0,
+            bytes: b"duplicate line\r\n".to_vec(),
+        }];
+
+        assert!(send_restored_output(
+            Some(b"\x1b[H\x1b[Jduplicate line".to_vec()),
+            &output_tx,
+            &mut buffered_chunks,
+        ));
+        let RmuxPaneEvent::Restore {
+            buffered_chunks,
+            capture,
+        } = output_rx.recv().unwrap()
+        else {
+            panic!("expected restore event");
+        };
+        assert_eq!(buffered_chunks.len(), 1);
+        assert_eq!(capture, b"\x1b[H\x1b[Jduplicate line");
     }
 
     #[test]
