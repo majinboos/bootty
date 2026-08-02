@@ -2647,6 +2647,33 @@ mod tests {
     }
 
     #[test]
+    fn diff_summary_reserves_width_for_long_removed_count() {
+        let items = run_source(
+            r##"return function()
+                return {
+                    {
+                        primitives = bootty.ui.diff_summary(1, 123456, {
+                            success = "#a6e3a1",
+                            destructive = "#f38ba8",
+                        }),
+                    },
+                }
+            end"##,
+        );
+        let x_offsets = items[0]
+            .primitives
+            .iter()
+            .filter_map(|primitive| match primitive {
+                ModulePrimitive::Text { x, .. } => Some(x.px),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(x_offsets.len(), 2);
+        assert!(x_offsets[1] - x_offsets[0] >= 60.0);
+    }
+
+    #[test]
     fn footer_meter_track_is_optional() {
         let items = run_source(
             r##"return function()

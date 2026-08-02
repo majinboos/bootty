@@ -88,6 +88,30 @@ function ui.text(text, options)
 		min_width = opts.min_width,
 	}
 end
+function ui.diff_summary(added, removed, options)
+	local opts = opt(options)
+	local size = opts.size or 12
+	local right_px = opts.right_px or -12
+	local removed_text = "-" .. tostring(removed)
+	local removed_width = #removed_text * size * 0.6
+	return {
+		ui.text("+" .. tostring(added), {
+			x = 1,
+			x_px = right_px - (opts.gap or 10) - removed_width,
+			color = opts.success,
+			align = "right_center",
+			size = size,
+		}),
+		ui.text(removed_text, {
+			x = 1,
+			x_px = right_px,
+			color = opts.destructive,
+			align = "right_center",
+			size = size,
+		}),
+	}
+end
+
 
 function ui.icon(icon, options)
 	local opts = opt(options)
