@@ -106,6 +106,9 @@ position = "left" # or "right"
 # selected = "#2a2f3d" # active session row tint
 # hover = "#1e222c"
 # border = "#313244" # edge border and footer separator
+# Overall sidebar modules remain separate from the pieces rendered for every session.
+# modules = ["sessions", "codexbar"]
+# session-modules = ["diffs", "process", "agent", "directory", "branch", "ports", "progress"]
 
 [multiplexer]
 # native keeps mux state and terminals inside Bootty. rmux renders through
