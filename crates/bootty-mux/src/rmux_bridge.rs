@@ -902,6 +902,21 @@ fn kitty_keyboard_protocol_query(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+fn send_restored_output(
+    capture: Option<Vec<u8>>,
+    output_tx: &mpsc::Sender<RmuxPaneEvent>,
+    buffered_chunks: &mut Vec<PaneOutputChunk>,
+) -> bool {
+    if capture.is_some_and(|bytes| {
+        !bytes.is_empty() && output_tx.send(RmuxPaneEvent::Capture(bytes)).is_err()
+    }) {
+        return false;
+    }
+    output_tx
+        .send(RmuxPaneEvent::Chunks(std::mem::take(buffered_chunks)))
+        .is_ok()
+}
+
 async fn run_pane_io_inner(
     target: RmuxPaneTarget,
     max_scrollback: usize,
@@ -939,17 +954,11 @@ async fn run_pane_io_inner(
         tokio::select! {
             restore = &mut restore_rx, if restore_pending => {
                 restore_pending = false;
-                if let Ok(Some(bytes)) = restore
-                    && !bytes.is_empty()
-                    && output_tx.send(RmuxPaneEvent::Capture(bytes)).is_err()
-                {
-                    break;
-                }
-                if !buffered_chunks.is_empty()
-                    && output_tx
-                        .send(RmuxPaneEvent::Chunks(std::mem::take(&mut buffered_chunks)))
-                        .is_err()
-                {
+                if !send_restored_output(
+                    restore.ok().flatten(),
+                    output_tx,
+                    &mut buffered_chunks,
+                ) {
                     break;
                 }
             }
@@ -997,6 +1006,13 @@ async fn run_pane_io_inner(
             Some(mut text) = input_rx.recv() => {
                 while let Ok(next) = input_rx.try_recv() {
                     text.push_str(&next);
+                }
+                if restore_pending {
+                    restore_pending = false;
+                    let capture = (&mut restore_rx).await.ok().flatten();
+                    if !send_restored_output(capture, output_tx, &mut buffered_chunks) {
+                        break;
+                    }
                 }
                 let result = pane.send_text(&text).await.map_err(|error| error.to_string());
                 let ok = result.is_ok();
@@ -1384,6 +1400,19 @@ mod tests {
         assert_eq!(bracketed_paste_mode(b"\x1b[?2004h\x1b[?2004l"), Some(false));
         assert_eq!(kitty_keyboard_protocol_query(b"\x1b[>7u\x1b[?"), None);
         assert_eq!(kitty_keyboard_protocol_query(b"\x1b[>xu\x1b[?u"), None);
+    }
+
+    #[test]
+    fn restored_output_detects_disconnected_receiver_without_chunks() {
+        let (output_tx, output_rx) = mpsc::channel();
+        drop(output_rx);
+        let mut buffered_chunks = Vec::new();
+
+        assert!(!send_restored_output(
+            None,
+            &output_tx,
+            &mut buffered_chunks
+        ));
     }
 
     #[test]
