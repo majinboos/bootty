@@ -763,9 +763,20 @@ impl BoottyApp {
                 .map(|segment| segment.module.clone()),
         );
 
+        let sidebar_config = &self.state.config().sidebar;
+        let session_modules = effective_session_modules(
+            sidebar_config,
+            self.sidebar_extensions.has_legacy_sessions_module(),
+        );
         self.sidebar_extensions.set_active(
             sidebar_visible
-                .then_some(self.state.config().sidebar.modules.iter().cloned())
+                .then_some(
+                    sidebar_config.modules.iter().cloned().chain(
+                        session_modules
+                            .iter()
+                            .map(|name| crate::extensions::session_module_key(name)),
+                    ),
+                )
                 .into_iter()
                 .flatten(),
         );
@@ -1262,6 +1273,17 @@ impl BoottyApp {
                     }
                 }
             }
+            let session_modules = effective_session_modules(
+                &self.state.config().sidebar,
+                self.sidebar_extensions.has_legacy_sessions_module(),
+            );
+            body = compose_session_module_items(
+                body,
+                session_modules.iter().flat_map(|name| {
+                    self.sidebar_extensions
+                        .items(&crate::extensions::session_module_key(name))
+                }),
+            );
             (body, footer)
         } else {
             (Vec::new(), Vec::new())
@@ -2034,6 +2056,62 @@ impl BoottyApp {
     }
 }
 
+fn effective_session_modules(
+    sidebar: &crate::config::SidebarConfig,
+    legacy_sessions_override: bool,
+) -> &[String] {
+    if legacy_sessions_override && !sidebar.session_modules_configured {
+        &[]
+    } else {
+        &sidebar.session_modules
+    }
+}
+
+pub(crate) fn compose_session_module_items(
+    base: Vec<crate::extensions::ModuleItem>,
+    components: impl IntoIterator<Item = crate::extensions::ModuleItem>,
+) -> Vec<crate::extensions::ModuleItem> {
+    let mut overlays = HashMap::<String, Vec<crate::extensions::ModulePrimitive>>::new();
+    let mut rows = HashMap::<String, Vec<crate::extensions::ModuleItem>>::new();
+    let mut unscoped = Vec::new();
+    for item in components {
+        let Some(session_id) = item.session_id.clone() else {
+            unscoped.push(item);
+            continue;
+        };
+        if item.kind.as_deref() == Some("session-overlay") {
+            overlays
+                .entry(session_id)
+                .or_default()
+                .extend(item.primitives);
+        } else {
+            rows.entry(session_id).or_default().push(item);
+        }
+    }
+
+    let mut composed = Vec::with_capacity(base.len() + rows.values().map(Vec::len).sum::<usize>());
+    for mut item in base {
+        let session_id = item
+            .kind
+            .as_deref()
+            .filter(|kind| *kind == "session")
+            .and(item.session_id.clone());
+        if let Some(session_id) = session_id {
+            if let Some(primitives) = overlays.remove(&session_id) {
+                item.primitives.extend(primitives);
+            }
+            composed.push(item);
+            if let Some(mut session_rows) = rows.remove(&session_id) {
+                composed.append(&mut session_rows);
+            }
+        } else {
+            composed.push(item);
+        }
+    }
+    composed.extend(unscoped);
+    composed
+}
+
 fn suppress_settings_recorder_duplicates(
     events: &mut Vec<egui::Event>,
     direct_inputs: &[crate::direct_input::DirectKeyInput],
@@ -2362,6 +2440,82 @@ fn egui_font_name(family: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extensions::{ModuleCoord, ModuleItem, ModulePrimitive};
+
+    #[test]
+    fn legacy_sessions_override_keeps_embedded_details_without_duplicates() {
+        let mut sidebar = crate::config::SidebarConfig::default();
+        assert!(effective_session_modules(&sidebar, true).is_empty());
+
+        sidebar.session_modules_configured = true;
+        assert_eq!(
+            effective_session_modules(&sidebar, true),
+            sidebar.session_modules
+        );
+    }
+
+    #[test]
+    fn session_modules_merge_summary_primitives_and_interleave_rows() {
+        let base = vec![
+            ModuleItem {
+                kind: Some("group".to_owned()),
+                text: "work".to_owned(),
+                ..ModuleItem::default()
+            },
+            ModuleItem {
+                kind: Some("session".to_owned()),
+                text: "api".to_owned(),
+                session_id: Some("$1".to_owned()),
+                ..ModuleItem::default()
+            },
+            ModuleItem {
+                kind: Some("session".to_owned()),
+                text: "ui".to_owned(),
+                session_id: Some("$2".to_owned()),
+                ..ModuleItem::default()
+            },
+        ];
+        let overlay = ModulePrimitive::Rect {
+            fill: None,
+            stroke: None,
+            x: ModuleCoord::default(),
+            y: ModuleCoord::default(),
+            w: ModuleCoord::default(),
+            h: ModuleCoord::default(),
+            radius: egui::CornerRadius::ZERO,
+        };
+        let components = vec![
+            ModuleItem {
+                kind: Some("session-overlay".to_owned()),
+                session_id: Some("$1".to_owned()),
+                primitives: vec![overlay],
+                ..ModuleItem::default()
+            },
+            ModuleItem {
+                key: Some("$1:cwd".to_owned()),
+                session_id: Some("$1".to_owned()),
+                text: "src/api".to_owned(),
+                ..ModuleItem::default()
+            },
+            ModuleItem {
+                key: Some("$2:cwd".to_owned()),
+                session_id: Some("$2".to_owned()),
+                text: "src/ui".to_owned(),
+                ..ModuleItem::default()
+            },
+        ];
+
+        let composed = compose_session_module_items(base, components);
+
+        assert_eq!(
+            composed
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["work", "api", "src/api", "ui", "src/ui"]
+        );
+        assert_eq!(composed[1].primitives.len(), 1);
+    }
 
     #[test]
     fn settings_editor_keeps_command_shortcuts_outside_keybind_recording() {

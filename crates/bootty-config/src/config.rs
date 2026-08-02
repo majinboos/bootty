@@ -254,7 +254,13 @@ pub struct SidebarConfig {
     pub selected: Option<Color>,
     pub hover: Option<Color>,
     pub border: Option<Color>,
-    /// Ordered sidebar modules. User files use their stem under `<config>/sidebar/`.
+    /// Ordered modules rendered for every session. User files use their stem under
+    /// `<config>/session/`.
+    pub session_modules: Vec<String>,
+    /// Whether `session-modules` was explicitly present in loaded configuration.
+    pub session_modules_configured: bool,
+    /// Ordered modules that compose the overall sidebar. User files use their stem under
+    /// `<config>/sidebar/`.
     pub modules: Vec<String>,
 }
 
@@ -267,6 +273,16 @@ impl Default for SidebarConfig {
             selected: None,
             hover: None,
             border: None,
+            session_modules: vec![
+                "diffs".to_owned(),
+                "process".to_owned(),
+                "agent".to_owned(),
+                "directory".to_owned(),
+                "branch".to_owned(),
+                "ports".to_owned(),
+                "progress".to_owned(),
+            ],
+            session_modules_configured: false,
             modules: vec!["sessions".to_owned(), "codexbar".to_owned()],
         }
     }
@@ -293,6 +309,7 @@ struct SidebarPatch {
     #[serde(rename = "fullscreen-hover")]
     _fullscreen_hover: Option<Color>,
     border: Option<Color>,
+    session_modules: Option<Vec<String>>,
     modules: Option<Vec<String>>,
 }
 
@@ -1731,6 +1748,10 @@ fn apply_partial_sidebar(sidebar: &mut SidebarConfig, partial: SidebarPatch) {
     apply_present(&mut sidebar.selected, partial.selected);
     apply_present(&mut sidebar.hover, partial.hover);
     apply_present(&mut sidebar.border, partial.border);
+    if let Some(modules) = partial.session_modules {
+        sidebar.session_modules = modules;
+        sidebar.session_modules_configured = true;
+    }
     apply_value(&mut sidebar.modules, partial.modules);
 }
 

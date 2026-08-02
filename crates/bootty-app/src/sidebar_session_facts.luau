@@ -1,8 +1,12 @@
 --!strict
 -- Optional session enrichment used by the built-in module.
 local sidebar = {}
+local shared_provider = nil
 
 function sidebar.session_facts(options)
+if shared_provider then
+	return shared_provider
+end
 options = options or {}
 
 local ui = bootty.ui
@@ -465,6 +469,7 @@ function provider.activity(facts)
 	return cycled_activity(facts), activity_color(facts)
 end
 
+shared_provider = provider
 return provider
 end
 

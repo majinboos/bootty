@@ -882,6 +882,12 @@ impl SettingsSurface {
         self.set_strings(&["sidebar", "modules"], &modules);
     }
 
+    fn set_session_modules(&mut self) {
+        self.config.sidebar.session_modules_configured = true;
+        let modules = self.config.sidebar.session_modules.clone();
+        self.set_strings(&["sidebar", "session-modules"], &modules);
+    }
+
     fn contains_config_value(&self, path: &[&str]) -> bool {
         let Ok(Some(document)) = crate::config::load_config_document(&self.config_path) else {
             return false;

@@ -429,6 +429,49 @@ function ui.session_items(options)
 	return items
 end
 
+-- Renders one independently configurable contribution for every session. Summary
+-- primitives are merged into the session row; detail and progress rows follow it.
+function ui.session_components(options)
+	local opts = opt(options)
+	local sessions = opts.sessions or {}
+	local group_of = opts.group_of or function(value)
+		return session_group(value.name)
+	end
+	local groups = count_groups(sessions, group_of)
+	local items = {}
+	local last_group = nil
+	for _, session in ipairs(sessions) do
+		local ctx = session_context(session, groups, last_group, opts)
+		local facts = if opts.facts then opts.facts(session, ctx) else nil
+		local parts = if opts.render then opts.render(ctx, facts) else nil
+		if parts then
+			if parts.summary then
+				ui.push(items, ui.row({
+					key = session.id .. ":summary",
+					kind = "session-overlay",
+					session = session,
+					anchor = ctx.anchor,
+					selectable = false,
+					primitives = parts.summary,
+				}))
+			end
+			for _, spec in ipairs(parts.details or {}) do
+				ui.push(items, ui.detail_row(ctx, spec))
+			end
+			local progress = parts.progress
+			if progress then
+				local rows = if progress.value ~= nil then { progress } else progress
+				for _, row in ipairs(rows) do
+					ui.push(items, ui.bar_row(ctx, row))
+				end
+			end
+		end
+		ctx.summary.emitted += 1
+		last_group = ctx.group
+	end
+	return items
+end
+
 function ui.footer_meter(spec)
 	local fill = ui.clamp(spec.fill or 0, 0, 1)
 	local primitives = {

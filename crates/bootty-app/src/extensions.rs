@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui::{self, Color32};
-use mlua::{Function, Lua, Table, Value};
+use mlua::{Function, Lua, Table, Value, VmState};
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
 use sysinfo::{MemoryRefreshKind, System};
 
@@ -48,6 +48,7 @@ const CODEXBAR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_COLOR: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
 const EXTENSION_UI_PRELUDE: &str = include_str!("extension_ui.luau");
 const SIDEBAR_FACTS_PRELUDE: &str = include_str!("sidebar_session_facts.luau");
+const SESSION_MODULE_PREFIX: &str = "session:";
 
 const BUILTIN_STATUS_EXTENSIONS: &[(&str, &str)] = &[
     ("windows", include_str!("status_defaults/windows.luau")),
@@ -60,6 +61,19 @@ const BUILTIN_SIDEBAR_EXTENSIONS: &[(&str, &str)] = &[
     ("sessions", include_str!("sidebar_defaults/sessions.luau")),
     ("codexbar", include_str!("sidebar_defaults/codexbar.luau")),
 ];
+
+const BUILTIN_SESSION_EXTENSIONS: &[(&str, &str)] = &[
+    ("diffs", include_str!("session_defaults/diffs.luau")),
+    ("process", include_str!("session_defaults/process.luau")),
+    ("agent", include_str!("session_defaults/agent.luau")),
+    ("directory", include_str!("session_defaults/directory.luau")),
+    ("branch", include_str!("session_defaults/branch.luau")),
+    ("ports", include_str!("session_defaults/ports.luau")),
+    ("progress", include_str!("session_defaults/progress.luau")),
+];
+pub fn session_module_key(name: &str) -> String {
+    format!("{SESSION_MODULE_PREFIX}{name}")
+}
 
 /// One renderable element a Lua/Luau module produced.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -932,6 +946,13 @@ impl Waker {
     }
 }
 
+#[derive(Clone)]
+struct ModuleCatalog {
+    dir: PathBuf,
+    builtins: &'static [(&'static str, &'static str)],
+    prefix: &'static str,
+}
+
 /// Owns the Luau worker thread, the shared item map the UI reads, and the mux snapshot the UI feeds.
 pub struct ExtensionHost {
     dir: PathBuf,
@@ -955,27 +976,54 @@ pub struct ExtensionHost {
 impl ExtensionHost {
     /// Spawns the status-bar extension worker. `ctx` is woken when module output changes.
     pub fn spawn_status(dir: PathBuf, ctx: egui::Context, theme: Vec<(String, String)>) -> Self {
-        Self::spawn_with_modules("bootty-status", dir, ctx, theme, BUILTIN_STATUS_EXTENSIONS)
-    }
-
-    /// Spawns the sidebar extension worker. User modules in `dir` override embedded defaults.
-    pub fn spawn_sidebar(dir: PathBuf, ctx: egui::Context, theme: Vec<(String, String)>) -> Self {
         Self::spawn_with_modules(
-            "bootty-sidebar",
-            dir,
+            "bootty-status",
+            vec![ModuleCatalog {
+                dir,
+                builtins: BUILTIN_STATUS_EXTENSIONS,
+                prefix: "",
+            }],
             ctx,
             theme,
-            BUILTIN_SIDEBAR_EXTENSIONS,
+        )
+    }
+
+    /// Spawns the sidebar extension worker. Overall sidebar modules and per-session modules
+    /// use sibling directories and share one Lua worker/facts cache.
+    pub fn spawn_sidebar(dir: PathBuf, ctx: egui::Context, theme: Vec<(String, String)>) -> Self {
+        let session_dir = dir
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("session");
+        Self::spawn_with_modules(
+            "bootty-sidebar",
+            vec![
+                ModuleCatalog {
+                    dir,
+                    builtins: BUILTIN_SIDEBAR_EXTENSIONS,
+                    prefix: "",
+                },
+                ModuleCatalog {
+                    dir: session_dir,
+                    builtins: BUILTIN_SESSION_EXTENSIONS,
+                    prefix: SESSION_MODULE_PREFIX,
+                },
+            ],
+            ctx,
+            theme,
         )
     }
 
     fn spawn_with_modules(
         thread_name: &str,
-        dir: PathBuf,
+        catalogs: Vec<ModuleCatalog>,
         ctx: egui::Context,
         theme: Vec<(String, String)>,
-        builtins: &'static [(&'static str, &'static str)],
     ) -> Self {
+        let module_dir = catalogs
+            .first()
+            .map(|catalog| catalog.dir.clone())
+            .unwrap_or_default();
         let items: Arc<RwLock<HashMap<String, Vec<ModuleItem>>>> = Arc::default();
         let mux: Arc<RwLock<MuxView>> = Arc::default();
         let metrics: Arc<RwLock<Metrics>> = Arc::default();
@@ -986,7 +1034,6 @@ impl ExtensionHost {
         let pending_window_actions: Arc<RwLock<Vec<WindowOutcome>>> = Arc::default();
         let next_window_id = Arc::new(AtomicU64::new(1));
         let waker: Arc<Waker> = Arc::default();
-        let module_dir = dir.clone();
         let run_jobs = Arc::new(PlatformRunJobs::default());
         cleanup_stale_platform_shell_run_jobs();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1007,10 +1054,9 @@ impl ExtensionHost {
                 let run_jobs = Arc::clone(&run_jobs);
                 move || {
                     run_loop(
-                        &dir,
+                        &catalogs,
                         &ctx,
                         &theme,
-                        builtins,
                         &mux,
                         &metrics,
                         &active,
@@ -1066,6 +1112,12 @@ impl ExtensionHost {
     #[must_use]
     pub fn has_user_module(&self, name: &str) -> bool {
         user_module_exists(&self.dir, name)
+    }
+    #[must_use]
+    pub fn has_legacy_sessions_module(&self) -> bool {
+        user_module_path(&self.dir, "sessions")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .is_some_and(|source| source.contains("bootty.sidebar.session_facts"))
     }
 
     #[must_use]
@@ -1166,10 +1218,9 @@ impl Drop for ExtensionHost {
 
 #[allow(clippy::too_many_arguments)]
 fn run_loop(
-    dir: &Path,
+    catalogs: &[ModuleCatalog],
     ctx: &egui::Context,
     theme: &[(String, String)],
-    builtins: &'static [(&'static str, &'static str)],
     mux: &Arc<RwLock<MuxView>>,
     metrics: &Arc<RwLock<Metrics>>,
     active: &RwLock<BTreeSet<String>>,
@@ -1202,8 +1253,8 @@ fn run_loop(
     WINDOW_QUEUE.with(|queue| {
         *queue.borrow_mut() = Some((Arc::clone(window_requests), Arc::clone(next_window_id)));
     });
-    let mut modules = load_modules(&lua, dir, builtins);
-    let mut signature = dir_signature(dir);
+    let mut modules = load_catalog_modules(&lua, catalogs);
+    let mut signature = catalog_signature(catalogs);
     let mut last_scan = Instant::now();
     let mut system = System::new();
     let battery = BatteryManager::new().ok();
@@ -1216,10 +1267,10 @@ fn run_loop(
         // Hot reload: re-evaluate when extension files are added, edited, or removed.
         if now.duration_since(last_scan) >= RELOAD_SCAN_INTERVAL {
             last_scan = now;
-            let current = dir_signature(dir);
+            let current = catalog_signature(catalogs);
             if current != signature {
                 signature = current;
-                modules = load_modules(&lua, dir, builtins);
+                modules = load_catalog_modules(&lua, catalogs);
                 let module_names = modules
                     .iter()
                     .map(|module| module.name.clone())
@@ -1319,6 +1370,29 @@ fn record_module_interval_run(force: bool, last_run: &mut Option<Instant>, now: 
     }
 }
 
+fn load_catalog_modules(lua: &Lua, catalogs: &[ModuleCatalog]) -> Vec<LoadedModule> {
+    catalogs
+        .iter()
+        .flat_map(|catalog| {
+            load_modules(lua, &catalog.dir, catalog.builtins)
+                .into_iter()
+                .map(|mut module| {
+                    module.name.insert_str(0, catalog.prefix);
+                    module
+                })
+        })
+        .collect()
+}
+
+fn catalog_signature(catalogs: &[ModuleCatalog]) -> Vec<(PathBuf, Option<SystemTime>)> {
+    let mut signature = catalogs
+        .iter()
+        .flat_map(|catalog| dir_signature(&catalog.dir))
+        .collect::<Vec<_>>();
+    signature.sort();
+    signature
+}
+
 fn prune_removed_items(
     items: &RwLock<HashMap<String, Vec<ModuleItem>>>,
     module_names: &BTreeSet<String>,
@@ -1332,6 +1406,7 @@ fn prune_removed_items(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModuleKind {
     Sidebar,
+    Session,
     Status,
 }
 
@@ -1339,9 +1414,191 @@ impl ModuleKind {
     fn builtins(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Sidebar => BUILTIN_SIDEBAR_EXTENSIONS,
+            Self::Session => BUILTIN_SESSION_EXTENSIONS,
             Self::Status => BUILTIN_STATUS_EXTENSIONS,
         }
     }
+}
+fn preview_run_cache() -> Arc<RunCache> {
+    let cache = Arc::new(RunCache::default());
+    cache.set_mode(RunMode::Cached);
+    let stderr_null = if cfg!(windows) {
+        "2>nul"
+    } else {
+        "2>/dev/null"
+    };
+    let session_id = platform_shell_quote("$1");
+    let pane_id = platform_shell_quote("%1");
+    let cwd = platform_shell_quote("/Users/demo/src/bootty");
+    let commands = [
+        (
+            format!(
+                "tmux list-panes -t {session_id} -F '#{{pane_active}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}' {stderr_null}"
+            ),
+            "1\t%1\tzsh\t4242",
+        ),
+        (
+            format!("tmux capture-pane -t {pane_id} -p -S -30 {stderr_null}"),
+            "• Working on module previews",
+        ),
+        (
+            format!("git -C {cwd} rev-parse --abbrev-ref HEAD {stderr_null}"),
+            "feature/module-previews",
+        ),
+        (
+            format!("git -C {cwd} diff HEAD --numstat {stderr_null}"),
+            "12\t3\tcrates/bootty-app/src/ui/settings/modules.rs",
+        ),
+        (
+            format!("ps -axo pid=,ppid=,comm=,args= {stderr_null}"),
+            "4243 4242 /opt/homebrew/bin/codex codex",
+        ),
+    ];
+    if let Ok(mut entries) = cache.entries.lock() {
+        for (command, output) in commands {
+            entries.insert(
+                command,
+                RunEntry {
+                    output: output.to_owned(),
+                    refreshing: false,
+                },
+            );
+        }
+    }
+    if let Ok(mut entries) = cache.codexbar.entries.lock() {
+        entries.insert(
+            "codex".to_owned(),
+            CodexBarEntry {
+                output: r#"{"primary":{"usedPercent":38,"windowMinutes":300},"secondary":{"usedPercent":61,"windowMinutes":10080}}"#.to_owned(),
+                ..CodexBarEntry::default()
+            },
+        );
+        entries.insert(
+            "claude".to_owned(),
+            CodexBarEntry {
+                output: r#"{"primary":{"usedPercent":17,"windowMinutes":300},"secondary":{"usedPercent":44,"windowMinutes":10080}}"#.to_owned(),
+                ..CodexBarEntry::default()
+            },
+        );
+    }
+    cache
+}
+
+/// Runs one module source in an isolated Lua VM with deterministic example host data.
+/// Shell-backed APIs serve seeded example output and never execute external commands.
+pub fn preview_module_source(
+    source: &str,
+    name: &str,
+    theme: &[(String, String)],
+) -> Vec<ModuleItem> {
+    let mux = Arc::new(RwLock::new(preview_mux_view()));
+    let metrics = Arc::new(RwLock::new(Metrics {
+        cpu: 42.0,
+        load1: 1.25,
+        mem_used_pct: 68.0,
+        mem_total_bytes: 16 * 1_073_741_824,
+        battery_percent: Some(73.0),
+        on_ac: false,
+        battery_time_to_empty_secs: Some(9_000.0),
+        battery_time_to_full_secs: None,
+    }));
+    let run_cache = preview_run_cache();
+    let result = setup_lua(theme, mux, metrics, Arc::default(), run_cache).and_then(|lua| {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        lua.set_interrupt(move |_| {
+            if Instant::now() >= deadline {
+                Err(mlua::Error::RuntimeError(
+                    "preview exceeded 50 ms".to_owned(),
+                ))
+            } else {
+                Ok(VmState::Continue)
+            }
+        });
+        let value = module_environment(&lua).and_then(|env| {
+            lua.load(source)
+                .set_name(name)
+                .set_environment(env)
+                .eval::<Value>()
+        })?;
+        loaded_module_from_value(name.to_owned(), value)
+            .map(|module| run_module(&module.body))
+            .ok_or_else(|| {
+                mlua::Error::RuntimeError("must return a function or { render = ... }".to_owned())
+            })
+    });
+    result.unwrap_or_else(|error| vec![error_item(&error.to_string())])
+}
+
+fn preview_mux_view() -> MuxView {
+    MuxView {
+        windows: vec![
+            WindowView {
+                id: "@1".to_owned(),
+                index: 1,
+                name: "editor".to_owned(),
+                active: true,
+                ..WindowView::default()
+            },
+            WindowView {
+                id: "@2".to_owned(),
+                index: 2,
+                name: "tests".to_owned(),
+                progress: Some(62),
+                ..WindowView::default()
+            },
+            WindowView {
+                id: "@3".to_owned(),
+                index: 3,
+                name: "server".to_owned(),
+                progress_indeterminate: true,
+                ..WindowView::default()
+            },
+        ],
+        sessions: vec![
+            SessionView {
+                id: "$1".to_owned(),
+                name: "work/api".to_owned(),
+                active: true,
+                selected: true,
+                cwd: Some("/Users/demo/src/bootty".to_owned()),
+                color: Some("#89b4fa".to_owned()),
+                dim_color: Some("#585b70".to_owned()),
+                progress: Some(62),
+                progresses: vec![SessionProgressView {
+                    process: "cargo test".to_owned(),
+                    value: 62,
+                    indeterminate: false,
+                }],
+                ports: vec![3000, 8080],
+                ..SessionView::default()
+            },
+            SessionView {
+                id: "$2".to_owned(),
+                name: "work/web".to_owned(),
+                active: true,
+                cwd: Some("/Users/demo/src/web".to_owned()),
+                color: Some("#a6e3a1".to_owned()),
+                dim_color: Some("#585b70".to_owned()),
+                ..SessionView::default()
+            },
+        ],
+        session: Some("work/api".to_owned()),
+        sidebar_visible: false,
+        session_color: Some("#89b4fa".to_owned()),
+        keep_awake: true,
+    }
+}
+pub fn preview_builtin_module(
+    kind: ModuleKind,
+    name: &str,
+    theme: &[(String, String)],
+) -> Vec<ModuleItem> {
+    kind.builtins()
+        .iter()
+        .find(|(builtin, _)| *builtin == name)
+        .map_or_else(Vec::new, |(_, source)| {
+            preview_module_source(source, name, theme)
+        })
 }
 
 /// Module names available to reference from a segment: built-ins plus user `*.lua` / `*.luau`
@@ -2674,6 +2931,111 @@ mod tests {
     }
 
     #[test]
+    fn module_preview_runs_source_with_example_host_data() {
+        let items = preview_module_source(
+            r#"return function()
+                local metrics = bootty.metrics()
+                local sessions = bootty.sessions()
+                return {
+                    {
+                        text = string.format(
+                            "%.0f%% · %s · %d",
+                            metrics.cpu,
+                            sessions[1].name,
+                            sessions[1].ports[1]
+                        )
+                    }
+                }
+            end"#,
+            "preview",
+            &[("accent".to_owned(), "#89b4fa".to_owned())],
+        );
+
+        assert_eq!(items[0].text, "42% · work/api · 3000");
+    }
+
+    #[test]
+    fn status_builtin_previews_produce_renderable_items() {
+        let theme = crate::theme::theme_tokens(
+            &crate::config::BoottyConfig::default(),
+            crate::config::AppearanceVariant::Dark,
+        );
+        for (name, source) in BUILTIN_STATUS_EXTENSIONS {
+            let items = preview_module_source(source, name, &theme);
+            assert!(!items.is_empty(), "{name} preview was empty");
+            assert!(
+                items.iter().all(|item| item.fg != Some(ERROR_COLOR)),
+                "{name} preview failed: {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_and_session_previews_use_seeded_example_data() {
+        let theme = crate::theme::theme_tokens(
+            &crate::config::BoottyConfig::default(),
+            crate::config::AppearanceVariant::Dark,
+        );
+        let usage = preview_builtin_module(ModuleKind::Sidebar, "codexbar", &theme);
+        assert_eq!(
+            usage
+                .iter()
+                .filter(|item| item.kind.as_deref() == Some("footer"))
+                .count(),
+            4
+        );
+
+        for (name, source) in BUILTIN_SESSION_EXTENSIONS {
+            let items = preview_module_source(source, name, &theme);
+            assert!(!items.is_empty(), "{name} preview was empty");
+            assert!(
+                items.iter().all(|item| item.fg != Some(ERROR_COLOR)),
+                "{name} preview failed: {items:?}"
+            );
+            if *name == "process" {
+                assert!(
+                    items
+                        .iter()
+                        .any(|item| item.key.as_deref() == Some("$1:process")),
+                    "dirty session process should remain visible"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn session_preview_composes_with_example_sidebar_sessions() {
+        let theme = crate::theme::theme_tokens(
+            &crate::config::BoottyConfig::default(),
+            crate::config::AppearanceVariant::Dark,
+        );
+        let base = preview_builtin_module(ModuleKind::Sidebar, "sessions", &theme);
+        let ports = preview_builtin_module(ModuleKind::Session, "ports", &theme);
+        let items = crate::app::compose_session_module_items(base, ports);
+
+        assert!(
+            items
+                .iter()
+                .any(|item| { item.kind.as_deref() == Some("group") && item.text == "work" })
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.key.as_deref() == Some("$1:ports"))
+        );
+    }
+
+    #[test]
+    fn module_preview_stops_runaway_source() {
+        let started = Instant::now();
+        let items =
+            preview_module_source("return function() while true do end end", "preview", &[]);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(items[0].text.contains("preview exceeded 50 ms"));
+    }
+
+    #[test]
     fn footer_meter_track_is_optional() {
         let items = run_source(
             r##"return function()
@@ -2754,6 +3116,20 @@ mod tests {
             dir.path(),
             BUILTIN_SIDEBAR_EXTENSIONS,
             &["sessions", "codexbar"],
+        );
+        assert_builtins_load(
+            &lua,
+            dir.path(),
+            BUILTIN_SESSION_EXTENSIONS,
+            &[
+                "diffs",
+                "process",
+                "agent",
+                "directory",
+                "branch",
+                "ports",
+                "progress",
+            ],
         );
     }
 
@@ -3333,7 +3709,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_sessions_keeps_branch_row_stable_without_status_progress_rows() {
+    fn builtin_session_modules_keep_rows_stable_without_progress() {
         let cwd = std::env::current_dir()
             .expect("current dir")
             .to_string_lossy()
@@ -3354,14 +3730,17 @@ mod tests {
         }));
         let lua = setup_lua(&[], mux, Arc::default(), Arc::default(), Arc::default()).unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
-        let modules = load_modules(&lua, dir.path(), BUILTIN_SIDEBAR_EXTENSIONS);
-        let sessions = modules
-            .iter()
-            .find(|module| module.name == "sessions")
-            .expect("sessions builtin loaded");
+        let modules = load_modules(&lua, dir.path(), BUILTIN_SESSION_EXTENSIONS);
+        let render = || {
+            modules
+                .iter()
+                .filter(|module| matches!(module.name.as_str(), "directory" | "branch" | "ports"))
+                .flat_map(|module| run_module(&module.body))
+                .collect::<Vec<_>>()
+        };
 
-        let first = run_module(&sessions.body);
-        let rerendered = run_module(&sessions.body);
+        let first = render();
+        let rerendered = render();
         let keys = rerendered
             .iter()
             .filter_map(|item| item.key.as_deref())
@@ -3389,11 +3768,11 @@ mod tests {
         assert!(!keys.contains(&"plain:progress"));
     }
 
-    // Drives the real `sessions` builtin through the Refresh-mode cache path (what the app uses),
+    // Drives the real `branch` module through the Refresh-mode cache path (what the app uses),
     // re-rendering until the branch row settles. Returns the branch row's text, or None if the
     // row is absent. Synchronizes on the rendered value rather than sleeping a fixed duration.
     fn settle_branch_row(
-        sessions: &LoadedModule,
+        branch: &LoadedModule,
         run_cache: &RunCache,
         want: impl Fn(&str) -> bool,
         timeout: Duration,
@@ -3402,7 +3781,7 @@ mod tests {
         let mut last = None;
         while Instant::now() < deadline {
             run_cache.set_mode(RunMode::Refresh);
-            let items = run_module(&sessions.body);
+            let items = run_module(&branch.body);
             run_cache.set_mode(RunMode::Live);
             last = items
                 .iter()
@@ -3417,7 +3796,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_sessions_branch_row_tracks_live_head_through_changes() {
+    fn builtin_branch_module_tracks_live_head_through_changes() {
         fn git(repo: &std::path::Path, args: &[&str]) {
             let status = std::process::Command::new("git")
                 .args(args)
@@ -3455,15 +3834,15 @@ mod tests {
         )
         .unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
-        let modules = load_modules(&lua, dir.path(), BUILTIN_SIDEBAR_EXTENSIONS);
-        let sessions = modules
+        let modules = load_modules(&lua, dir.path(), BUILTIN_SESSION_EXTENSIONS);
+        let branch = modules
             .iter()
-            .find(|module| module.name == "sessions")
-            .expect("sessions builtin loaded");
+            .find(|module| module.name == "branch")
+            .expect("branch builtin loaded");
 
         let timeout = Duration::from_secs(5);
         assert_eq!(
-            settle_branch_row(sessions, &run_cache, |b| b == "alpha", timeout).as_deref(),
+            settle_branch_row(branch, &run_cache, |b| b == "alpha", timeout).as_deref(),
             Some("alpha"),
             "branch row should report the starting branch",
         );
@@ -3471,7 +3850,7 @@ mod tests {
         // Switch to another branch: the row must follow, not freeze on the first value.
         git(path, &["checkout", "-q", "-b", "beta"]);
         assert_eq!(
-            settle_branch_row(sessions, &run_cache, |b| b == "beta", timeout).as_deref(),
+            settle_branch_row(branch, &run_cache, |b| b == "beta", timeout).as_deref(),
             Some("beta"),
             "branch row must update when the live branch changes",
         );
@@ -3479,7 +3858,7 @@ mod tests {
         // Detach HEAD: the row must report detached, not the stale branch name.
         git(path, &["checkout", "-q", "HEAD~1"]);
         let detached =
-            settle_branch_row(sessions, &run_cache, |b| b.starts_with("detached"), timeout);
+            settle_branch_row(branch, &run_cache, |b| b.starts_with("detached"), timeout);
         assert!(
             detached
                 .as_deref()
@@ -4105,6 +4484,8 @@ mod tests {
         let sidebar_names = module_names(dir.path(), ModuleKind::Sidebar);
         assert!(sidebar_names.contains(&"custom".to_owned()));
         assert!(sidebar_names.contains(&"sessions".to_owned()));
+        let session_names = module_names(dir.path(), ModuleKind::Session);
+        assert!(session_names.contains(&"directory".to_owned()));
     }
 
     #[test]

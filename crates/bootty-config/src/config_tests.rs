@@ -244,12 +244,31 @@ fn defaults_put_current_status_modules_in_visible_top_bar() {
 fn sidebar_modules_default_and_override_in_order() {
     let defaults = load_config_source("");
     assert_eq!(defaults.sidebar.modules, ["sessions", "codexbar"]);
+    assert_eq!(
+        defaults.sidebar.session_modules,
+        [
+            "diffs",
+            "process",
+            "agent",
+            "directory",
+            "branch",
+            "ports",
+            "progress"
+        ]
+    );
+    assert!(!defaults.sidebar.session_modules_configured);
 
     let configured = load_config_source(indoc! {r#"
         [sidebar]
         modules = ["custom", "sessions"]
+        session-modules = ["directory", "progress"]
     "#});
     assert_eq!(configured.sidebar.modules, ["custom", "sessions"]);
+    assert!(configured.sidebar.session_modules_configured);
+    assert_eq!(
+        configured.sidebar.session_modules,
+        ["directory", "progress"]
+    );
 }
 
 #[test]
