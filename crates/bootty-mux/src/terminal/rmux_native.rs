@@ -167,6 +167,7 @@ struct RmuxWorker {
     latest_frame: Arc<RmuxPublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_output: RmuxOutputBacklog,
+    pending_pre_restore_output: RmuxOutputBacklog,
     pending_restore_output: RmuxOutputBacklog,
     pending_output_len: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
@@ -549,6 +550,9 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
             latest_frame: config.latest_frame,
             latest_drain: config.latest_drain,
             pending_output: RmuxOutputBacklog::with_capacity(RMUX_MAX_COLLECT_CHUNKS_PER_TICK),
+            pending_pre_restore_output: RmuxOutputBacklog::with_capacity(
+                RMUX_MAX_COLLECT_CHUNKS_PER_TICK,
+            ),
             pending_restore_output: RmuxOutputBacklog::with_capacity(1),
             pending_output_len: config.pending_output_len,
             closed: config.closed,
@@ -851,11 +855,23 @@ impl RmuxWorker {
             };
             did_work = true;
             match event {
-                RmuxPaneEvent::Capture(bytes) => {
-                    collected_chunks += 1;
-                    let bytes = normalize_capture_newlines(&bytes);
-                    collected_bytes += bytes.len();
-                    self.push_pending_restore_output(bytes);
+                RmuxPaneEvent::Restore {
+                    buffered_chunks,
+                    capture,
+                } => {
+                    for chunk in buffered_chunks {
+                        collected_chunks += 1;
+                        if let Some(bytes) = pane_output_chunk_bytes(chunk) {
+                            collected_bytes += bytes.len();
+                            self.pending_pre_restore_output.push_back(bytes);
+                        }
+                    }
+                    if !capture.is_empty() {
+                        collected_chunks += 1;
+                        let bytes = normalize_capture_newlines(&capture);
+                        collected_bytes += bytes.len();
+                        self.push_pending_restore_output(bytes);
+                    }
                     self.scroll_bottom_after_output = true;
                 }
                 RmuxPaneEvent::Chunks(chunks) => {
@@ -908,6 +924,7 @@ impl RmuxWorker {
     fn total_pending_output_len(&self) -> usize {
         self.pending_output
             .len()
+            .saturating_add(self.pending_pre_restore_output.len())
             .saturating_add(self.pending_restore_output.len())
     }
 
@@ -932,6 +949,7 @@ impl RmuxWorker {
         };
         let stats = drain_rmux_pending_output(
             &mut self.engine,
+            &mut self.pending_pre_restore_output,
             &mut self.pending_restore_output,
             &mut self.pending_output,
             max_bytes,
@@ -941,7 +959,10 @@ impl RmuxWorker {
         if stats.bytes > 0 && self.scroll_bottom_after_output {
             self.engine.scroll_viewport_bottom();
         }
-        if self.pending_output.is_empty() && self.pending_restore_output.is_empty() {
+        if self.pending_output.is_empty()
+            && self.pending_pre_restore_output.is_empty()
+            && self.pending_restore_output.is_empty()
+        {
             self.scroll_bottom_after_output = false;
         }
         if stats.bytes > 0 {
@@ -1122,12 +1143,22 @@ fn rmux_restore_lines(max_scrollback_bytes: usize, viewport_rows: u16) -> usize 
 
 fn drain_rmux_pending_output(
     engine: &mut TerminalEngine,
+    pre_restore: &mut RmuxOutputBacklog,
     restore: &mut RmuxOutputBacklog,
     live: &mut RmuxOutputBacklog,
     max_bytes: usize,
     max_chunks: usize,
     max_time_us: u128,
 ) -> DrainStats {
+    if !pre_restore.is_empty() {
+        return drain_rmux_output_backlog_with_limits(
+            pre_restore,
+            max_bytes,
+            max_chunks,
+            max_time_us,
+            |bytes| engine.write_vt(bytes),
+        );
+    }
     if !restore.is_empty() {
         return drain_rmux_output_backlog_with_limits(
             restore,
@@ -1255,6 +1286,7 @@ mod tests {
     #[test]
     fn rmux_restore_drains_before_live_output() {
         let mut engine = TerminalEngine::new(test_geometry()).unwrap();
+        let mut pre_restore = RmuxOutputBacklog::with_capacity(0);
         let mut restore = RmuxOutputBacklog::with_capacity(1);
         restore.push_back(b"RESTORED\r\n".to_vec());
         let mut live = RmuxOutputBacklog::with_capacity(1);
@@ -1262,6 +1294,7 @@ mod tests {
 
         drain_rmux_pending_output(
             &mut engine,
+            &mut pre_restore,
             &mut restore,
             &mut live,
             usize::MAX,
