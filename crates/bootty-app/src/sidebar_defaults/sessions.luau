@@ -10,16 +10,10 @@ local DESTRUCTIVE_COLOR = bootty.theme.destructive
 
 local function session_right(_, enriched)
 	if enriched.diff_added and enriched.diff_removed then
-		return {
-			ui.text(
-				"+" .. tostring(enriched.diff_added),
-				{ x = 1, x_px = -62, color = SUCCESS_COLOR, align = "right_center", size = 12 }
-			),
-			ui.text(
-				"-" .. tostring(enriched.diff_removed),
-				{ x = 1, x_px = -12, color = DESTRUCTIVE_COLOR, align = "right_center", size = 12 }
-			),
-		}
+		return ui.diff_summary(enriched.diff_added, enriched.diff_removed, {
+			success = SUCCESS_COLOR,
+			destructive = DESTRUCTIVE_COLOR,
+		})
 	elseif enriched.display_process and enriched.display_process ~= "" then
 		return {
 			ui.text(
