@@ -181,6 +181,7 @@ pub fn suggested_session_name(cwd: &str) -> String {
 }
 
 fn read(cwd: &str, args: &[&str]) -> Option<String> {
+    bootty_runtime::perf::record_subprocess("git read");
     let output = git_command(cwd, args).output().ok()?;
     if !output.status.success() {
         return None;
@@ -189,6 +190,7 @@ fn read(cwd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn run(cwd: &str, args: &[&str]) -> Result<(), String> {
+    bootty_runtime::perf::record_subprocess("git run");
     let output = git_command(cwd, args)
         .output()
         .map_err(|error| error.to_string())?;

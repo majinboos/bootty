@@ -2800,11 +2800,7 @@ impl AppState {
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
             return;
         }
-        // The full backend list, not `sessions()`: that one is narrowed to this binding's
-        // membership by `sync_session_order` later in the same frame, so it alternates between the
-        // refreshed superset and the filtered subset depending on whether a refresh landed. The
-        // fingerprint below would flip on every one of those swings and fork `git` per session.
-        let sessions = self.binding.mux.all_sessions().to_vec();
+        let sessions = self.binding.mux.sessions().to_vec();
         if !self.generated_names_need_sync(&sessions) {
             return;
         }
@@ -5630,9 +5626,12 @@ fn run_ditch_cleanup(cwd: Option<&str>, action: &DitchAction) -> Result<(), Stri
 mod tests {
     use super::*;
     use crate::config::{MultiplexerBackendConfig, WindowFullscreen};
-    use crate::mux::{backend::MuxBackend, command::MuxCommand, native::NativeBackend};
+    use crate::mux::{
+        backend::MuxBackend, command::MuxCommand, native::NativeBackend, snapshot::MuxSnapshot,
+    };
     use anyhow::Context;
     use std::{
+        sync::Arc,
         sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, Instant},
@@ -6928,6 +6927,68 @@ mod tests {
             !state.generated_names_need_sync(&moved),
             "reconciliation must settle again once the session set stops changing"
         );
+    }
+
+    /// A backend that keeps answering with the same sessions, so every refresh is a no-op change.
+    struct SteadyBackend {
+        sessions: Vec<MuxSession>,
+    }
+
+    impl MuxBackend for SteadyBackend {
+        fn snapshot(&self) -> anyhow::Result<MuxSnapshot> {
+            Ok(MuxSnapshot {
+                active_session_id: self.sessions.first().map(|session| session.id.clone()),
+                sessions: self.sessions.clone(),
+            })
+        }
+
+        fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A frame that changes nothing must not fork a subprocess. `update_frame`'s `sync_*` helpers
+    /// resolve session cwds through `git`, which costs tens of milliseconds per spawn on the frame
+    /// thread; when that landed on every frame it stalled the window 60-207ms at a time.
+    ///
+    /// Asserting no spawn rather than a duration keeps this deterministic on a loaded CI runner.
+    /// Refreshes alternate so the guard covers both a snapshot-applying frame and an idle one.
+    #[test]
+    fn steady_state_frames_do_not_fork_subprocesses() {
+        let sessions = (0..7)
+            .map(|index| {
+                session_with(
+                    &format!("${index}"),
+                    &format!("session-{index}"),
+                    &format!("/tmp/bootty-steady-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        state.binding.mux.set_backend_factory(Arc::new(move |_| {
+            Box::new(SteadyBackend {
+                sessions: sessions.clone(),
+            })
+        }));
+        // Settle: the frames that first observe these sessions are entitled to resolve their cwds.
+        for _ in 0..3 {
+            state.binding.mux.refresh_on_next_frame();
+            state.update_frame(test_frame_inputs(Vec::new(), None));
+        }
+        assert_eq!(state.binding.mux.sessions().len(), 7);
+        // Without this the loop below is vacuous: an early return added ahead of the `git` call
+        // would skip the reconciler entirely and the guard would have nothing to complain about.
+        assert!(state.binding.generated_names_signature.is_some());
+
+        let _guard = bootty_runtime::perf::guard_frame_path();
+        for frame in 0..8 {
+            if frame % 2 == 0 {
+                state.binding.mux.refresh_on_next_frame();
+            }
+            state.update_frame(test_frame_inputs(Vec::new(), None));
+        }
     }
 
     #[test]

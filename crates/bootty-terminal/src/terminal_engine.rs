@@ -66,6 +66,8 @@ use {
 
 pub const DEFAULT_MAX_SCROLLBACK: usize = 0;
 const SELECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(500);
+/// Ceiling on button reports emitted for one wheel event. Well above a full-screen page scroll.
+const MAX_WHEEL_REPORTS: usize = 1024;
 pub const NATIVE_SCROLLBACK_TARGET_ROWS: usize = 1_000_000;
 pub const NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE: usize = 320;
 pub const NATIVE_MAX_SCROLLBACK: usize =
@@ -2101,6 +2103,10 @@ impl TerminalEngine {
         if notch == 0 {
             return Ok(());
         }
+        // The row count reaches us from a saturating f32 cast of an OS scroll delta, so a
+        // non-finite delta arrives as `isize::MAX`. Nothing observed produces one, but the cost of
+        // being wrong is an unbounded write to the PTY, and no real scroll exceeds a screenful.
+        let notches = notches.min(MAX_WHEEL_REPORTS);
         out.reserve(notch * notches.saturating_sub(1));
         for _ in 1..notches {
             out.extend_from_within(..notch);
