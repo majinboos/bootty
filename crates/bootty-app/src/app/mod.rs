@@ -1917,7 +1917,7 @@ impl BoottyApp {
         let Some(mut dialog) = self.state.take_session_picker_dialog() else {
             return;
         };
-        let groups = self.state.binding_session_groups();
+        let groups = self.state.session_finder_groups();
         let event = dialog.show(ctx, self.state.ui_theme(), &groups);
         self.state.apply_session_picker_event(dialog, event);
     }

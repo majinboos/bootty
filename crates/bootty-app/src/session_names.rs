@@ -127,6 +127,14 @@ impl SessionNameStore {
         Some(result)
     }
 
+    /// The name this binding last saw for `session_id`. A difference from the session's current
+    /// name is a rename this binding has yet to account for.
+    pub fn last_observed_name(&self, session_id: &str) -> Option<&str> {
+        self.records
+            .get(session_id)
+            .map(|record| record.session_name.as_str())
+    }
+
     pub fn remember_generated(&mut self, session_id: &str, cwd: &str, generated_name: &str) {
         let existing_key = self.matching_key(cwd);
         if existing_key
