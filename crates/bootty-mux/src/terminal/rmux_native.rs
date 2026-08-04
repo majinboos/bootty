@@ -721,7 +721,11 @@ impl RmuxWorker {
                         self.mark_input_fast_path();
                         if self
                             .engine
-                            .encode_mouse_to_vec(input, &mut self.output_buf)
+                            .encode_mouse_wheel_to_vec(
+                                input,
+                                scroll_delta.unsigned_abs().max(1),
+                                &mut self.output_buf,
+                            )
                             .is_ok()
                         {
                             self.write_output_buf();

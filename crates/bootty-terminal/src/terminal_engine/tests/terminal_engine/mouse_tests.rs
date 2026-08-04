@@ -591,3 +591,19 @@ fn mouse_encoder_ports_release_identity_and_boundary_cases() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn wheel_reports_one_button_press_per_scrolled_row() -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    engine.write_vt(b"\x1b[?1000h\x1b[?1006h");
+    let mut out = Vec::new();
+
+    engine.encode_mouse_wheel_to_vec(
+        test_mouse_input(MouseAction::Press, Some(MouseButton::Four), 0.0, 0.0),
+        3,
+        &mut out,
+    )?;
+
+    assert_eq!(out, b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M");
+    Ok(())
+}
