@@ -96,7 +96,7 @@ description = "Run the full benchmark reproduction suite for scheduled CI"
 run = "scripts/run-benchmark-suite.sh --quick --output artifacts/benchmark-reproduction/overnight"
 
 [tasks.release]
-description = "Prepare and auto-merge a patch, minor, or major release"
+description = "Prepare and auto-merge a release; pass patch or major for a bump other than minor"
 run = "./scripts/prepare-release.sh"
 
 [tasks.package]

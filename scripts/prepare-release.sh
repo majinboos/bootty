@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-bump="${1:-patch}"
+bump="${1:-minor}"
 current="$(awk '$0 == "[workspace.package]" { in_package = 1; next } /^\[/ { in_package = 0 } in_package && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)"
 
 if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
@@ -16,7 +16,7 @@ case "$bump" in
   major) next="$((major + 1)).0.0" ;;
   minor) next="$major.$((minor + 1)).0" ;;
   patch) next="$major.$minor.$((patch + 1))" ;;
-  *) echo "usage: mise run release -- patch|minor|major" >&2; exit 2 ;;
+  *) echo "usage: mise run release [-- patch|minor|major] (default: minor)" >&2; exit 2 ;;
 esac
 
 [[ "$(git branch --show-current)" == "main" ]] || { echo "run releases from main" >&2; exit 1; }
