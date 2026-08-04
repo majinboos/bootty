@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "bootty"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bootty-render",
  "bootty-runtime",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-site"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bootty-surface",
  "bootty-workspace-hack",
