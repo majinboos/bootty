@@ -2,7 +2,7 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use eframe::egui::CursorIcon;
 #[cfg(target_os = "macos")]
 use objc2::runtime::NSObjectProtocol;
@@ -25,9 +25,57 @@ pub fn read_clipboard_text() -> Result<Option<String>> {
     let mut clipboard = arboard::Clipboard::new()?;
     match clipboard.get_text() {
         Ok(text) if !text.is_empty() => Ok(Some(text)),
-        Ok(_) | Err(arboard::Error::ContentNotAvailable) => Ok(None),
+        Ok(_) | Err(arboard::Error::ContentNotAvailable) => read_clipboard_image_as_path(),
         Err(error) => Err(error.into()),
     }
+}
+
+/// A clipboard holding image bytes and no text (a screenshot, a copied image) has nothing to
+/// paste as text, so paste the image itself: spill it to a PNG under the temp dir and paste
+/// that path. Same shape as the copied-file case above, which pastes paths rather than bytes,
+/// and it gives programs that read paths — editors, agents, `open` — something to work with.
+fn read_clipboard_image_as_path() -> Result<Option<String>> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let path = write_clipboard_image_png(&image)?;
+    Ok(bootty_winit::file_paths::format_file_paths_for_paste([
+        path.as_path(),
+    ]))
+}
+
+fn write_clipboard_image_png(image: &arboard::ImageData<'_>) -> Result<PathBuf> {
+    let width = u32::try_from(image.width).context("clipboard image width")?;
+    let height = u32::try_from(image.height).context("clipboard image height")?;
+    let path = std::env::temp_dir().join(format!("bootty-clipboard-{}.png", clipboard_image_id()));
+
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("create clipboard image file {}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()
+        .context("write clipboard image header")?
+        .write_image_data(&image.bytes)
+        .context("write clipboard image data")?;
+    Ok(path)
+}
+
+/// Unique per paste without pulling in a uuid dependency: the process id pins the writer and the
+/// counter pins the paste, so two pastes never land on one file.
+fn clipboard_image_id() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 pub fn write_clipboard_text(text: &str) -> Result<()> {
@@ -635,6 +683,41 @@ mod macos_presentation {
 mod tests {
     use super::*;
     use eframe::egui;
+
+    #[test]
+    fn clipboard_image_spills_to_a_png_that_decodes_back_to_the_same_pixels() {
+        let pixels: Vec<u8> = vec![
+            255, 0, 0, 255, // red
+            0, 255, 0, 128, // half-transparent green
+            0, 0, 255, 255, // blue
+            9, 9, 9, 0, // fully transparent
+        ];
+        let image = arboard::ImageData {
+            width: 2,
+            height: 2,
+            bytes: pixels.clone().into(),
+        };
+
+        let path = write_clipboard_image_png(&image).expect("write clipboard png");
+        let decoded = std::fs::read(&path).expect("read clipboard png");
+        std::fs::remove_file(&path).ok();
+
+        let mut reader = png::Decoder::new(std::io::Cursor::new(decoded))
+            .read_info()
+            .expect("decode clipboard png");
+        assert_eq!(reader.info().color_type, png::ColorType::Rgba);
+        assert_eq!((reader.info().width, reader.info().height), (2, 2));
+        let mut out = vec![0; reader.output_buffer_size().expect("png buffer size")];
+        let frame = reader
+            .next_frame(&mut out)
+            .expect("read clipboard png frame");
+        assert_eq!(out[..frame.buffer_size()], pixels[..]);
+    }
+
+    #[test]
+    fn clipboard_image_ids_do_not_collide() {
+        assert_ne!(clipboard_image_id(), clipboard_image_id());
+    }
 
     #[test]
     fn native_options_use_configured_window_settings() {
