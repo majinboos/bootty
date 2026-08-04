@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     hash::Hasher,
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -401,6 +401,14 @@ impl BindingRuntime {
             terminal_side_effect_tx,
             terminal_side_effect_rx,
         } = NativeTerminalOwner::new(&config, variant, repaint);
+        let mut mux = BindingMuxController::new(scope);
+        // Bindings of one workspace share native sessions, separate workspaces cannot see each
+        // other's, and reopening a window keeps its own. Native sessions live in this process rather
+        // than in a server, so which state a binding reaches is a choice bootty has to make.
+        let workspace = config.config_path.clone();
+        mux.set_backend_factory(Arc::new(move |multiplexer| {
+            bootty_mux::config::build_backend_for_workspace(multiplexer, Some(&workspace))
+        }));
         Self {
             label: binding_label(scope, &config.multiplexer),
             backend_override,
@@ -409,7 +417,7 @@ impl BindingRuntime {
             terminal,
             terminal_side_effect_tx,
             terminal_side_effect_rx,
-            mux: BindingMuxController::new(scope),
+            mux,
             session_order: SessionOrderStore::for_binding(
                 &config.config_path,
                 scope.binding_id().persistence_value(),
@@ -2772,13 +2780,24 @@ impl AppState {
     fn sync_session_order(&mut self) {
         self.binding.sync_session_order();
     }
-    /// Whether the generated-name reconciler needs to run for `sessions`, updating the stored
-    /// fingerprint as a side effect. Reconciling forks a `git` subprocess per session (worktree
-    /// lookup), so this returns `false` while no session's id, name, or cwd has changed, keeping
+    /// Whether the generated-name reconciler needs to run, updating the stored fingerprint as a
+    /// side effect. Reconciling forks up to four `git` subprocesses per session (a worktree lookup,
+    /// then a suggested name), so this returns `false` while nothing relevant has changed, keeping
     /// that work off the steady-state frame path.
-    fn generated_names_need_sync(&mut self, sessions: &[MuxSession]) -> bool {
+    ///
+    /// Fingerprints the whole backend list, which changes only when the backend really did.
+    /// `mux.sessions()` cannot be used: it is narrowed to this binding's membership, and it is
+    /// unstable *within* a frame, because `apply_snapshot` resets it to the full backend list on
+    /// every refresh and `sync_session_order` narrows it again later in the same frame. Hashing it
+    /// reconciled several times a second forever, which is a `git` fork per session per refresh.
+    ///
+    /// Membership is left out on purpose. Including it would let a newly attached session take its
+    /// generated name immediately, rather than waiting for the next backend change, but the extra
+    /// reconciles it causes reach the cwd-keyed `SessionNameStore` collision between bindings often
+    /// enough to fail Space membership tests. Include it once that store is keyed by session id.
+    fn generated_names_need_sync(&mut self) -> bool {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for session in sessions {
+        for session in self.binding.mux.all_sessions() {
             hasher.write(session.id.as_bytes());
             hasher.write_u8(0);
             hasher.write(session.name.as_bytes());
@@ -2800,10 +2819,12 @@ impl AppState {
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
             return;
         }
-        let sessions = self.binding.mux.sessions().to_vec();
-        if !self.generated_names_need_sync(&sessions) {
+        if !self.generated_names_need_sync() {
             return;
         }
+        // Still only this binding's sessions: reconciling the whole backend list renames sessions
+        // that belong to other Spaces.
+        let sessions = self.binding.mux.sessions().to_vec();
         let mut renames = Vec::new();
         self.binding
             .pending_generated_names
@@ -6900,45 +6921,88 @@ mod tests {
         // Guards the fix for the per-frame `git` fork: the reconciler must not repeat its
         // per-session worktree lookups while the session set is unchanged, but must re-run when a
         // session's name or cwd changes so generated names stay current.
-        let mut state = test_state();
-        let sessions = vec![session_with("s1", "alpha", "/repo/alpha")];
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let backend = ScriptedBackend::with(vec![session_with("s1", "alpha", "/repo/alpha")])
+            .install(&mut state.binding);
 
         assert!(
-            state.generated_names_need_sync(&sessions),
+            frames_reconciled_names(&mut state),
             "first observation of a session set must reconcile"
         );
         assert!(
-            !state.generated_names_need_sync(&sessions),
+            !frames_reconciled_names(&mut state),
             "an unchanged session set must be skipped (no per-frame git forks)"
         );
 
-        let renamed = vec![session_with("s1", "beta", "/repo/alpha")];
+        backend.set(vec![session_with("s1", "beta", "/repo/alpha")]);
         assert!(
-            state.generated_names_need_sync(&renamed),
+            frames_reconciled_names(&mut state),
             "a session rename must trigger reconciliation"
         );
 
-        let moved = vec![session_with("s1", "beta", "/repo/beta")];
+        backend.set(vec![session_with("s1", "beta", "/repo/beta")]);
         assert!(
-            state.generated_names_need_sync(&moved),
+            frames_reconciled_names(&mut state),
             "a session cwd change must trigger reconciliation"
         );
         assert!(
-            !state.generated_names_need_sync(&moved),
+            !frames_reconciled_names(&mut state),
             "reconciliation must settle again once the session set stops changing"
         );
     }
 
-    /// A backend that keeps answering with the same sessions, so every refresh is a no-op change.
-    struct SteadyBackend {
-        sessions: Vec<MuxSession>,
+    /// Run a refreshing frame and then an idle one, and report whether either reconciled generated
+    /// names.
+    ///
+    /// Drives the real `update_frame` rather than replaying the calls it makes, so reordering them
+    /// cannot leave this passing while covering nothing. Both frames are needed: real refreshes are
+    /// 250ms apart, so most frames fall between them, and it is the *idle* frame that sees
+    /// `mux.sessions()` narrowed back down. Refreshing on every frame hides that entirely.
+    fn frames_reconciled_names(state: &mut AppState) -> bool {
+        let before = state.binding.generated_names_signature;
+        state.binding.mux.refresh_on_next_frame();
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+        let after_refresh = state.binding.generated_names_signature;
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+        after_refresh != before || state.binding.generated_names_signature != after_refresh
     }
 
-    impl MuxBackend for SteadyBackend {
+    /// A backend whose session list the test owns, so a refresh can be made to report a change or
+    /// to report the same thing again.
+    #[derive(Clone)]
+    struct ScriptedBackend {
+        sessions: Arc<std::sync::Mutex<Vec<MuxSession>>>,
+    }
+
+    impl ScriptedBackend {
+        fn with(sessions: Vec<MuxSession>) -> Self {
+            Self {
+                sessions: Arc::new(std::sync::Mutex::new(sessions)),
+            }
+        }
+
+        fn set(&self, sessions: Vec<MuxSession>) {
+            *self.sessions.lock().expect("scripted sessions") = sessions;
+        }
+
+        /// Installs itself on a binding and returns a handle the test keeps for later `set` calls.
+        fn install(self, binding: &mut BindingRuntime) -> Self {
+            let backend = self.clone();
+            binding
+                .mux
+                .set_backend_factory(Arc::new(move |_| Box::new(backend.clone())));
+            self
+        }
+    }
+
+    impl MuxBackend for ScriptedBackend {
         fn snapshot(&self) -> anyhow::Result<MuxSnapshot> {
+            let sessions = self.sessions.lock().expect("scripted sessions").clone();
             Ok(MuxSnapshot {
-                active_session_id: self.sessions.first().map(|session| session.id.clone()),
-                sessions: self.sessions.clone(),
+                active_session_id: sessions.first().map(|session| session.id.clone()),
+                sessions,
             })
         }
 
@@ -6967,17 +7031,18 @@ mod tests {
         let mut state = test_state_with_config(|config| {
             config.multiplexer.backend = MultiplexerBackendConfig::Native;
         });
-        state.binding.mux.set_backend_factory(Arc::new(move |_| {
-            Box::new(SteadyBackend {
-                sessions: sessions.clone(),
-            })
-        }));
+        ScriptedBackend::with(sessions).install(&mut state.binding);
+        // One of the seven belongs to this binding, which is what makes `mux.sessions()` unstable:
+        // a refresh resets it to all seven and `sync_session_order` narrows it back to one later in
+        // the same frame. Fingerprinting that list flips the signature on every refresh.
+        state.binding.session_order.add_session("session-0");
         // Settle: the frames that first observe these sessions are entitled to resolve their cwds.
         for _ in 0..3 {
             state.binding.mux.refresh_on_next_frame();
             state.update_frame(test_frame_inputs(Vec::new(), None));
         }
-        assert_eq!(state.binding.mux.sessions().len(), 7);
+        assert_eq!(state.binding.mux.all_sessions().len(), 7);
+        assert_eq!(state.binding.mux.sessions().len(), 1);
         // Without this the loop below is vacuous: an early return added ahead of the `git` call
         // would skip the reconciler entirely and the guard would have nothing to complain about.
         assert!(state.binding.generated_names_signature.is_some());
