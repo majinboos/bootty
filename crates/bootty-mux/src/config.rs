@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
@@ -20,9 +20,22 @@ pub fn selected_backend(config: &MultiplexerConfig) -> MultiplexerBackendConfig 
 }
 
 pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
+    build_backend_for_workspace(config, None)
+}
+
+/// Build the backend for `config`, giving the native backend the mux state belonging to
+/// `workspace`. Only the native backend keeps its sessions in this process, so it is the only one a
+/// workspace can scope; the others reach a server that is already shared.
+pub fn build_backend_for_workspace(
+    config: &MultiplexerConfig,
+    workspace: Option<&Path>,
+) -> Box<dyn MuxBackend> {
     match selected_backend(config) {
         MultiplexerBackendConfig::Rmux => Box::new(RmuxBackend::new()),
-        MultiplexerBackendConfig::Native => Box::new(NativeBackend::new()),
+        MultiplexerBackendConfig::Native => Box::new(match workspace {
+            Some(workspace) => NativeBackend::for_workspace(workspace),
+            None => NativeBackend::new(),
+        }),
         MultiplexerBackendConfig::Tmux => Box::new(TmuxBackend::new()),
         MultiplexerBackendConfig::Zellij => Box::new(ZellijBackend::new()),
     }

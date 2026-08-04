@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -463,10 +464,31 @@ fn clamp_move_index(index: usize, delta: i32, len: usize) -> usize {
 }
 
 impl NativeBackend {
+    /// A backend on the state shared by every caller that has no workspace to name.
     pub fn new() -> Self {
-        static STATE: OnceLock<Arc<Mutex<NativeMuxState>>> = OnceLock::new();
+        Self::for_workspace(Path::new(""))
+    }
+
+    /// The mux state belonging to `workspace`, creating it on first use.
+    ///
+    /// Native sessions live in this process, not in a server, so they have to outlive any single
+    /// `AppState` -- closing and reopening a window keeps its sessions. Keying by workspace gives
+    /// that while stopping two unrelated workspaces from seeing each other's sessions, which is what
+    /// a single process-wide state could not do: in tests it accumulated every session every test
+    /// created, so any assertion on a session list saw all of them and flaked.
+    pub fn for_workspace(workspace: &Path) -> Self {
+        static STATES: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<NativeMuxState>>>>> =
+            OnceLock::new();
+        let mut states = STATES
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("native mux state registry");
         Self {
-            state: Arc::clone(STATE.get_or_init(|| Arc::new(Mutex::new(NativeMuxState::new())))),
+            state: Arc::clone(
+                states
+                    .entry(workspace.to_path_buf())
+                    .or_insert_with(|| Arc::new(Mutex::new(NativeMuxState::new()))),
+            ),
         }
     }
 
