@@ -607,3 +607,21 @@ fn wheel_reports_one_button_press_per_scrolled_row() -> Result<()> {
     assert_eq!(out, b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M");
     Ok(())
 }
+
+/// The row count is a saturating cast of an OS float delta, so `isize::MAX` is representable. The
+/// buffer must stay bounded rather than spinning out a report per notch.
+#[test]
+fn an_absurd_wheel_row_count_stays_bounded() -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    engine.write_vt(b"\x1b[?1000h\x1b[?1006h");
+    let mut out = Vec::new();
+
+    engine.encode_mouse_wheel_to_vec(
+        test_mouse_input(MouseAction::Press, Some(MouseButton::Four), 0.0, 0.0),
+        usize::MAX,
+        &mut out,
+    )?;
+
+    assert_eq!(out.len(), b"\x1b[<64;1;1M".len() * 1024);
+    Ok(())
+}

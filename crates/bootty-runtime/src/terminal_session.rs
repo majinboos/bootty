@@ -2351,21 +2351,17 @@ mod tests {
     /// A window painting at the display rate needs content published near that rate, or scrolling a
     /// full-screen application stutters however fast the renderer is. Guards the pacing policy as a
     /// rate rather than as an interval constant, so it still holds if the constants are retuned.
+    ///
+    /// Scoped to the policy, not the worker: it says nothing about whether `run` calls it correctly.
+    /// The flood direction belongs to
+    /// `flood_backlog_waits_for_backlog_interval_before_publishing_partial_frame`.
     #[test]
-    fn interactive_redraw_publishes_near_display_rate_while_floods_stay_throttled() {
+    fn publish_policy_paces_interactive_redraws_near_display_rate() {
         let interactive = publishes_per_simulated_second(8 * 1024, Duration::from_millis(8));
+
         assert!(
             interactive >= 50,
             "an interactive redraw published {interactive} frames/s; content must keep up with the window"
-        );
-
-        let flood = publishes_per_simulated_second(
-            WORKER_FLOOD_BACKLOG_BYTES * 4,
-            Duration::from_millis(1),
-        );
-        assert!(
-            flood <= 20,
-            "a flood published {flood} frames/s; the drain must stay ahead of the renderer"
         );
     }
 

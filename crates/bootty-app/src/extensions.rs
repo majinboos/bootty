@@ -1911,7 +1911,6 @@ fn shell_run_output(
     run_jobs: &PlatformRunJobs,
     shutdown: &AtomicBool,
 ) -> std::io::Result<String> {
-    bootty_runtime::perf::record_subprocess("extension shell run");
     platform_shell_run_output(cmd, run_jobs, shutdown)
 }
 

@@ -6951,12 +6951,12 @@ mod tests {
         }
     }
 
-    /// Reconciling generated names forks `git` per session, so it is fingerprint-guarded -- but the
-    /// fingerprint is only as stable as the list it reads. Reading the membership-filtered
-    /// `sessions()` made it alternate with the refreshed superset, forking on every refresh for as
-    /// long as the window stayed open (measured: 115 reconciles in 20s, 60-207ms a frame).
+    /// A frame that changes nothing must not fork a subprocess. `update_frame`'s `sync_*` helpers
+    /// resolve session cwds through `git`, which costs tens of milliseconds per spawn on the frame
+    /// thread; when that landed on every frame it stalled the window 60-207ms at a time.
     ///
     /// Asserting no spawn rather than a duration keeps this deterministic on a loaded CI runner.
+    /// Refreshes alternate so the guard covers both a snapshot-applying frame and an idle one.
     #[test]
     fn steady_state_frames_do_not_fork_subprocesses() {
         let sessions = (0..7)
@@ -6976,19 +6976,18 @@ mod tests {
                 sessions: sessions.clone(),
             })
         }));
-        // Only one of the seven belongs to this binding, so `sync_session_order` narrows
-        // `sessions()` every frame while the refresh keeps restoring the full list. That swing is
-        // the shape the reconciler has to stay stable under.
-        state.binding.session_order.add_session("session-0");
-        // The first frame observes the sessions for the first time and is allowed to resolve them.
-        state.update_frame(test_frame_inputs(Vec::new(), None));
-        assert_eq!(state.binding.mux.all_sessions().len(), 7);
-        assert_eq!(state.binding.mux.sessions().len(), 1);
+        // Settle: the frames that first observe these sessions are entitled to resolve their cwds.
+        for _ in 0..3 {
+            state.binding.mux.refresh_on_next_frame();
+            state.update_frame(test_frame_inputs(Vec::new(), None));
+        }
+        assert_eq!(state.binding.mux.sessions().len(), 7);
+        // Without this the loop below is vacuous: an early return added ahead of the `git` call
+        // would skip the reconciler entirely and the guard would have nothing to complain about.
+        assert!(state.binding.generated_names_signature.is_some());
 
         let _guard = bootty_runtime::perf::guard_frame_path();
         for frame in 0..8 {
-            // Every other frame, so the list the reconciler sees alternates between the refreshed
-            // superset and the narrowed subset -- refreshing on all of them hides the swing.
             if frame % 2 == 0 {
                 state.binding.mux.refresh_on_next_frame();
             }

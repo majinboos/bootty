@@ -20,21 +20,26 @@ thread_local! {
 /// Panic on subprocess spawns from this thread until the returned guard drops.
 #[must_use = "the guard disarms as soon as it drops"]
 pub fn guard_frame_path() -> FramePathGuard {
-    ARMED.set(true);
-    FramePathGuard(())
+    FramePathGuard(ARMED.replace(true))
 }
 
-pub struct FramePathGuard(());
+/// Restores the previous state rather than disarming, so a nested guard cannot leave the rest of an
+/// enclosing guarded scope silently permitting forks.
+pub struct FramePathGuard(bool);
 
 impl Drop for FramePathGuard {
     fn drop(&mut self) {
-        ARMED.set(false);
+        ARMED.set(self.0);
     }
 }
 
 /// Refuse a subprocess spawn on a thread that is inside a guarded frame.
 ///
 /// `what` names the caller so the panic points at the offending path rather than at this helper.
+///
+/// Never place a call on a path a `Drop` impl can reach: panicking while already unwinding aborts,
+/// turning a named test failure into a bare SIGABRT. `BackendPaneTerminal::drop` forks `tmux`, so
+/// that constraint is live if this ever extends into `bootty-mux`.
 ///
 /// # Panics
 ///
@@ -59,6 +64,15 @@ mod tests {
 
         // A guard that has dropped must not keep refusing: the same helpers serve click handlers.
         record_subprocess("deliberate user action");
+    }
+
+    #[test]
+    #[should_panic(expected = "spawned a subprocess on the frame path")]
+    fn a_nested_guard_dropping_leaves_the_outer_one_armed() {
+        let _outer = guard_frame_path();
+        drop(guard_frame_path());
+
+        record_subprocess("git read");
     }
 
     #[test]
