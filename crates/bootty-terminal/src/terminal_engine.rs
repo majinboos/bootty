@@ -2087,6 +2087,27 @@ impl TerminalEngine {
         Ok(())
     }
 
+    /// Encode a wheel scroll of `notches` rows for a mouse-tracking application, which expects one
+    /// button report per row. A wheel event carries however many rows the scroll accumulator
+    /// resolved, so reporting it once makes fast scrolling crawl a line at a time.
+    pub fn encode_mouse_wheel_to_vec(
+        &mut self,
+        input: MouseInput,
+        notches: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        self.encode_mouse_to_vec(input, out)?;
+        let notch = out.len();
+        if notch == 0 {
+            return Ok(());
+        }
+        out.reserve(notch * notches.saturating_sub(1));
+        for _ in 1..notches {
+            out.extend_from_within(..notch);
+        }
+        Ok(())
+    }
+
     pub fn scroll_viewport_delta(&mut self, delta: isize) {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
         self.mark_content_changed();

@@ -54,6 +54,10 @@ const DEFAULT_SHELL: &str = "powershell.exe";
 const DEFAULT_SHELL: &str = "/bin/sh";
 pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_BACKLOG_FRAME_INTERVAL: Duration = Duration::from_millis(64);
+/// Pending PTY bytes past which output counts as a flood rather than an interactive redraw, and
+/// publishing backs off to [`WORKER_BACKLOG_FRAME_INTERVAL`] to keep the drain moving. A full-screen
+/// repaint of a large grid runs tens of kilobytes, so this sits well above one.
+pub(crate) const WORKER_FLOOD_BACKLOG_BYTES: usize = 256 * 1024;
 pub(crate) const WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_SETTLED_FRAME_DELAY: Duration = Duration::from_millis(16);
 pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
@@ -804,7 +808,11 @@ impl TerminalWorker {
                         self.mark_input_fast_path();
                         if self
                             .engine
-                            .encode_mouse_to_vec(input, &mut self.output_buf)
+                            .encode_mouse_wheel_to_vec(
+                                input,
+                                scroll_delta.unsigned_abs().max(1),
+                                &mut self.output_buf,
+                            )
                             .is_ok()
                         {
                             self.write_output_buf();
@@ -1420,7 +1428,16 @@ pub fn should_publish_frame_after_work(
         return true;
     }
     if pending_pty_bytes > 0 {
-        return elapsed_since_last_publish >= WORKER_BACKLOG_FRAME_INTERVAL;
+        // A TUI repainting as it scrolls keeps a little output pending at all times, which pinned
+        // publishing to the backlog interval and left content updating at ~15fps under a window
+        // painting at 120. That interval is there to keep a flood (`cat` of a large file) from
+        // starving the drain, so it applies once the backlog is actually flood-sized.
+        let interval = if pending_pty_bytes >= WORKER_FLOOD_BACKLOG_BYTES {
+            WORKER_BACKLOG_FRAME_INTERVAL
+        } else {
+            WORKER_READY_FRAME_INTERVAL
+        };
+        return elapsed_since_last_publish >= interval;
     }
     elapsed_since_last_terminal_change >= WORKER_SETTLED_FRAME_DELAY
 }
@@ -1858,12 +1875,12 @@ mod tests {
     }
 
     #[test]
-    fn sustained_backlog_waits_for_backlog_interval_before_publishing_partial_frame() {
+    fn flood_backlog_waits_for_backlog_interval_before_publishing_partial_frame() {
         assert!(!should_publish_frame_after_work(
             true,
             false,
             false,
-            4096,
+            WORKER_FLOOD_BACKLOG_BYTES,
             Duration::ZERO,
             WORKER_READY_FRAME_INTERVAL,
         ));
@@ -1872,7 +1889,7 @@ mod tests {
             true,
             false,
             false,
-            4096,
+            WORKER_FLOOD_BACKLOG_BYTES,
             Duration::ZERO,
             WORKER_BACKLOG_FRAME_INTERVAL,
         ));
@@ -2259,7 +2276,7 @@ mod tests {
             }
             if unpublished
                 && !force
-                && pending_pty_bytes > 0
+                && pending_pty_bytes >= WORKER_FLOOD_BACKLOG_BYTES
                 && elapsed_publish < WORKER_BACKLOG_FRAME_INTERVAL
             {
                 prop_assert!(!should_publish);
@@ -2275,12 +2292,57 @@ mod tests {
             if unpublished
                 && !sync_suppressed
                 && !force
+                && (1..WORKER_FLOOD_BACKLOG_BYTES).contains(&pending_pty_bytes)
+                && elapsed_publish >= WORKER_READY_FRAME_INTERVAL
+            {
+                prop_assert!(should_publish);
+            }
+            if unpublished
+                && !sync_suppressed
+                && !force
                 && pending_pty_bytes == 0
                 && elapsed_change >= WORKER_SETTLED_FRAME_DELAY
             {
                 prop_assert!(should_publish);
             }
         }
+    }
+
+    /// A scrolling TUI keeps a small backlog pending continuously. Holding those frames for the
+    /// flood interval capped visible content at ~15fps while the window painted at 120.
+    #[test]
+    fn interactive_backlog_publishes_at_the_ready_interval_and_floods_back_off() {
+        let interactive = 8 * 1024;
+        assert!(
+            should_publish_frame_after_work(
+                true,
+                false,
+                false,
+                interactive,
+                Duration::ZERO,
+                WORKER_READY_FRAME_INTERVAL,
+            ),
+            "an interactive redraw must publish at the ready interval"
+        );
+        assert!(
+            !should_publish_frame_after_work(
+                true,
+                false,
+                false,
+                WORKER_FLOOD_BACKLOG_BYTES,
+                Duration::ZERO,
+                WORKER_READY_FRAME_INTERVAL,
+            ),
+            "a flood must keep backing off so the drain is not starved"
+        );
+        assert!(should_publish_frame_after_work(
+            true,
+            false,
+            false,
+            WORKER_FLOOD_BACKLOG_BYTES,
+            Duration::ZERO,
+            WORKER_BACKLOG_FRAME_INTERVAL,
+        ));
     }
 
     #[cfg(unix)]
