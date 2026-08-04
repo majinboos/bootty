@@ -19,10 +19,12 @@ The updater verifies the release asset through GitHub's release checksum before 
 Run one command from a clean, synced `main` branch:
 
 ```sh
-mise run release -- patch
+mise run release
 ```
 
-Use `minor` or `major` instead of `patch` when needed. The command creates the version-bump PR and enables auto-merge. Once CI merges it, GitHub tags that commit and runs the release workflow.
+That publishes a minor release. Pass `-- patch` or `-- major` for the other two. The command creates the version-bump PR and enables auto-merge. Once CI merges it, GitHub tags that commit and dispatches the release workflow.
+
+The tag job dispatches that workflow by name rather than letting the new tag speak for itself: GitHub starts no workflow from a push made with `GITHUB_TOKEN`, so a `push: tags` trigger alone leaves the tag sitting there unreleased.
 
 The release workflow rejects a tag that does not match `Cargo.toml`. After packaging succeeds for every supported platform, it creates a GitHub Release, uploads target-named bundles for the updater, generates `SHA256SUMS`, and publishes generated release notes.
 
