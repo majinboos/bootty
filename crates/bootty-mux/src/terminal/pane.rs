@@ -65,6 +65,8 @@ pub struct BackendPaneTerminal {
     status_hidden_sessions: Vec<String>,
     /// Pane-local passthrough values to restore when Bootty releases its attached runtimes.
     passthrough_all_panes: HashMap<String, TmuxPanePassthroughOverride>,
+    /// Set when a runtime is swapped into the slot, cleared by the render resize that follows it.
+    terminal_awaits_resize: bool,
     #[deref]
     #[deref_mut]
     terminal: Box<dyn TerminalRuntime>,
@@ -271,6 +273,7 @@ impl BackendPaneTerminal {
             rmux_window_resize_worker: None,
             status_hidden_sessions: Vec::new(),
             passthrough_all_panes: HashMap::new(),
+            terminal_awaits_resize: false,
             terminal: idle_terminal(),
         }
     }
@@ -326,7 +329,7 @@ impl BackendPaneTerminal {
 
         self.backend = backend;
         self.active_target = target;
-        self.terminal = terminal;
+        self.set_active_terminal(terminal);
         self.sync_tmux_passthrough_override();
         self.sync_status_bar(config.hide_tmux_status);
         Ok(())
@@ -472,6 +475,14 @@ impl BackendPaneTerminal {
         }
     }
 
+    /// Swap in the runtime the pane slot renders and takes input through. The next render resize is
+    /// forwarded even when the slot's geometry is unchanged: the incoming runtime holds whatever
+    /// geometry it was parked at, and only the renderer knows the rect this pane now occupies.
+    fn set_active_terminal(&mut self, terminal: Box<dyn TerminalRuntime>) {
+        self.terminal = terminal;
+        self.terminal_awaits_resize = true;
+    }
+
     fn spawn_native_runtime(
         &self,
         target: &ScopedMuxPaneTarget,
@@ -562,7 +573,7 @@ impl BackendPaneTerminal {
                     self.clear_terminal();
                 })?;
             self.active_target = focused_target;
-            self.terminal = terminal;
+            self.set_active_terminal(terminal);
         }
 
         for target in &targets {
@@ -867,8 +878,15 @@ impl TerminalRenderSource for BackendPaneTerminal {
 
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
         if self.geometry == geometry {
-            return Ok(());
+            // A runtime that just landed in the slot is still at the geometry it was parked at, and
+            // this is the first call that knows the rect it now occupies. Runtimes drop a resize
+            // they already applied, so an unchanged one still never reaches the PTY.
+            if !std::mem::take(&mut self.terminal_awaits_resize) {
+                return Ok(());
+            }
+            return self.terminal.resize(geometry);
         }
+        self.terminal_awaits_resize = false;
         self.geometry = geometry;
         if self.backend == MultiplexerBackendConfig::Tmux {
             // Parked sessions keep their `attach-session` client alive, and that client's size is
@@ -1886,6 +1904,35 @@ mod tests {
         terminal.park_native_layout_terminal();
 
         assert!(terminal.native_terminals.contains_key(&target));
+    }
+
+    /// Focusing a parked pane whose rect matches the outgoing pane's leaves the slot geometry
+    /// unchanged, so the render resize is swallowed — while the runtime that just swapped in is
+    /// still at the geometry it was parked at. The first resize after a swap has to get through.
+    #[test]
+    fn first_render_resize_after_a_swap_reaches_the_new_runtime() {
+        let geometry = TerminalGeometry {
+            cols: 120,
+            rows: 40,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let swapped_in_resizes = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = BackendPaneTerminal::new_with_backend(
+            geometry,
+            MultiplexerBackendConfig::Rmux,
+            terminal_config(),
+            Arc::new(|| {}),
+        );
+
+        terminal.set_active_terminal(Box::new(ResizeRecordingRuntime {
+            resize_calls: Arc::clone(&swapped_in_resizes),
+        }));
+        TerminalRenderSource::resize(&mut terminal, geometry).unwrap();
+        // Steady state: later frames at the same geometry stay off the PTY.
+        TerminalRenderSource::resize(&mut terminal, geometry).unwrap();
+
+        assert_eq!(swapped_in_resizes.lock().unwrap().as_slice(), &[geometry]);
     }
 
     #[test]
