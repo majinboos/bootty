@@ -1237,6 +1237,38 @@ mod tests {
         );
     }
 
+    /// The generated-name reconciler in the app layer reads `all_sessions()` precisely because
+    /// `apply_session_order` narrows `sessions()` to binding membership partway through a frame.
+    /// Reading the narrowed list made its fingerprint flip every refresh, forking `git` per session.
+    #[test]
+    fn membership_filtering_narrows_sessions_but_leaves_all_sessions_whole() {
+        let mut controller = MuxController {
+            sessions: vec![session("$1", "main"), session("$2", "work")],
+            all_sessions: vec![session("$1", "main"), session("$2", "work")],
+            ..Default::default()
+        };
+
+        controller.apply_session_order(&["work".to_owned()]);
+
+        assert_eq!(
+            controller
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["work"]
+        );
+        assert_eq!(
+            controller
+                .all_sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main", "work"],
+            "the full list must survive membership filtering"
+        );
+    }
+
     #[test]
     fn optimistic_session_rename_keeps_external_session_visible() {
         let mut controller = MuxController {

@@ -2800,7 +2800,11 @@ impl AppState {
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
             return;
         }
-        let sessions = self.binding.mux.sessions().to_vec();
+        // The full backend list, not `sessions()`: that one is narrowed to this binding's
+        // membership by `sync_session_order` later in the same frame, so it alternates between the
+        // refreshed superset and the filtered subset depending on whether a refresh landed. The
+        // fingerprint below would flip on every one of those swings and fork `git` per session.
+        let sessions = self.binding.mux.all_sessions().to_vec();
         if !self.generated_names_need_sync(&sessions) {
             return;
         }
