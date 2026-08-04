@@ -870,6 +870,14 @@ impl TerminalRenderSource for BackendPaneTerminal {
             return Ok(());
         }
         self.geometry = geometry;
+        if self.backend == MultiplexerBackendConfig::Tmux {
+            // Parked sessions keep their `attach-session` client alive, and that client's size is
+            // the session's size. Skipping them leaves the window at the old size when we switch
+            // back, and clamps live windows under `window-size smallest`.
+            for terminal in self.native_terminals.values_mut() {
+                terminal.resize(geometry)?;
+            }
+        }
         self.terminal.resize(geometry)
     }
 
@@ -1878,6 +1886,43 @@ mod tests {
         terminal.park_native_layout_terminal();
 
         assert!(terminal.native_terminals.contains_key(&target));
+    }
+
+    #[test]
+    fn tmux_resize_reaches_parked_background_sessions() {
+        let geometry = TerminalGeometry {
+            cols: 120,
+            rows: 40,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let background: ScopedMuxPaneTarget = MuxPaneTarget::Session {
+            session_id: "$7".to_owned(),
+            cwd: None,
+        }
+        .into();
+        let background_resizes = Arc::new(Mutex::new(Vec::new()));
+        let mut terminal = BackendPaneTerminal::new_with_backend(
+            geometry,
+            MultiplexerBackendConfig::Tmux,
+            terminal_config(),
+            Arc::new(|| {}),
+        );
+        terminal.native_terminals.insert(
+            background,
+            Box::new(ResizeRecordingRuntime {
+                resize_calls: Arc::clone(&background_resizes),
+            }),
+        );
+
+        let resized = TerminalGeometry {
+            cols: 90,
+            rows: 30,
+            ..geometry
+        };
+        TerminalRenderSource::resize(&mut terminal, resized).unwrap();
+
+        assert_eq!(background_resizes.lock().unwrap().as_slice(), &[resized]);
     }
 
     #[test]
