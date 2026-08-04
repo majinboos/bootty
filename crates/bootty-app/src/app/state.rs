@@ -105,6 +105,8 @@ use crate::terminal::{KeyInput, TerminalKey};
 use bootty_terminal::terminal_engine::TerminalCopyModeMotion;
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
+/// Session-finder heading for sessions running in a backend that no Space has claimed.
+const UNCLAIMED_SESSIONS_LABEL: &str = "No space";
 
 fn mux_refresh_repaint_after(config: &crate::config::MultiplexerConfig) -> Option<Duration> {
     (selected_backend(config) != MultiplexerBackendConfig::Native)
@@ -482,9 +484,12 @@ impl BindingRuntime {
     }
 
     fn sync_session_order(&mut self) {
+        // Prune against the whole backend list, never `sessions()`: that one is already narrowed to
+        // membership, so a session this binding just attached would count as dead and be dropped
+        // again before it ever showed up in the sidebar.
         let ordered_names = self.session_order.sync_sessions(
             self.mux
-                .sessions()
+                .all_sessions()
                 .iter()
                 .map(|session| session.name.as_str())
                 .chain(
@@ -494,6 +499,25 @@ impl BindingRuntime {
                 ),
         );
         self.mux.apply_session_order(&ordered_names);
+    }
+
+    /// Carry membership across a session rename, using the name this binding last saw for that
+    /// session id. Membership is keyed by session name, so once the backend starts reporting the new
+    /// name the old entry prunes away and the new one belongs to nobody: the session vanishes from
+    /// its Space while still running, reachable only through the session finder.
+    fn carry_renamed_members(&mut self) {
+        let renames = self
+            .mux
+            .all_sessions()
+            .iter()
+            .filter_map(|session| {
+                let previous = self.session_names.last_observed_name(&session.id)?;
+                (previous != session.name).then(|| (previous.to_owned(), session.name.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (previous, current) in renames {
+            self.session_order.rename_session(&previous, &current);
+        }
     }
 
     fn discard_terminal_side_effects(&mut self) {
@@ -1698,35 +1722,109 @@ impl AppState {
                 } else {
                     binding.label.clone()
                 };
-                let attached = binding
-                    .mux
-                    .sessions()
-                    .iter()
-                    .map(|session| session.id.as_str())
-                    .collect::<HashSet<_>>();
-                let sessions = binding
-                    .mux
-                    .sessions()
-                    .iter()
-                    .chain(
-                        binding
-                            .mux
-                            .all_sessions()
-                            .iter()
-                            .filter(|session| !attached.contains(session.id.as_str())),
-                    )
-                    .cloned()
-                    .collect();
                 BindingSessionGroup {
                     scope: binding.scope,
                     label,
-                    sessions,
+                    sessions: binding.mux.sessions().to_vec(),
                     selected_session: binding.mux.selected_session().map(str::to_owned),
                     active: binding.scope == self.binding.scope,
                     can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
                 }
             })
             .collect()
+    }
+
+    /// Every session the workspace can reach, grouped by the Space that owns it, with a trailing
+    /// group for the sessions no Space claims. The finder needs the owner to know whether selecting a
+    /// session means switching Spaces or adopting the session into the current one; the sidebar stays
+    /// on `binding_session_groups`, which is this Space only.
+    pub fn session_finder_groups(&self) -> Vec<BindingSessionGroup> {
+        let mut spaces = vec![(
+            self.active_space_position,
+            self.active_space_name.as_str(),
+            std::iter::once(&self.binding)
+                .chain(self.inactive_bindings.iter())
+                .collect::<Vec<_>>(),
+        )];
+        spaces.extend(self.inactive_spaces.iter().map(|space| {
+            (
+                space.position,
+                space.name.as_str(),
+                space.bindings().collect::<Vec<_>>(),
+            )
+        }));
+        spaces.sort_by_key(|(position, ..)| *position);
+
+        // One entry per session name: only the active binding refreshes, so a Space that has not been
+        // visited this run has no snapshot of its own and has to borrow the shared backend's view of
+        // its members. Names are what membership is keyed by, so names are the identity here.
+        let mut sessions_across_spaces = Vec::<&MuxSession>::new();
+        for binding in spaces.iter().flat_map(|(_, _, bindings)| bindings) {
+            for session in binding.mux.all_sessions() {
+                if !sessions_across_spaces
+                    .iter()
+                    .any(|known| known.name == session.name)
+                {
+                    sessions_across_spaces.push(session);
+                }
+            }
+        }
+
+        let mut claimed = HashSet::new();
+        let mut groups = Vec::new();
+        for (_, space_name, bindings) in &spaces {
+            for binding in bindings {
+                let members = binding.session_order.session_names();
+                let sessions = members
+                    .iter()
+                    .filter_map(|name| {
+                        // The owner's own snapshot first: session ids are per backend, and the id is
+                        // what activation targets.
+                        binding
+                            .mux
+                            .all_sessions()
+                            .iter()
+                            .chain(sessions_across_spaces.iter().copied())
+                            .find(|session| session.name == *name)
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>();
+                claimed.extend(members);
+                if sessions.is_empty() {
+                    continue;
+                }
+                groups.push(BindingSessionGroup {
+                    scope: binding.scope,
+                    label: if bindings.len() > 1 {
+                        format!("{space_name} / {}", binding.label)
+                    } else {
+                        (*space_name).to_owned()
+                    },
+                    sessions,
+                    selected_session: binding.mux.selected_session().map(str::to_owned),
+                    active: binding.scope == self.binding.scope,
+                    can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
+                });
+            }
+        }
+
+        let unclaimed = sessions_across_spaces
+            .into_iter()
+            .filter(|session| !claimed.contains(&session.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unclaimed.is_empty() {
+            groups.push(BindingSessionGroup {
+                // Activating one of these adopts it into the current Space.
+                scope: self.binding.scope,
+                label: UNCLAIMED_SESSIONS_LABEL.to_owned(),
+                sessions: unclaimed,
+                selected_session: None,
+                active: false,
+                can_return_to_last_session: false,
+            });
+        }
+        groups
     }
 
     fn binding_runtimes_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
@@ -2404,6 +2502,13 @@ impl AppState {
     }
 
     pub fn activate_scoped_session_from_ui(&mut self, target: &ScopedSessionTarget) -> bool {
+        // A session that belongs to another Space is switched to there, not dragged over here: its
+        // binding, terminal, and pane layout all live in that Space.
+        if target.scope.space_id() != self.active_space_id
+            && !self.activate_space_from_ui(target.scope.space_id())
+        {
+            return false;
+        }
         if target.scope != self.binding.scope {
             let Some(index) = self
                 .inactive_bindings
@@ -2816,14 +2921,19 @@ impl AppState {
     }
 
     fn sync_generated_session_names(&mut self) {
+        // Membership follows a rename whichever backend is in use and whoever made it. Above the
+        // rmux guard on purpose: bootty does not generate names for rmux, but sessions there are
+        // still renamed behind its back, and membership has to follow those too.
+        self.binding.carry_renamed_members();
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
             return;
         }
         if !self.generated_names_need_sync() {
             return;
         }
-        // Still only this binding's sessions: reconciling the whole backend list renames sessions
-        // that belong to other Spaces.
+        // Reconcile only this binding's sessions. Generating names for the whole backend list renames
+        // sessions that belong to other Spaces; `carry_renamed_members` reads the full list because
+        // it only ever moves a row this binding already owns.
         let sessions = self.binding.mux.sessions().to_vec();
         let mut renames = Vec::new();
         self.binding
@@ -6967,6 +7077,134 @@ mod tests {
         let after_refresh = state.binding.generated_names_signature;
         state.update_frame(test_frame_inputs(Vec::new(), None));
         after_refresh != before || state.binding.generated_names_signature != after_refresh
+    }
+
+    /// Run one frame that refreshes the mux, so it reconciles names and re-narrows membership.
+    fn reconcile_frame(state: &mut AppState) {
+        state.binding.mux.refresh_on_next_frame();
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+    }
+
+    /// A generated-name rename has to take this binding's membership with it. Membership is keyed by
+    /// session name, so once the backend reports the new name the old entry prunes away — and nothing
+    /// added the new one, so the session belonged to no Space at all: gone from the sidebar while
+    /// still running.
+    #[test]
+    fn a_generated_rename_keeps_the_session_in_its_space() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let backend = ScriptedBackend::with(vec![session_with("s1", "stale", "/repo/alpha")])
+            .install(&mut state.binding);
+        // The reconciler only renames a name it generated itself, and the name it suggests for this
+        // cwd is "alpha".
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", "/repo/alpha", "stale");
+        state.binding.session_order.add_session("stale");
+
+        reconcile_frame(&mut state);
+        assert_eq!(state.binding.session_order.session_names(), ["stale"]);
+
+        // The rename reaches the backend (ScriptedBackend ignores commands, so the test applies it).
+        backend.set(vec![session_with("s1", "alpha", "/repo/alpha")]);
+        reconcile_frame(&mut state);
+
+        assert_eq!(state.binding.session_order.session_names(), ["alpha"]);
+        assert_eq!(
+            state
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha"],
+        );
+    }
+
+    /// The finder reaches every Space, so it has to say which Space each session belongs to, and
+    /// selecting one has to mean what the grouping implies: switch to the owning Space, or adopt an
+    /// unclaimed session into the current one.
+    #[test]
+    fn the_session_finder_groups_sessions_by_owning_space() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let home_space = state.active_space_id();
+        // Every binding answers from this one list: the Spaces share a backend, and a real native
+        // backend would report whatever other tests in this process happen to have running.
+        let backend = ScriptedBackend::with(vec![
+            session_with("s1", "home-session", "/repo/home"),
+            session_with("s2", "work-session", "/repo/work"),
+            session_with("s3", "unclaimed", "/repo/unclaimed"),
+        ]);
+        backend.clone().install(&mut state.binding);
+        // Seeded before any sync: a fresh store adopts every session it is shown.
+        state.binding.session_order.add_session("home-session");
+        assert!(state.create_space_from_ui(
+            "Work",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let work_scope = state.binding.scope;
+        backend.clone().install(&mut state.binding);
+        state.binding.session_order.add_session("work-session");
+        assert!(state.activate_space_from_ui(home_space));
+        reconcile_frame(&mut state);
+
+        let groups = state
+            .session_finder_groups()
+            .into_iter()
+            .map(|group| {
+                (
+                    group.label,
+                    group
+                        .sessions
+                        .iter()
+                        .map(|session| session.name.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            groups,
+            vec![
+                ("Default Space".to_owned(), vec!["home-session".to_owned()]),
+                ("Work".to_owned(), vec!["work-session".to_owned()]),
+                (
+                    UNCLAIMED_SESSIONS_LABEL.to_owned(),
+                    vec!["unclaimed".to_owned()]
+                ),
+            ]
+        );
+
+        state.apply_session_picker_event(
+            SessionPickerDialog::open(),
+            SessionPickerEvent::ActivateSession(ScopedSessionTarget::new(
+                state.binding.scope,
+                "s3",
+            )),
+        );
+        assert_eq!(state.active_space_id(), home_space);
+        assert_eq!(
+            state.binding.session_order.session_names(),
+            ["home-session", "unclaimed"],
+            "an unclaimed session must be adopted by the Space that activated it"
+        );
+
+        state.apply_session_picker_event(
+            SessionPickerDialog::open(),
+            SessionPickerEvent::ActivateSession(ScopedSessionTarget::new(work_scope, "s2")),
+        );
+        assert_eq!(
+            state.active_space_id(),
+            work_scope.space_id(),
+            "a session that belongs to another Space must be switched to there"
+        );
+        assert_eq!(state.mux().selected_session(), Some("s2"));
     }
 
     /// A backend whose session list the test owns, so a refresh can be made to report a change or
