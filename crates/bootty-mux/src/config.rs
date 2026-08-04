@@ -1,9 +1,16 @@
+use std::sync::Arc;
+
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
 use super::{
     backend::MuxBackend, native::NativeBackend, rmux::RmuxBackend, tmux::TmuxBackend,
     zellij::ZellijBackend,
 };
+
+/// Builds the backend a controller talks to. Held per controller rather than in a global so a test
+/// can drive one app against a scripted backend without leaking into every other test in the
+/// process. Shared because the refresh and command workers build their own backend off-thread.
+pub type BackendFactory = Arc<dyn Fn(&MultiplexerConfig) -> Box<dyn MuxBackend> + Send + Sync>;
 
 pub fn selected_backend(config: &MultiplexerConfig) -> MultiplexerBackendConfig {
     if cfg!(windows) && config.backend == MultiplexerBackendConfig::Tmux {
@@ -18,6 +25,16 @@ pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
         MultiplexerBackendConfig::Native => Box::new(NativeBackend::new()),
         MultiplexerBackendConfig::Tmux => Box::new(TmuxBackend::new()),
         MultiplexerBackendConfig::Zellij => Box::new(ZellijBackend::new()),
+    }
+}
+
+pub fn build_backend_with(
+    factory: Option<&BackendFactory>,
+    config: &MultiplexerConfig,
+) -> Box<dyn MuxBackend> {
+    match factory {
+        Some(factory) => factory(config),
+        None => build_backend(config),
     }
 }
 

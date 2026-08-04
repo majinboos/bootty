@@ -5630,9 +5630,12 @@ fn run_ditch_cleanup(cwd: Option<&str>, action: &DitchAction) -> Result<(), Stri
 mod tests {
     use super::*;
     use crate::config::{MultiplexerBackendConfig, WindowFullscreen};
-    use crate::mux::{backend::MuxBackend, command::MuxCommand, native::NativeBackend};
+    use crate::mux::{
+        backend::MuxBackend, command::MuxCommand, native::NativeBackend, snapshot::MuxSnapshot,
+    };
     use anyhow::Context;
     use std::{
+        sync::Arc,
         sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, Instant},
@@ -6928,6 +6931,69 @@ mod tests {
             !state.generated_names_need_sync(&moved),
             "reconciliation must settle again once the session set stops changing"
         );
+    }
+
+    /// A backend that keeps answering with the same sessions, so every refresh is a no-op change.
+    struct SteadyBackend {
+        sessions: Vec<MuxSession>,
+    }
+
+    impl MuxBackend for SteadyBackend {
+        fn snapshot(&self) -> anyhow::Result<MuxSnapshot> {
+            Ok(MuxSnapshot {
+                active_session_id: self.sessions.first().map(|session| session.id.clone()),
+                sessions: self.sessions.clone(),
+            })
+        }
+
+        fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Reconciling generated names forks `git` per session, so it is fingerprint-guarded -- but the
+    /// fingerprint is only as stable as the list it reads. Reading the membership-filtered
+    /// `sessions()` made it alternate with the refreshed superset, forking on every refresh for as
+    /// long as the window stayed open (measured: 115 reconciles in 20s, 60-207ms a frame).
+    ///
+    /// Asserting no spawn rather than a duration keeps this deterministic on a loaded CI runner.
+    #[test]
+    fn steady_state_frames_do_not_fork_subprocesses() {
+        let sessions = (0..7)
+            .map(|index| {
+                session_with(
+                    &format!("${index}"),
+                    &format!("session-{index}"),
+                    &format!("/tmp/bootty-steady-{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        state.binding.mux.set_backend_factory(Arc::new(move |_| {
+            Box::new(SteadyBackend {
+                sessions: sessions.clone(),
+            })
+        }));
+        // Only one of the seven belongs to this binding, so `sync_session_order` narrows
+        // `sessions()` every frame while the refresh keeps restoring the full list. That swing is
+        // the shape the reconciler has to stay stable under.
+        state.binding.session_order.add_session("session-0");
+        // The first frame observes the sessions for the first time and is allowed to resolve them.
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+        assert_eq!(state.binding.mux.all_sessions().len(), 7);
+        assert_eq!(state.binding.mux.sessions().len(), 1);
+
+        let _guard = bootty_runtime::perf::guard_frame_path();
+        for frame in 0..8 {
+            // Every other frame, so the list the reconciler sees alternates between the refreshed
+            // superset and the narrowed subset -- refreshing on all of them hides the swing.
+            if frame % 2 == 0 {
+                state.binding.mux.refresh_on_next_frame();
+            }
+            state.update_frame(test_frame_inputs(Vec::new(), None));
+        }
     }
 
     #[test]

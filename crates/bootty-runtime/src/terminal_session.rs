@@ -2308,6 +2308,67 @@ mod tests {
         }
     }
 
+    /// Drive the publish policy across a simulated second of output and count the frames that
+    /// reach the window. Pure simulated time: the policy is a function of elapsed durations, so
+    /// this measures pacing without a wall clock and cannot flake on a loaded runner.
+    ///
+    /// `output_every` is how often the application emits (a TUI redrawing as it scrolls), and
+    /// `pending` is the backlog left waiting for the parser at each of those moments.
+    fn publishes_per_simulated_second(pending: usize, output_every: Duration) -> usize {
+        const TICK: Duration = Duration::from_millis(1);
+        const RUN: Duration = Duration::from_secs(1);
+
+        let mut now = Duration::ZERO;
+        let mut last_publish = Duration::ZERO;
+        let mut last_change = Duration::ZERO;
+        let mut last_output = Duration::ZERO;
+        let mut unpublished = false;
+        let mut published = 0;
+
+        while now < RUN {
+            if now - last_output >= output_every {
+                last_output = now;
+                last_change = now;
+                unpublished = true;
+            }
+            if should_publish_frame_after_work(
+                unpublished,
+                false,
+                false,
+                pending,
+                now - last_change,
+                now - last_publish,
+            ) {
+                published += 1;
+                unpublished = false;
+                last_publish = now;
+            }
+            now += TICK;
+        }
+        published
+    }
+
+    /// A window painting at the display rate needs content published near that rate, or scrolling a
+    /// full-screen application stutters however fast the renderer is. Guards the pacing policy as a
+    /// rate rather than as an interval constant, so it still holds if the constants are retuned.
+    #[test]
+    fn interactive_redraw_publishes_near_display_rate_while_floods_stay_throttled() {
+        let interactive = publishes_per_simulated_second(8 * 1024, Duration::from_millis(8));
+        assert!(
+            interactive >= 50,
+            "an interactive redraw published {interactive} frames/s; content must keep up with the window"
+        );
+
+        let flood = publishes_per_simulated_second(
+            WORKER_FLOOD_BACKLOG_BYTES * 4,
+            Duration::from_millis(1),
+        );
+        assert!(
+            flood <= 20,
+            "a flood published {flood} frames/s; the drain must stay ahead of the renderer"
+        );
+    }
+
     /// A scrolling TUI keeps a small backlog pending continuously. Holding those frames for the
     /// flood interval capped visible content at ~15fps while the window painted at 120.
     #[test]

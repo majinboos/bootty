@@ -12,7 +12,7 @@ use crate::{
     backend::MuxBackend,
     capability::BindingOperationOutcome,
     command::MuxCommand,
-    config::{build_backend, selected_backend},
+    config::{BackendFactory, build_backend_with, selected_backend},
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh},
 };
 
@@ -399,6 +399,7 @@ pub struct MuxController {
     session_refresh_pending: bool,
     mux_command_tx: Option<mpsc::Sender<MuxCommandJob>>,
     mux_command_rx: Option<mpsc::Receiver<MuxCommandResult>>,
+    backend_factory: Option<BackendFactory>,
 }
 
 impl MuxController {
@@ -414,6 +415,16 @@ impl MuxController {
             scope: Some(scope),
             ..Self::new()
         }
+    }
+
+    /// Build backends with `factory` instead of the configured one. Set before the first refresh:
+    /// the refresh and command workers capture it when they start.
+    pub fn set_backend_factory(&mut self, factory: BackendFactory) {
+        self.backend_factory = Some(factory);
+    }
+
+    fn build_backend(&self, config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
+        build_backend_with(self.backend_factory.as_ref(), config)
     }
 
     pub fn refresh_on_next_frame(&mut self) {
@@ -589,7 +600,7 @@ impl MuxController {
     }
 
     fn refresh_native_sessions(&mut self, config: &MultiplexerConfig) -> Option<String> {
-        match build_backend(config).snapshot() {
+        match self.build_backend(config).snapshot() {
             Ok(snapshot) => {
                 self.refresh_completed |=
                     self.apply_refreshed_snapshot(MultiplexerBackendConfig::Native, snapshot);
@@ -844,10 +855,11 @@ impl MuxController {
         let (request_tx, request_rx) = mpsc::channel::<SessionRefreshRequest>();
         let (result_tx, result_rx) = mpsc::channel::<SessionRefreshResult>();
         let repaint = repaint.clone();
+        let factory = self.backend_factory.clone();
         thread::spawn(move || {
             while let Ok(request) = request_rx.recv() {
                 let backend_kind = selected_backend(&request.config);
-                let result = build_backend(&request.config)
+                let result = build_backend_with(factory.as_ref(), &request.config)
                     .snapshot()
                     .map(|snapshot| (backend_kind, snapshot))
                     .map_err(|error| error.to_string());
@@ -908,7 +920,7 @@ impl MuxController {
         if backend_kind != MultiplexerBackendConfig::Native {
             return Err("not synchronous-native".to_owned());
         }
-        let mut backend = build_backend(config);
+        let mut backend = self.build_backend(config);
         execute_backend_command(backend.as_mut(), self.scope, command)
             .and_then(|()| backend.snapshot().map_err(|error| error.to_string()))
             .map(|snapshot| {
@@ -1015,9 +1027,10 @@ impl MuxController {
         let (request_tx, request_rx) = mpsc::channel::<MuxCommandJob>();
         let (result_tx, result_rx) = mpsc::channel::<MuxCommandResult>();
         let repaint = repaint.clone();
+        let factory = self.backend_factory.clone();
         thread::spawn(move || {
             while let Ok(job) = request_rx.recv() {
-                let mut backend = build_backend(&job.config);
+                let mut backend = build_backend_with(factory.as_ref(), &job.config);
                 let result = execute_backend_command(backend.as_mut(), job.scope, job.command)
                     .map(|()| job.completion);
                 if result_tx.send(result).is_err() {
