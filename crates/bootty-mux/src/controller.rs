@@ -1661,7 +1661,12 @@ mod tests {
             MultiplexerBackendConfig::Native,
             snapshot_of(vec![work.clone(), created]),
         );
-        assert_eq!(controller.selected_session(), Some("agents/main"));
+        assert_eq!(
+            controller.selected_session(),
+            Some("$2"),
+            "once the backend reports it, the selection is its id: the sidebar marks the current row \
+             by id, and a name stops resolving the moment the session is renamed"
+        );
 
         // The expectation is spent: a session that disappears still hands focus back.
         controller

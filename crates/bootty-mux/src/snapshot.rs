@@ -67,12 +67,18 @@ pub fn session_matches(session: &MuxSession, session_id: &str) -> bool {
     session.id == session_id || session.name == session_id
 }
 
+/// Resolves the selection against the sessions the backend reports, as that backend's session id.
+///
+/// Answering with the id rather than the string that came in is what keeps a selection stable: a name
+/// stops resolving the moment the session is renamed, and the UI marks the current row by id, so a
+/// name-tracked selection leaves the focused session unhighlighted.
 pub fn selection_after_refresh(current: Option<String>, sessions: &[MuxSession]) -> Option<String> {
     current
-        .filter(|current| {
+        .and_then(|current| {
             sessions
                 .iter()
-                .any(|session| session_matches(session, current))
+                .find(|session| session_matches(session, &current))
+                .map(|session| session.id.clone())
         })
         .or_else(|| {
             sessions

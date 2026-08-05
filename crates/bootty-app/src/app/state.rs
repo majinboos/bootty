@@ -7131,6 +7131,36 @@ mod tests {
         );
     }
 
+    /// Focus lands on the created session *and* shows there: the sidebar marks its current row by
+    /// session id, so a selection still carrying the name bootty asked the backend for left the
+    /// focused session unhighlighted.
+    #[test]
+    fn a_created_session_is_the_current_sidebar_row() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let backend = ScriptedBackend::with(Vec::new()).install(&mut state.binding);
+        let dir = std::env::temp_dir().join(format!("bootty-current-row-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let cwd = dir.to_string_lossy().into_owned();
+        let name = crate::git::suggested_session_name(&AppState::session_root(&cwd));
+
+        state.create_project_session_for_cwd(cwd);
+        // The create reaches the backend (ScriptedBackend ignores commands, so the test applies it).
+        backend.set(vec![session_with(
+            "s1",
+            &name,
+            dir.to_str().expect("utf-8 cwd"),
+        )]);
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.mux.selected_session(),
+            Some("s1"),
+            "the selection resolves to the session id the sidebar marks rows by"
+        );
+    }
+
     /// A UI rename records the new name as pending so membership and uniqueness hold it while the
     /// backend catches up. That entry is keyed by the name rather than by a session id, so the id
     /// lookup in the reconciler never pruned it: the name stayed reserved for the rest of the run,
