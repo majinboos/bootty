@@ -3022,13 +3022,17 @@ impl AppState {
             .collect::<HashSet<_>>();
         let rename_supported =
             selected_backend(self.active_multiplexer()) != MultiplexerBackendConfig::Rmux;
+        // A generated name has to clear every session on the server, not just this binding's members:
+        // asking for one another Space or a hand-made session already holds is a rename the backend
+        // rejects, leaving bootty asking for it again on every change.
+        let taken_names = self.taken_session_names(None);
 
         for session in &sessions {
             let Some(raw_cwd) = session.anchor.cwd.as_deref() else {
                 continue;
             };
             let cwd = Self::session_root(raw_cwd);
-            let record = if let Some(record) =
+            let mut record = if let Some(record) =
                 self.binding
                     .session_names
                     .observe_session(&session.id, &session.name, &cwd)
@@ -3056,6 +3060,20 @@ impl AppState {
                     .observe_session(&session.id, &session.name, &cwd)
                     .expect("session name metadata should be observable after recording")
             };
+
+            if record.display_name.is_empty() {
+                // Written before display names existed. Fill in what bootty would call this session,
+                // otherwise every session predating the upgrade keeps showing the backend's name.
+                let display_name = if record.explicit {
+                    session.name.clone()
+                } else {
+                    crate::git::suggested_session_name(&cwd)
+                };
+                self.binding
+                    .session_names
+                    .set_display_name(&session.id, &display_name);
+                record.display_name = display_name;
+            }
 
             if let Some(pending) = self
                 .binding
@@ -3100,10 +3118,10 @@ impl AppState {
                 continue;
             }
 
-            let existing_names = sessions
+            let existing_names = taken_names
                 .iter()
-                .filter(|other| other.id != session.id)
-                .map(|other| other.name.as_str())
+                .map(String::as_str)
+                .filter(|name| *name != session.name)
                 .chain(planned_names.iter().map(String::as_str));
             let display_name = crate::git::suggested_session_name(&cwd);
             let desired = crate::strings::unique_session_name(&display_name, existing_names);
@@ -7346,6 +7364,46 @@ mod tests {
             state.binding.session_names.display_name(&backend_name),
             Some(wanted.as_str()),
             "bootty shows the name it meant, without the backend's suffix"
+        );
+    }
+
+    /// Sessions that predate display names have none recorded, so they kept showing the backend's
+    /// name — including the suffix bootty only ever added to clear the server's namespace.
+    #[test]
+    fn sessions_recorded_before_display_names_get_one() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-backfill-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let cwd = dir.to_string_lossy().into_owned();
+        let root = AppState::session_root(&cwd);
+        let wanted = crate::git::suggested_session_name(&root);
+        let backend_name = format!("{wanted}-2");
+        // What the old code left behind: a generated record with no display name of its own, on a
+        // session whose backend name carries the suffix that cleared a foreign session.
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", &root, &backend_name, "");
+        state.binding.session_order.add_session(&backend_name);
+        ScriptedBackend::with(vec![
+            session_with("s1", &backend_name, &root),
+            session_with("foreign", &wanted, "/repo/foreign"),
+        ])
+        .install(&mut state.binding);
+
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some(wanted.as_str()),
+            "the upgrade fills in the name bootty would have shown"
+        );
+        assert_eq!(
+            state.binding.mux.sessions()[0].name,
+            backend_name,
+            "and asks the backend for nothing: the foreign session still holds the clean name"
         );
     }
 

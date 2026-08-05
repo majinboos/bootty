@@ -176,6 +176,19 @@ impl SessionNameStore {
         self.save();
     }
 
+    /// Set what bootty shows for `session_id`, leaving the rest of the record alone. Fills in records
+    /// written before display names existed.
+    pub fn set_display_name(&mut self, session_id: &str, display_name: &str) {
+        let Some(record) = self.records.get_mut(session_id) else {
+            return;
+        };
+        if record.display_name == display_name {
+            return;
+        }
+        record.display_name = display_name.to_owned();
+        self.save();
+    }
+
     /// The name bootty shows for `session_id`, which is the backend name only when bootty never had
     /// a name of its own for it.
     pub fn display_name(&self, session_id: &str) -> Option<&str> {
