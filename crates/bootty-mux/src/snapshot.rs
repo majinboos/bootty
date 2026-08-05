@@ -63,20 +63,22 @@ pub struct MuxPaneAnchor {
     pub process: Option<String>,
 }
 
-pub fn selection_after_refresh(current: Option<String>, snapshot: &MuxSnapshot) -> Option<String> {
+pub fn session_matches(session: &MuxSession, session_id: &str) -> bool {
+    session.id == session_id || session.name == session_id
+}
+
+pub fn selection_after_refresh(current: Option<String>, sessions: &[MuxSession]) -> Option<String> {
     current
         .filter(|current| {
-            snapshot
-                .sessions
+            sessions
                 .iter()
-                .any(|session| session.id == *current || session.name == *current)
+                .any(|session| session_matches(session, current))
         })
         .or_else(|| {
-            snapshot
-                .sessions
+            sessions
                 .iter()
                 .find(|session| session.active)
-                .or_else(|| snapshot.sessions.first())
+                .or_else(|| sessions.first())
                 .map(|session| session.id.clone())
         })
 }
