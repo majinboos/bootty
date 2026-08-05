@@ -13,7 +13,7 @@ use crate::{
     capability::BindingOperationOutcome,
     command::MuxCommand,
     config::{BackendFactory, build_backend_with, selected_backend},
-    snapshot::{MuxSession, MuxSnapshot, selection_after_refresh},
+    snapshot::{MuxSession, MuxSnapshot, selection_after_refresh, session_matches},
 };
 
 pub const MUX_SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -385,6 +385,10 @@ pub struct MuxController {
     all_sessions: Vec<MuxSession>,
     backend_session_names: Vec<String>,
     selected_session: Option<String>,
+    /// A session this binding just asked the backend to create and still expects to see. Selection
+    /// falls back to whatever the backend calls active whenever the current one is missing, so
+    /// without this the session being created loses focus in the frames before it shows up.
+    expected_session: Option<String>,
     previous_selected_session: Option<String>,
     selected_window: Option<String>,
     /// The selected session's active window from the previous snapshot, used to detect window
@@ -523,11 +527,16 @@ impl MuxController {
         if self.sessions.is_empty() {
             return;
         }
+        // A session this binding is still waiting on keeps the selection: it belongs to the order
+        // already, it is just missing from the backend list the order was applied to.
+        if self.selected_session == self.expected_session {
+            return;
+        }
         if self.selected_session.as_deref().is_none_or(|selected| {
             !self
                 .sessions
                 .iter()
-                .any(|session| session.id == selected || session.name == selected)
+                .any(|session| session_matches(session, selected))
         }) {
             self.set_selected_session(self.sessions.first().map(|session| session.id.clone()));
             self.selected_window = None;
@@ -643,6 +652,8 @@ impl MuxController {
                     self.session_refresh_pending = false;
                 }
                 Err(error) => {
+                    // The session that command was going to create is never going to show up.
+                    self.expected_session = None;
                     if first_error.is_none() {
                         first_error = Some(error);
                     }
@@ -663,7 +674,42 @@ impl MuxController {
         self.selected_session = session_id;
     }
 
+    /// The selection to keep once `sessions` is the whole truth: the expected session survives even
+    /// while the backend has yet to report it, and anything else falls back as usual.
+    fn selection_within(
+        &self,
+        preferred: Option<String>,
+        sessions: &[MuxSession],
+    ) -> Option<String> {
+        if let Some(preferred) = preferred.as_deref()
+            && self.expected_session.as_deref() == Some(preferred)
+        {
+            return Some(preferred.to_owned());
+        }
+        selection_after_refresh(preferred, sessions)
+    }
+
+    /// The backend id behind the current selection. Selection resolves by name or id, and only the
+    /// id survives a rename, so commands that rename carry the id.
+    fn selected_session_id(&self) -> Option<String> {
+        let selected = self.selected_session.as_deref()?;
+        Some(
+            self.sessions
+                .iter()
+                .chain(self.all_sessions.iter())
+                .find(|session| session_matches(session, selected))
+                .map_or_else(|| selected.to_owned(), |session| session.id.clone()),
+        )
+    }
+
     pub fn activate_session(&mut self, session_id: &str) {
+        if self
+            .expected_session
+            .as_deref()
+            .is_some_and(|expected| expected != session_id)
+        {
+            self.expected_session = None;
+        }
         self.set_selected_session(Some(session_id.to_owned()));
         self.selected_window = None;
     }
@@ -726,6 +772,9 @@ impl MuxController {
         repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) {
+        // Names change here; ids do not. Pin the selection to its id first so it still resolves once
+        // the session answers to the new name, whichever backend applies the rename.
+        self.selected_session = self.selected_session_id();
         if selected_backend(config) != MultiplexerBackendConfig::Native {
             self.apply_optimistic_session_rename(session_id, &name);
         }
@@ -807,6 +856,7 @@ impl MuxController {
             session_id: request.session_id.clone(),
             cwd: request.cwd,
         };
+        self.expected_session = Some(request.session_id.clone());
         if self
             .execute_native_command(
                 config,
@@ -975,7 +1025,15 @@ impl MuxController {
         if same_backend {
             snapshot.sessions = stable_session_order(&self.sessions, snapshot.sessions);
         }
-        self.set_selected_session(selection_after_refresh(preferred_session, &snapshot));
+        if self.expected_session.as_deref().is_some_and(|expected| {
+            snapshot
+                .sessions
+                .iter()
+                .any(|session| session_matches(session, expected))
+        }) {
+            self.expected_session = None;
+        }
+        self.set_selected_session(self.selection_within(preferred_session, &snapshot.sessions));
         self.selected_window = selected_window_after_refresh(
             self.selected_session.as_deref(),
             preferred_window,
@@ -1527,6 +1585,123 @@ mod tests {
             active_window_id: None,
             windows: Vec::new(),
         }
+    }
+
+    /// A backend whose session list the test owns and whose commands change nothing, standing in for
+    /// a backend that has not caught up with a command yet.
+    #[derive(Clone)]
+    struct StaticBackend {
+        sessions: Vec<MuxSession>,
+    }
+
+    impl MuxBackend for StaticBackend {
+        fn snapshot(&self) -> anyhow::Result<MuxSnapshot> {
+            Ok(MuxSnapshot {
+                active_session_id: self.sessions.first().map(|session| session.id.clone()),
+                sessions: self.sessions.clone(),
+            })
+        }
+
+        fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn controller_with_backend(sessions: Vec<MuxSession>) -> MuxController {
+        let backend = StaticBackend { sessions };
+        let mut controller = MuxController::new();
+        controller.set_backend_factory(std::sync::Arc::new(move |_| Box::new(backend.clone())));
+        controller
+    }
+
+    fn snapshot_of(sessions: Vec<MuxSession>) -> MuxSnapshot {
+        MuxSnapshot {
+            active_session_id: sessions.first().map(|session| session.id.clone()),
+            sessions,
+        }
+    }
+
+    #[test]
+    fn a_new_session_keeps_focus_until_the_backend_reports_it() {
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let config = MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..Default::default()
+        };
+        let work = session("$1", "work");
+        let mut controller = controller_with_backend(vec![work.clone()]);
+        controller.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Native,
+            snapshot_of(vec![work.clone()]),
+        );
+
+        controller.create_project_session(
+            NewMuxSessionRequest {
+                session_id: "agents/main".to_owned(),
+                cwd: "/repo".to_owned(),
+            },
+            &repaint,
+            &config,
+        );
+
+        assert_eq!(
+            controller.selected_session(),
+            Some("agents/main"),
+            "the session just created takes focus even before the backend reports it"
+        );
+        controller.apply_session_order(&["work".to_owned(), "agents/main".to_owned()]);
+        assert_eq!(
+            controller.selected_session(),
+            Some("agents/main"),
+            "applying the session order must not snap focus back to an existing session"
+        );
+
+        let created = session("$2", "agents/main");
+        controller.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Native,
+            snapshot_of(vec![work.clone(), created]),
+        );
+        assert_eq!(
+            controller.selected_session(),
+            Some("$2"),
+            "once the backend reports it, the selection is its id: the sidebar marks the current row \
+             by id, and a name stops resolving the moment the session is renamed"
+        );
+
+        // The expectation is spent: a session that disappears still hands focus back.
+        controller
+            .apply_refreshed_snapshot(MultiplexerBackendConfig::Native, snapshot_of(vec![work]));
+        assert_eq!(controller.selected_session(), Some("$1"));
+    }
+
+    #[test]
+    fn renaming_the_selected_session_keeps_it_selected() {
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let config = MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..Default::default()
+        };
+        let work = session("$1", "work");
+        let agents = session("$2", "agents");
+        let mut controller = controller_with_backend(vec![work.clone(), agents.clone()]);
+        controller.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Tmux,
+            snapshot_of(vec![work.clone(), agents]),
+        );
+        // Focus tracked by name, as it is for a session bootty created this run.
+        controller.activate_session("agents");
+
+        controller.rename_session("$2", "agents/main".to_owned(), &repaint, &config);
+        controller.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Tmux,
+            snapshot_of(vec![work, session("$2", "agents/main")]),
+        );
+
+        assert_eq!(
+            controller.selected_session(),
+            Some("$2"),
+            "a rename must not hand focus to the backend's active session"
+        );
     }
 
     fn window(id: &str, index: u32) -> MuxWindow {

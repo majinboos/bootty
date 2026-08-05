@@ -2939,6 +2939,13 @@ impl AppState {
         self.binding
             .pending_generated_names
             .retain(|session_id, pending| {
+                // A pending name the backend already reports has served its purpose: it exists to
+                // keep the name alive for membership and uniqueness until the rename or create lands.
+                // Renames record it under the new name rather than a session id, so the id lookup
+                // below never prunes those and they would otherwise be held forever.
+                if sessions.iter().any(|session| session.name == pending.name) {
+                    return false;
+                }
                 sessions
                     .iter()
                     .find(|session| session.id == *session_id)
@@ -7122,6 +7129,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha"],
         );
+    }
+
+    /// Focus lands on the created session *and* shows there: the sidebar marks its current row by
+    /// session id, so a selection still carrying the name bootty asked the backend for left the
+    /// focused session unhighlighted.
+    #[test]
+    fn a_created_session_is_the_current_sidebar_row() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let backend = ScriptedBackend::with(Vec::new()).install(&mut state.binding);
+        let dir = std::env::temp_dir().join(format!("bootty-current-row-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let cwd = dir.to_string_lossy().into_owned();
+        let name = crate::git::suggested_session_name(&AppState::session_root(&cwd));
+
+        state.create_project_session_for_cwd(cwd);
+        // The create reaches the backend (ScriptedBackend ignores commands, so the test applies it).
+        backend.set(vec![session_with(
+            "s1",
+            &name,
+            dir.to_str().expect("utf-8 cwd"),
+        )]);
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.mux.selected_session(),
+            Some("s1"),
+            "the selection resolves to the session id the sidebar marks rows by"
+        );
+    }
+
+    /// A UI rename records the new name as pending so membership and uniqueness hold it while the
+    /// backend catches up. That entry is keyed by the name rather than by a session id, so the id
+    /// lookup in the reconciler never pruned it: the name stayed reserved for the rest of the run,
+    /// and the next session for that project was pushed onto a "-2" suffix by it.
+    #[test]
+    fn a_landed_ui_rename_releases_its_pending_name() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let backend = ScriptedBackend::with(vec![session_with("s1", "alpha", "/repo/alpha")])
+            .install(&mut state.binding);
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", "/repo/alpha", "alpha");
+        state.binding.session_order.add_session("alpha");
+        reconcile_frame(&mut state);
+
+        state.apply_rename_session_event(
+            RenameSessionDialog::open("s1".to_owned(), "alpha".to_owned()),
+            RenameSessionEvent::Rename {
+                session_id: "s1".to_owned(),
+                name: "release".to_owned(),
+            },
+        );
+        assert!(
+            state
+                .binding
+                .pending_generated_names
+                .contains_key("release"),
+            "the new name is held until the backend reports it"
+        );
+
+        // The rename reaches the backend (ScriptedBackend ignores commands, so the test applies it).
+        backend.set(vec![session_with("s1", "release", "/repo/alpha")]);
+        reconcile_frame(&mut state);
+
+        assert!(
+            state.binding.pending_generated_names.is_empty(),
+            "a pending name the backend now reports must be released"
+        );
+        assert_eq!(state.binding.session_order.session_names(), ["release"]);
     }
 
     /// The finder reaches every Space, so it has to say which Space each session belongs to, and

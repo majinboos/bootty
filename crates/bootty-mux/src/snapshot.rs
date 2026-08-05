@@ -63,20 +63,28 @@ pub struct MuxPaneAnchor {
     pub process: Option<String>,
 }
 
-pub fn selection_after_refresh(current: Option<String>, snapshot: &MuxSnapshot) -> Option<String> {
+pub fn session_matches(session: &MuxSession, session_id: &str) -> bool {
+    session.id == session_id || session.name == session_id
+}
+
+/// Resolves the selection against the sessions the backend reports, as that backend's session id.
+///
+/// Answering with the id rather than the string that came in is what keeps a selection stable: a name
+/// stops resolving the moment the session is renamed, and the UI marks the current row by id, so a
+/// name-tracked selection leaves the focused session unhighlighted.
+pub fn selection_after_refresh(current: Option<String>, sessions: &[MuxSession]) -> Option<String> {
     current
-        .filter(|current| {
-            snapshot
-                .sessions
+        .and_then(|current| {
+            sessions
                 .iter()
-                .any(|session| session.id == *current || session.name == *current)
+                .find(|session| session_matches(session, &current))
+                .map(|session| session.id.clone())
         })
         .or_else(|| {
-            snapshot
-                .sessions
+            sessions
                 .iter()
                 .find(|session| session.active)
-                .or_else(|| snapshot.sessions.first())
+                .or_else(|| sessions.first())
                 .map(|session| session.id.clone())
         })
 }
