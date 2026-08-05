@@ -72,6 +72,7 @@ pub fn build_sidebar_items<'a>(
     build_sidebar_items_inner(
         default_scope(),
         sessions,
+        &[],
         selected_session,
         true,
         false,
@@ -87,6 +88,7 @@ pub fn build_visible_sidebar_items<'a>(
     build_sidebar_items_inner(
         default_scope(),
         sessions,
+        &[],
         selected_session,
         true,
         false,
@@ -114,9 +116,15 @@ pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec
             icon: Some("terminal"),
             primitives: &[],
         });
+        let display_names = group
+            .sessions
+            .iter()
+            .map(|session| group.display_name(session))
+            .collect::<Vec<_>>();
         let mut binding_items = build_sidebar_items_inner(
             group.scope,
             &group.sessions,
+            &display_names,
             group.selected_session.as_deref(),
             group.active,
             group.can_return_to_last_session,
@@ -142,8 +150,12 @@ pub struct SidebarSessionColor<'a> {
     pub dim_color: Color32,
 }
 
-pub fn sidebar_session_colors(sessions: &[MuxSession]) -> Vec<SidebarSessionColor<'_>> {
-    let mut group_meta = GroupMeta::new(sessions);
+/// Session accents, grouped the same way the sidebar groups its rows: by the names bootty shows.
+pub fn sidebar_session_colors<'a>(
+    sessions: &'a [MuxSession],
+    display_names: &[&'a str],
+) -> Vec<SidebarSessionColor<'a>> {
+    let mut group_meta = GroupMeta::new(sessions, display_names);
     let dynamic_total = group_meta.dynamic_total;
     sessions
         .iter()
@@ -273,6 +285,7 @@ fn sidebar_tree(value: Option<&str>) -> SidebarTree {
 fn build_sidebar_items_inner<'a>(
     scope: MuxScope,
     sessions: &'a [MuxSession],
+    display_names: &[&'a str],
     selected_session: Option<&str>,
     binding_active: bool,
     can_return_to_last_session: bool,
@@ -281,7 +294,7 @@ fn build_sidebar_items_inner<'a>(
     if max_rows == Some(0) {
         return Vec::new();
     }
-    let mut group_meta = GroupMeta::new(sessions);
+    let mut group_meta = GroupMeta::new(sessions, display_names);
     let full_capacity = sessions.len().saturating_mul(6);
     let mut items = Vec::with_capacity(max_rows.unwrap_or(full_capacity).min(full_capacity));
     let mut ordinal = 0usize;
@@ -291,6 +304,11 @@ fn build_sidebar_items_inner<'a>(
         let Some(group_info) = group_meta.session(index) else {
             continue;
         };
+        // Labels come from the name bootty shows; anchors and ids stay on the backend's.
+        let display_name = display_names
+            .get(index)
+            .copied()
+            .unwrap_or(session.name.as_str());
         let group = group_info.name;
         let group_index = group_info.index;
         let group_count = group_info.count;
@@ -347,7 +365,7 @@ fn build_sidebar_items_inner<'a>(
                     break;
                 }
             }
-            let suffix = session_suffix(&session.name);
+            let suffix = session_suffix(display_name);
             let label = if suffix.is_empty() { group } else { suffix };
             let display = SidebarDisplay::Numbered {
                 number: ordinal + 1,
@@ -357,7 +375,7 @@ fn build_sidebar_items_inner<'a>(
             (display, 2)
         } else {
             let label = if group.is_empty() {
-                session.name.as_str()
+                display_name
             } else {
                 group
             };
@@ -433,12 +451,21 @@ struct GroupMeta<'a> {
 const HASHED_GROUP_LOOKUP_THRESHOLD: usize = 32;
 
 impl<'a> GroupMeta<'a> {
-    fn new(sessions: &'a [MuxSession]) -> Self {
+    /// Groups sessions by the name bootty shows, so a backend-only uniqueness suffix cannot split a
+    /// project into two groups. `display_names` pairs with `sessions` by position and may be short,
+    /// in which case the backend name stands in. `leader_session` stays a backend name: it is the
+    /// reorder anchor, an identity rather than a label.
+    fn new(sessions: &'a [MuxSession], display_names: &[&'a str]) -> Self {
         let mut groups = Vec::<GroupSummary<'a>>::new();
         let mut session_groups = Vec::with_capacity(sessions.len());
         let mut lookup = None::<HashMap<&'a str, usize>>;
-        for session in sessions {
-            let group = session_group(&session.name);
+        for (index, session) in sessions.iter().enumerate() {
+            let group = session_group(
+                display_names
+                    .get(index)
+                    .copied()
+                    .unwrap_or(session.name.as_str()),
+            );
             if let Some(index) = lookup
                 .as_ref()
                 .and_then(|lookup| lookup.get(group).copied())
@@ -665,6 +692,7 @@ mod tests {
                 selected_session: Some("$1".to_owned()),
                 active: true,
                 can_return_to_last_session: false,
+                display_names: HashMap::new(),
             },
             crate::ui::session_navigation::BindingSessionGroup {
                 scope: remote_scope,
@@ -673,6 +701,7 @@ mod tests {
                 selected_session: Some("$1".to_owned()),
                 active: false,
                 can_return_to_last_session: true,
+                display_names: HashMap::new(),
             },
         ];
 
@@ -740,7 +769,7 @@ mod tests {
             session("project", "project", "fish"),
         ];
 
-        let colors = sidebar_session_colors(&sessions);
+        let colors = sidebar_session_colors(&sessions, &[]);
 
         assert_eq!(colors.len(), 2);
         assert_ne!(colors[0].color, colors[1].color);

@@ -238,7 +238,10 @@ impl TerminalProgress {
 #[derive(Clone, Debug)]
 struct PendingGeneratedName {
     cwd: String,
+    /// The name asked of the backend, unique across the whole server.
     name: String,
+    /// What bootty calls it, which drops any uniqueness suffix `name` had to carry.
+    display_name: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -481,6 +484,50 @@ impl BindingRuntime {
             }
         }
         self.sync_session_order();
+    }
+
+    /// The names bootty shows for `sessions`, in the same order.
+    ///
+    /// A backend name has to be unique across a whole shared server, so bootty's own name for a
+    /// session can differ from it: creating `agents/main` while another Space (or a hand-made tmux
+    /// session) already holds that name asks the backend for `agents/main-2`, and that suffix is the
+    /// backend's business, not the sidebar's. Sessions bootty has no name for keep the backend name,
+    /// and so do two members that would otherwise show the same name — there the suffix is the only
+    /// thing telling them apart.
+    fn session_display_names(&self, sessions: &[MuxSession]) -> Vec<String> {
+        let mut counts = HashMap::<&str, usize>::new();
+        let candidates = sessions
+            .iter()
+            .map(|session| {
+                let display_name = self
+                    .session_names
+                    .display_name(&session.id)
+                    .unwrap_or(session.name.as_str());
+                *counts.entry(display_name).or_default() += 1;
+                display_name
+            })
+            .collect::<Vec<_>>();
+        sessions
+            .iter()
+            .zip(candidates)
+            .map(|(session, display_name)| {
+                if counts.get(display_name).copied().unwrap_or_default() > 1 {
+                    session.name.clone()
+                } else {
+                    display_name.to_owned()
+                }
+            })
+            .collect()
+    }
+
+    /// The same names keyed by session id, for the UI groups that carry sessions from several
+    /// bindings at once.
+    fn session_display_name_map(&self, sessions: &[MuxSession]) -> HashMap<String, String> {
+        sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .zip(self.session_display_names(sessions))
+            .collect()
     }
 
     fn sync_session_order(&mut self) {
@@ -1722,10 +1769,12 @@ impl AppState {
                 } else {
                     binding.label.clone()
                 };
+                let sessions = binding.mux.sessions().to_vec();
                 BindingSessionGroup {
                     scope: binding.scope,
                     label,
-                    sessions: binding.mux.sessions().to_vec(),
+                    display_names: binding.session_display_name_map(&sessions),
+                    sessions,
                     selected_session: binding.mux.selected_session().map(str::to_owned),
                     active: binding.scope == self.binding.scope,
                     can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
@@ -1800,6 +1849,7 @@ impl AppState {
                     } else {
                         (*space_name).to_owned()
                     },
+                    display_names: binding.session_display_name_map(&sessions),
                     sessions,
                     selected_session: binding.mux.selected_session().map(str::to_owned),
                     active: binding.scope == self.binding.scope,
@@ -1822,6 +1872,8 @@ impl AppState {
                 selected_session: None,
                 active: false,
                 can_return_to_last_session: false,
+                // No Space owns these, so bootty has no name of its own for them.
+                display_names: HashMap::new(),
             });
         }
         groups
@@ -2283,6 +2335,11 @@ impl AppState {
                     .iter()
                     .any(|window| self.window_has_indeterminate_progress(window))
             })
+    }
+
+    /// The names the active binding shows for `sessions`, in the same order.
+    pub(crate) fn session_display_names(&self, sessions: &[MuxSession]) -> Vec<String> {
+        self.binding.session_display_names(sessions)
     }
 
     pub(crate) fn window_has_indeterminate_progress(&self, window: &MuxWindow) -> bool {
@@ -2965,13 +3022,17 @@ impl AppState {
             .collect::<HashSet<_>>();
         let rename_supported =
             selected_backend(self.active_multiplexer()) != MultiplexerBackendConfig::Rmux;
+        // A generated name has to clear every session on the server, not just this binding's members:
+        // asking for one another Space or a hand-made session already holds is a rename the backend
+        // rejects, leaving bootty asking for it again on every change.
+        let taken_names = self.taken_session_names(None);
 
         for session in &sessions {
             let Some(raw_cwd) = session.anchor.cwd.as_deref() else {
                 continue;
             };
             let cwd = Self::session_root(raw_cwd);
-            let record = if let Some(record) =
+            let mut record = if let Some(record) =
                 self.binding
                     .session_names
                     .observe_session(&session.id, &session.name, &cwd)
@@ -2980,19 +3041,61 @@ impl AppState {
             } else {
                 let legacy_name = crate::strings::session_name_for_path(&cwd);
                 if session.name == legacy_name {
-                    self.binding
-                        .session_names
-                        .remember_generated(&session.id, &cwd, &session.name);
+                    self.binding.session_names.remember_generated(
+                        &session.id,
+                        &cwd,
+                        &session.name,
+                        &session.name,
+                    );
                 } else {
-                    self.binding
-                        .session_names
-                        .mark_explicit(&session.id, &session.name, &cwd);
+                    self.binding.session_names.mark_explicit(
+                        &session.id,
+                        &session.name,
+                        &session.name,
+                        &cwd,
+                    );
                 }
                 self.binding
                     .session_names
                     .observe_session(&session.id, &session.name, &cwd)
                     .expect("session name metadata should be observable after recording")
             };
+
+            // Records written before display names existed have none, and only those need one worked
+            // out: from here on, creating and renaming both record what bootty means to show, so a
+            // name someone typed is never something to second-guess.
+            if record.display_name.is_empty() {
+                let generated_suffix = session.name != record.generated_name
+                    && crate::strings::is_uniquified_session_name(
+                        &session.name,
+                        &record.generated_name,
+                    );
+                if record.explicit && generated_suffix {
+                    // Bootty generated `generated_name`, then asked the backend for that name plus a
+                    // uniqueness suffix — which the old reconciler read back as somebody's rename.
+                    self.binding
+                        .session_names
+                        .reclaim_generated(&session.id, &session.name);
+                    record.generated_name = session.name.clone();
+                    record.explicit = false;
+                }
+                let display_name = if record.explicit {
+                    session.name.clone()
+                } else {
+                    // The name bootty means for this worktree, whenever the backend name is that name
+                    // or that name plus the suffix it needed to clear the server.
+                    let suggested = crate::git::suggested_session_name(&cwd);
+                    if crate::strings::is_uniquified_session_name(&session.name, &suggested) {
+                        suggested
+                    } else {
+                        session.name.clone()
+                    }
+                };
+                self.binding
+                    .session_names
+                    .set_display_name(&session.id, &display_name);
+                record.display_name = display_name;
+            }
 
             if let Some(pending) = self
                 .binding
@@ -3007,14 +3110,18 @@ impl AppState {
                             &session.id,
                             &cwd,
                             &pending.name,
+                            &pending.display_name,
                         );
                         self.binding.pending_generated_names.remove(&session.id);
                     } else if session.name != record.generated_name {
                         planned_names.remove(&pending.name);
                         self.binding.pending_generated_names.remove(&session.id);
-                        self.binding
-                            .session_names
-                            .mark_explicit(&session.id, &session.name, &cwd);
+                        self.binding.session_names.mark_explicit(
+                            &session.id,
+                            &session.name,
+                            &session.name,
+                            &cwd,
+                        );
                     }
                     continue;
                 }
@@ -3024,21 +3131,22 @@ impl AppState {
                 continue;
             }
             if session.name != record.generated_name {
-                self.binding
-                    .session_names
-                    .mark_explicit(&session.id, &session.name, &cwd);
+                self.binding.session_names.mark_explicit(
+                    &session.id,
+                    &session.name,
+                    &session.name,
+                    &cwd,
+                );
                 continue;
             }
 
-            let existing_names = sessions
+            let existing_names = taken_names
                 .iter()
-                .filter(|other| other.id != session.id)
-                .map(|other| other.name.as_str())
+                .map(String::as_str)
+                .filter(|name| *name != session.name)
                 .chain(planned_names.iter().map(String::as_str));
-            let desired = crate::strings::unique_session_name(
-                &crate::git::suggested_session_name(&cwd),
-                existing_names,
-            );
+            let display_name = crate::git::suggested_session_name(&cwd);
+            let desired = crate::strings::unique_session_name(&display_name, existing_names);
             if desired == session.name || !rename_supported {
                 continue;
             }
@@ -3048,6 +3156,7 @@ impl AppState {
                 PendingGeneratedName {
                     cwd,
                     name: desired.clone(),
+                    display_name,
                 },
             );
             renames.push((session.id.clone(), desired));
@@ -3064,10 +3173,11 @@ impl AppState {
         }
     }
 
-    fn create_project_session_for_cwd(&mut self, cwd: String) {
-        let cwd = Self::session_root(&cwd);
-
-        let existing_names = std::iter::once(&self.binding)
+    /// Every session name the backend already answers to, plus the names bootty has asked it for and
+    /// is still waiting on. `keep` is the name of the session being renamed, which must not count as
+    /// taken against itself.
+    fn taken_session_names(&self, keep: Option<&str>) -> Vec<String> {
+        std::iter::once(&self.binding)
             .chain(self.inactive_bindings.iter())
             .chain(self.inactive_spaces.iter().flat_map(SpaceRuntime::bindings))
             .flat_map(|binding| {
@@ -3078,9 +3188,19 @@ impl AppState {
                         .map(|pending| pending.name.clone()),
                 )
             })
-            .collect::<Vec<_>>();
+            .filter(|name| Some(name.as_str()) != keep)
+            .collect()
+    }
+
+    fn create_project_session_for_cwd(&mut self, cwd: String) {
+        let cwd = Self::session_root(&cwd);
+
+        let existing_names = self.taken_session_names(None);
+        // The backend name has to clear every session on the server, including sessions bootty does
+        // not own; the display name is the one bootty meant, before that uniqueness pass.
+        let display_name = crate::git::suggested_session_name(&cwd);
         let session_id = crate::strings::unique_session_name(
-            &crate::git::suggested_session_name(&cwd),
+            &display_name,
             existing_names.iter().map(String::as_str),
         );
         self.binding.pending_generated_names.insert(
@@ -3088,11 +3208,15 @@ impl AppState {
             PendingGeneratedName {
                 cwd: cwd.clone(),
                 name: session_id.clone(),
+                display_name: display_name.clone(),
             },
         );
-        self.binding
-            .session_names
-            .remember_generated(&session_id, &cwd, &session_id);
+        self.binding.session_names.remember_generated(
+            &session_id,
+            &cwd,
+            &session_id,
+            &display_name,
+        );
         self.binding.session_order.add_session(&session_id);
         let mux_config = self.active_multiplexer().clone();
         self.binding.mux.create_project_session(
@@ -3300,20 +3424,37 @@ impl AppState {
                         .as_deref()
                         .map(Self::session_root)
                         .unwrap_or_default();
+                    // The typed name is what bootty shows. The backend still needs a name no other
+                    // session on the server holds, so it may carry a suffix the sidebar never shows.
+                    let taken = self.taken_session_names(Some(session.name.as_str()));
+                    let backend_name = crate::strings::unique_session_name(
+                        &name,
+                        taken.iter().map(String::as_str),
+                    );
                     self.binding
                         .session_order
-                        .rename_session(&session.name, &name);
+                        .rename_session(&session.name, &backend_name);
                     self.binding.pending_generated_names.insert(
-                        name.clone(),
+                        backend_name.clone(),
                         PendingGeneratedName {
-                            cwd,
-                            name: name.clone(),
+                            cwd: cwd.clone(),
+                            name: backend_name.clone(),
+                            display_name: name.clone(),
                         },
                     );
+                    self.binding.session_names.mark_explicit(
+                        &session.id,
+                        &backend_name,
+                        &name,
+                        &cwd,
+                    );
                     let mux_config = self.active_multiplexer().clone();
-                    self.binding
-                        .mux
-                        .rename_session(&session.id, name, &self.repaint, &mux_config);
+                    self.binding.mux.rename_session(
+                        &session.id,
+                        backend_name,
+                        &self.repaint,
+                        &mux_config,
+                    );
                 }
                 self.input_focus = InputFocus::Terminal;
             }
@@ -4169,7 +4310,17 @@ impl AppState {
             .sessions()
             .iter()
             .find(|session| session.id == session_id || session.name == session_id)
-            .map(|session| (session.id.clone(), session.name.clone()))
+            .map(|session| {
+                // Prefill what bootty shows, so a backend-only uniqueness suffix is not something
+                // the user has to delete out of the field.
+                let name = self
+                    .binding
+                    .session_names
+                    .display_name(&session.id)
+                    .unwrap_or(session.name.as_str())
+                    .to_owned();
+                (session.id.clone(), name)
+            })
         else {
             return false;
         };
@@ -7108,7 +7259,7 @@ mod tests {
         state
             .binding
             .session_names
-            .remember_generated("s1", "/repo/alpha", "stale");
+            .remember_generated("s1", "/repo/alpha", "stale", "stale");
         state.binding.session_order.add_session("stale");
 
         reconcile_frame(&mut state);
@@ -7175,7 +7326,7 @@ mod tests {
         state
             .binding
             .session_names
-            .remember_generated("s1", "/repo/alpha", "alpha");
+            .remember_generated("s1", "/repo/alpha", "alpha", "alpha");
         state.binding.session_order.add_session("alpha");
         reconcile_frame(&mut state);
 
@@ -7203,6 +7354,228 @@ mod tests {
             "a pending name the backend now reports must be released"
         );
         assert_eq!(state.binding.session_order.session_names(), ["release"]);
+    }
+
+    /// A backend name has to clear every session on a shared server, bootty's or not. The suffix that
+    /// takes is the backend's business: the sidebar shows the name bootty meant.
+    #[test]
+    fn a_name_taken_on_the_backend_only_suffixes_the_backend_name() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-display-name-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let cwd = dir.to_string_lossy().into_owned();
+        let wanted = crate::git::suggested_session_name(&AppState::session_root(&cwd));
+        // A session this Space does not own already answers to that name on the shared backend.
+        ScriptedBackend::with(vec![session_with("foreign", &wanted, "/repo/foreign")])
+            .install(&mut state.binding);
+        reconcile_frame(&mut state);
+
+        state.create_project_session_for_cwd(cwd);
+
+        let backend_name = format!("{wanted}-2");
+        assert!(
+            state
+                .binding
+                .pending_generated_names
+                .contains_key(&backend_name),
+            "the backend is asked for a name no other session holds"
+        );
+        assert_eq!(
+            state.binding.session_names.display_name(&backend_name),
+            Some(wanted.as_str()),
+            "bootty shows the name it meant, without the backend's suffix"
+        );
+    }
+
+    /// Bootty asking the backend for `agents/main-2` and then reading that back as somebody's rename
+    /// is how these sessions became "explicit": the suffix froze into the name shown everywhere, and
+    /// an explicit name is one bootty will not second-guess. Only records from before display names
+    /// existed are read this way — a name typed since then carries its own display name.
+    #[test]
+    fn a_legacy_generated_suffix_is_not_read_as_someone_elses_rename() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-suffix-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let root = AppState::session_root(&dir.to_string_lossy());
+        let wanted = crate::git::suggested_session_name(&root);
+        let backend_name = format!("{wanted}-2");
+        // The record the old reconciler left: generated under the clean name, then marked explicit
+        // because the backend reported the suffixed one, and with no display name of its own.
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", &root, &wanted, "");
+        state
+            .binding
+            .session_names
+            .mark_explicit("s1", &backend_name, "", &root);
+        state.binding.session_order.add_session(&backend_name);
+        ScriptedBackend::with(vec![session_with("s1", &backend_name, &root)])
+            .install(&mut state.binding);
+
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some(wanted.as_str()),
+            "the suffix bootty added is not part of the name it shows"
+        );
+    }
+
+    /// A suffix-shaped name someone typed is theirs. Nothing may re-derive it, or bootty would rename
+    /// the session back to the name it would have generated.
+    #[test]
+    fn a_typed_name_that_looks_like_a_generated_suffix_is_left_alone() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-typed-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let root = AppState::session_root(&dir.to_string_lossy());
+        let wanted = crate::git::suggested_session_name(&root);
+        let typed = format!("{wanted}-2");
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", &root, &wanted, &wanted);
+        // What the rename dialog records: the typed name, shown as typed.
+        state
+            .binding
+            .session_names
+            .mark_explicit("s1", &typed, &typed, &root);
+        state.binding.session_order.add_session(&typed);
+        ScriptedBackend::with(vec![session_with("s1", &typed, &root)]).install(&mut state.binding);
+
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some(typed.as_str()),
+            "a typed name stands, suffix-shaped or not"
+        );
+        assert_eq!(
+            state.binding.mux.sessions()[0].name,
+            typed,
+            "and no rename is attempted back to the generated name"
+        );
+    }
+
+    /// Sessions that predate display names have none recorded, so they kept showing the backend's
+    /// name — including the suffix bootty only ever added to clear the server's namespace.
+    #[test]
+    fn sessions_recorded_before_display_names_get_one() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-backfill-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let cwd = dir.to_string_lossy().into_owned();
+        let root = AppState::session_root(&cwd);
+        let wanted = crate::git::suggested_session_name(&root);
+        let backend_name = format!("{wanted}-2");
+        // What the old code left behind: a generated record with no display name of its own, on a
+        // session whose backend name carries the suffix that cleared a foreign session.
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", &root, &backend_name, "");
+        state.binding.session_order.add_session(&backend_name);
+        ScriptedBackend::with(vec![
+            session_with("s1", &backend_name, &root),
+            session_with("foreign", &wanted, "/repo/foreign"),
+        ])
+        .install(&mut state.binding);
+
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some(wanted.as_str()),
+            "the upgrade fills in the name bootty would have shown"
+        );
+        assert_eq!(
+            state.binding.mux.sessions()[0].name,
+            backend_name,
+            "and asks the backend for nothing: the foreign session still holds the clean name"
+        );
+    }
+
+    /// Two members that would show the same name are the one case the suffix has to stay: it is all
+    /// that tells them apart.
+    #[test]
+    fn members_that_would_show_the_same_name_keep_their_backend_names() {
+        let mut state = test_state();
+        state.binding.session_names.remember_generated(
+            "s1",
+            "/repo/a",
+            "agents/main",
+            "agents/main",
+        );
+        state.binding.session_names.remember_generated(
+            "s2",
+            "/repo/b",
+            "agents/main-2",
+            "agents/main",
+        );
+        let sessions = vec![
+            session_with("s1", "agents/main", "/repo/a"),
+            session_with("s2", "agents/main-2", "/repo/b"),
+        ];
+
+        assert_eq!(
+            state.session_display_names(&sessions),
+            ["agents/main", "agents/main-2"]
+        );
+        assert_eq!(
+            state.session_display_names(&sessions[1..]),
+            ["agents/main"],
+            "on its own, that session shows the name bootty meant"
+        );
+    }
+
+    /// Renaming onto a name some other session on the server holds used to be a rename the backend
+    /// rejected. The typed name is bootty's to show; the backend gets a unique one.
+    #[test]
+    fn renaming_onto_a_name_the_backend_holds_keeps_the_typed_name() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        ScriptedBackend::with(vec![
+            session_with("s1", "alpha", "/repo/alpha"),
+            session_with("foreign", "release", "/repo/foreign"),
+        ])
+        .install(&mut state.binding);
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", "/repo/alpha", "alpha", "alpha");
+        state.binding.session_order.add_session("alpha");
+        reconcile_frame(&mut state);
+
+        state.apply_rename_session_event(
+            RenameSessionDialog::open("s1".to_owned(), "alpha".to_owned()),
+            RenameSessionEvent::Rename {
+                session_id: "s1".to_owned(),
+                name: "release".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some("release"),
+            "the typed name is what bootty shows"
+        );
+        assert!(
+            state
+                .binding
+                .pending_generated_names
+                .contains_key("release-2"),
+            "the backend is asked for a name the foreign session does not hold"
+        );
     }
 
     /// The finder reaches every Space, so it has to say which Space each session belongs to, and

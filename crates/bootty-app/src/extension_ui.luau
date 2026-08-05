@@ -320,6 +320,13 @@ local function session_suffix(name)
 	return ""
 end
 
+-- What bootty calls the session, which is what grouping and labels read. `session.name` is the
+-- backend's name and stays the identity behind anchors, reorders, and commands: it can carry a
+-- uniqueness suffix that only exists because the backend's namespace is shared.
+local function session_display_name(session)
+	return session.display_name or session.name
+end
+
 local function count_groups(sessions, group_of)
 	local groups = {}
 	for _, session in ipairs(sessions) do
@@ -334,11 +341,11 @@ end
 
 local function session_context(session, groups, last_group, options)
 	local group_of = options.group_of or function(value)
-		return session_group(value.name)
+		return session_group(session_display_name(value))
 	end
 	local label_of = options.label_of
 		or function(value, group)
-			local suffix = session_suffix(value.name)
+			local suffix = session_suffix(session_display_name(value))
 			return if suffix == "" then group else suffix
 		end
 	local group = group_of(session)
@@ -369,7 +376,7 @@ function ui.session_items(options)
 	local opts = opt(options)
 	local sessions = opts.sessions or {}
 	local group_of = opts.group_of or function(value)
-		return session_group(value.name)
+		return session_group(session_display_name(value))
 	end
 	local groups = count_groups(sessions, group_of)
 	local items = {}
@@ -435,7 +442,7 @@ function ui.session_components(options)
 	local opts = opt(options)
 	local sessions = opts.sessions or {}
 	local group_of = opts.group_of or function(value)
-		return session_group(value.name)
+		return session_group(session_display_name(value))
 	end
 	local groups = count_groups(sessions, group_of)
 	local items = {}

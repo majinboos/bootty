@@ -1517,6 +1517,7 @@ mod tests {
                 selected_session: Some("$1".to_owned()),
                 active: true,
                 can_return_to_last_session: false,
+                display_names: HashMap::new(),
             },
             BindingSessionGroup {
                 scope: remote_scope,
@@ -1525,6 +1526,7 @@ mod tests {
                 selected_session: Some("$1".to_owned()),
                 active: false,
                 can_return_to_last_session: false,
+                display_names: HashMap::new(),
             },
         ];
         let items = build_binding_sidebar_items(&groups);

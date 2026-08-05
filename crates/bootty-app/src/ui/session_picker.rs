@@ -104,7 +104,11 @@ fn picker_rows(groups: &[BindingSessionGroup], filter: &str) -> Vec<PickerRow> {
         let matching_sessions = group
             .sessions
             .iter()
-            .filter(|session| binding_matches || session_matches(session, filter))
+            .filter(|session| {
+                binding_matches
+                    || session_matches(session, filter)
+                    || fuzzy_matches(group.display_name(session), filter)
+            })
             .collect::<Vec<_>>();
         if matching_sessions.is_empty() {
             continue;
@@ -123,7 +127,7 @@ fn picker_rows(groups: &[BindingSessionGroup], filter: &str) -> Vec<PickerRow> {
             PickerRow {
                 row: ListRow {
                     icon: Some("terminal".to_owned()),
-                    primary: session.name.clone(),
+                    primary: group.display_name(session).to_owned(),
                     trailing: session
                         .anchor
                         .process
@@ -157,6 +161,8 @@ fn session_matches(session: &MuxSession, filter: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::mux::snapshot::MuxPaneAnchor;
 
@@ -175,6 +181,7 @@ mod tests {
             selected_session: selected_session.map(str::to_owned),
             active: true,
             can_return_to_last_session: false,
+            display_names: HashMap::new(),
         }
     }
 
@@ -236,6 +243,7 @@ mod tests {
                 selected_session: Some("$1".to_owned()),
                 active: true,
                 can_return_to_last_session: false,
+                display_names: HashMap::new(),
             },
             BindingSessionGroup {
                 scope: remote_scope,
@@ -244,6 +252,7 @@ mod tests {
                 selected_session: Some("$1".to_owned()),
                 active: false,
                 can_return_to_last_session: false,
+                display_names: HashMap::new(),
             },
         ];
 

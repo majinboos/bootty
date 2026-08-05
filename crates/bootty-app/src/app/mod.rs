@@ -617,22 +617,25 @@ impl BoottyApp {
             })
             .collect::<Vec<_>>();
         windows.sort_by_key(|window| window.index);
-        let session = chrome::selected_session_name(
-            self.state.mux().sessions(),
-            self.state.mux().selected_session(),
-        )
-        .map(str::to_owned);
         let sessions = self.current_extension_sessions();
         let selected_session = self.state.mux().selected_session();
-        let session_color = sessions
-            .iter()
-            .find(|candidate| {
-                if let Some(selected) = selected_session {
-                    candidate.id == selected || candidate.name == selected
-                } else {
-                    candidate.active
-                }
-            })
+        let selected = sessions.iter().find(|candidate| {
+            if let Some(selected) = selected_session {
+                candidate.id == selected || candidate.name == selected
+            } else {
+                candidate.active
+            }
+        });
+        // `bootty.session()` names the session for the status bar, so it reads the same name the
+        // sidebar shows rather than the backend's.
+        let session = selected.map(|session| {
+            if session.display_name.is_empty() {
+                session.name.clone()
+            } else {
+                session.display_name.clone()
+            }
+        });
+        let session_color = selected
             .and_then(|session| session.color.clone())
             .or_else(|| Some(color_hex(self.state.ui_theme().palette.accent)));
         crate::extensions::MuxView {
@@ -677,18 +680,23 @@ impl BoottyApp {
         let fallback_dim_color = color_hex(palette.muted);
         let selected_session = self.state.mux().selected_session();
         let sessions = self.state.mux().sessions();
-        let session_colors = crate::ui::sidebar::sidebar_session_colors(sessions)
-            .into_iter()
-            .map(|entry| {
-                (
-                    entry.session_id.to_owned(),
-                    (color_hex(entry.color), color_hex(entry.dim_color)),
-                )
-            })
-            .collect::<HashMap<_, _>>();
+        let display_names = self.state.session_display_names(sessions);
+        let session_colors = crate::ui::sidebar::sidebar_session_colors(
+            sessions,
+            &display_names.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.session_id.to_owned(),
+                (color_hex(entry.color), color_hex(entry.dim_color)),
+            )
+        })
+        .collect::<HashMap<_, _>>();
         sessions
             .iter()
-            .map(|session| {
+            .zip(display_names)
+            .map(|(session, display_name)| {
                 let selected = if selected_session.is_some() {
                     selected_session == Some(session.id.as_str())
                         || selected_session == Some(session.name.as_str())
@@ -732,6 +740,7 @@ impl BoottyApp {
                 crate::extensions::SessionView {
                     id: session.id.clone(),
                     name: session.name.clone(),
+                    display_name,
                     active: session.active,
                     selected,
                     cwd: session.anchor.cwd.clone(),
