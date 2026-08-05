@@ -523,6 +523,7 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             cwd TEXT NOT NULL,
             generated_name TEXT NOT NULL,
             session_name TEXT NOT NULL DEFAULT '',
+            display_name TEXT NOT NULL DEFAULT '',
             explicit INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(binding_id, session_id)
         );
@@ -581,6 +582,13 @@ fn migrate_workspace_session_name_metadata(tx: &Transaction<'_>) -> rusqlite::Re
         tx.execute(
             "ALTER TABLE workspace_session_name_metadata
              ADD COLUMN session_name TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !columns.contains("display_name") {
+        tx.execute(
+            "ALTER TABLE workspace_session_name_metadata
+             ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }

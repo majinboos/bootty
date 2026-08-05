@@ -13,6 +13,9 @@ pub struct SessionNameRecord {
     pub cwd: String,
     pub generated_name: String,
     pub session_name: String,
+    /// What bootty calls this session in its own UI. The backend name has to be unique across a
+    /// shared server, so it carries any `-2` disambiguation; this one is the name bootty meant.
+    pub display_name: String,
     pub explicit: bool,
 }
 
@@ -38,7 +41,7 @@ impl SessionNameStore {
             return HashMap::new();
         };
         let Ok(mut statement) = conn.prepare(
-            "SELECT session_id, cwd, generated_name, session_name, explicit
+            "SELECT session_id, cwd, generated_name, session_name, display_name, explicit
              FROM workspace_session_name_metadata
              WHERE binding_id = ?1",
         ) else {
@@ -50,7 +53,8 @@ impl SessionNameStore {
                 cwd: row.get(1)?,
                 generated_name: row.get(2)?,
                 session_name: row.get(3)?,
-                explicit: row.get::<_, i64>(4)? != 0,
+                display_name: row.get(4)?,
+                explicit: row.get::<_, i64>(5)? != 0,
             })
         }) else {
             return HashMap::new();
@@ -82,14 +86,16 @@ impl SessionNameStore {
             if tx
                 .execute(
                     "INSERT INTO workspace_session_name_metadata
-                        (binding_id, session_id, cwd, generated_name, session_name, explicit)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        (binding_id, session_id, cwd, generated_name, session_name, display_name,
+                         explicit)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         binding_id,
                         record.session_id,
                         record.cwd,
                         record.generated_name,
                         record.session_name,
+                        record.display_name,
                         i64::from(record.explicit)
                     ],
                 )
@@ -135,7 +141,15 @@ impl SessionNameStore {
             .map(|record| record.session_name.as_str())
     }
 
-    pub fn remember_generated(&mut self, session_id: &str, cwd: &str, generated_name: &str) {
+    /// Record the name bootty generated for the backend, plus the `display_name` it stands for. They
+    /// differ whenever the backend name needed a `-2` suffix to stay unique on a shared server.
+    pub fn remember_generated(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        generated_name: &str,
+        display_name: &str,
+    ) {
         let existing_key = self.matching_key(cwd);
         if existing_key
             .as_ref()
@@ -155,13 +169,31 @@ impl SessionNameStore {
                 cwd: cwd.to_owned(),
                 generated_name: generated_name.to_owned(),
                 session_name: generated_name.to_owned(),
+                display_name: display_name.to_owned(),
                 explicit: false,
             },
         );
         self.save();
     }
 
-    pub fn mark_explicit(&mut self, session_id: &str, session_name: &str, cwd: &str) {
+    /// The name bootty shows for `session_id`, which is the backend name only when bootty never had
+    /// a name of its own for it.
+    pub fn display_name(&self, session_id: &str) -> Option<&str> {
+        self.records
+            .get(session_id)
+            .map(|record| record.display_name.as_str())
+            .filter(|display_name| !display_name.is_empty())
+    }
+
+    /// Record `session_name` as chosen rather than generated, shown as `display_name`. The two differ
+    /// when the backend needed a uniqueness suffix the name bootty shows does not carry.
+    pub fn mark_explicit(
+        &mut self,
+        session_id: &str,
+        session_name: &str,
+        display_name: &str,
+        cwd: &str,
+    ) {
         let existing_key = self.matching_key(cwd);
         let mut record = existing_key
             .and_then(|key| self.records.remove(&key))
@@ -170,11 +202,13 @@ impl SessionNameStore {
                 cwd: cwd.to_owned(),
                 generated_name: session_name.to_owned(),
                 session_name: session_name.to_owned(),
+                display_name: display_name.to_owned(),
                 explicit: false,
             });
         record.session_id = session_id.to_owned();
         record.cwd = cwd.to_owned();
         record.session_name = session_name.to_owned();
+        record.display_name = display_name.to_owned();
         record.explicit = true;
         self.records.insert(session_id.to_owned(), record);
         self.save();
@@ -229,7 +263,7 @@ mod tests {
     fn generated_name_survives_session_id_discovery() {
         let config = temp_config_path("id");
         let mut store = store(&config);
-        store.remember_generated("bootty/main", "/repo", "bootty/main");
+        store.remember_generated("bootty/main", "/repo", "bootty/main", "bootty/main");
 
         let record = store
             .observe_session("$1", "bootty/main", "/repo")
@@ -243,8 +277,8 @@ mod tests {
     fn explicit_name_survives_reload() {
         let config = temp_config_path("explicit");
         let mut names = store(&config);
-        names.remember_generated("$1", "/repo", "bootty/main");
-        names.mark_explicit("$1", "release", "/repo");
+        names.remember_generated("$1", "/repo", "bootty/main", "bootty/main");
+        names.mark_explicit("$1", "release", "release", "/repo");
 
         let mut reloaded = store(&config);
         let record = reloaded
@@ -258,9 +292,9 @@ mod tests {
     fn explicit_name_blocks_later_generated_name_updates() {
         let config = temp_config_path("protected");
         let mut store = store(&config);
-        store.remember_generated("$1", "/repo", "project/main");
-        store.mark_explicit("$1", "release", "/repo");
-        store.remember_generated("$1", "/repo", "project/feature");
+        store.remember_generated("$1", "/repo", "project/main", "project/main");
+        store.mark_explicit("$1", "release", "release", "/repo");
+        store.remember_generated("$1", "/repo", "project/feature", "project/feature");
 
         let record = store
             .observe_session("$1", "release", "/repo")
@@ -274,9 +308,9 @@ mod tests {
     fn reused_mux_id_does_not_transfer_explicit_name_to_another_worktree() {
         let config = temp_config_path("reused-id");
         let mut store = store(&config);
-        store.remember_generated("$1", "/old", "project/main");
-        store.mark_explicit("$1", "release", "/old");
-        store.remember_generated("$1", "/new", "other/main");
+        store.remember_generated("$1", "/old", "project/main", "project/main");
+        store.mark_explicit("$1", "release", "release", "/old");
+        store.remember_generated("$1", "/new", "other/main", "other/main");
 
         let record = store
             .observe_session("$1", "other/main", "/new")

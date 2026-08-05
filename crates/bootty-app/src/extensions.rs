@@ -179,7 +179,11 @@ pub struct SessionProgressView {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SessionView {
     pub id: String,
+    /// The backend's name, which is what every command and every membership record targets.
     pub name: String,
+    /// The name bootty shows, free of any uniqueness suffix the backend name needed. Empty means
+    /// bootty has no name of its own for this session; modules fall back to `name`.
+    pub display_name: String,
     pub active: bool,
     pub selected: bool,
     pub cwd: Option<String>,
@@ -1558,6 +1562,7 @@ fn preview_mux_view() -> MuxView {
             SessionView {
                 id: "$1".to_owned(),
                 name: "work/api".to_owned(),
+                display_name: String::new(),
                 active: true,
                 selected: true,
                 cwd: Some("/Users/demo/src/bootty".to_owned()),
@@ -1575,6 +1580,7 @@ fn preview_mux_view() -> MuxView {
             SessionView {
                 id: "$2".to_owned(),
                 name: "work/web".to_owned(),
+                display_name: String::new(),
                 active: true,
                 cwd: Some("/Users/demo/src/web".to_owned()),
                 color: Some("#a6e3a1".to_owned()),
@@ -2293,6 +2299,14 @@ fn setup_lua(
                     let entry = lua.create_table()?;
                     entry.set("id", session.id.as_str())?;
                     entry.set("name", session.name.as_str())?;
+                    entry.set(
+                        "display_name",
+                        if session.display_name.is_empty() {
+                            session.name.as_str()
+                        } else {
+                            session.display_name.as_str()
+                        },
+                    )?;
                     entry.set("active", session.active)?;
                     entry.set("selected", session.selected)?;
                     entry.set("progress", session.progress)?;
@@ -3661,6 +3675,68 @@ mod tests {
         assert_eq!(items[0].text, "codex:20:true:nil");
     }
 
+    /// Sidebar labels and grouping read the name bootty shows, so a suffix the backend name needed to
+    /// stay unique never reaches the sidebar — while anchors keep targeting the backend name.
+    #[test]
+    fn ui_session_items_label_and_group_by_display_name() {
+        let mux: Arc<RwLock<MuxView>> = Arc::new(RwLock::new(MuxView {
+            sessions: vec![
+                SessionView {
+                    id: "$1".to_owned(),
+                    name: "work-2/api".to_owned(),
+                    display_name: "work/api".to_owned(),
+                    ..SessionView::default()
+                },
+                SessionView {
+                    id: "$2".to_owned(),
+                    name: "work/ui".to_owned(),
+                    display_name: "work/ui".to_owned(),
+                    ..SessionView::default()
+                },
+            ],
+            ..MuxView::default()
+        }));
+        let lua = setup_lua(&[], mux, Arc::default(), Arc::default(), Arc::default()).unwrap();
+        let value = lua
+            .load(
+                r#"return function()
+                    return bootty.ui.session_items({ sessions = bootty.sessions() })
+                end"#,
+            )
+            .eval::<Value>()
+            .unwrap();
+        let module = loaded_module_from_value("test".to_owned(), value).unwrap();
+        let items = run_module(&module.body);
+        let sessions = items
+            .iter()
+            .filter(|item| item.kind.as_deref() == Some("session"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            items
+                .iter()
+                .find(|item| item.kind.as_deref() == Some("group"))
+                .map(|item| item.text.as_str()),
+            Some("work"),
+            "both sessions belong to the same project once the suffix is out of the way"
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["api", "ui"],
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|item| item.reorder_anchor.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("work-2/api"), Some("work/ui")],
+            "anchors are identities and stay on the backend's names"
+        );
+    }
+
     #[test]
     fn ui_session_items_namespaces_child_row_keys() {
         let mux: Arc<RwLock<MuxView>> = Arc::new(RwLock::new(MuxView {
@@ -3668,6 +3744,7 @@ mod tests {
                 SessionView {
                     id: "$1".to_owned(),
                     name: "work/api".to_owned(),
+                    display_name: String::new(),
                     color: Some("#89b4fa".to_owned()),
                     dim_color: Some("#455a7d".to_owned()),
                     ..SessionView::default()
@@ -3675,6 +3752,7 @@ mod tests {
                 SessionView {
                     id: "$2".to_owned(),
                     name: "work/ui".to_owned(),
+                    display_name: String::new(),
                     color: Some("#a6e3a1".to_owned()),
                     dim_color: Some("#526f50".to_owned()),
                     ..SessionView::default()
@@ -3719,6 +3797,7 @@ mod tests {
             sessions: vec![SessionView {
                 id: "plain".to_owned(),
                 name: "bootty".to_owned(),
+                display_name: String::new(),
                 selected: true,
                 cwd: Some(cwd.clone()),
                 color: Some("#89b4fa".to_owned()),
@@ -3818,6 +3897,7 @@ mod tests {
             sessions: vec![SessionView {
                 id: "plain".to_owned(),
                 name: "bootty".to_owned(),
+                display_name: String::new(),
                 selected: true,
                 cwd: Some(path.to_string_lossy().into_owned()),
                 ..SessionView::default()
@@ -4019,6 +4099,7 @@ mod tests {
             sessions: vec![SessionView {
                 id: "$1".to_owned(),
                 name: "work/api".to_owned(),
+                display_name: String::new(),
                 active: true,
                 selected: true,
                 cwd: Some("/tmp/work/api".to_owned()),

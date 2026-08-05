@@ -765,6 +765,7 @@ fn bench_session_picker_ui(c: &mut Criterion) {
         selected_session: Some(selected),
         active: true,
         can_return_to_last_session: false,
+        display_names: std::collections::HashMap::new(),
     }];
     let context = egui::Context::default();
     icons::install_icon_fonts(&context);
