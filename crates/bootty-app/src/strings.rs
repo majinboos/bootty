@@ -102,6 +102,28 @@ where
     unreachable!("session name suffix range is unbounded")
 }
 
+/// Whether `name` is what `unique_session_name` would produce from `base`: `base` itself, or `base`
+/// with a numeric suffix on its leaf. Recognizing bootty's own uniqueness suffix is what tells a
+/// backend name bootty asked for apart from a name someone else chose.
+pub fn is_uniquified_session_name(name: &str, base: &str) -> bool {
+    if name == base {
+        return true;
+    }
+    let (group, leaf) = base.rsplit_once('/').unwrap_or(("", base));
+    let Some(candidate_leaf) = name
+        .strip_prefix(group)
+        .and_then(|rest| rest.strip_prefix(if group.is_empty() { "" } else { "/" }))
+    else {
+        return false;
+    };
+    candidate_leaf
+        .strip_prefix(leaf)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.chars().all(|char| char.is_ascii_digit())
+        })
+}
+
 pub fn csv_field(value: &str) -> String {
     if value.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
@@ -171,6 +193,35 @@ mod tests {
         assert_eq!(
             unique_session_name("bootty/main", ["other/main"]),
             "bootty/main"
+        );
+    }
+
+    /// Recognizing bootty's own suffix decides whether a backend name counts as a rename someone else
+    /// made, so a name that merely looks numeric must not qualify.
+    #[test]
+    fn uniquified_session_names_are_the_base_plus_a_numeric_leaf_suffix() {
+        assert!(is_uniquified_session_name("bootty/main", "bootty/main"));
+        assert!(is_uniquified_session_name("bootty/main-2", "bootty/main"));
+        assert!(is_uniquified_session_name("bootty/main-13", "bootty/main"));
+        assert!(is_uniquified_session_name("scratch-2", "scratch"));
+
+        assert!(!is_uniquified_session_name("bootty/release", "bootty/main"));
+        assert!(!is_uniquified_session_name(
+            "bootty/main-next",
+            "bootty/main"
+        ));
+        assert!(!is_uniquified_session_name("bootty/main-", "bootty/main"));
+        assert!(
+            !is_uniquified_session_name("other/main-2", "bootty/main"),
+            "the group has to match too"
+        );
+        assert!(
+            !is_uniquified_session_name("bootty/main", "bootty/main-2"),
+            "a base that already carries a suffix is not the shorter name's base"
+        );
+        assert!(
+            !is_uniquified_session_name("bootty/mainline-2", "bootty/main"),
+            "the leaf has to end where the suffix begins"
         );
     }
 

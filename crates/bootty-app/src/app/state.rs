@@ -3061,13 +3061,35 @@ impl AppState {
                     .expect("session name metadata should be observable after recording")
             };
 
+            // Records written before display names existed have none, and only those need one worked
+            // out: from here on, creating and renaming both record what bootty means to show, so a
+            // name someone typed is never something to second-guess.
             if record.display_name.is_empty() {
-                // Written before display names existed. Fill in what bootty would call this session,
-                // otherwise every session predating the upgrade keeps showing the backend's name.
+                let generated_suffix = session.name != record.generated_name
+                    && crate::strings::is_uniquified_session_name(
+                        &session.name,
+                        &record.generated_name,
+                    );
+                if record.explicit && generated_suffix {
+                    // Bootty generated `generated_name`, then asked the backend for that name plus a
+                    // uniqueness suffix — which the old reconciler read back as somebody's rename.
+                    self.binding
+                        .session_names
+                        .reclaim_generated(&session.id, &session.name);
+                    record.generated_name = session.name.clone();
+                    record.explicit = false;
+                }
                 let display_name = if record.explicit {
                     session.name.clone()
                 } else {
-                    crate::git::suggested_session_name(&cwd)
+                    // The name bootty means for this worktree, whenever the backend name is that name
+                    // or that name plus the suffix it needed to clear the server.
+                    let suggested = crate::git::suggested_session_name(&cwd);
+                    if crate::strings::is_uniquified_session_name(&session.name, &suggested) {
+                        suggested
+                    } else {
+                        session.name.clone()
+                    }
                 };
                 self.binding
                     .session_names
@@ -7364,6 +7386,81 @@ mod tests {
             state.binding.session_names.display_name(&backend_name),
             Some(wanted.as_str()),
             "bootty shows the name it meant, without the backend's suffix"
+        );
+    }
+
+    /// Bootty asking the backend for `agents/main-2` and then reading that back as somebody's rename
+    /// is how these sessions became "explicit": the suffix froze into the name shown everywhere, and
+    /// an explicit name is one bootty will not second-guess. Only records from before display names
+    /// existed are read this way — a name typed since then carries its own display name.
+    #[test]
+    fn a_legacy_generated_suffix_is_not_read_as_someone_elses_rename() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-suffix-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let root = AppState::session_root(&dir.to_string_lossy());
+        let wanted = crate::git::suggested_session_name(&root);
+        let backend_name = format!("{wanted}-2");
+        // The record the old reconciler left: generated under the clean name, then marked explicit
+        // because the backend reported the suffixed one, and with no display name of its own.
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", &root, &wanted, "");
+        state
+            .binding
+            .session_names
+            .mark_explicit("s1", &backend_name, "", &root);
+        state.binding.session_order.add_session(&backend_name);
+        ScriptedBackend::with(vec![session_with("s1", &backend_name, &root)])
+            .install(&mut state.binding);
+
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some(wanted.as_str()),
+            "the suffix bootty added is not part of the name it shows"
+        );
+    }
+
+    /// A suffix-shaped name someone typed is theirs. Nothing may re-derive it, or bootty would rename
+    /// the session back to the name it would have generated.
+    #[test]
+    fn a_typed_name_that_looks_like_a_generated_suffix_is_left_alone() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let dir = std::env::temp_dir().join(format!("bootty-typed-{}", unique_test_id()));
+        std::fs::create_dir_all(&dir).expect("create session cwd");
+        let root = AppState::session_root(&dir.to_string_lossy());
+        let wanted = crate::git::suggested_session_name(&root);
+        let typed = format!("{wanted}-2");
+        state
+            .binding
+            .session_names
+            .remember_generated("s1", &root, &wanted, &wanted);
+        // What the rename dialog records: the typed name, shown as typed.
+        state
+            .binding
+            .session_names
+            .mark_explicit("s1", &typed, &typed, &root);
+        state.binding.session_order.add_session(&typed);
+        ScriptedBackend::with(vec![session_with("s1", &typed, &root)]).install(&mut state.binding);
+
+        reconcile_frame(&mut state);
+
+        assert_eq!(
+            state.binding.session_names.display_name("s1"),
+            Some(typed.as_str()),
+            "a typed name stands, suffix-shaped or not"
+        );
+        assert_eq!(
+            state.binding.mux.sessions()[0].name,
+            typed,
+            "and no rename is attempted back to the generated name"
         );
     }
 

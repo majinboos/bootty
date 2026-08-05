@@ -176,6 +176,20 @@ impl SessionNameStore {
         self.save();
     }
 
+    /// Take a record back as generated under `generated_name`. Used when a name that looked like
+    /// someone else's rename turns out to be one bootty asked the backend for.
+    pub fn reclaim_generated(&mut self, session_id: &str, generated_name: &str) {
+        let Some(record) = self.records.get_mut(session_id) else {
+            return;
+        };
+        if !record.explicit && record.generated_name == generated_name {
+            return;
+        }
+        record.generated_name = generated_name.to_owned();
+        record.explicit = false;
+        self.save();
+    }
+
     /// Set what bootty shows for `session_id`, leaving the rest of the record alone. Fills in records
     /// written before display names existed.
     pub fn set_display_name(&mut self, session_id: &str, display_name: &str) {
