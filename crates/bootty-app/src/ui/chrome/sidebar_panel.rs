@@ -343,19 +343,26 @@ const MACOS_TITLEBAR_BUTTON_CENTER_Y: f32 = 16.0;
 /// background, so each element fades in its own hue rather than washing toward white.
 const UNFOCUSED_ROW_KEEP: f32 = 0.5;
 
-fn sidebar_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
-    if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
-        return None;
-    }
+/// Every row a session owns — its title row plus the detail/progress rows beneath it — points at
+/// that session, so hovering or clicking anywhere in the block hits the whole session component.
+fn sidebar_row_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
     Some(ScopedSessionTarget::new(
         item.session_scope?,
         item.session_id?,
     ))
 }
 
+/// Only the title row, for the ordered session list that positions the context-menu actions.
+fn sidebar_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
+    if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
+        return None;
+    }
+    sidebar_row_session_target(item)
+}
+
 fn sidebar_context_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
     item.selectable
-        .then(|| sidebar_session_target(item))
+        .then(|| sidebar_row_session_target(item))
         .flatten()
 }
 
@@ -487,7 +494,8 @@ pub fn show_sidebar(
     let pointer_hovered_session = pointer_pos
         .and_then(|pos| sidebar_hovered_row(pos, rect.min.x, list_top, width, max_rows))
         .and_then(|index| items.get(index))
-        .and_then(sidebar_session_target);
+        .filter(|item| item.selectable)
+        .and_then(sidebar_row_session_target);
     let suppress_click = dragged.is_some();
 
     let mut event = None;
@@ -496,7 +504,7 @@ pub fn show_sidebar(
             Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
             egui::vec2(width, SIDEBAR_ROW_HEIGHT),
         );
-        let item_target = sidebar_session_target(item);
+        let item_target = sidebar_row_session_target(item);
         let hovered = item.selectable
             && item_target.as_ref().is_some_and(|target| {
                 Some(target) == pointer_hovered_session.as_ref()
@@ -1615,7 +1623,11 @@ mod tests {
             sidebar_context_session_target(&items[0]),
             Some(ScopedSessionTarget::new(test_scope(), "s1"))
         );
-        assert_eq!(sidebar_context_session_target(&items[1]), None);
+        // A detail row shares its session's context target even though it adds no ordered target.
+        assert_eq!(
+            sidebar_context_session_target(&items[1]),
+            Some(ScopedSessionTarget::new(test_scope(), "s1"))
+        );
     }
 
     #[test]
@@ -1755,12 +1767,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sidebar_detail_rows_with_session_id_do_not_activate() {
-        let context = egui::Context::default();
-        crate::ui::icons::install_icon_fonts(&context);
-        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
-        let items = vec![
+    fn detail_row_items(detail_selectable: bool) -> Vec<SidebarItem<'static>> {
+        vec![
             SidebarItem {
                 id: crate::ui::sidebar::SidebarItemId::Session {
                     scope: test_scope(),
@@ -1775,8 +1783,8 @@ mod tests {
                 reorder_anchor: Some("alpha"),
                 color: egui::Color32::WHITE,
                 dim_color: egui::Color32::GRAY,
-                kind: SidebarItemKind::Session { active: true },
-                current: true,
+                kind: SidebarItemKind::Session { active: false },
+                current: false,
                 can_return_to_last_session: false,
                 icon: None,
                 primitives: &[],
@@ -1786,19 +1794,26 @@ mod tests {
                 display: SidebarDisplay::Text("codex"),
                 indent: 2,
                 tree: SidebarTree::None,
-                selectable: false,
+                selectable: detail_selectable,
                 session_id: Some("s1"),
                 session_scope: Some(test_scope()),
                 reorder_anchor: Some("alpha"),
                 color: egui::Color32::WHITE,
                 dim_color: egui::Color32::GRAY,
                 kind: SidebarItemKind::Row,
-                current: true,
+                current: false,
                 can_return_to_last_session: false,
                 icon: None,
                 primitives: &[],
             },
-        ];
+        ]
+    }
+
+    fn detail_row_click_event(detail_selectable: bool) -> Option<SidebarEvent> {
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
+        let items = detail_row_items(detail_selectable);
 
         let show = |ui: &mut egui::Ui| {
             show_sidebar(
@@ -1828,30 +1843,36 @@ mod tests {
             )
         };
 
-        let _ = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(screen_rect),
-                events: vec![egui::Event::PointerButton {
-                    pos: Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 1.5),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                }],
-                ..Default::default()
-            },
-            |ui| {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let _ = show(ui);
-                });
-            },
-        );
+        let detail_row = Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 1.5);
+        for events in [
+            vec![egui::Event::PointerMoved(detail_row)],
+            vec![egui::Event::PointerButton {
+                pos: detail_row,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        ] {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let _ = show(ui);
+                    });
+                },
+            );
+        }
 
         let mut event = None;
         let _ = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(screen_rect),
                 events: vec![egui::Event::PointerButton {
-                    pos: Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 1.5),
+                    pos: detail_row,
                     button: egui::PointerButton::Primary,
                     pressed: false,
                     modifiers: egui::Modifiers::NONE,
@@ -1865,7 +1886,108 @@ mod tests {
             },
         );
 
-        assert_eq!(event, None);
+        event
+    }
+
+    #[test]
+    fn sidebar_detail_row_click_activates_its_session() {
+        assert_eq!(
+            detail_row_click_event(true),
+            Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
+                test_scope(),
+                "s1",
+            )))
+        );
+    }
+
+    #[test]
+    fn sidebar_unselectable_detail_rows_do_not_activate() {
+        assert_eq!(detail_row_click_event(false), None);
+    }
+
+    #[test]
+    fn sidebar_detail_row_context_menu_targets_its_session() {
+        let context = egui::Context::default();
+        crate::ui::icons::install_icon_fonts(&context);
+        let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(286.0, 300.0));
+        let items = detail_row_items(true);
+        let frame = |events: Vec<egui::Event>, captured: &mut Option<SidebarEvent>| {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen_rect),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        let event = show_sidebar(
+                            ui,
+                            ThemePalette::default(),
+                            300.0,
+                            SidebarModel {
+                                items: &items,
+                                footer_items: &[],
+                                session_count: 1,
+                                has_sessions: true,
+                                title_visible: false,
+                                reserve_titlebar_buttons: false,
+                                title_icon: None,
+                                top_inset: 0.0,
+                                border_visible: false,
+                                border_bottom: false,
+                                separator_visible: false,
+                                focused: false,
+                                hovered_session: None,
+                                unfocused_dim: 0.0,
+                                fullscreen: false,
+                                hover_override: None,
+                                current_override: None,
+                                border_override: None,
+                            },
+                        );
+                        if event.is_some() {
+                            *captured = event;
+                        }
+                    });
+                },
+            );
+        };
+
+        let detail_row = Pos2::new(20.0, SIDEBAR_ROW_HEIGHT * 1.5);
+        let activate = Pos2::new(60.0, SIDEBAR_ROW_HEIGHT * 2.15);
+        let mut captured = None;
+        frame(vec![egui::Event::PointerMoved(detail_row)], &mut captured);
+        for pressed in [true, false] {
+            frame(
+                vec![egui::Event::PointerButton {
+                    pos: detail_row,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut captured,
+            );
+        }
+        frame(vec![egui::Event::PointerMoved(activate)], &mut captured);
+        for pressed in [true, false] {
+            frame(
+                vec![egui::Event::PointerButton {
+                    pos: activate,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                &mut captured,
+            );
+        }
+
+        assert_eq!(
+            captured,
+            Some(SidebarEvent::ContextAction {
+                target: ScopedSessionTarget::new(test_scope(), "s1"),
+                action: SessionContextAction::Activate,
+            })
+        );
     }
 
     fn sidebar_drag_event(button: egui::PointerButton) -> Option<SidebarEvent> {

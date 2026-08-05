@@ -239,7 +239,9 @@ fn sidebar_item_from_module_item<'a>(
         dim_color: item.dim_fg.unwrap_or(color),
         kind: sidebar_kind,
         current,
-        can_return_to_last_session: kind == "session" && can_return_to_last_session,
+        // Every row a session owns offers the same context menu, so the flag follows the session
+        // rather than the title row alone.
+        can_return_to_last_session: item.session_id.is_some() && can_return_to_last_session,
         icon: item.icon.as_deref(),
         primitives: &item.primitives,
     })
