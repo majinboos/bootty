@@ -50,7 +50,7 @@ use libghostty_vt::{
     mouse, paste,
     render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIteration, RowIterator},
     selection::{FormatOptions as SelectionFormatOptions, Selection, gesture},
-    style::RgbColor,
+    style::{RgbColor, StyleColor},
     terminal::{
         ColorScheme, ConformanceLevel, CursorStyle, DeviceAttributeFeature, DeviceAttributes,
         DeviceType, Mode, Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport,
@@ -435,7 +435,12 @@ fn extract_render_row(
     let mut cell_iter = cell_iterator.update(row)?;
     let mut col_index = 0_u16;
     while let Some(cell) = cell_iter.next() {
-        let style = cell.style()?;
+        // Every field read here is its own call across the FFI boundary, and a terminal is mostly
+        // unstyled text. A cell that reports no styling has a default style and no foreground of
+        // its own, so asking for either only repeats what this one answer already said. Its
+        // background still has to be read: a blank painted with a background colour carries that
+        // colour and nothing else.
+        let style = cell.has_styling()?.then(|| cell.style()).transpose()?;
         let grapheme_len = cell.graphemes_len()?;
         grapheme_scratch.resize(grapheme_len, '\0');
         if grapheme_len > 0 {
@@ -448,8 +453,8 @@ fn extract_render_row(
                 x: col_index,
                 y: row_index,
                 grapheme: grapheme_scratch[..grapheme_len].to_vec(),
-                foreground: style.fg_color,
-                underline_color: style.underline_color,
+                foreground: style.map_or(StyleColor::None, |style| style.fg_color),
+                underline_color: style.map_or(StyleColor::None, |style| style.underline_color),
             });
         }
 
@@ -473,9 +478,12 @@ fn extract_render_row(
             y: row_index,
             text_start,
             text_len,
-            fg: cell.fg_color()?,
+            fg: match style {
+                Some(_) => cell.fg_color()?,
+                None => None,
+            },
             bg: cell.bg_color()?,
-            style: CellStyle {
+            style: style.map_or_else(CellStyle::default, |style| CellStyle {
                 bold: style.bold,
                 italic: style.italic,
                 faint: style.faint,
@@ -485,7 +493,7 @@ fn extract_render_row(
                 strikethrough: style.strikethrough,
                 overline: style.overline,
                 underline: style.underline,
-            },
+            }),
             hyperlink,
         });
 
