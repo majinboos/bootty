@@ -646,9 +646,15 @@ impl BoottyApp {
         let session_color = selected
             .and_then(|session| session.color.clone())
             .or_else(|| Some(color_hex(self.state.ui_theme().palette.accent)));
+        let scope = self.state.mux_scope();
         crate::extensions::MuxView {
             windows,
             sessions,
+            scope_key: format!(
+                "{}:{}",
+                scope.space_id().persistence_value(),
+                scope.binding_id().persistence_value()
+            ),
             session,
             sidebar_visible,
             session_color,

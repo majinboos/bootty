@@ -12,7 +12,7 @@ return {
 			sessions = sessions,
 			facts = facts.get,
 			render = function(_, enriched)
-				local activity, _ = facts.activity(enriched)
+				local activity, activity_color = facts.activity(enriched)
 				return {
 					details = {
 						{
@@ -21,7 +21,9 @@ return {
 							label = enriched.agent_name,
 							color = if enriched.agent_style then enriched.agent_style.color else nil,
 							right = activity,
-							right_color = bootty.theme.subtext,
+							-- The provider pulses this colour off `bootty.time()`, which is what
+							-- animates an agent's activity line. A fixed colour holds it still.
+							right_color = activity_color,
 						},
 					},
 				}
