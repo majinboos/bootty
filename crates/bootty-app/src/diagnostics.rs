@@ -10,6 +10,8 @@ use crate::{
 
 pub const STATUS_METRICS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
 
+pub use bootty_runtime::latency::{start as latency_start, trace_phase, trace_slow};
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StatusMetrics {
     pub drain: DrainStats,

@@ -1680,8 +1680,14 @@ impl AppState {
                 return false;
             }
         };
+        let switch_started = crate::diagnostics::latency_start();
         self.persist_active_binding_restore_state();
-        self.binding.terminal.deactivate_backend_side_effects();
+        crate::diagnostics::trace_phase("space.persist_restore_state", switch_started);
+        // Leave the outgoing space's tmux overrides in place. It keeps a live runtime, so its
+        // status bar should stay hidden, and its terminal carries the bookkeeping to restore on
+        // drop. Restoring here cost a tmux fork per pane and session, then the incoming binding
+        // immediately paid to set them again.
+        let phase = crate::diagnostics::latency_start();
         let mut target = self.inactive_spaces.remove(index);
         self.binding.discard_terminal_side_effects();
         for binding in &mut self.inactive_bindings {
@@ -1694,6 +1700,8 @@ impl AppState {
             owner.discard_side_effects();
         }
         self.prepare_native_terminal_transition(&mut target.binding);
+        crate::diagnostics::trace_phase("space.prepare_transition", phase);
+        let phase = crate::diagnostics::latency_start();
         let current = SpaceRuntime {
             id: std::mem::replace(&mut self.active_space_id, target.id),
             name: std::mem::replace(&mut self.active_space_name, target.name),
@@ -1717,7 +1725,10 @@ impl AppState {
                 .binding
                 .mux
                 .refresh_sessions(&self.repaint, &active_config);
+            crate::diagnostics::trace_phase("space.refresh_sessions", phase);
+            let phase = crate::diagnostics::latency_start();
             self.sync_session_order();
+            crate::diagnostics::trace_phase("space.sync_session_order", phase);
             if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
                 self.binding.persisted_sessions_restored = false;
                 self.binding.restore_persisted_sessions(&self.repaint);
@@ -1731,20 +1742,25 @@ impl AppState {
             to: self.active_space_id,
             started: Instant::now(),
         });
+        let phase = crate::diagnostics::latency_start();
         let workspace = WorkspaceStore::for_config_path(&self.config().config_path);
         if let Err(error) =
             workspace.set_selected_space(&self.window_state_key, self.active_space_id)
         {
             self.last_error = Some(error.to_string());
         }
+        crate::diagnostics::trace_phase("space.persist_selected_space", phase);
         self.app_key_bindings = app_key_bindings;
         self.terminal_surface = None;
         self.last_pane_area = None;
         self.clear_space_context_dialogs();
         self.input_focus = InputFocus::Terminal;
+        let phase = crate::diagnostics::latency_start();
         if let Err(error) = self.sync_terminal_panes() {
             self.last_error = Some(error.to_string());
         }
+        crate::diagnostics::trace_phase("space.sync_terminal_panes", phase);
+        crate::diagnostics::trace_phase("space.TOTAL", switch_started);
         (self.repaint)();
         true
     }
@@ -2127,14 +2143,21 @@ impl AppState {
     /// the layout's focused pane the input runtime and keep its siblings live. Non-native backends
     /// fall back to attaching the single selected anchor.
     fn sync_terminal_panes(&mut self) -> Result<()> {
+        let phase = crate::diagnostics::latency_start();
         self.prune_pane_layouts();
+        crate::diagnostics::trace_slow("panes.prune_pane_layouts", phase, 2.0);
+        let phase = crate::diagnostics::latency_start();
         let config = self.active_multiplexer().clone();
+        crate::diagnostics::trace_slow("panes.clone_config", phase, 2.0);
         if !self.uses_native_terminal_layout() {
-            return self.binding.terminal.sync_scoped_mux_anchor(
+            let phase = crate::diagnostics::latency_start();
+            let result = self.binding.terminal.sync_scoped_mux_anchor(
                 self.binding.scope,
                 &config,
                 self.binding.mux.selected_session_anchor(),
             );
+            crate::diagnostics::trace_slow("panes.sync_scoped_mux_anchor", phase, 2.0);
+            return result;
         }
         let panes: Vec<MuxPaneAnchor> = self.binding.mux.selected_window_panes().to_vec();
         let pane_ids: Vec<String> = panes
@@ -2595,7 +2618,8 @@ impl AppState {
                     return false;
                 }
             };
-            self.binding.terminal.deactivate_backend_side_effects();
+            // Same as the space switch: the outgoing binding stays live and restores its own tmux
+            // overrides on drop, so skip the fork-per-option restore the next attach would undo.
             let mut target_binding = self.inactive_bindings.remove(index);
             self.binding.discard_terminal_side_effects();
             target_binding.discard_terminal_side_effects();
@@ -4060,6 +4084,7 @@ impl AppState {
     }
 
     pub fn update_frame(&mut self, inputs: FrameInputs) -> Vec<AppEffect> {
+        let frame_started = crate::diagnostics::latency_start();
         let FrameInputs {
             now,
             stable_dt_ms,
@@ -4161,9 +4186,11 @@ impl AppState {
         }
         self.sync_generated_session_names();
         self.sync_session_order();
+        let phase = crate::diagnostics::latency_start();
         if let Err(error) = self.sync_terminal_panes() {
             self.last_error = Some(error.to_string());
         }
+        crate::diagnostics::trace_slow("frame.sync_terminal_panes", phase, 4.0);
         self.hot_reload_config_if_changed(&mut effects, now);
         self.terminal_view_transform = terminal_view_transform;
         self.restore_mouse_pointer_after_pointer_moved(&events, hover_pos, &mut effects);
@@ -4223,6 +4250,7 @@ impl AppState {
         } else {
             effects.push(AppEffect::RepaintAfter(repaint_after));
         }
+        crate::diagnostics::trace_slow("frame.update_frame", frame_started, 8.0);
         effects
     }
 
