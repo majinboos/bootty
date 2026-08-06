@@ -4,7 +4,7 @@
 local ui = bootty.ui
 
 return {
-	interval = 1 / 120,
+	interval = ui.animation_interval,
 	render = function()
 		return ui.session_items({ sessions = bootty.sessions() })
 	end,

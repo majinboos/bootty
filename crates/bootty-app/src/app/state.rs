@@ -61,8 +61,8 @@ use crate::{
         command::{MuxCommand, MuxSplitDirection},
         config::selected_backend,
         controller::{
-            BindingId, BindingMuxController, MUX_SESSION_REFRESH_INTERVAL, MuxController, MuxScope,
-            SpaceId,
+            BindingId, BindingMuxController, MuxController, MuxScope, SpaceId,
+            mux_session_refresh_interval,
         },
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow, MuxWindowProgress},
         terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
@@ -100,6 +100,10 @@ use bootty_terminal::terminal_engine::{
 };
 
 #[cfg(test)]
+use crate::mux::controller::{
+    MUX_SESSION_REFRESH_INTERVAL, MUX_SESSION_REFRESH_INTERVAL_UNFOCUSED,
+};
+#[cfg(test)]
 use crate::terminal::{KeyInput, TerminalKey};
 #[cfg(test)]
 use bootty_terminal::terminal_engine::TerminalCopyModeMotion;
@@ -108,9 +112,14 @@ const PRIMARY_WINDOW_STATE_KEY: &str = "main";
 /// Session-finder heading for sessions running in a backend that no Space has claimed.
 const UNCLAIMED_SESSIONS_LABEL: &str = "No space";
 
-fn mux_refresh_repaint_after(config: &crate::config::MultiplexerConfig) -> Option<Duration> {
+/// How soon to wake up for the next session poll, for backends that only report through polling.
+/// Native sessions live in-process and report themselves, so they schedule nothing.
+fn mux_refresh_repaint_after(
+    config: &crate::config::MultiplexerConfig,
+    window_focused: bool,
+) -> Option<Duration> {
     (selected_backend(config) != MultiplexerBackendConfig::Native)
-        .then_some(MUX_SESSION_REFRESH_INTERVAL)
+        .then(|| mux_session_refresh_interval(window_focused))
 }
 /// Per-frame snapshot of everything the state machine needs from the host.
 /// Captured once at frame start; `egui::Context` never enters this module.
@@ -124,6 +133,9 @@ pub struct FrameInputs {
     pub hover_pos: Option<Pos2>,
     pub pressed_mouse_button: Option<MouseButton>,
     pub viewport: ViewportSnapshot,
+    /// Whether the window has focus. Background work that only someone watching would notice —
+    /// polling the backend for sessions, animating chrome — backs off when it is false.
+    pub window_focused: bool,
     pub renderer_metrics: RendererMetrics,
     pub terminal_cell_width: f32,
     pub terminal_cell_height: f32,
@@ -4057,6 +4069,7 @@ impl AppState {
             hover_pos,
             pressed_mouse_button,
             viewport,
+            window_focused,
             renderer_metrics,
             terminal_cell_width,
             terminal_cell_height,
@@ -4124,12 +4137,15 @@ impl AppState {
             }
         }
         let active_config = self.binding.multiplexer.clone();
+        self.binding
+            .mux
+            .set_refresh_interval(mux_session_refresh_interval(window_focused));
         let _ = self
             .binding
             .mux
             .refresh_sessions(&self.repaint, &active_config);
         self.binding.restore_persisted_sessions(&self.repaint);
-        let schedule_mux_refresh = mux_refresh_repaint_after(&active_config).is_some();
+        let mux_refresh_after = mux_refresh_repaint_after(&active_config, window_focused);
         for binding in &mut self.inactive_bindings {
             binding.restore_persisted_sessions(&self.repaint);
             binding.sync_session_order();
@@ -4140,8 +4156,8 @@ impl AppState {
                 binding.sync_session_order();
             }
         }
-        if schedule_mux_refresh {
-            effects.push(AppEffect::RepaintAfter(MUX_SESSION_REFRESH_INTERVAL));
+        if let Some(after) = mux_refresh_after {
+            effects.push(AppEffect::RepaintAfter(after));
         }
         self.sync_generated_session_names();
         self.sync_session_order();
@@ -7025,25 +7041,42 @@ mod tests {
     #[test]
     fn external_mux_backends_schedule_frequent_refresh_repaints() {
         let mut config = BoottyConfig::default();
-        assert_eq!(mux_refresh_repaint_after(&config.multiplexer), None);
+        assert_eq!(mux_refresh_repaint_after(&config.multiplexer, true), None);
 
         config.multiplexer.backend = MultiplexerBackendConfig::Zellij;
 
         assert_eq!(
-            mux_refresh_repaint_after(&config.multiplexer),
+            mux_refresh_repaint_after(&config.multiplexer, true),
             Some(MUX_SESSION_REFRESH_INTERVAL)
         );
-        assert!(MUX_SESSION_REFRESH_INTERVAL <= Duration::from_millis(250));
+        assert!(MUX_SESSION_REFRESH_INTERVAL <= Duration::from_millis(500));
 
         config.multiplexer.backend = MultiplexerBackendConfig::Tmux;
         assert_eq!(
-            mux_refresh_repaint_after(&config.multiplexer),
+            mux_refresh_repaint_after(&config.multiplexer, true),
             if cfg!(windows) {
                 None
             } else {
                 Some(MUX_SESSION_REFRESH_INTERVAL)
             }
         );
+    }
+
+    #[test]
+    fn unfocused_windows_stop_waking_up_to_poll_for_sessions() {
+        let mut config = BoottyConfig::default();
+        config.multiplexer.backend = MultiplexerBackendConfig::Zellij;
+
+        // Each poll spawns a backend client and forces a frame, so an unfocused window pays the
+        // full cadence for a sidebar nobody is reading.
+        assert_eq!(
+            mux_refresh_repaint_after(&config.multiplexer, false),
+            Some(MUX_SESSION_REFRESH_INTERVAL_UNFOCUSED)
+        );
+        assert!(MUX_SESSION_REFRESH_INTERVAL_UNFOCUSED >= MUX_SESSION_REFRESH_INTERVAL * 4);
+
+        config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        assert_eq!(mux_refresh_repaint_after(&config.multiplexer, false), None);
     }
 
     #[test]
@@ -7108,6 +7141,7 @@ mod tests {
             hover_pos,
             pressed_mouse_button: None,
             viewport: ViewportSnapshot::default(),
+            window_focused: true,
             renderer_metrics: RendererMetrics::default(),
             terminal_cell_width: 10.0,
             terminal_cell_height: 20.0,

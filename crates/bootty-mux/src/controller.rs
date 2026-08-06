@@ -16,7 +16,25 @@ use crate::{
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh, session_matches},
 };
 
-pub const MUX_SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+/// How often a focused window polls the backend for session structure. Nothing pushes these
+/// changes to us: a session created from a shell, or a pane whose foreground command changed, only
+/// shows up on the next poll, so the cadence is what makes the sidebar feel live. It also sets the
+/// floor on how often an otherwise idle window repaints, and the session facts a row shows are
+/// themselves refreshed every 500ms, so polling faster than that only bought frames.
+pub const MUX_SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+/// The same poll behind an unfocused window. Every poll spawns a backend client process and forces
+/// a frame, and nobody is reading the sidebar, so it drops to a cadence that still notices sessions
+/// coming and going without paying 4 processes a second to watch them.
+pub const MUX_SESSION_REFRESH_INTERVAL_UNFOCUSED: Duration = Duration::from_secs(2);
+
+/// The session-poll cadence a window with this focus state should use.
+pub fn mux_session_refresh_interval(focused: bool) -> Duration {
+    if focused {
+        MUX_SESSION_REFRESH_INTERVAL
+    } else {
+        MUX_SESSION_REFRESH_INTERVAL_UNFOCUSED
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewMuxSessionRequest {
@@ -396,6 +414,8 @@ pub struct MuxController {
     last_active_window: Option<ActiveWindow>,
     current_backend: Option<MultiplexerBackendConfig>,
     last_session_refresh: Option<Instant>,
+    /// Cadence cap for [`Self::refresh_sessions`], driven by window focus.
+    refresh_interval: Option<Duration>,
     refresh_completed: bool,
     session_refresh_generation: u64,
     session_refresh_tx: Option<mpsc::Sender<SessionRefreshRequest>>,
@@ -408,10 +428,18 @@ pub struct MuxController {
 
 impl MuxController {
     pub fn new() -> Self {
-        Self {
-            last_session_refresh: Some(Instant::now() - Duration::from_secs(2)),
-            ..Default::default()
-        }
+        Self::default()
+    }
+
+    /// Cap how often the backend is polled for sessions. Callers set this from window focus each
+    /// frame; forced refreshes ([`Self::refresh_on_next_frame`], completed commands) ignore it.
+    pub fn set_refresh_interval(&mut self, interval: Duration) {
+        self.refresh_interval = Some(interval);
+    }
+
+    fn refresh_interval(&self) -> Duration {
+        self.refresh_interval
+            .unwrap_or(MUX_SESSION_REFRESH_INTERVAL)
     }
 
     fn with_scope(scope: MuxScope) -> Self {
@@ -433,7 +461,7 @@ impl MuxController {
 
     pub fn refresh_on_next_frame(&mut self) {
         self.current_backend = None;
-        self.last_session_refresh = Some(Instant::now() - MUX_SESSION_REFRESH_INTERVAL);
+        self.last_session_refresh = None;
     }
 
     pub fn sessions(&self) -> &[MuxSession] {
@@ -571,7 +599,7 @@ impl MuxController {
         let backend = selected_backend(config);
         if self
             .last_session_refresh
-            .is_some_and(|last| last.elapsed() < MUX_SESSION_REFRESH_INTERVAL)
+            .is_some_and(|last| last.elapsed() < self.refresh_interval())
         {
             return None;
         }
@@ -646,7 +674,7 @@ impl MuxController {
                         (None, Some(window)) => self.selected_window = Some(window),
                         (None, None) => {}
                     }
-                    self.last_session_refresh = Some(Instant::now() - MUX_SESSION_REFRESH_INTERVAL);
+                    self.last_session_refresh = None;
                     self.session_refresh_generation =
                         self.session_refresh_generation.wrapping_add(1);
                     self.session_refresh_pending = false;
@@ -975,7 +1003,7 @@ impl MuxController {
             .and_then(|()| backend.snapshot().map_err(|error| error.to_string()))
             .map(|snapshot| {
                 self.apply_snapshot(backend_kind, snapshot, preferred_session, preferred_window);
-                self.last_session_refresh = Some(Instant::now() - MUX_SESSION_REFRESH_INTERVAL);
+                self.last_session_refresh = None;
             })
     }
 

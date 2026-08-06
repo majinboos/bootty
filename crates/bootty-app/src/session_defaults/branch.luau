@@ -4,7 +4,7 @@ local ui = bootty.ui
 local facts = bootty.sidebar.session_facts()
 
 return {
-	interval = 1 / 120,
+	interval = ui.animation_interval,
 	render = function()
 		local sessions = bootty.sessions()
 		facts.refresh(sessions)

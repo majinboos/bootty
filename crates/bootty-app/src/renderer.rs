@@ -299,7 +299,10 @@ impl TerminalWidget {
         self.metrics.cursor_blinking = cursor_blinking;
         self.metrics.text_runs = self.render_cache.text_runs();
         self.paint_scrollbar(ui, surface, frame.as_ref());
-        if cursor_blinking {
+        // A blink frame repaints the whole window, so only animate while the window is focused:
+        // an unfocused window shows a static cursor instead of costing a frame every 33 ms.
+        // Regaining focus is itself a repaint, which restarts the animation.
+        if cursor_blinking && window_focused(ui.ctx()) {
             ui.ctx()
                 .request_repaint_after(CURSOR_BLINK_REFRESH_INTERVAL);
         }
@@ -945,6 +948,12 @@ impl From<CursorSnapshot> for CursorBlinkKey {
             at_wide_tail: cursor.at_wide_tail,
         }
     }
+}
+
+/// Whether the window has keyboard focus. Unknown counts as focused, so a platform that never
+/// reports focus keeps animating rather than freezing the cursor.
+fn window_focused(ctx: &egui::Context) -> bool {
+    ctx.input(|input| input.viewport().focused.unwrap_or(true))
 }
 
 fn cursor_blink_opacity(elapsed: Duration) -> f32 {

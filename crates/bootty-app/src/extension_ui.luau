@@ -4,6 +4,9 @@
 
 local ui = {}
 
+-- Shared cadence for built-ins with lightweight row animation. Structural changes force a render.
+ui.animation_interval = 1 / 20
+
 local function opt(options)
 	return options or {}
 end
