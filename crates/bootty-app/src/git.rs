@@ -2,8 +2,13 @@
 //! ("ditching"). Shelling out keeps us consistent with the tmux backend and the
 //! dotfiles `mux` tool rather than taking on a libgit dependency.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -180,6 +185,161 @@ pub fn suggested_session_name(cwd: &str) -> String {
     format!("{group}/{leaf}")
 }
 
+/// What `HEAD` points at, read straight from the git directory: a branch name, or
+/// `detached <short commit>` when `HEAD` holds a commit instead of a ref.
+///
+/// Reading the file keeps a per-session branch label from forking `git rev-parse` on every
+/// sidebar refresh, which was one of the busiest subprocesses Bootty ran.
+pub fn head_branch(cwd: &str) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir(Path::new(cwd))?.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref:") {
+        let reference = reference.trim();
+        let branch = reference.strip_prefix("refs/heads/").unwrap_or(reference);
+        return (!branch.is_empty()).then(|| branch.to_owned());
+    }
+    let commit = head.get(..7).unwrap_or(head);
+    (!commit.is_empty()).then(|| format!("detached {commit}"))
+}
+
+/// Most worktrees watched at once. A tree that misses out reports no revision, and its caller keeps
+/// asking git on its own schedule.
+const MAX_WATCHED_WORKTREES: usize = 64;
+
+struct WorktreeWatch {
+    revision: Arc<AtomicU64>,
+    paths: Vec<PathBuf>,
+}
+
+/// Revision counter and filesystem roots per worktree, shared with the watcher's event thread.
+type WorktreeRevisions = Arc<Mutex<HashMap<PathBuf, WorktreeWatch>>>;
+
+fn worktree_revisions() -> &'static WorktreeRevisions {
+    static REVISIONS: OnceLock<WorktreeRevisions> = OnceLock::new();
+    REVISIONS.get_or_init(WorktreeRevisions::default)
+}
+
+/// One watcher for every worktree: each `notify` watcher owns an event thread, and a thread per
+/// repository is a lot of idling for a counter.
+fn worktree_watcher() -> &'static Mutex<Option<RecommendedWatcher>> {
+    static WATCHER: OnceLock<Mutex<Option<RecommendedWatcher>>> = OnceLock::new();
+    WATCHER.get_or_init(|| {
+        let revisions = Arc::clone(worktree_revisions());
+        // Any event is enough: this says "ask git again", never what to believe instead. Bursts
+        // collapse on their own, since callers compare the counter rather than draining events.
+        let watcher = notify::recommended_watcher(move |event: notify::Result<Event>| {
+            let Ok(event) = event else { return };
+            let Ok(revisions) = revisions.lock() else {
+                return;
+            };
+            record_worktree_events(&revisions, &event.paths);
+        });
+        Mutex::new(watcher.ok())
+    })
+}
+
+/// A counter for the working tree holding `cwd`, bumped whenever the filesystem reports a change
+/// under it. Watching the tree — rather than just `.git` — is what makes an uncommitted edit count,
+/// and it is what an editor's git integration does instead of asking git on a timer.
+///
+/// The first call starts watching and answers 1. `0` means this tree is not watched, so the caller
+/// learns nothing from it and should ask git as it would have anyway.
+pub fn worktree_revision(cwd: &str) -> u64 {
+    let Some(paths) = worktree_watch_paths(Path::new(cwd)) else {
+        return 0;
+    };
+    let root = paths[0].clone();
+    if let Ok(revisions) = worktree_revisions().lock()
+        && let Some(watched) = revisions.get(&root)
+    {
+        return watched.revision.load(Ordering::Relaxed);
+    }
+
+    let Ok(mut watcher) = worktree_watcher().lock() else {
+        return 0;
+    };
+    let Some(watcher) = watcher.as_mut() else {
+        return 0;
+    };
+    let Ok(mut revisions) = worktree_revisions().lock() else {
+        return 0;
+    };
+    if revisions.len() >= MAX_WATCHED_WORKTREES {
+        return 0;
+    }
+    let mut registered: Vec<PathBuf> = Vec::new();
+    for path in &paths {
+        if watcher.watch(path, RecursiveMode::Recursive).is_err() {
+            for registered_path in registered {
+                let _ = watcher.unwatch(&registered_path);
+            }
+            return 0;
+        }
+        registered.push(path.clone());
+    }
+    revisions.insert(
+        root,
+        WorktreeWatch {
+            revision: Arc::new(AtomicU64::new(1)),
+            paths,
+        },
+    );
+    1
+}
+
+fn worktree_watch_paths(cwd: &Path) -> Option<Vec<PathBuf>> {
+    let root = native_worktree_root(cwd)?;
+    let git_dir = std::fs::canonicalize(git_dir(cwd)?).ok()?;
+    let mut paths = vec![root.clone()];
+    if !git_dir.starts_with(&root) {
+        paths.push(git_dir);
+    }
+    Some(paths)
+}
+
+fn record_worktree_events(revisions: &HashMap<PathBuf, WorktreeWatch>, event_paths: &[PathBuf]) {
+    for watched in revisions.values() {
+        if event_paths
+            .iter()
+            .any(|event| watched.paths.iter().any(|root| event.starts_with(root)))
+        {
+            watched.revision.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The working tree containing `cwd`, found by walking up to the `.git` entry rather than asking
+/// git. For a linked worktree this is that worktree's own root, not the main checkout.
+///
+/// The path is resolved, because filesystem events arrive resolved: on macOS a tree under `/var`
+/// is reported under `/private/var`, and an unresolved root matches none of its own events.
+fn native_worktree_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|dir| dir.join(".git").exists())
+        .and_then(|dir| std::fs::canonicalize(dir).ok())
+}
+
+/// The git directory governing `cwd`: `.git` in the nearest ancestor that has one, following the
+/// `gitdir:` pointer a linked worktree leaves in place of a directory.
+fn git_dir(cwd: &Path) -> Option<PathBuf> {
+    for dir in cwd.ancestors() {
+        let candidate = dir.join(".git");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if candidate.is_file() {
+            let pointer = std::fs::read_to_string(&candidate).ok()?;
+            let target = Path::new(pointer.trim().strip_prefix("gitdir:")?.trim()).to_path_buf();
+            return Some(if target.is_absolute() {
+                target
+            } else {
+                dir.join(target)
+            });
+        }
+    }
+    None
+}
+
 fn read(cwd: &str, args: &[&str]) -> Option<String> {
     bootty_runtime::perf::record_subprocess("git read");
     let output = git_command(cwd, args).output().ok()?;
@@ -222,6 +382,31 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    #[test]
+    fn worktree_events_under_content_or_git_metadata_move_the_revision() {
+        let revision = Arc::new(AtomicU64::new(1));
+        let mut revisions = HashMap::new();
+        revisions.insert(
+            PathBuf::from("/worktree"),
+            WorktreeWatch {
+                revision: Arc::clone(&revision),
+                paths: vec![
+                    PathBuf::from("/worktree"),
+                    PathBuf::from("/repo/.git/worktrees/feature"),
+                ],
+            },
+        );
+
+        record_worktree_events(&revisions, &[PathBuf::from("/worktree/src/main.rs")]);
+        record_worktree_events(
+            &revisions,
+            &[PathBuf::from("/repo/.git/worktrees/feature/index")],
+        );
+        record_worktree_events(&revisions, &[PathBuf::from("/somewhere/else")]);
+
+        assert_eq!(revision.load(Ordering::Relaxed), 3);
+    }
+
     fn git_ok(cwd: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -260,6 +445,54 @@ mod tests {
             ],
         );
         (root, main, worktree)
+    }
+
+    #[test]
+    fn head_branch_reads_slashed_names_through_a_worktree_pointer() {
+        let (_root, main, worktree) = repo_with_worktree();
+        // A `/` in the name is where naive parsing (taking the last path segment of the ref)
+        // silently reports "three" for `one/two/three`.
+        git_ok(&worktree, &["checkout", "-q", "-b", "one/two/three"]);
+        let nested = worktree.join("nested");
+        fs::create_dir(&nested).expect("create nested directory");
+
+        assert_eq!(head_branch(main.to_str().unwrap()).as_deref(), Some("main"));
+        assert_eq!(
+            head_branch(nested.to_str().unwrap()).as_deref(),
+            Some("one/two/three"),
+            "a linked worktree's HEAD lives behind its `.git` gitdir pointer"
+        );
+    }
+
+    #[test]
+    fn linked_worktree_watches_its_external_head_and_index() {
+        let (_root, _main, worktree) = repo_with_worktree();
+
+        let paths = worktree_watch_paths(&worktree).expect("linked worktree watch paths");
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].join(".git").is_file());
+        assert!(paths[1].join("HEAD").is_file());
+        assert!(paths[1].join("index").is_file());
+    }
+
+    #[test]
+    fn head_branch_reports_a_detached_head_as_its_short_commit() {
+        let (_root, main, _worktree) = repo_with_worktree();
+        let commit = read(main.to_str().unwrap(), &["rev-parse", "HEAD"]).expect("rev-parse");
+        git_ok(&main, &["checkout", "-q", "--detach"]);
+
+        assert_eq!(
+            head_branch(main.to_str().unwrap()).as_deref(),
+            Some(format!("detached {}", &commit[..7]).as_str())
+        );
+    }
+
+    #[test]
+    fn head_branch_is_none_outside_a_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        assert_eq!(head_branch(dir.path().to_str().unwrap()), None);
     }
 
     #[test]

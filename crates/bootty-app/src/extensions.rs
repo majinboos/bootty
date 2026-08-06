@@ -10,9 +10,8 @@
 //! explicit shell-outs use `bootty.run(cmd)`. Modules run on a worker thread so shell-outs
 //! never block the UI.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-#[cfg(target_os = "macos")]
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -22,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime};
 use eframe::egui::{self, Color32};
 use mlua::{Function, Lua, Table, Value, VmState};
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
-use sysinfo::{MemoryRefreshKind, System};
+use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 mod codexbar;
 mod http;
@@ -43,6 +42,17 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(8);
 /// How often extension dirs are re-scanned for edited/added/removed module files (hot reload).
 const RELOAD_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// Cap on how many descendants `bootty.descendants` reports, so a runaway process tree cannot
+/// stall a render.
+const DESCENDANT_SCAN_LIMIT: usize = 256;
+/// How long a macOS memory-pressure sample serves every host before another subprocess runs.
+#[cfg(target_os = "macos")]
+const MEMORY_PRESSURE_TTL: Duration = Duration::from_secs(5);
+/// How long a machine-wide process listing serves `bootty.descendants` calls. Listing every process
+/// costs a syscall per process, and the sidebar walks one session's tree every 500ms, so a TTL that
+/// matched that cadence re-listed the machine for every single call. Four calls now share a listing;
+/// the cost is that an agent started in the last couple of seconds is found on a later refresh.
+const PROCESS_TREE_TTL: Duration = Duration::from_secs(2);
 /// Slowest cadence any module runs at while the window is unfocused. Structural changes still
 /// force a render, so this only slows animation and polling, not the response to real events.
 const UNFOCUSED_INTERVAL_FLOOR: Duration = Duration::from_secs(1);
@@ -636,6 +646,38 @@ enum RunMode {
     Cached = 2,
 }
 
+/// A command a module asked for: either shell text or an argument vector run directly.
+enum RunCommand {
+    Shell(String),
+    Exec(Vec<String>),
+}
+
+impl RunCommand {
+    /// Cache identity. Shell text keys on itself, so seeded preview output still matches. An argv
+    /// joins on a separator no argument carries, keeping `{"a b"}` and `{"a", "b"}` apart.
+    fn cache_key(&self) -> Cow<'_, str> {
+        match self {
+            Self::Shell(cmd) => Cow::Borrowed(cmd),
+            Self::Exec(argv) => Cow::Owned(format!("exec\u{1f}{}", argv.join("\u{1f}"))),
+        }
+    }
+
+    /// The command as one line, for guards that read command text.
+    fn reserved_guard_text(&self) -> Cow<'_, str> {
+        match self {
+            Self::Shell(cmd) => Cow::Borrowed(cmd),
+            Self::Exec(argv) => Cow::Owned(argv.join(" ")),
+        }
+    }
+
+    fn output(&self, run_jobs: &PlatformRunJobs, shutdown: &AtomicBool) -> std::io::Result<String> {
+        match self {
+            Self::Shell(cmd) => shell_run_output(cmd, run_jobs, shutdown),
+            Self::Exec(argv) => exec_run_output(argv, run_jobs, shutdown),
+        }
+    }
+}
+
 /// Caches `bootty.run` query output across renders and refreshes shell-outs off the extension
 /// worker so one slow provider/command cannot block unrelated modules.
 #[derive(Default)]
@@ -647,6 +689,9 @@ struct RunCache {
     run_jobs: Arc<PlatformRunJobs>,
     shutdown: Arc<AtomicBool>,
     codexbar: CodexBarClient,
+    /// Branch a settings preview should show. Previews render against example sessions whose paths
+    /// do not exist, so a real `HEAD` read has nothing to find.
+    preview_branch: Option<String>,
 }
 
 #[derive(Default)]
@@ -688,16 +733,40 @@ impl RunCache {
         }
     }
 
-    fn run(self: &Arc<Self>, cmd: &str) -> std::io::Result<String> {
-        reject_reserved_shell_command(cmd)?;
+    fn run(self: &Arc<Self>, cmd: &str) -> std::io::Result<(String, bool)> {
+        self.run_command(RunCommand::Shell(cmd.to_owned()))
+    }
+
+    fn exec(self: &Arc<Self>, argv: Vec<String>) -> std::io::Result<(String, bool)> {
+        self.run_command(RunCommand::Exec(argv))
+    }
+
+    /// What a command last printed, without running it. This is how a module shows an answer the
+    /// moment it lands: the command that produces it is started on its own schedule, and every
+    /// render in between reads the result for free.
+    fn read(&self, argv: Vec<String>) -> (String, bool) {
+        let cached = self.cached(&RunCommand::Exec(argv).cache_key());
+        (cached.clone().unwrap_or_default(), cached.is_some())
+    }
+
+    /// Returns the command's output and whether that output is an answer yet. During a render the
+    /// first ask for a command only starts it, and an empty string is what a module gets back —
+    /// indistinguishable from a command that legitimately printed nothing. The flag is that
+    /// difference, so a module can ask again shortly instead of showing nothing until its next turn.
+    fn run_command(self: &Arc<Self>, command: RunCommand) -> std::io::Result<(String, bool)> {
+        reject_reserved_shell_command(&command.reserved_guard_text())?;
         match self.mode() {
-            RunMode::Live => shell_run_output(cmd, &self.run_jobs, &self.shutdown)
-                .map(|output| output.trim().to_owned()),
-            RunMode::Cached => Ok(self.cached(cmd).unwrap_or_default()),
+            RunMode::Live => command
+                .output(&self.run_jobs, &self.shutdown)
+                .map(|output| (output.trim().to_owned(), true)),
+            RunMode::Cached => {
+                let cached = self.cached(&command.cache_key());
+                Ok((cached.clone().unwrap_or_default(), cached.is_some()))
+            }
             RunMode::Refresh => {
-                let output = self.cached(cmd).unwrap_or_default();
-                self.refresh(cmd.to_owned());
-                Ok(output)
+                let cached = self.cached(&command.cache_key());
+                self.refresh(command);
+                Ok((cached.clone().unwrap_or_default(), cached.is_some()))
             }
         }
     }
@@ -716,19 +785,20 @@ impl RunCache {
         Ok(output)
     }
 
-    fn cached(&self, cmd: &str) -> Option<String> {
+    fn cached(&self, key: &str) -> Option<String> {
         self.entries
             .lock()
             .ok()
-            .and_then(|entries| entries.get(cmd).map(|entry| entry.output.clone()))
+            .and_then(|entries| entries.get(key).map(|entry| entry.output.clone()))
     }
 
-    fn refresh(self: &Arc<Self>, cmd: String) {
+    fn refresh(self: &Arc<Self>, command: RunCommand) {
+        let key = command.cache_key().into_owned();
         {
             let Ok(mut entries) = self.entries.lock() else {
                 return;
             };
-            let entry = entries.entry(cmd.clone()).or_default();
+            let entry = entries.entry(key.clone()).or_default();
             if entry.refreshing {
                 return;
             }
@@ -737,11 +807,12 @@ impl RunCache {
 
         let cache = Arc::clone(self);
         std::thread::spawn(move || {
-            let output = shell_run_output(&cmd, &cache.run_jobs, &cache.shutdown)
+            let output = command
+                .output(&cache.run_jobs, &cache.shutdown)
                 .map(|output| output.trim().to_owned())
                 .unwrap_or_else(|error| format!("bootty.run: {error}"));
             if let Ok(mut entries) = cache.entries.lock() {
-                let entry = entries.entry(cmd).or_default();
+                let entry = entries.entry(key).or_default();
                 entry.output = output;
                 entry.refreshing = false;
             }
@@ -1067,7 +1138,6 @@ impl ExtensionHost {
         let next_window_id = Arc::new(AtomicU64::new(1));
         let waker: Arc<Waker> = Arc::default();
         let run_jobs = Arc::new(PlatformRunJobs::default());
-        cleanup_stale_platform_shell_run_jobs();
         let shutdown = Arc::new(AtomicBool::new(false));
         let _handle = std::thread::Builder::new()
             .name(thread_name.to_owned())
@@ -1242,7 +1312,7 @@ impl ExtensionHost {
 
 impl Drop for ExtensionHost {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
+        self.shutdown.store(true, Ordering::Release);
         self.waker.wake();
         self.run_jobs.cleanup();
     }
@@ -1841,8 +1911,26 @@ fn sysinfo_used_percent(system: &System) -> f64 {
 
 /// Parse `memory_pressure`'s "System-wide memory free percentage: NN%" and return
 /// used = 100 - free, the figure Activity Monitor's memory-pressure graph reflects.
+///
+/// Shared across extension hosts and held for [`MEMORY_PRESSURE_TTL`], since every host sampling
+/// metrics on its own meant a subprocess per host per metrics tick.
 #[cfg(target_os = "macos")]
 fn macos_memory_pressure_used() -> Option<f64> {
+    static CACHED: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
+
+    let mut cached = CACHED.lock().ok()?;
+    if let Some((sampled_at, used)) = *cached
+        && sampled_at.elapsed() < MEMORY_PRESSURE_TTL
+    {
+        return Some(used);
+    }
+    let used = macos_memory_pressure_sample()?;
+    *cached = Some((Instant::now(), used));
+    Some(used)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_memory_pressure_sample() -> Option<f64> {
     let output = std::process::Command::new("/usr/bin/memory_pressure")
         .output()
         .ok()?;
@@ -1912,276 +2000,232 @@ fn json_value_to_lua(lua: &Lua, value: serde_json::Value) -> mlua::Result<Value>
     }
 }
 
-#[cfg(target_os = "macos")]
-static RUN_OUTPUT_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RUN_JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// The shells started by in-flight `bootty.run` calls, keyed by job id.
+///
+/// A module renders on a worker thread that blocks until its command finishes, and dropping the
+/// host must not join that thread, so cancellation kills the shell the worker is waiting on: the
+/// command's pipe reaches EOF and the worker returns.
 #[derive(Default)]
 struct PlatformRunJobs {
-    #[cfg(target_os = "macos")]
-    jobs: Mutex<BTreeMap<String, Vec<PathBuf>>>,
+    children: Mutex<BTreeMap<u64, Child>>,
 }
 
 impl PlatformRunJobs {
-    #[cfg(target_os = "macos")]
-    fn register(&self, label: &str, paths: Vec<PathBuf>) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.insert(label.to_owned(), paths);
+    fn register(&self, id: u64, child: Child, shutdown: &AtomicBool) -> std::io::Result<()> {
+        let mut children = self
+            .children
+            .lock()
+            .map_err(|_| std::io::Error::other("extension run jobs poisoned"))?;
+        children.insert(id, child);
+        // Drop can set shutdown and clean the registry between spawn and registration. Rechecking
+        // while the registry is locked closes that gap: either cleanup sees this child, or this
+        // path removes it itself.
+        if shutdown.load(Ordering::Acquire) {
+            let mut child = children.remove(&id).expect("registered child");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("extension host stopped"));
         }
+        Ok(())
     }
 
-    #[cfg(target_os = "macos")]
-    fn unregister(&self, label: &str) {
-        if let Ok(mut jobs) = self.jobs.lock() {
-            jobs.remove(label);
-        }
+    /// Reclaim a finished job. `None` means [`Self::cleanup`] already killed it.
+    fn take(&self, id: u64) -> Option<Child> {
+        self.children.lock().ok()?.remove(&id)
     }
 
     fn cleanup(&self) {
-        cleanup_platform_shell_run_jobs(self);
+        let Ok(mut children) = self.children.lock() else {
+            return;
+        };
+        // ponytail: killing the shell orphans any grandchild it started; a process-group kill
+        // needs `libc::killpg`, which the workspace's `unsafe_code = "deny"` rules out.
+        for (_, mut child) in std::mem::take(&mut *children) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
-#[cfg(target_os = "macos")]
-const MACOS_BACKGROUND_SHELL_SCRIPT: &str = r#"cwd=$1
-shell=$2
-command=$3
-status_path=$4
-cd "$cwd" 2>/dev/null || true
-"$shell" -c "$command"
-status=$?
-printf '%s' "$status" > "$status_path"
-exit "$status"
-"#;
-
+/// Run `cmd` through the platform shell and return its merged stdout/stderr.
+///
+/// The shell inherits Bootty's environment, which `shell_env::hydrate_from_login_shell` already
+/// filled with the login shell's PATH at startup, so commands resolve the same tools the user's
+/// terminal does.
 fn shell_run_output(
     cmd: &str,
     run_jobs: &PlatformRunJobs,
     shutdown: &AtomicBool,
 ) -> std::io::Result<String> {
-    platform_shell_run_output(cmd, run_jobs, shutdown)
+    // One pipe for both streams: a module's text keeps the interleaved output the old
+    // single-file capture produced, and reading a single end cannot deadlock on a full buffer.
+    run_output(shell_command(cmd), true, run_jobs, shutdown)
 }
 
-#[cfg(target_os = "macos")]
-fn platform_shell_run_output(
-    cmd: &str,
+/// Run `argv` directly and return its stdout, leaving the platform shell out of it.
+///
+/// A module that needs no shell syntax — no pipes, no globbing, no redirects — spends two processes
+/// per call going through one, and every argument has to survive quoting on the way. `argv` reaches
+/// the program as written, and only the program is spawned. Errors go to the null device, matching
+/// the `2>/dev/null` these call sites already asked the shell for.
+fn exec_run_output(
+    argv: &[String],
     run_jobs: &PlatformRunJobs,
     shutdown: &AtomicBool,
 ) -> std::io::Result<String> {
-    let id = RUN_OUTPUT_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let output_path =
-        std::env::temp_dir().join(format!("bootty-run-{}-{id}.out", std::process::id()));
-    let status_path =
-        std::env::temp_dir().join(format!("bootty-run-{}-{id}.status", std::process::id()));
-    let output_path_arg = output_path.to_string_lossy().into_owned();
-    let status_path_arg = status_path.to_string_lossy().into_owned();
-    let label = format!("dev.bootty.run.{}.{}", std::process::id(), id);
-    let launchctl = resolve_shell_program("launchctl")?;
-    let shell = resolve_shell_program("sh")?;
-    let cwd = std::env::current_dir()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
-    run_jobs.register(&label, vec![output_path.clone(), status_path.clone()]);
-    if shutdown.load(Ordering::Relaxed) {
-        run_jobs.unregister(&label);
-        let _ = std::fs::remove_file(&output_path);
-        let _ = std::fs::remove_file(&status_path);
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("bootty.exec needs a program to run"))?;
+    let mut command = Command::new(program);
+    command.args(args);
+    run_output(command, false, run_jobs, shutdown)
+}
+
+fn run_output(
+    mut command: Command,
+    capture_stderr: bool,
+    run_jobs: &PlatformRunJobs,
+    shutdown: &AtomicBool,
+) -> std::io::Result<String> {
+    if shutdown.load(Ordering::Acquire) {
         return Err(std::io::Error::other("extension host stopped"));
     }
-    let script = macos_shell_run_script();
-    let result = (|| {
-        let status = std::process::Command::new(&launchctl)
-            .args([
-                "submit",
-                "-l",
-                &label,
-                "-o",
-                &output_path_arg,
-                "-e",
-                &output_path_arg,
-                "--",
-                &shell,
-                "-c",
-            ])
-            .arg(script)
-            .args(["bootty-run", &cwd, &shell, cmd, &status_path_arg])
-            .status()?;
-        if !status.success() {
-            return Err(std::io::Error::other(format!(
-                "launchctl submit failed with {status}"
-            )));
-        }
-
-        wait_for_run_status(&status_path, shutdown, Duration::from_secs(60 * 60))?;
-        std::fs::read_to_string(&output_path)
-    })();
-    run_jobs.unregister(&label);
-    let _ = std::process::Command::new(&launchctl)
-        .args(["remove", &label])
-        .status();
-    let _ = std::fs::remove_file(&output_path);
-    let _ = std::fs::remove_file(&status_path);
-    result
-}
-
-#[cfg(target_os = "macos")]
-fn wait_for_run_status(
-    status_path: &Path,
-    shutdown: &AtomicBool,
-    timeout: Duration,
-) -> std::io::Result<i32> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if shutdown.load(Ordering::Relaxed) {
-            return Err(std::io::Error::other("extension host stopped"));
-        }
-        if let Ok(raw) = std::fs::read_to_string(status_path) {
-            let status = raw.trim();
-            if !status.is_empty() {
-                return status.parse::<i32>().map_err(std::io::Error::other);
-            }
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let (mut reader, writer) = std::io::pipe()?;
+    command.stdin(Stdio::null());
+    if capture_stderr {
+        command.stderr(writer.try_clone()?);
+    } else {
+        command.stderr(Stdio::null());
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        "bootty.run command did not finish before timeout",
-    ))
+    command.stdout(writer);
+
+    let id = RUN_JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let child = command.spawn()?;
+    // `command` holds the pipe's write end until it is dropped, and the read below ends only
+    // once every writer is closed.
+    drop(command);
+    run_jobs.register(id, child, shutdown)?;
+
+    let mut output = String::new();
+    let read = std::io::Read::read_to_string(&mut reader, &mut output);
+    let mut child = run_jobs
+        .take(id)
+        .ok_or_else(|| std::io::Error::other("extension host stopped"))?;
+    let _ = child.wait();
+    read?;
+    Ok(output)
 }
 
-#[cfg(target_os = "macos")]
-fn cleanup_platform_shell_run_jobs(run_jobs: &PlatformRunJobs) {
-    let jobs = run_jobs
-        .jobs
-        .lock()
-        .map(|jobs| jobs.clone())
-        .unwrap_or_default();
-    if jobs.is_empty() {
-        return;
+/// One process below a session's pane, as a module sees it.
+struct DescendantProcess {
+    /// Executable path when known, otherwise the process name.
+    command: String,
+    /// Full argument vector joined by spaces, `argv[0]` first, like `ps -o args=`.
+    args: String,
+}
+
+/// The machine's process table, reused across `bootty.descendants` calls.
+#[derive(Default)]
+struct ProcessTree {
+    system: System,
+    listed_at: Option<Instant>,
+}
+
+/// Breadth-first walk of the processes below `root_pid`.
+///
+/// Breadth-first because callers want the shallowest interesting descendant (the agent CLI a pane
+/// is running, not a tool that CLI spawned).
+///
+/// Two passes, because reading command lines is the expensive half: the machine-wide pass asks for
+/// parent links only, and command lines are fetched for the handful of processes the walk actually
+/// reaches. Asking for everything up front cost a `sysctl` per process on the machine.
+fn descendant_processes(tree: &mut ProcessTree, root_pid: u32) -> Vec<DescendantProcess> {
+    if tree
+        .listed_at
+        .is_none_or(|listed_at| listed_at.elapsed() >= PROCESS_TREE_TTL)
+    {
+        tree.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        tree.listed_at = Some(Instant::now());
     }
-    let launchctl = resolve_shell_program("launchctl").ok();
-    for (label, paths) in jobs {
-        if let Some(launchctl) = &launchctl {
-            let _ = std::process::Command::new(launchctl)
-                .args(["remove", &label])
-                .status();
-        }
-        for path in paths {
-            let _ = std::fs::remove_file(path);
-        }
-        run_jobs.unregister(&label);
-    }
-}
 
-#[cfg(not(target_os = "macos"))]
-fn cleanup_platform_shell_run_jobs(_run_jobs: &PlatformRunJobs) {}
-
-#[cfg(target_os = "macos")]
-fn cleanup_stale_platform_shell_run_jobs() {
-    let Ok(launchctl) = resolve_shell_program("launchctl") else {
-        return;
-    };
-    let Ok(output) = std::process::Command::new(&launchctl).arg("list").output() else {
-        return;
-    };
-    let listing = String::from_utf8_lossy(&output.stdout);
-    for line in listing.lines() {
-        let Some(label) = line
-            .split_whitespace()
-            .find(|field| field.starts_with("dev.bootty.run."))
-        else {
-            continue;
-        };
-        let Some(owner_pid) = stale_run_job_owner_pid(label) else {
-            continue;
-        };
-        if owner_pid == std::process::id() || process_exists(owner_pid) {
-            continue;
-        }
-        let _ = std::process::Command::new(&launchctl)
-            .args(["remove", label])
-            .status();
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn cleanup_stale_platform_shell_run_jobs() {}
-
-#[cfg(target_os = "macos")]
-fn stale_run_job_owner_pid(label: &str) -> Option<u32> {
-    let rest = label.strip_prefix("dev.bootty.run.")?;
-    rest.split('.').next()?.parse().ok()
-}
-
-#[cfg(target_os = "macos")]
-fn process_exists(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(target_os = "macos")]
-fn macos_shell_run_environment_from<I, K, V>(
-    current: I,
-    login_env: Option<Vec<(String, String)>>,
-) -> BTreeMap<OsString, OsString>
-where
-    I: IntoIterator<Item = (K, V)>,
-    K: Into<OsString>,
-    V: Into<OsString>,
-{
-    let mut env = current
-        .into_iter()
-        .map(|(key, value)| (key.into(), value.into()))
-        .collect::<BTreeMap<OsString, OsString>>();
-    if let Some(login_env) = login_env {
-        for (key, value) in login_env {
-            let key = OsString::from(key);
-            if key == "PATH" {
-                let login_path = OsString::from(value);
-                let current_path = env.get(&key);
-                env.insert(
-                    key,
-                    login_path_with_current_fallbacks(login_path, current_path),
-                );
-            } else {
-                env.entry(key).or_insert_with(|| OsString::from(value));
-            }
+    let mut children: HashMap<Pid, Vec<Pid>> = HashMap::new();
+    for (pid, process) in tree.system.processes() {
+        if let Some(parent) = process.parent() {
+            children.entry(parent).or_default().push(*pid);
         }
     }
-    env
-}
 
-#[cfg(target_os = "macos")]
-fn login_path_with_current_fallbacks(
-    login_path: OsString,
-    current_path: Option<&OsString>,
-) -> OsString {
-    let mut entries = std::env::split_paths(&login_path).collect::<Vec<_>>();
-    if let Some(current_path) = current_path {
-        for path in std::env::split_paths(current_path) {
-            if !entries.contains(&path) {
-                entries.push(path);
-            }
-        }
+    let found = descendant_pids(&children, Pid::from_u32(root_pid));
+    if found.is_empty() {
+        return Vec::new();
     }
-    std::env::join_paths(entries).unwrap_or(login_path)
-}
 
-#[cfg(target_os = "macos")]
-fn macos_shell_run_script() -> String {
-    let env = macos_shell_run_environment_from(
-        std::env::vars_os(),
-        crate::shell_env::login_shell_environment(),
+    tree.system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&found),
+        false,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
     );
-    let mut script = bootty_mux::process::macos_shell_environment_prelude_from(env);
-    script.push_str(MACOS_BACKGROUND_SHELL_SCRIPT);
-    script
+    found
+        .into_iter()
+        .filter_map(|pid| tree.system.process(pid))
+        .map(|process| DescendantProcess {
+            command: process
+                .exe()
+                .map(|exe| exe.to_string_lossy().into_owned())
+                .unwrap_or_else(|| process.name().to_string_lossy().into_owned()),
+            args: process
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+        .collect()
 }
 
-#[cfg(target_os = "macos")]
-fn resolve_shell_program(program: &str) -> std::io::Result<String> {
-    bootty_mux::process::resolve_program(program).map_err(std::io::Error::other)
+fn descendant_pids(children: &HashMap<Pid, Vec<Pid>>, root_pid: Pid) -> Vec<Pid> {
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root_pid]);
+    let mut visited = BTreeSet::new();
+    while let Some(pid) = queue.pop_front() {
+        if !visited.insert(pid) || found.len() >= DESCENDANT_SCAN_LIMIT {
+            continue;
+        }
+        for child in children.get(&pid).into_iter().flatten() {
+            if found.len() >= DESCENDANT_SCAN_LIMIT {
+                break;
+            }
+            found.push(*child);
+            queue.push_back(*child);
+        }
+    }
+    found
+}
+
+#[cfg(not(windows))]
+fn shell_command(cmd: &str) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(cmd);
+    command
+}
+
+#[cfg(windows)]
+fn shell_command(cmd: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = Command::new("cmd");
+    command
+        .creation_flags(windows_no_window_flag())
+        .raw_arg(format!("/S /C {cmd}"));
+    command
 }
 
 #[cfg(windows)]
@@ -2195,36 +2239,8 @@ fn platform_shell_quote(value: &str) -> String {
 }
 
 #[cfg(windows)]
-fn platform_shell_run_output(
-    cmd: &str,
-    _run_jobs: &PlatformRunJobs,
-    _shutdown: &AtomicBool,
-) -> std::io::Result<String> {
-    use std::os::windows::process::CommandExt;
-
-    let output = std::process::Command::new("cmd")
-        .creation_flags(windows_no_window_flag())
-        .raw_arg(format!("/S /C {cmd}"))
-        .output()?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-#[cfg(windows)]
 const fn windows_no_window_flag() -> u32 {
     0x0800_0000
-}
-
-#[cfg(all(not(windows), not(target_os = "macos")))]
-fn platform_shell_run_output(
-    cmd: &str,
-    _run_jobs: &PlatformRunJobs,
-    _shutdown: &AtomicBool,
-) -> std::io::Result<String> {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()?;
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn setup_lua(
@@ -2247,6 +2263,22 @@ fn setup_lua(
         lua.create_function(move |_, cmd: String| {
             run_shell_cache.run(&cmd).map_err(mlua::Error::external)
         })?,
+    )?;
+    // Run a program directly from its argument vector: no shell process in front of it, no quoting
+    // to get wrong. Use it for anything that needs no shell syntax; `bootty.run` covers the rest.
+    let exec_cache = Arc::clone(&run_cache);
+    bootty.set(
+        "exec",
+        lua.create_function(move |_, argv: Vec<String>| {
+            exec_cache.exec(argv).map_err(mlua::Error::external)
+        })?,
+    )?;
+    // Read what a command last printed without starting it. Pair with `bootty.exec` on a schedule:
+    // exec keeps the answer current, read shows it as soon as it arrives and costs nothing.
+    let read_cache = Arc::clone(&run_cache);
+    bootty.set(
+        "read",
+        lua.create_function(move |_, argv: Vec<String>| Ok(read_cache.read(argv)))?,
     )?;
     let shell_table = lua.create_table()?;
     let shell_run_cache = Arc::clone(&run_cache);
@@ -2271,6 +2303,29 @@ fn setup_lua(
     shell_table.set_readonly(true);
     bootty.set("shell", shell_table)?;
 
+    // Walk a process subtree natively. Modules used to shell out to `ps -axo` and rebuild the
+    // whole machine's tree in Lua, which cost a full process listing several times a second.
+    let process_tree = Mutex::new(ProcessTree::default());
+    bootty.set(
+        "descendants",
+        lua.create_function(move |lua, root_pid: u32| {
+            let table = lua.create_table()?;
+            let Ok(mut tree) = process_tree.lock() else {
+                return Ok(table);
+            };
+            for (index, descendant) in descendant_processes(&mut tree, root_pid)
+                .into_iter()
+                .enumerate()
+            {
+                let entry = lua.create_table()?;
+                entry.set("command", descendant.command)?;
+                entry.set("args", descendant.args)?;
+                table.set(index + 1, entry)?;
+            }
+            Ok(table)
+        })?,
+    )?;
+
     let path_table = lua.create_table()?;
     path_table.set(
         "display",
@@ -2278,6 +2333,34 @@ fn setup_lua(
     )?;
     path_table.set_readonly(true);
     bootty.set("path", path_table)?;
+
+    let git_table = lua.create_table()?;
+    let git_preview_branch = run_cache.preview_branch.clone();
+    git_table.set(
+        "branch",
+        lua.create_function(move |_, cwd: String| {
+            Ok(match &git_preview_branch {
+                Some(branch) => Some(branch.clone()),
+                None => crate::git::head_branch(&cwd),
+            })
+        })?,
+    )?;
+    // A counter for the working tree, bumped by the filesystem whenever something under it changes.
+    // A module compares it against the value from its last `git` call to know whether asking again
+    // could possibly say anything new. `0` means the tree is not watched and nothing can be assumed.
+    let git_watch_previews = run_cache.preview_branch.is_some();
+    git_table.set(
+        "worktree_revision",
+        lua.create_function(move |_, cwd: String| {
+            Ok(if git_watch_previews {
+                0
+            } else {
+                crate::git::worktree_revision(&cwd)
+            })
+        })?,
+    )?;
+    git_table.set_readonly(true);
+    bootty.set("git", git_table)?;
 
     let codexbar_cache = Arc::clone(&run_cache);
     bootty.set(
@@ -3236,32 +3319,97 @@ mod tests {
         assert_eq!(last_run, Some(now));
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(not(windows))]
     #[test]
-    fn macos_shell_run_environment_uses_login_path_with_current_path_fallbacks() {
-        let env = macos_shell_run_environment_from(
-            [
-                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-                (OsString::from("HOME"), OsString::from("/Users/live")),
-            ],
-            Some(vec![
-                ("PATH".to_owned(), "/opt/bin:/usr/bin".to_owned()),
-                ("HOME".to_owned(), "/Users/login".to_owned()),
-                ("BOOTTY_ENV_PROBE".to_owned(), "login".to_owned()),
-            ]),
+    fn descendant_processes_reaches_a_grandchild_of_the_scanned_pid() {
+        // The trailing command keeps the shell from `exec`ing `sleep`, so `sleep` really is a
+        // grandchild of this test process and the walk has to go two levels deep to see it.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30; true"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn shell");
+        let mut tree = ProcessTree::default();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let found = loop {
+            // A fresh listing each round, so the walk sees the grandchild as soon as it exists.
+            tree.listed_at = None;
+            let commands = descendant_processes(&mut tree, std::process::id())
+                .into_iter()
+                .any(|process| process.command.contains("sleep") || process.args.contains("sleep"));
+            if commands || Instant::now() >= deadline {
+                break commands;
+            }
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            found,
+            "the walk should reach `sleep` under the shell it started"
+        );
+    }
+
+    #[test]
+    fn descendant_scan_caps_a_wide_process_tree() {
+        let root = Pid::from_u32(1);
+        let children = HashMap::from([(root, (2..=400).map(Pid::from_u32).collect::<Vec<_>>())]);
+
+        let found = descendant_pids(&children, root);
+
+        assert_eq!(found.len(), DESCENDANT_SCAN_LIMIT);
+        assert_eq!(found.first().map(|pid| pid.as_u32()), Some(2));
+        assert_eq!(found.last().map(|pid| pid.as_u32()), Some(257));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_job_registered_after_shutdown_is_killed_immediately() {
+        let jobs = PlatformRunJobs::default();
+        let shutdown = AtomicBool::new(true);
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn stand-in job");
+
+        let error = jobs
+            .register(7, child, &shutdown)
+            .expect_err("shutdown must reject a late registration");
+
+        assert_eq!(error.to_string(), "extension host stopped");
+        assert!(jobs.children.lock().expect("jobs").is_empty());
+    }
+
+    #[test]
+    fn shell_run_output_cancels_in_flight_commands_on_cleanup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = dir.path().join("started");
+        let gate = dir.path().join("gate");
+        let done = dir.path().join("done");
+        let command = blocking_file_command(&started, &gate, &done);
+        let run_jobs = Arc::new(PlatformRunJobs::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let worker = std::thread::spawn({
+            let run_jobs = Arc::clone(&run_jobs);
+            let shutdown = Arc::clone(&shutdown);
+            move || shell_run_output(&command, &run_jobs, &shutdown).is_err()
+        });
+        assert!(
+            wait_for_path(&started, Duration::from_secs(5)),
+            "the command should start before cleanup cancels it"
         );
 
-        assert_eq!(
-            env.get(&OsString::from("PATH")),
-            Some(&OsString::from("/opt/bin:/usr/bin:/bin"))
+        run_jobs.cleanup();
+
+        assert!(
+            worker.join().expect("worker"),
+            "a cancelled bootty.run must report failure, not a truncated result"
         );
-        assert_eq!(
-            env.get(&OsString::from("HOME")),
-            Some(&OsString::from("/Users/live"))
-        );
-        assert_eq!(
-            env.get(&OsString::from("BOOTTY_ENV_PROBE")),
-            Some(&OsString::from("login"))
+        assert!(
+            !wait_for_path(&done, Duration::from_millis(200)),
+            "cleanup should stop the command before it reaches its gate"
         );
     }
 
@@ -3337,13 +3485,10 @@ mod tests {
             dropped_before_gate,
             "ExtensionHost drop must not join a worker blocked in bootty.run"
         );
-        #[cfg(target_os = "macos")]
         assert!(
             !wait_for_path(&done, Duration::from_millis(200)),
-            "dropping the host should cancel macOS launchd shell jobs"
+            "dropping the host should cancel its in-flight shell commands"
         );
-        #[cfg(not(target_os = "macos"))]
-        assert!(wait_for_path(&done, Duration::from_secs(2)));
     }
 
     #[cfg(unix)]
@@ -3621,9 +3766,8 @@ mod tests {
         format!("printf {}", platform_shell_quote(text))
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn shell_run_output_captures_launchd_job_stderr() {
+    fn shell_run_output_captures_command_stderr() {
         assert_eq!(
             shell_run_output(
                 "printf bootty-stderr >&2",
@@ -3635,20 +3779,19 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn shell_run_output_waits_for_fast_launchd_jobs_to_start() {
-        for index in 0..20 {
-            assert_eq!(
-                shell_run_output(
-                    &format!("printf fast-{index}"),
-                    &PlatformRunJobs::default(),
-                    &AtomicBool::new(false),
-                )
-                .unwrap(),
-                format!("fast-{index}")
-            );
-        }
+    fn exec_run_output_hands_arguments_to_the_program_unchanged() {
+        // The shell these call sites used to go through would split the space, strip the quotes and
+        // expand `$HOME`; every one of those is a wrong argument reaching git or tmux.
+        let argv = ["/bin/echo", "a b", "it's", "$HOME"]
+            .map(str::to_owned)
+            .to_vec();
+
+        assert_eq!(
+            exec_run_output(&argv, &PlatformRunJobs::default(), &AtomicBool::new(false)).unwrap(),
+            "a b it's $HOME\n"
+        );
     }
 
     #[cfg(unix)]
@@ -4312,7 +4455,9 @@ mod tests {
         });
 
         run_cache.set_mode(RunMode::Refresh);
-        assert_eq!(run_cache.run(&cmd).unwrap(), "");
+        // Empty and not an answer yet: a module told only "empty" cannot tell this from a command
+        // that printed nothing, and would show a blank row until its next turn came round.
+        assert_eq!(run_cache.run(&cmd).unwrap(), (String::new(), false));
 
         assert!(wait_for_cached_output_containing(
             &run_cache,

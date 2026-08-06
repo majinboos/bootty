@@ -32,6 +32,7 @@ serde_json.workspace = true
 self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "checksums", "compression-tar-gz", "compression-zip-deflate", "github", "rustls", "ureq"] }
 starship-battery.workspace = true
 strum.workspace = true
+notify.workspace = true
 sysinfo.workspace = true
 ttf-parser.workspace = true
 wgpu.workspace = true
