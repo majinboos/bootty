@@ -116,6 +116,14 @@ windows-sys = "0.61"
 
 [profile.dev]
 debug = "limited"
+# macOS would otherwise leave every codegen unit's object file in `target/debug/deps` forever: the
+# executable's debug map points into them, so nothing ever removes them, and one rebuild of this
+# workspace leaves hundreds behind. That directory is also where test binaries live, and the first
+# CoreText call in a process enumerates the directory its executable sits in to look for bundled
+# fonts — so an unbounded pile of objects turned into seconds of startup for every test that touches
+# a font. Collect the debug info into one .dSYM per binary instead, which keeps debugging intact and
+# leaves the directory bounded.
+split-debuginfo = "packed"
 
 [profile.profiling]
 inherits = "release"

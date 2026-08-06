@@ -1,0 +1,6 @@
+# Tests that talk to a real tmux server or the filesystem can wedge instead of
+# failing, and an unbounded test stalls the whole run — one hung test held a
+# workspace run open for 22 minutes. Report a test as slow after 30s and kill it
+# once it has been slow four times over, so a wedge costs two minutes, not a run.
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }
