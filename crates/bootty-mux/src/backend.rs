@@ -74,6 +74,7 @@ mod tests {
                 anchor: MuxPaneAnchor {
                     session_id: "project".to_owned(),
                     pane_id: Some("pane-1".to_owned()),
+                    pane_pid: None,
                     cwd: Some("/repo".to_owned()),
                     process: Some("zsh".to_owned()),
                 },

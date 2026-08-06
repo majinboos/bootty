@@ -5,25 +5,30 @@ use super::{
     capability::{BindingCapabilityDescriptor, BindingOperation},
     command::{MuxCommand, MuxDirection, MuxSplitDirection},
     controller::MuxScope,
-    process::{CommandRunner, SystemCommandRunner, require_success},
+    process::{CommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
+    tmux_control::TmuxControlRunner,
 };
 
 const TMUX_FIELD_SEPARATOR: char = '\x1f';
+/// Line tags for the combined session/pane snapshot. Sessions and panes come from one tmux
+/// invocation, so each line says which list it belongs to.
+const TMUX_SESSION_LINE_TAG: char = 's';
+const TMUX_PANE_LINE_TAG: char = 'p';
 
 #[derive(Clone, Debug)]
-pub struct TmuxBackend<R = SystemCommandRunner> {
+pub struct TmuxBackend<R = TmuxControlRunner> {
     program: String,
     runner: R,
 }
 
-impl TmuxBackend<SystemCommandRunner> {
+impl TmuxBackend<TmuxControlRunner> {
     pub fn new() -> Self {
-        Self::with_runner("tmux", SystemCommandRunner)
+        Self::with_runner("tmux", TmuxControlRunner::default())
     }
 }
 
-impl Default for TmuxBackend<SystemCommandRunner> {
+impl Default for TmuxBackend<TmuxControlRunner> {
     fn default() -> Self {
         Self::new()
     }
@@ -78,21 +83,21 @@ impl<R: CommandRunner> TmuxBackend<R> {
 
 impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
     fn snapshot(&self) -> Result<MuxSnapshot> {
-        let Some(sessions) = self.run_snapshot(&[
+        // One tmux process for both lists: the snapshot polls several times a second, and a
+        // second invocation doubled that process churn for no extra information.
+        let Some(combined) = self.run_snapshot(&[
             "list-sessions",
             "-F",
-            "#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_current_path}\x1f#{pane_current_command}",
-        ])? else {
-            return Ok(MuxSnapshot::default());
-        };
-        let Some(panes) = self.run_snapshot(&[
+            "s\x1f#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            ";",
             "list-panes",
             "-a",
             "-F",
-            "#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            "p\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}",
         ])? else {
             return Ok(MuxSnapshot::default());
         };
+        let (sessions, panes) = split_tagged_snapshot(&combined);
         parse_tmux_snapshot(&sessions, &panes)
     }
 
@@ -329,13 +334,43 @@ fn underscore_joined_tmux_fields(line: &str, fixed_fields_before_tail: usize) ->
     fields
 }
 
+/// Split the tagged output of the combined `list-sessions ; list-panes` call back into the two
+/// listings the parsers expect. Untagged lines belong to neither list and are dropped.
+fn split_tagged_snapshot(combined: &str) -> (String, String) {
+    let mut sessions = String::new();
+    let mut panes = String::new();
+    for line in combined.lines() {
+        let (target, rest) = if let Some(rest) = strip_snapshot_tag(line, TMUX_SESSION_LINE_TAG) {
+            (&mut sessions, rest)
+        } else if let Some(rest) = strip_snapshot_tag(line, TMUX_PANE_LINE_TAG) {
+            (&mut panes, rest)
+        } else {
+            continue;
+        };
+        target.push_str(rest);
+        target.push('\n');
+    }
+    (sessions, panes)
+}
+
+/// Drop a line's list tag and the separator after it. The separator forms match the ones
+/// [`tmux_fields`] accepts, since a tmux build that renders `\x1f` as something else does so for
+/// the tag too.
+fn strip_snapshot_tag(line: &str, tag: char) -> Option<&str> {
+    let tagged = line.strip_prefix(tag)?;
+    [TMUX_FIELD_SEPARATOR, '\t', '_']
+        .into_iter()
+        .find_map(|separator| tagged.strip_prefix(separator))
+        .or_else(|| tagged.strip_prefix("\\t"))
+}
+
 fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxSnapshot> {
     let mut sessions = Vec::new();
     for line in sessions_output
         .lines()
         .filter(|line| !line.trim().is_empty())
     {
-        let mut fields = tmux_fields(line, 5).into_iter();
+        let mut fields = tmux_fields(line, 6).into_iter();
         let id = fields.next().context("tmux snapshot missing session id")?;
         let name = fields
             .next()
@@ -344,6 +379,7 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
         let attached = fields.next().is_some_and(|value| value != "0");
         let _windows = fields.next();
         let pane_id = fields.next().filter(|value| !value.is_empty());
+        let pane_pid = fields.next().and_then(|value| value.parse().ok());
         let cwd = fields.next().filter(|value| !value.is_empty());
         let process = fields.next().filter(|value| !value.is_empty());
         sessions.push(MuxSession {
@@ -353,6 +389,7 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
             anchor: MuxPaneAnchor {
                 session_id: id,
                 pane_id,
+                pane_pid,
                 cwd,
                 process,
             },
@@ -432,6 +469,7 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
                 window.anchor = MuxPaneAnchor {
                     session_id: session_id.clone(),
                     pane_id: pane_id.clone(),
+                    pane_pid: None,
                     cwd: cwd.clone(),
                     process: process.clone(),
                 };
@@ -443,6 +481,7 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
         let anchor = MuxPaneAnchor {
             session_id,
             pane_id,
+            pane_pid: None,
             cwd,
             process,
         };
@@ -714,21 +753,30 @@ mod tests {
     fn tmux_snapshot_maps_sessions_and_metadata_anchors() {
         let runner = RecordingRunner {
             calls: Rc::default(),
-            stdout: Rc::new(RefCell::new(VecDeque::from([
-                "$1\talpha\t1\t2\t%3\t/repo\tzsh\n$2\tbeta\t0\t1\t%4\t/tmp\tfish\n"
-                    .to_owned(),
-                "$1\t@1\t0\teditor\t1\t1\t%3\t/repo\tnvim\n$1\t@2\t1\tshell\t0\t1\t%5\t/repo\tzsh\n$2\t@3\t0\tlogs\t1\t1\t%4\t/tmp\tfish\n"
-                    .to_owned(),
-            ]))),
+            stdout: Rc::new(RefCell::new(VecDeque::from([[
+                "s\t$1\talpha\t1\t2\t%3\t4242\t/repo\tzsh",
+                "s\t$2\tbeta\t0\t1\t%4\t4243\t/tmp\tfish",
+                "p\t$1\t@1\t0\teditor\t1\t1\t%3\t/repo\tnvim",
+                "p\t$1\t@2\t1\tshell\t0\t1\t%5\t/repo\tzsh",
+                "p\t$2\t@3\t0\tlogs\t1\t1\t%4\t/tmp\tfish",
+            ]
+            .join("\n")]))),
             ..Default::default()
         };
+        let calls = runner.calls.clone();
         let backend = TmuxBackend::with_runner("tmux", runner);
 
         let snapshot = backend.snapshot().unwrap();
 
+        assert_eq!(
+            calls.borrow().len(),
+            1,
+            "sessions and panes should come from one tmux process"
+        );
         assert_eq!(snapshot.active_session_id.as_deref(), Some("$1"));
         assert_eq!(snapshot.sessions[0].name, "alpha");
         assert_eq!(snapshot.sessions[0].anchor.pane_id.as_deref(), Some("%3"));
+        assert_eq!(snapshot.sessions[0].anchor.pane_pid, Some(4242));
         assert_eq!(snapshot.sessions[0].anchor.cwd.as_deref(), Some("/repo"));
         assert_eq!(snapshot.sessions[0].anchor.process.as_deref(), Some("zsh"));
         assert_eq!(snapshot.sessions[0].active_window_id.as_deref(), Some("@1"));
@@ -786,7 +834,7 @@ mod tests {
     #[test]
     fn tmux_snapshot_recovers_underscore_joined_rows() {
         let snapshot = parse_tmux_snapshot(
-            "$2_agents_0_3_%34_/Users/luan/src/agents_node\n",
+            "$2_agents_0_3_%34_4242_/Users/luan/src/agents_node\n",
             "$2_@28_1_ai_1_1_%34_normal_42_/Users/luan/src/agents_node\n",
         )
         .unwrap();

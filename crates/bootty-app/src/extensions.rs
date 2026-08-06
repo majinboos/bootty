@@ -187,6 +187,11 @@ pub struct SessionView {
     pub active: bool,
     pub selected: bool,
     pub cwd: Option<String>,
+    /// The session's active pane, its process id, and the command running in it, as the last mux
+    /// snapshot reported them. Modules read these instead of asking the backend again.
+    pub pane_id: Option<String>,
+    pub pane_pid: Option<u32>,
+    pub process: Option<String>,
     pub color: Option<String>,
     pub dim_color: Option<String>,
     pub progress: Option<u8>,
@@ -1566,6 +1571,11 @@ fn preview_mux_view() -> MuxView {
                 active: true,
                 selected: true,
                 cwd: Some("/Users/demo/src/bootty".to_owned()),
+                pane_id: Some("%1".to_owned()),
+                pane_pid: Some(4242),
+                // An agent as the pane command, so the agent and process previews show a live
+                // session without a process-tree walk the preview cannot seed.
+                process: Some("codex".to_owned()),
                 color: Some("#89b4fa".to_owned()),
                 dim_color: Some("#585b70".to_owned()),
                 progress: Some(62),
@@ -2327,6 +2337,15 @@ fn setup_lua(
                     entry.set("ports", ports)?;
                     if let Some(value) = &session.cwd {
                         entry.set("cwd", value.as_str())?;
+                    }
+                    if let Some(value) = &session.pane_id {
+                        entry.set("pane_id", value.as_str())?;
+                    }
+                    if let Some(value) = session.pane_pid {
+                        entry.set("pane_pid", value)?;
+                    }
+                    if let Some(value) = &session.process {
+                        entry.set("process", value.as_str())?;
                     }
                     if let Some(value) = &session.color {
                         entry.set("color", value.as_str())?;
@@ -4120,6 +4139,9 @@ mod tests {
                     },
                 ],
                 ports: vec![8040, 3000],
+                pane_id: Some("%7".to_owned()),
+                pane_pid: Some(4242),
+                process: Some("codex".to_owned()),
             }],
             ..MuxView::default()
         }));
@@ -4128,7 +4150,7 @@ mod tests {
             .load(
                 r#"return function() local s = bootty.sessions()[1]
                    local p = s.progresses
-                   return { kind = 'session', text = s.name .. ':' .. s.cwd .. ':' .. p[1].process .. ':' .. p[2].value .. ':' .. s.ports[1],
+                   return { kind = 'session', text = s.name .. ':' .. s.cwd .. ':' .. p[1].process .. ':' .. p[2].value .. ':' .. s.ports[1] .. ':' .. s.pane_id .. ':' .. s.pane_pid .. ':' .. s.process,
                    session_id = s.id, fg = s.color } end"#,
             )
             .eval::<Value>()
@@ -4137,7 +4159,10 @@ mod tests {
         let items = run_module(&module.body);
 
         assert_eq!(items[0].kind.as_deref(), Some("session"));
-        assert_eq!(items[0].text, "work/api:/tmp/work/api:pi:42:8040");
+        assert_eq!(
+            items[0].text,
+            "work/api:/tmp/work/api:pi:42:8040:%7:4242:codex"
+        );
         assert_eq!(items[0].session_id.as_deref(), Some("$1"));
         assert_eq!(items[0].fg, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));
     }
