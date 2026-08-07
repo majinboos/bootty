@@ -21,6 +21,7 @@ pub mod process;
 pub mod rmux;
 pub(crate) mod rmux_bridge;
 pub mod snapshot;
+pub mod ssh;
 pub mod terminal;
 pub mod tmux;
 pub mod tmux_control;

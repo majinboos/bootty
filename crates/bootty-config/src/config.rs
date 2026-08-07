@@ -371,6 +371,10 @@ pub struct MultiplexerConfig {
     /// Hide tmux's own status bar in bootty's client by toggling the attached
     /// session's `status` option off (and restoring it on detach). tmux-only.
     pub hide_tmux_status: bool,
+    /// Reach the multiplexer on another host over SSH instead of this one. The backend's client
+    /// runs there and bootty renders it here, so its sessions attach like local ones. Set for the
+    /// client-server backends (`tmux`, `zellij`), which is what a remote client can drive.
+    pub remote: Option<SshRemoteConfig>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -378,6 +382,74 @@ pub struct MultiplexerConfig {
 struct MultiplexerPatch {
     backend: Option<MultiplexerBackendConfig>,
     hide_tmux_status: Option<bool>,
+    remote: Option<SshRemoteConfig>,
+}
+
+/// Where and how to run the multiplexer client for a remote binding.
+///
+/// `host` alone is enough when the host is an `~/.ssh/config` alias; `user`, `port` and `args`
+/// cover the machines where that file is absent or does not describe the host.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SshRemoteConfig {
+    /// SSH config alias, hostname or address of the host running the multiplexer.
+    pub host: String,
+    /// Login user, when it is neither the local user nor covered by `~/.ssh/config`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// SSH port, when it is neither 22 nor covered by `~/.ssh/config`.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// The SSH client to run. Both OpenSSH builds bootty targets are called `ssh`, including the
+    /// one shipped with Windows.
+    #[serde(default = "default_ssh_program")]
+    pub program: String,
+    /// Extra flags handed to the SSH client before the destination, for whatever `~/.ssh/config`
+    /// does not carry: `-i`, `-J`, `-o`.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+fn default_ssh_program() -> String {
+    "ssh".to_owned()
+}
+
+impl SshRemoteConfig {
+    /// A remote reached as `~/.ssh/config` describes it, or as the defaults do when it says nothing.
+    pub fn for_host(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            user: None,
+            port: None,
+            program: default_ssh_program(),
+            args: Vec::new(),
+        }
+    }
+}
+
+impl MultiplexerConfig {
+    /// A remote binding renders a multiplexer client running on the other host, so the backend has
+    /// to be one that has a client: `native` panes are this process's own PTYs, and `rmux` streams
+    /// its pane output through files on the local filesystem.
+    pub fn validate_remote(&self) -> ConfigResult<()> {
+        let Some(remote) = &self.remote else {
+            return Ok(());
+        };
+        if remote.host.trim().is_empty() {
+            return Err(ConfigLoadError::new(
+                "multiplexer.remote.host must name a host".to_owned(),
+            ));
+        }
+        match self.backend {
+            MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => Ok(()),
+            MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux => {
+                Err(ConfigLoadError::new(format!(
+                    "multiplexer.remote needs backend \"tmux\" or \"zellij\", got {:?}",
+                    self.backend
+                )))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -772,6 +844,7 @@ impl Default for MultiplexerConfig {
         Self {
             backend: MultiplexerBackendConfig::Native,
             hide_tmux_status: false,
+            remote: None,
         }
     }
 }
@@ -1643,7 +1716,7 @@ impl ConfigResolver<'_> {
         apply_font_features(&mut config.font, raw.font_feature)?;
         apply_partial_chrome(&mut config.chrome, raw.chrome);
         apply_partial_sidebar(&mut config.sidebar, raw.sidebar);
-        apply_partial_multiplexer(&mut config.multiplexer, raw.multiplexer);
+        apply_partial_multiplexer(&mut config.multiplexer, raw.multiplexer)?;
         apply_partial_input(&mut config.input, raw.input);
         apply_partial_session(&mut config.session, raw.session);
         apply_partial_diagnostics(&mut config.diagnostics, raw.diagnostics);
@@ -1755,9 +1828,14 @@ fn apply_partial_sidebar(sidebar: &mut SidebarConfig, partial: SidebarPatch) {
     apply_value(&mut sidebar.modules, partial.modules);
 }
 
-fn apply_partial_multiplexer(multiplexer: &mut MultiplexerConfig, partial: MultiplexerPatch) {
+fn apply_partial_multiplexer(
+    multiplexer: &mut MultiplexerConfig,
+    partial: MultiplexerPatch,
+) -> ConfigResult<()> {
     apply_value(&mut multiplexer.backend, partial.backend);
     apply_value(&mut multiplexer.hide_tmux_status, partial.hide_tmux_status);
+    apply_present(&mut multiplexer.remote, partial.remote);
+    multiplexer.validate_remote()
 }
 
 fn apply_partial_input(input: &mut InputConfig, partial: InputPatch) {

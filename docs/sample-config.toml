@@ -122,6 +122,16 @@ backend = "native"
 # until Bootty detaches.
 hide-tmux-status = false
 
+# Run the backend's client on another host over SSH, so its sessions attach here
+# like local ones. tmux and zellij only: the native and rmux backends keep their
+# terminals in this process.
+# [multiplexer.remote]
+# host = "devbox"       # ~/.ssh/config alias, hostname, or address
+# user = "dev"         # when ~/.ssh/config does not name one
+# port = 2222           # when ~/.ssh/config does not name one
+# program = "ssh"       # the SSH client to run
+# args = ["-i", "~/.ssh/devbox"] # extra flags, passed before the destination
+
 [input]
 # Active keybinds must use executable Bootty actions. Unsupported actions are
 # rejected during startup/reload instead of being silently accepted.

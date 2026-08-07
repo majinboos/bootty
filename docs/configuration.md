@@ -79,6 +79,18 @@ backend = "rmux"
 # native keeps mux state and terminals inside Bootty. rmux renders through
 # rmux-sdk. tmux and zellij attach through their backend UI.
 
+# Attach a multiplexer running on another host. The backend's client runs there
+# over SSH and Bootty renders it here, so remote sessions behave like local ones.
+# Available for the backends that have a client to run: tmux and zellij.
+[multiplexer.remote]
+host = "devbox" # ~/.ssh/config alias, hostname, or address
+# user = "dev"        # when ~/.ssh/config does not name one
+# port = 2222          # when ~/.ssh/config does not name one
+# program = "ssh"      # the SSH client to run
+# args = ["-i", "~/.ssh/devbox"] # extra flags, passed before the destination
+
+# `bootty --backend tmux --ssh-remote devbox` does the same for one run.
+
 [input]
 preset = "ghostty" # ghostty (default), bootty, or tmux — which built-in default keybind set to use
 prefix = "ctrl+space" # leader for prefixed chords (bootty/tmux presets); defaults to ctrl+space / ctrl+b

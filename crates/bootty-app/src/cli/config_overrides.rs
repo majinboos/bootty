@@ -5,8 +5,8 @@ use bootty_config::{
     color::Color,
     config::{
         BoottyConfig, CursorStyleConfig, MacosOptionAsAltConfig, MacosTitlebarStyle,
-        MultiplexerBackendConfig, SidebarPosition, WindowDecoration, WindowFullscreen,
-        resolve_theme,
+        MultiplexerBackendConfig, SidebarPosition, SshRemoteConfig, WindowDecoration,
+        WindowFullscreen, resolve_theme,
     },
 };
 use bootty_render::terminal_text::FontFeature;
@@ -18,6 +18,10 @@ pub(super) struct ConfigOverrides {
     /// Force the multiplexer backend.
     #[arg(long, value_enum, value_name = "BACKEND")]
     backend: Option<CliBackend>,
+
+    /// Attach the multiplexer running on this SSH host instead of the local one.
+    #[arg(long, value_name = "HOST")]
+    ssh_remote: Option<String>,
 
     /// Force tmux status hiding on.
     #[arg(long, conflicts_with = "show_tmux_status")]
@@ -302,7 +306,7 @@ pub(super) struct ConfigOverrides {
 
 impl ConfigOverrides {
     pub(super) fn apply(&self, config: &mut BoottyConfig) -> Result<()> {
-        self.apply_multiplexer(config);
+        self.apply_multiplexer(config)?;
         self.apply_window(config);
         self.apply_theme_and_colors(config)?;
         self.apply_font(config)?;
@@ -315,7 +319,7 @@ impl ConfigOverrides {
         Ok(())
     }
 
-    fn apply_multiplexer(&self, config: &mut BoottyConfig) {
+    fn apply_multiplexer(&self, config: &mut BoottyConfig) -> Result<()> {
         if let Some(backend) = self.backend {
             config.multiplexer.backend = backend.into();
         }
@@ -323,6 +327,17 @@ impl ConfigOverrides {
         {
             config.multiplexer.hide_tmux_status = hide_tmux_status;
         }
+        if let Some(host) = &self.ssh_remote {
+            // The flag names a host and nothing else, so whatever `[multiplexer.remote]` says about
+            // reaching it — port, identity, jump host — stays in place.
+            config
+                .multiplexer
+                .remote
+                .get_or_insert_with(|| SshRemoteConfig::for_host(host.clone()))
+                .host = host.clone();
+        }
+        config.multiplexer.validate_remote()?;
+        Ok(())
     }
 
     fn apply_window(&self, config: &mut BoottyConfig) {

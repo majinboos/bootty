@@ -1020,6 +1020,7 @@ mod tests {
         let config = MultiplexerConfig {
             backend: MultiplexerBackendConfig::Tmux,
             hide_tmux_status: true,
+            ..MultiplexerConfig::default()
         };
         let mut store = WorkspaceStore::for_config_path(&config_path);
 

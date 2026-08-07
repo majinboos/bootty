@@ -3,7 +3,13 @@ use std::{path::Path, sync::Arc};
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
 use super::{
-    backend::MuxBackend, native::NativeBackend, rmux::RmuxBackend, tmux::TmuxBackend,
+    backend::MuxBackend,
+    native::NativeBackend,
+    process::SystemCommandRunner,
+    rmux::RmuxBackend,
+    ssh::{SshCommandRunner, SshRemote},
+    tmux::TmuxBackend,
+    tmux_control::TmuxControlRunner,
     zellij::ZellijBackend,
 };
 
@@ -13,10 +19,28 @@ use super::{
 pub type BackendFactory = Arc<dyn Fn(&MultiplexerConfig) -> Box<dyn MuxBackend> + Send + Sync>;
 
 pub fn selected_backend(config: &MultiplexerConfig) -> MultiplexerBackendConfig {
-    if cfg!(windows) && config.backend == MultiplexerBackendConfig::Tmux {
+    resolve_backend(config.backend, config.remote.is_some(), cfg!(windows))
+}
+
+/// Windows has no tmux to fall back from, so a local tmux binding renders natively there. A remote
+/// one still resolves to tmux: its client runs on the other host, and this side only runs `ssh`,
+/// which Windows does ship.
+fn resolve_backend(
+    backend: MultiplexerBackendConfig,
+    remote: bool,
+    windows: bool,
+) -> MultiplexerBackendConfig {
+    if windows && backend == MultiplexerBackendConfig::Tmux && !remote {
         return MultiplexerBackendConfig::Native;
     }
-    config.backend
+    backend
+}
+
+/// The SSH transport a binding's backend client runs over, or `None` when the multiplexer is this
+/// machine's. Remote configs that name a backend without a client are rejected when the config is
+/// loaded, so anything reaching here is a backend that can be driven from another host.
+pub fn remote_transport(config: &MultiplexerConfig) -> Option<SshRemote> {
+    config.remote.clone().map(SshRemote::new)
 }
 
 pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
@@ -30,14 +54,24 @@ pub fn build_backend_for_workspace(
     config: &MultiplexerConfig,
     workspace: Option<&Path>,
 ) -> Box<dyn MuxBackend> {
+    let remote = remote_transport(config);
     match selected_backend(config) {
         MultiplexerBackendConfig::Rmux => Box::new(RmuxBackend::new()),
         MultiplexerBackendConfig::Native => Box::new(match workspace {
             Some(workspace) => NativeBackend::for_workspace(workspace),
             None => NativeBackend::new(),
         }),
-        MultiplexerBackendConfig::Tmux => Box::new(TmuxBackend::new()),
-        MultiplexerBackendConfig::Zellij => Box::new(ZellijBackend::new()),
+        MultiplexerBackendConfig::Tmux => Box::new(match remote {
+            Some(remote) => TmuxBackend::with_runner("tmux", TmuxControlRunner::for_remote(remote)),
+            None => TmuxBackend::new(),
+        }),
+        MultiplexerBackendConfig::Zellij => match remote {
+            Some(remote) => Box::new(ZellijBackend::with_runner(SshCommandRunner::new(
+                remote,
+                SystemCommandRunner,
+            ))),
+            None => Box::new(ZellijBackend::new()),
+        },
     }
 }
 
@@ -91,6 +125,28 @@ mod tests {
 
             assert_eq!(selected_backend(&config), expected);
         }
+    }
+
+    /// Windows ships an SSH client but no tmux, so the fallback to the native backend has to look
+    /// at where the tmux server is: substituting it for a remote binding would render this
+    /// machine's own shells instead of the ones the user asked to attach to.
+    #[test]
+    fn windows_keeps_a_remote_tmux_binding_and_replaces_only_a_local_one() {
+        for windows in [true, false] {
+            assert_eq!(
+                resolve_backend(MultiplexerBackendConfig::Tmux, true, windows),
+                MultiplexerBackendConfig::Tmux
+            );
+        }
+
+        assert_eq!(
+            resolve_backend(MultiplexerBackendConfig::Tmux, false, true),
+            MultiplexerBackendConfig::Native
+        );
+        assert_eq!(
+            resolve_backend(MultiplexerBackendConfig::Tmux, false, false),
+            MultiplexerBackendConfig::Tmux
+        );
     }
 
     #[test]
