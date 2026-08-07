@@ -59,6 +59,7 @@ libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "c1
 ] }
 memchr = "2.8"
 muda = "0.19"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSApplication",

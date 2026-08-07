@@ -58,7 +58,7 @@ pub fn hydrate_from_login_shell() {
 }
 
 #[cfg(target_os = "macos")]
-pub fn login_shell_environment() -> Option<Vec<(String, String)>> {
+fn login_shell_environment() -> Option<Vec<(String, String)>> {
     LOGIN_SHELL_ENVIRONMENT
         .get_or_init(|| {
             let shell = login_shell();
