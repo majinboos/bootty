@@ -201,6 +201,10 @@ fn indeterminate_progress_left(track_width: f32, time: f64) -> f32 {
     (track_width - segment_width).max(0.0) * travel
 }
 
+fn animate_indeterminate_progress(window_focused: bool, has_indeterminate_progress: bool) -> bool {
+    window_focused && has_indeterminate_progress
+}
+
 fn paint_terminal_progress(
     painter: &egui::Painter,
     rect: Rect,
@@ -327,6 +331,9 @@ pub struct BoottyApp {
     keep_awake: Option<keepawake::KeepAwake>,
     terminal_cursor_icon: egui::CursorIcon,
     sidebar_space_swipe: chrome::SidebarSpaceSwipeState,
+    /// Whether the window had keyboard focus this frame. Extension hosts throttle themselves while
+    /// it is false, so an unfocused window stops animating (and repainting) its chrome.
+    window_focused: bool,
 }
 
 impl BoottyApp {
@@ -420,6 +427,7 @@ impl BoottyApp {
             keep_awake: None,
             terminal_cursor_icon: egui::CursorIcon::Text,
             sidebar_space_swipe: chrome::SidebarSpaceSwipeState::default(),
+            window_focused: true,
         })
     }
 
@@ -645,6 +653,7 @@ impl BoottyApp {
             sidebar_visible,
             session_color,
             keep_awake: self.keep_awake.is_some(),
+            focused: self.window_focused,
         }
     }
 
@@ -2155,6 +2164,7 @@ impl eframe::App for BoottyApp {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.window_focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
         let (
             mut events,
             mut dropped_file_paths,
@@ -2210,6 +2220,7 @@ impl eframe::App for BoottyApp {
             hover_pos,
             pressed_mouse_button,
             viewport,
+            window_focused: self.window_focused,
             renderer_metrics: self.terminal_widget.metrics(),
             terminal_cell_width,
             terminal_cell_height,
@@ -2218,7 +2229,10 @@ impl eframe::App for BoottyApp {
         };
         let effects = self.state.update_frame(inputs);
         self.apply_effects(ctx, effects);
-        if self.state.has_indeterminate_terminal_progress() {
+        if animate_indeterminate_progress(
+            self.window_focused,
+            self.state.has_indeterminate_terminal_progress(),
+        ) {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
@@ -2576,6 +2590,13 @@ mod tests {
         assert_eq!(indeterminate_progress_left(100.0, 0.0), 0.0);
         assert_eq!(indeterminate_progress_left(100.0, 0.75), 75.0);
         assert_eq!(indeterminate_progress_left(100.0, 1.5), 0.0);
+    }
+
+    #[test]
+    fn unfocused_indeterminate_progress_does_not_schedule_animation() {
+        assert!(animate_indeterminate_progress(true, true));
+        assert!(!animate_indeterminate_progress(false, true));
+        assert!(!animate_indeterminate_progress(true, false));
     }
     #[test]
     fn custom_egui_fonts_only_load_for_visible_chrome() {

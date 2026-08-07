@@ -111,6 +111,7 @@ fn frame_inputs_at(
         modifiers: egui::Modifiers::default(),
         hover_pos: Some(egui::Pos2::new(420.0, 240.0)),
         pressed_mouse_button: None,
+        window_focused: true,
         viewport: ViewportSnapshot {
             fullscreen: false,
             maximized: false,

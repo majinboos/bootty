@@ -2,7 +2,10 @@ use std::time::Duration;
 
 pub const INPUT_REFRESH_INTERVAL: Duration = Duration::ZERO;
 pub const BUSY_REFRESH_INTERVAL: Duration = Duration::ZERO;
-pub const CURSOR_BLINK_REFRESH_INTERVAL: Duration = Duration::from_millis(33);
+/// Cadence of the cursor's fade animation, and with it the app's idle frame rate: a repaint
+/// rebuilds the whole window, so this constant sets what an idle focused window costs. 20 Hz keeps
+/// the fade smooth at half the frames 30 Hz asked for; `cursor.blink = false` opts out entirely.
+pub const CURSOR_BLINK_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 pub const CHROME_REFRESH_INTERVAL: Duration = Duration::from_millis(900);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

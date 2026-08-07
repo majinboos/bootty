@@ -43,6 +43,9 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(8);
 /// How often extension dirs are re-scanned for edited/added/removed module files (hot reload).
 const RELOAD_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// Slowest cadence any module runs at while the window is unfocused. Structural changes still
+/// force a render, so this only slows animation and polling, not the response to real events.
+const UNFOCUSED_INTERVAL_FLOOR: Duration = Duration::from_secs(1);
 const CODEXBAR_SERVER_PORT: u16 = 17_613;
 const CODEXBAR_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 const ERROR_COLOR: Color32 = Color32::from_rgb(0xf3, 0x8b, 0xa8);
@@ -201,7 +204,7 @@ pub struct SessionView {
 }
 
 /// Mux state shared with the worker thread so modules can render it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MuxView {
     pub windows: Vec<WindowView>,
     pub sessions: Vec<SessionView>,
@@ -212,6 +215,26 @@ pub struct MuxView {
     pub session_color: Option<String>,
     /// Whether Bootty is currently holding a keep-awake/caffeinate guard.
     pub keep_awake: bool,
+    /// Whether the window has keyboard focus. Hosts run modules at [`UNFOCUSED_INTERVAL_FLOOR`]
+    /// while it is false: a module that animates its rows otherwise repaints the whole window
+    /// several times a second at nobody.
+    pub focused: bool,
+}
+
+impl Default for MuxView {
+    /// Focused by default: a host that has not been told otherwise should run at full cadence
+    /// rather than start out throttled.
+    fn default() -> Self {
+        Self {
+            windows: Vec::new(),
+            sessions: Vec::new(),
+            session: None,
+            sidebar_visible: false,
+            session_color: None,
+            keep_awake: false,
+            focused: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1343,6 +1366,13 @@ fn run_loop(
         } else {
             RunMode::Refresh
         });
+        // An unfocused window animates at nobody, and every changed item repaints the whole
+        // window, so hold modules to a slow floor until focus returns.
+        let interval_floor = if mux.read().is_ok_and(|view| view.focused) {
+            Duration::ZERO
+        } else {
+            UNFOCUSED_INTERVAL_FLOOR
+        };
         for module in &mut modules {
             // Only run modules a segment references, so an unused module never
             // shells out on its interval.
@@ -1353,9 +1383,9 @@ fn run_loop(
                 continue;
             }
             if force
-                || module
-                    .last_run
-                    .is_none_or(|last| now.duration_since(last) >= module.interval)
+                || module.last_run.is_none_or(|last| {
+                    now.duration_since(last) >= module.interval.max(interval_floor)
+                })
             {
                 record_module_interval_run(force, &mut module.last_run, now);
                 let produced = run_module(&module.body);
@@ -1602,6 +1632,7 @@ fn preview_mux_view() -> MuxView {
         sidebar_visible: false,
         session_color: Some("#89b4fa".to_owned()),
         keep_awake: true,
+        focused: true,
     }
 }
 pub fn preview_builtin_module(
