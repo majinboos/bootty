@@ -451,6 +451,28 @@ fn segment_width(ui: &egui::Ui, segment: &ResolvedSegment, font: &egui::FontId) 
     items_width(ui, &items, font)
 }
 
+/// Width of each item, in order. Laying an item's text out costs a text layout, and the draw path
+/// wants the same widths three times over — to place the segment, to hit-test the pointer, and to
+/// draw — so it measures once and passes these along.
+fn item_widths(ui: &egui::Ui, items: &[&ResolvedItem], font: &egui::FontId) -> Vec<f32> {
+    items
+        .iter()
+        .map(|item| item_width(ui, item, font))
+        .collect()
+}
+
+/// Width of `items` laid out left to right, gaps included, from widths already measured.
+fn laid_out_width(items: &[&ResolvedItem], widths: &[f32]) -> f32 {
+    let mut total = 0.0;
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 && item_gap_before(item) && !connected(Some(items[index - 1]), item) {
+            total += STATUS_ITEM_GAP;
+        }
+        total += widths.get(index).copied().unwrap_or_default();
+    }
+    total
+}
+
 fn segments_width(ui: &egui::Ui, segments: &[&ResolvedSegment], font: &egui::FontId) -> f32 {
     let mut total = 0.0;
     for segment in segments.iter().filter(|segment| !segment.items.is_empty()) {
@@ -812,21 +834,22 @@ fn draw_segments(
     let mut x = start_x;
     let mut drawn = 0;
     for segment in segments {
-        let width = segment_width(ui, segment, &font);
+        let items = segment.items.iter().collect::<Vec<_>>();
+        let widths = item_widths(ui, &items, &font);
+        let width = laid_out_width(&items, &widths);
         if width <= 0.0 {
             continue;
         }
         if drawn > 0 {
             x += STATUS_ITEM_GAP;
         }
-        let items = segment.items.iter().collect::<Vec<_>>();
         if x + width > bound {
             if segment_contains_module(segment, STATUS_WINDOWS_MODULE) && x < bound {
-                draw_items(ui, x, bound, segment, &items, input);
+                draw_items(ui, x, bound, segment, &items, &widths, input);
             }
             break;
         }
-        draw_items(ui, x, x + width, segment, &items, input);
+        draw_items(ui, x, x + width, segment, &items, &widths, input);
         drawn += 1;
         x += width;
     }
@@ -884,16 +907,7 @@ fn item_gap_before(item: &ResolvedItem) -> bool {
 }
 
 fn items_width(ui: &egui::Ui, items: &[&ResolvedItem], font: &egui::FontId) -> f32 {
-    let mut total = 0.0;
-    let mut prev: Option<&ResolvedItem> = None;
-    for item in items {
-        if prev.is_some() && item_gap_before(item) && !connected(prev, item) {
-            total += STATUS_ITEM_GAP;
-        }
-        total += item_width(ui, item, font);
-        prev = Some(item);
-    }
-    total
+    laid_out_width(items, &item_widths(ui, items, font))
 }
 
 fn hovered_reorder_anchor(
@@ -902,7 +916,7 @@ fn hovered_reorder_anchor(
     start_x: f32,
     bound: f32,
     items: &[&ResolvedItem],
-    font: &egui::FontId,
+    widths: &[f32],
 ) -> Option<(String, String)> {
     let hover_pos = ui.input(|input| input.pointer.hover_pos())?;
     let mut x = start_x;
@@ -912,7 +926,7 @@ fn hovered_reorder_anchor(
         if prev.is_some() && item_gap_before(item) && !connected(prev, item) {
             x += STATUS_ITEM_GAP;
         }
-        let width = item_width(ui, item, font);
+        let width = widths.get(index).copied().unwrap_or_default();
         if x + width > bound {
             break;
         }
@@ -1002,12 +1016,13 @@ fn draw_items(
     bound: f32,
     segment: &ResolvedSegment,
     items: &[&ResolvedItem],
+    widths: &[f32],
     input: &mut StatusInput,
 ) {
     let rect = input.rect;
     let palette = input.palette;
     let font = input.font.clone();
-    let hovered_anchor = hovered_reorder_anchor(ui, rect, start_x, bound, items, &font);
+    let hovered_anchor = hovered_reorder_anchor(ui, rect, start_x, bound, items, widths);
     let mut x = start_x;
     for index in 0..items.len() {
         let item = items[index];
@@ -1016,7 +1031,7 @@ fn draw_items(
         if prev.is_some() && item_gap_before(item) && !connected(prev, item) {
             x += STATUS_ITEM_GAP;
         }
-        let width = item_width(ui, item, &font);
+        let width = widths.get(index).copied().unwrap_or_default();
         if x + width > bound {
             break;
         }

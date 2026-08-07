@@ -7,7 +7,10 @@ use crate::{
     assets,
     config::ChromeConfig,
     extensions::ModuleItem,
-    mux::{controller::SpaceId, snapshot::MuxSession},
+    mux::{
+        controller::{MuxScope, SpaceId},
+        snapshot::MuxSession,
+    },
     strings::truncate_label,
     ui::{
         icons::paint_icon_slug,
@@ -343,54 +346,46 @@ const MACOS_TITLEBAR_BUTTON_CENTER_Y: f32 = 16.0;
 /// background, so each element fades in its own hue rather than washing toward white.
 const UNFOCUSED_ROW_KEEP: f32 = 0.5;
 
+/// A session row's identity, borrowed from the item so per-row lookups allocate nothing.
+type SidebarSessionKey<'a> = (MuxScope, &'a str);
+
 /// Every row a session owns — its title row plus the detail/progress rows beneath it — points at
 /// that session, so hovering or clicking anywhere in the block hits the whole session component.
-fn sidebar_row_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
-    Some(ScopedSessionTarget::new(
-        item.session_scope?,
-        item.session_id?,
-    ))
+fn sidebar_session_key<'a>(item: &SidebarItem<'a>) -> Option<SidebarSessionKey<'a>> {
+    Some((item.session_scope?, item.session_id?))
 }
 
-/// Only the title row, for the ordered session list that positions the context-menu actions.
-fn sidebar_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
-    if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
-        return None;
-    }
-    sidebar_row_session_target(item)
+fn sidebar_context_session_key<'a>(item: &SidebarItem<'a>) -> Option<SidebarSessionKey<'a>> {
+    item.selectable.then(|| sidebar_session_key(item)).flatten()
 }
 
-fn sidebar_context_session_target(item: &SidebarItem<'_>) -> Option<ScopedSessionTarget> {
-    item.selectable
-        .then(|| sidebar_row_session_target(item))
-        .flatten()
-}
-
-fn sidebar_session_targets(items: &[SidebarItem<'_>]) -> Vec<ScopedSessionTarget> {
-    let mut targets = Vec::new();
+/// Where each session sits in its binding's ordered list, and how many sessions that binding has:
+/// the context menu needs both for every row it draws. One borrowed pass over the items keeps the
+/// sidebar linear — asking per row made it compare session id strings quadratically.
+fn sidebar_binding_target_positions<'a>(
+    items: &[SidebarItem<'a>],
+) -> HashMap<SidebarSessionKey<'a>, (usize, usize)> {
+    let mut positions = HashMap::new();
+    let mut binding_counts: HashMap<MuxScope, usize> = HashMap::new();
     for item in items {
-        let Some(target) = sidebar_session_target(item) else {
+        // Only title rows are ordered targets; detail rows share their session's context target.
+        if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
+            continue;
+        }
+        let Some(key) = sidebar_session_key(item) else {
             continue;
         };
-        if !targets.contains(&target) {
-            targets.push(target);
+        if positions.contains_key(&key) {
+            continue;
         }
+        let count = binding_counts.entry(key.0).or_default();
+        positions.insert(key, (*count, 0));
+        *count += 1;
     }
-    targets
-}
-
-fn sidebar_binding_target_position(
-    targets: &[ScopedSessionTarget],
-    target: &ScopedSessionTarget,
-) -> Option<(usize, usize)> {
-    let binding_targets = targets
-        .iter()
-        .filter(|candidate| candidate.scope == target.scope)
-        .collect::<Vec<_>>();
-    let position = binding_targets
-        .iter()
-        .position(|candidate| *candidate == target)?;
-    Some((position, binding_targets.len()))
+    for (key, value) in &mut positions {
+        value.1 = binding_counts.get(&key.0).copied().unwrap_or_default();
+    }
+    positions
 }
 
 fn sidebar_title_drag_rect(rect: Rect, reserve_titlebar_buttons: bool) -> Rect {
@@ -478,8 +473,7 @@ pub fn show_sidebar(
         .take(max_rows)
         .cloned()
         .collect::<Vec<_>>();
-    let session_targets = sidebar_session_targets(model.items);
-    let preview_labels = sidebar_drag_preview_labels(&items);
+    let binding_positions = sidebar_binding_target_positions(model.items);
     let drag_id = egui::Id::new("mux-sidebar-drag-anchor");
     let mut dragged = ui
         .ctx()
@@ -495,7 +489,10 @@ pub fn show_sidebar(
         .and_then(|pos| sidebar_hovered_row(pos, rect.min.x, list_top, width, max_rows))
         .and_then(|index| items.get(index))
         .filter(|item| item.selectable)
-        .and_then(sidebar_row_session_target);
+        .and_then(sidebar_session_key);
+    let model_hovered_session = model
+        .hovered_session
+        .map(|target| (target.scope, target.session_id.as_str()));
     let suppress_click = dragged.is_some();
 
     let mut event = None;
@@ -504,11 +501,11 @@ pub fn show_sidebar(
             Pos2::new(rect.min.x, list_top + index as f32 * SIDEBAR_ROW_HEIGHT),
             egui::vec2(width, SIDEBAR_ROW_HEIGHT),
         );
-        let item_target = sidebar_row_session_target(item);
+        let item_key = sidebar_session_key(item);
         let hovered = item.selectable
-            && item_target.as_ref().is_some_and(|target| {
-                Some(target) == pointer_hovered_session.as_ref()
-                    || model.focused && Some(target) == model.hovered_session
+            && item_key.is_some_and(|key| {
+                Some(key) == pointer_hovered_session
+                    || model.focused && Some(key) == model_hovered_session
             });
         let response = sidebar_item_row(
             ui,
@@ -524,10 +521,7 @@ pub fn show_sidebar(
         {
             let state = SidebarDragState {
                 anchor: anchor.to_owned(),
-                preview: preview_labels
-                    .get(anchor)
-                    .cloned()
-                    .unwrap_or_else(|| anchor.to_owned()),
+                preview: sidebar_drag_preview_label(&items, anchor),
             };
             ui.ctx()
                 .data_mut(|data| data.insert_persisted(drag_id, state.clone()));
@@ -539,14 +533,15 @@ pub fn show_sidebar(
             && !suppress_click
             && response.clicked_by(egui::PointerButton::Primary)
             && item.selectable
-            && let Some(target) = item_target.clone()
+            && let Some((scope, session_id)) = item_key
         {
-            event = Some(SidebarEvent::ActivateSession(target));
+            event = Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
+                scope, session_id,
+            )));
         }
         if event.is_none()
-            && let Some(target) = sidebar_context_session_target(item)
-            && let Some((position, binding_session_count)) =
-                sidebar_binding_target_position(&session_targets, &target)
+            && let Some(key) = sidebar_context_session_key(item)
+            && let Some(&(position, binding_session_count)) = binding_positions.get(&key)
             && let Some(action) = session_context_action(
                 &response,
                 !item.current,
@@ -556,7 +551,10 @@ pub fn show_sidebar(
                 item.can_return_to_last_session,
             )
         {
-            event = Some(SidebarEvent::ContextAction { target, action });
+            event = Some(SidebarEvent::ContextAction {
+                target: ScopedSessionTarget::new(key.0, key.1),
+                action,
+            });
         }
     }
 
@@ -756,17 +754,13 @@ struct SidebarDragState {
     preview: String,
 }
 
-fn sidebar_drag_preview_labels<'a>(items: &'a [SidebarItem<'a>]) -> HashMap<&'a str, String> {
-    let mut labels = HashMap::new();
-    for item in items {
-        let Some(anchor) = item.reorder_anchor else {
-            continue;
-        };
-        labels
-            .entry(anchor)
-            .or_insert_with(|| sidebar_drag_label(item));
-    }
-    labels
+/// The label the drag preview carries, taken from the anchor's first row. Looked up when a drag
+/// starts rather than mapped every frame: nothing else reads it.
+fn sidebar_drag_preview_label(items: &[SidebarItem<'_>], anchor: &str) -> String {
+    items
+        .iter()
+        .find(|item| item.reorder_anchor == Some(anchor))
+        .map_or_else(|| anchor.to_owned(), sidebar_drag_label)
 }
 
 fn sidebar_drag_label(item: &SidebarItem<'_>) -> String {
@@ -1411,23 +1405,24 @@ mod tests {
     fn context_navigation_counts_sessions_within_the_target_binding() {
         let local_scope = binding_scope(10);
         let remote_scope = binding_scope(20);
-        let targets = vec![
-            ScopedSessionTarget::new(local_scope, "$1"),
-            ScopedSessionTarget::new(local_scope, "$2"),
-            ScopedSessionTarget::new(remote_scope, "$1"),
+        let sessions = vec![
+            test_session("$1", "alpha", true),
+            test_session("$2", "beta", false),
         ];
+        let mut items = build_visible_sidebar_items(&sessions, Some("$1"), 32);
+        for item in &mut items {
+            item.session_scope = Some(local_scope);
+        }
+        let mut remote = items[0].clone();
+        remote.session_scope = Some(remote_scope);
+        items.push(remote);
 
-        assert_eq!(
-            sidebar_binding_target_position(&targets, &ScopedSessionTarget::new(local_scope, "$2"),),
-            Some((1, 2))
-        );
-        assert_eq!(
-            sidebar_binding_target_position(
-                &targets,
-                &ScopedSessionTarget::new(remote_scope, "$1"),
-            ),
-            Some((0, 1))
-        );
+        let positions = sidebar_binding_target_positions(&items);
+
+        // Position and count are per binding: the remote session shares "$1" without shifting it.
+        assert_eq!(positions.get(&(local_scope, "$1")), Some(&(0, 2)));
+        assert_eq!(positions.get(&(local_scope, "$2")), Some(&(1, 2)));
+        assert_eq!(positions.get(&(remote_scope, "$1")), Some(&(0, 1)));
     }
 
     #[test]
@@ -1613,22 +1608,19 @@ mod tests {
         let duplicate = items[2].clone();
         items.push(duplicate);
 
-        let targets = sidebar_session_targets(&items);
+        let positions = sidebar_binding_target_positions(&items);
+        // Neither the detail row nor the duplicated session row adds an ordered target.
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions.get(&(test_scope(), "s1")), Some(&(0, 2)));
+        assert_eq!(positions.get(&(test_scope(), "s2")), Some(&(1, 2)));
         assert_eq!(
-            targets,
-            vec![
-                ScopedSessionTarget::new(test_scope(), "s1"),
-                ScopedSessionTarget::new(test_scope(), "s2"),
-            ]
-        );
-        assert_eq!(
-            sidebar_context_session_target(&items[0]),
-            Some(ScopedSessionTarget::new(test_scope(), "s1"))
+            sidebar_context_session_key(&items[0]),
+            Some((test_scope(), "s1"))
         );
         // A detail row shares its session's context target even though it adds no ordered target.
         assert_eq!(
-            sidebar_context_session_target(&items[1]),
-            Some(ScopedSessionTarget::new(test_scope(), "s1"))
+            sidebar_context_session_key(&items[1]),
+            Some((test_scope(), "s1"))
         );
     }
 

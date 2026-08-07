@@ -30,6 +30,55 @@ fn terminal_engine_extracts_color_and_flag_style_state() -> Result<()> {
 }
 
 #[test]
+fn terminal_engine_extracts_a_background_only_cell_that_carries_no_styling() -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    // Blanks painted with only a background: the color lives in the cell's own content, and the
+    // cell reports no styling at all. Extraction that reads a background only from styled cells
+    // loses every colored blank — most of a TUI's status line, tables and dashboards.
+    engine.write_vt(b"\x1b[48;2;10;20;30m \x1b[0mZ");
+    let frame = engine.extract_frame()?;
+    let at = |x: u16| {
+        frame
+            .cells
+            .iter()
+            .find(|cell| cell.x == x && cell.y == 0)
+            .expect("extracted cell")
+    };
+
+    let painted = RgbColor {
+        r: 10,
+        g: 20,
+        b: 30,
+    };
+    let blank = at(0);
+    assert_eq!(frame.cell_text(blank), [' ']);
+    assert_eq!(blank.bg, Some(painted));
+    assert_eq!(blank.fg, None);
+    assert!(!blank.style.bold);
+
+    // After the reset, a plain cell carries no colors of its own and leaves both to the theme.
+    let plain = at(1);
+    assert_eq!(frame.cell_text(plain), ['Z']);
+    assert_eq!((plain.fg, plain.bg), (None, None));
+
+    // Erasing with a background set is the other way a cell ends up holding a color and nothing
+    // else: the region has no text to style, so the color is all there is to lose.
+    let mut engine = test_terminal_engine()?;
+    engine.write_vt(b"\x1b[2;1H\x1b[48;2;10;20;30m\x1b[K");
+    let frame = engine.extract_frame()?;
+    let erased = frame
+        .cells
+        .iter()
+        .find(|cell| cell.x == 0 && cell.y == 1)
+        .expect("erased cell");
+
+    assert_eq!(erased.bg, Some(painted));
+    assert_eq!(erased.fg, None);
+
+    Ok(())
+}
+
+#[test]
 fn terminal_engine_extracts_sgr_attribute_variants() -> Result<()> {
     let mut engine = test_terminal_engine()?;
     let palette_color = engine.terminal.color_palette()?[4];

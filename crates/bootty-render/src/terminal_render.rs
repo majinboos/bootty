@@ -464,13 +464,26 @@ pub struct FillCommand {
     pub role: FillRole,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct TextCommand {
     pub rect: SurfaceRect,
     pub text: String,
     pub attrs: TextAttrs,
     pub face: Arc<ResolvedFontFace>,
     pub font_size: f32,
+}
+
+impl PartialEq for TextCommand {
+    /// Compares the face by handle first. Faces come from a small interned set, so equal commands
+    /// share one `Arc` and skip comparing the family and fallback family names — a string compare
+    /// the per-frame prepared-text cache would otherwise pay on every hit.
+    fn eq(&self, other: &Self) -> bool {
+        self.rect == other.rect
+            && self.text == other.text
+            && self.attrs == other.attrs
+            && self.font_size == other.font_size
+            && (Arc::ptr_eq(&self.face, &other.face) || self.face == other.face)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
