@@ -4,6 +4,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     env,
     fs::{File, OpenOptions, TryLockError},
+    future::Future,
     hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -29,16 +30,19 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use crate::{
     command::{MuxCommand, MuxSplitDirection},
     rmux::{
-        RmuxWindowRow, list_pane_rows, list_window_rows, rmux_request_checked, session_from_rows,
+        RmuxWindowRow, list_pane_rows, list_window_rows, rmux_request, rmux_request_checked,
+        session_from_rows,
     },
     snapshot::MuxSnapshot,
 };
 
 const RMUX_OUTPUT_POLL_MIN_DELAY: Duration = Duration::from_millis(1);
 const RMUX_OUTPUT_POLL_MAX_DELAY: Duration = Duration::from_millis(16);
+const RMUX_RESTORE_CAPTURE_TIMEOUT: Duration = Duration::from_millis(500);
 const RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES: usize = 64;
 const RMUX_KEYBOARD_PROTOCOL_OPTION: &str = "@bootty-keyboard-protocol";
 const RMUX_BRACKETED_PASTE_OPTION: &str = "@bootty-bracketed-paste";
+const RMUX_MOUSE_MODE_FORMAT: &str = "#{pane_id}\x1f#{mouse_all_flag}\x1f#{mouse_button_flag}\x1f#{mouse_standard_flag}\x1f#{mouse_utf8_flag}\x1f#{mouse_sgr_flag}";
 
 const TERM_ENV: &str = "TERM";
 const COLORTERM_ENV: &str = "COLORTERM";
@@ -130,7 +134,7 @@ pub(crate) enum RmuxPaneEvent {
 
 pub(crate) struct RmuxPaneIo {
     pub(crate) output_rx: mpsc::Receiver<RmuxPaneEvent>,
-    pub(crate) input_tx: tokio_mpsc::UnboundedSender<String>,
+    pub(crate) input_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
     pub(crate) resize_tx: tokio_mpsc::UnboundedSender<TerminalSizeSpec>,
     pub(crate) result_rx: mpsc::Receiver<std::result::Result<(), String>>,
 }
@@ -162,7 +166,7 @@ struct RmuxOpenPaneRequest {
     target: RmuxPaneTarget,
     max_scrollback: usize,
     output_tx: mpsc::Sender<RmuxPaneEvent>,
-    input_rx: tokio_mpsc::UnboundedReceiver<String>,
+    input_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     resize_rx: tokio_mpsc::UnboundedReceiver<TerminalSizeSpec>,
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
 }
@@ -263,13 +267,41 @@ pub fn run_embedded_rmux_daemon() -> Result<Option<i32>> {
     Ok(Some(0))
 }
 
+#[doc(hidden)]
+pub fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
+    static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    STARTED
+        .get_or_init(|| {
+            let socket = crate::bootty_rmux_endpoint_path().map_err(|error| error.to_string())?;
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let started_tx = ready_tx.clone();
+                let result = (|| -> Result<()> {
+                    let runtime = Builder::new_multi_thread().enable_all().build()?;
+                    runtime.block_on(async {
+                        let daemon =
+                            rmux_server::ServerDaemon::new(rmux_server::DaemonConfig::new(socket))
+                                .bind()
+                                .await?;
+                        let _ = started_tx.send(Ok(()));
+                        daemon.wait().await
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            });
+            ready_rx.recv().map_err(|error| error.to_string())?
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
 fn ensure_rmux_sdk_daemon_binary() -> Result<()> {
     static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     RESOLVED
         .get_or_init(|| {
-            if env::var_os(rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV).is_some() {
-                return Ok(());
-            }
             let binary = env::current_exe().map_err(|error| error.to_string())?;
             // SAFETY: rmux workers are started only after this one-time initialization.
             unsafe {
@@ -593,8 +625,11 @@ impl RmuxBridgeState {
     async fn new_window(&mut self, session_name: &str, cwd: Option<&str>) -> Result<()> {
         let rmux = self.rmux().await?;
         let name = SessionName::new(session_name).context("invalid rmux session name")?;
+        let window_index = append_window_index(&list_window_rows(rmux, &name).await?);
         let session = rmux.session(name).await?;
-        let mut builder = apply_bootty_rmux_environment_to_window(session.new_window_with());
+        let mut builder = apply_bootty_rmux_environment_to_window(
+            session.new_window_with().at_index(window_index),
+        );
         if let Some(cwd) = cwd {
             builder = builder.cwd(cwd);
         }
@@ -768,6 +803,13 @@ fn should_retry_rmux_error(error: &anyhow::Error) -> bool {
         || text.contains("No such file")
 }
 
+fn append_window_index(rows: &[RmuxWindowRow]) -> u32 {
+    rows.iter()
+        .map(|window| window.index)
+        .max()
+        .map_or(0, |index| index.saturating_add(1))
+}
+
 fn display_window_index(rows: &[RmuxWindowRow], row: &RmuxWindowRow) -> u32 {
     let mut ordered = rows.iter().collect::<Vec<_>>();
     ordered.sort_by(|left, right| {
@@ -793,7 +835,7 @@ async fn run_pane_io(
     target: RmuxPaneTarget,
     max_scrollback: usize,
     output_tx: mpsc::Sender<RmuxPaneEvent>,
-    mut input_rx: tokio_mpsc::UnboundedReceiver<String>,
+    mut input_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     mut resize_rx: tokio_mpsc::UnboundedReceiver<TerminalSizeSpec>,
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
@@ -813,9 +855,10 @@ async fn run_pane_io(
     }
 }
 
-async fn replay_retained_kitty_keyboard_protocol(
+async fn replay_retained_terminal_protocol(
     pane: &Pane,
     output_tx: &mpsc::Sender<RmuxPaneEvent>,
+    mouse_modes: &[u16],
 ) -> Result<()> {
     let mut output_stream = pane
         .output_stream_starting_at(PaneOutputStart::Oldest)
@@ -846,11 +889,22 @@ async fn replay_retained_kitty_keyboard_protocol(
             .set_option(RMUX_BRACKETED_PASTE_OPTION, if enabled { "1" } else { "0" })
             .await;
     }
-    if let Some(sequence) = keyboard_protocol {
-        if let Some(flags) = kitty_keyboard_protocol_flags(&sequence) {
-            let _ = pane.set_option(RMUX_KEYBOARD_PROTOCOL_OPTION, flags).await;
-        }
-        let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(sequence));
+    let flags = keyboard_protocol
+        .as_deref()
+        .and_then(kitty_keyboard_protocol_flags);
+    let _ = pane
+        .set_option(
+            RMUX_KEYBOARD_PROTOCOL_OPTION,
+            flags.as_deref().unwrap_or(""),
+        )
+        .await;
+    let protocol = restored_terminal_protocol(
+        flags.as_deref(),
+        bracketed_paste.unwrap_or(false),
+        mouse_modes,
+    );
+    if !protocol.is_empty() {
+        let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(protocol));
     }
     Ok(())
 }
@@ -864,12 +918,104 @@ fn kitty_keyboard_protocol_flags(sequence: &[u8]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&flags[..end]).into_owned())
 }
 
-pub(crate) fn restored_terminal_protocol(flags: &str, bracketed_paste: bool) -> Vec<u8> {
-    format!(
-        "\x1b[>{flags}u{}",
-        if bracketed_paste { "\x1b[?2004h" } else { "" }
-    )
-    .into_bytes()
+pub(crate) fn restored_terminal_protocol(
+    flags: Option<&str>,
+    bracketed_paste: bool,
+    mouse_modes: &[u16],
+) -> Vec<u8> {
+    let mut protocol = Vec::new();
+    if let Some(flags) = flags {
+        protocol.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+    }
+    if bracketed_paste {
+        protocol.extend_from_slice(b"\x1b[?2004h");
+    }
+    for mode in mouse_modes {
+        protocol.extend_from_slice(format!("\x1b[?{mode}h").as_bytes());
+    }
+    protocol
+}
+
+async fn rmux_mouse_protocol_modes(target: &RmuxPaneTarget) -> Result<Vec<u16>> {
+    let session = target.session_name()?;
+    let response = rmux_request(Request::ListPanes(Box::new(rmux_proto::ListPanesRequest {
+        target: session,
+        target_window_index: None,
+        format: Some(RMUX_MOUSE_MODE_FORMAT.to_owned()),
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    })))
+    .await?;
+    let Response::ListPanes(response) = response else {
+        anyhow::bail!("rmux returned an unexpected list-panes response");
+    };
+    let target_pane = target.pane_id().map(|id| id.to_string());
+    for row in String::from_utf8_lossy(&response.output.stdout).lines() {
+        let Some((pane_id, modes)) = parse_rmux_mouse_protocol_modes(row) else {
+            continue;
+        };
+        if target_pane
+            .as_deref()
+            .is_some_and(|target_pane| target_pane != pane_id)
+        {
+            continue;
+        }
+        return Ok(modes);
+    }
+    anyhow::bail!("rmux pane mouse modes not found")
+}
+
+fn parse_rmux_mouse_protocol_modes(row: &str) -> Option<(&str, Vec<u16>)> {
+    let mut fields = row.split('\x1f');
+    let pane_id = fields.next()?;
+    let mouse_all = fields.next()? == "1";
+    let mouse_button = fields.next()? == "1";
+    let mouse_standard = fields.next()? == "1";
+    let mouse_utf8 = fields.next()? == "1";
+    let mouse_sgr = fields.next()? == "1";
+    let mut modes = Vec::new();
+    if mouse_all {
+        modes.push(1003);
+    } else if mouse_button {
+        modes.push(1002);
+    } else if mouse_standard {
+        modes.push(1000);
+    }
+    if mouse_utf8 {
+        modes.push(1005);
+    }
+    if mouse_sgr {
+        modes.push(1006);
+    }
+    Some((pane_id, modes))
+}
+
+async fn send_rmux_pane_input(pane: &Pane, target: &PaneTarget, bytes: &[u8]) -> Result<()> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return pane.send_text(text).await.map_err(Into::into);
+    }
+    let response = rmux_request(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
+        target: Some(target.clone()),
+        keys: rmux_hex_keys(bytes),
+        expand_formats: false,
+        hex: true,
+        literal: false,
+        dispatch_key_table: false,
+        copy_mode_command: false,
+        forward_mouse_event: false,
+        reset_terminal: false,
+        repeat_count: None,
+    }))
+    .await?;
+    let Response::SendKeys(_) = response else {
+        anyhow::bail!("rmux returned an unexpected send-keys response");
+    };
+    Ok(())
+}
+
+fn rmux_hex_keys(bytes: &[u8]) -> Vec<String> {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn bracketed_paste_mode(bytes: &[u8]) -> Option<bool> {
@@ -1073,14 +1219,20 @@ async fn run_pane_io_inner(
     target: RmuxPaneTarget,
     max_scrollback: usize,
     output_tx: &mpsc::Sender<RmuxPaneEvent>,
-    input_rx: &mut tokio_mpsc::UnboundedReceiver<String>,
+    input_rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     resize_rx: &mut tokio_mpsc::UnboundedReceiver<TerminalSizeSpec>,
     result_tx: &mpsc::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
     target.session_name()?;
     let rmux = connect_bootty_rmux().await?;
     let pane = pane_for_target(&rmux, &target).await?;
-    if let Ok(Some(flags)) = pane.option(RMUX_KEYBOARD_PROTOCOL_OPTION).await {
+    let mouse_modes = rmux_mouse_protocol_modes(&target).await?;
+    let keyboard_protocol = pane
+        .option(RMUX_KEYBOARD_PROTOCOL_OPTION)
+        .await
+        .ok()
+        .flatten();
+    if let Some(flags) = &keyboard_protocol {
         let bracketed_paste = pane
             .option(RMUX_BRACKETED_PASTE_OPTION)
             .await
@@ -1088,14 +1240,19 @@ async fn run_pane_io_inner(
             .flatten()
             .as_deref()
             == Some("1");
-        let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(restored_terminal_protocol(
-            &flags,
+        let protocol = restored_terminal_protocol(
+            (!flags.is_empty()).then_some(flags.as_str()),
             bracketed_paste,
-        )));
+            &mouse_modes,
+        );
+        if !protocol.is_empty() {
+            let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(protocol));
+        }
     } else {
-        replay_retained_kitty_keyboard_protocol(&pane, output_tx).await?;
+        replay_retained_terminal_protocol(&pane, output_tx, &mouse_modes).await?;
     }
     let mut live_output = RmuxLiveOutput::open(&rmux, &target).await?;
+    let input_target = live_output.pipe_target.clone();
     let mut restore_rx = start_restore_capture(target.clone(), max_scrollback);
     let mut restore_pending = true;
     let mut buffered_chunks = Vec::new();
@@ -1155,9 +1312,9 @@ async fn run_pane_io_inner(
                     }
                 }
             }
-            Some(mut text) = input_rx.recv() => {
+            Some(mut bytes) = input_rx.recv() => {
                 while let Ok(next) = input_rx.try_recv() {
-                    text.push_str(&next);
+                    bytes.extend_from_slice(&next);
                 }
                 if restore_pending {
                     restore_pending = false;
@@ -1166,7 +1323,9 @@ async fn run_pane_io_inner(
                         break;
                     }
                 }
-                let result = pane.send_text(&text).await.map_err(|error| error.to_string());
+                let result = send_rmux_pane_input(&pane, &input_target, &bytes)
+                    .await
+                    .map_err(|error| error.to_string());
                 let ok = result.is_ok();
                 let _ = result_tx.send(result);
                 if ok {
@@ -1196,11 +1355,11 @@ fn start_restore_capture(
 ) -> oneshot::Receiver<Option<Vec<u8>>> {
     let (result_tx, result_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let bytes = async {
+        let bytes = complete_restore_capture(RMUX_RESTORE_CAPTURE_TIMEOUT, async {
             let rmux = connect_bootty_rmux().await.ok()?;
             let pane = pane_for_target(&rmux, &target).await.ok()?;
             restore_capture(&pane, max_scrollback).await.ok()
-        }
+        })
         .await;
         let _ = result_tx.send(bytes);
     });
@@ -1223,11 +1382,7 @@ async fn restore_capture(pane: &Pane, max_scrollback: usize) -> Result<Vec<u8>> 
 }
 
 fn append_restore_snapshot(bytes: &mut Vec<u8>, snapshot: &PaneSnapshot) {
-    if bytes.windows(4).any(|window| window == b"\x1b]8;") {
-        append_restore_cursor_position(bytes, snapshot.cursor);
-    } else {
-        append_restore_snapshot_visible(bytes, snapshot);
-    }
+    append_restore_snapshot_visible(bytes, snapshot);
 }
 
 fn append_restore_snapshot_visible(bytes: &mut Vec<u8>, snapshot: &PaneSnapshot) {
@@ -1363,6 +1518,13 @@ fn append_restore_cursor_position(bytes: &mut Vec<u8>, cursor: PaneCursor) {
     }
 }
 
+async fn complete_restore_capture<F>(timeout: Duration, capture: F) -> Option<Vec<u8>>
+where
+    F: Future<Output = Option<Vec<u8>>>,
+{
+    tokio::time::timeout(timeout, capture).await.ok().flatten()
+}
+
 async fn pane_for_target(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<Pane> {
     let session_name = target.session_name()?;
     if let Some(pane_id) = target.pane_id() {
@@ -1379,6 +1541,18 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn stalled_restore_capture_completes_without_history() {
+        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
+
+        let capture = runtime.block_on(complete_restore_capture(
+            Duration::from_millis(1),
+            std::future::pending::<Option<Vec<u8>>>(),
+        ));
+
+        assert_eq!(capture, None);
+    }
 
     #[test]
     fn display_window_index_uses_compact_visual_order_for_skipped_rmux_indexes() {
@@ -1402,6 +1576,30 @@ mod tests {
         ];
 
         assert_eq!(display_window_index(&rows, &rows[1]), 2);
+    }
+
+    #[test]
+    fn new_window_index_appends_after_gaps() {
+        let rows = vec![
+            RmuxWindowRow {
+                session_name: "alpha".to_owned(),
+                id: "@10".to_owned(),
+                index: 0,
+                active: false,
+                name: "one".to_owned(),
+                layout: None,
+            },
+            RmuxWindowRow {
+                session_name: "alpha".to_owned(),
+                id: "@12".to_owned(),
+                index: 2,
+                active: true,
+                name: "three".to_owned(),
+                layout: None,
+            },
+        ];
+
+        assert_eq!(append_window_index(&rows), 3);
     }
 
     #[test]
@@ -1482,7 +1680,7 @@ mod tests {
         );
     }
     #[test]
-    fn restore_snapshot_keeps_captured_hyperlinks() {
+    fn restore_snapshot_realigns_hyperlinked_capture_before_cursor() {
         let snapshot = PaneSnapshot::new(
             4,
             1,
@@ -1500,7 +1698,7 @@ mod tests {
         append_restore_snapshot(&mut bytes, &snapshot);
 
         assert!(bytes.windows(4).any(|window| window == b"\x1b]8;"));
-        assert!(!bytes.windows(6).any(|window| window == b"\x1b[H\x1b[J"));
+        assert!(bytes.windows(6).any(|window| window == b"\x1b[H\x1b[J"));
         assert!(bytes.ends_with(b"\x1b[1;4H\x1b[?25h"));
     }
 
@@ -1535,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_kitty_keyboard_query_is_replayed_without_screen_output() {
+    fn retained_terminal_protocol_is_replayed_without_screen_output() {
         assert_eq!(
             kitty_keyboard_protocol_query(b"prompt\x1b[>7u\x1b[?u\x1b[c"),
             Some(b"\x1b[>7u\x1b[?u".to_vec())
@@ -1545,13 +1743,26 @@ mod tests {
             Some("7".to_owned())
         );
         assert_eq!(
-            restored_terminal_protocol("7", true),
-            b"\x1b[>7u\x1b[?2004h".to_vec()
+            restored_terminal_protocol(Some("7"), true, &[1000, 1006]),
+            b"\x1b[>7u\x1b[?2004h\x1b[?1000h\x1b[?1006h".to_vec()
         );
         assert_eq!(bracketed_paste_mode(b"\x1b[?2004h"), Some(true));
         assert_eq!(bracketed_paste_mode(b"\x1b[?2004h\x1b[?2004l"), Some(false));
         assert_eq!(kitty_keyboard_protocol_query(b"\x1b[>7u\x1b[?"), None);
         assert_eq!(kitty_keyboard_protocol_query(b"\x1b[>xu\x1b[?u"), None);
+        assert_eq!(
+            parse_rmux_mouse_protocol_modes("%152\x1f1\x1f0\x1f0\x1f0\x1f1"),
+            Some(("%152", vec![1003, 1006]))
+        );
+        assert_eq!(
+            parse_rmux_mouse_protocol_modes("%152\x1f0\x1f0\x1f1\x1f0\x1f0"),
+            Some(("%152", vec![1000]))
+        );
+    }
+
+    #[test]
+    fn rmux_hex_keys_preserve_arbitrary_input_bytes() {
+        assert_eq!(rmux_hex_keys(&[0x1b, 0x80, 0xff]), ["1b", "80", "ff"]);
     }
 
     #[test]
@@ -1592,10 +1803,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_control_commands_do_not_wait_for_background_snapshot() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        start_embedded_rmux_daemon_for_tests()?;
 
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
         let sessions = (0..10)
@@ -1636,11 +1847,6 @@ mod tests {
         for session_id in sessions {
             let _ = rmux_execute(MuxCommand::DitchSession { session_id });
         }
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 }

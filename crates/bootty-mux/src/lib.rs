@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 pub type RepaintHandle = Arc<dyn Fn() + Send + Sync + 'static>;
-pub use rmux_bridge::run_embedded_rmux_daemon;
+pub use rmux_bridge::{run_embedded_rmux_daemon, start_embedded_rmux_daemon_for_tests};
 
 const BOOTTY_RMUX_ABI_VERSION: &str = "0.9.1";
 

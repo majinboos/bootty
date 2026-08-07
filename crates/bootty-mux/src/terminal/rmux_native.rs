@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bootty_runtime::{
     DrainStats, TerminalSessionConfig,
     render_source::TerminalRenderSource,
@@ -104,7 +104,7 @@ enum RmuxTerminalCommand {
         scroll_delta: isize,
     },
     Paste(String),
-    InputText(String),
+    InputBytes(Vec<u8>),
     MouseViewportScroll {
         delta: isize,
     },
@@ -338,11 +338,11 @@ impl RmuxNativeTerminal {
         self.send_command(RmuxTerminalCommand::Resize(self.geometry))
     }
 
-    fn queue_input_text(&mut self, text: &str) -> Result<()> {
-        if text.is_empty() {
+    fn queue_input(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
             return Ok(());
         }
-        self.send_command(RmuxTerminalCommand::InputText(text.to_owned()))
+        self.send_command(RmuxTerminalCommand::InputBytes(bytes.to_vec()))
     }
 
     fn check_worker_error(&mut self) -> Result<()> {
@@ -366,8 +366,7 @@ impl RmuxNativeTerminal {
     }
 
     fn write_literal_input(&mut self, bytes: &[u8]) -> Result<()> {
-        let text = literal_input_text(bytes)?;
-        self.queue_input_text(text)
+        self.queue_input(bytes)
     }
 }
 
@@ -751,11 +750,11 @@ impl RmuxWorker {
                         self.write_output_buf();
                     }
                 }
-                RmuxTerminalCommand::InputText(text) => {
+                RmuxTerminalCommand::InputBytes(bytes) => {
                     self.mark_input_fast_path();
                     self.engine.scroll_viewport_bottom();
                     stats.terminal_changed = true;
-                    self.queue_input_text(&text);
+                    self.queue_input(&bytes);
                 }
                 RmuxTerminalCommand::MouseViewportScroll { delta } => {
                     self.mark_input_fast_path();
@@ -872,7 +871,9 @@ impl RmuxWorker {
                     }
                     if !capture.is_empty() {
                         collected_chunks += 1;
-                        let bytes = normalize_capture_newlines(&capture);
+                        let mut bytes = normalize_capture_newlines(&capture);
+                        // A captured snapshot is complete even when live output was cut mid-redraw.
+                        bytes.extend_from_slice(b"\x1b[?2026l");
                         collected_bytes += bytes.len();
                         self.push_pending_restore_output(bytes);
                     }
@@ -1071,20 +1072,17 @@ impl RmuxWorker {
         }
     }
 
-    fn queue_input_text(&mut self, text: &str) {
-        if text.is_empty() {
+    fn queue_input(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
             return;
         }
-        if self.pane_io.input_tx.send(text.to_owned()).is_err() {
+        if self.pane_io.input_tx.send(bytes.to_vec()).is_err() {
             self.send_error(anyhow::anyhow!("rmux input queue stopped"));
         }
     }
 
     fn write_literal_input(&mut self, bytes: &[u8]) {
-        match literal_input_text(bytes) {
-            Ok(text) => self.queue_input_text(text),
-            Err(error) => self.send_error(error),
-        }
+        self.queue_input(bytes);
     }
 
     fn write_output_buf(&mut self) {
@@ -1098,10 +1096,6 @@ impl RmuxWorker {
     fn send_error(&self, error: anyhow::Error) {
         let _ = self.error_tx.send(error.to_string());
     }
-}
-
-fn literal_input_text(bytes: &[u8]) -> Result<&str> {
-    std::str::from_utf8(bytes).context("rmux pane literal input must be valid UTF-8")
 }
 
 fn normalize_capture_newlines(bytes: &[u8]) -> Vec<u8> {
@@ -1217,8 +1211,14 @@ fn drain_rmux_output_backlog_with_limits(
 mod tests {
     use super::*;
     use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
+    use anyhow::Context;
     use bootty_terminal::terminal_input_model::{KeyMods, TerminalKey};
     use std::net::{TcpListener, TcpStream};
+
+    fn start_rmux_live_test() -> Result<()> {
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        crate::start_embedded_rmux_daemon_for_tests()
+    }
 
     fn test_repaint_callback() -> Arc<dyn Fn() + Send + Sync> {
         let thread = std::thread::current();
@@ -1256,6 +1256,59 @@ mod tests {
             side_effect_pane_id: None,
             benchmark_trace: None,
         }
+    }
+
+    #[test]
+    fn incomplete_synchronized_restore_publishes_initial_frame_promptly() -> Result<()> {
+        let (output_tx, output_rx) = mpsc::channel();
+        let (input_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, result_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        let (error_tx, _) = mpsc::channel();
+        let latest_frame = Arc::new(RmuxPublishedFrame::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        spawn_rmux_terminal_worker(RmuxWorkerConfig {
+            pane_io: RmuxPaneIo {
+                output_rx,
+                input_tx,
+                resize_tx,
+                result_rx,
+            },
+            geometry: test_geometry(),
+            terminal_config: test_config(),
+            command_rx,
+            latest_frame: Arc::clone(&latest_frame),
+            latest_drain: Arc::new(Mutex::new(DrainStats::default())),
+            pending_output_len: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::clone(&closed),
+            error_tx,
+            repaint_wakeup: test_repaint_callback(),
+            waiting_initial_remote_frame: true,
+        })?;
+        output_tx.send(RmuxPaneEvent::Restore {
+            buffered_chunks: Vec::new(),
+            capture: b"\x1b[?2026hrestored".to_vec(),
+        })?;
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let published = loop {
+            let frame = latest_frame.load()?;
+            if frame.text.iter().collect::<String>().contains("restored") {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        };
+        let _ = command_tx.send(RmuxTerminalCommand::Stop);
+
+        assert!(
+            published,
+            "an interrupted synchronized-output restore suppressed the initial frame"
+        );
+        Ok(())
     }
 
     #[test]
@@ -1331,17 +1384,14 @@ mod tests {
         );
     }
 
-    fn rmux_capture_text(pane_id: &str) -> Result<String> {
-        let output = std::process::Command::new("rmux")
-            .args(["capture-pane", "-t", pane_id, "-p"])
-            .output()?;
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    fn rmux_capture_text(session: &str, pane_id: &str) -> Result<String> {
+        rmux_sdk_capture_text(session, pane_id)
     }
 
-    fn wait_rmux_capture_contains(pane_id: &str, needle: &str) -> Result<()> {
+    fn wait_rmux_capture_contains(session: &str, pane_id: &str, needle: &str) -> Result<()> {
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let text = rmux_capture_text(pane_id)?;
+            let text = rmux_capture_text(session, pane_id)?;
             if text.contains(needle) {
                 return Ok(());
             }
@@ -1353,10 +1403,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_input_write_is_non_blocking_and_reaches_pane() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        start_rmux_live_test()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1392,10 +1441,7 @@ mod tests {
         loop {
             terminal.drain_pty();
             terminal.check_worker_error()?;
-            let output = std::process::Command::new("rmux")
-                .args(["capture-pane", "-t", &pane_id, "-p"])
-                .output()?;
-            let text = String::from_utf8_lossy(&output.stdout);
+            let text = rmux_capture_text(&session, &pane_id)?;
             if text.contains("BOOTTY_FAST_INPUT") {
                 break;
             }
@@ -1405,18 +1451,13 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
     #[test]
     #[ignore = "requires chafa and an isolated RMUX_TMPDIR"]
     fn rmux_live_chafa_renders_kitty_image() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        start_rmux_live_test()?;
 
         let client = SdkRmuxClient::new();
         let session = format!("bootty-image-{}", std::process::id());
@@ -1500,9 +1541,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_two_processes_receive_the_same_pane_output() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        start_rmux_live_test()?;
 
         let client = SdkRmuxClient::new();
         let session = format!("bootty-shared-output-{}", std::process::id());
@@ -1663,10 +1704,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_ctrl_c_key_interrupts_foreground_process() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        start_rmux_live_test()?;
 
         let client = SdkRmuxClient::new();
         let session = format!("bootty-ctrl-c-{}", std::process::id());
@@ -1690,7 +1730,7 @@ mod tests {
             RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
 
         terminal.write_input(b"sleep 30\r")?;
-        wait_rmux_capture_contains(&pane_id, "sleep 30")?;
+        wait_rmux_capture_contains(&session, &pane_id, "sleep 30")?;
         terminal.encode_key(KeyInput {
             key: TerminalKey::C,
             mods: KeyMods {
@@ -1702,22 +1742,16 @@ mod tests {
             unshifted: Some('c'),
         })?;
         terminal.write_input(b"printf 'BOOTTY_AFTER_CTRL_C\\n'\r")?;
-        wait_rmux_capture_contains(&pane_id, "BOOTTY_AFTER_CTRL_C")?;
+        wait_rmux_capture_contains(&session, &pane_id, "BOOTTY_AFTER_CTRL_C")?;
 
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_input_latency_stays_interactive() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        start_rmux_live_test()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1752,7 +1786,8 @@ mod tests {
         while Instant::now() < deadline && (capture_elapsed.is_none() || frame_elapsed.is_none()) {
             terminal.drain_pty();
             terminal.check_worker_error()?;
-            if capture_elapsed.is_none() && rmux_capture_text(&pane_id)?.contains(&marker) {
+            if capture_elapsed.is_none() && rmux_capture_text(&session, &pane_id)?.contains(&marker)
+            {
                 capture_elapsed = Some(start.elapsed());
             }
             if frame_elapsed.is_none() {
@@ -1782,19 +1817,13 @@ mod tests {
         );
 
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_input_after_scrollback_restore_stays_interactive() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        start_rmux_live_test()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1811,11 +1840,8 @@ mod tests {
             .and_then(|pane| pane.pane_id.clone())
             .context("restore latency smoke pane should exist")?;
         let prefill = "for i in $(seq 1 4000); do printf 'BOOTTY_PREFILL_%04d\\n' $i; done; printf 'BOOTTY_PREFILL_DONE\\n'";
-        let status = std::process::Command::new("rmux")
-            .args(["send-keys", "-t", &pane_id, prefill, "Enter"])
-            .status()?;
-        anyhow::ensure!(status.success(), "rmux send-keys prefill failed: {status}");
-        wait_rmux_capture_contains(&pane_id, "BOOTTY_PREFILL_DONE")?;
+        rmux_live_send_text(&session, &pane_id, &format!("{prefill}\r"))?;
+        wait_rmux_capture_contains(&session, &pane_id, "BOOTTY_PREFILL_DONE")?;
 
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
@@ -1835,7 +1861,8 @@ mod tests {
         while Instant::now() < deadline && (capture_elapsed.is_none() || frame_elapsed.is_none()) {
             terminal.drain_pty();
             terminal.check_worker_error()?;
-            if capture_elapsed.is_none() && rmux_capture_text(&pane_id)?.contains(&marker) {
+            if capture_elapsed.is_none() && rmux_capture_text(&session, &pane_id)?.contains(&marker)
+            {
                 capture_elapsed = Some(start.elapsed());
             }
             if frame_elapsed.is_none() {
@@ -1865,20 +1892,14 @@ mod tests {
         );
 
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_drop_and_reopen_preserves_process_and_restores_history_after_initial_resize()
     -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        start_rmux_live_test()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1927,19 +1948,13 @@ mod tests {
         rmux_live_send_text(&session, &pane_id, &format!("printf '{after_marker}\\n'\r"))?;
         wait_rmux_sdk_capture_contains(&session, &pane_id, &after_marker)?;
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_drop_and_reopen_restores_cursor_position() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        start_rmux_live_test()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1971,7 +1986,7 @@ mod tests {
             terminal.write_input(
                 b"printf '\x1b[2J\x1b[5;10HBOOTTY_CURSOR_MARK\x1b[8;15H'; sleep 30\r",
             )?;
-            wait_rmux_capture_contains(&pane_id, "BOOTTY_CURSOR_MARK")?;
+            wait_rmux_capture_contains(&session, &pane_id, "BOOTTY_CURSOR_MARK")?;
             let deadline = Instant::now() + std::time::Duration::from_secs(2);
             loop {
                 terminal.drain_pty();
@@ -2007,11 +2022,6 @@ mod tests {
         }
 
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
@@ -2087,25 +2097,6 @@ mod tests {
             let cursor = pane.snapshot().await?.cursor;
             Ok((cursor.row, cursor.col))
         })
-    }
-
-    #[test]
-    fn literal_input_text_accepts_terminal_control_sequences() -> Result<()> {
-        let text = literal_input_text(b"\x1b[200~hello\r\x1b[201~")?;
-
-        assert_eq!(text, "\x1b[200~hello\r\x1b[201~");
-        Ok(())
-    }
-
-    #[test]
-    fn literal_input_text_rejects_non_utf8_bytes() {
-        let error = literal_input_text(&[0xff]).unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("rmux pane literal input must be valid UTF-8")
-        );
     }
 
     #[test]

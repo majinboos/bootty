@@ -1975,6 +1975,11 @@ impl AppState {
         self.binding.mux.last_error().or(self.last_error.as_deref())
     }
 
+    pub fn clear_last_error(&mut self) {
+        self.binding.mux.set_error(None);
+        self.last_error = None;
+    }
+
     pub fn sidebar_focused(&self) -> bool {
         self.input_focus == InputFocus::Sidebar
     }
@@ -9417,10 +9422,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_app_state_session_and_tab_activation_stay_interactive() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        bootty_mux::start_embedded_rmux_daemon_for_tests()?;
         use crate::mux::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -9494,11 +9499,6 @@ mod tests {
 
         client.kill_session(&session_a)?;
         client.kill_session(&session_b)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
 
         assert!(
             session_elapsed < Duration::from_millis(100),

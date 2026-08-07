@@ -2266,13 +2266,20 @@ impl eframe::App for BoottyApp {
             }
         });
         if let Some(error) = self.state.last_error().map(str::to_owned) {
+            let mut dismiss = false;
             egui::Area::new(egui::Id::new("last-error"))
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -12.0])
                 .show(ui.ctx(), |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.colored_label(egui::Color32::from_rgb(0xf3, 0x8b, 0xa8), error);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(egui::Color32::from_rgb(0xf3, 0x8b, 0xa8), error);
+                            dismiss = ui.small_button("Dismiss").clicked();
+                        });
                     });
                 });
+            if dismiss {
+                self.state.clear_last_error();
+            }
         }
         if !self.settings_open {
             self.show_new_mux_session_dialog(ui.ctx());
