@@ -7128,6 +7128,7 @@ mod tests {
             anchor: MuxPaneAnchor {
                 session_id: id.to_owned(),
                 pane_id: Some(format!("{id}-pane")),
+                pane_pid: None,
                 cwd: Some(cwd.to_owned()),
                 process: None,
             },

@@ -23,6 +23,7 @@ pub(crate) mod rmux_bridge;
 pub mod snapshot;
 pub mod terminal;
 pub mod tmux;
+pub mod tmux_control;
 pub mod tmux_protocol;
 pub mod zellij;
 

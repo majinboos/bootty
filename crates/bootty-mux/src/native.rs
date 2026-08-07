@@ -381,6 +381,7 @@ impl NativeMuxState {
             .unwrap_or_else(|| MuxPaneAnchor {
                 session_id: session.id.clone(),
                 pane_id: None,
+                pane_pid: None,
                 cwd: None,
                 process: None,
             });
@@ -411,6 +412,7 @@ fn anchor_for_window(session_id: &str, window: &NativeWindow) -> MuxPaneAnchor {
     MuxPaneAnchor {
         session_id: session_id.to_owned(),
         pane_id: pane.map(|pane| pane.id.clone()),
+        pane_pid: None,
         cwd: pane.map(|pane| pane.cwd.to_string_lossy().into_owned()),
         process: Some("shell".to_owned()),
     }
@@ -420,6 +422,7 @@ fn anchor_for_pane(session_id: &str, pane: &NativePane) -> MuxPaneAnchor {
     MuxPaneAnchor {
         session_id: session_id.to_owned(),
         pane_id: Some(pane.id.clone()),
+        pane_pid: None,
         cwd: Some(pane.cwd.to_string_lossy().into_owned()),
         process: Some("shell".to_owned()),
     }

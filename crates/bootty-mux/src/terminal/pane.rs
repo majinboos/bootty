@@ -1443,6 +1443,7 @@ mod tests {
         let anchor = MuxPaneAnchor {
             session_id: "$1".to_owned(),
             pane_id: Some("%1".to_owned()),
+            pane_pid: None,
             cwd: None,
             process: None,
         };
@@ -2167,6 +2168,7 @@ mod tests {
         let before = MuxPaneAnchor {
             session_id: "agents".to_owned(),
             pane_id: Some("%3".to_owned()),
+            pane_pid: None,
             cwd: Some("/repo".to_owned()),
             process: Some("nvim".to_owned()),
         };
@@ -2189,6 +2191,7 @@ mod tests {
         let anchor = MuxPaneAnchor {
             session_id: "agents".to_owned(),
             pane_id: Some("%3".to_owned()),
+            pane_pid: None,
             cwd: Some("/repo/subdir".to_owned()),
             process: Some("zsh".to_owned()),
         };
@@ -2210,11 +2213,13 @@ mod tests {
         let session_anchor = MuxPaneAnchor {
             session_id: "agents".to_owned(),
             pane_id: None,
+            pane_pid: None,
             cwd: None,
             process: None,
         };
         let other_pane = MuxPaneAnchor {
             pane_id: Some("%4".to_owned()),
+            pane_pid: None,
             ..session_anchor.clone()
         };
 
@@ -2246,6 +2251,7 @@ mod tests {
         let split_changed_active_pane = MuxPaneAnchor {
             session_id: "agents".to_owned(),
             pane_id: Some("%4".to_owned()),
+            pane_pid: None,
             cwd: None,
             process: None,
         };

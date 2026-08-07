@@ -1139,6 +1139,7 @@ mod tests {
         let anchor = MuxPaneAnchor {
             session_id: "$7".to_owned(),
             pane_id: Some("%9".to_owned()),
+            pane_pid: None,
             cwd: None,
             process: None,
         };
@@ -1157,6 +1158,7 @@ mod tests {
                     anchor: MuxPaneAnchor {
                         session_id: "$7".to_owned(),
                         pane_id: Some("%11".to_owned()),
+                        pane_pid: None,
                         cwd: None,
                         process: Some("nvim".to_owned()),
                     },
@@ -1199,6 +1201,7 @@ mod tests {
         active.anchor = MuxPaneAnchor {
             session_id: "$1".to_owned(),
             pane_id: Some("%2".to_owned()),
+            pane_pid: None,
             cwd: None,
             process: Some("fish".to_owned()),
         };
@@ -1206,6 +1209,7 @@ mod tests {
         inactive.anchor = MuxPaneAnchor {
             session_id: "$1".to_owned(),
             pane_id: Some("%1".to_owned()),
+            pane_pid: None,
             cwd: None,
             process: Some("zsh".to_owned()),
         };
@@ -1579,6 +1583,7 @@ mod tests {
             anchor: MuxPaneAnchor {
                 session_id: id.to_owned(),
                 pane_id: None,
+                pane_pid: None,
                 cwd: None,
                 process: None,
             },
@@ -1787,6 +1792,7 @@ mod tests {
         editor.anchor = MuxPaneAnchor {
             session_id: "work".to_owned(),
             pane_id: Some("%1".to_owned()),
+            pane_pid: None,
             cwd: Some("/repo".to_owned()),
             process: Some("nvim".to_owned()),
         };
@@ -1859,6 +1865,7 @@ mod tests {
         editor.anchor = MuxPaneAnchor {
             session_id: "work".to_owned(),
             pane_id: Some("%1".to_owned()),
+            pane_pid: None,
             cwd: Some("/repo".to_owned()),
             process: Some("nvim".to_owned()),
         };

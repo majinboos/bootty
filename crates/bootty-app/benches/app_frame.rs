@@ -155,6 +155,7 @@ fn sidebar_sessions(count: usize) -> Vec<MuxSession> {
             let anchor = MuxPaneAnchor {
                 session_id: id.clone(),
                 pane_id: Some(format!("%{}", index + 10)),
+                pane_pid: None,
                 cwd: Some("/Users/luan/src/bootty".to_owned()),
                 process: Some(
                     match index % 4 {

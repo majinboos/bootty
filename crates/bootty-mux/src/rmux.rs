@@ -511,6 +511,7 @@ pub(crate) fn session_from_rows(
                 .unwrap_or_else(|| MuxPaneAnchor {
                     session_id: name.to_owned(),
                     pane_id: None,
+                    pane_pid: None,
                     cwd: None,
                     process: None,
                 });
@@ -548,6 +549,7 @@ pub(crate) fn session_from_rows(
         .unwrap_or_else(|| MuxPaneAnchor {
             session_id: name.to_owned(),
             pane_id: None,
+            pane_pid: None,
             cwd: None,
             process: None,
         });
@@ -566,6 +568,7 @@ fn anchor_for_pane_row(session_name: &str, pane: &RmuxPaneRow) -> MuxPaneAnchor 
     MuxPaneAnchor {
         session_id: session_name.to_owned(),
         pane_id: Some(pane.pane_id.clone()),
+        pane_pid: None,
         cwd: pane.cwd.clone(),
         process: pane.process.clone(),
     }
@@ -1583,6 +1586,7 @@ mod tests {
                     anchor: MuxPaneAnchor {
                         session_id: "alpha".to_owned(),
                         pane_id: Some("%1".to_owned()),
+                        pane_pid: None,
                         cwd: Some("/repo".to_owned()),
                         process: Some("vim".to_owned()),
                     },

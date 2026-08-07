@@ -133,6 +133,7 @@ fn parse_zellij_snapshot(output: &str) -> MuxSnapshot {
                 anchor: MuxPaneAnchor {
                     session_id: name.to_owned(),
                     pane_id: None,
+                    pane_pid: None,
                     cwd: None,
                     process: None,
                 },

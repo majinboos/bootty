@@ -59,6 +59,9 @@ pub struct MuxWindowProgress {
 pub struct MuxPaneAnchor {
     pub session_id: String,
     pub pane_id: Option<String>,
+    /// The pane's process id, when the backend reports one. Lets a module walk the pane's process
+    /// tree without asking the backend again for what a snapshot already knows.
+    pub pane_pid: Option<u32>,
     pub cwd: Option<String>,
     pub process: Option<String>,
 }
