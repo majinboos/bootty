@@ -297,6 +297,8 @@ fn key_label(token: &str) -> String {
         "enter" | "return" => "Enter".to_owned(),
         "esc" | "escape" => "Esc".to_owned(),
         "space" => "Space".to_owned(),
+        "scroll_up" => "Scroll ↑".to_owned(),
+        "scroll_down" => "Scroll ↓".to_owned(),
         other if other.chars().count() == 1 => other.to_uppercase(),
         other => other.to_owned(),
     }
