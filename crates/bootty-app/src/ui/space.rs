@@ -9,13 +9,13 @@ use eframe::egui;
 use iconflow::{Pack, list};
 
 use crate::{
-    config::MultiplexerBackendConfig,
+    config::{MultiplexerBackendConfig, SshRemoteConfig},
     mux::controller::SpaceId,
     ui::{
         icons::{has_slug, icon_text},
         overlay::{self, FloatingWindow, TextPrompt},
     },
-    workspace::DEFAULT_SPACE_COLOR,
+    workspace::{DEFAULT_SPACE_COLOR, SpaceMuxOverride},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,8 +26,64 @@ pub struct SpaceEditorDialog {
     color: [u8; 3],
     tint_sidebar: bool,
     backend: Option<MultiplexerBackendConfig>,
+    /// The backend a `None` override resolves to, so the editor knows whether this space can name a
+    /// remote host at all.
+    inherited_backend: MultiplexerBackendConfig,
+    remote: RemoteFields,
     focus: bool,
     icon_search: String,
+}
+
+/// The remote connection as typed. Held as text so a half-written port or host does not have to
+/// parse on every keystroke; it becomes an [`SshRemoteConfig`] when the space is saved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RemoteFields {
+    host: String,
+    user: String,
+    port: String,
+    program: String,
+    flags: String,
+}
+
+impl RemoteFields {
+    fn from_config(remote: Option<&SshRemoteConfig>) -> Self {
+        let Some(remote) = remote else {
+            return Self::default();
+        };
+        Self {
+            host: remote.host.clone(),
+            user: remote.user.clone().unwrap_or_default(),
+            port: remote.port.map(|port| port.to_string()).unwrap_or_default(),
+            program: remote.program.clone(),
+            flags: remote.args.join(" "),
+        }
+    }
+
+    /// The remote to save, or `None` when no host is named: a remote without a host reaches
+    /// nothing, and the rest of the fields describe how to reach a host that is not there.
+    fn to_config(&self) -> Option<SshRemoteConfig> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return None;
+        }
+        let mut remote = SshRemoteConfig::for_host(host);
+        remote.user = nonempty(&self.user);
+        remote.port = self.port.trim().parse().ok();
+        if let Some(program) = nonempty(&self.program) {
+            remote.program = program;
+        }
+        remote.args = self
+            .flags
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        Some(remote)
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,19 +96,25 @@ pub enum SpaceEditorEvent {
         icon: String,
         color: [u8; 3],
         tint_sidebar: bool,
-        backend: Option<MultiplexerBackendConfig>,
+        mux: SpaceMuxOverride,
     },
 }
 
 impl SpaceEditorDialog {
-    pub fn new_space(icon: String, backend: Option<MultiplexerBackendConfig>) -> Self {
+    pub fn new_space(
+        icon: String,
+        mux: SpaceMuxOverride,
+        inherited_backend: MultiplexerBackendConfig,
+    ) -> Self {
         Self {
             space_id: None,
             name: String::new(),
             icon,
             color: DEFAULT_SPACE_COLOR,
             tint_sidebar: false,
-            backend,
+            backend: mux.backend,
+            inherited_backend,
+            remote: RemoteFields::from_config(mux.remote.as_ref()),
             icon_search: String::new(),
             focus: true,
         }
@@ -64,7 +126,8 @@ impl SpaceEditorDialog {
         icon: String,
         color: [u8; 3],
         tint_sidebar: bool,
-        backend: Option<MultiplexerBackendConfig>,
+        mux: SpaceMuxOverride,
+        inherited_backend: MultiplexerBackendConfig,
     ) -> Self {
         Self {
             space_id: Some(space_id),
@@ -72,10 +135,17 @@ impl SpaceEditorDialog {
             icon,
             color,
             tint_sidebar,
-            backend,
+            backend: mux.backend,
+            inherited_backend,
+            remote: RemoteFields::from_config(mux.remote.as_ref()),
             icon_search: String::new(),
             focus: true,
         }
+    }
+
+    /// The backend this space will actually run, override or inherited.
+    fn resolved_backend(&self) -> MultiplexerBackendConfig {
+        self.backend.unwrap_or(self.inherited_backend)
     }
 
     pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> SpaceEditorEvent {
@@ -141,6 +211,7 @@ impl SpaceEditorDialog {
                             }
                         });
                 });
+                self.remote_ui(ui, palette);
                 ui.label(
                     egui::RichText::new("icon")
                         .monospace()
@@ -168,13 +239,73 @@ impl SpaceEditorDialog {
                 icon: self.icon.clone(),
                 color: self.color,
                 tint_sidebar: self.tint_sidebar,
-                backend: self.backend,
+                mux: SpaceMuxOverride {
+                    backend: self.backend,
+                    remote: self.remote.to_config(),
+                },
             };
         }
         if result.escaped || result.clicked_outside {
             return SpaceEditorEvent::Close;
         }
         SpaceEditorEvent::None
+    }
+}
+
+impl SpaceEditorDialog {
+    /// The host this space's multiplexer runs on. Only for the backends bootty reaches through a
+    /// client — the others keep their terminals in this process, with no host to name.
+    fn remote_ui(&mut self, ui: &mut egui::Ui, palette: ThemePalette) {
+        if !self.resolved_backend().supports_remote() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("ssh host")
+                    .monospace()
+                    .size(12.0)
+                    .color(palette.muted),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.remote.host)
+                    .hint_text("empty keeps this space local")
+                    .desired_width(220.0),
+            );
+        });
+        if self.remote.host.trim().is_empty() {
+            return;
+        }
+        egui::CollapsingHeader::new(
+            egui::RichText::new("connection details")
+                .monospace()
+                .size(12.0)
+                .color(palette.muted),
+        )
+        .id_salt("space-editor-remote-details")
+        .show(ui, |ui| {
+            for (caption, hint, value) in [
+                ("user", "from ~/.ssh/config", &mut self.remote.user),
+                ("port", "22", &mut self.remote.port),
+                ("ssh client", "ssh", &mut self.remote.program),
+                ("flags", "-i ~/.ssh/devbox", &mut self.remote.flags),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(caption)
+                            .monospace()
+                            .size(12.0)
+                            .color(palette.muted),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(value)
+                            .hint_text(hint)
+                            .desired_width(200.0),
+                    );
+                });
+            }
+        });
+        ui.add_space(8.0);
     }
 }
 
@@ -324,6 +455,45 @@ fn normalized_name(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// The editor holds the connection as text while it is being typed, so what comes back out has
+    /// to be the same remote that went in — and a space with no host named has to save as local
+    /// rather than as a remote pointing nowhere.
+    #[test]
+    fn editor_fields_round_trip_the_remote_they_were_opened_with() {
+        let remote = SshRemoteConfig {
+            host: "devbox".to_owned(),
+            user: Some("dev".to_owned()),
+            port: Some(2222),
+            program: "ssh".to_owned(),
+            args: vec!["-i".to_owned(), "~/.ssh/devbox".to_owned()],
+        };
+
+        let fields = RemoteFields::from_config(Some(&remote));
+
+        assert_eq!(fields.to_config(), Some(remote));
+        assert_eq!(RemoteFields::default().to_config(), None);
+        assert_eq!(
+            RemoteFields {
+                host: "  ".to_owned(),
+                user: "dev".to_owned(),
+                ..RemoteFields::default()
+            }
+            .to_config(),
+            None
+        );
+        // A port mid-edit is not a port: it drops rather than becoming a different one.
+        assert_eq!(
+            RemoteFields {
+                host: "devbox".to_owned(),
+                port: "22x".to_owned(),
+                ..RemoteFields::default()
+            }
+            .to_config()
+            .and_then(|remote| remote.port),
+            None
+        );
+    }
+
     #[test]
     fn space_name_trims_and_rejects_blank() {
         assert_eq!(normalized_name("  Review  "), Some("Review".to_owned()));
@@ -332,7 +502,11 @@ mod tests {
 
     #[test]
     fn new_space_editor_starts_with_a_blank_name() {
-        let dialog = SpaceEditorDialog::new_space("folder".to_owned(), None);
+        let dialog = SpaceEditorDialog::new_space(
+            "folder".to_owned(),
+            SpaceMuxOverride::default(),
+            MultiplexerBackendConfig::Native,
+        );
         assert!(dialog.name.is_empty());
     }
 

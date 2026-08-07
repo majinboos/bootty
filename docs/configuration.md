@@ -90,6 +90,10 @@ host = "devbox" # ~/.ssh/config alias, hostname, or address
 # args = ["-i", "~/.ssh/devbox"] # extra flags, passed before the destination
 
 # `bootty --backend tmux --ssh-remote devbox` does the same for one run.
+#
+# This is the default every space inherits. A single space can name its own host
+# in the space editor, next to its backend, so remote and local spaces sit side
+# by side; that override lives in the workspace database, not in this file.
 
 [input]
 preset = "ghostty" # ghostty (default), bootty, or tmux — which built-in default keybind set to use

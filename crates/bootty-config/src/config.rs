@@ -7,7 +7,7 @@ use std::{
     time::SystemTime,
 };
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use bootty_render::terminal_text::{FontFeature, TerminalTextConfig};
@@ -389,7 +389,7 @@ struct MultiplexerPatch {
 ///
 /// `host` alone is enough when the host is an `~/.ssh/config` alias; `user`, `port` and `args`
 /// cover the machines where that file is absent or does not describe the host.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct SshRemoteConfig {
     /// SSH config alias, hostname or address of the host running the multiplexer.
@@ -427,10 +427,19 @@ impl SshRemoteConfig {
     }
 }
 
+impl MultiplexerBackendConfig {
+    /// Whether this backend's multiplexer can live on another host. Bootty drives `tmux` and
+    /// `zellij` through a client it can run anywhere; `native` panes are this process's own PTYs,
+    /// and `rmux` streams its pane output through files on the local filesystem.
+    pub fn supports_remote(self) -> bool {
+        match self {
+            Self::Tmux | Self::Zellij => true,
+            Self::Native | Self::Rmux => false,
+        }
+    }
+}
+
 impl MultiplexerConfig {
-    /// A remote binding renders a multiplexer client running on the other host, so the backend has
-    /// to be one that has a client: `native` panes are this process's own PTYs, and `rmux` streams
-    /// its pane output through files on the local filesystem.
     pub fn validate_remote(&self) -> ConfigResult<()> {
         let Some(remote) = &self.remote else {
             return Ok(());
@@ -440,15 +449,13 @@ impl MultiplexerConfig {
                 "multiplexer.remote.host must name a host".to_owned(),
             ));
         }
-        match self.backend {
-            MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => Ok(()),
-            MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux => {
-                Err(ConfigLoadError::new(format!(
-                    "multiplexer.remote needs backend \"tmux\" or \"zellij\", got {:?}",
-                    self.backend
-                )))
-            }
+        if self.backend.supports_remote() {
+            return Ok(());
         }
+        Err(ConfigLoadError::new(format!(
+            "multiplexer.remote needs backend \"tmux\" or \"zellij\", got {:?}",
+            self.backend
+        )))
     }
 }
 

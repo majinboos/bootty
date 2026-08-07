@@ -7,7 +7,7 @@ use std::{
 };
 
 use anyhow::Result;
-use bootty_config::config::MultiplexerBackendConfig;
+use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig};
 use eframe::egui::{self, Pos2, Rect};
 
 mod copy_mode;
@@ -91,7 +91,7 @@ use crate::{
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::{WorkspaceSpace, WorkspaceStore},
+    workspace::{SpaceMuxOverride, WorkspaceSpace, WorkspaceStore},
 };
 use bootty_terminal::terminal_engine::{
     TerminalColorConfig, TerminalCopyModeAction, TerminalCursorConfig, TerminalFeatureConfig,
@@ -369,6 +369,7 @@ struct BindingRuntime {
     scope: MuxScope,
     label: String,
     backend_override: Option<MultiplexerBackendConfig>,
+    remote_override: Option<SshRemoteConfig>,
     multiplexer: crate::config::MultiplexerConfig,
     terminal: Box<ActiveTerminal>,
     mux: BindingMuxController,
@@ -397,7 +398,7 @@ impl BindingRuntime {
         repaint: RepaintHandle,
     ) -> Self {
         let mut binding =
-            Self::new_with_backend_override(scope, config, None, variant, repaint.clone());
+            Self::new_with_backend_override(scope, config, None, None, variant, repaint.clone());
         binding.restore_persisted_sessions(&repaint);
         binding
     }
@@ -406,12 +407,21 @@ impl BindingRuntime {
         scope: MuxScope,
         config: &BoottyConfig,
         backend_override: Option<MultiplexerBackendConfig>,
+        remote_override: Option<SshRemoteConfig>,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
         let mut config = config.clone();
         if let Some(backend) = backend_override {
             config.multiplexer.backend = backend;
+        }
+        if let Some(remote) = remote_override.clone() {
+            config.multiplexer.remote = Some(remote);
+        }
+        // A space that keeps its sessions in this process has no host to reach, so an inherited
+        // remote is dropped rather than handed to a backend that cannot use it.
+        if !config.multiplexer.backend.supports_remote() {
+            config.multiplexer.remote = None;
         }
         let NativeTerminalOwner {
             terminal,
@@ -429,6 +439,7 @@ impl BindingRuntime {
         Self {
             label: binding_label(scope, &config.multiplexer),
             backend_override,
+            remote_override,
             multiplexer: config.multiplexer.clone(),
             scope,
             terminal,
@@ -601,6 +612,7 @@ fn binding_runtime_for_multiplexer(
     scope: MuxScope,
     label: String,
     backend_override: Option<MultiplexerBackendConfig>,
+    remote_override: Option<SshRemoteConfig>,
     variant: AppearanceVariant,
     repaint: RepaintHandle,
 ) -> BindingRuntime {
@@ -608,6 +620,7 @@ fn binding_runtime_for_multiplexer(
         scope,
         config,
         backend_override,
+        remote_override,
         variant,
         repaint.clone(),
     );
@@ -643,6 +656,7 @@ impl SpaceRuntime {
                     workspace_binding.mux_scope(),
                     workspace_binding.name().to_owned(),
                     workspace_binding.backend_override(),
+                    workspace_binding.remote_override().cloned(),
                     variant,
                     repaint.clone(),
                 );
@@ -1443,6 +1457,16 @@ impl AppState {
             .map(|space| space.binding.backend_override)
     }
 
+    fn space_remote_override(&self, space_id: SpaceId) -> Option<SshRemoteConfig> {
+        if space_id == self.active_space_id {
+            return self.binding.remote_override.clone();
+        }
+        self.inactive_spaces
+            .iter()
+            .find(|space| space.id == space_id)
+            .and_then(|space| space.binding.remote_override.clone())
+    }
+
     pub fn space_transition(&self, now: Instant) -> Option<(SpaceId, SpaceId, f32)> {
         let transition = self.space_transition?;
         let progress = transition.progress_at(now);
@@ -1467,7 +1491,13 @@ impl AppState {
         color: [u8; 3],
         tint_sidebar: bool,
     ) -> bool {
-        self.create_space_with_backend_from_ui(name, icon, color, tint_sidebar, None)
+        self.create_space_with_backend_from_ui(
+            name,
+            icon,
+            color,
+            tint_sidebar,
+            SpaceMuxOverride::default(),
+        )
     }
 
     fn create_space_with_backend_from_ui(
@@ -1476,7 +1506,7 @@ impl AppState {
         icon: &str,
         color: [u8; 3],
         tint_sidebar: bool,
-        backend_override: Option<MultiplexerBackendConfig>,
+        mux: SpaceMuxOverride,
     ) -> bool {
         let config_path = self.config().config_path.clone();
         let mut workspace = WorkspaceStore::for_config_path(&config_path);
@@ -1485,7 +1515,7 @@ impl AppState {
             icon,
             color,
             tint_sidebar,
-            backend_override,
+            mux,
             &self.config().multiplexer,
         ) {
             Ok(Some(space)) => space,
@@ -1546,11 +1576,16 @@ impl AppState {
         icon: &str,
         color: [u8; 3],
         tint_sidebar: bool,
-        backend_override: Option<MultiplexerBackendConfig>,
+        mux: SpaceMuxOverride,
     ) -> bool {
+        let SpaceMuxOverride {
+            backend: backend_override,
+            remote: remote_override,
+        } = mux.clone();
         let Some(previous_override) = self.space_backend_override(space_id) else {
             return false;
         };
+        let previous_remote = self.space_remote_override(space_id);
         let resolved_backend = backend_override.unwrap_or(self.config().multiplexer.backend);
         let app_key_bindings = if space_id == self.active_space_id {
             let keybinds = self.config().input.keybinds_for_backend(resolved_backend);
@@ -1564,13 +1599,16 @@ impl AppState {
         } else {
             None
         };
-        let backend_changed = previous_override != backend_override;
+        // The remote decides which machine the binding's sessions live on, so a change to it needs
+        // the same rebuild a backend change does.
+        let backend_changed =
+            previous_override != backend_override || previous_remote != remote_override;
         let config_path = self.config().config_path.clone();
         let mut workspace = WorkspaceStore::for_config_path(&config_path);
         let runtime_config = self.config().clone();
         let active_appearance_variant = self.active_appearance_variant;
         let repaint = self.repaint.clone();
-        match workspace.update_space(space_id, name, icon, color, tint_sidebar, backend_override) {
+        match workspace.update_space(space_id, name, icon, color, tint_sidebar, mux) {
             Ok(true) => {
                 if space_id == self.active_space_id {
                     self.active_space_name = name.trim().to_owned();
@@ -1585,6 +1623,7 @@ impl AppState {
                             scope,
                             label,
                             backend_override,
+                            remote_override.clone(),
                             active_appearance_variant,
                             repaint.clone(),
                         );
@@ -1613,6 +1652,7 @@ impl AppState {
                             scope,
                             label,
                             backend_override,
+                            remote_override.clone(),
                             active_appearance_variant,
                             repaint.clone(),
                         );
@@ -3343,7 +3383,7 @@ impl AppState {
                 icon,
                 color,
                 tint_sidebar,
-                backend,
+                mux,
             } => {
                 let saved = match space_id {
                     Some(space_id) => self.update_space_from_ui(
@@ -3352,14 +3392,14 @@ impl AppState {
                         &icon,
                         color,
                         tint_sidebar,
-                        backend,
+                        mux.clone(),
                     ),
                     None => self.create_space_with_backend_from_ui(
                         &name,
                         &icon,
                         color,
                         tint_sidebar,
-                        backend,
+                        mux,
                     ),
                 };
                 if !saved {
@@ -4296,7 +4336,11 @@ impl AppState {
             .collect::<Vec<_>>();
         self.space_editor_dialog = Some(SpaceEditorDialog::new_space(
             default_space_icon(&existing_icons),
-            None,
+            SpaceMuxOverride {
+                backend: None,
+                remote: self.config().multiplexer.remote.clone(),
+            },
+            self.config().multiplexer.backend,
         ));
         self.input_focus = InputFocus::Picker;
         true
@@ -4313,13 +4357,17 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
+        let remote = self
+            .space_remote_override(space.id)
+            .or_else(|| self.config().multiplexer.remote.clone());
         self.space_editor_dialog = Some(SpaceEditorDialog::edit_space(
             space.id,
             space.name,
             space.icon,
             space.color,
             space.tint_sidebar,
-            backend,
+            SpaceMuxOverride { backend, remote },
+            self.config().multiplexer.backend,
         ));
         self.input_focus = InputFocus::Picker;
         true
@@ -8282,7 +8330,11 @@ mod tests {
         state.apply_space_editor_event(
             SpaceEditorDialog::new_space(
                 "phosphor:alarm".to_owned(),
-                Some(MultiplexerBackendConfig::Native),
+                SpaceMuxOverride {
+                    backend: Some(MultiplexerBackendConfig::Native),
+                    remote: None,
+                },
+                MultiplexerBackendConfig::Native,
             ),
             SpaceEditorEvent::Save {
                 space_id: None,
@@ -8290,7 +8342,10 @@ mod tests {
                 icon: "terminal".to_owned(),
                 color: [1, 2, 3],
                 tint_sidebar: true,
-                backend: Some(MultiplexerBackendConfig::Rmux),
+                mux: SpaceMuxOverride {
+                    backend: Some(MultiplexerBackendConfig::Rmux),
+                    remote: None,
+                },
             },
         );
         let review_space = state.active_space_id();
@@ -8302,7 +8357,11 @@ mod tests {
                 "terminal".to_owned(),
                 [1, 2, 3],
                 true,
-                Some(MultiplexerBackendConfig::Rmux),
+                SpaceMuxOverride {
+                    backend: Some(MultiplexerBackendConfig::Rmux),
+                    remote: None,
+                },
+                MultiplexerBackendConfig::Native,
             ),
             SpaceEditorEvent::Save {
                 space_id: Some(review_space),
@@ -8310,7 +8369,10 @@ mod tests {
                 icon: "calendar".to_owned(),
                 color: [4, 5, 6],
                 tint_sidebar: false,
-                backend: Some(MultiplexerBackendConfig::Zellij),
+                mux: SpaceMuxOverride {
+                    backend: Some(MultiplexerBackendConfig::Zellij),
+                    remote: None,
+                },
             },
         );
         assert_eq!(
@@ -8360,6 +8422,50 @@ mod tests {
         assert!(!reopened.close_space_from_ui(default_space));
     }
 
+    /// A space's host reaches the binding that attaches it, and stops being carried the moment the
+    /// space moves to a backend that keeps its terminals in this process — otherwise the binding
+    /// would hold a host it can never dial while rendering local shells.
+    #[test]
+    fn a_space_carries_its_host_only_while_its_backend_can_reach_one() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-space-remote-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let space = state.active_space_id();
+        let remote = SshRemoteConfig::for_host("devbox");
+
+        assert!(state.update_space_from_ui(
+            space,
+            "Remote",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Tmux),
+                remote: Some(remote.clone()),
+            },
+        ));
+        assert_eq!(state.binding.multiplexer.remote.as_ref(), Some(&remote));
+
+        assert!(state.update_space_from_ui(
+            space,
+            "Remote",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Native),
+                remote: Some(remote),
+            },
+        ));
+        assert_eq!(state.binding.multiplexer.remote, None);
+    }
+
     #[test]
     fn inherited_space_backend_resolves_the_current_global_backend_after_restart() {
         let unique = unique_test_id();
@@ -8388,7 +8494,10 @@ mod tests {
             "folder",
             crate::workspace::DEFAULT_SPACE_COLOR,
             false,
-            Some(MultiplexerBackendConfig::Native),
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Native),
+                remote: None,
+            },
         ));
         drop(state);
 
@@ -8415,7 +8524,7 @@ mod tests {
             "folder",
             crate::workspace::DEFAULT_SPACE_COLOR,
             false,
-            None,
+            SpaceMuxOverride::default(),
         ));
         assert_eq!(
             reopened.multiplexer_backend(),
@@ -8619,7 +8728,8 @@ mod tests {
                 active_space.icon,
                 active_space.color,
                 active_space.tint_sidebar,
-                None,
+                SpaceMuxOverride::default(),
+                MultiplexerBackendConfig::Native,
             ))
         );
 

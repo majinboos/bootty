@@ -659,7 +659,7 @@ impl SettingsSurface {
                     self.set_str(&["multiplexer", "backend"], backend_token(backend));
                     // native and rmux keep their terminals in this process, so a remote left
                     // behind here would be a config the next load refuses.
-                    if !backend_runs_remotely(backend) {
+                    if !backend.supports_remote() {
                         self.clear_multiplexer_remote();
                     }
                 }
@@ -701,7 +701,7 @@ impl SettingsSurface {
     /// put. Shown for the backends bootty drives through a client; the others have no remote to
     /// name.
     fn remote_ui(&mut self, ui: &mut egui::Ui) {
-        if !backend_runs_remotely(self.config.multiplexer.backend) {
+        if !self.config.multiplexer.backend.supports_remote() {
             return;
         }
         section(ui, self.palette, "REMOTE");
@@ -1165,15 +1165,6 @@ fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static 
         (MultiplexerBackendConfig::Tmux, "tmux"),
         (MultiplexerBackendConfig::Zellij, "zellij"),
     ]
-}
-
-/// Whether this backend's multiplexer can live on another host: the ones bootty drives through a
-/// client can, and the ones that own their terminals in this process cannot.
-fn backend_runs_remotely(backend: MultiplexerBackendConfig) -> bool {
-    match backend {
-        MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => true,
-        MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux => false,
-    }
 }
 
 fn non_empty(value: &str) -> Option<String> {
