@@ -318,10 +318,34 @@ fn write_agent_dashboard_frame(engine: &mut TerminalEngine, tick: u32, cols: u16
     }
 }
 
+/// Build a benchmark's state the first time criterion runs it, then keep it.
+///
+/// Criterion calls the routine it times once per sample, so a state built inside that routine is
+/// rebuilt a hundred times over — and an `AppState` costs whole seconds, almost all of it opening
+/// and closing the workspace database. Building it up front instead would charge every benchmark in
+/// this group to whichever one you asked for. Neither is what the numbers are about: the frame being
+/// measured already runs against a state it has updated before, so the first sample can build it and
+/// the rest can measure against it. Rebuilding it per sample measures the same frame cost, so the
+/// state that survives is the cheap way to measure it, not a different measurement.
+fn warmed_state(slot: &mut Option<AppState>, build: impl FnOnce() -> AppState) -> &mut AppState {
+    let state = slot.get_or_insert_with(build);
+    // Hand the state back through a value the optimizer cannot see into. A state built as a local
+    // right next to the loop that updates it lets a release build with fat LTO hoist the frame work
+    // out of the loop entirely, which is how these benchmarks came to report a few hundred
+    // nanoseconds for a frame that costs closer to a hundred microseconds.
+    black_box(state)
+}
+
 fn bench_app_state_update(c: &mut Criterion) {
     let metrics = renderer_metrics(0, 0);
+    let active_metrics = renderer_metrics(48, 3);
+
+    let mut idle = None;
     c.bench_function("app_state_update_idle_frame", |b| {
-        let mut state = app_state(false);
+        // Read the clock after fixture construction but outside Criterion's timed iterator. Each
+        // sample measures one stable frame workload without charging clock acquisition or letting
+        // periodic background work become due partway through the sample.
+        let state = warmed_state(&mut idle, || app_state(false));
         let now = Instant::now();
         black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
         b.iter(|| {
@@ -329,32 +353,33 @@ fn bench_app_state_update(c: &mut Criterion) {
         })
     });
 
+    let events = vec![egui::Event::PointerMoved(egui::Pos2::new(600.0, 400.0))];
+    let mut active = None;
     c.bench_function("app_state_update_active_terminal_frame", |b| {
-        let mut state = app_state(false);
+        let state = warmed_state(&mut active, || app_state(false));
         let now = Instant::now();
-        let metrics = renderer_metrics(48, 3);
-        let events = vec![egui::Event::PointerMoved(egui::Pos2::new(600.0, 400.0))];
-        black_box(state.update_frame(frame_inputs_at(now, events.clone(), metrics)));
+        black_box(state.update_frame(frame_inputs_at(now, events.clone(), active_metrics)));
         b.iter(|| {
-            black_box(state.update_frame(frame_inputs_at(now, events.clone(), metrics)));
+            black_box(state.update_frame(frame_inputs_at(now, events.clone(), active_metrics)));
         })
     });
 
+    let mut sidebar = None;
     c.bench_function("app_state_update_sidebar_status_frame", |b| {
-        let mut state = app_state(true);
+        let state = warmed_state(&mut sidebar, || app_state(true));
         let now = Instant::now();
-        let metrics = renderer_metrics(48, 3);
-        black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
+        black_box(state.update_frame(frame_inputs_at(now, Vec::new(), active_metrics)));
         b.iter(|| {
-            black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
+            black_box(state.update_frame(frame_inputs_at(now, Vec::new(), active_metrics)));
         })
     });
 
     for spaces in [8, 32] {
+        let mut spaced = None;
         c.bench_function(
             &format!("app_state_update_idle_frame_{spaces}_spaces"),
             |b| {
-                let mut state = app_state_with_spaces(spaces);
+                let state = warmed_state(&mut spaced, || app_state_with_spaces(spaces));
                 let now = Instant::now();
                 black_box(state.update_frame(frame_inputs_at(now, Vec::new(), metrics)));
                 b.iter(|| {
@@ -373,11 +398,11 @@ fn bench_egui_app_frames(c: &mut Criterion) {
     let context = egui::Context::default();
     icons::install_icon_fonts(&context);
 
+    let mut terminal = BenchTerminal::new(109, 39);
+    let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Rgba8Unorm))
+        .with_text_config(bootty_app::terminal_text::TerminalTextConfig::default());
+    let mut tick = 0_u32;
     c.bench_function("egui_frame_terminal_active_109x39", |b| {
-        let mut terminal = BenchTerminal::new(109, 39);
-        let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Rgba8Unorm))
-            .with_text_config(bootty_app::terminal_text::TerminalTextConfig::default());
-        let mut tick = 0_u32;
         b.iter(|| {
             tick = tick.wrapping_add(1);
             terminal.write_agent_frame(tick, 109, 39);
@@ -416,16 +441,16 @@ fn bench_egui_app_frames(c: &mut Criterion) {
         })
     });
 
+    let mut combined_terminal = BenchTerminal::new(109, 39);
+    let mut combined_widget = TerminalWidget::new(Some(wgpu::TextureFormat::Rgba8Unorm))
+        .with_text_config(bootty_app::terminal_text::TerminalTextConfig::default());
+    let mut combined_tick = 0_u32;
     c.bench_function(
         "egui_frame_terminal_sidebar_status_109x39_384_sessions",
         |b| {
-            let mut terminal = BenchTerminal::new(109, 39);
-            let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Rgba8Unorm))
-                .with_text_config(bootty_app::terminal_text::TerminalTextConfig::default());
-            let mut tick = 0_u32;
             b.iter(|| {
-                tick = tick.wrapping_add(1);
-                terminal.write_agent_frame(tick, 109, 39);
+                combined_tick = combined_tick.wrapping_add(1);
+                combined_terminal.write_agent_frame(combined_tick, 109, 39);
                 let output = context.run_ui(
                     egui::RawInput {
                         screen_rect: Some(FRAME_RECT),
@@ -436,7 +461,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
                         egui::CentralPanel::default().show(ui, |ui| {
                             sidebar_ui_frame(ui, black_box(&sessions), selected);
                             status_ui_frame(ui, selected);
-                            terminal_widget_frame(ui, &mut terminal, &mut widget);
+                            terminal_widget_frame(ui, &mut combined_terminal, &mut combined_widget);
                         });
                     },
                 );
