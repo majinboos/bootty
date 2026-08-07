@@ -218,6 +218,8 @@ pub struct SessionView {
 pub struct MuxView {
     pub windows: Vec<WindowView>,
     pub sessions: Vec<SessionView>,
+    /// Stable identity of the Space/backend binding that owns `sessions`.
+    pub scope_key: String,
     pub session: Option<String>,
     pub sidebar_visible: bool,
     /// The active session's sidebar accent color as `#rrggbb`, so modules can
@@ -238,6 +240,7 @@ impl Default for MuxView {
         Self {
             windows: Vec::new(),
             sessions: Vec::new(),
+            scope_key: String::new(),
             session: None,
             sidebar_visible: false,
             session_color: None,
@@ -1529,44 +1532,40 @@ impl ModuleKind {
     }
 }
 fn preview_run_cache() -> Arc<RunCache> {
-    let cache = Arc::new(RunCache::default());
+    let cache = Arc::new(RunCache {
+        preview_branch: Some("feature/module-previews".to_owned()),
+        ..RunCache::default()
+    });
     cache.set_mode(RunMode::Cached);
-    let stderr_null = if cfg!(windows) {
-        "2>nul"
-    } else {
-        "2>/dev/null"
-    };
-    let session_id = platform_shell_quote("$1");
-    let pane_id = platform_shell_quote("%1");
-    let cwd = platform_shell_quote("/Users/demo/src/bootty");
     let commands = [
         (
-            format!(
-                "tmux list-panes -t {session_id} -F '#{{pane_active}}\t#{{pane_id}}\t#{{pane_current_command}}\t#{{pane_pid}}' {stderr_null}"
+            RunCommand::Exec(
+                ["tmux", "capture-pane", "-t", "%1", "-p", "-S", "-30"]
+                    .map(str::to_owned)
+                    .to_vec(),
             ),
-            "1\t%1\tzsh\t4242",
+            "• Working on module previews".to_owned(),
         ),
         (
-            format!("tmux capture-pane -t {pane_id} -p -S -30 {stderr_null}"),
-            "• Working on module previews",
-        ),
-        (
-            format!("git -C {cwd} rev-parse --abbrev-ref HEAD {stderr_null}"),
-            "feature/module-previews",
-        ),
-        (
-            format!("git -C {cwd} diff HEAD --numstat {stderr_null}"),
-            "12\t3\tcrates/bootty-app/src/ui/settings/modules.rs",
-        ),
-        (
-            format!("ps -axo pid=,ppid=,comm=,args= {stderr_null}"),
-            "4243 4242 /opt/homebrew/bin/codex codex",
+            RunCommand::Exec(
+                [
+                    "git",
+                    "-C",
+                    "/Users/demo/src/bootty",
+                    "diff",
+                    "HEAD",
+                    "--numstat",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            ),
+            "12\t3\tcrates/bootty-app/src/ui/settings/modules.rs".to_owned(),
         ),
     ];
     if let Ok(mut entries) = cache.entries.lock() {
         for (command, output) in commands {
             entries.insert(
-                command,
+                command.cache_key().into_owned(),
                 RunEntry {
                     output: output.to_owned(),
                     refreshing: false,
@@ -1640,6 +1639,7 @@ pub fn preview_module_source(
 
 fn preview_mux_view() -> MuxView {
     MuxView {
+        scope_key: "preview:binding".to_owned(),
         windows: vec![
             WindowView {
                 id: "@1".to_owned(),
@@ -2422,6 +2422,7 @@ fn setup_lua(
                 for (index, session) in view.sessions.iter().enumerate() {
                     let entry = lua.create_table()?;
                     entry.set("id", session.id.as_str())?;
+                    entry.set("cache_key", format!("{}:{}", view.scope_key, session.id))?;
                     entry.set("name", session.name.as_str())?;
                     entry.set(
                         "display_name",
@@ -3281,6 +3282,169 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_facts_isolate_scopes_and_reset_when_the_pane_changes() {
+        let run_cache = Arc::new(RunCache::default());
+        run_cache.set_mode(RunMode::Cached);
+        let lua = setup_lua(
+            &[],
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            run_cache,
+        )
+        .expect("lua host");
+        let provider: Table = lua
+            .load("return bootty.sidebar.session_facts()")
+            .eval()
+            .expect("facts provider");
+        let refresh: Function = provider.get("refresh").expect("refresh");
+        let get: Function = provider.get("get").expect("get");
+        let session = |scope: &str, pane: &str, process: &str| {
+            let value = lua.create_table().expect("session");
+            value.set("id", "$1").expect("id");
+            value.set("cache_key", scope).expect("scope");
+            value.set("pane_id", pane).expect("pane");
+            value.set("process", process).expect("process");
+            value.set("selected", true).expect("selected");
+            value
+        };
+        let refresh_one = |value: Table| {
+            let sessions = lua.create_table().expect("sessions");
+            sessions.set(1, value).expect("session entry");
+            refresh.call::<()>(sessions).expect("refresh facts");
+        };
+
+        let first = session("1:1:$1", "%1", "codex");
+        refresh_one(first.clone());
+        let first_facts: Table = get.call(first.clone()).expect("first facts");
+        assert_eq!(first_facts.get::<String>("agent_name").unwrap(), "codex");
+
+        let other_scope = session("2:2:$1", "%1", "zsh");
+        refresh_one(other_scope.clone());
+        let other_facts: Table = get.call(other_scope.clone()).expect("other facts");
+        assert_eq!(other_facts.get::<String>("display_process").unwrap(), "zsh");
+        assert!(
+            other_facts
+                .get::<Option<String>>("agent_name")
+                .unwrap()
+                .is_none()
+        );
+        let retained_first: Table = get.call(first).expect("retained first scope");
+        assert_eq!(retained_first.get::<String>("agent_name").unwrap(), "codex");
+
+        let replacement_pane = session("2:2:$1", "%2", "cargo");
+        refresh_one(replacement_pane.clone());
+        let replacement_facts: Table = get.call(replacement_pane).expect("replacement facts");
+        assert_eq!(
+            replacement_facts.get::<String>("display_process").unwrap(),
+            "cargo"
+        );
+        assert!(
+            replacement_facts
+                .get::<Option<String>>("agent_name")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sidebar_facts_starts_one_cold_session_per_frame() {
+        let run_cache = Arc::new(RunCache {
+            shutdown: Arc::new(AtomicBool::new(true)),
+            ..RunCache::default()
+        });
+        run_cache.set_mode(RunMode::Refresh);
+        let lua = setup_lua(
+            &[],
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            Arc::clone(&run_cache),
+        )
+        .expect("lua host");
+        let provider: Table = lua
+            .load("return bootty.sidebar.session_facts()")
+            .eval()
+            .expect("facts provider");
+        let sessions = lua.create_table().expect("sessions");
+        for index in 1..=3 {
+            let session = lua.create_table().expect("session");
+            session.set("id", format!("${index}")).expect("id");
+            session
+                .set("cache_key", format!("1:1:${index}"))
+                .expect("cache key");
+            session.set("pane_id", format!("%{index}")).expect("pane");
+            session.set("process", "codex").expect("process");
+            sessions.set(index, session).expect("session entry");
+        }
+
+        let refresh: Function = provider.get("refresh").expect("refresh");
+        refresh
+            .call::<()>(sessions.clone())
+            .expect("first module refresh");
+        refresh
+            .call::<()>(sessions)
+            .expect("second module in the same frame");
+
+        assert_eq!(
+            run_cache.entries.lock().expect("entries").len(),
+            1,
+            "shared provider calls in one UI frame must start only one cold command"
+        );
+    }
+
+    #[test]
+    fn sidebar_facts_consumes_a_completed_diff_on_the_next_frame() {
+        let run_cache = Arc::new(RunCache::default());
+        run_cache.set_mode(RunMode::Cached);
+        let lua = setup_lua(
+            &[],
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            Arc::clone(&run_cache),
+        )
+        .expect("lua host");
+        let provider: Table = lua
+            .load("return bootty.sidebar.session_facts()")
+            .eval()
+            .expect("facts provider");
+        let session = lua.create_table().expect("session");
+        session.set("id", "$1").expect("id");
+        session.set("cache_key", "1:1:$1").expect("cache key");
+        session.set("cwd", "/missing/repo").expect("cwd");
+        session.set("process", "zsh").expect("process");
+        let sessions = lua.create_table().expect("sessions");
+        sessions.set(1, session.clone()).expect("session entry");
+        let refresh: Function = provider.get("refresh").expect("refresh");
+        refresh
+            .call::<()>(sessions.clone())
+            .expect("initial refresh");
+        let command = RunCommand::Exec(
+            ["git", "-C", "/missing/repo", "diff", "HEAD", "--numstat"]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+        run_cache.entries.lock().expect("entries").insert(
+            command.cache_key().into_owned(),
+            RunEntry {
+                output: "12\t3\tsrc/main.rs".to_owned(),
+                refreshing: false,
+            },
+        );
+
+        refresh.call::<()>(sessions).expect("next frame");
+
+        let facts: Table = provider
+            .get::<Function>("get")
+            .expect("get")
+            .call(session)
+            .expect("facts");
+        assert_eq!(facts.get::<u32>("diff_added").unwrap(), 12);
+        assert_eq!(facts.get::<u32>("diff_removed").unwrap(), 3);
+    }
+
+    #[test]
     fn built_in_session_only_renders_when_sidebar_is_hidden() {
         let mux = Arc::new(RwLock::new(MuxView {
             session: Some("work/api".to_owned()),
@@ -3887,6 +4051,7 @@ mod tests {
                     ..SessionView::default()
                 },
             ],
+            scope_key: "preview:binding".to_owned(),
             ..MuxView::default()
         }));
         let lua = setup_lua(&[], mux, Arc::default(), Arc::default(), Arc::default()).unwrap();
@@ -3987,6 +4152,7 @@ mod tests {
             .into_owned();
         let display_cwd = crate::strings::display_path(&cwd);
         let mux: Arc<RwLock<MuxView>> = Arc::new(RwLock::new(MuxView {
+            scope_key: "7:11".to_owned(),
             sessions: vec![SessionView {
                 id: "plain".to_owned(),
                 name: "bootty".to_owned(),
@@ -4289,6 +4455,7 @@ mod tests {
     #[test]
     fn sessions_host_fn_exposes_bootty_owned_sessions() {
         let mux: Arc<RwLock<MuxView>> = Arc::new(RwLock::new(MuxView {
+            scope_key: "7:11".to_owned(),
             sessions: vec![SessionView {
                 id: "$1".to_owned(),
                 name: "work/api".to_owned(),
@@ -4324,7 +4491,7 @@ mod tests {
             .load(
                 r#"return function() local s = bootty.sessions()[1]
                    local p = s.progresses
-                   return { kind = 'session', text = s.name .. ':' .. s.cwd .. ':' .. p[1].process .. ':' .. p[2].value .. ':' .. s.ports[1] .. ':' .. s.pane_id .. ':' .. s.pane_pid .. ':' .. s.process,
+                   return { kind = 'session', text = s.cache_key .. ':' .. s.name .. ':' .. s.cwd .. ':' .. p[1].process .. ':' .. p[2].value .. ':' .. s.ports[1] .. ':' .. s.pane_id .. ':' .. s.pane_pid .. ':' .. s.process,
                    session_id = s.id, fg = s.color } end"#,
             )
             .eval::<Value>()
@@ -4335,7 +4502,7 @@ mod tests {
         assert_eq!(items[0].kind.as_deref(), Some("session"));
         assert_eq!(
             items[0].text,
-            "work/api:/tmp/work/api:pi:42:8040:%7:4242:codex"
+            "7:11:$1:work/api:/tmp/work/api:pi:42:8040:%7:4242:codex"
         );
         assert_eq!(items[0].session_id.as_deref(), Some("$1"));
         assert_eq!(items[0].fg, Some(Color32::from_rgb(0x89, 0xb4, 0xfa)));

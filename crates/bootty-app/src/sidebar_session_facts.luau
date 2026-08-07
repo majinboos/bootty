@@ -10,9 +10,6 @@ end
 options = options or {}
 
 local ui = bootty.ui
-local shell = bootty.shell
-local quote = shell.quote
-local stderr_null = shell.stderr_null
 
 local MUTED_COLOR = bootty.theme.muted
 local DESTRUCTIVE_COLOR = bootty.theme.destructive
@@ -24,7 +21,25 @@ local PERC_BASE = bootty.theme.destructive
 local PERC_SHINE = bootty.theme.warning
 
 local PULSE_PERIOD = 2.0
-local FACT_REFRESH_INTERVAL = options.fact_refresh_interval or 0.5
+-- How stale a session's git and agent facts may get. Each refresh runs a `git diff` for that
+-- session's repo, so the session being watched is worth checking often and the rest are not.
+local FOCUSED_FACT_INTERVAL = options.fact_refresh_interval or 5
+local BACKGROUND_FACT_INTERVAL = options.background_fact_refresh_interval or 30
+-- Floor between refreshes of sessions that already have facts, so a batch coming due together
+-- spreads out instead of shelling out all at once.
+local REFRESH_SPACING = 0.5
+-- Start one cold session per frame, spreading a fresh sidebar's subprocesses instead of firing the
+-- whole list together.
+local COLD_REFRESH_BURST = 1
+local COLD_REFRESH_SPACING = 1 / 20
+-- Cadence for the facts that start no process at all — the pane's command and the repo's `HEAD`.
+local LIVE_FACT_INTERVAL = 0.25
+-- However quiet a worktree looks, count its diff again this often. A watcher can miss events, and
+-- an unwatched tree reports no revision at all.
+local FORCED_DIFF_INTERVAL = 60
+-- How long a session that has left the sidebar keeps its facts, so switching spaces and coming
+-- back shows them immediately.
+local FACT_CACHE_TTL = 300
 local CODEX_VERBS = { "Codexing…", "Working…", "Thingamabobbing…" }
 local OPENCODE_VERBS = { "Opencodding…", "Opendoing…", "Shming Shmopenig…" }
 
@@ -35,69 +50,38 @@ local AGENT_STYLE = {
 }
 
 local FACTS_CACHE = {}
-local first_render = true
-local refresh_index = 1
 local last_fact_refresh = 0
+local last_cold_refresh = nil
 
 local function tmux_session(session)
 	return string.sub(session.id, 1, 1) == "$"
 end
 
-local function tmux_active_pane(session)
+-- The active pane's command, id, and pid, straight from the mux snapshot bootty already polls.
+-- Asking tmux again here cost a shell and a `tmux list-panes` per session per refresh.
+local function active_pane(session)
 	if not tmux_session(session) then
 		return nil, nil, nil
 	end
-	local out = shell.run(
-		"tmux list-panes -t "
-			.. quote(session.id)
-			.. " -F '#{pane_active}\t#{pane_id}\t#{pane_current_command}\t#{pane_pid}' "
-			.. stderr_null
-	)
-	for line in string.gmatch(out, "[^\n]+") do
-		local active, pane_id, command, pane_pid = string.match(line, "^([^\t]*)\t([^\t]*)\t([^\t]*)\t(.+)$")
-		if active == "1" and command ~= "" then
-			return command, pane_id, pane_pid
-		end
+	local command = session.process
+	if command == "" then
+		command = nil
 	end
-	return nil, nil, nil
+	return command, session.pane_id, session.pane_pid
 end
 
-local function captured_pane(pane_id)
-	return if pane_id and pane_id ~= ""
-		then shell.run("tmux capture-pane -t " .. quote(pane_id) .. " -p -S -30 " .. stderr_null)
-		else ""
+local function capture_pane_argv(pane_id)
+	return { "tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-30" }
 end
 
-local function git_branch(cwd)
-	if not cwd or cwd == "" then
-		return nil
-	end
-	local branch = shell.run("git -C " .. quote(cwd) .. " rev-parse --abbrev-ref HEAD " .. stderr_null)
-	local function unusable(value)
-		return value == "" or ui.starts_with(value, "bootty.run:") or string.find(value, "\n", 1, true) ~= nil
-	end
-	if unusable(branch) then
-		return nil
-	end
-	-- Detached HEAD reports "HEAD" here. Return the short commit (not nil) so the
-	-- caller does not preserve the last real branch name, which would read as a stale
-	-- branch with no sign the session has detached. nil stays reserved for the
-	-- error/empty case, where preserving the previous branch is correct.
-	if branch == "HEAD" then
-		local short = shell.run("git -C " .. quote(cwd) .. " rev-parse --short HEAD " .. stderr_null)
-		return if unusable(short) then "detached" else "detached " .. short
-	end
-	return branch
+local function git_numstat_argv(cwd)
+	return { "git", "-C", cwd, "diff", "HEAD", "--numstat" }
 end
 
-
-local function git_diff(cwd)
-	if not cwd or cwd == "" then
-		return nil, nil
-	end
+local function diff_counts_from(numstat)
 	local added = 0
 	local removed = 0
-	for line in string.gmatch(shell.run("git -C " .. quote(cwd) .. " diff HEAD --numstat " .. stderr_null), "[^\n]+") do
+	for line in string.gmatch(numstat, "[^\n]+") do
 		local add, remove = string.match(line, "^(%d+)\t(%d+)\t")
 		added += tonumber(add) or 0
 		removed += tonumber(remove) or 0
@@ -107,6 +91,7 @@ local function git_diff(cwd)
 	end
 	return added, removed
 end
+
 
 local function command_basename(command)
 	if not command or command == "" then
@@ -159,48 +144,22 @@ local function wrapper_script_agent(command, args)
 	return nil
 end
 
-local function process_snapshot()
-	local children = {}
-	for line in string.gmatch(shell.run("ps -axo pid=,ppid=,comm=,args= " .. stderr_null), "[^\n]+") do
-		local pid, ppid, command, args = string.match(line, "^%s*(%d+)%s+(%d+)%s+(%S+)%s*(.*)$")
-		if pid and ppid and command then
-			if not children[ppid] then
-				children[ppid] = {}
-			end
-			local siblings = children[ppid]
-			siblings[#siblings + 1] = {
-				pid = pid,
-				command = command_basename(command),
-				agent = command_agent_name(command) or wrapper_script_agent(command, args),
-			}
-		end
-	end
-	return children
-end
-
 local function agent_command(command)
 	return command_agent_name(command)
 end
 
-local function descendant_agent(children, root_pid)
-	if not root_pid or root_pid == "" then
+-- `bootty.descendants` walks the process tree natively, breadth-first, so the shallowest agent
+-- below the pane wins.
+local function descendant_agent(root_pid)
+	local pid = tonumber(root_pid)
+	if not pid then
 		return nil
 	end
-	local queue = { root_pid }
-	local seen = {}
-	local head = 1
-	while head <= #queue and head < 256 do
-		local pid = queue[head]
-		head += 1
-		if not seen[pid] then
-			seen[pid] = true
-			for _, child in ipairs(children[pid] or {}) do
-				local agent = child.agent or agent_command(child.command)
-				if agent then
-					return agent
-				end
-				queue[#queue + 1] = child.pid
-			end
+	for _, descendant in ipairs(bootty.descendants(pid)) do
+		local agent = command_agent_name(descendant.command)
+			or wrapper_script_agent(descendant.command, descendant.args)
+		if agent then
+			return agent
 		end
 	end
 	return nil
@@ -379,85 +338,200 @@ local function minimal_facts()
 	return {}
 end
 
-local function refreshed_session_facts(session)
-	local process, pane_id, pane_pid = tmux_active_pane(session)
-	local agent_name = agent_command(process)
-	if not agent_name and pane_pid then
-		agent_name = descendant_agent(process_snapshot(), pane_pid)
-	end
-	local agent_detail = if agent_name then agent_status(agent_name, captured_pane(pane_id)) else nil
-	local diff_added, diff_removed = git_diff(session.cwd)
+-- A session's facts, filled in by the two refreshes below: `display_process`, `branch` and
+-- `branch_status` by the live one, `diff_added`/`diff_removed`, `agent_name`, `agent_detail`,
+-- `agent_style` and `tree_agent_name` by the deep one. `tree_agent_name` is the agent found by
+-- walking the pane's process tree, kept apart so a live refresh can re-derive the effective agent
+-- without losing what only the deep refresh can see.
+local function session_cache_key(session)
+	return session.cache_key or session.id
+end
+
+local function session_identity(session)
+	return session_cache_key(session) .. "\0" .. (session.cwd or "") .. "\0" .. (session.pane_id or "")
+end
+
+local function new_facts(session, now)
 	return {
-		display_process = agent_name or process,
-		branch = git_branch(session.cwd),
-		branch_status = "current",
-		diff_added = diff_added,
-		diff_removed = diff_removed,
-		agent_name = agent_name,
-		agent_detail = agent_detail,
-		agent_style = AGENT_STYLE[agent_name],
+		identity = session_identity(session),
+		branch_status = "unknown",
+		refreshed_at = 0,
+		live_at = 0,
+		seen_at = now,
+		-- Worktree revision the diff counts were taken at, when, and whether any count has landed.
+		diff_revision = 0,
+		diff_counted_at = 0,
+		diff_counted = false,
 	}
 end
 
-local function cached_session_facts(session)
-	return FACTS_CACHE[session.id] or minimal_facts()
+local function consume_completed_facts(session, facts)
+	local _, pane_id = active_pane(session)
+	if facts.agent_name and pane_id and pane_id ~= "" then
+		local text = bootty.read(capture_pane_argv(pane_id))
+		if text ~= "" then
+			facts.agent_detail = agent_status(facts.agent_name, text)
+		end
+	end
+	if session.cwd and session.cwd ~= "" then
+		local numstat, counted = bootty.read(git_numstat_argv(session.cwd))
+		if counted then
+			facts.diff_added, facts.diff_removed = diff_counts_from(numstat)
+			facts.diff_counted = true
+		end
+	end
 end
 
-local function prune_fact_cache(sessions)
-	local live = {}
-	for _, session in ipairs(sessions) do
-		live[session.id] = true
+-- Everything a row can know without starting a process: the pane's command from the mux snapshot,
+-- the branch from the repo's `HEAD`, and whatever the commands below last printed. Reading their
+-- output here is what makes an answer appear the moment it lands, rather than when its next turn
+-- comes round — the read costs nothing and never starts anything.
+local function apply_live_facts(session, facts, now)
+	local process, pane_id = active_pane(session)
+	local branch = if session.cwd and session.cwd ~= "" then bootty.git.branch(session.cwd) else nil
+	if branch then
+		facts.branch = branch
+		facts.branch_status = "current"
+	elseif facts.branch then
+		facts.branch_status = "stale"
 	end
-	for id, _ in pairs(FACTS_CACHE) do
-		if not live[id] then
+	-- The pane's own command is what changes when a command starts or exits; an agent found deeper in
+	-- the tree keeps its name until the next deep pass looks again.
+	facts.agent_name = agent_command(process) or facts.tree_agent_name
+	facts.agent_style = AGENT_STYLE[facts.agent_name]
+	facts.display_process = facts.agent_name or process
+	if not facts.agent_name or not pane_id or pane_id == "" then
+		facts.agent_detail = nil
+	end
+	consume_completed_facts(session, facts)
+	facts.live_at = now
+end
+
+-- Starts the commands whose answers the live pass reads, and does the one piece of work that has to
+-- happen here: walking the pane's process tree to find an agent running under a wrapper.
+local function start_deep_refresh(session, facts, now)
+	local process, pane_id, pane_pid = active_pane(session)
+	if not agent_command(process) and pane_pid then
+		facts.tree_agent_name = descendant_agent(pane_pid)
+	else
+		facts.tree_agent_name = nil
+	end
+	if (agent_command(process) or facts.tree_agent_name) and pane_id and pane_id ~= "" then
+		bootty.exec(capture_pane_argv(pane_id))
+	end
+	if session.cwd and session.cwd ~= "" then
+		-- Counting a diff runs git over the whole worktree. The filesystem already says when something
+		-- under that tree changed, so a tree that has not moved since the last count is not worth
+		-- asking about again — what an editor's git integration does instead of polling. A tree nobody
+		-- is watching reports 0, and then this always asks.
+		local revision = bootty.git.worktree_revision(session.cwd)
+		local settled = facts.diff_counted and revision ~= 0 and revision == facts.diff_revision
+		if not settled or now - facts.diff_counted_at >= FORCED_DIFF_INTERVAL then
+			bootty.exec(git_numstat_argv(session.cwd))
+			facts.diff_revision = revision
+			facts.diff_counted_at = now
+		end
+	end
+	facts.refreshed_at = now
+end
+
+local function cached_session_facts(session)
+	return FACTS_CACHE[session_cache_key(session)] or minimal_facts()
+end
+
+-- Sessions leave the list whenever the sidebar shows a different space, and their facts are still
+-- true when they come back. Entries are kept until nothing has referred to them for a while, so
+-- switching spaces shows what it showed before instead of refilling a row at a time.
+local function prune_fact_cache(sessions, now)
+	for _, session in ipairs(sessions) do
+		local cached = FACTS_CACHE[session_cache_key(session)]
+		if cached then
+			cached.seen_at = now
+		end
+	end
+	for id, cached in pairs(FACTS_CACHE) do
+		if now - (cached.seen_at or 0) > FACT_CACHE_TTL then
 			FACTS_CACHE[id] = nil
 		end
 	end
 end
 
-local function next_refresh_session(sessions)
-	if #sessions == 0 then
-		return nil
-	end
-	for _, session in ipairs(sessions) do
-		if session.selected and not FACTS_CACHE[session.id] then
-			return session
-		end
-	end
-	if refresh_index > #sessions then
-		refresh_index = 1
-	end
-	local session = sessions[refresh_index]
-	refresh_index = refresh_index % #sessions + 1
-	return session
+local function deep_interval(session, facts)
+	return if session.selected then FOCUSED_FACT_INTERVAL else BACKGROUND_FACT_INTERVAL
 end
 
-local function refresh_one_session(sessions)
-	local session = next_refresh_session(sessions)
-	if not session then
-		return
+-- Cheap facts for every visible session, on their own short cadence. Nothing here starts a process,
+-- so this is the part that keeps a row's branch and process honest between deep refreshes.
+local function refresh_live_facts(sessions, now)
+	for _, session in ipairs(sessions) do
+		local key = session_cache_key(session)
+		local facts = FACTS_CACHE[key]
+		if not facts or facts.identity ~= session_identity(session) then
+			facts = new_facts(session, now)
+			FACTS_CACHE[key] = facts
+		end
+		-- Completed subprocess output is consumed on every module frame, so an answer is visible on the
+		-- first frame after it lands rather than waiting for the cheap live-fact cadence.
+		consume_completed_facts(session, facts)
+		if now - facts.live_at >= LIVE_FACT_INTERVAL then
+			apply_live_facts(session, facts, now)
+		end
 	end
-	local previous = FACTS_CACHE[session.id]
-	local refreshed = refreshed_session_facts(session)
-	if refreshed.branch == nil then
-		refreshed.branch_status = if previous and previous.branch then "stale" else "unknown"
-		refreshed.branch = if previous then previous.branch else nil
+end
+
+-- A session nobody has deep facts for yet is worth several at once: the subprocesses behind them run
+-- in the background, so a fresh sidebar fills in one pass instead of one row per tick.
+local function refresh_unknown_sessions(sessions, now)
+	local refreshed = 0
+	for _, session in ipairs(sessions) do
+		if refreshed >= COLD_REFRESH_BURST then
+			break
+		end
+		local facts = FACTS_CACHE[session_cache_key(session)]
+		if facts.refreshed_at == 0 then
+			start_deep_refresh(session, facts, now)
+			refreshed += 1
+		end
 	end
-	FACTS_CACHE[session.id] = refreshed
+	return refreshed
+end
+
+-- The session being watched earns the short interval; the rest are checked rarely, and a set of
+-- sessions that are all current starts no processes at all.
+local function refresh_most_overdue_session(sessions, now)
+	local due_session, due_by = nil, 0
+	for _, session in ipairs(sessions) do
+		local facts = FACTS_CACHE[session_cache_key(session)]
+		local overdue = now - facts.refreshed_at - deep_interval(session, facts)
+		if overdue > 0 and overdue >= due_by then
+			due_session, due_by = session, overdue
+		end
+	end
+	if due_session then
+		start_deep_refresh(due_session, FACTS_CACHE[session_cache_key(due_session)], now)
+	end
+	return due_session ~= nil
 end
 
 local provider = {}
 
 function provider.refresh(sessions)
 	local now = bootty.time()
-	prune_fact_cache(sessions)
-	if first_render then
-		first_render = false
+	prune_fact_cache(sessions, now)
+	refresh_live_facts(sessions, now)
+	if (not last_cold_refresh or now - last_cold_refresh >= COLD_REFRESH_SPACING)
+		and refresh_unknown_sessions(sessions, now) > 0
+	then
+		last_cold_refresh = now
 		last_fact_refresh = now
-		refresh_one_session(sessions)
-	elseif now - last_fact_refresh >= FACT_REFRESH_INTERVAL then
+		return
+	end
+	-- Anything already answered waits for its interval, and never runs two refreshes back to back.
+	if now - last_fact_refresh < REFRESH_SPACING then
+		return
+	end
+	if refresh_most_overdue_session(sessions, now) then
 		last_fact_refresh = now
-		refresh_one_session(sessions)
 	end
 end
 
