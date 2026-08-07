@@ -166,6 +166,7 @@ struct TmuxPanePassthroughOverride {
     previous: TmuxOptionValue,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct TmuxOptionValue {
     value: String,
     local: bool,
@@ -318,6 +319,7 @@ impl BackendPaneTerminal {
         }
 
         self.park_native_layout_terminal();
+        let phase = bootty_runtime::latency::start();
         let terminal = self
             .start_terminal(backend, target.as_ref())
             .inspect_err(|_| {
@@ -326,12 +328,19 @@ impl BackendPaneTerminal {
                 self.sync_tmux_passthrough_override();
                 self.clear_terminal();
             })?;
+        bootty_runtime::latency::trace_slow("attach.start_terminal", phase, 2.0);
 
         self.backend = backend;
         self.active_target = target;
+        let phase = bootty_runtime::latency::start();
         self.set_active_terminal(terminal);
+        bootty_runtime::latency::trace_slow("attach.set_active_terminal", phase, 2.0);
+        let phase = bootty_runtime::latency::start();
         self.sync_tmux_passthrough_override();
+        bootty_runtime::latency::trace_slow("attach.passthrough_override", phase, 2.0);
+        let phase = bootty_runtime::latency::start();
         self.sync_status_bar(config.hide_tmux_status);
+        bootty_runtime::latency::trace_slow("attach.status_bar", phase, 2.0);
         Ok(())
     }
 
@@ -346,9 +355,7 @@ impl BackendPaneTerminal {
         if self.passthrough_all_panes.contains_key(pane_id) {
             return;
         }
-        if let Ok(previous) = pane_allow_passthrough(pane_id)
-            && set_pane_allow_passthrough(pane_id, "all").is_ok()
-        {
+        if let Ok(previous) = take_pane_allow_passthrough(pane_id) {
             self.passthrough_all_panes.insert(
                 pane_id.to_owned(),
                 TmuxPanePassthroughOverride {
@@ -1234,39 +1241,62 @@ fn passthrough_override_target(
     })
 }
 
-fn pane_allow_passthrough(pane_id: &str) -> Result<TmuxOptionValue> {
-    if let Some(value) =
-        tmux_option_value(&["show-options", "-p", "-t", pane_id, "allow-passthrough"])?
-    {
-        return Ok(TmuxOptionValue { value, local: true });
-    }
-    let value = tmux_option_value(&["show-options", "-g", "allow-passthrough"])?
-        .ok_or_else(|| anyhow::anyhow!("tmux global allow-passthrough option had no value"))?;
-    Ok(TmuxOptionValue {
-        value,
-        local: false,
-    })
-}
-
-fn tmux_option_value(args: &[&str]) -> Result<Option<String>> {
+/// Read the pane's current `allow-passthrough` and switch it to `all`, returning the value to put
+/// back on drop.
+///
+/// tmux runs a `;`-separated sequence in one process, so this is a single fork on the
+/// session-switch path instead of three. Both reads always run: asking for the global costs
+/// nothing extra once the process exists, and it saves a second fork when the pane has no local
+/// value. A pane-local value prints its own line first, so two lines means local and one means the
+/// pane was inheriting the global.
+fn take_pane_allow_passthrough(pane_id: &str) -> Result<TmuxOptionValue> {
     let program = resolve_launch_program("tmux")?;
     let output = Command::new(program)
-        .args(args)
+        .args([
+            "show-options",
+            "-p",
+            "-t",
+            pane_id,
+            "allow-passthrough",
+            ";",
+            "show-options",
+            "-g",
+            "allow-passthrough",
+            ";",
+            "set-option",
+            "-p",
+            "-t",
+            pane_id,
+            "allow-passthrough",
+            "all",
+        ])
         .env_remove("TMUX")
         .env_remove("ZELLIJ")
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
-            "tmux option command failed: {}",
+            "tmux allow-passthrough read-and-set failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut fields = stdout.split_whitespace();
-    if fields.next().is_none() {
-        return Ok(None);
-    }
-    Ok(fields.next().map(str::to_owned))
+    parse_allow_passthrough(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| anyhow::anyhow!("tmux reported no allow-passthrough value"))
+}
+
+/// Pick the effective `allow-passthrough` out of the paired `show-options` output.
+///
+/// tmux prints the pane-local line first and the global second, and omits the local line when the
+/// pane has none. So two lines means the pane owns a value worth restoring, and one means it was
+/// inheriting and should be unset again on drop.
+fn parse_allow_passthrough(stdout: &str) -> Option<TmuxOptionValue> {
+    let values: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .collect();
+    Some(TmuxOptionValue {
+        value: (*values.first()?).to_owned(),
+        local: values.len() > 1,
+    })
 }
 
 fn set_pane_allow_passthrough(pane_id: &str, value: &str) -> Result<()> {
@@ -1362,6 +1392,31 @@ mod tests {
     use bootty_terminal::terminal_engine::TerminalColorConfig;
     use bootty_terminal::terminal_frame::RenderFrame;
     use tempfile::TempDir;
+
+    /// Both fixtures are verbatim output from `tmux show-options -p ... ; show-options -g ...`.
+    /// Reading the pair in the wrong order restores the wrong value on drop: the pane either keeps
+    /// `all` forever, or loses a setting its owner chose.
+    #[test]
+    fn paired_show_options_tells_a_pane_local_value_from_an_inherited_one() {
+        // Pane with no value of its own: tmux omits the local line and prints only the global.
+        assert_eq!(
+            parse_allow_passthrough("allow-passthrough off\n"),
+            Some(TmuxOptionValue {
+                value: "off".to_owned(),
+                local: false,
+            })
+        );
+        // Pane carrying its own value: the local line comes first, the global follows.
+        assert_eq!(
+            parse_allow_passthrough("allow-passthrough all\nallow-passthrough off\n"),
+            Some(TmuxOptionValue {
+                value: "all".to_owned(),
+                local: true,
+            })
+        );
+        // A server that answered with nothing leaves no value to restore.
+        assert_eq!(parse_allow_passthrough(""), None);
+    }
 
     #[test]
     fn status_bar_hidden_only_targets_tmux_when_enabled() {

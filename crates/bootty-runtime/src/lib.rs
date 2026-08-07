@@ -1,4 +1,5 @@
 pub mod benchmark_trace;
+pub mod latency;
 pub mod perf;
 pub mod render_source;
 pub mod scheduler;

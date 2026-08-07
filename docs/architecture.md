@@ -45,8 +45,8 @@ multiple callers.
   input value types, Kitty image extraction, and inherited Ghostty adapter
   tests.
 - `bootty-runtime` owns the PTY/session runtime, worker thread, bounded drain
-  budgets, published frame snapshots, repaint wakeup policy, and scheduling
-  guardrails.
+  budgets, published frame snapshots, repaint wakeup policy, scheduling
+  guardrails, and host-neutral runtime diagnostics shared across crates.
 - `bootty-render` owns renderer-independent paint planning plus WGPU resource
   preparation for backgrounds, text, color emoji, sprites, decorations, cursor,
   and Kitty image placement.
