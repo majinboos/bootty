@@ -698,6 +698,50 @@ impl SpaceRuntime {
     }
 }
 
+/// A remote binding's attach client is gone and bootty is waiting to start the next one.
+///
+/// The sessions themselves live on the other host and outlive the connection, so a lost link is
+/// reconnected to rather than treated as the pane ending. Attempts back off, because the same loss
+/// that ends one client usually ends the next few too, and each attempt is a fresh SSH handshake.
+#[derive(Clone, Copy, Debug)]
+struct RemoteReattach {
+    retry_at: Instant,
+    attempts: u32,
+    /// Set once the waiting is over and a new attach client has been asked for.
+    started: bool,
+}
+
+impl RemoteReattach {
+    const FIRST_DELAY: Duration = Duration::from_millis(500);
+    const MAX_DELAY: Duration = Duration::from_secs(30);
+    /// How long an attach client has to survive before its connection counts as established. A
+    /// client that dies sooner is the same outage continuing, so the backoff keeps growing.
+    const STABLE_AFTER: Duration = Duration::from_secs(5);
+
+    fn after_failure(previous: Option<Self>, attached_for: Option<Duration>, now: Instant) -> Self {
+        let established = attached_for.is_some_and(|elapsed| elapsed >= Self::STABLE_AFTER);
+        let attempts = match previous {
+            Some(previous) if !established => previous.attempts.saturating_add(1),
+            _ => 1,
+        };
+        Self {
+            retry_at: now + Self::delay(attempts),
+            attempts,
+            started: false,
+        }
+    }
+
+    fn due(self, now: Instant) -> bool {
+        !self.started && now >= self.retry_at
+    }
+
+    fn delay(attempts: u32) -> Duration {
+        Self::FIRST_DELAY
+            .saturating_mul(1u32 << attempts.saturating_sub(1).min(8))
+            .min(Self::MAX_DELAY)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SpaceTransition {
     from: SpaceId,
@@ -739,6 +783,11 @@ pub struct AppState {
     active_space_position: i64,
     inactive_spaces: Vec<SpaceRuntime>,
     space_transition: Option<SpaceTransition>,
+    /// Set while a remote binding's attach client is gone and bootty is waiting to start another.
+    reattach: Option<RemoteReattach>,
+    /// When the current remote attach client was asked for, so an outage that keeps ending clients
+    /// can be told from one connection that lasted and then dropped much later.
+    remote_attach_started: Option<Instant>,
     /// Keeps the one live native terminal while a non-native binding is active.
     parked_native_terminal: Option<NativeTerminalOwner>,
     repaint_scheduler: RepaintScheduler,
@@ -1149,6 +1198,8 @@ impl AppState {
             active_space_position,
             inactive_spaces,
             space_transition: None,
+            reattach: None,
+            remote_attach_started: None,
             parked_native_terminal: None,
             repaint_scheduler: RepaintScheduler::default(),
             last_error: None,
@@ -4190,10 +4241,11 @@ impl AppState {
             }
         } else {
             match self.binding.terminal.child_exited() {
-                Ok(true) => self.close_active_pane(),
-                Ok(false) => {}
+                Ok(true) => self.handle_attach_client_exit(now),
+                Ok(false) => self.note_attach_client_alive(now),
                 Err(error) => self.last_error = Some(error.to_string()),
             }
+            self.start_due_reattach(now, &mut effects);
         }
 
         if let Some(Err(_)) = self.binding.mux.poll_command() {
@@ -5419,6 +5471,63 @@ impl AppState {
         if !self.copy_terminal_selection_if_any() {
             effects.push(AppEffect::RequestCopy);
         }
+    }
+
+    /// The attach client exited. For a local binding that means the pane it was showing ended, so
+    /// the pane closes. For a remote one it means either that or a dropped connection, and the two
+    /// look identical from here — so bootty reconnects instead of closing. The sessions live on the
+    /// other host and outlive the link; closing on a network blip would kill work the user still
+    /// has. A pane that really did end is gone from the next snapshot, which closes it properly.
+    fn handle_attach_client_exit(&mut self, now: Instant) {
+        let Some(remote) = self.binding.multiplexer.remote.clone() else {
+            self.close_active_pane();
+            return;
+        };
+        if self.reattach.is_some_and(|reattach| !reattach.started) {
+            return;
+        }
+        let attached_for = self
+            .remote_attach_started
+            .map(|started| now.saturating_duration_since(started));
+        let reattach = RemoteReattach::after_failure(self.reattach, attached_for, now);
+        self.last_error = Some(format!(
+            "lost the connection to {}; reconnecting (attempt {})",
+            remote.host, reattach.attempts
+        ));
+        self.reattach = Some(reattach);
+    }
+
+    /// A remote attach client that has been alive long enough proves the connection is back, so the
+    /// next outage starts its backoff from the beginning rather than from where this one left off.
+    fn note_attach_client_alive(&mut self, now: Instant) {
+        let established = self.remote_attach_started.is_some_and(|started| {
+            now.saturating_duration_since(started) >= RemoteReattach::STABLE_AFTER
+        });
+        if established && self.reattach.is_some_and(|reattach| reattach.started) {
+            self.reattach = None;
+        }
+    }
+
+    /// Drop the dead attach client once its backoff has passed. Clearing the pane's target is what
+    /// asks for a new one: this frame's pane sync starts a fresh client for the same session.
+    fn start_due_reattach(&mut self, now: Instant, effects: &mut Vec<AppEffect>) {
+        let Some(mut reattach) = self.reattach else {
+            return;
+        };
+        if !reattach.due(now) {
+            // Nothing else is guaranteed to wake the frame loop while a pane sits disconnected, so
+            // the wait itself asks for the frame that ends it.
+            if !reattach.started {
+                effects.push(AppEffect::RepaintAfter(
+                    reattach.retry_at.saturating_duration_since(now),
+                ));
+            }
+            return;
+        }
+        reattach.started = true;
+        self.reattach = Some(reattach);
+        self.remote_attach_started = Some(now);
+        self.binding.terminal.discard_active_pane();
     }
 
     // Close the focused pane (cmd+w or its shell exiting) and let the mux cascade to the tab. The
@@ -8420,6 +8529,73 @@ mod tests {
         assert!(reopened.close_space_from_ui(review_space));
         assert_eq!(reopened.active_space_id(), default_space);
         assert!(!reopened.close_space_from_ui(default_space));
+    }
+
+    /// A dropped connection has to reconnect, not close: the sessions are on the other host, and
+    /// closing the pane sends the backend a kill that would destroy work the user still has. The
+    /// pane's target survives so the next sync attaches the same session again.
+    #[test]
+    fn a_lost_remote_connection_reconnects_instead_of_killing_the_pane() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-reattach-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+        let space = state.active_space_id();
+        assert!(state.update_space_from_ui(
+            space,
+            "Remote",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Tmux),
+                remote: Some(SshRemoteConfig::for_host("devbox")),
+            },
+        ));
+        let now = Instant::now();
+
+        state.handle_attach_client_exit(now);
+
+        let reattach = state
+            .reattach
+            .expect("a lost connection schedules a reconnect");
+        assert_eq!(reattach.attempts, 1);
+        assert!(!reattach.started);
+        assert!(reattach.retry_at > now);
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("devbox"))
+        );
+    }
+
+    /// Backoff grows while one outage keeps ending clients, and starts over once a connection has
+    /// lasted — otherwise a host that drops out for an hour would still be waiting the maximum
+    /// delay the next time it blips, long after it came back.
+    #[test]
+    fn reconnect_backoff_grows_during_an_outage_and_resets_after_a_connection_lasts() {
+        let now = Instant::now();
+        let first = RemoteReattach::after_failure(None, None, now);
+        let second = RemoteReattach::after_failure(Some(first), Some(Duration::from_secs(1)), now);
+        let third = RemoteReattach::after_failure(Some(second), Some(Duration::from_secs(1)), now);
+
+        assert_eq!((first.attempts, second.attempts, third.attempts), (1, 2, 3));
+        assert!(RemoteReattach::delay(1) < RemoteReattach::delay(2));
+        assert!(RemoteReattach::delay(2) < RemoteReattach::delay(3));
+        assert_eq!(RemoteReattach::delay(99), RemoteReattach::MAX_DELAY);
+
+        let after_a_long_session = RemoteReattach::after_failure(
+            Some(third),
+            Some(RemoteReattach::STABLE_AFTER + Duration::from_secs(1)),
+            now,
+        );
+        assert_eq!(after_a_long_session.attempts, 1);
     }
 
     /// A space's host reaches the binding that attaches it, and stops being carried the moment the

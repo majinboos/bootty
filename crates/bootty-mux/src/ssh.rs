@@ -17,6 +17,13 @@ use super::{
     tmux_protocol::shell_quote,
 };
 
+/// Seconds to wait for a connection to be established before giving up.
+const CONNECT_TIMEOUT: u32 = 5;
+/// Seconds between the keepalives that prove an established connection still carries traffic.
+const SERVER_ALIVE_INTERVAL: u32 = 5;
+/// How many unanswered keepalives end the connection.
+const SERVER_ALIVE_COUNT_MAX: u32 = 3;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshRemote {
     config: SshRemoteConfig,
@@ -58,18 +65,37 @@ impl SshRemote {
             .iter()
             .map(|flag| (*flag).to_owned())
             .collect::<Vec<_>>();
-        ssh_args.extend(self.multiplexing_args());
+        // Configured flags precede bootty's own: SSH keeps the first value it is given for an
+        // option, so whatever the host needs wins over the defaults below.
+        ssh_args.extend(self.config.args.iter().cloned());
         if let Some(port) = self.config.port {
             ssh_args.push("-p".to_owned());
             ssh_args.push(port.to_string());
         }
-        ssh_args.extend(self.config.args.iter().cloned());
+        ssh_args.extend(self.keepalive_args());
+        ssh_args.extend(self.multiplexing_args());
         ssh_args.push(self.destination());
         // SSH joins the remaining argv with spaces and hands the result to the remote login shell,
         // so the command has to arrive already quoted for that shell.
         ssh_args.push("--".to_owned());
         ssh_args.push(remote_command_line(program, args));
         (self.config.program.clone(), ssh_args)
+    }
+
+    /// Turn a lost connection into a failure instead of a wait. A black-holed link answers nothing
+    /// and closes nothing: without these, dialing blocks for the operating system's TCP timeout and
+    /// an established connection never ends at all, which strands the mutation worker and leaves the
+    /// pane showing a session it can no longer reach. Losses are noticed in about
+    /// `SERVER_ALIVE_INTERVAL * SERVER_ALIVE_COUNT_MAX` seconds, and the pane reconnects.
+    fn keepalive_args(&self) -> Vec<String> {
+        vec![
+            "-o".to_owned(),
+            format!("ConnectTimeout={CONNECT_TIMEOUT}"),
+            "-o".to_owned(),
+            format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL}"),
+            "-o".to_owned(),
+            format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}"),
+        ]
     }
 
     /// Share one connection across invocations, so a mutation issued from a keypress does not pay
@@ -203,6 +229,34 @@ mod tests {
             !attached
                 .windows(2)
                 .any(|pair| pair == ["-o", "BatchMode=yes"])
+        );
+    }
+
+    /// A connection that stops answering has to end rather than hang: the snapshot poll and every
+    /// mutation run to completion before the next one starts, so a wait with no timeout strands
+    /// them. Configured flags come first, because SSH keeps the first value given for an option and
+    /// a host that needs different timings has to be able to say so.
+    #[test]
+    fn every_connection_is_bounded_and_configured_flags_outrank_the_defaults() {
+        let (_, argv) = remote(SshRemoteConfig {
+            args: args(&["-o", "ServerAliveInterval=30"]),
+            ..config("devbox")
+        })
+        .command("tmux", &args(&["list-sessions"]));
+
+        let options = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-o")
+            .map(|pair| pair[1].clone())
+            .collect::<Vec<_>>();
+        assert!(options.contains(&"ConnectTimeout=5".to_owned()));
+        assert!(options.contains(&"ServerAliveCountMax=3".to_owned()));
+        assert_eq!(
+            options
+                .iter()
+                .find(|option| option.starts_with("ServerAliveInterval")),
+            Some(&"ServerAliveInterval=30".to_owned()),
+            "the configured interval has to be the one SSH reads first"
         );
     }
 

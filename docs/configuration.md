@@ -94,6 +94,12 @@ host = "devbox" # ~/.ssh/config alias, hostname, or address
 # This is the default every space inherits. A single space can name its own host
 # in the space editor, next to its backend, so remote and local spaces sit side
 # by side; that override lives in the workspace database, not in this file.
+#
+# Bootty dials with ConnectTimeout=5, ServerAliveInterval=5 and
+# ServerAliveCountMax=3, so a lost connection ends in about 15 seconds instead of
+# hanging. The pane then reconnects on its own, with a growing delay between
+# attempts; the sessions stay on the remote host throughout. Flags listed in
+# `args` come first on the command line, so any of these can be set differently.
 
 [input]
 preset = "ghostty" # ghostty (default), bootty, or tmux — which built-in default keybind set to use
