@@ -79,12 +79,12 @@ pollster = "0.4"
 png = "0.18"
 portable-pty = "0.9"
 proptest = "1"
-rmux-client = "0.9.1"
-rmux-sdk = "0.9.1"
+rmux-client = "0.10"
+rmux-sdk = "0.10"
 keepawake = "0.6"
-rmux-ipc = "0.9.1"
-rmux-proto = "0.9.1"
-rmux-server = { version = "0.9.1", default-features = false }
+rmux-ipc = "0.10"
+rmux-proto = "0.10"
+rmux-server = { version = "0.10", default-features = false }
 rstest = "0.26"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 rustybuzz = "0.20"
