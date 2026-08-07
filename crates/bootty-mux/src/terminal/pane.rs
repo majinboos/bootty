@@ -1596,10 +1596,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_window_resize_worker_is_non_blocking_and_reaches_server() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        crate::start_embedded_rmux_daemon_for_tests()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1635,18 +1635,27 @@ mod tests {
             start.elapsed()
         );
 
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
         let expected = format!("{session} {window_id} 117x40");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let output = std::process::Command::new("rmux")
-                .args([
-                    "list-windows",
-                    "-a",
-                    "-F",
-                    "#{session_name} #{window_id} #{window_width}x#{window_height}",
-                ])
-                .output()?;
-            let last_output = String::from_utf8_lossy(&output.stdout).into_owned();
+            let response = runtime.block_on(crate::rmux::rmux_request(
+                rmux_proto::Request::ListWindows(Box::new(rmux_proto::ListWindowsRequest {
+                    target: rmux_sdk::SessionName::new(&session)?,
+                    format: Some(
+                        "#{session_name} #{window_id} #{window_width}x#{window_height}".to_owned(),
+                    ),
+                    filter: None,
+                    sort_order: None,
+                    reversed: false,
+                })),
+            ))?;
+            let rmux_proto::Response::ListWindows(response) = response else {
+                anyhow::bail!("rmux returned an unexpected list-windows response");
+            };
+            let last_output = String::from_utf8_lossy(&response.output.stdout).into_owned();
             if last_output.lines().any(|line| line == expected) {
                 break;
             }
@@ -1657,19 +1666,14 @@ mod tests {
         }
         terminal.resize_native_layout_window(117, 40)?;
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_native_window_attach_and_switch_stay_interactive() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        crate::start_embedded_rmux_daemon_for_tests()?;
         use crate::rmux::{RmuxSessionClient, SdkRmuxClient};
 
         let client = SdkRmuxClient::new();
@@ -1737,11 +1741,6 @@ mod tests {
         );
 
         client.kill_session(&session)?;
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
         Ok(())
     }
     #[test]

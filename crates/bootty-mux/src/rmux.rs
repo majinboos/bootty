@@ -580,6 +580,14 @@ mod tests {
 
     use super::*;
     use crate::command::MuxCommand;
+    use rmux_sdk::{PaneId, TerminalSizeSpec};
+
+    fn rmux_test_request(request: Request) -> Result<Response> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(rmux_request(request))
+    }
 
     #[derive(Clone, Default)]
     struct RecordingClient {
@@ -1061,33 +1069,22 @@ mod tests {
         }
     }
 
-    fn kill_rmux_server() {
-        let _ = std::process::Command::new("rmux")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-    }
-
     fn rmux_pane_sizes(session: &str) -> Result<Vec<(u16, u16)>> {
-        let output = std::process::Command::new("rmux")
-            .args([
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name} #{pane_width} #{pane_height}",
-            ])
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "rmux list-panes exited with {}",
-            output.status
-        );
-        let text = String::from_utf8_lossy(&output.stdout);
-        text.lines()
-            .filter_map(|line| line.strip_prefix(session))
-            .map(|fields| {
-                let mut fields = fields.split_whitespace();
+        let response = rmux_test_request(Request::ListPanes(Box::new(ListPanesRequest {
+            target: SessionName::new(session)?,
+            target_window_index: None,
+            format: Some("#{pane_width} #{pane_height}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))?;
+        let Response::ListPanes(response) = response else {
+            anyhow::bail!("rmux returned an unexpected list-panes response");
+        };
+        String::from_utf8_lossy(&response.output.stdout)
+            .lines()
+            .map(|line| {
+                let mut fields = line.split_whitespace();
                 let width = fields
                     .next()
                     .context("missing pane width")?
@@ -1102,10 +1099,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_split_down_stacks_panes() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        crate::start_embedded_rmux_daemon_for_tests()?;
         let client = SdkRmuxClient::new();
         let session = format!("bootty-split-down-{}", std::process::id());
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
@@ -1133,7 +1130,6 @@ mod tests {
         );
 
         client.kill_session(&session)?;
-        kill_rmux_server();
 
         assert_eq!(sizes.len(), 2, "expected two panes, got {sizes:?}");
         assert!(
@@ -1148,10 +1144,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_backend_smoke_covers_tabs_splits_switching_and_persistence() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        crate::start_embedded_rmux_daemon_for_tests()?;
         let client = SdkRmuxClient::new();
         let session = format!("bootty-smoke-{}", std::process::id());
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
@@ -1343,15 +1339,14 @@ mod tests {
         client.kill_session(&session)?;
         client.kill_session(&other_session)?;
 
-        kill_rmux_server();
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires an rmux binary; set RMUX_TMPDIR to isolate the daemon"]
+    #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_window_resize_makes_bootty_split_pane_sizes_real() -> Result<()> {
-        std::env::var_os("RMUX_TMPDIR")
-            .context("set RMUX_TMPDIR to an empty temporary directory before running this test")?;
+        std::env::var_os("RMUX_TMPDIR").context("set isolated RMUX_TMPDIR")?;
+        crate::start_embedded_rmux_daemon_for_tests()?;
         let client = SdkRmuxClient::new();
         let session = format!("bootty-resize-{}", std::process::id());
         let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
@@ -1377,37 +1372,29 @@ mod tests {
         assert_eq!(pane_ids.len(), 2);
 
         resize_bootty_rmux_window(&window_id, 117, 40)?;
-        for pane_id in &pane_ids {
-            let status = std::process::Command::new("rmux")
-                .args(["resize-pane", "-t", pane_id, "-x", "58", "-y", "40"])
-                .status()?;
-            anyhow::ensure!(status.success(), "rmux resize-pane exited with {status}");
-        }
-        let output = std::process::Command::new("rmux")
-            .args([
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name} #{pane_id} #{pane_width}x#{pane_height}",
-            ])
-            .output()?;
-        anyhow::ensure!(
-            output.status.success(),
-            "rmux list-panes exited with {}",
-            output.status
-        );
-        let sizes = String::from_utf8_lossy(&output.stdout).into_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let rmux = crate::rmux_bridge::connect_bootty_rmux().await?;
+            let session_name = SessionName::new(&session)?;
+            for pane_id in &pane_ids {
+                let pane_id = pane_id
+                    .strip_prefix('%')
+                    .context("rmux pane id should use tmux-style prefix")?
+                    .parse::<u32>()?;
+                rmux.pane_by_id(session_name.clone(), PaneId::from(pane_id))
+                    .await?
+                    .resize(TerminalSizeSpec::new(58, 40))
+                    .await?;
+            }
+            Result::<()>::Ok(())
+        })?;
+        let sizes = rmux_pane_sizes(&session)?;
 
         client.kill_session(&session)?;
-        kill_rmux_server();
 
-        for pane_id in pane_ids {
-            let expected = format!("{session} {pane_id} 58x40");
-            assert!(
-                sizes.lines().any(|line| line == expected),
-                "expected {expected:?} in rmux sizes:\n{sizes}"
-            );
-        }
+        assert_eq!(sizes, vec![(58, 40), (58, 40)]);
         Ok(())
     }
 
