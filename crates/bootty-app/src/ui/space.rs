@@ -26,12 +26,21 @@ pub struct SpaceEditorDialog {
     color: [u8; 3],
     tint_sidebar: bool,
     backend: Option<MultiplexerBackendConfig>,
-    /// The backend a `None` override resolves to, so the editor knows whether this space can name a
-    /// remote host at all.
-    inherited_backend: MultiplexerBackendConfig,
+    /// What this space runs when it overrides nothing. The editor needs it to know whether the
+    /// space can name a host at all, and to show what it would otherwise inherit — editing a space
+    /// that inherits must not turn the inherited value into an override of the same value.
+    inherited: SpaceInheritance,
     remote: RemoteFields,
     focus: bool,
     icon_search: String,
+}
+
+/// What a space falls back to when it overrides nothing: the backend the config file names, and
+/// the host that backend would run on. Shown as placeholders, never written as the space's own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpaceInheritance {
+    pub backend: MultiplexerBackendConfig,
+    pub host: Option<String>,
 }
 
 /// The remote connection as typed. Held as text so a half-written port or host does not have to
@@ -101,11 +110,7 @@ pub enum SpaceEditorEvent {
 }
 
 impl SpaceEditorDialog {
-    pub fn new_space(
-        icon: String,
-        mux: SpaceMuxOverride,
-        inherited_backend: MultiplexerBackendConfig,
-    ) -> Self {
+    pub fn new_space(icon: String, mux: SpaceMuxOverride, inherited: SpaceInheritance) -> Self {
         Self {
             space_id: None,
             name: String::new(),
@@ -113,7 +118,7 @@ impl SpaceEditorDialog {
             color: DEFAULT_SPACE_COLOR,
             tint_sidebar: false,
             backend: mux.backend,
-            inherited_backend,
+            inherited,
             remote: RemoteFields::from_config(mux.remote.as_ref()),
             icon_search: String::new(),
             focus: true,
@@ -127,7 +132,7 @@ impl SpaceEditorDialog {
         color: [u8; 3],
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
-        inherited_backend: MultiplexerBackendConfig,
+        inherited: SpaceInheritance,
     ) -> Self {
         Self {
             space_id: Some(space_id),
@@ -136,7 +141,7 @@ impl SpaceEditorDialog {
             color,
             tint_sidebar,
             backend: mux.backend,
-            inherited_backend,
+            inherited,
             remote: RemoteFields::from_config(mux.remote.as_ref()),
             icon_search: String::new(),
             focus: true,
@@ -145,7 +150,7 @@ impl SpaceEditorDialog {
 
     /// The backend this space will actually run, override or inherited.
     fn resolved_backend(&self) -> MultiplexerBackendConfig {
-        self.backend.unwrap_or(self.inherited_backend)
+        self.backend.unwrap_or(self.inherited.backend)
     }
 
     pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> SpaceEditorEvent {
@@ -256,9 +261,15 @@ impl SpaceEditorDialog {
     /// The host this space's multiplexer runs on. Only for the backends bootty reaches through a
     /// client — the others keep their terminals in this process, with no host to name.
     fn remote_ui(&mut self, ui: &mut egui::Ui, palette: ThemePalette) {
-        if !self.resolved_backend().supports_remote() {
-            return;
-        }
+        // Always shown, so the field is where someone looks for it rather than something they find
+        // by changing the backend first. It is only editable for a backend that has a client to run
+        // elsewhere, and says so when it does not.
+        let remotable = self.resolved_backend().supports_remote();
+        let placeholder = match (&self.inherited.host, remotable) {
+            (_, false) => "tmux or zellij only".to_owned(),
+            (Some(host), true) => format!("{host} (inherited)"),
+            (None, true) => "empty keeps this space local".to_owned(),
+        };
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(
@@ -267,13 +278,14 @@ impl SpaceEditorDialog {
                     .size(12.0)
                     .color(palette.muted),
             );
-            ui.add(
+            ui.add_enabled(
+                remotable,
                 egui::TextEdit::singleline(&mut self.remote.host)
-                    .hint_text("empty keeps this space local")
+                    .hint_text(placeholder)
                     .desired_width(220.0),
             );
         });
-        if self.remote.host.trim().is_empty() {
+        if !remotable || self.remote.host.trim().is_empty() {
             return;
         }
         egui::CollapsingHeader::new(
@@ -505,7 +517,7 @@ mod tests {
         let dialog = SpaceEditorDialog::new_space(
             "folder".to_owned(),
             SpaceMuxOverride::default(),
-            MultiplexerBackendConfig::Native,
+            SpaceInheritance::default(),
         );
         assert!(dialog.name.is_empty());
     }

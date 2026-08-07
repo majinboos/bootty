@@ -87,7 +87,7 @@ use crate::{
         rename::{RenameSessionDialog, RenameSessionEvent, RenameTabDialog, RenameTabEvent},
         session_navigation::{BindingSessionGroup, ScopedSessionTarget},
         session_picker::{SessionPickerDialog, SessionPickerEvent},
-        space::{SpaceEditorDialog, SpaceEditorEvent, default_space_icon},
+        space::{SpaceEditorDialog, SpaceEditorEvent, SpaceInheritance, default_space_icon},
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
@@ -370,6 +370,13 @@ struct BindingRuntime {
     label: String,
     backend_override: Option<MultiplexerBackendConfig>,
     remote_override: Option<SshRemoteConfig>,
+    /// Set while this binding's remote attach client is gone and bootty is waiting to start
+    /// another. Per binding, not per window: one space's outage is not another's, and a reconnect
+    /// pending here must not discard the pane of whichever space is active when it comes due.
+    reattach: Option<RemoteReattach>,
+    /// When this binding's current remote attach client was asked for, so an outage that keeps
+    /// ending clients can be told from one connection that lasted and then dropped much later.
+    remote_attach_started: Option<Instant>,
     multiplexer: crate::config::MultiplexerConfig,
     terminal: Box<ActiveTerminal>,
     mux: BindingMuxController,
@@ -440,6 +447,8 @@ impl BindingRuntime {
             label: binding_label(scope, &config.multiplexer),
             backend_override,
             remote_override,
+            reattach: None,
+            remote_attach_started: None,
             multiplexer: config.multiplexer.clone(),
             scope,
             terminal,
@@ -783,11 +792,6 @@ pub struct AppState {
     active_space_position: i64,
     inactive_spaces: Vec<SpaceRuntime>,
     space_transition: Option<SpaceTransition>,
-    /// Set while a remote binding's attach client is gone and bootty is waiting to start another.
-    reattach: Option<RemoteReattach>,
-    /// When the current remote attach client was asked for, so an outage that keeps ending clients
-    /// can be told from one connection that lasted and then dropped much later.
-    remote_attach_started: Option<Instant>,
     /// Keeps the one live native terminal while a non-native binding is active.
     parked_native_terminal: Option<NativeTerminalOwner>,
     repaint_scheduler: RepaintScheduler,
@@ -1198,8 +1202,6 @@ impl AppState {
             active_space_position,
             inactive_spaces,
             space_transition: None,
-            reattach: None,
-            remote_attach_started: None,
             parked_native_terminal: None,
             repaint_scheduler: RepaintScheduler::default(),
             last_error: None,
@@ -1506,6 +1508,19 @@ impl AppState {
             .iter()
             .find(|space| space.id == space_id)
             .map(|space| space.binding.backend_override)
+    }
+
+    /// What a space runs when it overrides nothing, for the editor to show as its placeholders.
+    fn space_inheritance(&self) -> SpaceInheritance {
+        SpaceInheritance {
+            backend: self.config().multiplexer.backend,
+            host: self
+                .config()
+                .multiplexer
+                .remote
+                .as_ref()
+                .map(|remote| remote.host.clone()),
+        }
     }
 
     fn space_remote_override(&self, space_id: SpaceId) -> Option<SshRemoteConfig> {
@@ -4386,13 +4401,11 @@ impl AppState {
             .into_iter()
             .map(|space| space.icon)
             .collect::<Vec<_>>();
+        let inherited = self.space_inheritance();
         self.space_editor_dialog = Some(SpaceEditorDialog::new_space(
             default_space_icon(&existing_icons),
-            SpaceMuxOverride {
-                backend: None,
-                remote: self.config().multiplexer.remote.clone(),
-            },
-            self.config().multiplexer.backend,
+            SpaceMuxOverride::default(),
+            inherited,
         ));
         self.input_focus = InputFocus::Picker;
         true
@@ -4409,9 +4422,10 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
-        let remote = self
-            .space_remote_override(space.id)
-            .or_else(|| self.config().multiplexer.remote.clone());
+        // Only this space's own host, so saving an inheriting space keeps it inheriting; the
+        // inherited one is the placeholder.
+        let remote = self.space_remote_override(space.id);
+        let inherited = self.space_inheritance();
         self.space_editor_dialog = Some(SpaceEditorDialog::edit_space(
             space.id,
             space.name,
@@ -4419,7 +4433,7 @@ impl AppState {
             space.color,
             space.tint_sidebar,
             SpaceMuxOverride { backend, remote },
-            self.config().multiplexer.backend,
+            inherited,
         ));
         self.input_focus = InputFocus::Picker;
         true
@@ -5483,35 +5497,45 @@ impl AppState {
             self.close_active_pane();
             return;
         };
-        if self.reattach.is_some_and(|reattach| !reattach.started) {
+        if self
+            .binding
+            .reattach
+            .is_some_and(|reattach| !reattach.started)
+        {
             return;
         }
         let attached_for = self
+            .binding
             .remote_attach_started
             .map(|started| now.saturating_duration_since(started));
-        let reattach = RemoteReattach::after_failure(self.reattach, attached_for, now);
+        let reattach = RemoteReattach::after_failure(self.binding.reattach, attached_for, now);
         self.last_error = Some(format!(
             "lost the connection to {}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         ));
-        self.reattach = Some(reattach);
+        self.binding.reattach = Some(reattach);
     }
 
     /// A remote attach client that has been alive long enough proves the connection is back, so the
     /// next outage starts its backoff from the beginning rather than from where this one left off.
     fn note_attach_client_alive(&mut self, now: Instant) {
-        let established = self.remote_attach_started.is_some_and(|started| {
+        let established = self.binding.remote_attach_started.is_some_and(|started| {
             now.saturating_duration_since(started) >= RemoteReattach::STABLE_AFTER
         });
-        if established && self.reattach.is_some_and(|reattach| reattach.started) {
-            self.reattach = None;
+        if established
+            && self
+                .binding
+                .reattach
+                .is_some_and(|reattach| reattach.started)
+        {
+            self.binding.reattach = None;
         }
     }
 
     /// Drop the dead attach client once its backoff has passed. Clearing the pane's target is what
     /// asks for a new one: this frame's pane sync starts a fresh client for the same session.
     fn start_due_reattach(&mut self, now: Instant, effects: &mut Vec<AppEffect>) {
-        let Some(mut reattach) = self.reattach else {
+        let Some(mut reattach) = self.binding.reattach else {
             return;
         };
         if !reattach.due(now) {
@@ -5525,8 +5549,8 @@ impl AppState {
             return;
         }
         reattach.started = true;
-        self.reattach = Some(reattach);
-        self.remote_attach_started = Some(now);
+        self.binding.reattach = Some(reattach);
+        self.binding.remote_attach_started = Some(now);
         self.binding.terminal.discard_active_pane();
     }
 
@@ -8443,7 +8467,7 @@ mod tests {
                     backend: Some(MultiplexerBackendConfig::Native),
                     remote: None,
                 },
-                MultiplexerBackendConfig::Native,
+                SpaceInheritance::default(),
             ),
             SpaceEditorEvent::Save {
                 space_id: None,
@@ -8470,7 +8494,7 @@ mod tests {
                     backend: Some(MultiplexerBackendConfig::Rmux),
                     remote: None,
                 },
-                MultiplexerBackendConfig::Native,
+                SpaceInheritance::default(),
             ),
             SpaceEditorEvent::Save {
                 space_id: Some(review_space),
@@ -8562,6 +8586,7 @@ mod tests {
         state.handle_attach_client_exit(now);
 
         let reattach = state
+            .binding
             .reattach
             .expect("a lost connection schedules a reconnect");
         assert_eq!(reattach.attempts, 1);
@@ -8905,7 +8930,7 @@ mod tests {
                 active_space.color,
                 active_space.tint_sidebar,
                 SpaceMuxOverride::default(),
-                MultiplexerBackendConfig::Native,
+                SpaceInheritance::default(),
             ))
         );
 
