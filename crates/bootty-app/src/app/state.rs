@@ -543,6 +543,7 @@ impl BindingRuntime {
     }
 
     fn sync_session_order(&mut self) {
+        self.carry_renamed_members();
         // Prune against the whole backend list, never `sessions()`: that one is already narrowed to
         // membership, so a session this binding just attached would count as dead and be dropped
         // again before it ever showed up in the sidebar.
@@ -3014,9 +3015,7 @@ impl AppState {
     }
 
     fn sync_generated_session_names(&mut self) {
-        // Membership follows a rename whichever backend is in use and whoever made it. Above the
-        // rmux guard on purpose: bootty does not generate names for rmux, but sessions there are
-        // still renamed behind its back, and membership has to follow those too.
+        // Preserve membership before `observe_session` records the backend's new names below.
         self.binding.carry_renamed_members();
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
             return;
@@ -3024,9 +3023,8 @@ impl AppState {
         if !self.generated_names_need_sync() {
             return;
         }
-        // Reconcile only this binding's sessions. Generating names for the whole backend list renames
-        // sessions that belong to other Spaces; `carry_renamed_members` reads the full list because
-        // it only ever moves a row this binding already owns.
+        // Reconcile only this binding's sessions. Generating names for the whole backend list
+        // renames sessions that belong to other Spaces.
         let sessions = self.binding.mux.sessions().to_vec();
         let mut renames = Vec::new();
         self.binding
@@ -7342,6 +7340,45 @@ mod tests {
                 .map(|session| session.name.as_str())
                 .collect::<Vec<_>>(),
             ["alpha"],
+        );
+    }
+
+    #[test]
+    fn switching_to_a_space_keeps_a_session_renamed_while_inactive() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        let home_space = state.active_space_id();
+        assert!(state.create_space_from_ui(
+            "Work",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let work_space = state.active_space_id();
+        let backend = ScriptedBackend::with(vec![session_with("s1", "before", "/repo/work")])
+            .install(&mut state.binding);
+        state
+            .binding
+            .session_names
+            .mark_explicit("s1", "before", "before", "/repo/work");
+        state.binding.session_order.add_session("before");
+        reconcile_frame(&mut state);
+
+        assert!(state.activate_space_from_ui(home_space));
+        backend.set(vec![session_with("s1", "after", "/repo/work")]);
+        assert!(state.activate_space_from_ui(work_space));
+
+        assert_eq!(state.binding.session_order.session_names(), ["after"]);
+        assert_eq!(
+            state
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            ["after"],
         );
     }
 
