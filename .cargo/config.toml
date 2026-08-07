@@ -3,3 +3,13 @@
 # (pervasive access violations in FFI calls). ReleaseSafe keeps runtime safety
 # checks while producing a working library on every platform.
 LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseSafe"
+
+# On the first CoreText call in a process, macOS registers the fonts bundled with
+# the running executable, and for a bare binary that means enumerating the entire
+# directory the binary sits in. Test binaries live in `target/debug/deps`, which
+# accumulates hundreds of thousands of build artifacts, so that single call cost
+# ~5s per test process. CoreFoundation resolves the main bundle from `CFProcessPath`
+# when it is set, so pointing it at an empty directory keeps the scan to a few
+# milliseconds. Nothing here reads its own bundle resources, and the path has to
+# name a file that exists, so borrow a system binary that lives in a small directory.
+CFProcessPath = "/bin/sh"
