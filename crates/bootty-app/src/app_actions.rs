@@ -623,7 +623,7 @@ fn binding_triggers_for_egui_scroll_with_modifier_sides(
         .collect()
 }
 
-fn key_mods_for_egui_binding(
+pub fn key_mods_for_egui_binding(
     modifiers: egui::Modifiers,
     modifier_sides: ModifierSideState,
 ) -> KeyMods {

@@ -4020,6 +4020,13 @@ impl AppState {
         &self.pending_direct_input
     }
 
+    /// The modifier keys held right now, with their left/right sides, as tracked by the direct
+    /// winit input path. The settings recorder needs this for wheel steps, which arrive as egui
+    /// events with side-less modifiers.
+    pub fn modifier_sides(&self) -> ModifierSideState {
+        self.modifier_sides
+    }
+
     /// Drain the pending direct-input chords as binding-trigger strings for the settings keybind
     /// recorder. This is how the recorder captures cmd-modified chords like ⌘V and ⌘⌥X: egui
     /// collapses those into copy/cut/paste events with no key event, but bootty's direct winit path

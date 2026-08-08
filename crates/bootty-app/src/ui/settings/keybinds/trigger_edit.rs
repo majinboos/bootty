@@ -1,3 +1,5 @@
+use crate::direct_input::ModifierSideState;
+use crate::input_binding::BindingTrigger;
 use eframe::egui;
 
 /// Trigger flag prefixes from the binding grammar (`performable:`, `global:`, …). Surfaced as
@@ -183,7 +185,28 @@ fn is_sided_modifier_token(token: &str) -> bool {
 }
 
 pub(super) fn trigger_step(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
-    let token = key_token(key)?;
+    Some(modified_step(&key_token(key)?, modifiers))
+}
+
+/// A wheel step (`alt+scroll_up`), formatted by the binding grammar's own writer so the tokens
+/// match what the parser accepts. A side-sensitive row keeps the left/right side of every held
+/// modifier, taken from the same live side state the runtime matches wheel bindings against —
+/// egui's `Modifiers` alone cannot tell the sides apart.
+pub(super) fn scroll_step(
+    up: bool,
+    modifiers: egui::Modifiers,
+    modifier_sides: ModifierSideState,
+    side_sensitive: bool,
+) -> String {
+    let mods = crate::app_actions::key_mods_for_egui_binding(modifiers, modifier_sides);
+    let mut trigger = BindingTrigger::from_scroll_with_modifier_sides(up, mods);
+    if !side_sensitive {
+        trigger.mods = trigger.mods.without_side_constraints();
+    }
+    trigger.format_entry()
+}
+
+fn modified_step(token: &str, modifiers: egui::Modifiers) -> String {
     let mut parts: Vec<&str> = Vec::new();
     // egui aliases `command` to `ctrl` off macOS, so only treat the real Cmd key as cmd.
     if cfg!(target_os = "macos") && (modifiers.mac_cmd || modifiers.command) {
@@ -202,8 +225,8 @@ pub(super) fn trigger_step(key: egui::Key, modifiers: egui::Modifiers) -> Option
     if !step.is_empty() {
         step.push('+');
     }
-    step.push_str(&token);
-    Some(step)
+    step.push_str(token);
+    step
 }
 
 fn key_token(key: egui::Key) -> Option<String> {
@@ -324,6 +347,48 @@ mod tests {
         let (flags, combo) = parse_trigger_flags("cmd+shift+r");
         assert_eq!(combo, "cmd+shift+r");
         assert!(flags.iter().all(|on| !on));
+    }
+
+    #[test]
+    fn recorded_scroll_steps_parse_as_wheel_binding_triggers() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+
+        let step = scroll_step(true, alt, ModifierSideState::default(), false);
+        assert_eq!(step, "alt+scroll_up");
+        let trigger: BindingTrigger = step.parse().expect("wheel trigger");
+        assert_eq!(trigger.key, crate::input_binding::BindingKey::ScrollUp);
+
+        let down = scroll_step(
+            false,
+            egui::Modifiers::default(),
+            ModifierSideState::default(),
+            false,
+        );
+        assert_eq!(down, "scroll_down");
+        let trigger: BindingTrigger = down.parse().expect("wheel trigger");
+        assert_eq!(trigger.key, crate::input_binding::BindingKey::ScrollDown);
+    }
+
+    #[test]
+    fn side_sensitive_scroll_steps_keep_the_held_modifier_side() {
+        let alt = egui::Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        let right_alt = ModifierSideState {
+            right_alt: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scroll_step(true, alt, right_alt, true),
+            "right_alt+scroll_up"
+        );
+        // The same wheel event on a side-agnostic row still records the unsided trigger.
+        assert_eq!(scroll_step(true, alt, right_alt, false), "alt+scroll_up");
     }
 
     #[test]

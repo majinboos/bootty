@@ -157,6 +157,20 @@ impl BindingTrigger {
         }
     }
 
+    /// Wheel counterpart to [`Self::from_key_input_with_modifier_sides`]: a `scroll_up` /
+    /// `scroll_down` trigger carrying the left/right side of every held modifier. Callers that want
+    /// a side-agnostic trigger follow with [`BindingMods::without_side_constraints`].
+    pub fn from_scroll_with_modifier_sides(up: bool, mods: KeyMods) -> Self {
+        Self {
+            mods: BindingMods::from_key_mods_with_sides(mods),
+            key: if up {
+                BindingKey::ScrollUp
+            } else {
+                BindingKey::ScrollDown
+            },
+        }
+    }
+
     pub fn input_mod_candidates(input: KeyInput) -> Vec<BindingMods> {
         BindingMods::input_candidates(input.mods)
     }

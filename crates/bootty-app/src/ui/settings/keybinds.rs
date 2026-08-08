@@ -5,11 +5,13 @@ mod trigger_edit;
 
 use super::SettingsWindow;
 use crate::config::KeybindPreset;
+use crate::direct_input::ModifierSideState;
 pub(super) use model::{BindingRow, ChordCapture, KeybindScope};
 use model::{action_options, effective_bindings, read_scope_entries, split_entry, write_scope};
 use trigger_edit::{
     MODIFIER_TOKENS, TRIGGER_FLAGS, add_default_modifier_sides, captured_step, join_trigger_flags,
-    parse_trigger_flags, prefix_combo, strip_modifier_sides, trigger_step, unprefix_combo,
+    parse_trigger_flags, prefix_combo, scroll_step, strip_modifier_sides, trigger_step,
+    unprefix_combo,
 };
 
 /// Seconds to wait for the next chord step before committing the captured trigger.
@@ -104,6 +106,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
         &mut rows,
         &mut changed,
         &direct_chords,
+        win.recorder_modifier_sides,
         effective_prefix.as_deref(),
     );
 
@@ -625,7 +628,7 @@ fn binding_editor_row(
                     .filter(|cap| cap.row == ctx.index)
                     .map(|cap| {
                         if cap.steps.is_empty() {
-                            "Press keys… Esc to cancel".to_owned()
+                            "Press keys or scroll… Esc to cancel".to_owned()
                         } else {
                             cap.steps.join(">")
                         }
@@ -982,7 +985,7 @@ fn record_cell(
         }
     }
     response.on_hover_text(if recording {
-        "Recording — press keys, Esc cancels"
+        "Recording — press keys or scroll, Esc cancels"
     } else {
         "Click to record a shortcut"
     })
@@ -1055,6 +1058,7 @@ fn handle_capture(
     rows: &mut [BindingRow],
     changed: &mut bool,
     direct_chords: &[String],
+    modifier_sides: ModifierSideState,
     prefix: Option<&str>,
 ) {
     if capture.is_none() {
@@ -1081,6 +1085,18 @@ fn handle_capture(
             cap.steps.push(step);
             cap.deadline = Some(now + CHORD_TIMEOUT);
         }
+        return;
+    }
+
+    // Wheel steps: `scroll_up` / `scroll_down` are bindable triggers (the default font-size zoom
+    // rides on `alt+shift+scroll`), so the recorder captures the wheel the same way it captures keys.
+    if let Some((up, modifiers)) = drain_first_scroll(ui)
+        && let Some(cap) = capture.as_mut()
+    {
+        let side_sensitive = rows.get(cap.row).is_some_and(|row| row.side_sensitive);
+        cap.steps
+            .push(scroll_step(up, modifiers, modifier_sides, side_sensitive));
+        cap.deadline = Some(now + CHORD_TIMEOUT);
         return;
     }
 
@@ -1150,6 +1166,30 @@ fn drain_first_key_press(ui: &egui::Ui) -> Option<(egui::Key, egui::Modifiers)> 
             }
             _ => true,
         });
+        first
+    })
+}
+
+/// Remove and return the first wheel event this frame, as `(scrolled_up, modifiers)`. The frame's
+/// accumulated scroll is zeroed too, since the deltas are summed before events reach us and would
+/// otherwise scroll the settings page out from under the row being recorded.
+fn drain_first_scroll(ui: &egui::Ui) -> Option<(bool, egui::Modifiers)> {
+    ui.input_mut(|input| {
+        let mut first = None;
+        input.events.retain(|event| match event {
+            egui::Event::MouseWheel {
+                delta, modifiers, ..
+            } if delta.y != 0.0 => {
+                if first.is_none() {
+                    first = Some((delta.y > 0.0, *modifiers));
+                }
+                false
+            }
+            _ => true,
+        });
+        if first.is_some() {
+            input.smooth_scroll_delta = egui::Vec2::ZERO;
+        }
         first
     })
 }

@@ -22,6 +22,7 @@ use crate::{
         BoottyConfig, ConfigDocument, ConfigResult, MultiplexerBackendConfig, SidebarPosition,
         load_or_create_config_document,
     },
+    direct_input::ModifierSideState,
 };
 
 const SEARCH_ID: &str = "bootty::settings::search";
@@ -269,6 +270,9 @@ pub struct SettingsSurface {
     /// Binding-trigger chords captured this frame from the host's direct input path, fed in by the
     /// app so the recorder can capture cmd-modified combos egui drops (⌘V, ⌘⌥X, …).
     recorder_chords: Vec<String>,
+    /// Which physical modifier keys are held right now, fed in by the app each frame. Wheel steps
+    /// carry no key event, so this is the only source of left/right sides for a scroll recording.
+    recorder_modifier_sides: ModifierSideState,
     last_write_error: Option<String>,
     /// An action the keybind editor should focus (and add a row for) on its next
     /// frame, set by "configure this command's keybinding" from the palette.
@@ -302,6 +306,7 @@ impl SettingsSurface {
             prefix_capture: false,
             modifier_rows: None,
             recorder_chords: Vec::new(),
+            recorder_modifier_sides: ModifierSideState::default(),
             last_write_error: None,
             pending_keybind_focus: None,
             base_style: None,
@@ -329,8 +334,10 @@ impl SettingsSurface {
         ui: &mut egui::Ui,
         theme: Theme,
         captured_chords: Vec<String>,
+        modifier_sides: ModifierSideState,
     ) -> SettingsAction {
         self.recorder_chords = captured_chords;
+        self.recorder_modifier_sides = modifier_sides;
         self.palette = theme.palette;
         bootty_ui::configure_style(ui.style_mut(), theme);
         // Remember the style as it was before settings overrode it, so closing

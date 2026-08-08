@@ -476,7 +476,12 @@ impl BoottyApp {
         }
         let theme = self.state.ui_theme();
         let captured_chords = self.state.take_settings_capture_chords();
-        if self.settings.show(ui, theme, captured_chords) == SettingsAction::Close {
+        let modifier_sides = self.state.modifier_sides();
+        if self
+            .settings
+            .show(ui, theme, captured_chords, modifier_sides)
+            == SettingsAction::Close
+        {
             self.settings_open = false;
             self.state.set_settings_open(false);
             self.settings.restore_global_style(ui.ctx());
