@@ -140,22 +140,43 @@ fn remote_command_line(program: &str, args: &[String]) -> String {
 pub struct SshCommandRunner<R> {
     remote: SshRemote,
     runner: R,
+    /// Arguments every invocation carries before its own, for a program that has to be told which
+    /// server it is talking to on the other side.
+    leading_args: Vec<String>,
 }
 
 impl<R> SshCommandRunner<R> {
     pub fn new(remote: SshRemote, runner: R) -> Self {
-        Self { remote, runner }
+        Self {
+            remote,
+            runner,
+            leading_args: Vec::new(),
+        }
+    }
+
+    pub fn with_leading_args(remote: SshRemote, runner: R, leading_args: Vec<String>) -> Self {
+        Self {
+            remote,
+            runner,
+            leading_args,
+        }
+    }
+
+    fn remote_argv(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
+        let mut all = self.leading_args.clone();
+        all.extend_from_slice(args);
+        self.remote.command(program, &all)
     }
 }
 
 impl<R: CommandRunner> CommandRunner for SshCommandRunner<R> {
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
-        let (program, args) = self.remote.command(program, args);
+        let (program, args) = self.remote_argv(program, args);
         self.runner.run(&program, &args)
     }
 
     fn run_disowned(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
-        let (program, args) = self.remote.command(program, args);
+        let (program, args) = self.remote_argv(program, args);
         self.runner.run_disowned(&program, &args)
     }
 }

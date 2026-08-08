@@ -29,6 +29,8 @@ use bootty_terminal::{
 use rmux_sdk::{PaneOutputChunk, TerminalSizeSpec};
 
 use crate::rmux_bridge::{RmuxPaneEvent, RmuxPaneIo, RmuxPaneTarget, open_rmux_pane_io};
+use crate::rmux_remote::open_remote_rmux_pane_io;
+use crate::ssh::SshRemote;
 
 use super::pane::{MuxPaneTarget, TerminalRuntime};
 
@@ -265,6 +267,7 @@ struct RmuxCommandStats {
 impl RmuxNativeTerminal {
     pub(super) fn new(
         target: MuxPaneTarget,
+        remote: Option<&SshRemote>,
         geometry: TerminalGeometry,
         config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -277,7 +280,12 @@ impl RmuxNativeTerminal {
             },
         );
         let restore_lines = rmux_restore_lines(config.max_scrollback, geometry.rows);
-        let pane_io = open_rmux_pane_io(pane_target, restore_lines)?;
+        // A remote pane is driven through the other host's rmux client rather than a socket and the
+        // files beside it, neither of which crosses the connection.
+        let pane_io = match remote {
+            Some(remote) => open_remote_rmux_pane_io(remote, &pane_target, config.max_scrollback)?,
+            None => open_rmux_pane_io(pane_target, restore_lines)?,
+        };
         let (command_tx, command_rx) = mpsc::channel();
         let (error_tx, error_rx) = mpsc::channel();
         let waiting_initial_remote_frame = true;
@@ -1426,8 +1434,13 @@ mod tests {
             pane_id: pane_id.clone(),
             cwd: None,
         };
-        let mut terminal =
-            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        let mut terminal = RmuxNativeTerminal::new(
+            target,
+            None,
+            test_geometry(),
+            test_config(),
+            Arc::new(|| {}),
+        )?;
 
         let start = Instant::now();
         terminal.write_input(b"printf 'BOOTTY_FAST_INPUT\\n'\r")?;
@@ -1483,8 +1496,13 @@ mod tests {
             cell_width: 10,
             cell_height: 20,
         };
-        let mut terminal =
-            RmuxNativeTerminal::new(target, geometry, test_config(), test_repaint_callback())?;
+        let mut terminal = RmuxNativeTerminal::new(
+            target,
+            None,
+            geometry,
+            test_config(),
+            test_repaint_callback(),
+        )?;
         terminal.write_input(b"printf '\\nBOOTTY_%s\\n' READY\r")?;
         let ready_deadline = Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -1672,6 +1690,7 @@ mod tests {
         };
         let mut terminal = RmuxNativeTerminal::new(
             target,
+            None,
             test_geometry(),
             test_config(),
             test_repaint_callback(),
@@ -1726,8 +1745,13 @@ mod tests {
             pane_id: pane_id.clone(),
             cwd: None,
         };
-        let mut terminal =
-            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        let mut terminal = RmuxNativeTerminal::new(
+            target,
+            None,
+            test_geometry(),
+            test_config(),
+            Arc::new(|| {}),
+        )?;
 
         terminal.write_input(b"sleep 30\r")?;
         wait_rmux_capture_contains(&session, &pane_id, "sleep 30")?;
@@ -1772,8 +1796,13 @@ mod tests {
             pane_id: pane_id.clone(),
             cwd: None,
         };
-        let mut terminal =
-            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        let mut terminal = RmuxNativeTerminal::new(
+            target,
+            None,
+            test_geometry(),
+            test_config(),
+            Arc::new(|| {}),
+        )?;
 
         let marker = format!("BOOTTY_LATENCY_{}", std::process::id());
         let input = format!("printf '{marker}\\n'\r");
@@ -1848,8 +1877,13 @@ mod tests {
             pane_id: pane_id.clone(),
             cwd: None,
         };
-        let mut terminal =
-            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        let mut terminal = RmuxNativeTerminal::new(
+            target,
+            None,
+            test_geometry(),
+            test_config(),
+            Arc::new(|| {}),
+        )?;
         let marker = format!("BOOTTY_RESTORE_FAST_INPUT_{}", std::process::id());
         let input = format!("printf '{marker}\\n'\r");
         let start = Instant::now();
@@ -1925,8 +1959,13 @@ mod tests {
         rmux_live_send_text(&session, &pane_id, &format!("printf '{marker}\\n'\r"))?;
         wait_rmux_sdk_capture_contains(&session, &pane_id, &marker)?;
 
-        let mut reopened =
-            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        let mut reopened = RmuxNativeTerminal::new(
+            target,
+            None,
+            test_geometry(),
+            test_config(),
+            Arc::new(|| {}),
+        )?;
         reopened.resize(test_geometry())?;
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -1979,6 +2018,7 @@ mod tests {
         {
             let mut terminal = RmuxNativeTerminal::new(
                 target.clone(),
+                None,
                 test_geometry(),
                 test_config(),
                 Arc::new(|| {}),
@@ -1999,8 +2039,13 @@ mod tests {
         }
         let expected_cursor = rmux_live_pane_cursor(&session, &pane_id)?;
 
-        let mut reopened =
-            RmuxNativeTerminal::new(target, test_geometry(), test_config(), Arc::new(|| {}))?;
+        let mut reopened = RmuxNativeTerminal::new(
+            target,
+            None,
+            test_geometry(),
+            test_config(),
+            Arc::new(|| {}),
+        )?;
         reopened.resize(test_geometry())?;
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
         loop {

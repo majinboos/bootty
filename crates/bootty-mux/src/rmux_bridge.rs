@@ -112,6 +112,16 @@ impl RmuxPaneTarget {
         SessionName::new(&self.session_name).context("invalid rmux session name")
     }
 
+    /// The session and pane as rmux's command line names them, for the paths that reach a daemon
+    /// through a shell rather than through the socket.
+    pub(crate) fn session_selector(&self) -> &str {
+        &self.session_name
+    }
+
+    pub(crate) fn pane_selector(&self) -> Option<&str> {
+        self.pane_id.as_deref()
+    }
+
     fn pane_id(&self) -> Option<PaneId> {
         self.pane_id
             .as_deref()

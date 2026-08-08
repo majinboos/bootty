@@ -32,6 +32,7 @@ pub mod native;
 pub mod process;
 pub mod rmux;
 pub(crate) mod rmux_bridge;
+pub(crate) mod rmux_remote;
 pub mod snapshot;
 pub mod ssh;
 pub mod terminal;

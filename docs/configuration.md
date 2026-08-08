@@ -81,7 +81,10 @@ backend = "rmux"
 
 # Attach a multiplexer running on another host. The backend's client runs there
 # over SSH and Bootty renders it here, so remote sessions behave like local ones.
-# Available for the backends that have a client to run: tmux and zellij.
+# Available for every backend bootty reaches through a client: tmux, zellij, and
+# rmux. A remote rmux binding drives bootty's own daemon on that host through the
+# rmux command line, so bootty has to be installed there; tmux and zellij only
+# need their own binary.
 [multiplexer.remote]
 host = "devbox" # ~/.ssh/config alias, hostname, or address
 # user = "dev"        # when ~/.ssh/config does not name one

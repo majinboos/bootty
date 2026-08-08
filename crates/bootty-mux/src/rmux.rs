@@ -71,22 +71,7 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
     }
 
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        BindingCapabilityDescriptor::new(
-            scope,
-            [
-                BindingOperation::ActivateWindow,
-                BindingOperation::CreateWindow,
-                BindingOperation::RenameWindow,
-                BindingOperation::NavigateWindow,
-                BindingOperation::MoveWindow,
-                BindingOperation::SplitPane,
-                BindingOperation::ClosePane,
-                BindingOperation::CreateProjectSession,
-                BindingOperation::CreateWorktreeSession,
-                BindingOperation::RenameSession,
-                BindingOperation::DitchSession,
-            ],
-        )
+        rmux_capabilities(scope)
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
@@ -175,6 +160,28 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
         }
         Ok(())
     }
+}
+
+/// What an rmux binding can do, wherever its daemon runs. A remote binding drives the same rmux
+/// through its command line rather than the socket, so it has to claim the same operations and not
+/// the ones tmux happens to add.
+pub fn rmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+    BindingCapabilityDescriptor::new(
+        scope,
+        [
+            BindingOperation::ActivateWindow,
+            BindingOperation::CreateWindow,
+            BindingOperation::RenameWindow,
+            BindingOperation::NavigateWindow,
+            BindingOperation::MoveWindow,
+            BindingOperation::SplitPane,
+            BindingOperation::ClosePane,
+            BindingOperation::CreateProjectSession,
+            BindingOperation::CreateWorktreeSession,
+            BindingOperation::RenameSession,
+            BindingOperation::DitchSession,
+        ],
+    )
 }
 
 pub struct SdkRmuxClient;

@@ -428,13 +428,14 @@ impl SshRemoteConfig {
 }
 
 impl MultiplexerBackendConfig {
-    /// Whether this backend's multiplexer can live on another host. Bootty drives `tmux` and
-    /// `zellij` through a client it can run anywhere; `native` panes are this process's own PTYs,
-    /// and `rmux` streams its pane output through files on the local filesystem.
+    /// Whether this backend's multiplexer can live on another host. `tmux` and `zellij` are driven
+    /// through a client bootty can run anywhere, and `rmux` through its own command line on the
+    /// host holding the daemon. `native` panes are this process's own PTYs and have nowhere else to
+    /// be.
     pub fn supports_remote(self) -> bool {
         match self {
-            Self::Tmux | Self::Zellij => true,
-            Self::Native | Self::Rmux => false,
+            Self::Tmux | Self::Zellij | Self::Rmux => true,
+            Self::Native => false,
         }
     }
 }
@@ -453,7 +454,7 @@ impl MultiplexerConfig {
             return Ok(());
         }
         Err(ConfigLoadError::new(format!(
-            "multiplexer.remote needs backend \"tmux\" or \"zellij\", got {:?}",
+            "multiplexer.remote needs a backend with a client to run there, got {:?}",
             self.backend
         )))
     }

@@ -477,6 +477,7 @@ impl BackendPaneTerminal {
                 config.side_effect_pane_id = target.side_effect_pane_id();
                 Ok(Box::new(RmuxNativeTerminal::new(
                     target.target.clone(),
+                    self.remote.as_ref(),
                     self.native_window_spawn_geometry.unwrap_or(self.geometry),
                     config,
                     Arc::clone(&self.repaint_wakeup),

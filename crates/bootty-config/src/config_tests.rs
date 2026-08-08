@@ -1110,15 +1110,16 @@ fn multiplexer_remote_carries_the_connection_details_ssh_config_would_hold() {
     assert_eq!(remote.args, vec!["-i", "C:\\keys\\id_ed25519"]);
 }
 
-/// Only the backends bootty drives through a client can run on another host. Accepting the pairing
-/// silently would start local shells and present them as the remote host's sessions.
+/// Only the backends bootty drives through a client can run on another host. The native backend
+/// owns its terminals in this process, so accepting it would start local shells and present them as
+/// the remote host's sessions.
 #[test]
 fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
     for (backend, accepted) in [
         ("tmux", true),
         ("zellij", true),
+        ("rmux", true),
         ("native", false),
-        ("rmux", false),
     ] {
         let loaded = ConfigSandbox::with_config(&format!(
             "[multiplexer]\nbackend = \"{backend}\"\n\n[multiplexer.remote]\nhost = \"devbox\"\n"

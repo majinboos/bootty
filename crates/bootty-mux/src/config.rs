@@ -7,6 +7,7 @@ use super::{
     native::NativeBackend,
     process::SystemCommandRunner,
     rmux::RmuxBackend,
+    rmux_remote::RemoteRmuxBackend,
     ssh::{SshCommandRunner, SshRemote},
     tmux::TmuxBackend,
     tmux_control::TmuxControlRunner,
@@ -56,7 +57,10 @@ pub fn build_backend_for_workspace(
 ) -> Box<dyn MuxBackend> {
     let remote = remote_transport(config);
     match selected_backend(config) {
-        MultiplexerBackendConfig::Rmux => Box::new(RmuxBackend::new()),
+        MultiplexerBackendConfig::Rmux => match remote {
+            Some(remote) => Box::new(RemoteRmuxBackend::new(remote)),
+            None => Box::new(RmuxBackend::new()),
+        },
         MultiplexerBackendConfig::Native => Box::new(match workspace {
             Some(workspace) => NativeBackend::for_workspace(workspace),
             None => NativeBackend::new(),
