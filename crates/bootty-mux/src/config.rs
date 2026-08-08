@@ -6,6 +6,7 @@ use super::{
     backend::MuxBackend,
     native::NativeBackend,
     process::SystemCommandRunner,
+    remote_space::RemoteSpaceBackend,
     rmux::RmuxBackend,
     rmux_remote::RemoteRmuxBackend,
     ssh::{SshCommandRunner, SshRemote},
@@ -18,6 +19,26 @@ use super::{
 /// can drive one app against a scripted backend without leaking into every other test in the
 /// process. Shared because the refresh and command workers build their own backend off-thread.
 pub type BackendFactory = Arc<dyn Fn(&MultiplexerConfig) -> Box<dyn MuxBackend> + Send + Sync>;
+
+struct UnavailableBackend {
+    message: String,
+}
+
+impl MuxBackend for UnavailableBackend {
+    fn snapshot(&self) -> anyhow::Result<crate::snapshot::MuxSnapshot> {
+        anyhow::bail!("{}", self.message)
+    }
+
+    fn execute(&mut self, _command: crate::command::MuxCommand) -> anyhow::Result<()> {
+        anyhow::bail!("{}", self.message)
+    }
+}
+
+pub fn unavailable_backend(message: impl Into<String>) -> Box<dyn MuxBackend> {
+    Box::new(UnavailableBackend {
+        message: message.into(),
+    })
+}
 
 pub fn selected_backend(config: &MultiplexerConfig) -> MultiplexerBackendConfig {
     resolve_backend(config.backend, config.remote.is_some(), cfg!(windows))
@@ -56,6 +77,13 @@ pub fn build_backend_for_workspace(
     workspace: Option<&Path>,
 ) -> Box<dyn MuxBackend> {
     let remote = remote_transport(config);
+    if let (Some(remote), Some(space_id)) = (remote.clone(), config.remote_space_id.clone()) {
+        return Box::new(RemoteSpaceBackend::new(
+            remote,
+            space_id,
+            selected_backend(config),
+        ));
+    }
     match selected_backend(config) {
         MultiplexerBackendConfig::Rmux => match remote {
             Some(remote) => Box::new(RemoteRmuxBackend::new(remote)),
@@ -221,5 +249,24 @@ mod tests {
             assert_eq!(descriptor.scope(), scope);
             assert_eq!(descriptor.operations().collect::<Vec<_>>(), expected);
         }
+    }
+
+    #[test]
+    fn unavailable_backend_never_falls_back_to_local_state() {
+        let mut backend = unavailable_backend("SSH profile 'lab' is unavailable");
+
+        assert_eq!(
+            backend.snapshot().unwrap_err().to_string(),
+            "SSH profile 'lab' is unavailable"
+        );
+        assert_eq!(
+            backend
+                .execute(crate::command::MuxCommand::DitchSession {
+                    session_id: "local".to_owned(),
+                })
+                .unwrap_err()
+                .to_string(),
+            "SSH profile 'lab' is unavailable"
+        );
     }
 }

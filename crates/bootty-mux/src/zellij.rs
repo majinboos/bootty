@@ -52,15 +52,7 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
     }
 
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        BindingCapabilityDescriptor::new(
-            scope,
-            [
-                BindingOperation::CreateProjectSession,
-                BindingOperation::CreateWorktreeSession,
-                BindingOperation::RenameSession,
-                BindingOperation::DitchSession,
-            ],
-        )
+        zellij_capabilities(scope)
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
@@ -116,6 +108,18 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
         }
         Ok(())
     }
+}
+
+pub(crate) fn zellij_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+    BindingCapabilityDescriptor::new(
+        scope,
+        [
+            BindingOperation::CreateProjectSession,
+            BindingOperation::CreateWorktreeSession,
+            BindingOperation::RenameSession,
+            BindingOperation::DitchSession,
+        ],
+    )
 }
 
 fn parse_zellij_snapshot(output: &str) -> MuxSnapshot {

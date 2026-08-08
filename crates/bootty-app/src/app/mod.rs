@@ -322,6 +322,7 @@ pub struct BoottyApp {
     app_icon_texture: Option<TextureHandle>,
     settings_open: bool,
     settings: SettingsSurface,
+    error_details_open: bool,
     // Held for the process lifetime so the native menu stays installed.
     _menu: Option<AppMenu>,
     status_extensions: crate::extensions::ExtensionHost,
@@ -419,6 +420,7 @@ impl BoottyApp {
             app_icon_texture: None,
             settings_open: false,
             settings: SettingsSurface::new(config.clone()),
+            error_details_open: false,
             _menu: crate::menu::install(),
             status_extensions,
             sidebar_extensions,
@@ -1334,6 +1336,7 @@ impl BoottyApp {
                 icon: space.icon,
                 color: space.color,
                 active: space.active,
+                error: space.error,
             })
             .collect::<Vec<_>>();
         let space_transition = self.state.space_transition(std::time::Instant::now());
@@ -1698,6 +1701,9 @@ impl BoottyApp {
                             }
                             chrome::SpaceSwitcherEvent::Edit(space_id) => {
                                 self.state.open_edit_space_dialog_from_ui(space_id);
+                            }
+                            chrome::SpaceSwitcherEvent::Reconnect(space_id) => {
+                                self.state.reconnect_space_from_ui(space_id);
                             }
                             chrome::SpaceSwitcherEvent::Close(space_id) => {
                                 self.state.close_space_from_ui(space_id);
@@ -2154,6 +2160,31 @@ fn suppress_settings_recorder_duplicates(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ErrorToastText {
+    summary: String,
+    details: Option<String>,
+}
+
+fn error_toast_text(error: &str) -> ErrorToastText {
+    let normalized = error.trim();
+    let lower = normalized.to_ascii_lowercase();
+    let summary = if lower.contains("rmux") {
+        "Could not reach remote rmux.".to_owned()
+    } else if lower.contains("ssh") || lower.contains("connection") {
+        "Could not reach the remote workspace.".to_owned()
+    } else {
+        let first_line = normalized.lines().next().unwrap_or("Operation failed.");
+        if first_line.chars().count() <= 96 {
+            first_line.to_owned()
+        } else {
+            "The operation failed. Open details for the technical error.".to_owned()
+        }
+    };
+    let details = (summary != normalized).then(|| normalized.to_owned());
+    ErrorToastText { summary, details }
+}
+
 impl eframe::App for BoottyApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.state.drain_direct_input();
@@ -2271,18 +2302,58 @@ impl eframe::App for BoottyApp {
             }
         });
         if let Some(error) = self.state.last_error().map(str::to_owned) {
+            let toast = error_toast_text(&error);
             let mut dismiss = false;
             egui::Area::new(egui::Id::new("last-error"))
+                .order(egui::Order::Tooltip)
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -12.0])
                 .show(ui.ctx(), |ui| {
+                    let max_width = (ui.ctx().content_rect().width() - 48.0).clamp(280.0, 560.0);
                     egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(egui::Color32::from_rgb(0xf3, 0x8b, 0xa8), error);
-                            dismiss = ui.small_button("Dismiss").clicked();
+                        ui.set_max_width(max_width);
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&toast.summary).color(palette.destructive),
+                                )
+                                .wrap(),
+                            );
+                            ui.horizontal(|ui| {
+                                if toast.details.is_some()
+                                    && ui
+                                        .button(if self.error_details_open {
+                                            "Hide details"
+                                        } else {
+                                            "Details"
+                                        })
+                                        .clicked()
+                                {
+                                    self.error_details_open = !self.error_details_open;
+                                }
+                                dismiss = ui.button("Dismiss").clicked();
+                            });
+                            if self.error_details_open
+                                && let Some(details) = &toast.details
+                            {
+                                egui::ScrollArea::vertical()
+                                    .max_height(180.0)
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(details)
+                                                    .monospace()
+                                                    .size(11.0)
+                                                    .color(palette.subtext),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                            }
                         });
                     });
                 });
             if dismiss {
+                self.error_details_open = false;
                 self.state.clear_last_error();
             }
         }
@@ -2861,6 +2932,15 @@ mod tests {
             &events[0],
             egui::Event::MouseWheel { modifiers, .. } if *modifiers == alt
         ));
+    }
+
+    #[test]
+    fn long_transport_errors_have_a_short_summary_and_details() {
+        let error = "remote rmux snapshot failed while running a very long list-sessions and list-panes command with every format field repeated until the error cannot fit in the window";
+        let toast = error_toast_text(error);
+
+        assert!(toast.summary.chars().count() <= 96);
+        assert_eq!(toast.details.as_deref(), Some(error));
     }
 
     #[test]

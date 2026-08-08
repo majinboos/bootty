@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::capability::BindingOperation;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MuxDirection {
     Left,
     Down,
@@ -8,13 +10,13 @@ pub enum MuxDirection {
     Right,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MuxSplitDirection {
     Right,
     Down,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MuxCommand {
     ActivateWindow {
         session_id: String,

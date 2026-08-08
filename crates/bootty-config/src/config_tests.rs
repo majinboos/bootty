@@ -667,6 +667,109 @@ fn config_accepts_xterm_dynamic_color_slots() {
 }
 
 #[test]
+fn named_ssh_profile_parses_structured_connection_fields() {
+    let config = load_config_source(indoc! {r#"
+        [ssh-profiles.local-mac]
+        name = "Local Mac"
+        host = "localhost"
+        user = "luan"
+        port = 2222
+        host-key-policy = "accept-new"
+        authentication = "key-file"
+        identity-file = "/tmp/local-mac-key"
+        proxy-jump = "gateway"
+    "#});
+
+    let profile = &config.ssh_profiles["local-mac"];
+    assert_eq!(profile.name, "Local Mac");
+    assert_eq!(profile.authentication, SshAuthenticationConfig::KeyFile);
+    assert_eq!(
+        profile.to_remote(),
+        SshRemoteConfig {
+            host: "localhost".to_owned(),
+            user: Some("luan".to_owned()),
+            port: Some(2222),
+            program: "ssh".to_owned(),
+            args: vec![
+                "-J".to_owned(),
+                "gateway".to_owned(),
+                "-o".to_owned(),
+                "StrictHostKeyChecking=accept-new".to_owned(),
+                "-i".to_owned(),
+                "/tmp/local-mac-key".to_owned(),
+                "-o".to_owned(),
+                "IdentitiesOnly=yes".to_owned(),
+            ],
+        }
+    );
+}
+
+#[test]
+fn ssh_agent_profile_selects_one_agent_identity_without_password_fallbacks() {
+    let config = load_config_source(indoc! {r#"
+        [ssh-profiles.agent]
+        name = "Agent"
+        host = "example.test"
+        authentication = "agent"
+        identity-file = "/tmp/agent-key.pub"
+    "#});
+
+    assert_eq!(
+        config.ssh_profiles["agent"].to_remote().args,
+        vec![
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-i",
+            "/tmp/agent-key.pub",
+            "-o",
+            "IdentitiesOnly=yes",
+        ]
+    );
+}
+
+#[test]
+fn ssh_agent_profile_requires_an_identity_reference() {
+    let error = ConfigSandbox::with_config(indoc! {r#"
+        [ssh-profiles.broken-agent]
+        name = "Broken Agent"
+        host = "example.test"
+        authentication = "agent"
+    "#})
+    .load()
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("ssh-profiles.broken-agent.identity-file")
+    );
+}
+
+#[test]
+fn key_file_profile_requires_an_identity_file() {
+    let error = ConfigSandbox::with_config(indoc! {r#"
+        [ssh-profiles.broken]
+        name = "Broken"
+        host = "example.test"
+        authentication = "key-file"
+    "#})
+    .load()
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("ssh-profiles.broken.identity-file")
+    );
+}
+
+#[test]
 fn user_theme_shadows_builtin_theme_name() {
     let sandbox = ConfigSandbox::with_config(indoc! {r#"
         theme = "Catppuccin Mocha"

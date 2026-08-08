@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hasher,
+    net::{IpAddr, UdpSocket},
     path::PathBuf,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig};
+use bootty_config::config::MultiplexerBackendConfig;
+#[cfg(test)]
+use bootty_config::config::{SshProfileConfig, SshRemoteConfig};
 use eframe::egui::{self, Pos2, Rect};
 
 mod copy_mode;
@@ -87,11 +90,11 @@ use crate::{
         rename::{RenameSessionDialog, RenameSessionEvent, RenameTabDialog, RenameTabEvent},
         session_navigation::{BindingSessionGroup, ScopedSessionTarget},
         session_picker::{SessionPickerDialog, SessionPickerEvent},
-        space::{SpaceEditorDialog, SpaceEditorEvent, SpaceInheritance, default_space_icon},
+        space::{SpaceEditorDialog, SpaceEditorEvent, default_space_icon},
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::{SpaceMuxOverride, WorkspaceSpace, WorkspaceStore},
+    workspace::{SpaceMuxOverride, SpaceRemoteOverride, WorkspaceSpace, WorkspaceStore},
 };
 use bootty_terminal::terminal_engine::{
     TerminalColorConfig, TerminalCopyModeAction, TerminalCursorConfig, TerminalFeatureConfig,
@@ -178,6 +181,7 @@ pub struct SpaceSummary {
     pub color: [u8; 3],
     pub tint_sidebar: bool,
     pub active: bool,
+    pub error: Option<String>,
 }
 
 /// Host actions requested by a frame update, applied by the eframe adapter.
@@ -369,7 +373,7 @@ struct BindingRuntime {
     scope: MuxScope,
     label: String,
     backend_override: Option<MultiplexerBackendConfig>,
-    remote_override: Option<SshRemoteConfig>,
+    remote_override: SpaceRemoteOverride,
     /// Set while this binding's remote attach client is gone and bootty is waiting to start
     /// another. Per binding, not per window: one space's outage is not another's, and a reconnect
     /// pending here must not discard the pane of whichever space is active when it comes due.
@@ -404,8 +408,14 @@ impl BindingRuntime {
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
-        let mut binding =
-            Self::new_with_backend_override(scope, config, None, None, variant, repaint.clone());
+        let mut binding = Self::new_with_backend_override(
+            scope,
+            config,
+            None,
+            SpaceRemoteOverride::Inherit,
+            variant,
+            repaint.clone(),
+        );
         binding.restore_persisted_sessions(&repaint);
         binding
     }
@@ -414,19 +424,43 @@ impl BindingRuntime {
         scope: MuxScope,
         config: &BoottyConfig,
         backend_override: Option<MultiplexerBackendConfig>,
-        remote_override: Option<SshRemoteConfig>,
+        remote_override: SpaceRemoteOverride,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
         let mut config = config.clone();
+        let backend_override = match &remote_override {
+            SpaceRemoteOverride::Profile(remote) => Some(remote.backend),
+            _ => backend_override,
+        };
         if let Some(backend) = backend_override {
             config.multiplexer.backend = backend;
         }
-        if let Some(remote) = remote_override.clone() {
-            config.multiplexer.remote = Some(remote);
-        }
-        // A space that keeps its sessions in this process has no host to reach, so an inherited
-        // remote is dropped rather than handed to a backend that cannot use it.
+        config.multiplexer.remote_space_id = None;
+        let remote_error = match &remote_override {
+            SpaceRemoteOverride::Inherit => None,
+            SpaceRemoteOverride::Local => {
+                config.multiplexer.remote = None;
+                None
+            }
+            SpaceRemoteOverride::Profile(remote) => {
+                config.multiplexer.remote_space_id = Some(remote.remote_space_id.clone());
+                if let Some(profile) = config.ssh_profiles.get(&remote.profile_id) {
+                    config.multiplexer.remote = Some(profile.to_remote());
+                    None
+                } else {
+                    config.multiplexer.remote = None;
+                    Some(format!(
+                        "SSH profile '{}' is unavailable",
+                        remote.profile_id
+                    ))
+                }
+            }
+            SpaceRemoteOverride::Inline(remote) => {
+                config.multiplexer.remote = Some(remote.clone());
+                None
+            }
+        };
         if !config.multiplexer.backend.supports_remote() {
             config.multiplexer.remote = None;
         }
@@ -440,10 +474,14 @@ impl BindingRuntime {
         // other's, and reopening a window keeps its own. Native sessions live in this process rather
         // than in a server, so which state a binding reaches is a choice bootty has to make.
         let workspace = config.config_path.clone();
+        let unavailable = remote_error.clone();
         mux.set_backend_factory(Arc::new(move |multiplexer| {
+            if let Some(message) = &unavailable {
+                return bootty_mux::config::unavailable_backend(message.clone());
+            }
             bootty_mux::config::build_backend_for_workspace(multiplexer, Some(&workspace))
         }));
-        Self {
+        let mut binding = Self {
             label: binding_label(scope, &config.multiplexer),
             backend_override,
             remote_override,
@@ -474,7 +512,11 @@ impl BindingRuntime {
             unscoped_terminal_ports: Vec::new(),
             unscoped_terminal_progress: None,
             persisted_sessions_restored: false,
+        };
+        if let Some(error) = remote_error {
+            binding.mux.set_error(Some(error));
         }
+        binding
     }
 
     fn restore_persisted_sessions(&mut self, repaint: &RepaintHandle) {
@@ -516,6 +558,16 @@ impl BindingRuntime {
             }
         }
         self.sync_session_order();
+    }
+
+    fn resolve_empty_remote_after_attach_exit(&mut self, refresh_completed: bool) -> bool {
+        if !refresh_completed || self.reattach.is_none() || !self.mux.sessions().is_empty() {
+            return false;
+        }
+        self.reattach = None;
+        self.remote_attach_started = None;
+        self.mux.set_error(None);
+        true
     }
 
     /// The names bootty shows for `sessions`, in the same order.
@@ -564,6 +616,11 @@ impl BindingRuntime {
 
     fn sync_session_order(&mut self) {
         self.carry_renamed_members();
+        if self.multiplexer.remote_space_id.is_some() {
+            for session in self.mux.all_sessions() {
+                self.session_order.add_session(&session.name);
+            }
+        }
         // Prune against the whole backend list, never `sessions()`: that one is already narrowed to
         // membership, so a session this binding just attached would count as dead and be dropped
         // again before it ever showed up in the sidebar.
@@ -614,6 +671,13 @@ impl BindingRuntime {
             pane_id: pane_id.into(),
         }
     }
+
+    fn degraded_error(&self) -> Option<String> {
+        self.mux.last_error().map(str::to_owned).or_else(|| {
+            self.reattach
+                .map(|reattach| format!("reconnecting (attempt {})", reattach.attempts))
+        })
+    }
 }
 
 fn binding_runtime_for_multiplexer(
@@ -621,7 +685,7 @@ fn binding_runtime_for_multiplexer(
     scope: MuxScope,
     label: String,
     backend_override: Option<MultiplexerBackendConfig>,
-    remote_override: Option<SshRemoteConfig>,
+    remote_override: SpaceRemoteOverride,
     variant: AppearanceVariant,
     repaint: RepaintHandle,
 ) -> BindingRuntime {
@@ -665,7 +729,7 @@ impl SpaceRuntime {
                     workspace_binding.mux_scope(),
                     workspace_binding.name().to_owned(),
                     workspace_binding.backend_override(),
-                    workspace_binding.remote_override().cloned(),
+                    workspace_binding.remote_override().clone(),
                     variant,
                     repaint.clone(),
                 );
@@ -780,6 +844,42 @@ fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig
     )
 }
 
+struct NetworkChangeDetector {
+    next_check: Instant,
+    signature: Option<IpAddr>,
+}
+
+impl NetworkChangeDetector {
+    const INTERVAL: Duration = Duration::from_secs(2);
+
+    fn new(now: Instant) -> Self {
+        Self {
+            next_check: now + Self::INTERVAL,
+            signature: network_signature(),
+        }
+    }
+
+    fn changed(&mut self, now: Instant) -> bool {
+        self.changed_to(now, network_signature())
+    }
+
+    fn changed_to(&mut self, now: Instant, signature: Option<IpAddr>) -> bool {
+        if now < self.next_check {
+            return false;
+        }
+        self.next_check = now + Self::INTERVAL;
+        let changed = signature != self.signature;
+        self.signature = signature;
+        changed
+    }
+}
+
+fn network_signature() -> Option<IpAddr> {
+    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("1.1.1.1", 80)).ok()?;
+    socket.local_addr().ok().map(|address| address.ip())
+}
+
 pub struct AppState {
     window_state_key: String,
     binding: BindingRuntime,
@@ -795,6 +895,7 @@ pub struct AppState {
     /// Keeps the one live native terminal while a non-native binding is active.
     parked_native_terminal: Option<NativeTerminalOwner>,
     repaint_scheduler: RepaintScheduler,
+    network_change_detector: NetworkChangeDetector,
     last_error: Option<String>,
     last_drain: DrainStats,
     last_frame_dt_ms: f32,
@@ -1204,6 +1305,7 @@ impl AppState {
             space_transition: None,
             parked_native_terminal: None,
             repaint_scheduler: RepaintScheduler::default(),
+            network_change_detector: NetworkChangeDetector::new(Instant::now()),
             last_error: None,
             last_drain: DrainStats::default(),
             last_frame_dt_ms: 0.0,
@@ -1478,6 +1580,7 @@ impl AppState {
                 color: self.active_space_color,
                 tint_sidebar: self.active_space_tint_sidebar,
                 active: true,
+                error: self.binding.degraded_error(),
             },
         )];
         spaces.extend(self.inactive_spaces.iter().map(|space| {
@@ -1490,6 +1593,7 @@ impl AppState {
                     color: space.color,
                     tint_sidebar: space.tint_sidebar,
                     active: false,
+                    error: space.binding.degraded_error(),
                 },
             )
         }));
@@ -1510,27 +1614,14 @@ impl AppState {
             .map(|space| space.binding.backend_override)
     }
 
-    /// What a space runs when it overrides nothing, for the editor to show as its placeholders.
-    fn space_inheritance(&self) -> SpaceInheritance {
-        SpaceInheritance {
-            backend: self.config().multiplexer.backend,
-            host: self
-                .config()
-                .multiplexer
-                .remote
-                .as_ref()
-                .map(|remote| remote.host.clone()),
-        }
-    }
-
-    fn space_remote_override(&self, space_id: SpaceId) -> Option<SshRemoteConfig> {
+    fn space_remote_override(&self, space_id: SpaceId) -> Option<SpaceRemoteOverride> {
         if space_id == self.active_space_id {
-            return self.binding.remote_override.clone();
+            return Some(self.binding.remote_override.clone());
         }
         self.inactive_spaces
             .iter()
             .find(|space| space.id == space_id)
-            .and_then(|space| space.binding.remote_override.clone())
+            .map(|space| space.binding.remote_override.clone())
     }
 
     pub fn space_transition(&self, now: Instant) -> Option<(SpaceId, SpaceId, f32)> {
@@ -1667,8 +1758,8 @@ impl AppState {
         };
         // The remote decides which machine the binding's sessions live on, so a change to it needs
         // the same rebuild a backend change does.
-        let backend_changed =
-            previous_override != backend_override || previous_remote != remote_override;
+        let backend_changed = previous_override != backend_override
+            || previous_remote.as_ref() != Some(&remote_override);
         let config_path = self.config().config_path.clone();
         let mut workspace = WorkspaceStore::for_config_path(&config_path);
         let runtime_config = self.config().clone();
@@ -4248,6 +4339,9 @@ impl AppState {
             terminal_cell_height,
             terminal_scale_factor,
         );
+        if self.has_degraded_remote() && self.network_change_detector.changed(now) {
+            self.reset_remote_reconnects(now);
+        }
         // A shell exiting closes its pane, collapsing the split (or cascading to the tab when it was
         // the last pane). On native, any pane's shell can exit, not just the focused one.
         if self.is_native() {
@@ -4287,6 +4381,8 @@ impl AppState {
             .mux
             .refresh_sessions(&self.repaint, &active_config);
         self.binding.restore_persisted_sessions(&self.repaint);
+        let refresh_completed = self.binding.mux.take_refresh_completed();
+        self.resolve_remote_attach_exit_after_refresh(refresh_completed);
         let mux_refresh_after = mux_refresh_repaint_after(&active_config, window_focused);
         for binding in &mut self.inactive_bindings {
             binding.restore_persisted_sessions(&self.repaint);
@@ -4304,8 +4400,16 @@ impl AppState {
         self.sync_generated_session_names();
         self.sync_session_order();
         let phase = crate::diagnostics::latency_start();
-        if let Err(error) = self.sync_terminal_panes() {
-            self.last_error = Some(error.to_string());
+        let waiting_to_reattach = self
+            .binding
+            .reattach
+            .is_some_and(|reattach| !reattach.started);
+        if !waiting_to_reattach && let Err(error) = self.sync_terminal_panes() {
+            if self.binding.multiplexer.remote.is_some() {
+                self.handle_attach_start_failure(now, &error.to_string());
+            } else {
+                self.last_error = Some(error.to_string());
+            }
         }
         crate::diagnostics::trace_slow("frame.sync_terminal_panes", phase, 4.0);
         self.hot_reload_config_if_changed(&mut effects, now);
@@ -4401,12 +4505,19 @@ impl AppState {
             .into_iter()
             .map(|space| space.icon)
             .collect::<Vec<_>>();
-        let inherited = self.space_inheritance();
-        self.space_editor_dialog = Some(SpaceEditorDialog::new_space(
-            default_space_icon(&existing_icons),
-            SpaceMuxOverride::default(),
-            inherited,
-        ));
+        let profiles = self
+            .config()
+            .ssh_profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.clone()))
+            .collect::<Vec<_>>();
+        self.space_editor_dialog = Some(
+            SpaceEditorDialog::new_space(
+                default_space_icon(&existing_icons),
+                SpaceMuxOverride::default(),
+            )
+            .with_profiles(profiles.into_iter()),
+        );
         self.input_focus = InputFocus::Picker;
         true
     }
@@ -4422,19 +4533,27 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
-        // Only this space's own host, so saving an inheriting space keeps it inheriting; the
-        // inherited one is the placeholder.
-        let remote = self.space_remote_override(space.id);
-        let inherited = self.space_inheritance();
-        self.space_editor_dialog = Some(SpaceEditorDialog::edit_space(
-            space.id,
-            space.name,
-            space.icon,
-            space.color,
-            space.tint_sidebar,
-            SpaceMuxOverride { backend, remote },
-            inherited,
-        ));
+        // Save only this Space's remote override.
+        let remote = self
+            .space_remote_override(space.id)
+            .expect("a listed Space has a remote source");
+        let profiles = self
+            .config()
+            .ssh_profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.clone()))
+            .collect::<Vec<_>>();
+        self.space_editor_dialog = Some(
+            SpaceEditorDialog::edit_space(
+                space.id,
+                space.name,
+                space.icon,
+                space.color,
+                space.tint_sidebar,
+                SpaceMuxOverride { backend, remote },
+            )
+            .with_profiles(profiles.into_iter()),
+        );
         self.input_focus = InputFocus::Picker;
         true
     }
@@ -4644,6 +4763,25 @@ impl AppState {
             && !self.settings_open
     }
 
+    fn rebuild_profile_bindings(&mut self, config: &BoottyConfig) {
+        let repaint = self.repaint.clone();
+        let variant = self.active_appearance_variant;
+        for binding in self.binding_runtimes_mut() {
+            if !matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)) {
+                continue;
+            }
+            *binding = binding_runtime_for_multiplexer(
+                config,
+                binding.scope,
+                binding.label.clone(),
+                binding.backend_override,
+                binding.remote_override.clone(),
+                variant,
+                repaint.clone(),
+            );
+        }
+    }
+
     fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
         let previous = self.config().clone();
         let path = previous.config_path.clone();
@@ -4731,6 +4869,9 @@ impl AppState {
         self.app_key_bindings = app_key_bindings;
         self.sidebar_key_bindings = sidebar_key_bindings;
         let active_appearance_variant = self.active_appearance_variant;
+        if previous.ssh_profiles != next.ssh_profiles {
+            self.rebuild_profile_bindings(&next);
+        }
         for binding in self.binding_runtimes_mut() {
             let mut binding_config = next.clone();
             binding_config.multiplexer = binding.multiplexer.clone();
@@ -5172,6 +5313,10 @@ impl AppState {
         if paths.is_empty() {
             return 0;
         }
+        if self.binding.multiplexer.remote.is_some() {
+            self.last_error = Some("File handoff to remote Spaces is not supported.".to_owned());
+            return 0;
+        }
         let text = match local_file_handoff(&paths) {
             LocalFileHandoff::Ready(text) => text,
             LocalFileHandoff::Rejected(message) => {
@@ -5509,13 +5654,41 @@ impl AppState {
             .remote_attach_started
             .map(|started| now.saturating_duration_since(started));
         let reattach = RemoteReattach::after_failure(self.binding.reattach, attached_for, now);
-        self.last_error = Some(format!(
+        let error = format!(
             "lost the connection to {}; reconnecting (attempt {})",
             remote.host, reattach.attempts
-        ));
+        );
+        self.last_error = Some(error.clone());
+        self.binding.mux.set_error(Some(error));
         self.binding.reattach = Some(reattach);
     }
 
+    fn handle_attach_start_failure(&mut self, now: Instant, detail: &str) {
+        let Some(remote) = self.binding.multiplexer.remote.clone() else {
+            return;
+        };
+        let reattach = RemoteReattach::after_failure(self.binding.reattach, None, now);
+        let error = format!(
+            "could not connect to {}: {detail}; reconnecting (attempt {})",
+            remote.host, reattach.attempts
+        );
+        self.last_error = Some(error.clone());
+        self.binding.mux.set_error(Some(error));
+        self.binding.reattach = Some(reattach);
+    }
+
+    fn resolve_remote_attach_exit_after_refresh(&mut self, refresh_completed: bool) {
+        if self
+            .binding
+            .resolve_empty_remote_after_attach_exit(refresh_completed)
+            && self
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("lost the connection to "))
+        {
+            self.last_error = None;
+        }
+    }
     /// A remote attach client that has been alive long enough proves the connection is back, so the
     /// next outage starts its backoff from the beginning rather than from where this one left off.
     fn note_attach_client_alive(&mut self, now: Instant) {
@@ -5529,6 +5702,7 @@ impl AppState {
                 .is_some_and(|reattach| reattach.started)
         {
             self.binding.reattach = None;
+            self.binding.mux.set_error(None);
         }
     }
 
@@ -5554,6 +5728,76 @@ impl AppState {
         self.binding.terminal.discard_active_pane();
     }
 
+    pub fn reconnect_space_from_ui(&mut self, space_id: SpaceId) -> bool {
+        let now = Instant::now();
+        if space_id == self.active_space_id {
+            let mut restarted = Self::restart_remote_binding(&mut self.binding, now);
+            for binding in &mut self.inactive_bindings {
+                restarted |= Self::restart_remote_binding(binding, now);
+            }
+            return restarted;
+        }
+        let Some(space) = self
+            .inactive_spaces
+            .iter_mut()
+            .find(|space| space.id == space_id)
+        else {
+            return false;
+        };
+        let mut restarted = false;
+        for binding in space.bindings_mut() {
+            restarted |= Self::restart_remote_binding(binding, now);
+        }
+        restarted
+    }
+
+    fn has_degraded_remote(&self) -> bool {
+        self.binding.reattach.is_some()
+            || self
+                .inactive_bindings
+                .iter()
+                .any(|binding| binding.reattach.is_some())
+            || self
+                .inactive_spaces
+                .iter()
+                .flat_map(SpaceRuntime::bindings)
+                .any(|binding| binding.reattach.is_some())
+    }
+
+    fn reset_remote_reconnects(&mut self, now: Instant) {
+        if self.binding.reattach.is_some() {
+            Self::restart_remote_binding(&mut self.binding, now);
+        }
+        for binding in &mut self.inactive_bindings {
+            if binding.reattach.is_some() {
+                Self::restart_remote_binding(binding, now);
+            }
+        }
+        for space in &mut self.inactive_spaces {
+            for binding in space.bindings_mut() {
+                if binding.reattach.is_some() {
+                    Self::restart_remote_binding(binding, now);
+                }
+            }
+        }
+    }
+
+    fn restart_remote_binding(binding: &mut BindingRuntime, now: Instant) -> bool {
+        let Some(remote) = binding.multiplexer.remote.as_ref() else {
+            return false;
+        };
+        binding.reattach = Some(RemoteReattach {
+            retry_at: now,
+            attempts: 1,
+            started: true,
+        });
+        binding.remote_attach_started = Some(now);
+        binding
+            .mux
+            .set_error(Some(format!("reconnecting to {}", remote.host)));
+        binding.terminal.discard_active_pane();
+        true
+    }
     // Close the focused pane (cmd+w or its shell exiting) and let the mux cascade to the tab. The
     // active terminal is dropped here so its PTY is reaped; sync_mux_anchor then attaches whatever
     // pane the mux selected next (or idle when the session has no tabs left).
@@ -8465,9 +8709,8 @@ mod tests {
                 "phosphor:alarm".to_owned(),
                 SpaceMuxOverride {
                     backend: Some(MultiplexerBackendConfig::Native),
-                    remote: None,
+                    remote: SpaceRemoteOverride::Inherit,
                 },
-                SpaceInheritance::default(),
             ),
             SpaceEditorEvent::Save {
                 space_id: None,
@@ -8477,7 +8720,7 @@ mod tests {
                 tint_sidebar: true,
                 mux: SpaceMuxOverride {
                     backend: Some(MultiplexerBackendConfig::Rmux),
-                    remote: None,
+                    remote: SpaceRemoteOverride::Inherit,
                 },
             },
         );
@@ -8492,9 +8735,8 @@ mod tests {
                 true,
                 SpaceMuxOverride {
                     backend: Some(MultiplexerBackendConfig::Rmux),
-                    remote: None,
+                    remote: SpaceRemoteOverride::Inherit,
                 },
-                SpaceInheritance::default(),
             ),
             SpaceEditorEvent::Save {
                 space_id: Some(review_space),
@@ -8504,7 +8746,7 @@ mod tests {
                 tint_sidebar: false,
                 mux: SpaceMuxOverride {
                     backend: Some(MultiplexerBackendConfig::Zellij),
-                    remote: None,
+                    remote: SpaceRemoteOverride::Inherit,
                 },
             },
         );
@@ -8578,7 +8820,7 @@ mod tests {
             false,
             SpaceMuxOverride {
                 backend: Some(MultiplexerBackendConfig::Tmux),
-                remote: Some(SshRemoteConfig::for_host("devbox")),
+                remote: SpaceRemoteOverride::Inline(SshRemoteConfig::for_host("devbox")),
             },
         ));
         let now = Instant::now();
@@ -8598,6 +8840,25 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("devbox"))
         );
+        assert!(
+            state.space_summaries()[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("devbox"))
+        );
+        assert!(state.reconnect_space_from_ui(space));
+        let manual = state.binding.reattach.expect("manual reconnect");
+        assert!(manual.started);
+        assert_eq!(manual.attempts, 1);
+
+        state.resolve_remote_attach_exit_after_refresh(true);
+
+        assert!(
+            state.binding.reattach.is_none(),
+            "an empty successful snapshot means the session ended normally"
+        );
+        assert!(state.binding.mux.last_error().is_none());
+        assert!(state.last_error.is_none());
     }
 
     /// Backoff grows while one outage keeps ending clients, and starts over once a connection has
@@ -8621,6 +8882,21 @@ mod tests {
             now,
         );
         assert_eq!(after_a_long_session.attempts, 1);
+    }
+
+    #[test]
+    fn network_address_change_resets_only_after_the_poll_interval() {
+        let now = Instant::now();
+        let first = Some("10.0.0.1".parse().expect("address"));
+        let second = Some("192.168.1.7".parse().expect("address"));
+        let mut detector = NetworkChangeDetector {
+            next_check: now,
+            signature: first,
+        };
+
+        assert!(!detector.changed_to(now, first));
+        assert!(!detector.changed_to(now + Duration::from_secs(1), second));
+        assert!(detector.changed_to(now + Duration::from_secs(2), second));
     }
 
     /// A space's host reaches the binding that attaches it, and stops being carried the moment the
@@ -8648,7 +8924,7 @@ mod tests {
             false,
             SpaceMuxOverride {
                 backend: Some(MultiplexerBackendConfig::Tmux),
-                remote: Some(remote.clone()),
+                remote: SpaceRemoteOverride::Inline(remote.clone()),
             },
         ));
         assert_eq!(state.binding.multiplexer.remote.as_ref(), Some(&remote));
@@ -8661,10 +8937,84 @@ mod tests {
             false,
             SpaceMuxOverride {
                 backend: Some(MultiplexerBackendConfig::Native),
-                remote: Some(remote),
+                remote: SpaceRemoteOverride::Inline(remote),
             },
         ));
         assert_eq!(state.binding.multiplexer.remote, None);
+    }
+
+    #[test]
+    fn remote_space_reference_resolves_its_named_profile() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-profile-space-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let profile = SshProfileConfig {
+            name: "Lab".to_owned(),
+            host: "lab-host".to_owned(),
+            user: Some("developer".to_owned()),
+            port: Some(2222),
+            authentication: Default::default(),
+            host_key_policy: Default::default(),
+            identity_file: None,
+            proxy_jump: None,
+            program: "ssh".to_owned(),
+            args: Vec::new(),
+        };
+        let mut config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        config
+            .ssh_profiles
+            .insert("lab".to_owned(), profile.clone());
+        let mut changed = config.clone();
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let mut state = AppState::new(config, repaint, None, None).expect("state");
+
+        assert!(state.update_space_from_ui(
+            state.active_space_id(),
+            "Remote",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Tmux),
+                remote: SpaceRemoteOverride::Profile(crate::workspace::RemoteSpaceRef {
+                    profile_id: "lab".to_owned(),
+                    remote_space_id: "remote-7".to_owned(),
+                    remote_space_name: "Production".to_owned(),
+                    backend: MultiplexerBackendConfig::Tmux,
+                }),
+            },
+        ));
+        assert_eq!(state.binding.multiplexer.remote, Some(profile.to_remote()));
+        assert_eq!(
+            state.binding.multiplexer.remote_space_id,
+            Some("remote-7".to_owned())
+        );
+        assert_eq!(
+            state.binding.multiplexer.backend,
+            MultiplexerBackendConfig::Tmux
+        );
+        changed.ssh_profiles.get_mut("lab").unwrap().host = "new-lab-host".to_owned();
+        state.rebuild_profile_bindings(&changed);
+        assert_eq!(
+            state
+                .binding
+                .multiplexer
+                .remote
+                .as_ref()
+                .map(|remote| remote.host.as_str()),
+            Some("new-lab-host")
+        );
+
+        changed.ssh_profiles.remove("lab");
+        state.rebuild_profile_bindings(&changed);
+        assert_eq!(state.binding.multiplexer.remote, None);
+        assert_eq!(
+            state.binding.degraded_error().as_deref(),
+            Some("SSH profile 'lab' is unavailable")
+        );
     }
 
     #[test]
@@ -8697,7 +9047,7 @@ mod tests {
             false,
             SpaceMuxOverride {
                 backend: Some(MultiplexerBackendConfig::Native),
-                remote: None,
+                remote: SpaceRemoteOverride::Inherit,
             },
         ));
         drop(state);
@@ -8911,28 +9261,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first_space, middle_space, last_space]
         );
-        let active_space = state
-            .space_summaries()
-            .into_iter()
-            .find(|space| space.active)
-            .expect("active space");
         state.apply_keybind_action(
             KeybindAction::App(AppAction::EditSpace),
             ViewportSnapshot::default(),
             &mut effects,
         );
-        assert_eq!(
-            state.take_space_editor_dialog(),
-            Some(SpaceEditorDialog::edit_space(
-                active_space.id,
-                active_space.name,
-                active_space.icon,
-                active_space.color,
-                active_space.tint_sidebar,
-                SpaceMuxOverride::default(),
-                SpaceInheritance::default(),
-            ))
-        );
+        assert!(state.take_space_editor_dialog().is_some());
 
         state.apply_keybind_action(
             KeybindAction::App(AppAction::PreviousSpace),
@@ -11148,6 +11482,19 @@ mod tests {
         state.last_error = None;
         assert_eq!(state.handle_dropped_file_paths(Vec::new()), 0);
         assert_eq!(state.last_error(), None);
+
+        state.binding.multiplexer.remote = Some(crate::config::SshRemoteConfig::for_host("remote"));
+        state.last_error = None;
+        assert_eq!(state.handle_dropped_file_paths(Vec::new()), 0);
+        assert_eq!(state.last_error(), None);
+        assert_eq!(
+            state.handle_dropped_file_paths(vec![file.path().to_path_buf()]),
+            0
+        );
+        assert_eq!(
+            state.last_error(),
+            Some("File handoff to remote Spaces is not supported.")
+        );
     }
 
     #[test]

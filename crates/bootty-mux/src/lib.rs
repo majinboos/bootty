@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 pub type RepaintHandle = Arc<dyn Fn() + Send + Sync + 'static>;
 pub use rmux_bridge::{run_embedded_rmux_daemon, start_embedded_rmux_daemon_for_tests};
+pub use rmux_remote::run_remote_rmux_command;
 
 /// Bootty's own rmux daemon, named for the wire protocol it speaks rather than the release it was
 /// built from.
@@ -30,6 +31,7 @@ pub mod config;
 pub mod controller;
 pub mod native;
 pub mod process;
+pub mod remote_space;
 pub mod rmux;
 pub(crate) mod rmux_bridge;
 pub(crate) mod rmux_remote;

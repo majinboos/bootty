@@ -1187,40 +1187,6 @@ pub(super) fn backend_attach_launch(
     }
 }
 
-/// Chooses the remote client's terminal on the host that can answer the question, rather than
-/// guessing here or paying a round trip to ask.
-///
-/// Bootty compiles the xterm-bootty entry into its own state directory and points children at it
-/// through TERMINFO — on whichever machine bootty runs. A host that also has bootty can resolve the
-/// entry once TERMINFO says where it is; a host without bootty never can, and a client handed a
-/// terminal it cannot resolve refuses to start ("missing or unsuitable terminal"). So the remote
-/// looks, and falls back to the universally installed xterm-256color when the entry is absent.
-///
-/// `sh` runs this because the remote login shell may be anything — fish rejects the syntax outright
-/// — and `exec "$@"` leaves the client itself holding the PTY, with no shell in between.
-const REMOTE_TERM_SCRIPT: &str = r#"terminfo="${XDG_STATE_HOME:-$HOME/.local/state}/bootty/terminfo"
-if TERMINFO="$terminfo" infocmp -x xterm-bootty >/dev/null 2>&1; then
-  TERM=xterm-bootty
-  export TERMINFO="$terminfo" TERM
-else
-  TERM=xterm-256color
-  export TERM
-fi
-exec "$@"
-"#;
-
-fn remote_term_launch(program: String, args: Vec<String>) -> (String, Vec<String>) {
-    let mut script_args = vec![
-        "-c".to_owned(),
-        REMOTE_TERM_SCRIPT.to_owned(),
-        // $0 for the script, which names the process in the remote's own logs.
-        "bootty-attach".to_owned(),
-        program,
-    ];
-    script_args.extend(args);
-    ("sh".to_owned(), script_args)
-}
-
 fn backend_attach_env_remove(backend: MultiplexerBackendConfig) -> Vec<String> {
     match backend {
         MultiplexerBackendConfig::Tmux => vec!["TMUX".to_owned()],
@@ -1260,12 +1226,9 @@ fn backend_attach_session_config_with_path(
     let (program, args) = backend_attach_launch(backend, attach_session);
     // A remote pane runs the same attach client, in the SSH session that carries its PTY.
     let (program, args) = match remote {
-        Some(remote) => {
-            let (program, args) = remote_term_launch(program, args);
-            remote.tty_command(&program, &args)
-        }
-        None => (program, args),
-    };
+        Some(remote) => remote.proxy_tty_command(&program, &args),
+        None => Ok((program, args)),
+    }?;
     config.launch.shell = Some(resolve_launch_program_with_path(&program, path)?);
     config.launch.args = args;
     config.launch.env_remove = backend_attach_env_remove(backend);
@@ -2540,57 +2503,22 @@ mod tests {
             Some(OsStr::new("ssh"))
         );
         assert!(attach.launch.args.contains(&"-t".to_owned()));
-        // The client runs under sh, which picks the terminal on the host that can resolve it, and
-        // execs the same tmux invocation a local attach would run.
         assert_eq!(
-            attach.launch.args.last().map(String::as_str),
-            Some(
-                format!(
-                    "'sh' '-c' {} 'bootty-attach' 'tmux' '-T' '{TMUX_CLIENT_FEATURES}' 'attach-session' '-t' 'agents'",
-                    crate::tmux_protocol::shell_quote(REMOTE_TERM_SCRIPT)
-                )
-                .as_str()
+            crate::ssh::decode_proxy_command_line(
+                attach.launch.args.last().expect("remote command")
             )
-        );
-    }
-
-    /// The remote's terminal choice, run by the same `sh` that will run it over there: bootty's
-    /// entry when that host has it compiled, and the universally installed fallback when it does
-    /// not. A client handed a terminal its host cannot resolve refuses to start, which is exactly
-    /// what a remote attach hit before this existed.
-    #[cfg(unix)]
-    #[test]
-    fn the_remote_picks_bootty_terminfo_when_its_host_has_it_and_falls_back_when_it_does_not() {
-        fn term_chosen_with_state_dir(state_home: &Path) -> String {
-            let output = Command::new("sh")
-                .args([
-                    "-c",
-                    REMOTE_TERM_SCRIPT,
-                    "bootty-attach",
-                    "sh",
-                    "-c",
-                    r#"printf %s "$TERM""#,
-                ])
-                .env("XDG_STATE_HOME", state_home)
-                .output()
-                .expect("run the remote terminal script");
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        }
-
-        let without_bootty = tempfile::tempdir().expect("tempdir");
-        assert_eq!(
-            term_chosen_with_state_dir(without_bootty.path()),
-            "xterm-256color"
-        );
-
-        let with_bootty = tempfile::tempdir().expect("tempdir");
-        bootty_runtime::terminfo::ensure_xterm_bootty_terminfo_in(
-            &with_bootty.path().join("bootty"),
-        )
-        .expect("compile the vendored terminfo");
-        assert_eq!(
-            term_chosen_with_state_dir(with_bootty.path()),
-            bootty_runtime::terminfo::XTERM_BOOTTY
+            .expect("decode remote command"),
+            (
+                "tmux".to_owned(),
+                vec![
+                    "-T".to_owned(),
+                    TMUX_CLIENT_FEATURES.to_owned(),
+                    "attach-session".to_owned(),
+                    "-t".to_owned(),
+                    "agents".to_owned(),
+                ],
+                true,
+            )
         );
     }
 

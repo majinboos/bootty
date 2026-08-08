@@ -280,10 +280,9 @@ impl RmuxNativeTerminal {
             },
         );
         let restore_lines = rmux_restore_lines(config.max_scrollback, geometry.rows);
-        // A remote pane is driven through the other host's rmux client rather than a socket and the
-        // files beside it, neither of which crosses the connection.
+        // A remote pane uses the other host's embedded Bootty rmux protocol.
         let pane_io = match remote {
-            Some(remote) => open_remote_rmux_pane_io(remote, &pane_target, config.max_scrollback)?,
+            Some(remote) => open_remote_rmux_pane_io(remote, &pane_target, restore_lines)?,
             None => open_rmux_pane_io(pane_target, restore_lines)?,
         };
         let (command_tx, command_rx) = mpsc::channel();

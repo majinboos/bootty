@@ -5,6 +5,33 @@ APP_NAME="Bootty"
 BINARY_NAME="bootty"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
 
+ensure_user_path() {
+  local directory="$1"
+  case ":$PATH:" in
+    *":$directory:"*) return ;;
+  esac
+
+  local profile line
+  case "${SHELL##*/}" in
+    fish)
+      profile="$HOME/.config/fish/config.fish"
+      line="fish_add_path \"$directory\""
+      ;;
+    zsh)
+      profile="$HOME/.zprofile"
+      line="export PATH=\"$directory:\$PATH\""
+      ;;
+    *)
+      profile="$HOME/.profile"
+      line="export PATH=\"$directory:\$PATH\""
+      ;;
+  esac
+  mkdir -p "$(dirname "$profile")"
+  touch "$profile"
+  grep -Fqx "$line" "$profile" || printf '\n%s\n' "$line" >> "$profile"
+  echo "Added $directory to PATH in $profile"
+}
+
 ./scripts/package-bootty-unix.sh "$@"
 
 case "$(uname -s)" in
@@ -20,7 +47,22 @@ case "$(uname -s)" in
 
     rm -rf "$APP_TARGET"
     cp -R "$APP_SOURCE" "$APP_TARGET"
-    echo "Installed $APP_TARGET"
+    CLI_DIR="$HOME/.local/bin"
+    IFS=: read -r -a PATH_DIRS <<< "$PATH"
+    for CANDIDATE in "${PATH_DIRS[@]}"; do
+      case "$CANDIDATE" in
+        "$HOME/.local/bin"|"$HOME/bin"|/usr/local/bin|/opt/homebrew/bin)
+          if [[ -d "$CANDIDATE" && -w "$CANDIDATE" ]]; then
+            CLI_DIR="$CANDIDATE"
+            break
+          fi
+          ;;
+      esac
+    done
+    mkdir -p "$CLI_DIR"
+    ln -sfn "$APP_TARGET/Contents/MacOS/$BINARY_NAME" "$CLI_DIR/$BINARY_NAME"
+    ensure_user_path "$CLI_DIR"
+    echo "Installed $APP_TARGET and $CLI_DIR/$BINARY_NAME"
     ;;
   Linux)
     PREFIX="${BOOTTY_INSTALL_PREFIX:-$HOME/.local}"
@@ -33,6 +75,7 @@ case "$(uname -s)" in
     fi
 
     install -Dm755 "$ROOT_DIR/bin/$BINARY_NAME" "$PREFIX/bin/$BINARY_NAME"
+    ensure_user_path "$PREFIX/bin"
     if [[ -d "$ROOT_DIR/lib" ]]; then
       mkdir -p "$PREFIX/lib"
       cp -f "$ROOT_DIR/lib/"*.so "$PREFIX/lib/"

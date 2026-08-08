@@ -7,16 +7,70 @@ use std::{
 
 use anyhow::{Context, Result};
 use bootty_config::config::{BoottyConfig, default_config_path, load_config_from_path};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 mod config_overrides;
 
 use config_overrides::ConfigOverrides;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
 pub enum Command {
     /// Download and install the latest Bootty release.
     Update,
+    /// Machine-readable remote Space catalog used by another Bootty instance over SSH.
+    #[command(name = "remote-space", hide = true, subcommand)]
+    RemoteSpace(RemoteSpaceCommand),
+    /// Cross-platform command transport used by another Bootty instance over SSH.
+    #[command(name = "remote-exec", hide = true)]
+    RemoteExec { payload: String },
+    /// Cross-platform availability probe used by another Bootty instance over SSH.
+    #[command(name = "remote-ping", hide = true)]
+    RemotePing,
+    /// Embedded remote terminal protocol used by another Bootty instance over SSH.
+    #[command(name = "remote-rmux", hide = true)]
+    RemoteRmux { payload: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum RemoteSpaceCommand {
+    List,
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum)]
+        backend: RemoteSpaceBackend,
+    },
+    Snapshot {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_enum)]
+        backend: RemoteSpaceBackend,
+    },
+    Execute {
+        #[arg(long)]
+        id: String,
+        #[arg(long, value_enum)]
+        backend: RemoteSpaceBackend,
+        #[arg(long)]
+        payload: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RemoteSpaceBackend {
+    Rmux,
+    Tmux,
+    Zellij,
+}
+
+impl From<RemoteSpaceBackend> for bootty_config::config::MultiplexerBackendConfig {
+    fn from(value: RemoteSpaceBackend) -> Self {
+        match value {
+            RemoteSpaceBackend::Rmux => Self::Rmux,
+            RemoteSpaceBackend::Tmux => Self::Tmux,
+            RemoteSpaceBackend::Zellij => Self::Zellij,
+        }
+    }
 }
 #[derive(Debug, Parser)]
 #[command(name = "bootty", version, about = "Bootty terminal emulator")]
@@ -55,8 +109,8 @@ impl Cli {
         &self.window_state_key
     }
 
-    pub fn subcommand(&self) -> Option<Command> {
-        self.command
+    pub fn subcommand(&self) -> Option<&Command> {
+        self.command.as_ref()
     }
 
     fn selected_config_path(&self) -> PathBuf {
@@ -114,7 +168,29 @@ mod tests {
     fn update_subcommand_is_parsed() {
         let cli = Cli::try_parse_from(["bootty", "update"]).unwrap();
 
-        assert_eq!(cli.subcommand(), Some(Command::Update));
+        assert_eq!(cli.subcommand(), Some(&Command::Update));
+    }
+
+    #[test]
+    fn remote_proxy_commands_are_parsed() {
+        let exec = Cli::try_parse_from(["bootty", "remote-exec", "payload"]).unwrap();
+        assert_eq!(
+            exec.subcommand(),
+            Some(&Command::RemoteExec {
+                payload: "payload".to_owned(),
+            })
+        );
+
+        let ping = Cli::try_parse_from(["bootty", "remote-ping"]).unwrap();
+        assert_eq!(ping.subcommand(), Some(&Command::RemotePing));
+
+        let rmux = Cli::try_parse_from(["bootty", "remote-rmux", "payload"]).unwrap();
+        assert_eq!(
+            rmux.subcommand(),
+            Some(&Command::RemoteRmux {
+                payload: "payload".to_owned(),
+            })
+        );
     }
 
     #[test]
@@ -442,7 +518,7 @@ mod tests {
 
     #[test]
     fn fullscreen_flag_without_value_uses_native_fullscreen() {
-        let cli = Cli::try_parse_from(["bootty", "--fullscreen"]).unwrap();
+        let cli = Cli::try_parse_from(["bootty", "--defaults", "--fullscreen"]).unwrap();
         let config = cli.load_config().unwrap();
 
         assert_eq!(config.window.fullscreen, WindowFullscreen::Native);

@@ -102,24 +102,7 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
     }
 
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        BindingCapabilityDescriptor::new(
-            scope,
-            [
-                BindingOperation::ActivateWindow,
-                BindingOperation::CreateWindow,
-                BindingOperation::RenameWindow,
-                BindingOperation::NavigateWindow,
-                BindingOperation::MoveWindow,
-                BindingOperation::SplitPane,
-                BindingOperation::NavigatePane,
-                BindingOperation::ClosePane,
-                BindingOperation::TogglePaneZoom,
-                BindingOperation::CreateProjectSession,
-                BindingOperation::CreateWorktreeSession,
-                BindingOperation::RenameSession,
-                BindingOperation::DitchSession,
-            ],
-        )
+        tmux_capabilities(scope)
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
@@ -293,6 +276,27 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
         }
         Ok(())
     }
+}
+
+pub(crate) fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+    BindingCapabilityDescriptor::new(
+        scope,
+        [
+            BindingOperation::ActivateWindow,
+            BindingOperation::CreateWindow,
+            BindingOperation::RenameWindow,
+            BindingOperation::NavigateWindow,
+            BindingOperation::MoveWindow,
+            BindingOperation::SplitPane,
+            BindingOperation::NavigatePane,
+            BindingOperation::ClosePane,
+            BindingOperation::TogglePaneZoom,
+            BindingOperation::CreateProjectSession,
+            BindingOperation::CreateWorktreeSession,
+            BindingOperation::RenameSession,
+            BindingOperation::DitchSession,
+        ],
+    )
 }
 
 fn tmux_server_exited(stderr: &str) -> bool {

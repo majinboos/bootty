@@ -1,6 +1,7 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    sync::mpsc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -9,16 +10,17 @@ use eframe::egui;
 use iconflow::{Pack, list};
 
 use crate::{
-    config::{MultiplexerBackendConfig, SshRemoteConfig},
+    config::{MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
     mux::controller::SpaceId,
+    remote_catalog::{self, RemoteSpaceSummary},
     ui::{
         icons::{has_slug, icon_text},
         overlay::{self, FloatingWindow, TextPrompt},
     },
-    workspace::{DEFAULT_SPACE_COLOR, SpaceMuxOverride},
+    workspace::{DEFAULT_SPACE_COLOR, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct SpaceEditorDialog {
     space_id: Option<SpaceId>,
     name: String,
@@ -26,23 +28,39 @@ pub struct SpaceEditorDialog {
     color: [u8; 3],
     tint_sidebar: bool,
     backend: Option<MultiplexerBackendConfig>,
-    /// What this space runs when it overrides nothing. The editor needs it to know whether the
-    /// space can name a host at all, and to show what it would otherwise inherit — editing a space
-    /// that inherits must not turn the inherited value into an override of the same value.
-    inherited: SpaceInheritance,
     remote: RemoteFields,
+    remote_source: SpaceRemoteOverride,
+    profiles: Vec<(String, SshProfileConfig)>,
+    catalog: RemoteCatalogState,
+    new_remote_space_name: String,
+    new_remote_space_backend: MultiplexerBackendConfig,
     focus: bool,
     icon_search: String,
 }
 
-/// What a space falls back to when it overrides nothing: the backend the config file names, and
-/// the host that backend would run on. Shown as placeholders, never written as the space's own.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SpaceInheritance {
-    pub backend: MultiplexerBackendConfig,
-    pub host: Option<String>,
+#[derive(Debug)]
+struct RemoteCatalogResult {
+    spaces: Vec<RemoteSpaceSummary>,
+    selected: Option<RemoteSpaceSummary>,
 }
 
+#[derive(Debug, Default)]
+enum RemoteCatalogState {
+    #[default]
+    Idle,
+    Running {
+        profile_id: String,
+        receiver: mpsc::Receiver<Result<RemoteCatalogResult, String>>,
+    },
+    Ready {
+        profile_id: String,
+        spaces: Vec<RemoteSpaceSummary>,
+    },
+    Failed {
+        profile_id: String,
+        error: String,
+    },
+}
 /// The remote connection as typed. Held as text so a half-written port or host does not have to
 /// parse on every keystroke; it becomes an [`SshRemoteConfig`] when the space is saved.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -95,6 +113,25 @@ fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
+fn remote_text_edit(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    theme: Theme,
+    hint: &str,
+    width: f32,
+) -> egui::Response {
+    let response = ui.allocate_ui_with_layout(
+        egui::vec2(width, 34.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            bootty_ui::themed_text_edit_singleline(ui, value, theme, |edit| {
+                edit.hint_text(hint).desired_width(width)
+            })
+        },
+    );
+    response.inner.union(response.response)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpaceEditorEvent {
     None,
@@ -110,7 +147,7 @@ pub enum SpaceEditorEvent {
 }
 
 impl SpaceEditorDialog {
-    pub fn new_space(icon: String, mux: SpaceMuxOverride, inherited: SpaceInheritance) -> Self {
+    pub fn new_space(icon: String, mux: SpaceMuxOverride) -> Self {
         Self {
             space_id: None,
             name: String::new(),
@@ -118,8 +155,15 @@ impl SpaceEditorDialog {
             color: DEFAULT_SPACE_COLOR,
             tint_sidebar: false,
             backend: mux.backend,
-            inherited,
-            remote: RemoteFields::from_config(mux.remote.as_ref()),
+            remote: RemoteFields::from_config(match &mux.remote {
+                SpaceRemoteOverride::Inline(remote) => Some(remote),
+                _ => None,
+            }),
+            remote_source: mux.remote,
+            profiles: Vec::new(),
+            catalog: RemoteCatalogState::Idle,
+            new_remote_space_name: String::new(),
+            new_remote_space_backend: MultiplexerBackendConfig::Tmux,
             icon_search: String::new(),
             focus: true,
         }
@@ -132,7 +176,6 @@ impl SpaceEditorDialog {
         color: [u8; 3],
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
-        inherited: SpaceInheritance,
     ) -> Self {
         Self {
             space_id: Some(space_id),
@@ -141,19 +184,30 @@ impl SpaceEditorDialog {
             color,
             tint_sidebar,
             backend: mux.backend,
-            inherited,
-            remote: RemoteFields::from_config(mux.remote.as_ref()),
+            remote: RemoteFields::from_config(match &mux.remote {
+                SpaceRemoteOverride::Inline(remote) => Some(remote),
+                _ => None,
+            }),
+            remote_source: mux.remote,
+            profiles: Vec::new(),
+            catalog: RemoteCatalogState::Idle,
+            new_remote_space_name: String::new(),
+            new_remote_space_backend: MultiplexerBackendConfig::Tmux,
             icon_search: String::new(),
             focus: true,
         }
     }
 
-    /// The backend this space will actually run, override or inherited.
-    fn resolved_backend(&self) -> MultiplexerBackendConfig {
-        self.backend.unwrap_or(self.inherited.backend)
+    pub fn with_profiles(
+        mut self,
+        profiles: impl Iterator<Item = (String, SshProfileConfig)>,
+    ) -> Self {
+        self.profiles = profiles.collect();
+        self
     }
 
     pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> SpaceEditorEvent {
+        self.poll_catalog();
         let name = normalized_name(&self.name);
         let title = if self.space_id.is_some() {
             "Edit Space"
@@ -198,25 +252,30 @@ impl SpaceEditorDialog {
                             .size(12.0)
                             .color(palette.muted),
                     );
-                    egui::ComboBox::from_id_salt("space-editor-backend")
-                        .selected_text(backend_label(self.backend))
-                        .show_ui(ui, |ui| {
-                            for backend in [
-                                None,
-                                Some(MultiplexerBackendConfig::Native),
-                                Some(MultiplexerBackendConfig::Rmux),
-                                Some(MultiplexerBackendConfig::Tmux),
-                                Some(MultiplexerBackendConfig::Zellij),
-                            ] {
-                                ui.selectable_value(
-                                    &mut self.backend,
-                                    backend,
-                                    backend_label(backend),
-                                );
-                            }
-                        });
+                    ui.add_enabled_ui(
+                        !matches!(&self.remote_source, SpaceRemoteOverride::Profile(_)),
+                        |ui| {
+                            egui::ComboBox::from_id_salt("space-editor-backend")
+                                .selected_text(backend_label(self.backend))
+                                .show_ui(ui, |ui| {
+                                    for backend in [
+                                        None,
+                                        Some(MultiplexerBackendConfig::Native),
+                                        Some(MultiplexerBackendConfig::Rmux),
+                                        Some(MultiplexerBackendConfig::Tmux),
+                                        Some(MultiplexerBackendConfig::Zellij),
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut self.backend,
+                                            backend,
+                                            backend_label(backend),
+                                        );
+                                    }
+                                });
+                        },
+                    );
                 });
-                self.remote_ui(ui, palette);
+                self.remote_ui(ui, theme);
                 ui.label(
                     egui::RichText::new("icon")
                         .monospace()
@@ -231,11 +290,15 @@ impl SpaceEditorDialog {
                 ui.add_space(16.0);
                 submitted
                     || ui
-                        .add_enabled(name.is_some(), egui::Button::new("Save"))
+                        .add_enabled(
+                            name.is_some() && self.remote_ready(),
+                            egui::Button::new("Save"),
+                        )
                         .clicked()
             });
 
         if result.inner
+            && self.remote_ready()
             && let Some(name) = name
         {
             return SpaceEditorEvent::Save {
@@ -246,7 +309,19 @@ impl SpaceEditorDialog {
                 tint_sidebar: self.tint_sidebar,
                 mux: SpaceMuxOverride {
                     backend: self.backend,
-                    remote: self.remote.to_config(),
+                    remote: match &self.remote_source {
+                        SpaceRemoteOverride::Inherit => self
+                            .remote
+                            .to_config()
+                            .map(SpaceRemoteOverride::Inline)
+                            .unwrap_or_default(),
+                        SpaceRemoteOverride::Inline(_) => self
+                            .remote
+                            .to_config()
+                            .map(SpaceRemoteOverride::Inline)
+                            .unwrap_or(SpaceRemoteOverride::Local),
+                        remote => remote.clone(),
+                    },
                 },
             };
         }
@@ -260,64 +335,292 @@ impl SpaceEditorDialog {
 impl SpaceEditorDialog {
     /// The host this space's multiplexer runs on. Only for the backends bootty reaches through a
     /// client — the others keep their terminals in this process, with no host to name.
-    fn remote_ui(&mut self, ui: &mut egui::Ui, palette: ThemePalette) {
-        // Always shown, so the field is where someone looks for it rather than something they find
-        // by changing the backend first. It is only editable for a backend that has a client to run
-        // elsewhere, and says so when it does not.
-        let remotable = self.resolved_backend().supports_remote();
-        let placeholder = match (&self.inherited.host, remotable) {
-            (_, false) => "tmux or zellij only".to_owned(),
-            (Some(host), true) => format!("{host} (inherited)"),
-            (None, true) => "empty keeps this space local".to_owned(),
-        };
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
+    fn remote_ui(&mut self, ui: &mut egui::Ui, theme: Theme) {
+        self.location_ui(ui);
+        if let Some(profile_id) = self.selected_profile_id() {
+            self.catalog_ui(ui, theme, profile_id);
+        } else if matches!(&self.remote_source, SpaceRemoteOverride::Inline(_)) {
             ui.label(
-                egui::RichText::new("ssh host")
-                    .monospace()
-                    .size(12.0)
-                    .color(palette.muted),
-            );
-            ui.add_enabled(
-                remotable,
-                egui::TextEdit::singleline(&mut self.remote.host)
-                    .hint_text(placeholder)
-                    .desired_width(220.0),
-            );
-        });
-        if !remotable || self.remote.host.trim().is_empty() {
-            return;
-        }
-        egui::CollapsingHeader::new(
-            egui::RichText::new("connection details")
-                .monospace()
+                egui::RichText::new(
+                    "Legacy inline SSH settings are preserved. Select an SSH profile to migrate.",
+                )
                 .size(12.0)
-                .color(palette.muted),
-        )
-        .id_salt("space-editor-remote-details")
-        .show(ui, |ui| {
-            for (caption, hint, value) in [
-                ("user", "from ~/.ssh/config", &mut self.remote.user),
-                ("port", "22", &mut self.remote.port),
-                ("ssh client", "ssh", &mut self.remote.program),
-                ("flags", "-i ~/.ssh/devbox", &mut self.remote.flags),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(caption)
-                            .monospace()
-                            .size(12.0)
-                            .color(palette.muted),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(value)
-                            .hint_text(hint)
-                            .desired_width(200.0),
-                    );
+                .color(theme.palette.muted),
+            );
+        }
+    }
+
+    fn selected_profile_id(&self) -> Option<String> {
+        match &self.remote_source {
+            SpaceRemoteOverride::Profile(remote) => Some(remote.profile_id.clone()),
+            _ => None,
+        }
+    }
+
+    fn location_ui(&mut self, ui: &mut egui::Ui) {
+        let profiles = self
+            .profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.name.clone()))
+            .collect::<Vec<_>>();
+        let mut requested = None;
+        ui.horizontal(|ui| {
+            ui.label("location");
+            egui::ComboBox::from_id_salt("space-editor-location")
+                .selected_text(self.remote_source_label())
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(
+                            matches!(&self.remote_source, SpaceRemoteOverride::Inherit),
+                            "Inherit",
+                        )
+                        .clicked()
+                    {
+                        requested = Some(SpaceRemoteOverride::Inherit);
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(&self.remote_source, SpaceRemoteOverride::Local),
+                            "This computer",
+                        )
+                        .clicked()
+                    {
+                        requested = Some(SpaceRemoteOverride::Local);
+                    }
+                    for (profile_id, name) in profiles {
+                        let selected = matches!(
+                            &self.remote_source,
+                            SpaceRemoteOverride::Profile(remote)
+                                if remote.profile_id == profile_id
+                        );
+                        if ui.selectable_label(selected, name).clicked() {
+                            requested = Some(SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                                profile_id,
+                                remote_space_id: String::new(),
+                                remote_space_name: String::new(),
+                                backend: MultiplexerBackendConfig::Tmux,
+                            }));
+                        }
+                    }
                 });
+        });
+        if let Some(remote) = requested {
+            self.remote_source = remote;
+            self.catalog = RemoteCatalogState::Idle;
+        }
+    }
+
+    fn catalog_ui(&mut self, ui: &mut egui::Ui, theme: Theme, profile_id: String) {
+        enum View {
+            Idle,
+            Running,
+            Ready(Vec<RemoteSpaceSummary>),
+            Failed(String),
+        }
+        let view = match &self.catalog {
+            RemoteCatalogState::Idle => View::Idle,
+            RemoteCatalogState::Running {
+                profile_id: current,
+                ..
+            } if current == &profile_id => View::Running,
+            RemoteCatalogState::Ready {
+                profile_id: current,
+                spaces,
+            } if current == &profile_id => View::Ready(spaces.clone()),
+            RemoteCatalogState::Failed {
+                profile_id: current,
+                error,
+            } if current == &profile_id => View::Failed(error.clone()),
+            _ => View::Idle,
+        };
+        match view {
+            View::Idle => self.start_catalog(ui.ctx(), &profile_id, None),
+            View::Running => {
+                ui.label("Loading remote Spaces...");
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            View::Failed(error) => {
+                ui.label(egui::RichText::new(error).color(theme.palette.destructive));
+                if ui.button("Retry").clicked() {
+                    self.start_catalog(ui.ctx(), &profile_id, None);
+                }
+            }
+            View::Ready(spaces) => {
+                let selected = match &self.remote_source {
+                    SpaceRemoteOverride::Profile(remote)
+                        if !remote.remote_space_name.is_empty() =>
+                    {
+                        remote.remote_space_name.clone()
+                    }
+                    _ => "Select a remote Space".to_owned(),
+                };
+                egui::ComboBox::from_id_salt("space-editor-remote-space")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for space in spaces {
+                            let current = matches!(
+                                &self.remote_source,
+                                SpaceRemoteOverride::Profile(remote)
+                                    if remote.remote_space_id == space.id
+                            );
+                            if ui.selectable_label(current, &space.name).clicked() {
+                                self.backend = Some(space.backend);
+                                self.remote_source = SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                                    profile_id: profile_id.clone(),
+                                    remote_space_id: space.id,
+                                    remote_space_name: space.name,
+                                    backend: space.backend,
+                                });
+                            }
+                        }
+                    });
+                self.create_remote_space_ui(ui, theme, &profile_id);
+            }
+        }
+    }
+
+    fn create_remote_space_ui(&mut self, ui: &mut egui::Ui, theme: Theme, profile_id: &str) {
+        ui.horizontal(|ui| {
+            remote_text_edit(
+                ui,
+                &mut self.new_remote_space_name,
+                theme,
+                "new remote Space",
+                220.0,
+            );
+            egui::ComboBox::from_id_salt("space-editor-new-remote-backend")
+                .selected_text(backend_label(Some(self.new_remote_space_backend)))
+                .show_ui(ui, |ui| {
+                    for backend in [
+                        MultiplexerBackendConfig::Rmux,
+                        MultiplexerBackendConfig::Tmux,
+                        MultiplexerBackendConfig::Zellij,
+                    ] {
+                        ui.selectable_value(
+                            &mut self.new_remote_space_backend,
+                            backend,
+                            backend_label(Some(backend)),
+                        );
+                    }
+                });
+            if ui
+                .add_enabled(
+                    !self.new_remote_space_name.trim().is_empty(),
+                    egui::Button::new("Create"),
+                )
+                .clicked()
+            {
+                let name = self.new_remote_space_name.trim().to_owned();
+                self.start_catalog(
+                    ui.ctx(),
+                    profile_id,
+                    Some((name, self.new_remote_space_backend)),
+                );
             }
         });
-        ui.add_space(8.0);
+    }
+
+    fn remote_source_label(&self) -> String {
+        match &self.remote_source {
+            SpaceRemoteOverride::Inherit => "Inherit".to_owned(),
+            SpaceRemoteOverride::Local => "This computer".to_owned(),
+            SpaceRemoteOverride::Profile(remote) => self
+                .profiles
+                .iter()
+                .find(|(id, _)| id == &remote.profile_id)
+                .map(|(_, profile)| profile.name.clone())
+                .unwrap_or_else(|| remote.profile_id.clone()),
+            SpaceRemoteOverride::Inline(remote) => format!("Legacy: {}", remote.host),
+        }
+    }
+
+    fn remote_ready(&self) -> bool {
+        !matches!(
+            &self.remote_source,
+            SpaceRemoteOverride::Profile(remote) if remote.remote_space_id.is_empty()
+        )
+    }
+
+    fn start_catalog(
+        &mut self,
+        ctx: &egui::Context,
+        profile_id: &str,
+        create: Option<(String, MultiplexerBackendConfig)>,
+    ) {
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|(id, _)| id == profile_id)
+            .map(|(_, profile)| profile.clone())
+        else {
+            self.catalog = RemoteCatalogState::Failed {
+                profile_id: profile_id.to_owned(),
+                error: format!("SSH profile '{profile_id}' is unavailable"),
+            };
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = if let Some((name, backend)) = create {
+                remote_catalog::create_remote(&profile, &name, backend).and_then(|selected| {
+                    remote_catalog::list_remote(&profile).map(|spaces| RemoteCatalogResult {
+                        spaces,
+                        selected: Some(selected),
+                    })
+                })
+            } else {
+                remote_catalog::list_remote(&profile).map(|spaces| RemoteCatalogResult {
+                    spaces,
+                    selected: None,
+                })
+            }
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+            ctx.request_repaint();
+        });
+        self.catalog = RemoteCatalogState::Running {
+            profile_id: profile_id.to_owned(),
+            receiver,
+        };
+    }
+
+    fn poll_catalog(&mut self) {
+        let RemoteCatalogState::Running {
+            profile_id,
+            receiver,
+        } = &self.catalog
+        else {
+            return;
+        };
+        let Ok(result) = receiver.try_recv() else {
+            return;
+        };
+        let profile_id = profile_id.clone();
+        match result {
+            Ok(result) => self.accept_catalog_result(profile_id, result),
+            Err(error) => {
+                self.catalog = RemoteCatalogState::Failed { profile_id, error };
+            }
+        }
+    }
+
+    fn accept_catalog_result(&mut self, profile_id: String, result: RemoteCatalogResult) {
+        if let Some(selected) = result.selected {
+            self.backend = Some(selected.backend);
+            self.remote_source = SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                profile_id: profile_id.clone(),
+                remote_space_id: selected.id,
+                remote_space_name: selected.name,
+                backend: selected.backend,
+            });
+            self.new_remote_space_name.clear();
+        }
+        self.catalog = RemoteCatalogState::Ready {
+            profile_id,
+            spaces: result.spaces,
+        };
     }
 }
 
@@ -514,12 +817,48 @@ mod tests {
 
     #[test]
     fn new_space_editor_starts_with_a_blank_name() {
-        let dialog = SpaceEditorDialog::new_space(
-            "folder".to_owned(),
-            SpaceMuxOverride::default(),
-            SpaceInheritance::default(),
-        );
+        let dialog = SpaceEditorDialog::new_space("folder".to_owned(), SpaceMuxOverride::default());
         assert!(dialog.name.is_empty());
+    }
+
+    #[test]
+    fn created_remote_space_becomes_the_selected_reference() {
+        let mut dialog =
+            SpaceEditorDialog::new_space("folder".to_owned(), SpaceMuxOverride::default());
+        dialog.remote_source = SpaceRemoteOverride::Profile(RemoteSpaceRef {
+            profile_id: "lab".to_owned(),
+            remote_space_id: String::new(),
+            remote_space_name: String::new(),
+            backend: MultiplexerBackendConfig::Tmux,
+        });
+        dialog.new_remote_space_name = "Production".to_owned();
+        let selected = RemoteSpaceSummary {
+            catalog_version: remote_catalog::REMOTE_SPACE_CATALOG_VERSION,
+            id: "remote-42".to_owned(),
+            name: "Production".to_owned(),
+            backend: MultiplexerBackendConfig::Zellij,
+        };
+
+        dialog.accept_catalog_result(
+            "lab".to_owned(),
+            RemoteCatalogResult {
+                spaces: vec![selected.clone()],
+                selected: Some(selected),
+            },
+        );
+
+        assert_eq!(dialog.backend, Some(MultiplexerBackendConfig::Zellij));
+        assert_eq!(
+            dialog.remote_source,
+            SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                profile_id: "lab".to_owned(),
+                remote_space_id: "remote-42".to_owned(),
+                remote_space_name: "Production".to_owned(),
+                backend: MultiplexerBackendConfig::Zellij,
+            })
+        );
+        assert!(dialog.new_remote_space_name.is_empty());
+        assert!(dialog.remote_ready());
     }
 
     #[test]

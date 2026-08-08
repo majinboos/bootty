@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     fs,
@@ -18,13 +19,28 @@ pub(crate) const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
 const DEFAULT_TINT_SIDEBAR: bool = false;
 const DEFAULT_BINDING_NAME: &str = "Default Binding";
 
-/// What a space runs its sessions on: the backend it overrides the config's default with, and the
-/// host that backend's client runs on. The two travel together because a remote only means anything
-/// for a backend bootty reaches through a client.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpaceMuxOverride {
     pub backend: Option<MultiplexerBackendConfig>,
-    pub remote: Option<SshRemoteConfig>,
+    pub remote: SpaceRemoteOverride,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteSpaceRef {
+    pub profile_id: String,
+    pub remote_space_id: String,
+    pub remote_space_name: String,
+    pub backend: MultiplexerBackendConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", content = "value", rename_all = "kebab-case")]
+pub enum SpaceRemoteOverride {
+    #[default]
+    Inherit,
+    Local,
+    Profile(RemoteSpaceRef),
+    Inline(SshRemoteConfig),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,9 +48,7 @@ pub(crate) struct WorkspaceBinding {
     scope: MuxScope,
     name: String,
     backend_override: Option<MultiplexerBackendConfig>,
-    /// The SSH host this binding's multiplexer client runs on, when it is not the config file's.
-    /// A space can sit on another machine while its neighbours stay local.
-    remote_override: Option<SshRemoteConfig>,
+    remote_override: SpaceRemoteOverride,
     unavailable: bool,
     selection: Option<WorkspaceBindingSelection>,
 }
@@ -48,8 +62,8 @@ impl WorkspaceBinding {
         self.backend_override
     }
 
-    pub(crate) fn remote_override(&self) -> Option<&SshRemoteConfig> {
-        self.remote_override.as_ref()
+    pub(crate) fn remote_override(&self) -> &SpaceRemoteOverride {
+        &self.remote_override
     }
 
     pub(crate) fn mux_scope(&self) -> MuxScope {
@@ -83,6 +97,7 @@ impl WorkspaceBindingSelection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceSpace {
     id: SpaceId,
+    remote_id: String,
     name: String,
     icon: String,
     color: [u8; 3],
@@ -94,6 +109,10 @@ pub(crate) struct WorkspaceSpace {
 impl WorkspaceSpace {
     pub(crate) fn id(&self) -> SpaceId {
         self.id
+    }
+
+    pub(crate) fn remote_id(&self) -> &str {
+        &self.remote_id
     }
 
     pub(crate) fn name(&self) -> &str {
@@ -190,15 +209,17 @@ impl WorkspaceStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(names);
         let name = Self::unique_space_name(existing_names.iter().map(String::as_str), name);
+        let remote_id = new_remote_space_id(&tx)?;
         let position = tx.query_row(
             "SELECT COALESCE(MAX(position) + 1, 0) FROM workspace_spaces",
             [],
             |row| row.get(0),
         )?;
         tx.execute(
-            "INSERT INTO workspace_spaces (name, icon, color, tint_sidebar, position)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO workspace_spaces (remote_id, name, icon, color, tint_sidebar, position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
+                remote_id,
                 name,
                 icon,
                 color_to_hex(color),
@@ -215,7 +236,7 @@ impl WorkspaceStore {
                 DEFAULT_BINDING_NAME,
                 backend_to_storage(mux.backend),
                 i64::from(config.hide_tmux_status),
-                remote_to_storage(mux.remote.as_ref()),
+                remote_to_storage(&mux.remote),
             ],
         )?;
         let binding_id = tx.last_insert_rowid();
@@ -228,6 +249,7 @@ impl WorkspaceStore {
 
         let space = WorkspaceSpace {
             id: SpaceId::from_persistence(space_id),
+            remote_id,
             name,
             icon,
             color,
@@ -292,7 +314,7 @@ impl WorkspaceStore {
              )",
             params![
                 backend_to_storage(mux.backend),
-                remote_to_storage(mux.remote.as_ref()),
+                remote_to_storage(&mux.remote),
                 id.persistence_value()
             ],
         )?;
@@ -426,6 +448,7 @@ impl WorkspaceStore {
         let tx = conn.transaction()?;
         create_workspace_schema(&tx)?;
         migrate_workspace_space_icons(&tx)?;
+        migrate_workspace_remote_ids(&tx)?;
         migrate_workspace_space_appearance(&tx)?;
         migrate_workspace_session_name_metadata(&tx)?;
         migrate_workspace_snapshot_state(&tx)?;
@@ -509,6 +532,7 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_spaces (
             id INTEGER PRIMARY KEY,
+            remote_id TEXT UNIQUE,
             name TEXT NOT NULL,
             icon TEXT NOT NULL DEFAULT 'folder',
             color TEXT NOT NULL DEFAULT '#7AA2F7',
@@ -556,6 +580,47 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             selected_space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE
         );",
     )
+}
+
+fn new_remote_space_id(tx: &Transaction<'_>) -> rusqlite::Result<String> {
+    tx.query_row(
+        "SELECT lower(hex(randomblob(4))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(2))) || '-' ||
+                lower(hex(randomblob(6)))",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn migrate_workspace_remote_ids(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let mut statement = tx.prepare("PRAGMA table_info(workspace_spaces)")?;
+    let has_remote_id = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == "remote_id");
+    drop(statement);
+    if !has_remote_id {
+        tx.execute("ALTER TABLE workspace_spaces ADD COLUMN remote_id TEXT", [])?;
+    }
+    tx.execute(
+        "UPDATE workspace_spaces
+         SET remote_id = lower(hex(randomblob(4))) || '-' ||
+                         lower(hex(randomblob(2))) || '-' ||
+                         lower(hex(randomblob(2))) || '-' ||
+                         lower(hex(randomblob(2))) || '-' ||
+                         lower(hex(randomblob(6)))
+         WHERE remote_id IS NULL OR remote_id = ''",
+        [],
+    )?;
+    tx.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS workspace_spaces_remote_id
+         ON workspace_spaces(remote_id)",
+        [],
+    )?;
+    Ok(())
 }
 
 fn migrate_workspace_space_icons(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -665,7 +730,7 @@ fn create_missing_space_bindings(tx: &Transaction<'_>) -> rusqlite::Result<()> {
 
 fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
     let mut statement = tx.prepare(
-        "SELECT s.id, s.name, s.icon, s.color, s.tint_sidebar, s.position,
+        "SELECT s.id, s.remote_id, s.name, s.icon, s.color, s.tint_sidebar, s.position,
                 b.id, b.name, b.backend, b.hide_tmux_status, b.unavailable,
                 b.selected_session_id, b.selected_window_id, b.remote
          FROM workspace_spaces s
@@ -678,22 +743,23 @@ fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
             space_id,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
-            color_from_hex(&row.get::<_, String>(3)?).unwrap_or(DEFAULT_SPACE_COLOR),
-            row.get::<_, i64>(4)? != 0,
-            row.get::<_, i64>(5)?,
+            row.get::<_, String>(3)?,
+            color_from_hex(&row.get::<_, String>(4)?).unwrap_or(DEFAULT_SPACE_COLOR),
+            row.get::<_, i64>(5)? != 0,
+            row.get::<_, i64>(6)?,
             WorkspaceBinding {
                 scope: MuxScope::new(
                     SpaceId::from_persistence(space_id),
-                    BindingId::from_persistence(row.get(6)?),
+                    BindingId::from_persistence(row.get(7)?),
                 ),
-                name: row.get(7)?,
-                backend_override: backend_from_storage(&row.get::<_, String>(8)?),
-                remote_override: remote_from_storage(row.get::<_, Option<String>>(13)?.as_deref()),
-                unavailable: row.get::<_, i64>(10)? != 0,
-                selection: row.get::<_, Option<String>>(11)?.map(|session_id| {
+                name: row.get(8)?,
+                backend_override: backend_from_storage(&row.get::<_, String>(9)?),
+                remote_override: remote_from_storage(row.get::<_, Option<String>>(14)?.as_deref()),
+                unavailable: row.get::<_, i64>(11)? != 0,
+                selection: row.get::<_, Option<String>>(12)?.map(|session_id| {
                     WorkspaceBindingSelection {
                         session_id,
-                        window_id: row.get::<_, Option<String>>(12).unwrap_or_default(),
+                        window_id: row.get::<_, Option<String>>(13).unwrap_or_default(),
                     }
                 }),
             },
@@ -701,7 +767,7 @@ fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
     })?;
     let mut spaces = Vec::<WorkspaceSpace>::new();
     for row in rows {
-        let (space_id, name, icon, color, tint_sidebar, position, binding) = row?;
+        let (space_id, remote_id, name, icon, color, tint_sidebar, position, binding) = row?;
         if let Some(space) = spaces.last_mut()
             && space.id.persistence_value() == space_id
         {
@@ -709,6 +775,7 @@ fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
         } else {
             spaces.push(WorkspaceSpace {
                 id: SpaceId::from_persistence(space_id),
+                remote_id,
                 name,
                 icon,
                 color,
@@ -722,10 +789,12 @@ fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
 }
 
 fn create_default_binding(tx: &Transaction<'_>, path: &Path) -> rusqlite::Result<WorkspaceBinding> {
+    let remote_id = new_remote_space_id(tx)?;
     tx.execute(
-        "INSERT INTO workspace_spaces (name, icon, color, tint_sidebar, position)
-         VALUES (?1, ?2, ?3, ?4, 0)",
+        "INSERT INTO workspace_spaces (remote_id, name, icon, color, tint_sidebar, position)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
         params![
+            remote_id,
             DEFAULT_SPACE_NAME,
             DEFAULT_SPACE_ICON,
             color_to_hex(DEFAULT_SPACE_COLOR),
@@ -752,7 +821,7 @@ fn create_default_binding(tx: &Transaction<'_>, path: &Path) -> rusqlite::Result
         ),
         name: DEFAULT_BINDING_NAME.to_owned(),
         backend_override: None,
-        remote_override: None,
+        remote_override: SpaceRemoteOverride::Inherit,
         unavailable: false,
         selection: None,
     })
@@ -901,12 +970,23 @@ fn backend_to_storage(backend: Option<MultiplexerBackendConfig>) -> &'static str
 
 /// A binding's remote is stored as JSON rather than as columns of its own: it is one value the app
 /// reads and writes whole, and every field it gained would otherwise be another migration.
-fn remote_to_storage(remote: Option<&SshRemoteConfig>) -> Option<String> {
-    remote.and_then(|remote| serde_json::to_string(remote).ok())
+fn remote_to_storage(remote: &SpaceRemoteOverride) -> Option<String> {
+    match remote {
+        SpaceRemoteOverride::Inherit => None,
+        SpaceRemoteOverride::Inline(remote) => serde_json::to_string(remote).ok(),
+        remote => serde_json::to_string(remote).ok(),
+    }
 }
 
-fn remote_from_storage(stored: Option<&str>) -> Option<SshRemoteConfig> {
-    serde_json::from_str(stored?).ok()
+fn remote_from_storage(stored: Option<&str>) -> SpaceRemoteOverride {
+    let Some(stored) = stored else {
+        return SpaceRemoteOverride::Inherit;
+    };
+    serde_json::from_str(stored).unwrap_or_else(|_| {
+        serde_json::from_str(stored)
+            .map(SpaceRemoteOverride::Inline)
+            .unwrap_or_default()
+    })
 }
 
 fn nonempty_trimmed(value: &str) -> Option<String> {
@@ -990,7 +1070,7 @@ mod tests {
                 false,
                 SpaceMuxOverride {
                     backend: Some(MultiplexerBackendConfig::Tmux),
-                    remote: Some(remote.clone()),
+                    remote: SpaceRemoteOverride::Inline(remote.clone()),
                 },
                 &MultiplexerConfig::default(),
             )
@@ -1003,7 +1083,10 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id() == space.id())
             .expect("persisted space");
-        assert_eq!(stored.bindings()[0].remote_override(), Some(&remote));
+        assert_eq!(
+            stored.bindings()[0].remote_override(),
+            &SpaceRemoteOverride::Inline(remote)
+        );
 
         assert!(
             store
@@ -1015,7 +1098,7 @@ mod tests {
                     false,
                     SpaceMuxOverride {
                         backend: Some(MultiplexerBackendConfig::Tmux),
-                        remote: None,
+                        remote: SpaceRemoteOverride::Local,
                     },
                 )
                 .expect("clear remote")
@@ -1027,7 +1110,54 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id() == space.id())
             .expect("persisted space");
-        assert_eq!(stored.bindings()[0].remote_override(), None);
+        assert_eq!(
+            stored.bindings()[0].remote_override(),
+            &SpaceRemoteOverride::Local
+        );
+    }
+
+    #[test]
+    fn a_space_remembers_its_remote_space_reference() {
+        let config_path = temp_config_path("remote-space-reference");
+        let mut store = WorkspaceStore::for_config_path(&config_path);
+        let reference = RemoteSpaceRef {
+            profile_id: "home-lab".to_owned(),
+            remote_space_id: "remote-42".to_owned(),
+            remote_space_name: "Production".to_owned(),
+            backend: MultiplexerBackendConfig::Tmux,
+        };
+        store
+            .create_space(
+                "Production",
+                "terminal",
+                DEFAULT_SPACE_COLOR,
+                false,
+                SpaceMuxOverride {
+                    backend: Some(reference.backend),
+                    remote: SpaceRemoteOverride::Profile(reference.clone()),
+                },
+                &MultiplexerConfig::default(),
+            )
+            .expect("create remote Space")
+            .expect("Space");
+
+        let reopened = WorkspaceStore::for_config_path(&config_path);
+
+        assert_eq!(
+            reopened.spaces()[1].bindings()[0].remote_override(),
+            &SpaceRemoteOverride::Profile(reference)
+        );
+    }
+
+    #[test]
+    fn legacy_inline_remote_json_still_loads() {
+        let remote = SshRemoteConfig::for_host("legacy-host");
+        let stored = serde_json::to_string(&remote).expect("legacy JSON");
+
+        assert_eq!(
+            remote_from_storage(Some(&stored)),
+            SpaceRemoteOverride::Inline(remote)
+        );
     }
 
     #[test]
@@ -1071,8 +1201,8 @@ mod tests {
         )
         .expect("insert second binding");
         conn.execute(
-            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
-            ["Other Space"],
+            "INSERT INTO workspace_spaces (remote_id, name, position) VALUES (?1, ?2, 1)",
+            ["other-space", "Other Space"],
         )
         .expect("insert other space");
         let other_space_id = conn.last_insert_rowid();
@@ -1119,8 +1249,8 @@ mod tests {
         let store = WorkspaceStore::for_config_path(&config_path);
         let conn = open_db(store.path()).expect("open workspace database");
         conn.execute(
-            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
-            ["Empty Space"],
+            "INSERT INTO workspace_spaces (remote_id, name, position) VALUES (?1, ?2, 1)",
+            ["empty-space", "Empty Space"],
         )
         .expect("insert empty space");
 
@@ -1254,7 +1384,7 @@ mod tests {
                     false,
                     SpaceMuxOverride {
                         backend: Some(MultiplexerBackendConfig::Zellij),
-                        remote: None,
+                        remote: SpaceRemoteOverride::Inherit,
                     },
                 )
                 .expect("update space")
@@ -1469,7 +1599,7 @@ mod tests {
                 false,
                 SpaceMuxOverride {
                     backend: Some(MultiplexerBackendConfig::Tmux),
-                    remote: None,
+                    remote: SpaceRemoteOverride::Inherit,
                 },
                 &MultiplexerConfig::default(),
             )
@@ -1555,5 +1685,37 @@ mod tests {
             })
             .expect("space count");
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn deleted_space_remote_identity_is_not_reused() {
+        let config_path = temp_config_path("remote-id");
+        let mut store = WorkspaceStore::for_config_path(&config_path);
+        let first = store
+            .create_space(
+                "First",
+                "folder",
+                DEFAULT_SPACE_COLOR,
+                false,
+                SpaceMuxOverride::default(),
+                &MultiplexerConfig::default(),
+            )
+            .unwrap()
+            .unwrap();
+        let first_remote_id = first.remote_id().to_owned();
+        assert!(store.delete_space(first.id()).unwrap());
+        let second = store
+            .create_space(
+                "Second",
+                "folder",
+                DEFAULT_SPACE_COLOR,
+                false,
+                SpaceMuxOverride::default(),
+                &MultiplexerConfig::default(),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_ne!(second.remote_id(), first_remote_id);
     }
 }

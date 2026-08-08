@@ -7,6 +7,7 @@ mod appearance;
 mod font;
 mod keybinds;
 mod modules;
+mod remotes;
 mod session;
 mod status_bar;
 mod window;
@@ -20,7 +21,7 @@ use crate::{
     color::Color,
     config::{
         BoottyConfig, ConfigDocument, ConfigResult, MultiplexerBackendConfig, SidebarPosition,
-        SshRemoteConfig, load_or_create_config_document,
+        load_or_create_config_document,
     },
     direct_input::ModifierSideState,
 };
@@ -31,6 +32,7 @@ const SEARCH_ID: &str = "bootty::settings::search";
 pub enum SettingsPage {
     #[default]
     General,
+    Remotes,
     Text,
     Appearance,
     Window,
@@ -52,7 +54,7 @@ struct PageMeta {
     terms: &'static [&'static str],
 }
 
-const PAGE_META: [PageMeta; 10] = [
+const PAGE_META: [PageMeta; 11] = [
     PageMeta {
         page: SettingsPage::General,
         group: "Core",
@@ -67,6 +69,25 @@ const PAGE_META: [PageMeta; 10] = [
             "status bar",
             "new windows",
             "terminal preview",
+        ],
+    },
+    PageMeta {
+        page: SettingsPage::Remotes,
+        group: "Core",
+        label: "Remotes",
+        icon: "server",
+        title: "Remotes",
+        terms: &[
+            "ssh",
+            "remote",
+            "profile",
+            "host",
+            "port",
+            "user",
+            "authentication",
+            "private key",
+            "proxy",
+            "test connection",
         ],
     },
     PageMeta {
@@ -253,6 +274,7 @@ pub struct SettingsSurface {
     font_families: Option<Vec<String>>,
     theme_names: Option<Vec<String>>,
     appearance_variant: crate::config::AppearanceVariant,
+    remote_editor: remotes::EditorState,
     /// Which keybind list is being edited (global, or one of the per-backend lists).
     keybind_scope: keybinds::KeybindScope,
     /// Editable rows for the loaded scope: the user layer that sits on top of the built-in defaults.
@@ -298,6 +320,7 @@ impl SettingsSurface {
             font_families: None,
             theme_names: None,
             appearance_variant: crate::config::AppearanceVariant::Dark,
+            remote_editor: remotes::EditorState::default(),
             keybind_scope: keybinds::KeybindScope::Global,
             keybind_rows: None,
             keybind_clear: false,
@@ -618,6 +641,7 @@ impl SettingsSurface {
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| match self.page {
                                         SettingsPage::General => self.general_ui(ui),
+                                        SettingsPage::Remotes => remotes::ui(self, ui),
                                         SettingsPage::Text => font::ui(self, ui),
                                         SettingsPage::Appearance => appearance::ui(self, ui),
                                         SettingsPage::Window => window::ui(self, ui),
@@ -665,7 +689,6 @@ impl SettingsSurface {
                 }
             },
         );
-        self.remote_ui(ui);
         settings_row(
             ui,
             self.palette,
@@ -694,142 +717,6 @@ impl SettingsSurface {
                 ui.label(RichText::new("Bottom bar").color(self.palette.subtext));
             },
         );
-    }
-
-    /// The SSH host a new binding's multiplexer client runs on, and the connection details a
-    /// machine without a usable `~/.ssh/config` — the common case on Windows — has nowhere else to
-    /// put. Shown for the backends bootty drives through a client; the others have no remote to
-    /// name.
-    fn remote_ui(&mut self, ui: &mut egui::Ui) {
-        if !self.config.multiplexer.backend.supports_remote() {
-            return;
-        }
-        section(ui, self.palette, "REMOTE");
-        settings_row(
-            ui,
-            self.palette,
-            "SSH host",
-            "Run the backend on this host and render it here. Empty keeps sessions local. Applies to spaces opened after the change.",
-            |ui| {
-                let mut host = self.remote_field(|remote| remote.host.clone());
-                if settings_text_edit(ui, self.palette, &mut host, "ssh config alias or address")
-                    .changed()
-                {
-                    self.edit_multiplexer_remote(|remote| remote.host = host.clone());
-                }
-            },
-        );
-        if self.config.multiplexer.remote.is_none() {
-            return;
-        }
-        settings_row(
-            ui,
-            self.palette,
-            "User",
-            "Empty uses what ~/.ssh/config or the local account name resolves.",
-            |ui| {
-                let mut user = self.remote_field(|remote| remote.user.clone().unwrap_or_default());
-                if settings_text_edit(ui, self.palette, &mut user, "login user").changed() {
-                    self.edit_multiplexer_remote(|remote| {
-                        remote.user = non_empty(&user);
-                    });
-                }
-            },
-        );
-        settings_row(
-            ui,
-            self.palette,
-            "Port",
-            "Empty uses what ~/.ssh/config resolves, or 22.",
-            |ui| {
-                let mut port = self.remote_field(|remote| {
-                    remote.port.map(|port| port.to_string()).unwrap_or_default()
-                });
-                if settings_text_edit(ui, self.palette, &mut port, "22").changed() {
-                    // A half-typed port is not a port yet; keeping the last valid one lets the
-                    // field be edited without the connection details changing under the cursor.
-                    let parsed = port.trim().parse::<u16>().ok();
-                    self.edit_multiplexer_remote(|remote| {
-                        remote.port = if port.trim().is_empty() {
-                            None
-                        } else {
-                            parsed.or(remote.port)
-                        };
-                    });
-                }
-            },
-        );
-        settings_row(
-            ui,
-            self.palette,
-            "SSH client",
-            "The program bootty runs to reach the host.",
-            |ui| {
-                let mut program = self.remote_field(|remote| remote.program.clone());
-                if settings_text_edit(ui, self.palette, &mut program, "ssh").changed() {
-                    self.edit_multiplexer_remote(|remote| {
-                        remote.program = match program.trim() {
-                            "" => "ssh".to_owned(),
-                            program => program.to_owned(),
-                        };
-                    });
-                }
-            },
-        );
-        settings_row(
-            ui,
-            self.palette,
-            "SSH flags",
-            "Passed before the destination, separated by spaces: -i, -J, -o.",
-            |ui| {
-                let mut flags = self.remote_field(|remote| remote.args.join(" "));
-                if settings_text_edit(ui, self.palette, &mut flags, "-i ~/.ssh/devbox").changed() {
-                    self.edit_multiplexer_remote(|remote| {
-                        remote.args = flags
-                            .split_whitespace()
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
-                    });
-                }
-            },
-        );
-    }
-
-    fn remote_field<T: Default>(&self, read: impl Fn(&SshRemoteConfig) -> T) -> T {
-        self.config
-            .multiplexer
-            .remote
-            .as_ref()
-            .map(read)
-            .unwrap_or_default()
-    }
-
-    /// Apply one edit to `[multiplexer.remote]`. Clearing the host clears the remote: a remote
-    /// without a host names nothing to connect to, and the config would be refused on the next load.
-    fn edit_multiplexer_remote(&mut self, edit: impl FnOnce(&mut SshRemoteConfig)) {
-        let mut remote = self
-            .config
-            .multiplexer
-            .remote
-            .clone()
-            .unwrap_or_else(|| SshRemoteConfig::for_host(String::new()));
-        edit(&mut remote);
-        if remote.host.trim().is_empty() {
-            self.clear_multiplexer_remote();
-            return;
-        }
-        self.config.multiplexer.remote = Some(remote.clone());
-        self.set_str(&["multiplexer", "remote", "host"], &remote.host);
-        match &remote.user {
-            Some(user) => self.set_str(&["multiplexer", "remote", "user"], user),
-            None => self.remove(&["multiplexer", "remote", "user"]),
-        }
-        match remote.port {
-            Some(port) => self.set_i64(&["multiplexer", "remote", "port"], i64::from(port)),
-            None => self.remove(&["multiplexer", "remote", "port"]),
-        }
-        self.set_str(&["multiplexer", "remote", "program"], &remote.program);
-        self.set_strings(&["multiplexer", "remote", "args"], &remote.args);
     }
 
     fn clear_multiplexer_remote(&mut self) {
@@ -1165,10 +1052,6 @@ fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static 
         (MultiplexerBackendConfig::Tmux, "tmux"),
         (MultiplexerBackendConfig::Zellij, "zellij"),
     ]
-}
-
-fn non_empty(value: &str) -> Option<String> {
-    (!value.trim().is_empty()).then(|| value.trim().to_owned())
 }
 
 fn backend_token(backend: MultiplexerBackendConfig) -> &'static str {
@@ -1771,24 +1654,9 @@ fn settings_text_edit_width(
     hint: &str,
     width: f32,
 ) -> egui::Response {
-    let fill = palette.surface;
-    egui::Frame::NONE
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(10, 7))
-        .show(ui, |ui| {
-            ui.add_sized(
-                [width, 22.0],
-                egui::TextEdit::singleline(value)
-                    .hint_text(hint)
-                    .text_color(readable_color(fill, palette.text))
-                    .vertical_align(egui::Align::Center)
-                    .background_color(fill)
-                    .frame(egui::Frame::NONE),
-            )
-        })
-        .inner
+    bootty_ui::themed_text_edit_singleline(ui, value, Theme::new(palette), |edit| {
+        edit.hint_text(hint).desired_width(width)
+    })
 }
 
 fn settings_segmented(
@@ -2363,39 +2231,6 @@ fn chrome_color_row_with_alpha(
 mod tests {
     use super::*;
 
-    /// Every remote detail typed in the settings window has to come back out of the config file:
-    /// the panel writes TOML, and the running app only ever sees what the next load parses. The
-    /// file also has to stay loadable once the host is cleared, since a hostless remote is refused.
-    #[test]
-    fn remote_settings_round_trip_through_the_config_file() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[multiplexer]\nbackend = \"tmux\"\n").expect("seed config");
-        let mut window =
-            SettingsWindow::new(crate::config::load_config_from_path(&path).expect("load config"));
-
-        window.edit_multiplexer_remote(|remote| {
-            remote.host = "devbox".to_owned();
-            remote.user = Some("dev".to_owned());
-            remote.port = Some(2222);
-            remote.args = vec!["-i".to_owned(), "~/.ssh/devbox".to_owned()];
-        });
-
-        let reloaded = crate::config::load_config_from_path(&path).expect("reload config");
-        let remote = reloaded.multiplexer.remote.expect("remote");
-        assert_eq!(remote.host, "devbox");
-        assert_eq!(remote.user.as_deref(), Some("dev"));
-        assert_eq!(remote.port, Some(2222));
-        assert_eq!(remote.program, "ssh");
-        assert_eq!(remote.args, vec!["-i", "~/.ssh/devbox"]);
-
-        window.edit_multiplexer_remote(|remote| remote.host = "  ".to_owned());
-
-        let cleared = crate::config::load_config_from_path(&path).expect("reload cleared config");
-        assert_eq!(cleared.multiplexer.remote, None);
-        assert_eq!(window.last_write_error, None);
-    }
-
     #[test]
     fn settings_page_metadata_uses_expected_group_order() {
         let pages: Vec<SettingsPage> = PAGE_META.iter().map(|meta| meta.page).collect();
@@ -2403,6 +2238,7 @@ mod tests {
             pages,
             [
                 SettingsPage::General,
+                SettingsPage::Remotes,
                 SettingsPage::Text,
                 SettingsPage::Appearance,
                 SettingsPage::Window,
@@ -2415,8 +2251,8 @@ mod tests {
             ]
         );
         assert_eq!(PAGE_META[0].group, "Core");
-        assert_eq!(PAGE_META[6].group, "Terminal");
-        assert_eq!(PAGE_META[8].group, "Advanced");
+        assert_eq!(PAGE_META[7].group, "Terminal");
+        assert_eq!(PAGE_META[9].group, "Advanced");
     }
 
     #[test]

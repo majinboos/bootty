@@ -6,14 +6,19 @@
 //! on the other host, so a remote binding reuses every parser, layout and capability the local one
 //! does.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    process::Command,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bootty_config::config::SshRemoteConfig;
+use serde::{Deserialize, Serialize};
 
 use super::{
-    process::{CommandOutput, CommandRunner},
+    process::{CommandOutput, CommandRunner, SystemCommandRunner},
     tmux_protocol::shell_quote,
 };
 
@@ -23,6 +28,17 @@ const CONNECT_TIMEOUT: u32 = 5;
 const SERVER_ALIVE_INTERVAL: u32 = 5;
 /// How many unanswered keepalives end the connection.
 const SERVER_ALIVE_COUNT_MAX: u32 = 3;
+const REMOTE_EXEC_PROGRAM: &str = "bootty";
+const REMOTE_EXEC_SUBCOMMAND: &str = "remote-exec";
+const REMOTE_PING_SUBCOMMAND: &str = "remote-ping";
+const MAX_REMOTE_COMMAND_PAYLOAD: usize = 1024 * 1024;
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct RemoteCommand {
+    program: String,
+    args: Vec<String>,
+    terminal: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshRemote {
@@ -47,20 +63,42 @@ impl SshRemote {
         }
     }
 
-    /// argv for running `program args...` on the remote host and reading its output. Batch mode is
-    /// on: the snapshot poll runs several times a second with no terminal to answer a passphrase
-    /// prompt on, and a command that blocks on one would never return.
+    /// argv for a direct remote-shell command. Bootty uses this only for shell-neutral bootstrap
+    /// commands. Backend commands use [`Self::proxy_command`] so their arguments never depend on
+    /// the remote login shell.
     pub fn command(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
-        self.build(program, args, &["-o", "BatchMode=yes"])
+        self.build_line(remote_command_line(program, args), &["-o", "BatchMode=yes"])
     }
 
-    /// argv for the attach client, which owns a PTY: it asks for a remote terminal, and may prompt
-    /// for credentials on the pane the user is looking at.
-    pub fn tty_command(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
-        self.build(program, args, &["-t"])
+    /// Run one backend command through the remote Bootty executable. The SSH shell sees only
+    /// `bootty remote-exec <base64url>`, which is valid in POSIX shells, cmd.exe, and PowerShell.
+    pub fn proxy_command(&self, program: &str, args: &[String]) -> Result<(String, Vec<String>)> {
+        Ok(self.build_line(
+            remote_proxy_command_line_for(REMOTE_EXEC_SUBCOMMAND, program, args, false)?,
+            &["-o", "BatchMode=yes"],
+        ))
     }
 
-    fn build(&self, program: &str, args: &[String], mode: &[&str]) -> (String, Vec<String>) {
+    /// The proxied attach client owns a PTY and may prompt for credentials.
+    pub fn proxy_tty_command(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> Result<(String, Vec<String>)> {
+        Ok(self.build_line(
+            remote_proxy_command_line_for(REMOTE_EXEC_SUBCOMMAND, program, args, true)?,
+            &["-t"],
+        ))
+    }
+
+    fn ping_command(&self) -> (String, Vec<String>) {
+        self.build_line(
+            format!("{REMOTE_EXEC_PROGRAM} {REMOTE_PING_SUBCOMMAND}"),
+            &["-o", "BatchMode=yes"],
+        )
+    }
+
+    fn build_line(&self, remote_line: String, mode: &[&str]) -> (String, Vec<String>) {
         let mut ssh_args = mode
             .iter()
             .map(|flag| (*flag).to_owned())
@@ -74,11 +112,9 @@ impl SshRemote {
         }
         ssh_args.extend(self.keepalive_args());
         ssh_args.extend(self.multiplexing_args());
-        ssh_args.push(self.destination());
-        // SSH joins the remaining argv with spaces and hands the result to the remote login shell,
-        // so the command has to arrive already quoted for that shell.
         ssh_args.push("--".to_owned());
-        ssh_args.push(remote_command_line(program, args));
+        ssh_args.push(self.destination());
+        ssh_args.push(remote_line);
         (self.config.program.clone(), ssh_args)
     }
 
@@ -134,49 +170,141 @@ fn remote_command_line(program: &str, args: &[String]) -> String {
     line
 }
 
+#[cfg(test)]
+fn remote_proxy_command_line(program: &str, args: &[String]) -> Result<String> {
+    remote_proxy_command_line_for(REMOTE_EXEC_SUBCOMMAND, program, args, false)
+}
+
+fn remote_proxy_command_line_for(
+    subcommand: &str,
+    program: &str,
+    args: &[String],
+    terminal: bool,
+) -> Result<String> {
+    let payload = serde_json::to_vec(&RemoteCommand {
+        program: program.to_owned(),
+        args: args.to_vec(),
+        terminal,
+    })
+    .context("encode remote command")?;
+    Ok(format!(
+        "{REMOTE_EXEC_PROGRAM} {subcommand} {}",
+        URL_SAFE_NO_PAD.encode(payload)
+    ))
+}
+
+fn decode_remote_command(payload: &str) -> Result<RemoteCommand> {
+    if payload.len() > MAX_REMOTE_COMMAND_PAYLOAD {
+        bail!("remote command payload is too large")
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload)
+        .context("decode remote command payload")?;
+    let command: RemoteCommand =
+        serde_json::from_slice(&bytes).context("parse remote command payload")?;
+    if command.program.is_empty() {
+        bail!("remote command program cannot be empty")
+    }
+    Ok(command)
+}
+
+pub fn run_remote_command(payload: &str) -> Result<i32> {
+    let command = decode_remote_command(payload)?;
+    let mut child = Command::new(&command.program);
+    child.args(&command.args);
+    if command.terminal {
+        if let Some(terminfo) = bootty_runtime::terminfo::vendored_terminfo_dir() {
+            child.env("TERM", "xterm-bootty").env("TERMINFO", terminfo);
+        } else {
+            child.env("TERM", "xterm-256color");
+        }
+    }
+    let status = child
+        .status()
+        .with_context(|| format!("run remote command {}", command.program))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(test)]
+pub(crate) fn decode_proxy_command_line(line: &str) -> Result<(String, Vec<String>, bool)> {
+    let mut tokens = line.split_whitespace();
+    if tokens.next() != Some(REMOTE_EXEC_PROGRAM) || tokens.next() != Some(REMOTE_EXEC_SUBCOMMAND) {
+        bail!("not a Bootty remote proxy command")
+    }
+    let payload = tokens
+        .next()
+        .context("remote proxy command has no payload")?;
+    if tokens.next().is_some() {
+        bail!("remote proxy command has extra tokens")
+    }
+    let command = decode_remote_command(payload)?;
+    Ok((command.program, command.args, command.terminal))
+}
+
+pub fn remote_bootty_failure(host: &str, detail: &str) -> String {
+    let detail = detail.trim();
+    let missing = detail.lines().any(|line| {
+        line.to_ascii_lowercase().contains("bootty")
+            && (line.contains("Unknown command")
+                || line.contains("command not found")
+                || line.contains("not found"))
+    });
+    if missing {
+        return format!(
+            "Bootty is not installed on {host}. Install and open Bootty there, then try again."
+        );
+    }
+    if detail.is_empty() {
+        return format!("Could not run Bootty on {host}.");
+    }
+    format!(
+        "Could not run Bootty on {host}: {}",
+        detail.lines().next().unwrap_or(detail)
+    )
+}
+pub fn test_ssh_connection(config: &SshRemoteConfig) -> Result<()> {
+    test_ssh_connection_with_runner(config, &SystemCommandRunner)
+}
+
+fn test_ssh_connection_with_runner<R: CommandRunner>(
+    config: &SshRemoteConfig,
+    runner: &R,
+) -> Result<()> {
+    let (program, args) = SshRemote::new(config.clone()).ping_command();
+    let output = runner.run(&program, &args)?;
+    if output.success {
+        return Ok(());
+    }
+
+    bail!("{}", remote_bootty_failure(&config.host, &output.stderr))
+}
+
 /// Runs every command through [`SshRemote`], for the backends whose own runner has nothing to keep
 /// open between invocations.
 #[derive(Clone, Debug)]
 pub struct SshCommandRunner<R> {
     remote: SshRemote,
     runner: R,
-    /// Arguments every invocation carries before its own, for a program that has to be told which
-    /// server it is talking to on the other side.
-    leading_args: Vec<String>,
 }
 
 impl<R> SshCommandRunner<R> {
     pub fn new(remote: SshRemote, runner: R) -> Self {
-        Self {
-            remote,
-            runner,
-            leading_args: Vec::new(),
-        }
+        Self { remote, runner }
     }
 
-    pub fn with_leading_args(remote: SshRemote, runner: R, leading_args: Vec<String>) -> Self {
-        Self {
-            remote,
-            runner,
-            leading_args,
-        }
-    }
-
-    fn remote_argv(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
-        let mut all = self.leading_args.clone();
-        all.extend_from_slice(args);
-        self.remote.command(program, &all)
+    fn remote_argv(&self, program: &str, args: &[String]) -> Result<(String, Vec<String>)> {
+        self.remote.proxy_command(program, args)
     }
 }
 
 impl<R: CommandRunner> CommandRunner for SshCommandRunner<R> {
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
-        let (program, args) = self.remote_argv(program, args);
+        let (program, args) = self.remote_argv(program, args)?;
         self.runner.run(&program, &args)
     }
 
     fn run_disowned(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
-        let (program, args) = self.remote_argv(program, args);
+        let (program, args) = self.remote_argv(program, args)?;
         self.runner.run_disowned(&program, &args)
     }
 }
@@ -205,6 +333,16 @@ mod tests {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
 
+    fn proxied_command(argv: &[String]) -> RemoteCommand {
+        let line = argv.last().expect("remote command line");
+        let mut tokens = line.split_whitespace();
+        assert_eq!(tokens.next(), Some(REMOTE_EXEC_PROGRAM));
+        assert_eq!(tokens.next(), Some(REMOTE_EXEC_SUBCOMMAND));
+        let payload = tokens.next().expect("remote command payload");
+        assert!(tokens.next().is_none());
+        decode_remote_command(payload).expect("decode remote command")
+    }
+
     /// Everything after the destination reaches a remote shell as one string, so the format
     /// strings tmux snapshots depend on have to survive that shell intact.
     #[test]
@@ -223,11 +361,73 @@ mod tests {
     }
 
     #[test]
+    fn connection_test_uses_batch_mode_without_opening_a_live_connection() {
+        #[derive(Default)]
+        struct Runner {
+            call: RefCell<Option<(String, Vec<String>)>>,
+        }
+
+        impl CommandRunner for Runner {
+            fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
+                self.call.replace(Some((program.to_owned(), args.to_vec())));
+                Ok(CommandOutput {
+                    success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let runner = Runner::default();
+        test_ssh_connection_with_runner(&config("devbox"), &runner).expect("connection test");
+        let (_, args) = runner.call.take().expect("SSH invocation");
+        assert_eq!(args.first().map(String::as_str), Some("-o"));
+        assert_eq!(args.get(1).map(String::as_str), Some("BatchMode=yes"));
+        assert_eq!(args.last().map(String::as_str), Some("bootty remote-ping"));
+    }
+
+    #[test]
     fn remote_command_line_escapes_embedded_single_quotes() {
         assert_eq!(
             remote_command_line("tmux", &args(&["rename-session", "-t", "it's"])),
             r"'tmux' 'rename-session' '-t' 'it'\''s'"
         );
+    }
+
+    #[test]
+    fn proxied_command_round_trips_argv_without_remote_shell_quoting() {
+        let argv = args(&[
+            r"C:\Program Files\backend.exe",
+            "rename-session",
+            "it's remote",
+        ]);
+        let line = remote_proxy_command_line(&argv[0], &argv[1..]).expect("encode command");
+
+        assert_eq!(
+            decode_remote_command(line.split_whitespace().nth(2).expect("payload"))
+                .expect("decode command"),
+            RemoteCommand {
+                program: argv[0].clone(),
+                args: argv[1..].to_vec(),
+                terminal: false,
+            }
+        );
+        assert!(
+            line.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_'))
+        );
+    }
+
+    #[test]
+    fn remote_exec_runs_the_decoded_command_without_a_shell() {
+        #[cfg(unix)]
+        let (program, command_args) = ("sh", args(&["-c", "exit 7"]));
+        #[cfg(windows)]
+        let (program, command_args) = ("cmd.exe", args(&["/C", "exit 7"]));
+        let line = remote_proxy_command_line(program, &command_args).expect("encode command");
+        let payload = line.split_whitespace().nth(2).expect("payload");
+
+        assert_eq!(run_remote_command(payload).expect("run command"), 7);
     }
 
     /// Snapshots poll on a timer with nothing to type a passphrase into; the attach pane is the one
@@ -236,8 +436,12 @@ mod tests {
     fn only_the_attach_client_asks_for_a_tty_and_allows_prompts() {
         let remote = remote(config("devbox"));
 
-        let (_, polled) = remote.command("tmux", &args(&["list-sessions"]));
-        let (_, attached) = remote.tty_command("tmux", &args(&["attach-session"]));
+        let (_, polled) = remote
+            .proxy_command("tmux", &args(&["list-sessions"]))
+            .expect("polled command");
+        let (_, attached) = remote
+            .proxy_tty_command("tmux", &args(&["attach-session"]))
+            .expect("attach command");
 
         assert!(
             polled
@@ -282,7 +486,7 @@ mod tests {
     }
 
     /// The hosts that need `user`/`port`/`args` are the ones without a usable `~/.ssh/config`, so
-    /// each has to reach the argv, and the destination has to stay the last word before `--`.
+    /// each has to reach argv, and `--` must terminate options before the destination.
     #[test]
     fn explicit_credentials_replace_what_ssh_config_would_have_carried() {
         let (_, argv) = remote(SshRemoteConfig {
@@ -296,7 +500,7 @@ mod tests {
         let destination = argv
             .iter()
             .position(|arg| arg == "--")
-            .and_then(|index| argv.get(index - 1));
+            .and_then(|index| argv.get(index + 1));
         assert_eq!(destination.map(String::as_str), Some("dev@10.0.0.4"));
         assert!(argv.windows(2).any(|pair| pair == ["-p", "2222"]));
         assert!(
@@ -332,8 +536,12 @@ mod tests {
         let calls = runner.runner.calls.borrow();
         assert_eq!(calls[0].0, "ssh");
         assert_eq!(
-            calls[0].1.last().map(String::as_str),
-            Some("'zellij' 'list-sessions'")
+            proxied_command(&calls[0].1),
+            RemoteCommand {
+                program: "zellij".to_owned(),
+                args: args(&["list-sessions"]),
+                terminal: false,
+            }
         );
     }
 }
