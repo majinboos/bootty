@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::{
-    config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig},
+    config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig, default_config_path},
     mux::controller::{BindingId, MuxScope, SpaceId},
 };
 
@@ -860,14 +860,18 @@ fn migrate_legacy_order_file(
     Ok(())
 }
 
-fn legacy_order_paths(database_path: &Path) -> [PathBuf; 2] {
+fn legacy_order_paths(database_path: &Path) -> Vec<PathBuf> {
     let config_dir = database_path.parent().unwrap_or_else(|| Path::new("."));
-    let bootty_legacy = config_dir.join("session-order");
-    let tmux_legacy = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
-        .join(".config/tmux/session-order");
-    [bootty_legacy, tmux_legacy]
+    let mut paths = vec![config_dir.join("session-order")];
+    if default_config_path().parent() == Some(config_dir) {
+        paths.push(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/"))
+                .join(".config/tmux/session-order"),
+        );
+    }
+    paths
 }
 
 struct LegacySessionGroup {
@@ -949,6 +953,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bootty-workspace-{name}-{unique}"));
         fs::create_dir_all(&dir).expect("create workspace directory");
         dir.join("config.toml")
+    }
+
+    #[test]
+    fn isolated_workspace_does_not_read_global_tmux_legacy_order() {
+        let config_path = temp_config_path("isolated-legacy-order");
+        let database_path = sqlite_path(&config_path);
+
+        let paths = legacy_order_paths(&database_path);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0],
+            database_path.parent().unwrap().join("session-order")
+        );
     }
 
     /// The host a space's sessions live on has to survive storage whole: bootty reads it back to
