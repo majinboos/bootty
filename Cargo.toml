@@ -87,6 +87,7 @@ rmux-proto = "0.10"
 rmux-server = { version = "0.10", default-features = false }
 rstest = "0.26"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+sha2 = "0.10"
 rustybuzz = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
@@ -106,6 +107,7 @@ tuirealm = { version = "4.1.0", default-features = false, features = [
   "derive",
 ] }
 unicode-width = "0.2"
+ureq = "3"
 wasm-bindgen = "0.2"
 wgpu = { version = "29", default-features = false, features = [
   "parking_lot",
@@ -137,6 +139,13 @@ strip = false
 [profile.release]
 lto = "fat"
 split-debuginfo = "off"
+
+[profile.daemon-release]
+inherits = "release"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
 
 [profile.dynamic-release]
 inherits = "release"

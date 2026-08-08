@@ -32,7 +32,11 @@ ensure_user_path() {
   echo "Added $directory to PATH in $profile"
 }
 
-./scripts/package-bootty-unix.sh "$@"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  ./scripts/package-bootty-unix.sh --all-daemons "$@"
+else
+  ./scripts/package-bootty-unix.sh "$@"
+fi
 
 case "$(uname -s)" in
   Darwin)
@@ -75,6 +79,7 @@ case "$(uname -s)" in
     fi
 
     install -Dm755 "$ROOT_DIR/bin/$BINARY_NAME" "$PREFIX/bin/$BINARY_NAME"
+    install -Dm755 "$ROOT_DIR/bin/bootty-daemon" "$PREFIX/bin/bootty-daemon"
     ensure_user_path "$PREFIX/bin"
     if [[ -d "$ROOT_DIR/lib" ]]; then
       mkdir -p "$PREFIX/lib"

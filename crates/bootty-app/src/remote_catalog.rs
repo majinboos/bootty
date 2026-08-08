@@ -4,21 +4,22 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig},
+    config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
     session_order::SessionOrderStore,
     workspace::{
         DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SpaceMuxOverride, SpaceRemoteOverride,
         WorkspaceBinding, WorkspaceStore,
     },
 };
+use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
     command::MuxCommand,
     process::{CommandRunner, SystemCommandRunner},
     snapshot::{MuxSnapshot, session_matches},
-    ssh::{SshRemote, remote_bootty_failure},
+    ssh::{SshRemote, remote_daemon_failure},
 };
 
-pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 2;
+pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RemoteSpaceSummary {
@@ -279,6 +280,67 @@ pub fn create_remote(
     create_remote_with_runner(profile, name, backend, &SystemCommandRunner)
 }
 
+pub fn list_remote_projects_with_runner<R: CommandRunner>(
+    remote: &SshRemoteConfig,
+    runner: &R,
+) -> Result<Vec<ProjectPickerEntry>> {
+    let output = run_remote_config(remote, &["remote-project", "list"], runner)?;
+    Ok(serde_json::from_str(&output)?)
+}
+
+pub fn toggle_remote_project_favorite_with_runner<R: CommandRunner>(
+    remote: &SshRemoteConfig,
+    path: &str,
+    runner: &R,
+) -> Result<bool> {
+    let output = run_remote_config(
+        remote,
+        &["remote-project", "favorite", "--path", path],
+        runner,
+    )?;
+    Ok(serde_json::from_str(&output)?)
+}
+
+pub fn list_remote_worktrees_with_runner<R: CommandRunner>(
+    remote: &SshRemoteConfig,
+    project: &str,
+    open_cwds: &[String],
+    runner: &R,
+) -> Result<Vec<WorktreePickerEntry>> {
+    let mut args = vec![
+        "remote-worktree".to_owned(),
+        "list".to_owned(),
+        "--project".to_owned(),
+        project.to_owned(),
+    ];
+    for cwd in open_cwds {
+        args.extend(["--open-cwd".to_owned(), cwd.clone()]);
+    }
+    let output = run_remote_config_owned(remote, &args, runner)?;
+    Ok(serde_json::from_str(&output)?)
+}
+
+pub fn create_remote_worktree_with_runner<R: CommandRunner>(
+    remote: &SshRemoteConfig,
+    project: &str,
+    branch: &str,
+    runner: &R,
+) -> Result<String> {
+    let output = run_remote_config(
+        remote,
+        &[
+            "remote-worktree",
+            "create",
+            "--project",
+            project,
+            "--branch",
+            branch,
+        ],
+        runner,
+    )?;
+    Ok(serde_json::from_str(&output)?)
+}
+
 fn list_remote_with_runner<R: CommandRunner>(
     profile: &SshProfileConfig,
     runner: &R,
@@ -323,13 +385,32 @@ fn run_remote<R: CommandRunner>(
     args: &[&str],
     runner: &R,
 ) -> Result<String> {
+    run_remote_config(&profile.to_remote(), args, runner)
+}
+
+fn run_remote_config<R: CommandRunner>(
+    remote: &SshRemoteConfig,
+    args: &[&str],
+    runner: &R,
+) -> Result<String> {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    let (program, args) = SshRemote::new(profile.to_remote()).proxy_command("bootty", &args)?;
+    run_remote_config_owned(remote, &args, runner)
+}
+
+fn run_remote_config_owned<R: CommandRunner>(
+    remote: &SshRemoteConfig,
+    args: &[String],
+    runner: &R,
+) -> Result<String> {
+    let remote = SshRemote::new(remote.clone());
+    remote.ensure_daemon_with(runner)?;
+    let host = remote.host().to_owned();
+    let (program, args) = remote.proxy_command(bootty_mux::ssh::REMOTE_DAEMON_PROGRAM, args)?;
     let output = runner.run(&program, &args)?;
     if output.success {
         return Ok(output.stdout);
     }
-    bail!("{}", remote_bootty_failure(&profile.host, &output.stderr))
+    bail!("{}", remote_daemon_failure(&host, &output.stderr))
 }
 
 fn validate_versions(spaces: &[RemoteSpaceSummary]) -> Result<()> {
@@ -360,6 +441,17 @@ mod tests {
         fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
             self.command
                 .replace(Some((program.to_owned(), args.to_vec())));
+            if args.last().is_some_and(|arg| arg.ends_with("remote-ping")) {
+                return Ok(CommandOutput {
+                    success: true,
+                    stdout: format!(
+                        "{}:{}",
+                        bootty_mux::ssh::REMOTE_DAEMON_PROTOCOL_VERSION,
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    stderr: String::new(),
+                });
+            }
             Ok(self.output.clone())
         }
     }
@@ -412,7 +504,7 @@ mod tests {
         let runner = FakeRunner {
             output: CommandOutput {
                 success: true,
-                stdout: r#"[{"catalog_version":2,"id":"remote-7","name":"Lab","backend":"tmux"}]"#
+                stdout: r#"[{"catalog_version":3,"id":"remote-7","name":"Lab","backend":"tmux"}]"#
                     .to_owned(),
                 stderr: String::new(),
             },
@@ -424,11 +516,41 @@ mod tests {
         assert_eq!(spaces[0].id, "remote-7");
         let (_, args) = runner.command.into_inner().expect("command");
         let command = args.last().expect("remote command");
-        assert!(command.starts_with("bootty remote-exec "));
+        assert!(command.starts_with(&format!(
+            "./.bootty/bin/bootty-daemon-{}-{}.exe remote-exec ",
+            bootty_mux::REMOTE_DAEMON_PROTOCOL_VERSION,
+            env!("CARGO_PKG_VERSION")
+        )));
         assert!(
             command
                 .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_'))
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | '/'))
+        );
+    }
+
+    #[test]
+    fn ssh_project_catalog_returns_remote_paths_through_the_daemon_proxy() {
+        let runner = FakeRunner {
+            output: CommandOutput {
+                success: true,
+                stdout: r#"[{"path":"/srv/projects/bootty","favorite":false}]"#.to_owned(),
+                stderr: String::new(),
+            },
+            command: RefCell::new(None),
+        };
+
+        let output =
+            run_remote_config(&profile().to_remote(), &["remote-project", "list"], &runner)
+                .expect("remote projects");
+        let projects =
+            serde_json::from_str::<Vec<ProjectPickerEntry>>(&output).expect("project JSON");
+
+        assert_eq!(projects[0].path, "/srv/projects/bootty");
+        let (_, args) = runner.command.into_inner().expect("command");
+        assert!(
+            args.last()
+                .expect("remote command")
+                .contains(" remote-exec ")
         );
     }
 
@@ -437,7 +559,7 @@ mod tests {
         let runner = FakeRunner {
             output: CommandOutput {
                 success: true,
-                stdout: r#"[{"catalog_version":3,"id":"remote-7","name":"Lab","backend":"tmux"}]"#
+                stdout: r#"[{"catalog_version":4,"id":"remote-7","name":"Lab","backend":"tmux"}]"#
                     .to_owned(),
                 stderr: String::new(),
             },
@@ -448,27 +570,7 @@ mod tests {
             list_remote_with_runner(&profile(), &runner)
                 .unwrap_err()
                 .to_string()
-                .contains("version 3")
-        );
-    }
-
-    #[test]
-    fn ssh_catalog_reports_a_missing_remote_bootty_install() {
-        let runner = FakeRunner {
-            output: CommandOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: "fish: Unknown command: bootty\nfish:\n'bootty' 'remote-space' 'list'"
-                    .to_owned(),
-            },
-            command: RefCell::new(None),
-        };
-
-        let error = list_remote_with_runner(&profile(), &runner).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            "Bootty is not installed on lab. Install and open Bootty there, then try again."
+                .contains("version 4")
         );
     }
 

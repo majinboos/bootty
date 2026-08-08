@@ -1,10 +1,13 @@
 use anyhow::Result;
 
+#[cfg(feature = "app")]
 use super::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation},
-    command::MuxCommand,
     controller::MuxScope,
+};
+use super::{
+    command::MuxCommand,
     process::{CommandRunner, SystemCommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot},
 };
@@ -45,17 +48,13 @@ impl<R: CommandRunner> ZellijBackend<R> {
     }
 }
 
-impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
-    fn snapshot(&self) -> Result<MuxSnapshot> {
+impl<R: CommandRunner> ZellijBackend<R> {
+    pub fn snapshot(&self) -> Result<MuxSnapshot> {
         let output = self.run(&["list-sessions", "--short", "--no-formatting"])?;
         Ok(parse_zellij_snapshot(&output))
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        zellij_capabilities(scope)
-    }
-
-    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+    pub fn execute(&mut self, command: MuxCommand) -> Result<()> {
         match command {
             MuxCommand::ActivateWindow { .. } => {
                 anyhow::bail!("zellij native window activation is not implemented");
@@ -110,6 +109,22 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
     }
 }
 
+#[cfg(feature = "app")]
+impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        ZellijBackend::snapshot(self)
+    }
+
+    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        ZellijBackend::execute(self, command)
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        zellij_capabilities(scope)
+    }
+}
+
+#[cfg(feature = "app")]
 pub(crate) fn zellij_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
     BindingCapabilityDescriptor::new(
         scope,

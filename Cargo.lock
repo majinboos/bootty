@@ -731,7 +731,6 @@ dependencies = [
  "bootty-runtime",
  "bootty-terminal",
  "bootty-winit",
- "bootty-workspace-hack",
  "indoc",
  "libghostty-vt",
  "proptest",
@@ -742,8 +741,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootty-daemon"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "bootty-mux",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml_edit 0.25.13+spec-1.1.0",
+]
+
+[[package]]
 name = "bootty-mux"
-version = "0.0.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -751,7 +763,6 @@ dependencies = [
  "bootty-runtime",
  "bootty-surface",
  "bootty-terminal",
- "bootty-workspace-hack",
  "derive_more",
  "libghostty-vt",
  "rmux-client",
@@ -761,8 +772,10 @@ dependencies = [
  "rmux-server",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "ureq",
 ]
 
 [[package]]
@@ -773,7 +786,6 @@ dependencies = [
  "anyhow",
  "bootty-surface",
  "bootty-terminal",
- "bootty-workspace-hack",
  "eframe",
  "epaint_default_fonts",
  "fontdb",
@@ -795,7 +807,6 @@ dependencies = [
  "anyhow",
  "bootty-surface",
  "bootty-terminal",
- "bootty-workspace-hack",
  "criterion",
  "portable-pty",
  "proptest",
@@ -820,7 +831,6 @@ dependencies = [
 name = "bootty-surface"
 version = "0.0.0"
 dependencies = [
- "bootty-workspace-hack",
  "eframe",
  "proptest",
 ]
@@ -832,7 +842,6 @@ dependencies = [
  "anyhow",
  "base64",
  "bootty-surface",
- "bootty-workspace-hack",
  "libc",
  "libghostty-vt",
  "memchr",
@@ -861,7 +870,6 @@ dependencies = [
  "bootty-runtime",
  "bootty-surface",
  "bootty-terminal",
- "bootty-workspace-hack",
  "eframe",
  "libghostty-vt",
  "pollster",
@@ -899,9 +907,12 @@ dependencies = [
  "getrandom 0.3.4",
  "hashbrown 0.16.1",
  "hashbrown 0.17.1",
+ "http",
  "image",
  "indexmap",
+ "js-sys",
  "libc",
+ "linux-raw-sys 0.12.1",
  "lock_api",
  "memchr",
  "miniz_oxide",
@@ -923,6 +934,7 @@ dependencies = [
  "rustix 1.1.4",
  "serde",
  "serde_core",
+ "serde_json",
  "serde_spanned 1.1.1",
  "simd-adler32",
  "smallvec",
@@ -938,6 +950,7 @@ dependencies = [
  "tracing",
  "tracing-core",
  "typenum",
+ "ureq",
  "uuid",
  "wasm-bindgen",
  "wayland-sys",

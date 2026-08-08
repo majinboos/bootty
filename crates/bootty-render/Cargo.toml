@@ -16,7 +16,6 @@ smallvec.workspace = true
 ttf-parser.workspace = true
 unicode-width.workspace = true
 wgpu.workspace = true
-bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { workspace = true, features = ["metal"] }

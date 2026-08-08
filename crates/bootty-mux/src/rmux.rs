@@ -2,13 +2,18 @@ use anyhow::{Context, Result};
 use rmux_proto::{ListPanesRequest, ListWindowsRequest, Request, Response};
 use rmux_sdk::{Rmux, SessionName};
 
-use crate::rmux_bridge::{resize_rmux_window, rmux_execute, rmux_snapshot};
+#[cfg(feature = "app")]
+use crate::rmux_bridge::resize_rmux_window;
+use crate::rmux_bridge::{rmux_execute, rmux_snapshot};
 
+#[cfg(feature = "app")]
 use super::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation},
-    command::{MuxCommand, MuxSplitDirection},
     controller::MuxScope,
+};
+use super::{
+    command::{MuxCommand, MuxSplitDirection},
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxPaneSplitDirection, MuxSession, MuxSnapshot, MuxWindow,
     },
@@ -65,16 +70,12 @@ impl<C> RmuxBackend<C> {
     }
 }
 
-impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
-    fn snapshot(&self) -> Result<MuxSnapshot> {
+impl<C: RmuxSessionClient> RmuxBackend<C> {
+    pub fn snapshot(&self) -> Result<MuxSnapshot> {
         self.client.snapshot()
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        rmux_capabilities(scope)
-    }
-
-    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+    pub fn execute(&mut self, command: MuxCommand) -> Result<()> {
         match command {
             MuxCommand::ActivateWindow {
                 session_id,
@@ -162,6 +163,22 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
     }
 }
 
+#[cfg(feature = "app")]
+impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        RmuxBackend::snapshot(self)
+    }
+
+    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        RmuxBackend::execute(self, command)
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        rmux_capabilities(scope)
+    }
+}
+
+#[cfg(feature = "app")]
 /// What an rmux binding can do, wherever its daemon runs. A remote binding drives the same rmux
 /// through its command line rather than the socket, so it has to claim the same operations and not
 /// the ones tmux happens to add.
@@ -299,6 +316,7 @@ impl RmuxSessionClient for SdkRmuxClient {
     }
 }
 
+#[cfg(feature = "app")]
 pub(crate) fn resize_bootty_rmux_window(window_id: &str, cols: u16, rows: u16) -> Result<()> {
     resize_rmux_window(window_id, cols, rows)
 }
@@ -587,6 +605,7 @@ mod tests {
 
     use super::*;
     use crate::command::MuxCommand;
+    #[cfg(feature = "app")]
     use rmux_sdk::{PaneId, TerminalSizeSpec};
 
     fn rmux_test_request(request: Request) -> Result<Response> {
@@ -1042,6 +1061,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "app")]
     fn wait_for_controller(
         label: &str,
         controller: &mut crate::controller::MuxController,
@@ -1150,6 +1170,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "app")]
     #[test]
     #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_backend_smoke_covers_tabs_splits_switching_and_persistence() -> Result<()> {
@@ -1349,6 +1370,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "app")]
     #[test]
     #[ignore = "requires an isolated RMUX_TMPDIR"]
     fn rmux_live_window_resize_makes_bootty_split_pane_sizes_real() -> Result<()> {

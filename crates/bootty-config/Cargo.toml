@@ -10,7 +10,6 @@ bootty-render = { path = "../bootty-render" }
 bootty-runtime = { path = "../bootty-runtime" }
 bootty-terminal = { path = "../bootty-terminal" }
 bootty-winit = { path = "../bootty-winit", default-features = false }
-bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [dev-dependencies]
 indoc.workspace = true

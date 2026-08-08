@@ -80,9 +80,11 @@ backend = "rmux"
 # rmux-sdk. tmux and zellij attach through their backend UI.
 
 # Attach a multiplexer running on another host. Bootty reaches the remote host
-# over SSH and renders its sessions here. Remote rmux uses the remote Bootty
-# installation and its embedded rmux SDK. Remote tmux and zellij use their own
-# installed backend binaries.
+# over SSH and renders its sessions here. On first use, Bootty uploads the
+# matching daemon bundled with the app. If the bundle has no matching target,
+# Bootty downloads and checksum-verifies the release daemon. New Session uses
+# that daemon to discover projects and Git worktrees on the remote filesystem.
+# The full Bootty app is not required on the remote host.
 [multiplexer.remote]
 host = "devbox" # ~/.ssh/config alias, hostname, or address
 # user = "dev"        # when ~/.ssh/config does not name one

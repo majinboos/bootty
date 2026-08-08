@@ -3,18 +3,27 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::{
     collections::hash_map::DefaultHasher,
     env,
+    ffi::OsStr,
     fs::{File, OpenOptions, TryLockError},
     future::Future,
     hash::{Hash, Hasher},
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    process::Command,
     sync::{OnceLock, mpsc},
     thread,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
+#[cfg(feature = "app")]
 use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TERMINAL_TERM};
+#[cfg(not(feature = "app"))]
+const TERMINAL_PROGRAM: &str = "ghostty";
+#[cfg(not(feature = "app"))]
+const TERMINAL_PROGRAM_VERSION: &str = concat!("Bootty ", env!("CARGO_PKG_VERSION"));
+#[cfg(not(feature = "app"))]
+const TERMINAL_TERM: &str = "xterm-bootty";
 use rmux_proto::{
     LastWindowRequest, PaneTarget, RenameSessionRequest, Request, Response, SwapWindowRequest,
     WindowTarget,
@@ -51,7 +60,17 @@ const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
 const TERM_PROGRAM_VERSION_ENV: &str = "TERM_PROGRAM_VERSION";
 
 fn bootty_rmux_process_environment() -> Vec<String> {
-    bootty_rmux_process_environment_with_terminfo(bootty_runtime::terminfo::vendored_terminfo_dir())
+    bootty_rmux_process_environment_with_terminfo(vendored_terminfo_dir())
+}
+
+#[cfg(feature = "app")]
+fn vendored_terminfo_dir() -> Option<&'static Path> {
+    bootty_runtime::terminfo::vendored_terminfo_dir()
+}
+
+#[cfg(not(feature = "app"))]
+fn vendored_terminfo_dir() -> Option<&'static Path> {
+    None
 }
 
 fn bootty_rmux_process_environment_with_terminfo(terminfo_dir: Option<&Path>) -> Vec<String> {
@@ -112,11 +131,13 @@ impl RmuxPaneTarget {
         SessionName::new(&self.session_name).context("invalid rmux session name")
     }
 
+    #[cfg(feature = "app")]
     /// The stable session selector shared by local and remote Bootty protocols.
     pub(crate) fn session_selector(&self) -> &str {
         &self.session_name
     }
 
+    #[cfg(feature = "app")]
     pub(crate) fn pane_selector(&self) -> Option<&str> {
         self.pane_id.as_deref()
     }
@@ -163,6 +184,7 @@ enum RmuxControlRequest {
         command: MuxCommand,
         result_tx: mpsc::Sender<std::result::Result<(), String>>,
     },
+    #[cfg(feature = "app")]
     ResizeWindow {
         window_id: String,
         cols: u16,
@@ -197,6 +219,7 @@ pub(crate) fn rmux_execute(command: MuxCommand) -> Result<()> {
     request_control_sync(|result_tx| RmuxControlRequest::Execute { command, result_tx })
 }
 
+#[cfg(feature = "app")]
 pub(crate) fn resize_rmux_window(window_id: &str, cols: u16, rows: u16) -> Result<()> {
     let window_id = window_id.to_owned();
     request_control_sync(|result_tx| RmuxControlRequest::ResizeWindow {
@@ -315,11 +338,13 @@ pub fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
+const BOOTTY_DAEMON_BINARY_ENV: &str = "BOOTTY_DAEMON_BINARY";
+
 fn ensure_rmux_sdk_daemon_binary() -> Result<()> {
     static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     RESOLVED
         .get_or_init(|| {
-            let binary = env::current_exe().map_err(|error| error.to_string())?;
+            let binary = bootty_daemon_binary().map_err(|error| error.to_string())?;
             // SAFETY: rmux workers are started only after this one-time initialization.
             unsafe {
                 env::set_var(
@@ -331,6 +356,50 @@ fn ensure_rmux_sdk_daemon_binary() -> Result<()> {
         })
         .clone()
         .map_err(anyhow::Error::msg)
+}
+
+fn bootty_daemon_binary() -> Result<PathBuf> {
+    let executable = env::current_exe().context("resolve Bootty executable")?;
+    Ok(resolve_bootty_daemon_binary(
+        &executable,
+        env::var_os(BOOTTY_DAEMON_BINARY_ENV).as_deref(),
+        sidecar_is_compatible,
+    ))
+}
+
+fn resolve_bootty_daemon_binary(
+    executable: &Path,
+    override_binary: Option<&OsStr>,
+    is_compatible: impl FnOnce(&Path) -> bool,
+) -> PathBuf {
+    if let Some(binary) = override_binary {
+        return binary.into();
+    }
+    let daemon = executable.with_file_name(if cfg!(windows) {
+        "bootty-daemon.exe"
+    } else {
+        "bootty-daemon"
+    });
+    if daemon == executable || (daemon.is_file() && is_compatible(&daemon)) {
+        daemon
+    } else {
+        executable.to_owned()
+    }
+}
+
+fn sidecar_is_compatible(daemon: &Path) -> bool {
+    Command::new(daemon)
+        .arg("remote-ping")
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim()
+                    == format!(
+                        "{}:{}",
+                        crate::REMOTE_DAEMON_PROTOCOL_VERSION,
+                        env!("CARGO_PKG_VERSION")
+                    )
+        })
 }
 
 fn request_control_sync<T>(
@@ -407,6 +476,7 @@ fn run_control_worker(request_rx: mpsc::Receiver<RmuxControlRequest>) {
                     .map_err(|error| error.to_string());
                 let _ = result_tx.send(result);
             }
+            #[cfg(feature = "app")]
             RmuxControlRequest::ResizeWindow {
                 window_id,
                 cols,
@@ -750,6 +820,7 @@ impl RmuxBridgeState {
         Ok(())
     }
 
+    #[cfg(feature = "app")]
     async fn resize_window(&mut self, window_id: &str, cols: u16, rows: u16) -> Result<()> {
         let first = self.resize_window_once(window_id, cols, rows).await;
         match first {
@@ -762,6 +833,7 @@ impl RmuxBridgeState {
         }
     }
 
+    #[cfg(feature = "app")]
     async fn resize_window_once(&mut self, window_id: &str, cols: u16, rows: u16) -> Result<()> {
         let Some((session_name, index)) = self.any_window_index_by_id(window_id).await? else {
             anyhow::bail!("rmux window {window_id} not found");
@@ -773,6 +845,7 @@ impl RmuxBridgeState {
         Ok(())
     }
 
+    #[cfg(feature = "app")]
     async fn any_window_index_by_id(&mut self, window_id: &str) -> Result<Option<(String, u32)>> {
         let names = self.list_session_names().await?;
         let rmux = self.rmux().await?;
@@ -1558,6 +1631,39 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn packaged_app_uses_its_daemon_sidecar() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let executable = directory.path().join(if cfg!(windows) {
+            "bootty.exe"
+        } else {
+            "bootty"
+        });
+        let daemon = directory.path().join(if cfg!(windows) {
+            "bootty-daemon.exe"
+        } else {
+            "bootty-daemon"
+        });
+        std::fs::write(&daemon, []).expect("daemon");
+
+        assert_eq!(
+            resolve_bootty_daemon_binary(&executable, None, |candidate| candidate == daemon),
+            daemon
+        );
+    }
+
+    #[test]
+    fn stale_sidecar_falls_back_to_the_app_daemon() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let executable = directory.path().join("bootty");
+        std::fs::write(directory.path().join("bootty-daemon"), []).expect("daemon");
+
+        assert_eq!(
+            resolve_bootty_daemon_binary(&executable, None, |_| false),
+            executable
+        );
+    }
 
     #[test]
     fn stalled_restore_capture_completes_without_history() {

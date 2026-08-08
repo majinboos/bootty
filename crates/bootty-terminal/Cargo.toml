@@ -9,7 +9,6 @@ libghostty-vt.workspace = true
 memchr.workspace = true
 bootty-surface = { path = "../bootty-surface" }
 png.workspace = true
-bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [dev-dependencies]
 libc = "0.2"

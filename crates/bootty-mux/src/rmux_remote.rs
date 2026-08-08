@@ -1,36 +1,45 @@
-//! Runs Bootty's embedded rmux backend on another host through the remote Bootty CLI.
+//! Runs Bootty's embedded rmux backend through the small remote Bootty daemon.
 //!
 //! The remote host never resolves or executes an `rmux` binary. Bootty serializes backend requests,
 //! sends them through SSH, and handles them with the same embedded rmux SDK path used locally.
 
+#[cfg(feature = "app")]
+use std::io::BufReader;
+use std::io::{BufRead, BufWriter, Write};
+use std::thread;
+#[cfg(feature = "app")]
 use std::{
-    io::{BufRead, BufReader, BufWriter, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc,
-    thread,
 };
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rmux_sdk::{PaneOutputChunk, TerminalSizeSpec};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "app")]
 use tokio::sync::mpsc as tokio_mpsc;
 
+#[cfg(feature = "app")]
 use crate::{
     backend::MuxBackend,
     capability::BindingCapabilityDescriptor,
-    command::MuxCommand,
     controller::MuxScope,
     process::{CommandOutput, CommandRunner, SystemCommandRunner},
     rmux::rmux_capabilities,
-    rmux_bridge::{
-        RmuxPaneEvent, RmuxPaneIo, RmuxPaneTarget, open_rmux_pane_io, resize_rmux_pane,
-        rmux_execute, rmux_snapshot,
-    },
+    rmux_bridge::RmuxPaneIo,
     snapshot::MuxSnapshot,
-    ssh::{SshRemote, remote_bootty_failure},
+    ssh::{SshRemote, remote_daemon_failure},
+};
+use crate::{
+    command::MuxCommand,
+    rmux_bridge::{
+        RmuxPaneEvent, RmuxPaneTarget, open_rmux_pane_io, resize_rmux_pane, rmux_execute,
+        rmux_snapshot,
+    },
 };
 
+#[cfg(feature = "app")]
 const REMOTE_RMUX_SUBCOMMAND: &str = "remote-rmux";
 const MAX_REMOTE_RMUX_PAYLOAD: usize = 1024 * 1024;
 
@@ -68,16 +77,19 @@ enum RemotePaneFrame {
     Error(String),
 }
 
+#[cfg(feature = "app")]
 pub struct RemoteRmuxBackend {
     remote: SshRemote,
 }
 
+#[cfg(feature = "app")]
 impl RemoteRmuxBackend {
     pub fn new(remote: SshRemote) -> Self {
         Self { remote }
     }
 
     fn run(&self, request: &RemoteRmuxRequest) -> Result<CommandOutput> {
+        self.remote.ensure_daemon()?;
         let (program, args) = remote_rmux_argv(&self.remote, request)?;
         let output = SystemCommandRunner.run(&program, &args)?;
         if output.success {
@@ -85,11 +97,12 @@ impl RemoteRmuxBackend {
         }
         bail!(
             "{}",
-            remote_bootty_failure(self.remote.host(), &output.stderr)
+            remote_daemon_failure(self.remote.host(), &output.stderr)
         )
     }
 }
 
+#[cfg(feature = "app")]
 impl MuxBackend for RemoteRmuxBackend {
     fn snapshot(&self) -> Result<MuxSnapshot> {
         let output = self.run(&RemoteRmuxRequest::Snapshot)?;
@@ -106,6 +119,7 @@ impl MuxBackend for RemoteRmuxBackend {
     }
 }
 
+#[cfg(feature = "app")]
 pub(crate) fn open_remote_rmux_pane_io(
     remote: &SshRemote,
     target: &RmuxPaneTarget,
@@ -117,6 +131,7 @@ pub(crate) fn open_remote_rmux_pane_io(
             target.session_selector()
         )
     })?;
+    remote.ensure_daemon()?;
     let session = target.session_selector().to_owned();
     let (output_tx, output_rx) = mpsc::channel();
     let (input_tx, input_rx) = tokio_mpsc::unbounded_channel();
@@ -148,14 +163,19 @@ pub(crate) fn open_remote_rmux_pane_io(
     })
 }
 
+#[cfg(feature = "app")]
 fn remote_rmux_argv(
     remote: &SshRemote,
     request: &RemoteRmuxRequest,
 ) -> Result<(String, Vec<String>)> {
     let payload = encode_request(request)?;
-    remote.proxy_command("bootty", &[REMOTE_RMUX_SUBCOMMAND.to_owned(), payload])
+    remote.proxy_command(
+        crate::REMOTE_DAEMON_PROGRAM,
+        &[REMOTE_RMUX_SUBCOMMAND.to_owned(), payload],
+    )
 }
 
+#[cfg(feature = "app")]
 fn encode_request(request: &RemoteRmuxRequest) -> Result<String> {
     let json = serde_json::to_vec(request).context("encode remote terminal request")?;
     if json.len() > MAX_REMOTE_RMUX_PAYLOAD {
@@ -244,6 +264,7 @@ fn encode_chunks(chunks: Vec<PaneOutputChunk>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "app")]
 fn decode_chunks(chunks: Vec<String>) -> Result<Vec<PaneOutputChunk>> {
     chunks
         .into_iter()
@@ -282,6 +303,7 @@ fn decode_input_line(line: &str) -> Result<Vec<u8>> {
         .context("decode remote terminal input")
 }
 
+#[cfg(feature = "app")]
 fn spawn_output(
     remote: &SshRemote,
     session: String,
@@ -332,6 +354,7 @@ fn spawn_output(
     Ok(())
 }
 
+#[cfg(feature = "app")]
 fn decode_frame(frame: RemotePaneFrame) -> Result<RmuxPaneEvent> {
     Ok(match frame {
         RemotePaneFrame::Restore {
@@ -353,6 +376,7 @@ fn decode_frame(frame: RemotePaneFrame) -> Result<RmuxPaneEvent> {
     })
 }
 
+#[cfg(feature = "app")]
 fn spawn_input(
     remote: &SshRemote,
     session: String,
@@ -387,12 +411,14 @@ fn spawn_input(
     Ok(())
 }
 
+#[cfg(feature = "app")]
 fn write_input_line(writer: &mut BufWriter<ChildStdin>, bytes: &[u8]) -> std::io::Result<()> {
     writer.write_all(URL_SAFE_NO_PAD.encode(bytes).as_bytes())?;
     writer.write_all(b"\n")?;
     writer.flush()
 }
 
+#[cfg(feature = "app")]
 fn spawn_resize(
     remote: &SshRemote,
     session: String,
@@ -414,7 +440,7 @@ fn spawn_resize(
                 if output.success {
                     Ok(())
                 } else {
-                    bail!("{}", remote_bootty_failure(remote.host(), &output.stderr))
+                    bail!("{}", remote_daemon_failure(remote.host(), &output.stderr))
                 }
             });
             let _ = result_tx.send(result.map_err(|error| error.to_string()));
@@ -422,8 +448,10 @@ fn spawn_resize(
     });
 }
 
+#[cfg(feature = "app")]
 struct ChildGuard(Child);
 
+#[cfg(feature = "app")]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -434,13 +462,17 @@ impl Drop for ChildGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "app")]
     use crate::controller::{BindingId, SpaceId};
+    #[cfg(feature = "app")]
     use bootty_config::config::SshRemoteConfig;
 
+    #[cfg(feature = "app")]
     fn remote() -> SshRemote {
         SshRemote::new(SshRemoteConfig::for_host("devbox"))
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn remote_commands_use_boottys_embedded_protocol() {
         let (_program, argv) =
@@ -449,13 +481,14 @@ mod tests {
             crate::ssh::decode_proxy_command_line(argv.last().expect("command"))
                 .expect("decode command");
 
-        assert_eq!(remote_program, "bootty");
+        assert_eq!(remote_program, crate::ssh::REMOTE_DAEMON_PROGRAM);
         assert_eq!(
             args.first().map(String::as_str),
             Some(REMOTE_RMUX_SUBCOMMAND)
         );
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn remote_request_round_trips_hostile_command_arguments() {
         let request = RemoteRmuxRequest::Execute {
@@ -475,6 +508,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn pane_frames_preserve_binary_output() {
         let event = RmuxPaneEvent::Restore {
@@ -495,6 +529,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn pane_frames_preserve_lag_recovery_bytes() {
         let bytes = vec![0x1b, b'[', b'm'];
@@ -527,6 +562,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn a_remote_rmux_binding_claims_rmux_operations() {
         let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
@@ -538,6 +574,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn a_session_without_a_pane_refuses_to_open() {
         let target = RmuxPaneTarget::new("project".to_owned(), None);

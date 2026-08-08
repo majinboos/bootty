@@ -7,7 +7,6 @@ anyhow.workspace = true
 bootty-surface = { path = "../bootty-surface" }
 bootty-terminal = { path = "../bootty-terminal" }
 portable-pty.workspace = true
-bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [[bench]]
 name = "pty_drain"

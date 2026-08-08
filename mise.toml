@@ -2,6 +2,8 @@
 rust = "stable"
 # macOS must use Homebrew/system Zig for libghostty; mise manages Zig elsewhere.
 zig = { version = "0.15.2", os = ["linux", "windows"] }
+"cargo:cargo-xwin" = "0.23.0"
+"cargo:cargo-zigbuild" = "0.23.0"
 
 [tasks.build]
 description = "Build the bootty app with dynamic local linkage; pass --static for distribution or --fast for fast-release"
@@ -98,6 +100,10 @@ run = "scripts/run-benchmark-suite.sh --quick --output artifacts/benchmark-repro
 [tasks.release]
 description = "Prepare and auto-merge a release; pass patch or major for a bump other than minor"
 run = "./scripts/prepare-release.sh"
+
+[tasks."daemon:build-all"]
+description = "Cross-build daemon assets for every supported remote target"
+run = "./scripts/build-bootty-daemons.sh"
 
 [tasks.package]
 description = "Package the app bundle with dynamic local linkage; pass --static for distribution or --fast for fast-release"

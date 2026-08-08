@@ -115,27 +115,7 @@ pub fn remove_worktree(worktree_path: &str, force: bool) -> Result<(), String> {
 /// `repo_dir`, returning the new worktree path (a sibling dir named
 /// `<repo>-<branch-slug>`).
 pub fn add_worktree(repo_dir: &str, branch: &str) -> Result<String, String> {
-    let path = new_worktree_path(repo_dir, branch)?;
-    run(repo_dir, &["worktree", "add", "-b", branch, &path])?;
-    Ok(path)
-}
-
-/// Sibling path for a new worktree: `<repo-parent>/<repo-name>-<branch-slug>`.
-fn new_worktree_path(repo_dir: &str, branch: &str) -> Result<String, String> {
-    let main = main_worktree(repo_dir).unwrap_or_else(|| repo_dir.to_owned());
-    let main = Path::new(&main);
-    let parent = main
-        .parent()
-        .ok_or_else(|| "repository has no parent directory".to_owned())?;
-    let repo_name = main
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "could not read repository name".to_owned())?;
-    let slug = branch.replace('/', "-");
-    Ok(parent
-        .join(format!("{repo_name}-{slug}"))
-        .to_string_lossy()
-        .into_owned())
+    bootty_mux::project::add_worktree(repo_dir, branch)
 }
 
 /// Delete `branch`, running git in `repo_dir` — any live working tree of the
