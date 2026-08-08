@@ -458,6 +458,7 @@ mod macos_clipboard {
     use std::path::PathBuf;
 
     use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    use objc2_foundation::{NSString, NSURL};
 
     pub fn read_file_paths() -> Option<Vec<PathBuf>> {
         let pasteboard = NSPasteboard::generalPasteboard();
@@ -475,39 +476,11 @@ mod macos_clipboard {
     }
 
     fn path_from_file_url(url: &str) -> Option<PathBuf> {
-        let rest = url.strip_prefix("file://")?;
-        let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-        if !rest.starts_with('/') {
+        let url = NSURL::URLWithString(&NSString::from_str(url))?;
+        if !url.isFileURL() {
             return None;
         }
-        Some(PathBuf::from(percent_decode(rest)?))
-    }
-
-    fn percent_decode(input: &str) -> Option<String> {
-        let bytes = input.as_bytes();
-        let mut decoded = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%' {
-                let hi = hex_value(*bytes.get(index + 1)?)?;
-                let lo = hex_value(*bytes.get(index + 2)?)?;
-                decoded.push((hi << 4) | lo);
-                index += 3;
-            } else {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
-        }
-        String::from_utf8(decoded).ok()
-    }
-
-    fn hex_value(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
+        url.filePathURL()?.to_file_path()
     }
 
     #[cfg(test)]
@@ -527,6 +500,27 @@ mod macos_clipboard {
             assert_eq!(
                 path_from_file_url("file://localhost/tmp/a%27b.png"),
                 Some(PathBuf::from("/tmp/a'b.png"))
+            );
+        }
+
+        #[test]
+        fn file_reference_urls_resolve_to_paths() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("file.txt");
+            std::fs::write(&path, "clipboard").expect("write file");
+            let reference = NSURL::from_file_path(&path)
+                .expect("file URL")
+                .fileReferenceURL()
+                .expect("file reference URL");
+            let url = reference
+                .absoluteString()
+                .expect("absolute URL")
+                .to_string();
+
+            assert!(reference.isFileReferenceURL());
+            assert_eq!(
+                path_from_file_url(&url),
+                Some(std::fs::canonicalize(path).expect("canonical path"))
             );
         }
 
