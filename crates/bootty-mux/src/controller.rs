@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     RepaintHandle,
     backend::MuxBackend,
-    capability::BindingOperationOutcome,
+    capability::{BindingOperation, BindingOperationOutcome},
     command::MuxCommand,
     config::{BackendFactory, build_backend_with, selected_backend},
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh, session_matches},
@@ -318,10 +319,35 @@ impl MuxScope {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MuxResourceKey {
+    Session(String),
+    Window(String, String),
+    Pane(String, String, String),
+    Terminal(String, String, String),
+}
+
+impl MuxResourceKey {
+    fn generation_in(
+        &self,
+        generations: &BTreeMap<MuxResourceKey, u64>,
+        observed: &BTreeMap<MuxResourceKey, String>,
+    ) -> Option<u64> {
+        observed
+            .contains_key(self)
+            .then(|| generations.get(self).copied())
+            .flatten()
+    }
+}
+
 pub struct BindingMuxController {
     controller: MuxController,
     last_error: Option<String>,
     refresh_completed: bool,
+    binding_generation: u64,
+    resource_generations: BTreeMap<MuxResourceKey, u64>,
+    observed_resources: BTreeMap<MuxResourceKey, String>,
+    observed_backend: Option<MultiplexerBackendConfig>,
 }
 
 impl Default for BindingMuxController {
@@ -336,6 +362,10 @@ impl BindingMuxController {
             controller: MuxController::with_scope(scope),
             last_error: None,
             refresh_completed: false,
+            binding_generation: 1,
+            resource_generations: BTreeMap::new(),
+            observed_resources: BTreeMap::new(),
+            observed_backend: None,
         }
     }
 
@@ -344,6 +374,10 @@ impl BindingMuxController {
             controller: MuxController::new(),
             last_error: None,
             refresh_completed: false,
+            binding_generation: 1,
+            resource_generations: BTreeMap::new(),
+            observed_resources: BTreeMap::new(),
+            observed_backend: None,
         }
     }
     pub fn last_error(&self) -> Option<&str> {
@@ -358,17 +392,130 @@ impl BindingMuxController {
         std::mem::take(&mut self.refresh_completed)
     }
 
+    pub fn binding_generation(&self) -> u64 {
+        self.binding_generation
+    }
+
+    pub fn operation_outcome(
+        &self,
+        config: &MultiplexerConfig,
+        operation: BindingOperation,
+    ) -> BindingOperationOutcome<()> {
+        let Some(scope) = self.controller.scope else {
+            return BindingOperationOutcome::Supported(());
+        };
+        if self
+            .controller
+            .build_backend(config)
+            .capabilities(scope)
+            .supports(operation)
+        {
+            BindingOperationOutcome::Supported(())
+        } else {
+            BindingOperationOutcome::Unsupported
+        }
+    }
+
+    pub fn session_generation(&self, session_id: &str) -> Option<u64> {
+        MuxResourceKey::Session(session_id.to_owned())
+            .generation_in(&self.resource_generations, &self.observed_resources)
+    }
+
+    pub fn window_generation(&self, session_id: &str, window_id: &str) -> Option<u64> {
+        MuxResourceKey::Window(session_id.to_owned(), window_id.to_owned())
+            .generation_in(&self.resource_generations, &self.observed_resources)
+    }
+
+    pub fn pane_generation(&self, session_id: &str, window_id: &str, pane_id: &str) -> Option<u64> {
+        MuxResourceKey::Pane(
+            session_id.to_owned(),
+            window_id.to_owned(),
+            pane_id.to_owned(),
+        )
+        .generation_in(&self.resource_generations, &self.observed_resources)
+    }
+
+    pub fn terminal_generation(
+        &self,
+        session_id: &str,
+        window_id: &str,
+        pane_id: &str,
+    ) -> Option<u64> {
+        MuxResourceKey::Terminal(
+            session_id.to_owned(),
+            window_id.to_owned(),
+            pane_id.to_owned(),
+        )
+        .generation_in(&self.resource_generations, &self.observed_resources)
+    }
+
+    fn record_resource_snapshot(&mut self) {
+        let mut current = BTreeMap::new();
+        for session in self.controller.sessions() {
+            current.insert(MuxResourceKey::Session(session.id.clone()), String::new());
+            for window in &session.windows {
+                current.insert(
+                    MuxResourceKey::Window(session.id.clone(), window.id.clone()),
+                    String::new(),
+                );
+                for pane in &window.panes {
+                    let Some(pane_id) = &pane.pane_id else {
+                        continue;
+                    };
+                    let path = (session.id.clone(), window.id.clone(), pane_id.clone());
+                    current.insert(
+                        MuxResourceKey::Pane(path.0.clone(), path.1.clone(), path.2.clone()),
+                        String::new(),
+                    );
+                    current.insert(
+                        MuxResourceKey::Terminal(path.0, path.1, path.2),
+                        format!("{:?}:{:?}", pane.pane_pid, pane.process),
+                    );
+                }
+            }
+        }
+        for (key, fingerprint) in &current {
+            let reappeared = !self.observed_resources.contains_key(key);
+            let occupant_changed = matches!(key, MuxResourceKey::Terminal(..))
+                && self
+                    .observed_resources
+                    .get(key)
+                    .is_some_and(|previous| previous != fingerprint);
+            match self.resource_generations.get_mut(key) {
+                Some(generation) if reappeared || occupant_changed => {
+                    *generation = generation.saturating_add(1);
+                }
+                Some(_) => {}
+                None => {
+                    self.resource_generations.insert(key.clone(), 1);
+                }
+            }
+        }
+        self.observed_resources = current;
+    }
+
     pub fn refresh_sessions(
         &mut self,
         repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) -> Option<String> {
+        let recovering = self.last_error.is_some();
         let error = self.controller.refresh_sessions(repaint, config);
         if let Some(error) = &error {
             self.last_error = Some(error.clone());
         } else if self.controller.take_refresh_completed() {
+            let backend = self.controller.current_backend;
+            let backend_changed = self
+                .observed_backend
+                .is_some_and(|observed| Some(observed) != backend);
+            if recovering || backend_changed {
+                self.binding_generation = self.binding_generation.saturating_add(1);
+                self.observed_resources.clear();
+            }
+            self.observed_backend = backend;
             self.last_error = None;
             self.refresh_completed = true;
+            self.record_resource_snapshot();
         }
         error
     }
@@ -377,6 +524,9 @@ impl BindingMuxController {
         let result = self.controller.poll_command();
         if let Some(result) = &result {
             self.last_error = result.as_ref().err().cloned();
+            if result.is_ok() {
+                self.record_resource_snapshot();
+            }
         }
         result
     }
@@ -1918,6 +2068,47 @@ mod tests {
                 .and_then(|anchor| anchor.pane_id.as_deref()),
             Some("%1")
         );
+    }
+
+    #[test]
+    fn scoped_resource_generations_advance_on_replacement() {
+        let pane = MuxPaneAnchor {
+            session_id: "$1".to_owned(),
+            pane_id: Some("%1".to_owned()),
+            pane_pid: Some(10),
+            cwd: None,
+            process: Some("zsh".to_owned()),
+        };
+        let mut editor = window("@1", 1);
+        editor.anchor = pane.clone();
+        editor.panes = vec![pane];
+        let mut work = session("$1", "work");
+        work.active_window_id = Some("@1".to_owned());
+        work.windows = vec![editor];
+        let mut binding = BindingMuxController::default();
+        binding.controller.sessions = vec![work.clone()];
+
+        binding.record_resource_snapshot();
+
+        assert_eq!(binding.session_generation("$1"), Some(1));
+        assert_eq!(binding.window_generation("$1", "@1"), Some(1));
+        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(1));
+        assert_eq!(binding.terminal_generation("$1", "@1", "%1"), Some(1));
+
+        binding.controller.sessions[0].windows[0].panes[0].pane_pid = Some(11);
+        binding.record_resource_snapshot();
+        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(1));
+        assert_eq!(binding.terminal_generation("$1", "@1", "%1"), Some(2));
+
+        binding.controller.sessions.clear();
+        binding.record_resource_snapshot();
+        binding.controller.sessions = vec![work];
+        binding.record_resource_snapshot();
+
+        assert_eq!(binding.session_generation("$1"), Some(2));
+        assert_eq!(binding.window_generation("$1", "@1"), Some(2));
+        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(2));
+        assert_eq!(binding.terminal_generation("$1", "@1", "%1"), Some(3));
     }
 
     #[test]

@@ -4,6 +4,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::{
+    commands::{Caller, CommandInvocation},
     config::InputConfig,
     direct_input::ModifierSideState,
     input::terminal_key,
@@ -105,10 +106,22 @@ pub enum FontSizeAction {
 }
 
 #[derive(Clone, Debug)]
+struct BoundCommand {
+    action_name: String,
+    action: KeybindAction,
+}
+
+impl BoundCommand {
+    fn invocation(&self) -> CommandInvocation {
+        CommandInvocation::from_action(&self.action_name, Caller::Keybinding)
+    }
+}
+
+#[derive(Clone, Debug)]
 struct AppKeyBinding {
     leader: Option<BindingTrigger>,
     trigger: BindingTrigger,
-    action: KeybindAction,
+    command: BoundCommand,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,13 +172,17 @@ impl AppKeyBindings {
                         pending_leader = Some(trigger);
                     }
                     BindingElement::Binding(binding) => {
+                        let action_name = binding.action.format_entry();
                         let action = keybind_action(binding.action).map_err(|error| {
                             anyhow::anyhow!("unsupported keybind {entry:?}: {error}")
                         })?;
                         bindings.push(AppKeyBinding {
                             leader: pending_leader.take(),
                             trigger: binding.trigger,
-                            action,
+                            command: BoundCommand {
+                                action_name,
+                                action,
+                            },
                         });
                     }
                     BindingElement::Chain(_) => {
@@ -189,11 +206,26 @@ impl AppKeyBindings {
         modifiers: egui::Modifiers,
         modifier_sides: ModifierSideState,
     ) -> Option<KeybindAction> {
-        self.action_for_candidates(binding_triggers_for_egui_key_with_modifier_sides(
+        self.command_for_candidates(binding_triggers_for_egui_key_with_modifier_sides(
             key,
             modifiers,
             modifier_sides,
         ))
+        .map(|command| command.action)
+    }
+
+    pub fn invocation_for_key_with_modifier_sides(
+        &mut self,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+        modifier_sides: ModifierSideState,
+    ) -> Option<CommandInvocation> {
+        self.command_for_candidates(binding_triggers_for_egui_key_with_modifier_sides(
+            key,
+            modifiers,
+            modifier_sides,
+        ))
+        .map(|command| command.invocation())
     }
     pub fn action_for_scroll_with_modifier_sides(
         &mut self,
@@ -201,18 +233,39 @@ impl AppKeyBindings {
         modifiers: egui::Modifiers,
         modifier_sides: ModifierSideState,
     ) -> Option<KeybindAction> {
-        self.action_for_candidates(binding_triggers_for_egui_scroll_with_modifier_sides(
+        self.command_for_candidates(binding_triggers_for_egui_scroll_with_modifier_sides(
             up,
             modifiers,
             modifier_sides,
         ))
+        .map(|command| command.action)
+    }
+
+    pub fn invocation_for_scroll_with_modifier_sides(
+        &mut self,
+        up: bool,
+        modifiers: egui::Modifiers,
+        modifier_sides: ModifierSideState,
+    ) -> Option<CommandInvocation> {
+        self.command_for_candidates(binding_triggers_for_egui_scroll_with_modifier_sides(
+            up,
+            modifiers,
+            modifier_sides,
+        ))
+        .map(|command| command.invocation())
     }
 
     pub fn action_for_input(&mut self, input: KeyInput) -> Option<KeybindAction> {
-        self.action_for_candidates(binding_triggers_for_key_input(input))
+        self.command_for_candidates(binding_triggers_for_key_input(input))
+            .map(|command| command.action)
     }
 
-    fn action_for_candidates(&mut self, candidates: Vec<BindingTrigger>) -> Option<KeybindAction> {
+    pub fn invocation_for_input(&mut self, input: KeyInput) -> Option<CommandInvocation> {
+        self.command_for_candidates(binding_triggers_for_key_input(input))
+            .map(|command| command.invocation())
+    }
+
+    fn command_for_candidates(&mut self, candidates: Vec<BindingTrigger>) -> Option<BoundCommand> {
         if let Some(leader) = self.active_leader.take() {
             return candidates
                 .iter()
@@ -223,9 +276,14 @@ impl AppKeyBindings {
                             binding.leader.as_ref() == Some(&leader)
                                 && binding.trigger == *candidate
                         })
-                        .map(|binding| binding.action.clone())
+                        .map(|binding| binding.command.clone())
                 })
-                .or(Some(KeybindAction::App(AppAction::Ignore)));
+                .or_else(|| {
+                    Some(BoundCommand {
+                        action_name: "ignore".to_owned(),
+                        action: KeybindAction::App(AppAction::Ignore),
+                    })
+                });
         }
 
         if let Some(leader) = candidates.iter().find_map(|candidate| {
@@ -235,14 +293,17 @@ impl AppKeyBindings {
                 .cloned()
         }) {
             self.active_leader = Some(leader);
-            return Some(KeybindAction::App(AppAction::Ignore));
+            return Some(BoundCommand {
+                action_name: "ignore".to_owned(),
+                action: KeybindAction::App(AppAction::Ignore),
+            });
         }
 
         candidates.iter().find_map(|candidate| {
             self.bindings
                 .iter()
                 .find(|binding| binding.leader.is_none() && binding.trigger == *candidate)
-                .map(|binding| binding.action.clone())
+                .map(|binding| binding.command.clone())
         })
     }
 }
@@ -308,7 +369,7 @@ pub fn split_app_actions_for_bindings_with_modifier_sides(
     app_key_bindings: &mut AppKeyBindings,
     events: Vec<egui::Event>,
     modifier_sides: ModifierSideState,
-) -> (Vec<egui::Event>, Vec<KeybindAction>) {
+) -> (Vec<egui::Event>, Vec<CommandInvocation>) {
     let mut terminal_events = Vec::with_capacity(events.len());
     let mut actions = Vec::new();
     let mut suppress_next_text = false;
@@ -326,7 +387,7 @@ pub fn split_app_actions_for_bindings_with_modifier_sides(
             suppress_next_paste = false;
         }
 
-        let action = match &event {
+        let invocation = match &event {
             egui::Event::Key {
                 key,
                 pressed: true,
@@ -334,23 +395,27 @@ pub fn split_app_actions_for_bindings_with_modifier_sides(
                 modifiers,
                 ..
             } => app_key_bindings
-                .action_for_key_with_modifier_sides(*key, *modifiers, modifier_sides)
-                .or_else(|| builtin_app_action_for_key(*key, *modifiers)),
+                .invocation_for_key_with_modifier_sides(*key, *modifiers, modifier_sides)
+                .or_else(|| {
+                    builtin_app_action_for_key(*key, *modifiers).map(|_| {
+                        CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding)
+                    })
+                }),
             egui::Event::MouseWheel {
                 delta, modifiers, ..
-            } if delta.y != 0.0 => app_key_bindings.action_for_scroll_with_modifier_sides(
+            } if delta.y != 0.0 => app_key_bindings.invocation_for_scroll_with_modifier_sides(
                 delta.y > 0.0,
                 *modifiers,
                 modifier_sides,
             ),
             _ => None,
         };
-        if let Some(action) = action {
+        if let Some(invocation) = invocation {
             if matches!(event, egui::Event::Key { .. }) {
                 suppress_next_text = true;
-                suppress_next_paste = matches!(action, KeybindAction::PasteFromClipboard);
+                suppress_next_paste = invocation.command == "paste_from_clipboard";
             }
-            actions.push(action);
+            actions.push(invocation);
         } else {
             terminal_events.push(event);
         }
@@ -739,11 +804,21 @@ mod tests {
         app_key_bindings: &mut AppKeyBindings,
         events: Vec<egui::Event>,
     ) -> (Vec<egui::Event>, Vec<KeybindAction>) {
-        split_app_actions_for_bindings_with_modifier_sides(
+        let (events, invocations) = split_app_actions_for_bindings_with_modifier_sides(
             app_key_bindings,
             events,
             ModifierSideState::default(),
-        )
+        );
+        let actions = invocations
+            .into_iter()
+            .map(|invocation| {
+                crate::commands::CommandRegistry::core()
+                    .resolve(invocation)
+                    .expect("test command")
+                    .action
+            })
+            .collect();
+        (events, actions)
     }
 
     #[test]

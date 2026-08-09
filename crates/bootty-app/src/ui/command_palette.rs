@@ -8,8 +8,11 @@ use std::collections::HashMap;
 use bootty_ui::Theme;
 use eframe::egui;
 
-use crate::action_catalog::Command;
-use crate::ui::overlay::{self, FloatingWindow, ListRow, ListView, list};
+use crate::{
+    action_catalog::Command,
+    commands::CommandRegistry,
+    ui::overlay::{self, FloatingWindow, ListRow, ListView, list},
+};
 
 #[derive(Clone, Debug)]
 pub struct CommandPaletteDialog {
@@ -26,8 +29,7 @@ pub struct CommandPaletteDialog {
 pub enum CommandPaletteEvent {
     None,
     Close,
-    /// The user activated a command; the value is its dispatch action string.
-    Run(&'static str),
+    Run(Command),
 }
 
 impl CommandPaletteDialog {
@@ -44,9 +46,7 @@ impl CommandPaletteDialog {
             filter: String::new(),
             selected: 0,
             focus_filter: true,
-            commands: Command::all()
-                .filter(|command| command.palette_action().is_some())
-                .collect(),
+            commands: CommandRegistry::core().palette_commands().collect(),
             bindings,
         }
     }
@@ -121,12 +121,11 @@ impl CommandPaletteDialog {
             });
 
         if let Some(index) = result.inner
-            && let Some(action) = matches
+            && let Some(command) = matches
                 .get(index)
                 .and_then(|matched| self.commands.get(matched.index))
-                .and_then(|command| command.palette_action())
         {
-            return CommandPaletteEvent::Run(action);
+            return CommandPaletteEvent::Run(*command);
         }
         if result.escaped || result.clicked_outside {
             return CommandPaletteEvent::Close;

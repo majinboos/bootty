@@ -38,8 +38,12 @@ use crate::{
     app_actions::{
         AppAction, AppKeyBindings, FontSizeAction, KeybindAction, MuxKeyAction, SidebarAction,
         SidebarKeyBindings, TerminalFindAction, TerminalScrollAction,
-        builtin_app_action_for_direct_key, keybind_action_for_name,
-        split_app_actions_for_bindings_with_modifier_sides,
+        builtin_app_action_for_direct_key, split_app_actions_for_bindings_with_modifier_sides,
+    },
+    commands::{
+        AppCommandReceiver, AppCommandSender, Caller, CommandInvocation, CommandOutcome,
+        CommandRegistry, CommandTarget, MutationClass, ResourceKind,
+        app_command_channel_with_repaint,
     },
     config::{
         AppearanceMode, AppearanceVariant, BoottyConfig, ConfigState, WindowConfig,
@@ -61,6 +65,7 @@ use crate::{
     modifier_remap::ModifierRemapSet,
     mux::{
         RepaintHandle,
+        capability::{BindingOperation, BindingOperationOutcome},
         command::{MuxCommand, MuxSplitDirection},
         config::selected_backend,
         controller::{
@@ -207,6 +212,37 @@ pub enum AppEffect {
     /// Open settings to the keybindings page focused on the given action name,
     /// adding an editable row for it if none exists yet.
     ConfigureKeybind(String),
+}
+
+fn command_outcome_message(outcome: &CommandOutcome) -> Option<String> {
+    match outcome {
+        CommandOutcome::Success { .. } => None,
+        CommandOutcome::Unsupported { message }
+        | CommandOutcome::Unavailable { message }
+        | CommandOutcome::Denied { message }
+        | CommandOutcome::StaleTarget { message }
+        | CommandOutcome::Failed { message, .. } => Some(message.clone()),
+        CommandOutcome::ConfirmationRequired { .. } => {
+            Some("command requires confirmation".to_owned())
+        }
+    }
+}
+
+fn command_outcome_for_binding_operation(
+    outcome: BindingOperationOutcome<()>,
+) -> Option<CommandOutcome> {
+    match outcome {
+        BindingOperationOutcome::Supported(()) => None,
+        BindingOperationOutcome::Unsupported => Some(CommandOutcome::Unsupported {
+            message: "mux operation is unsupported".to_owned(),
+        }),
+        BindingOperationOutcome::Unavailable => Some(CommandOutcome::Unavailable {
+            message: "mux operation is unavailable".to_owned(),
+        }),
+        BindingOperationOutcome::Stale => Some(CommandOutcome::StaleTarget {
+            message: "mux operation capability is stale".to_owned(),
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -951,9 +987,10 @@ pub struct AppState {
     last_terminal_search: String,
     last_terminal_search_direction: TerminalSearchDirection,
     theme_picker_restore_config: Option<BoottyConfig>,
-    /// A command-palette choice waiting to be dispatched on the next input pass,
-    /// where the viewport snapshot and effect sink are in scope.
-    pending_command: Option<KeybindAction>,
+    /// A command-palette choice waiting for the next frame's viewport and effect sink.
+    pending_command: Option<CommandInvocation>,
+    app_command_tx: AppCommandSender,
+    app_command_rx: AppCommandReceiver,
     #[cfg(debug_assertions)]
     diagnostic_action_driver: Option<DiagnosticActionDriver>,
     macos_non_native_fullscreen_active: bool,
@@ -1290,6 +1327,8 @@ impl AppState {
             macos_non_native_fullscreen_active && !macos_non_native_fullscreen_applied;
         #[cfg(debug_assertions)]
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
+        let (app_command_tx, app_command_rx) =
+            app_command_channel_with_repaint(64, repaint.clone());
 
         Ok(Self {
             window_state_key,
@@ -1352,6 +1391,8 @@ impl AppState {
             last_terminal_search_direction: TerminalSearchDirection::Next,
             theme_picker_restore_config: None,
             pending_command: None,
+            app_command_tx,
+            app_command_rx,
             ditch_session_dialog: None,
             keybind_help_dialog: None,
             #[cfg(debug_assertions)]
@@ -3862,11 +3903,12 @@ impl AppState {
             CommandPaletteEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
             }
-            CommandPaletteEvent::Run(action) => {
+            CommandPaletteEvent::Run(command) => {
                 // Close the palette now; run the command on the next input pass,
                 // where the viewport snapshot and effect sink are available.
                 self.input_focus = InputFocus::Terminal;
-                self.pending_command = keybind_action_for_name(action);
+                self.pending_command =
+                    CommandInvocation::from_catalog(command, Caller::CommandPalette);
             }
         }
     }
@@ -4332,10 +4374,12 @@ impl AppState {
         } = inputs;
         let mut effects = Vec::new();
 
+        self.drain_app_commands(now, viewport, &mut effects);
+
         // A command-palette choice from the previous frame runs as soon as viewport/effects are
         // available, before mux refresh can retarget selected-window actions back to backend-active.
-        if let Some(action) = self.pending_command.take() {
-            self.apply_keybind_action(action, viewport, &mut effects);
+        if let Some(invocation) = self.pending_command.take() {
+            self.dispatch_command(invocation, viewport, &mut effects);
         }
 
         self.sync_macos_non_native_fullscreen_presentation();
@@ -4957,7 +5001,7 @@ impl AppState {
     fn split_app_actions(
         &mut self,
         events: Vec<egui::Event>,
-    ) -> (Vec<egui::Event>, Vec<KeybindAction>) {
+    ) -> (Vec<egui::Event>, Vec<CommandInvocation>) {
         split_app_actions_for_bindings_with_modifier_sides(
             &mut self.app_key_bindings,
             events,
@@ -5323,8 +5367,8 @@ impl AppState {
             + copy_mode_count
             + copy_selection_count;
 
-        for action in actions {
-            self.apply_keybind_action(action, viewport, effects);
+        for invocation in actions {
+            self.dispatch_command(invocation, viewport, effects);
         }
 
         for command in commands {
@@ -5394,17 +5438,19 @@ impl AppState {
             if direct_copy_shortcut_pressed(input) && self.copy_terminal_selection_if_any() {
                 continue;
             }
-            if let Some(action) = self.app_key_bindings.action_for_input(input) {
-                if matches!(action, KeybindAction::PasteFromClipboard) {
+            if let Some(invocation) = self.app_key_bindings.invocation_for_input(input) {
+                if invocation.command == "paste_from_clipboard" {
                     self.suppress_next_egui_paste = true;
                 }
-                self.apply_keybind_action(action, viewport, effects);
+                self.dispatch_command(invocation, viewport, effects);
                 continue;
             }
-            if let Some(KeybindAction::App(AppAction::NewMuxSession)) =
-                builtin_app_action_for_direct_key(input)
-            {
-                self.open_new_mux_session_dialog();
+            if builtin_app_action_for_direct_key(input).is_some() {
+                self.dispatch_command(
+                    CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding),
+                    viewport,
+                    effects,
+                );
                 continue;
             }
             if copy_mode_active {
@@ -5456,6 +5502,244 @@ impl AppState {
             }
         }
         count
+    }
+
+    pub fn app_command_sender(&self) -> AppCommandSender {
+        self.app_command_tx.clone()
+    }
+
+    fn drain_app_commands(
+        &mut self,
+        now: Instant,
+        viewport: ViewportSnapshot,
+        effects: &mut Vec<AppEffect>,
+    ) {
+        for _ in 0..32 {
+            let request = match self.app_command_rx.try_recv() {
+                Ok(request) => request,
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            };
+            let outcome = if request.cancellation.is_cancelled() {
+                CommandOutcome::Failed {
+                    code: "cancelled".to_owned(),
+                    message: "command was cancelled".to_owned(),
+                }
+            } else if now >= request.deadline {
+                CommandOutcome::Failed {
+                    code: "deadline_exceeded".to_owned(),
+                    message: "command deadline expired".to_owned(),
+                }
+            } else {
+                self.dispatch_command(request.invocation, viewport, effects)
+            };
+            let _ = request.response.send(outcome);
+        }
+    }
+
+    fn dispatch_command(
+        &mut self,
+        invocation: CommandInvocation,
+        viewport: ViewportSnapshot,
+        effects: &mut Vec<AppEffect>,
+    ) -> CommandOutcome {
+        let mut resolved = match CommandRegistry::core().resolve(invocation) {
+            Ok(resolved) => resolved,
+            Err(outcome) => {
+                self.last_error = command_outcome_message(&outcome);
+                return outcome;
+            }
+        };
+        let target = match self.resolve_command_target(
+            resolved.descriptor.target,
+            resolved.invocation.target.as_ref(),
+        ) {
+            Ok(target) => target,
+            Err(outcome) => {
+                self.last_error = command_outcome_message(&outcome);
+                return outcome;
+            }
+        };
+        resolved.invocation.target = target;
+        if resolved.descriptor.mutation == MutationClass::Destructive
+            && matches!(
+                resolved.invocation.caller,
+                Caller::Cli | Caller::Socket | Caller::Luau
+            )
+            && resolved.invocation.confirmation.as_ref()
+                != Some(&resolved.invocation.confirmation())
+        {
+            return CommandOutcome::ConfirmationRequired {
+                confirmation: Box::new(resolved.invocation.confirmation()),
+            };
+        }
+        self.dispatch_resolved_command(
+            resolved.action,
+            resolved.invocation.caller,
+            viewport,
+            effects,
+        )
+    }
+
+    fn resolve_command_target(
+        &self,
+        expected: Option<ResourceKind>,
+        supplied: Option<&CommandTarget>,
+    ) -> Result<Option<CommandTarget>, CommandOutcome> {
+        let Some(expected) = expected else {
+            return if supplied.is_none() {
+                Ok(None)
+            } else {
+                Err(CommandOutcome::Denied {
+                    message: "command does not accept a target".to_owned(),
+                })
+            };
+        };
+        if supplied.is_some_and(|target| target.kind != expected) {
+            return Err(CommandOutcome::Denied {
+                message: format!("command requires a {expected:?} target"),
+            });
+        }
+        let Some(current) = self.current_command_target(expected) else {
+            return Err(CommandOutcome::Unavailable {
+                message: format!("no current {expected:?} target is available"),
+            });
+        };
+        if supplied.is_some_and(|target| target != &current) {
+            return Err(CommandOutcome::StaleTarget {
+                message: format!("the {expected:?} target is stale"),
+            });
+        }
+        Ok(Some(current))
+    }
+
+    fn current_command_target(&self, kind: ResourceKind) -> Option<CommandTarget> {
+        let process = std::process::id().to_string();
+        let window = &self.window_state_key;
+        let scope = self.binding.scope;
+        let space = scope.space_id().persistence_value().to_string();
+        let binding = scope.binding_id().persistence_value().to_string();
+        let binding_handle =
+            serde_json::to_string(&[&process, window, &space, &binding]).expect("serialize target");
+        let (session, mux_window, pane) = self.selected_mux_resource_path();
+        let target = match kind {
+            ResourceKind::Instance => CommandTarget {
+                kind,
+                handle: process,
+                generation: 1,
+            },
+            ResourceKind::ApplicationWindow => CommandTarget {
+                kind,
+                handle: serde_json::to_string(&[&process, window]).expect("serialize target"),
+                generation: 1,
+            },
+            ResourceKind::Binding => CommandTarget {
+                kind,
+                handle: binding_handle,
+                generation: self.binding.mux.binding_generation(),
+            },
+            ResourceKind::Session => {
+                let session = session?;
+                CommandTarget {
+                    kind,
+                    handle: serde_json::to_string(&[&binding_handle, &session])
+                        .expect("serialize target"),
+                    generation: self.binding.mux.session_generation(&session).unwrap_or(1),
+                }
+            }
+            ResourceKind::MuxWindow => {
+                let (session, mux_window) = (session?, mux_window?);
+                CommandTarget {
+                    kind,
+                    handle: serde_json::to_string(&[&binding_handle, &session, &mux_window])
+                        .expect("serialize target"),
+                    generation: self
+                        .binding
+                        .mux
+                        .window_generation(&session, &mux_window)
+                        .unwrap_or(1),
+                }
+            }
+            ResourceKind::Pane => {
+                let (session, mux_window, pane) = (session?, mux_window?, pane?);
+                CommandTarget {
+                    kind,
+                    handle: serde_json::to_string(&[&binding_handle, &session, &mux_window, &pane])
+                        .expect("serialize target"),
+                    generation: self
+                        .binding
+                        .mux
+                        .pane_generation(&session, &mux_window, &pane)
+                        .unwrap_or(1),
+                }
+            }
+            ResourceKind::Terminal => {
+                let (session, mux_window, pane) = (session?, mux_window?, pane?);
+                CommandTarget {
+                    kind,
+                    handle: serde_json::to_string(&[&binding_handle, &session, &mux_window, &pane])
+                        .expect("serialize target"),
+                    generation: self
+                        .binding
+                        .mux
+                        .terminal_generation(&session, &mux_window, &pane)
+                        .unwrap_or(1),
+                }
+            }
+        };
+        Some(target)
+    }
+
+    fn selected_mux_resource_path(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let Some(anchor) = self.binding.mux.selected_session_anchor() else {
+            return (None, None, None);
+        };
+        let session = anchor.session_id.clone();
+        let mux_window = self
+            .binding
+            .mux
+            .selected_window()
+            .map(str::to_owned)
+            .or_else(|| {
+                self.binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .find(|candidate| candidate.id == session)
+                    .and_then(|candidate| candidate.active_window_id.clone())
+            });
+        (Some(session), mux_window, anchor.pane_id.clone())
+    }
+
+    fn dispatch_resolved_command(
+        &mut self,
+        action: KeybindAction,
+        _caller: Caller,
+        viewport: ViewportSnapshot,
+        effects: &mut Vec<AppEffect>,
+    ) -> CommandOutcome {
+        if let KeybindAction::Mux(mux_action) = &action
+            && let Some(operation) = Self::mux_operation_for_action(*mux_action)
+            && let Some(outcome) = command_outcome_for_binding_operation(
+                self.binding
+                    .mux
+                    .operation_outcome(&self.binding.multiplexer, operation),
+            )
+        {
+            self.last_error = command_outcome_message(&outcome);
+            return outcome;
+        }
+        let previous_error = self.last_error.take();
+        self.apply_keybind_action(action, viewport, effects);
+        match self.last_error.clone() {
+            Some(message) => CommandOutcome::Failed {
+                code: "execution_failed".to_owned(),
+                message,
+            },
+            None => {
+                self.last_error = previous_error;
+                CommandOutcome::success()
+            }
+        }
     }
 
     fn apply_keybind_action(
@@ -5878,6 +6162,28 @@ impl AppState {
             layout.remove(pane_id);
         }
         let _ = self.sync_terminal_panes();
+    }
+
+    fn mux_operation_for_action(action: MuxKeyAction) -> Option<BindingOperation> {
+        match action {
+            MuxKeyAction::NewTab => Some(BindingOperation::CreateWindow),
+            MuxKeyAction::NextTab
+            | MuxKeyAction::PreviousTab
+            | MuxKeyAction::LastTab
+            | MuxKeyAction::SelectTab(_) => Some(BindingOperation::NavigateWindow),
+            MuxKeyAction::MoveTab(_) => Some(BindingOperation::MoveWindow),
+            MuxKeyAction::SplitPane(_) => Some(BindingOperation::SplitPane),
+            MuxKeyAction::SelectPane(_) | MuxKeyAction::NextPane | MuxKeyAction::PreviousPane => {
+                Some(BindingOperation::NavigatePane)
+            }
+            MuxKeyAction::KillPane | MuxKeyAction::ClosePane => Some(BindingOperation::ClosePane),
+            MuxKeyAction::TogglePaneZoom => Some(BindingOperation::TogglePaneZoom),
+            MuxKeyAction::NextSession
+            | MuxKeyAction::PreviousSession
+            | MuxKeyAction::LastSession
+            | MuxKeyAction::SelectSession(_)
+            | MuxKeyAction::MoveSession(_) => None,
+        }
     }
 
     fn apply_mux_key_action(&mut self, action: MuxKeyAction) {
@@ -10997,7 +11303,7 @@ mod tests {
 
         state.apply_command_palette_event(
             CommandPaletteDialog::open(&[]),
-            CommandPaletteEvent::Run("move_tab:-1"),
+            CommandPaletteEvent::Run(crate::action_catalog::Command::MoveTabLeft),
         );
         let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
         assert!(
@@ -11501,13 +11807,172 @@ mod tests {
         let before = state.config().chrome.sidebar;
         state.apply_command_palette_event(
             CommandPaletteDialog::open(&[]),
-            CommandPaletteEvent::Run("toggle_sidebar_visibility"),
+            CommandPaletteEvent::Run(crate::action_catalog::Command::ToggleSidebar),
         );
 
         assert_eq!(state.config().chrome.sidebar, before);
         let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
         assert_eq!(state.config().chrome.sidebar, !before);
         assert!(effects.contains(&AppEffect::RequestRepaint));
+    }
+
+    #[test]
+    fn egui_keybinding_dispatches_sidebar_command() {
+        let mut state = test_state();
+        state.app_key_bindings =
+            AppKeyBindings::from_keybinds(&["ctrl+b=toggle_sidebar_visibility".to_owned()])
+                .unwrap();
+        let before = state.config().chrome.sidebar;
+        let event = egui::Event::Key {
+            key: egui::Key::B,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        };
+
+        let effects = state.update_frame(test_frame_inputs(vec![event], None));
+
+        assert_eq!(state.config().chrome.sidebar, !before);
+        assert!(effects.contains(&AppEffect::RequestRepaint));
+    }
+
+    #[test]
+    fn direct_keybinding_dispatches_sidebar_command() {
+        let mut state = test_state();
+        state.app_key_bindings =
+            AppKeyBindings::from_keybinds(&["cmd+b=toggle_sidebar_visibility".to_owned()]).unwrap();
+        state.pending_direct_input.push(
+            crate::direct_input::direct_key_input_from_winit_code(
+                winit::keyboard::KeyCode::KeyB,
+                winit::keyboard::ModifiersState::SUPER,
+                ModifierSideState::default(),
+                false,
+            )
+            .expect("direct key input"),
+        );
+        let before = state.config().chrome.sidebar;
+
+        let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
+
+        assert_eq!(state.config().chrome.sidebar, !before);
+        assert!(effects.contains(&AppEffect::RequestRepaint));
+    }
+
+    #[test]
+    fn app_command_channel_runs_on_the_ui_thread() {
+        let mut state = test_state();
+        let before = state.config().chrome.sidebar;
+        let sender = state.app_command_sender();
+        let (response, response_rx) = mpsc::channel();
+        sender
+            .try_send(crate::commands::AppCommandRequest {
+                invocation: CommandInvocation::from_action(
+                    "toggle_sidebar_visibility",
+                    Caller::Socket,
+                ),
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: crate::commands::CommandCancellation::new(),
+                response,
+            })
+            .unwrap();
+
+        let effects = state.update_frame(test_frame_inputs(Vec::new(), None));
+
+        assert_eq!(state.config().chrome.sidebar, !before);
+        assert!(effects.contains(&AppEffect::RequestRepaint));
+        assert_eq!(response_rx.recv().unwrap(), CommandOutcome::success());
+    }
+
+    #[test]
+    fn app_command_channel_rejects_cancelled_and_expired_requests() {
+        let mut state = test_state();
+        let before = state.config().chrome.sidebar;
+        let sender = state.app_command_sender();
+        let cancellation = crate::commands::CommandCancellation::new();
+        cancellation.cancel();
+
+        for (deadline, cancellation, expected_code) in [
+            (
+                Instant::now() + Duration::from_secs(1),
+                cancellation,
+                "cancelled",
+            ),
+            (
+                Instant::now() - Duration::from_secs(1),
+                crate::commands::CommandCancellation::new(),
+                "deadline_exceeded",
+            ),
+        ] {
+            let (response, response_rx) = mpsc::channel();
+            sender
+                .try_send(crate::commands::AppCommandRequest {
+                    invocation: CommandInvocation::from_action(
+                        "toggle_sidebar_visibility",
+                        Caller::Socket,
+                    ),
+                    deadline,
+                    cancellation,
+                    response,
+                })
+                .unwrap();
+            state.update_frame(test_frame_inputs(Vec::new(), None));
+            assert!(matches!(
+                response_rx.recv().unwrap(),
+                CommandOutcome::Failed { code, .. } if code == expected_code
+            ));
+        }
+
+        assert_eq!(state.config().chrome.sidebar, before);
+    }
+
+    #[test]
+    fn destructive_command_confirmation_binds_the_current_window_generation() {
+        let mut state = test_state();
+        let viewport = ViewportSnapshot::default();
+        let mut effects = Vec::new();
+        let invocation = CommandInvocation::from_action("close_window", Caller::Socket);
+
+        let confirmation = match state.dispatch_command(invocation.clone(), viewport, &mut effects)
+        {
+            CommandOutcome::ConfirmationRequired { confirmation } => *confirmation,
+            outcome => panic!("expected confirmation, got {outcome:?}"),
+        };
+        assert_eq!(
+            confirmation.target.as_ref().map(|target| target.kind),
+            Some(ResourceKind::ApplicationWindow)
+        );
+
+        let mut confirmed = invocation;
+        confirmed.target = confirmation.target.clone();
+        confirmed.confirmation = Some(confirmation);
+        assert_eq!(
+            state.dispatch_command(confirmed, viewport, &mut effects),
+            CommandOutcome::success()
+        );
+    }
+
+    #[test]
+    fn command_rejects_a_stale_target_before_confirmation() {
+        let mut state = test_state();
+        let viewport = ViewportSnapshot::default();
+        let mut effects = Vec::new();
+        let mut invocation = CommandInvocation::from_action("close_window", Caller::Socket);
+        let mut target = state
+            .current_command_target(ResourceKind::ApplicationWindow)
+            .unwrap();
+        target.generation += 1;
+        invocation.target = Some(target);
+        invocation.confirmation = Some(invocation.confirmation());
+
+        assert!(matches!(
+            state.dispatch_command(invocation, viewport, &mut effects),
+            CommandOutcome::StaleTarget { .. }
+        ));
+        assert!(effects.is_empty());
     }
 
     #[test]
