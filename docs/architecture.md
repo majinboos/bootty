@@ -5,11 +5,12 @@ Bootty is a Rust-first, cross-platform terminal application. The app shell is
 render commands submitted as an eframe WGPU callback; egui owns chrome, layout,
 focus, input capture, and repaint scheduling.
 
-The workspace keeps one binary crate, `bootty-app` (binary name `bootty`), and
-splits reusable terminal implementation into supporting library crates. These
-crates are not compatibility wrappers: each owns a seam whose deletion would
-push state, runtime, geometry, renderer, or host-specific complexity back into
-multiple callers.
+The workspace ships the full `bootty` app and a separate `bootty-daemon`
+headless binary. Supporting library crates keep terminal and multiplexer logic
+shared without pulling egui or WGPU into the daemon interface. These crates are
+not compatibility wrappers. Each owns a seam whose deletion would push state,
+runtime, geometry, renderer, or host-specific complexity back into multiple
+callers.
 
 ## Design constraints
 
@@ -27,6 +28,13 @@ multiple callers.
 - `bootty-app` owns product composition: the default binary, full egui app,
   theme resolution, mux chrome, app-level metrics, examples, and
   compatibility-facing re-exports for tests and package examples.
+- `bootty-daemon` owns the small headless executable used as the app's local
+  rmux daemon and as the automatically installed remote Space server. It owns
+  command dispatch, remote Space catalog persistence, and remote project and
+  worktree operations. Protocol, backend behavior, and the project discovery
+  heuristics stay in `bootty-mux`.
+  Local macOS installs cross-build every supported daemon target and keep the
+  target-named binaries under `Bootty.app/Contents/Resources/daemons`.
 - `bootty-config` owns the Bootty TOML schema, XDG config path resolution,
   includes, restricted theme color resolution, reload state, and round-trip
   TOML writeback. It is host-neutral so non-egui hosts can load the same

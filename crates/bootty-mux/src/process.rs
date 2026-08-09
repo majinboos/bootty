@@ -1,17 +1,20 @@
 use anyhow::{Context, Result, bail};
-use std::process::{Command, Output};
+use std::{
+    io::{self, Read},
+    process::{Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 #[cfg(target_os = "macos")]
 use std::{env, ffi::OsStr, path::Path};
 
 #[cfg(target_os = "macos")]
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
-
-#[cfg(not(target_os = "macos"))]
-use std::process::Stdio;
+use std::{sync::atomic::AtomicU64, time::Instant};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::process::CommandExt;
@@ -42,6 +45,89 @@ impl CommandRunner for SystemCommandRunner {
     fn run_disowned(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
         disowned_command_output(program, args)
     }
+}
+#[derive(Clone, Debug, Default)]
+pub struct CommandCancellation(Arc<AtomicBool>);
+
+impl CommandCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CancellableCommandRunner {
+    cancellation: CommandCancellation,
+}
+
+impl CancellableCommandRunner {
+    pub fn new(cancellation: CommandCancellation) -> Self {
+        Self { cancellation }
+    }
+}
+
+impl CommandRunner for CancellableCommandRunner {
+    fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
+        cancellable_command_output(program, args, &self.cancellation)
+    }
+}
+
+fn cancellable_command_output(
+    program: &str,
+    args: &[String],
+    cancellation: &CommandCancellation,
+) -> Result<CommandOutput> {
+    if cancellation.0.load(Ordering::Acquire) {
+        bail!("command canceled")
+    }
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run {program}"))?;
+    let stdout = read_pipe(child.stdout.take().context("capture stdout")?);
+    let stderr = read_pipe(child.stderr.take().context("capture stderr")?);
+    let status = loop {
+        if cancellation.0.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_pipe(stdout);
+            let _ = join_pipe(stderr);
+            bail!("command canceled")
+        }
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("wait for {program}"))?
+        {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    command_output(
+        program,
+        Ok(Output {
+            status,
+            stdout: join_pipe(stdout)?,
+            stderr: join_pipe(stderr)?,
+        }),
+    )
+}
+
+fn read_pipe(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_pipe(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("command output reader stopped"))?
+        .context("read command output")
 }
 
 #[cfg(target_os = "macos")]
@@ -321,4 +407,42 @@ pub fn require_success(_program: &str, _args: &[String], output: CommandOutput) 
         bail!("command failed")
     }
     bail!("{detail}")
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn canceled_runner_does_not_start_a_command() {
+        let cancellation = CommandCancellation::default();
+        cancellation.cancel();
+        let runner = CancellableCommandRunner::new(cancellation);
+
+        assert!(
+            runner
+                .run("bootty-command-that-must-not-exist", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("canceled")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_stops_a_running_command() {
+        let cancellation = CommandCancellation::default();
+        let runner = CancellableCommandRunner::new(cancellation.clone());
+        let worker =
+            thread::spawn(move || runner.run("sh", &["-c".to_owned(), "sleep 10".to_owned()]));
+        thread::sleep(Duration::from_millis(50));
+
+        cancellation.cancel();
+        let error = worker
+            .join()
+            .expect("command worker")
+            .expect_err("canceled command");
+
+        assert!(error.to_string().contains("canceled"));
+    }
 }

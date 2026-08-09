@@ -1,5 +1,5 @@
+pub use crate::remote_space_protocol::decode_command;
 use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bootty_config::config::MultiplexerBackendConfig;
 
 use crate::{
@@ -8,15 +8,15 @@ use crate::{
     command::MuxCommand,
     controller::MuxScope,
     process::{CommandRunner, SystemCommandRunner},
+    remote_space_protocol::encode_command,
     rmux::rmux_capabilities,
     snapshot::MuxSnapshot,
-    ssh::{SshRemote, remote_bootty_failure},
+    ssh::{REMOTE_DAEMON_PROGRAM, SshRemote, remote_daemon_failure},
     tmux::tmux_capabilities,
     zellij::zellij_capabilities,
 };
 
 const REMOTE_SPACE_SUBCOMMAND: &str = "remote-space";
-const MAX_COMMAND_PAYLOAD: usize = 1024 * 1024;
 
 pub struct RemoteSpaceBackend {
     remote: SshRemote,
@@ -38,14 +38,15 @@ impl RemoteSpaceBackend {
     }
 
     fn run(&self, args: Vec<String>) -> Result<String> {
-        let (program, args) = self.remote.proxy_command("bootty", &args)?;
+        self.remote.ensure_daemon()?;
+        let (program, args) = self.remote.proxy_command(REMOTE_DAEMON_PROGRAM, &args)?;
         let output = SystemCommandRunner.run(&program, &args)?;
         if output.success {
             return Ok(output.stdout);
         }
         bail!(
             "{}",
-            remote_bootty_failure(self.remote.host(), &output.stderr)
+            remote_daemon_failure(self.remote.host(), &output.stderr)
         )
     }
 }
@@ -93,41 +94,5 @@ fn backend_name(backend: MultiplexerBackendConfig) -> &'static str {
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
         MultiplexerBackendConfig::Zellij => "zellij",
-    }
-}
-
-fn encode_command(command: &MuxCommand) -> Result<String> {
-    let bytes = serde_json::to_vec(command).context("encode remote Space command")?;
-    if bytes.len() > MAX_COMMAND_PAYLOAD {
-        bail!("remote Space command is too large")
-    }
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-pub fn decode_command(payload: &str) -> Result<MuxCommand> {
-    if payload.len() > MAX_COMMAND_PAYLOAD * 2 {
-        bail!("remote Space command is too large")
-    }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .context("decode remote Space command")?;
-    serde_json::from_slice(&bytes).context("parse remote Space command")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_payload_preserves_arguments() {
-        let command = MuxCommand::RenameSession {
-            session_id: "space ; $HOME".to_owned(),
-            name: "work & play".to_owned(),
-        };
-
-        assert_eq!(
-            decode_command(&encode_command(&command).unwrap()).unwrap(),
-            command
-        );
     }
 }

@@ -25,8 +25,20 @@ platforms = [
     "x86_64-unknown-linux-gnu",
 ]
 
+# The daemon dependency closure must stay free of the workspace-wide feature
+# unification crate so its clean cross-build remains small.
+[final-excludes]
+workspace-members = [
+    "bootty-config",
+    "bootty-daemon",
+    "bootty-mux",
+    "bootty-render",
+    "bootty-runtime",
+    "bootty-site",
+    "bootty-surface",
+    "bootty-terminal",
+    "bootty-winit",
+]
+
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
-
-[final-excludes]
-workspace-members = ["bootty-site"]

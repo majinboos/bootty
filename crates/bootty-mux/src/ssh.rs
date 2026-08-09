@@ -6,16 +6,21 @@
 //! on the other host, so a remote binding reuses every parser, layout and capability the local one
 //! does.
 
+#[cfg(feature = "remote-install")]
+use std::path::{Path, PathBuf};
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    process::Command,
+    sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, bail};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+pub use crate::remote_exec::run_remote_command;
+pub use crate::remote_exec::{REMOTE_DAEMON_PROGRAM, REMOTE_DAEMON_PROTOCOL_VERSION};
+use crate::remote_exec::{REMOTE_EXEC_PROGRAM, REMOTE_PING_SUBCOMMAND, proxy_command_line};
+#[cfg(test)]
+use crate::remote_exec::{REMOTE_EXEC_SUBCOMMAND, RemoteCommand, decode_remote_command};
+use anyhow::Result;
 use bootty_config::config::SshRemoteConfig;
-use serde::{Deserialize, Serialize};
 
 use super::{
     process::{CommandOutput, CommandRunner, SystemCommandRunner},
@@ -28,26 +33,27 @@ const CONNECT_TIMEOUT: u32 = 5;
 const SERVER_ALIVE_INTERVAL: u32 = 5;
 /// How many unanswered keepalives end the connection.
 const SERVER_ALIVE_COUNT_MAX: u32 = 3;
-const REMOTE_EXEC_PROGRAM: &str = "bootty";
-const REMOTE_EXEC_SUBCOMMAND: &str = "remote-exec";
-const REMOTE_PING_SUBCOMMAND: &str = "remote-ping";
-const MAX_REMOTE_COMMAND_PAYLOAD: usize = 1024 * 1024;
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
-struct RemoteCommand {
-    program: String,
-    args: Vec<String>,
-    terminal: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct SshRemote {
     config: SshRemoteConfig,
+    daemon_ready: Arc<Mutex<bool>>,
 }
+
+impl PartialEq for SshRemote {
+    fn eq(&self, other: &Self) -> bool {
+        self.config == other.config
+    }
+}
+
+impl Eq for SshRemote {}
 
 impl SshRemote {
     pub fn new(config: SshRemoteConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            daemon_ready: Arc::new(Mutex::new(false)),
+        }
     }
 
     pub fn host(&self) -> &str {
@@ -63,18 +69,39 @@ impl SshRemote {
         }
     }
 
-    /// argv for a direct remote-shell command. Bootty uses this only for shell-neutral bootstrap
+    pub fn ensure_daemon(&self) -> Result<()> {
+        self.ensure_daemon_with(&SystemCommandRunner)
+    }
+
+    pub fn ensure_daemon_with<R: CommandRunner>(&self, runner: &R) -> Result<()> {
+        let mut ready = self
+            .daemon_ready
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote daemon installer lock is poisoned"))?;
+        if *ready {
+            return Ok(());
+        }
+        #[cfg(feature = "remote-install")]
+        crate::remote_install::ensure(self, runner)?;
+        #[cfg(not(feature = "remote-install"))]
+        let _ = runner;
+        *ready = true;
+        Ok(())
+    }
+
+    /// argv for a direct remote-shell command. Bootty uses this only for target-specific bootstrap
     /// commands. Backend commands use [`Self::proxy_command`] so their arguments never depend on
     /// the remote login shell.
     pub fn command(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
         self.build_line(remote_command_line(program, args), &["-o", "BatchMode=yes"])
     }
 
-    /// Run one backend command through the remote Bootty executable. The SSH shell sees only
-    /// `bootty remote-exec <base64url>`, which is valid in POSIX shells, cmd.exe, and PowerShell.
+    /// Run one backend command through the remote Bootty daemon. The SSH shell sees one
+    /// versioned daemon path plus a base64url payload, which is valid in POSIX shells,
+    /// cmd.exe, and PowerShell.
     pub fn proxy_command(&self, program: &str, args: &[String]) -> Result<(String, Vec<String>)> {
         Ok(self.build_line(
-            remote_proxy_command_line_for(REMOTE_EXEC_SUBCOMMAND, program, args, false)?,
+            proxy_command_line(program, args, false)?,
             &["-o", "BatchMode=yes"],
         ))
     }
@@ -85,17 +112,44 @@ impl SshRemote {
         program: &str,
         args: &[String],
     ) -> Result<(String, Vec<String>)> {
-        Ok(self.build_line(
-            remote_proxy_command_line_for(REMOTE_EXEC_SUBCOMMAND, program, args, true)?,
-            &["-t"],
-        ))
+        Ok(self.build_line(proxy_command_line(program, args, true)?, &["-t"]))
     }
 
-    fn ping_command(&self) -> (String, Vec<String>) {
+    pub(crate) fn ping_command(&self) -> (String, Vec<String>) {
         self.build_line(
             format!("{REMOTE_EXEC_PROGRAM} {REMOTE_PING_SUBCOMMAND}"),
             &["-o", "BatchMode=yes"],
         )
+    }
+
+    #[cfg(feature = "remote-install")]
+    pub(crate) fn raw_command(&self, remote_line: &str) -> (String, Vec<String>) {
+        self.build_line(remote_line.to_owned(), &["-o", "BatchMode=yes"])
+    }
+
+    #[cfg(feature = "remote-install")]
+    pub(crate) fn scp_command(
+        &self,
+        local_path: &Path,
+        remote_path: &str,
+    ) -> (String, Vec<String>) {
+        let ssh = Path::new(&self.config.program);
+        let scp_name = if cfg!(windows) { "scp.exe" } else { "scp" };
+        let program = match ssh.file_name().and_then(|name| name.to_str()) {
+            Some("ssh" | "ssh.exe") => ssh.with_file_name(scp_name),
+            _ => PathBuf::from(scp_name),
+        };
+        let mut args = self.config.args.clone();
+        args.extend(["-o".to_owned(), "BatchMode=yes".to_owned()]);
+        if let Some(port) = self.config.port {
+            args.push("-P".to_owned());
+            args.push(port.to_string());
+        }
+        args.extend(self.keepalive_args());
+        args.push("--".to_owned());
+        args.push(local_path.to_string_lossy().into_owned());
+        args.push(format!("{}:{remote_path}", self.destination()));
+        (program.to_string_lossy().into_owned(), args)
     }
 
     fn build_line(&self, remote_line: String, mode: &[&str]) -> (String, Vec<String>) {
@@ -172,93 +226,22 @@ fn remote_command_line(program: &str, args: &[String]) -> String {
 
 #[cfg(test)]
 fn remote_proxy_command_line(program: &str, args: &[String]) -> Result<String> {
-    remote_proxy_command_line_for(REMOTE_EXEC_SUBCOMMAND, program, args, false)
-}
-
-fn remote_proxy_command_line_for(
-    subcommand: &str,
-    program: &str,
-    args: &[String],
-    terminal: bool,
-) -> Result<String> {
-    let payload = serde_json::to_vec(&RemoteCommand {
-        program: program.to_owned(),
-        args: args.to_vec(),
-        terminal,
-    })
-    .context("encode remote command")?;
-    Ok(format!(
-        "{REMOTE_EXEC_PROGRAM} {subcommand} {}",
-        URL_SAFE_NO_PAD.encode(payload)
-    ))
-}
-
-fn decode_remote_command(payload: &str) -> Result<RemoteCommand> {
-    if payload.len() > MAX_REMOTE_COMMAND_PAYLOAD {
-        bail!("remote command payload is too large")
-    }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .context("decode remote command payload")?;
-    let command: RemoteCommand =
-        serde_json::from_slice(&bytes).context("parse remote command payload")?;
-    if command.program.is_empty() {
-        bail!("remote command program cannot be empty")
-    }
-    Ok(command)
-}
-
-pub fn run_remote_command(payload: &str) -> Result<i32> {
-    let command = decode_remote_command(payload)?;
-    let mut child = Command::new(&command.program);
-    child.args(&command.args);
-    if command.terminal {
-        if let Some(terminfo) = bootty_runtime::terminfo::vendored_terminfo_dir() {
-            child.env("TERM", "xterm-bootty").env("TERMINFO", terminfo);
-        } else {
-            child.env("TERM", "xterm-256color");
-        }
-    }
-    let status = child
-        .status()
-        .with_context(|| format!("run remote command {}", command.program))?;
-    Ok(status.code().unwrap_or(1))
+    proxy_command_line(program, args, false)
 }
 
 #[cfg(test)]
 pub(crate) fn decode_proxy_command_line(line: &str) -> Result<(String, Vec<String>, bool)> {
-    let mut tokens = line.split_whitespace();
-    if tokens.next() != Some(REMOTE_EXEC_PROGRAM) || tokens.next() != Some(REMOTE_EXEC_SUBCOMMAND) {
-        bail!("not a Bootty remote proxy command")
-    }
-    let payload = tokens
-        .next()
-        .context("remote proxy command has no payload")?;
-    if tokens.next().is_some() {
-        bail!("remote proxy command has extra tokens")
-    }
-    let command = decode_remote_command(payload)?;
+    let command = crate::remote_exec::decode_proxy_command_line(line)?;
     Ok((command.program, command.args, command.terminal))
 }
 
-pub fn remote_bootty_failure(host: &str, detail: &str) -> String {
+pub fn remote_daemon_failure(host: &str, detail: &str) -> String {
     let detail = detail.trim();
-    let missing = detail.lines().any(|line| {
-        line.to_ascii_lowercase().contains("bootty")
-            && (line.contains("Unknown command")
-                || line.contains("command not found")
-                || line.contains("not found"))
-    });
-    if missing {
-        return format!(
-            "Bootty is not installed on {host}. Install and open Bootty there, then try again."
-        );
-    }
     if detail.is_empty() {
-        return format!("Could not run Bootty on {host}.");
+        return format!("Could not run the Bootty daemon on {host}.");
     }
     format!(
-        "Could not run Bootty on {host}: {}",
+        "Could not run the Bootty daemon on {host}: {}",
         detail.lines().next().unwrap_or(detail)
     )
 }
@@ -270,13 +253,7 @@ fn test_ssh_connection_with_runner<R: CommandRunner>(
     config: &SshRemoteConfig,
     runner: &R,
 ) -> Result<()> {
-    let (program, args) = SshRemote::new(config.clone()).ping_command();
-    let output = runner.run(&program, &args)?;
-    if output.success {
-        return Ok(());
-    }
-
-    bail!("{}", remote_bootty_failure(&config.host, &output.stderr))
+    SshRemote::new(config.clone()).ensure_daemon_with(runner)
 }
 
 /// Runs every command through [`SshRemote`], for the backends whose own runner has nothing to keep
@@ -299,11 +276,13 @@ impl<R> SshCommandRunner<R> {
 
 impl<R: CommandRunner> CommandRunner for SshCommandRunner<R> {
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
+        self.remote.ensure_daemon_with(&self.runner)?;
         let (program, args) = self.remote_argv(program, args)?;
         self.runner.run(&program, &args)
     }
 
     fn run_disowned(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
+        self.remote.ensure_daemon_with(&self.runner)?;
         let (program, args) = self.remote_argv(program, args)?;
         self.runner.run_disowned(&program, &args)
     }
@@ -313,7 +292,14 @@ impl<R: CommandRunner> CommandRunner for SshCommandRunner<R> {
 mod tests {
     use super::*;
     use crate::process::CommandOutput;
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     fn remote(config: SshRemoteConfig) -> SshRemote {
         SshRemote::new(config)
@@ -372,7 +358,10 @@ mod tests {
                 self.call.replace(Some((program.to_owned(), args.to_vec())));
                 Ok(CommandOutput {
                     success: true,
-                    stdout: String::new(),
+                    stdout: format!(
+                        "{REMOTE_DAEMON_PROTOCOL_VERSION}:{}",
+                        env!("CARGO_PKG_VERSION")
+                    ),
                     stderr: String::new(),
                 })
             }
@@ -383,7 +372,10 @@ mod tests {
         let (_, args) = runner.call.take().expect("SSH invocation");
         assert_eq!(args.first().map(String::as_str), Some("-o"));
         assert_eq!(args.get(1).map(String::as_str), Some("BatchMode=yes"));
-        assert_eq!(args.last().map(String::as_str), Some("bootty remote-ping"));
+        assert_eq!(
+            args.last(),
+            Some(&format!("{REMOTE_EXEC_PROGRAM} {REMOTE_PING_SUBCOMMAND}"))
+        );
     }
 
     #[test]
@@ -414,7 +406,7 @@ mod tests {
         );
         assert!(
             line.chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_'))
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '-' | '_' | '.' | '/'))
         );
     }
 
@@ -509,6 +501,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cloned_remote_serializes_daemon_installation() {
+        #[derive(Clone)]
+        struct PingRunner(Arc<AtomicUsize>);
+
+        impl CommandRunner for PingRunner {
+            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput> {
+                assert!(args.last().expect("ping").ends_with("remote-ping"));
+                self.0.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(10));
+                Ok(CommandOutput {
+                    success: true,
+                    stdout: format!(
+                        "{}:{}",
+                        REMOTE_DAEMON_PROTOCOL_VERSION,
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    stderr: String::new(),
+                })
+            }
+        }
+
+        let remote = remote(config("devbox"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handles = (0..4)
+            .map(|_| {
+                let remote = remote.clone();
+                let runner = PingRunner(calls.clone());
+                std::thread::spawn(move || remote.ensure_daemon_with(&runner))
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("installer thread").expect("install");
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[derive(Default)]
     struct RecordingRunner {
         calls: RefCell<Vec<(String, Vec<String>)>>,
@@ -521,7 +551,15 @@ mod tests {
                 .push((program.to_owned(), args.to_vec()));
             Ok(CommandOutput {
                 success: true,
-                stdout: String::new(),
+                stdout: if args.last().is_some_and(|arg| arg.ends_with("remote-ping")) {
+                    format!(
+                        "{}:{}",
+                        REMOTE_DAEMON_PROTOCOL_VERSION,
+                        env!("CARGO_PKG_VERSION")
+                    )
+                } else {
+                    String::new()
+                },
                 stderr: String::new(),
             })
         }
@@ -534,9 +572,11 @@ mod tests {
         runner.run("zellij", &args(&["list-sessions"])).unwrap();
 
         let calls = runner.runner.calls.borrow();
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].0, "ssh");
+        assert!(calls[0].1.last().expect("ping").ends_with("remote-ping"));
         assert_eq!(
-            proxied_command(&calls[0].1),
+            proxied_command(&calls[1].1),
             RemoteCommand {
                 program: "zellij".to_owned(),
                 args: args(&["list-sessions"]),

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "app")]
 use crate::capability::BindingOperation;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -105,6 +106,7 @@ pub enum MuxCommand {
     },
 }
 
+#[cfg(feature = "app")]
 impl MuxCommand {
     pub fn operation(&self) -> BindingOperation {
         match self {

@@ -19,6 +19,15 @@ pub fn session_name_for_path(path: &str) -> String {
         .to_owned()
 }
 
+pub fn session_name_for_remote_path(path: &str) -> String {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|name| !name.is_empty() && !name.ends_with(':'))
+        .unwrap_or("bootty")
+        .trim_end_matches(".git")
+        .to_owned()
+}
+
 pub fn expand_home_path(path: &str) -> PathBuf {
     if let Some(rest) = home_relative_path(path)
         && let Some(home) = home_dir()

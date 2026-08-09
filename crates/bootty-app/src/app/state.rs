@@ -3217,6 +3217,7 @@ impl AppState {
     }
 
     fn sync_generated_session_names(&mut self) {
+        let remote = self.active_multiplexer().remote.is_some();
         // Preserve membership before `observe_session` records the backend's new names below.
         self.binding.carry_renamed_members();
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
@@ -3247,7 +3248,7 @@ impl AppState {
                             .anchor
                             .cwd
                             .as_deref()
-                            .is_some_and(|cwd| Self::session_root(cwd) == pending.cwd)
+                            .is_some_and(|cwd| Self::session_cwd(cwd, remote) == pending.cwd)
                     })
             });
         let mut planned_names = self
@@ -3267,7 +3268,7 @@ impl AppState {
             let Some(raw_cwd) = session.anchor.cwd.as_deref() else {
                 continue;
             };
-            let cwd = Self::session_root(raw_cwd);
+            let cwd = Self::session_cwd(raw_cwd, remote);
             let mut record = if let Some(record) =
                 self.binding
                     .session_names
@@ -3275,7 +3276,11 @@ impl AppState {
             {
                 record
             } else {
-                let legacy_name = crate::strings::session_name_for_path(&cwd);
+                let legacy_name = if remote {
+                    crate::strings::session_name_for_remote_path(&cwd)
+                } else {
+                    crate::strings::session_name_for_path(&cwd)
+                };
                 if session.name == legacy_name {
                     self.binding.session_names.remember_generated(
                         &session.id,
@@ -3320,7 +3325,7 @@ impl AppState {
                 } else {
                     // The name bootty means for this worktree, whenever the backend name is that name
                     // or that name plus the suffix it needed to clear the server.
-                    let suggested = crate::git::suggested_session_name(&cwd);
+                    let suggested = Self::suggested_session_name(&cwd, remote);
                     if crate::strings::is_uniquified_session_name(&session.name, &suggested) {
                         suggested
                     } else {
@@ -3381,7 +3386,7 @@ impl AppState {
                 .map(String::as_str)
                 .filter(|name| *name != session.name)
                 .chain(planned_names.iter().map(String::as_str));
-            let display_name = crate::git::suggested_session_name(&cwd);
+            let display_name = Self::suggested_session_name(&cwd, remote);
             let desired = crate::strings::unique_session_name(&display_name, existing_names);
             if desired == session.name || !rename_supported {
                 continue;
@@ -3429,12 +3434,13 @@ impl AppState {
     }
 
     fn create_project_session_for_cwd(&mut self, cwd: String) {
-        let cwd = Self::session_root(&cwd);
+        let remote = self.active_multiplexer().remote.is_some();
+        let cwd = Self::session_cwd(&cwd, remote);
 
         let existing_names = self.taken_session_names(None);
         // The backend name has to clear every session on the server, including sessions bootty does
         // not own; the display name is the one bootty meant, before that uniqueness pass.
-        let display_name = crate::git::suggested_session_name(&cwd);
+        let display_name = Self::suggested_session_name(&cwd, remote);
         let session_id = crate::strings::unique_session_name(
             &display_name,
             existing_names.iter().map(String::as_str),
@@ -3462,6 +3468,22 @@ impl AppState {
         );
         self.persist_rmux_restore_state();
         self.input_focus = InputFocus::Terminal;
+    }
+
+    fn session_cwd(cwd: &str, remote: bool) -> String {
+        if remote {
+            cwd.to_owned()
+        } else {
+            Self::session_root(cwd)
+        }
+    }
+
+    fn suggested_session_name(cwd: &str, remote: bool) -> String {
+        if remote {
+            crate::strings::session_name_for_remote_path(cwd)
+        } else {
+            crate::git::suggested_session_name(cwd)
+        }
     }
 
     fn session_root(cwd: &str) -> String {
@@ -4495,7 +4517,13 @@ impl AppState {
 
     fn open_new_mux_session_dialog(&mut self) {
         self.close_overlay_dialogs();
-        self.new_mux_session_dialog = Some(NewMuxSessionDialog::open());
+        self.new_mux_session_dialog = Some(
+            self.active_multiplexer()
+                .remote
+                .clone()
+                .map(|remote| NewMuxSessionDialog::open_remote(remote, self.repaint.clone()))
+                .unwrap_or_else(NewMuxSessionDialog::open),
+        );
         self.input_focus = InputFocus::Picker;
     }
     pub fn open_create_space_dialog_from_ui(&mut self) -> bool {
@@ -7642,6 +7670,69 @@ mod tests {
         state.create_project_session_for_cwd(std::env::temp_dir().to_string_lossy().into_owned());
 
         assert_eq!(state.input_focus, InputFocus::Terminal);
+    }
+
+    #[test]
+    fn remote_session_creation_preserves_the_remote_path() {
+        let mut state = test_state();
+        state.binding.multiplexer.remote = Some(SshRemoteConfig::for_host("devbox"));
+        let cwd = r"C:\Users\developer\project";
+
+        state.create_project_session_for_cwd(cwd.to_owned());
+
+        let pending = state
+            .binding
+            .pending_generated_names
+            .values()
+            .next()
+            .expect("pending remote session");
+        assert_eq!(pending.cwd, cwd);
+        assert_eq!(pending.display_name, "project");
+    }
+
+    #[test]
+    fn remote_session_reconciliation_preserves_posix_and_windows_paths_without_client_git() {
+        let mut state = test_state();
+        state.binding.multiplexer.backend = MultiplexerBackendConfig::Tmux;
+        state.binding.multiplexer.remote = Some(SshRemoteConfig::for_host("devbox"));
+        let posix = "/srv/projects/alpha";
+        let windows = r"C:\Users\developer\beta";
+        ScriptedBackend::with(vec![
+            session_with("$1", "alpha", posix),
+            session_with("$2", "beta", windows),
+        ])
+        .install(&mut state.binding);
+        state.binding.session_order.add_session("alpha");
+        state.binding.session_order.add_session("beta");
+
+        let _guard = bootty_runtime::perf::guard_frame_path();
+        let config = state.active_multiplexer().clone();
+        state.binding.mux.refresh_on_next_frame();
+        state.binding.mux.refresh_sessions(&state.repaint, &config);
+        for _ in 0..50 {
+            if state.binding.mux.all_sessions().len() == 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            state.binding.mux.refresh_sessions(&state.repaint, &config);
+        }
+        state.sync_generated_session_names();
+        assert_eq!(state.binding.mux.all_sessions().len(), 2);
+
+        assert!(
+            state
+                .binding
+                .session_names
+                .observe_session("$1", "alpha", posix)
+                .is_some()
+        );
+        assert!(
+            state
+                .binding
+                .session_names
+                .observe_session("$2", "beta", windows)
+                .is_some()
+        );
     }
 
     #[test]

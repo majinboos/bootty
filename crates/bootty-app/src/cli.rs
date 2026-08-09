@@ -17,16 +17,16 @@ use config_overrides::ConfigOverrides;
 pub enum Command {
     /// Download and install the latest Bootty release.
     Update,
-    /// Machine-readable remote Space catalog used by another Bootty instance over SSH.
+    /// Legacy remote Space protocol retained while daemon installations roll out.
     #[command(name = "remote-space", hide = true, subcommand)]
     RemoteSpace(RemoteSpaceCommand),
-    /// Cross-platform command transport used by another Bootty instance over SSH.
+    /// Legacy remote command transport retained while daemon installations roll out.
     #[command(name = "remote-exec", hide = true)]
     RemoteExec { payload: String },
-    /// Cross-platform availability probe used by another Bootty instance over SSH.
+    /// Legacy remote availability probe retained while daemon installations roll out.
     #[command(name = "remote-ping", hide = true)]
     RemotePing,
-    /// Embedded remote terminal protocol used by another Bootty instance over SSH.
+    /// Legacy remote terminal protocol retained while daemon installations roll out.
     #[command(name = "remote-rmux", hide = true)]
     RemoteRmux { payload: String },
 }

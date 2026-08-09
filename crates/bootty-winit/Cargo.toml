@@ -18,7 +18,6 @@ bootty-terminal = { path = "../bootty-terminal" }
 pollster = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 winit.workspace = true
-bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { workspace = true, features = ["metal"], optional = true }

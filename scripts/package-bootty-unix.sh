@@ -4,8 +4,11 @@ set -euo pipefail
 APP_NAME="Bootty"
 BINARY_NAME="bootty"
 PACKAGE_NAME="bootty-app"
+DAEMON_BINARY_NAME="bootty-daemon"
+DAEMON_PACKAGE_NAME="bootty-daemon"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
 TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
+DAEMON_OUTPUT_DIR="${BOOTTY_DAEMON_OUTPUT_DIR:-$TARGET_ROOT/bootty-daemons}"
 MACOS_ICON_NAME="bootty"
 MACOS_ICON_SOURCE="crates/bootty-app/assets/$MACOS_ICON_NAME.icon"
 VERSION="${BOOTTY_VERSION:-$(awk '
@@ -18,6 +21,7 @@ PROFILE="release"
 CARGO_PROFILE_ARGS=(--release)
 FAST=0
 LINKAGE="dynamic"
+ALL_DAEMONS=0
 while (($#)); do
   case "$1" in
     --fast)
@@ -25,6 +29,9 @@ while (($#)); do
       ;;
     --static)
       LINKAGE="static"
+      ;;
+    --all-daemons)
+      ALL_DAEMONS=1
       ;;
     *)
       echo "unknown package argument: $1" >&2
@@ -146,6 +153,11 @@ rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
 cargo build "${CARGO_PROFILE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
+if [[ "$ALL_DAEMONS" -eq 1 ]]; then
+  RUSTFLAGS= ./scripts/build-bootty-daemons.sh
+else
+  RUSTFLAGS= cargo build --profile daemon-release -p "$DAEMON_PACKAGE_NAME" --bin "$DAEMON_BINARY_NAME"
+fi
 
 case "$(uname -s)" in
   Darwin)
@@ -157,6 +169,21 @@ case "$(uname -s)" in
 
     mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$MACOS_DIR/$BINARY_NAME"
+    if [[ "$ALL_DAEMONS" -eq 1 ]]; then
+      case "$ARCH" in
+        arm64) HOST_DAEMON_TARGET="aarch64-apple-darwin" ;;
+        x86_64) HOST_DAEMON_TARGET="x86_64-apple-darwin" ;;
+        *)
+          echo "unsupported macOS architecture: $ARCH" >&2
+          exit 1
+          ;;
+      esac
+      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$MACOS_DIR/$DAEMON_BINARY_NAME"
+      mkdir -p "$RESOURCES_DIR/daemons"
+      cp "$DAEMON_OUTPUT_DIR"/bootty-daemon-* "$RESOURCES_DIR/daemons/"
+    else
+      cp "$TARGET_ROOT/daemon-release/$DAEMON_BINARY_NAME" "$MACOS_DIR/$DAEMON_BINARY_NAME"
+    fi
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$MACOS_DIR/$BINARY_NAME" "$CONTENTS_DIR/Frameworks"
     fi
@@ -186,6 +213,7 @@ case "$(uname -s)" in
     fi
     rm -f "$ICON_PARTIAL_INFO" "$ACTOOL_LOG"
     chmod +x "$MACOS_DIR/$BINARY_NAME"
+    chmod +x "$MACOS_DIR/$DAEMON_BINARY_NAME"
 
     cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -226,6 +254,7 @@ PLIST
       if [[ -d "$CONTENTS_DIR/Frameworks" ]]; then
         find "$CONTENTS_DIR/Frameworks" -type f -name '*.dylib' -exec codesign --force --sign - {} \;
       fi
+      codesign --force --sign - "$MACOS_DIR/$DAEMON_BINARY_NAME"
       codesign --force --sign - \
         --requirements '=designated => identifier "dev.bootty.desktop"' \
         "$BUNDLE_DIR"
@@ -244,12 +273,14 @@ PLIST
       "$ROOT_DIR/share/icons/hicolor/scalable/apps"
 
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$ROOT_DIR/bin/$BINARY_NAME"
+    cp "$TARGET_ROOT/daemon-release/$DAEMON_BINARY_NAME" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$ROOT_DIR/bin/$BINARY_NAME" "$ROOT_DIR/lib"
     fi
     cp "crates/bootty-app/assets/bootty-mascot.png" "$ROOT_DIR/share/icons/hicolor/256x256/apps/bootty.png"
     cp "crates/bootty-app/assets/bootty-mascot.svg" "$ROOT_DIR/share/icons/hicolor/scalable/apps/bootty.svg"
     chmod +x "$ROOT_DIR/bin/$BINARY_NAME"
+    chmod +x "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
 
     cat > "$ROOT_DIR/share/applications/dev.bootty.desktop" <<DESKTOP
 [Desktop Entry]

@@ -446,7 +446,6 @@ mod tests {
     #[test]
     #[ignore = "reads the running tmux server on the default socket"]
     fn control_mode_and_process_snapshots_describe_the_same_server() {
-        use super::super::backend::MuxBackend;
         use super::super::tmux::TmuxBackend;
 
         let forked = TmuxBackend::with_runner("tmux", SystemCommandRunner)

@@ -1,13 +1,18 @@
 use anyhow::{Context, Result};
 
+#[cfg(not(feature = "app"))]
+use super::process::SystemCommandRunner;
+#[cfg(feature = "app")]
 use super::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation},
-    command::{MuxCommand, MuxDirection, MuxSplitDirection},
     controller::MuxScope,
+    tmux_control::TmuxControlRunner,
+};
+use super::{
+    command::{MuxCommand, MuxDirection, MuxSplitDirection},
     process::{CommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
-    tmux_control::TmuxControlRunner,
 };
 
 const TMUX_FIELD_SEPARATOR: char = '\x1f';
@@ -16,19 +21,32 @@ const TMUX_FIELD_SEPARATOR: char = '\x1f';
 const TMUX_SESSION_LINE_TAG: char = 's';
 const TMUX_PANE_LINE_TAG: char = 'p';
 
+#[cfg(feature = "app")]
+pub type DefaultTmuxRunner = TmuxControlRunner;
+#[cfg(not(feature = "app"))]
+pub type DefaultTmuxRunner = SystemCommandRunner;
+
 #[derive(Clone, Debug)]
-pub struct TmuxBackend<R = TmuxControlRunner> {
+pub struct TmuxBackend<R = DefaultTmuxRunner> {
     program: String,
     runner: R,
 }
 
-impl TmuxBackend<TmuxControlRunner> {
+#[cfg(feature = "app")]
+impl TmuxBackend<DefaultTmuxRunner> {
     pub fn new() -> Self {
         Self::with_runner("tmux", TmuxControlRunner::default())
     }
 }
 
-impl Default for TmuxBackend<TmuxControlRunner> {
+#[cfg(not(feature = "app"))]
+impl TmuxBackend<DefaultTmuxRunner> {
+    pub fn new() -> Self {
+        Self::with_runner("tmux", SystemCommandRunner)
+    }
+}
+
+impl Default for TmuxBackend<DefaultTmuxRunner> {
     fn default() -> Self {
         Self::new()
     }
@@ -81,8 +99,8 @@ impl<R: CommandRunner> TmuxBackend<R> {
     }
 }
 
-impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
-    fn snapshot(&self) -> Result<MuxSnapshot> {
+impl<R: CommandRunner> TmuxBackend<R> {
+    pub fn snapshot(&self) -> Result<MuxSnapshot> {
         // One tmux process for both lists: the snapshot polls several times a second, and a
         // second invocation doubled that process churn for no extra information.
         let Some(combined) = self.run_snapshot(&[
@@ -101,11 +119,7 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
         parse_tmux_snapshot(&sessions, &panes)
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        tmux_capabilities(scope)
-    }
-
-    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+    pub fn execute(&mut self, command: MuxCommand) -> Result<()> {
         match command {
             MuxCommand::ActivateWindow {
                 session_id: _,
@@ -278,6 +292,22 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
     }
 }
 
+#[cfg(feature = "app")]
+impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        TmuxBackend::snapshot(self)
+    }
+
+    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        TmuxBackend::execute(self, command)
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        tmux_capabilities(scope)
+    }
+}
+
+#[cfg(feature = "app")]
 pub(crate) fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
     BindingCapabilityDescriptor::new(
         scope,
