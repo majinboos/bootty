@@ -112,6 +112,15 @@ impl RmuxPaneTarget {
         SessionName::new(&self.session_name).context("invalid rmux session name")
     }
 
+    /// The stable session selector shared by local and remote Bootty protocols.
+    pub(crate) fn session_selector(&self) -> &str {
+        &self.session_name
+    }
+
+    pub(crate) fn pane_selector(&self) -> Option<&str> {
+        self.pane_id.as_deref()
+    }
+
     fn pane_id(&self) -> Option<PaneId> {
         self.pane_id
             .as_deref()
@@ -196,6 +205,14 @@ pub(crate) fn resize_rmux_window(window_id: &str, cols: u16, rows: u16) -> Resul
         rows,
         result_tx,
     })
+}
+
+pub(crate) fn resize_rmux_pane(target: RmuxPaneTarget, size: TerminalSizeSpec) -> Result<()> {
+    let io = open_rmux_pane_io(target, 0)?;
+    io.resize_tx
+        .send(size)
+        .map_err(|_| anyhow::anyhow!("rmux pane resize worker stopped"))?;
+    recv_bridge_result(io.result_rx, "rmux pane resize worker")
 }
 
 pub(crate) fn open_rmux_pane_io(

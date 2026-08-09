@@ -22,6 +22,20 @@
 Bootty uses the macOS account login shell by default. Use `BOOTTY_SHELL=/path/to/shell`
 only when a smoke test needs an explicit shell override.
 
+## rmux Integration Boundary
+
+Bootty owns rmux through the embedded Rust API. Use `rmux-sdk`, `rmux-client`,
+`rmux-proto`, and Bootty-owned protocol surfaces for all local and remote rmux
+work.
+
+The standalone `rmux` executable and its CLI are outside Bootty's architecture.
+Never execute, discover, install, or depend on that executable from production
+code, tests, scripts, packaging, or remote commands.
+
+Test the positive SDK or Bootty protocol behavior. Do not enforce this boundary
+with source-text scans, forbidden-word assertions, or executable-name rejection
+logic.
+
 ## Validation
 
 Default correctness gate for code changes:

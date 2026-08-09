@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 
 use super::process::{CommandOutput, CommandRunner, SystemCommandRunner};
+use super::ssh::SshRemote;
 use super::tmux_protocol::{TmuxControlNotification, TmuxControlParser};
 
 /// tmux commands that only read state, and so can be answered by a client shared with every other
@@ -36,6 +37,18 @@ const READY_TOKEN: &str = "bootty-control-ready";
 #[derive(Clone, Default)]
 pub struct TmuxControlRunner {
     clients: Arc<Mutex<HashMap<String, ClientSlot>>>,
+    /// Set when the tmux server lives on another host. The control client is then a long-lived SSH
+    /// process, which is the one place a remote snapshot poll can be as cheap as a local one.
+    remote: Option<SshRemote>,
+}
+
+impl TmuxControlRunner {
+    pub fn for_remote(remote: SshRemote) -> Self {
+        Self {
+            clients: Arc::default(),
+            remote: Some(remote),
+        }
+    }
 }
 
 impl std::fmt::Debug for TmuxControlRunner {
@@ -50,12 +63,16 @@ impl CommandRunner for TmuxControlRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
         match self.control_query(program, args) {
             Some(output) => Ok(output),
-            None => SystemCommandRunner.run(program, args),
+            None => {
+                let (program, args) = self.spawned(program, args);
+                SystemCommandRunner.run(&program, &args)
+            }
         }
     }
 
     fn run_disowned(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
-        SystemCommandRunner.run_disowned(program, args)
+        let (program, args) = self.spawned(program, args);
+        SystemCommandRunner.run_disowned(&program, &args)
     }
 }
 
@@ -71,19 +88,25 @@ struct TmuxControlClient {
 }
 
 impl TmuxControlClient {
-    fn start(program: &str) -> Result<Self> {
-        Self::start_with(program, &[])
+    fn start(program: &str, remote: Option<&SshRemote>) -> Result<Self> {
+        Self::start_with(program, &[], remote)
     }
 
     /// `prefix_args` go before `-C`, which is where tmux wants `-L`/`-S`. Only tests pass any.
-    fn start_with(program: &str, prefix_args: &[&str]) -> Result<Self> {
+    fn start_with(program: &str, prefix_args: &[&str], remote: Option<&SshRemote>) -> Result<Self> {
+        // No `-t`: the most recently used session is as good as any, since the client is only ever
+        // asked about the server as a whole. `no-output` keeps pane data out of the pipe, which
+        // bootty reads from its own PTY attachments, and `ignore-size` keeps a client with no
+        // terminal from having an opinion about window size.
+        let tmux_args = prefix_args
+            .iter()
+            .copied()
+            .chain(["-C", "attach-session", "-f", "ignore-size,no-output"])
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let (program, args) = spawn_argv(program, &tmux_args, remote);
         let mut child = Command::new(program)
-            .args(prefix_args)
-            // No `-t`: the most recently used session is as good as any, since the client is only
-            // ever asked about the server as a whole. `no-output` keeps pane data out of the pipe,
-            // which bootty reads from its own PTY attachments, and `ignore-size` keeps a client with
-            // no terminal from having an opinion about window size.
-            .args(["-C", "attach-session", "-f", "ignore-size,no-output"])
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -189,6 +212,12 @@ struct ClientSlot {
 }
 
 impl TmuxControlRunner {
+    /// argv for running `program args...` as its own process: an SSH invocation for a remote
+    /// server, and the command itself for a local one.
+    fn spawned(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
+        spawn_argv(program, args, self.remote.as_ref())
+    }
+
     /// Answer `args` from this backend's control client, or `None` to let the caller run its own
     /// process. Cloned backends share the client; dropping the last clone drops the registry and
     /// tears every attached client down.
@@ -196,12 +225,12 @@ impl TmuxControlRunner {
         let line = control_command_line(args)?;
         let blocks = expected_blocks(args);
         let mut clients = self.clients.lock().ok()?;
-        let slot = clients.entry(program.to_owned()).or_default();
+        let slot = clients.entry(self.client_key(program)).or_default();
         if slot.client.is_none() {
             if slot.retry_after.is_some_and(|at| Instant::now() < at) {
                 return None;
             }
-            match TmuxControlClient::start(program) {
+            match TmuxControlClient::start(program, self.remote.as_ref()) {
                 Ok(client) => {
                     slot.client = Some(client);
                     slot.retry_after = None;
@@ -227,6 +256,23 @@ impl TmuxControlRunner {
                 None
             }
         }
+    }
+}
+
+impl TmuxControlRunner {
+    /// A client answers for one tmux server, so the host it runs on is part of its identity.
+    fn client_key(&self, program: &str) -> String {
+        match &self.remote {
+            Some(remote) => format!("{}@{program}", remote.destination()),
+            None => program.to_owned(),
+        }
+    }
+}
+
+fn spawn_argv(program: &str, args: &[String], remote: Option<&SshRemote>) -> (String, Vec<String>) {
+    match remote {
+        Some(remote) => remote.command(program, args),
+        None => (program.to_owned(), args.to_vec()),
     }
 }
 
@@ -297,6 +343,32 @@ mod tests {
             expected_blocks(&args(&["list-sessions", ";", "list-panes"])),
             2
         );
+    }
+
+    /// Mutations skip the control client and fork their own process. For a remote binding that fork
+    /// has to be an SSH invocation: run here, a rename or a kill would land on this machine's tmux
+    /// server, whose sessions bootty is not showing.
+    #[test]
+    fn a_remote_runner_forks_its_mutations_at_the_other_host() {
+        let remote = SshRemote::new(bootty_config::config::SshRemoteConfig {
+            host: "devbox".to_owned(),
+            user: None,
+            port: None,
+            program: "ssh".to_owned(),
+            args: Vec::new(),
+        });
+        let mutation = args(&["kill-session", "-t", "build"]);
+
+        let (program, argv) = TmuxControlRunner::for_remote(remote).spawned("tmux", &mutation);
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("'tmux' 'kill-session' '-t' 'build'")
+        );
+
+        let (program, argv) = TmuxControlRunner::default().spawned("tmux", &mutation);
+        assert_eq!(program, "tmux");
+        assert_eq!(argv, mutation);
     }
 
     #[test]
@@ -426,8 +498,9 @@ mod tests {
         }
         let _guard = KillServer(socket.clone());
 
-        let mut client = TmuxControlClient::start_with("tmux", &["-L", &socket, "-f", "/dev/null"])
-            .expect("control client");
+        let mut client =
+            TmuxControlClient::start_with("tmux", &["-L", &socket, "-f", "/dev/null"], None)
+                .expect("control client");
         let query = "list-sessions -F '#{session_name}'";
 
         assert_eq!(client.query(query, 1).expect("first query"), "one");

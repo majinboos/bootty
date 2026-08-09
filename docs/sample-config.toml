@@ -122,6 +122,16 @@ backend = "native"
 # until Bootty detaches.
 hide-tmux-status = false
 
+# Reach a multiplexer on another host over SSH and render its sessions here.
+# Remote rmux uses that host's Bootty installation and embedded rmux SDK.
+# Remote tmux and zellij use their own installed backend binaries.
+# [multiplexer.remote]
+# host = "devbox"       # ~/.ssh/config alias, hostname, or address
+# user = "dev"         # when ~/.ssh/config does not name one
+# port = 2222           # when ~/.ssh/config does not name one
+# program = "ssh"       # the SSH client to run
+# args = ["-i", "~/.ssh/devbox"] # extra flags, passed before the destination
+
 [input]
 # Active keybinds must use executable Bootty actions. Unsupported actions are
 # rejected during startup/reload instead of being silently accepted.

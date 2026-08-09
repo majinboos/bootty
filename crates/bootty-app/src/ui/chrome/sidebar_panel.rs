@@ -91,6 +91,7 @@ pub struct SpaceSwitcherItem {
     pub icon: String,
     pub color: [u8; 3],
     pub active: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +99,7 @@ pub enum SpaceSwitcherEvent {
     Activate(SpaceId),
     Create,
     Edit(SpaceId),
+    Reconnect(SpaceId),
     Close(SpaceId),
 }
 
@@ -253,6 +255,10 @@ pub fn show_space_switcher(
     let mut event = None;
     for (index, space) in spaces.iter().enumerate() {
         let item_rect = space_switcher_button_rect(rect, item_center_x(index));
+        let tooltip = match &space.error {
+            Some(error) => format!("{}\n\n{error}", space.name),
+            None => space.name.clone(),
+        };
         let response = ui
             .interact(
                 item_rect,
@@ -260,7 +266,7 @@ pub fn show_space_switcher(
                     .with(("space-switcher", space.id.persistence_value())),
                 egui::Sense::click(),
             )
-            .on_hover_text(space.name.as_str());
+            .on_hover_text(tooltip);
         if response.hovered() && !space.active {
             painter.rect_filled(item_rect, 6.0, sidebar_hover_color(palette));
         }
@@ -269,12 +275,19 @@ pub fn show_space_switcher(
             &space.icon,
             item_rect.center(),
             16.0,
-            egui::Color32::from_rgb(space.color[0], space.color[1], space.color[2]),
+            space.error.as_ref().map_or_else(
+                || egui::Color32::from_rgb(space.color[0], space.color[1], space.color[2]),
+                |_| palette.muted,
+            ),
         );
         if event.is_none() && !space.active && response.clicked_by(egui::PointerButton::Primary) {
             event = Some(SpaceSwitcherEvent::Activate(space.id));
         }
         response.context_menu(|ui| {
+            if space.error.is_some() && ui.button("Reconnect").clicked() {
+                event = Some(SpaceSwitcherEvent::Reconnect(space.id));
+                ui.close();
+            }
             if ui.button("Edit Space").clicked() {
                 event = Some(SpaceSwitcherEvent::Edit(space.id));
                 ui.close();
@@ -2134,6 +2147,7 @@ mod tests {
             icon: "folder".to_owned(),
             color: [0x7A, 0xA2, 0xF7],
             active: false,
+            error: None,
         };
         (
             vec![
@@ -2143,6 +2157,7 @@ mod tests {
                     icon: "folder".to_owned(),
                     color: [0x7A, 0xA2, 0xF7],
                     active: true,
+                    error: None,
                 },
                 second.clone(),
             ],
@@ -2429,6 +2444,7 @@ mod tests {
             icon: "folder".to_owned(),
             color: [0x7A, 0xA2, 0xF7],
             active: true,
+            error: None,
         };
         let second = SpaceSwitcherItem {
             id: SpaceId::from_persistence(2),
@@ -2436,6 +2452,7 @@ mod tests {
             icon: "folder".to_owned(),
             color: [0x7A, 0xA2, 0xF7],
             active: false,
+            error: None,
         };
         let spaces = vec![first, second.clone()];
         let context = egui::Context::default();
@@ -2486,6 +2503,7 @@ mod tests {
             icon: "folder".to_owned(),
             color: [0x7A, 0xA2, 0xF7],
             active: true,
+            error: None,
         }];
         let context = egui::Context::default();
         crate::ui::icons::install_icon_fonts(&context);
@@ -2536,6 +2554,7 @@ mod tests {
                 icon: "folder".to_owned(),
                 color: [0x7A, 0xA2, 0xF7],
                 active: true,
+                error: None,
             },
             SpaceSwitcherItem {
                 id: SpaceId::from_persistence(2),
@@ -2543,6 +2562,7 @@ mod tests {
                 icon: "terminal".to_owned(),
                 color: [0x7A, 0xA2, 0xF7],
                 active: false,
+                error: None,
             },
         ];
         let context = egui::Context::default();
@@ -2628,6 +2648,7 @@ mod tests {
                 icon: "folder".to_owned(),
                 color: [0x7A, 0xA2, 0xF7],
                 active: false,
+                error: None,
             },
             SpaceSwitcherItem {
                 id: SpaceId::from_persistence(2),
@@ -2635,6 +2656,7 @@ mod tests {
                 icon: "terminal".to_owned(),
                 color: [0x7A, 0xA2, 0xF7],
                 active: true,
+                error: None,
             },
         ];
 

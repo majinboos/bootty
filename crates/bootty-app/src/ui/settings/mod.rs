@@ -7,6 +7,7 @@ mod appearance;
 mod font;
 mod keybinds;
 mod modules;
+mod remotes;
 mod session;
 mod status_bar;
 mod window;
@@ -31,6 +32,7 @@ const SEARCH_ID: &str = "bootty::settings::search";
 pub enum SettingsPage {
     #[default]
     General,
+    Remotes,
     Text,
     Appearance,
     Window,
@@ -52,7 +54,7 @@ struct PageMeta {
     terms: &'static [&'static str],
 }
 
-const PAGE_META: [PageMeta; 10] = [
+const PAGE_META: [PageMeta; 11] = [
     PageMeta {
         page: SettingsPage::General,
         group: "Core",
@@ -67,6 +69,25 @@ const PAGE_META: [PageMeta; 10] = [
             "status bar",
             "new windows",
             "terminal preview",
+        ],
+    },
+    PageMeta {
+        page: SettingsPage::Remotes,
+        group: "Core",
+        label: "Remotes",
+        icon: "server",
+        title: "Remotes",
+        terms: &[
+            "ssh",
+            "remote",
+            "profile",
+            "host",
+            "port",
+            "user",
+            "authentication",
+            "private key",
+            "proxy",
+            "test connection",
         ],
     },
     PageMeta {
@@ -253,6 +274,7 @@ pub struct SettingsSurface {
     font_families: Option<Vec<String>>,
     theme_names: Option<Vec<String>>,
     appearance_variant: crate::config::AppearanceVariant,
+    remote_editor: remotes::EditorState,
     /// Which keybind list is being edited (global, or one of the per-backend lists).
     keybind_scope: keybinds::KeybindScope,
     /// Editable rows for the loaded scope: the user layer that sits on top of the built-in defaults.
@@ -298,6 +320,7 @@ impl SettingsSurface {
             font_families: None,
             theme_names: None,
             appearance_variant: crate::config::AppearanceVariant::Dark,
+            remote_editor: remotes::EditorState::default(),
             keybind_scope: keybinds::KeybindScope::Global,
             keybind_rows: None,
             keybind_clear: false,
@@ -618,6 +641,7 @@ impl SettingsSurface {
                                     egui::Layout::top_down(egui::Align::Min),
                                     |ui| match self.page {
                                         SettingsPage::General => self.general_ui(ui),
+                                        SettingsPage::Remotes => remotes::ui(self, ui),
                                         SettingsPage::Text => font::ui(self, ui),
                                         SettingsPage::Appearance => appearance::ui(self, ui),
                                         SettingsPage::Window => window::ui(self, ui),
@@ -657,6 +681,11 @@ impl SettingsSurface {
                     backend = options[index].0;
                     self.config.multiplexer.backend = backend;
                     self.set_str(&["multiplexer", "backend"], backend_token(backend));
+                    // native and rmux keep their terminals in this process, so a remote left
+                    // behind here would be a config the next load refuses.
+                    if !backend.supports_remote() {
+                        self.clear_multiplexer_remote();
+                    }
                 }
             },
         );
@@ -688,6 +717,11 @@ impl SettingsSurface {
                 ui.label(RichText::new("Bottom bar").color(self.palette.subtext));
             },
         );
+    }
+
+    fn clear_multiplexer_remote(&mut self) {
+        self.config.multiplexer.remote = None;
+        self.remove(&["multiplexer", "remote"]);
     }
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
@@ -1620,24 +1654,9 @@ fn settings_text_edit_width(
     hint: &str,
     width: f32,
 ) -> egui::Response {
-    let fill = palette.surface;
-    egui::Frame::NONE
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(10, 7))
-        .show(ui, |ui| {
-            ui.add_sized(
-                [width, 22.0],
-                egui::TextEdit::singleline(value)
-                    .hint_text(hint)
-                    .text_color(readable_color(fill, palette.text))
-                    .vertical_align(egui::Align::Center)
-                    .background_color(fill)
-                    .frame(egui::Frame::NONE),
-            )
-        })
-        .inner
+    bootty_ui::themed_text_edit_singleline(ui, value, Theme::new(palette), |edit| {
+        edit.hint_text(hint).desired_width(width)
+    })
 }
 
 fn settings_segmented(
@@ -2219,6 +2238,7 @@ mod tests {
             pages,
             [
                 SettingsPage::General,
+                SettingsPage::Remotes,
                 SettingsPage::Text,
                 SettingsPage::Appearance,
                 SettingsPage::Window,
@@ -2231,8 +2251,8 @@ mod tests {
             ]
         );
         assert_eq!(PAGE_META[0].group, "Core");
-        assert_eq!(PAGE_META[6].group, "Terminal");
-        assert_eq!(PAGE_META[8].group, "Advanced");
+        assert_eq!(PAGE_META[7].group, "Terminal");
+        assert_eq!(PAGE_META[9].group, "Advanced");
     }
 
     #[test]

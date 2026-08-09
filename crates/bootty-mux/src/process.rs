@@ -311,15 +311,14 @@ fn command_output(program: &str, output: std::io::Result<Output>) -> Result<Comm
     })
 }
 
-pub fn require_success(program: &str, args: &[String], output: CommandOutput) -> Result<String> {
+pub fn require_success(_program: &str, _args: &[String], output: CommandOutput) -> Result<String> {
     if output.success {
         return Ok(output.stdout);
     }
 
-    bail!(
-        "{} {} failed: {}",
-        program,
-        args.join(" "),
-        output.stderr.trim()
-    );
+    let detail = output.stderr.trim();
+    if detail.is_empty() {
+        bail!("command failed")
+    }
+    bail!("{detail}")
 }

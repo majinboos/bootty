@@ -45,6 +45,10 @@ pub struct FloatingWindow {
     width: f32,
 }
 
+fn floating_window_orders() -> (egui::Order, egui::Order) {
+    (egui::Order::Foreground, egui::Order::Foreground)
+}
+
 impl FloatingWindow {
     pub fn new(
         id_source: impl std::hash::Hash + std::fmt::Debug,
@@ -111,10 +115,13 @@ impl FloatingWindow {
         let palette = theme.palette;
         let screen = ctx.input(|input| input.content_rect());
 
-        // The scrim sits in its own area below the panel (added first => lower in
-        // the same order). A click that reaches it landed outside the panel.
+        let (scrim_order, panel_order) = floating_window_orders();
+        // Keep both areas at Foreground and show the panel after the scrim. Widget popups
+        // also use Foreground, so they can then render above their parent panel.
+        // Order::Tooltip would place the panel above ComboBox popups.
+        // A click that reaches the scrim landed outside the panel.
         let clicked_outside = egui::Area::new(self.id.with("scrim"))
-            .order(egui::Order::Foreground)
+            .order(scrim_order)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let response = ui.allocate_rect(screen, egui::Sense::click());
@@ -129,7 +136,7 @@ impl FloatingWindow {
 
         let mut body = None;
         egui::Area::new(self.id)
-            .order(egui::Order::Foreground)
+            .order(panel_order)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 bootty_ui::configure_style(ui.style_mut(), theme);
@@ -341,6 +348,14 @@ fn word_boundary_match(candidate: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floating_window_panel_shares_widget_popup_order() {
+        let (scrim_order, panel_order) = floating_window_orders();
+
+        assert_eq!(scrim_order, egui::Order::Foreground);
+        assert_eq!(panel_order, egui::PopupKind::Popup.order());
+    }
 
     #[test]
     fn parse_keybind_splits_on_last_equals_and_strips_flags() {

@@ -21,6 +21,7 @@ pub mod extensions;
 pub mod native_host;
 pub mod platform;
 pub mod project_catalog;
+pub mod remote_catalog;
 pub mod renderer;
 pub mod session_names;
 pub mod session_order;

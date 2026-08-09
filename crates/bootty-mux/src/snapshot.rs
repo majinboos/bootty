@@ -1,10 +1,12 @@
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MuxSnapshot {
     pub sessions: Vec<MuxSession>,
     pub active_session_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MuxSession {
     pub id: String,
     pub name: String,
@@ -14,13 +16,13 @@ pub struct MuxSession {
     pub windows: Vec<MuxWindow>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MuxPaneSplitDirection {
     Right,
     Down,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum MuxPaneLayout {
     Pane(String),
     Split {
@@ -30,7 +32,7 @@ pub enum MuxPaneLayout {
         second: Box<MuxPaneLayout>,
     },
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MuxWindow {
     pub id: String,
     pub index: u32,
@@ -49,13 +51,13 @@ pub struct MuxWindow {
 }
 
 /// Backend-reported progress, in the ConEmu vocabulary the OSC 9;4 parser already speaks.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MuxWindowProgress {
     pub state: String,
     pub percent: Option<u8>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MuxPaneAnchor {
     pub session_id: String,
     pub pane_id: Option<String>,

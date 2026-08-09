@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     env,
     ffi::OsString,
     fs, io,
@@ -7,7 +7,7 @@ use std::{
     time::SystemTime,
 };
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use bootty_render::terminal_text::{FontFeature, TerminalTextConfig};
@@ -45,6 +45,7 @@ pub struct BoottyConfig {
     pub chrome: ChromeConfig,
     pub sidebar: SidebarConfig,
     pub multiplexer: MultiplexerConfig,
+    pub ssh_profiles: BTreeMap<String, SshProfileConfig>,
     pub input: InputConfig,
     pub session: SessionConfig,
     pub diagnostics: DiagnosticsConfig,
@@ -78,6 +79,8 @@ struct RawConfig {
     sidebar: SidebarPatch,
     #[serde(default)]
     multiplexer: MultiplexerPatch,
+    #[serde(default)]
+    ssh_profiles: BTreeMap<String, SshProfileConfig>,
     #[serde(default)]
     input: InputPatch,
     #[serde(default)]
@@ -371,6 +374,12 @@ pub struct MultiplexerConfig {
     /// Hide tmux's own status bar in bootty's client by toggling the attached
     /// session's `status` option off (and restoring it on detach). tmux-only.
     pub hide_tmux_status: bool,
+    /// Reach the multiplexer on another host over SSH instead of this one. The backend's client
+    /// runs there and bootty renders it here, so its sessions attach like local ones. Set for the
+    /// client-server backends (`tmux`, `zellij`), which is what a remote client can drive.
+    pub remote: Option<SshRemoteConfig>,
+    /// The remote-owned Space selected through a named SSH profile.
+    pub remote_space_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -378,9 +387,197 @@ pub struct MultiplexerConfig {
 struct MultiplexerPatch {
     backend: Option<MultiplexerBackendConfig>,
     hide_tmux_status: Option<bool>,
+    remote: Option<SshRemoteConfig>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+/// Where and how to run the multiplexer client for a remote binding.
+///
+/// `host` alone is enough when the host is an `~/.ssh/config` alias; `user`, `port` and `args`
+/// cover the machines where that file is absent or does not describe the host.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SshRemoteConfig {
+    /// SSH config alias, hostname or address of the host running the multiplexer.
+    pub host: String,
+    /// Login user, when it is neither the local user nor covered by `~/.ssh/config`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// SSH port, when it is neither 22 nor covered by `~/.ssh/config`.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// The SSH client to run. Both OpenSSH builds bootty targets are called `ssh`, including the
+    /// one shipped with Windows.
+    #[serde(default = "default_ssh_program")]
+    pub program: String,
+    /// Extra flags handed to the SSH client before the destination, for whatever `~/.ssh/config`
+    /// does not carry: `-i`, `-J`, `-o`.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+fn default_ssh_program() -> String {
+    "ssh".to_owned()
+}
+
+impl SshRemoteConfig {
+    /// A remote reached as `~/.ssh/config` describes it, or as the defaults do when it says nothing.
+    pub fn for_host(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            user: None,
+            port: None,
+            program: default_ssh_program(),
+            args: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshAuthenticationConfig {
+    #[default]
+    Auto,
+    Agent,
+    KeyFile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SshHostKeyPolicyConfig {
+    #[default]
+    Strict,
+    AcceptNew,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SshProfileConfig {
+    pub name: String,
+    pub host: String,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub authentication: SshAuthenticationConfig,
+    #[serde(default)]
+    pub host_key_policy: SshHostKeyPolicyConfig,
+    #[serde(default)]
+    pub identity_file: Option<PathBuf>,
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+    #[serde(default = "default_ssh_program")]
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl SshProfileConfig {
+    pub fn to_remote(&self) -> SshRemoteConfig {
+        let mut args = Vec::new();
+        if let Some(proxy_jump) = nonempty_owned(self.proxy_jump.as_deref()) {
+            args.extend(["-J".to_owned(), proxy_jump]);
+        }
+        match self.host_key_policy {
+            SshHostKeyPolicyConfig::Strict => {
+                args.extend(["-o".to_owned(), "StrictHostKeyChecking=yes".to_owned()])
+            }
+            SshHostKeyPolicyConfig::AcceptNew => args.extend([
+                "-o".to_owned(),
+                "StrictHostKeyChecking=accept-new".to_owned(),
+            ]),
+        }
+        if self.authentication == SshAuthenticationConfig::Agent {
+            args.extend([
+                "-o".to_owned(),
+                "PreferredAuthentications=publickey".to_owned(),
+                "-o".to_owned(),
+                "PasswordAuthentication=no".to_owned(),
+                "-o".to_owned(),
+                "KbdInteractiveAuthentication=no".to_owned(),
+            ]);
+        }
+        if self.authentication != SshAuthenticationConfig::Auto
+            && let Some(identity_file) = &self.identity_file
+        {
+            args.extend([
+                "-i".to_owned(),
+                identity_file.display().to_string(),
+                "-o".to_owned(),
+                "IdentitiesOnly=yes".to_owned(),
+            ]);
+        }
+        args.extend(self.args.iter().cloned());
+        SshRemoteConfig {
+            host: self.host.clone(),
+            user: self.user.clone(),
+            port: self.port,
+            program: self.program.clone(),
+            args,
+        }
+    }
+
+    fn validate(&self, id: &str) -> ConfigResult<()> {
+        if id.trim().is_empty() || self.name.trim().is_empty() || self.host.trim().is_empty() {
+            return Err(ConfigLoadError::new(
+                "SSH profiles need a stable id, display name, and host",
+            ));
+        }
+        if self.authentication != SshAuthenticationConfig::Auto && self.identity_file.is_none() {
+            let mode = match self.authentication {
+                SshAuthenticationConfig::Agent => "agent",
+                SshAuthenticationConfig::KeyFile => "key-file",
+                SshAuthenticationConfig::Auto => unreachable!(),
+            };
+            return Err(ConfigLoadError::new(format!(
+                "ssh-profiles.{id}.identity-file is required for {mode} authentication"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn nonempty_owned(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+impl MultiplexerBackendConfig {
+    /// Whether this backend's multiplexer can live on another host. `tmux` and `zellij` are driven
+    /// through a client bootty can run anywhere, and `rmux` through its own command line on the
+    /// host holding the daemon. `native` panes are this process's own PTYs and have nowhere else to
+    /// be.
+    pub fn supports_remote(self) -> bool {
+        match self {
+            Self::Tmux | Self::Zellij | Self::Rmux => true,
+            Self::Native => false,
+        }
+    }
+}
+
+impl MultiplexerConfig {
+    pub fn validate_remote(&self) -> ConfigResult<()> {
+        let Some(remote) = &self.remote else {
+            return Ok(());
+        };
+        if remote.host.trim().is_empty() {
+            return Err(ConfigLoadError::new(
+                "multiplexer.remote.host must name a host".to_owned(),
+            ));
+        }
+        if self.backend.supports_remote() {
+            return Ok(());
+        }
+        Err(ConfigLoadError::new(format!(
+            "multiplexer.remote needs a backend with a client to run there, got {:?}",
+            self.backend
+        )))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum MultiplexerBackendConfig {
     Rmux,
@@ -772,6 +969,8 @@ impl Default for MultiplexerConfig {
         Self {
             backend: MultiplexerBackendConfig::Native,
             hide_tmux_status: false,
+            remote: None,
+            remote_space_id: None,
         }
     }
 }
@@ -1228,6 +1427,7 @@ impl Default for BoottyConfig {
             chrome: ChromeConfig::default(),
             sidebar: SidebarConfig::default(),
             multiplexer: MultiplexerConfig::default(),
+            ssh_profiles: BTreeMap::new(),
             input: InputConfig::default(),
             session: SessionConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
@@ -1643,7 +1843,11 @@ impl ConfigResolver<'_> {
         apply_font_features(&mut config.font, raw.font_feature)?;
         apply_partial_chrome(&mut config.chrome, raw.chrome);
         apply_partial_sidebar(&mut config.sidebar, raw.sidebar);
-        apply_partial_multiplexer(&mut config.multiplexer, raw.multiplexer);
+        apply_partial_multiplexer(&mut config.multiplexer, raw.multiplexer)?;
+        config.ssh_profiles = raw.ssh_profiles;
+        for (id, profile) in &config.ssh_profiles {
+            profile.validate(id)?;
+        }
         apply_partial_input(&mut config.input, raw.input);
         apply_partial_session(&mut config.session, raw.session);
         apply_partial_diagnostics(&mut config.diagnostics, raw.diagnostics);
@@ -1755,9 +1959,14 @@ fn apply_partial_sidebar(sidebar: &mut SidebarConfig, partial: SidebarPatch) {
     apply_value(&mut sidebar.modules, partial.modules);
 }
 
-fn apply_partial_multiplexer(multiplexer: &mut MultiplexerConfig, partial: MultiplexerPatch) {
+fn apply_partial_multiplexer(
+    multiplexer: &mut MultiplexerConfig,
+    partial: MultiplexerPatch,
+) -> ConfigResult<()> {
     apply_value(&mut multiplexer.backend, partial.backend);
     apply_value(&mut multiplexer.hide_tmux_status, partial.hide_tmux_status);
+    apply_present(&mut multiplexer.remote, partial.remote);
+    multiplexer.validate_remote()
 }
 
 fn apply_partial_input(input: &mut InputConfig, partial: InputPatch) {

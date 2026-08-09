@@ -27,6 +27,20 @@ if (Test-Path -LiteralPath $InstallDir) {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Copy-Item -Path (Join-Path $BundleRoot "*") -Destination $InstallDir -Recurse -Force
 
+$UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$InstallPath = $InstallDir.TrimEnd("\")
+$AlreadyOnPath = @($UserPath -split ";" | Where-Object {
+    [string]::Equals($_.TrimEnd("\"), $InstallPath, [StringComparison]::OrdinalIgnoreCase)
+}).Count -gt 0
+if (-not $AlreadyOnPath) {
+    $UpdatedPath = if ([string]::IsNullOrWhiteSpace($UserPath)) {
+        $InstallDir
+    } else {
+        "$UserPath;$InstallDir"
+    }
+    [Environment]::SetEnvironmentVariable("Path", $UpdatedPath, "User")
+}
+
 $StartMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 if (Test-Path -LiteralPath $StartMenuDir) {
     $ShortcutPath = Join-Path $StartMenuDir "$AppName.lnk"
@@ -38,4 +52,4 @@ if (Test-Path -LiteralPath $StartMenuDir) {
     $Shortcut.Save()
 }
 
-Write-Output "Installed $(Join-Path $InstallDir $BinaryName)"
+Write-Output "Installed $(Join-Path $InstallDir $BinaryName) and added $InstallDir to the user PATH"
