@@ -15,4 +15,4 @@ serde-wasm-bindgen.workspace = true
 syntect.workspace = true
 tuirealm.workspace = true
 wasm-bindgen.workspace = true
-bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
