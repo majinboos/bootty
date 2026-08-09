@@ -5564,9 +5564,15 @@ impl AppState {
                     message: "command was cancelled".to_owned(),
                 }
             } else if Instant::now() >= request.deadline {
+                request.cancellation.cancel();
                 CommandOutcome::Failed {
                     code: "deadline_exceeded".to_owned(),
                     message: "command deadline expired".to_owned(),
+                }
+            } else if !request.cancellation.try_start() {
+                CommandOutcome::Failed {
+                    code: "cancelled".to_owned(),
+                    message: "command was cancelled".to_owned(),
                 }
             } else {
                 self.dispatch_command(request.invocation, viewport, effects)

@@ -5,6 +5,7 @@ mod assets;
 pub mod commands;
 pub use bootty_config::{color, config, config_reload};
 pub mod cli;
+pub mod control;
 pub mod diagnostics;
 pub use bootty_render::{
     geometry, paint_plan, renderer_frame, selection, terminal_font_face, terminal_render,

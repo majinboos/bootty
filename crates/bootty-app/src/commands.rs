@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     time::Instant,
@@ -625,19 +625,41 @@ fn target_for(id: &str) -> Option<ResourceKind> {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct CommandCancellation(Arc<AtomicBool>);
+pub struct CommandCancellation(Arc<AtomicU8>);
 
 impl CommandCancellation {
+    const PENDING: u8 = 0;
+    const CANCELLED: u8 = 1;
+    const STARTED: u8 = 2;
+
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    pub fn try_start(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PENDING,
+                Self::STARTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 
@@ -950,6 +972,16 @@ mod tests {
         cancellation.cancel();
 
         assert!(queued.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_cannot_override_started_dispatch() {
+        let cancellation = CommandCancellation::new();
+
+        assert!(cancellation.try_start());
+        cancellation.cancel();
+
+        assert!(!cancellation.is_cancelled());
     }
 
     #[test]
