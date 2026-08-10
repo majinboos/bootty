@@ -64,6 +64,26 @@ impl RenderFrame {
     pub fn cell_text(&self, cell: &RenderCell) -> &[char] {
         &self.text[cell.text_start..cell.text_start + cell.text_len]
     }
+
+    pub fn text_rows(&self) -> Vec<String> {
+        let mut rows =
+            vec![vec![String::from(" "); usize::from(self.cols)]; usize::from(self.rows)];
+        for cell in self
+            .cells
+            .iter()
+            .filter(|cell| cell.text_len > 0 && !cell.style.invisible)
+        {
+            let Some(row) = rows.get_mut(usize::from(cell.y)) else {
+                continue;
+            };
+            if let Some(slot) = row.get_mut(usize::from(cell.x)) {
+                *slot = self.cell_text(cell).iter().collect();
+            }
+        }
+        rows.into_iter()
+            .map(|row| row.concat().trim_end().to_owned())
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -155,5 +175,103 @@ impl Default for CellStyle {
             overline: false,
             underline: Underline::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_rows_preserve_cell_positions_and_trim_padding() {
+        let frame = RenderFrame {
+            cols: 5,
+            rows: 2,
+            cells: vec![
+                RenderCell {
+                    x: 1,
+                    y: 0,
+                    text_start: 0,
+                    text_len: 2,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+                RenderCell {
+                    x: 0,
+                    y: 1,
+                    text_start: 2,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+            ],
+            text: vec!['a', 'b', 'c'],
+            ..RenderFrame::default()
+        };
+
+        assert_eq!(frame.text_rows(), [" ab", "c"]);
+    }
+
+    #[test]
+    fn text_rows_preserve_combining_characters_in_one_cell() {
+        let frame = RenderFrame {
+            cols: 2,
+            rows: 1,
+            cells: vec![
+                RenderCell {
+                    x: 0,
+                    y: 0,
+                    text_start: 0,
+                    text_len: 2,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+                RenderCell {
+                    x: 1,
+                    y: 0,
+                    text_start: 2,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+            ],
+            text: vec!['e', '\u{301}', 'x'],
+            ..RenderFrame::default()
+        };
+
+        assert_eq!(frame.text_rows(), ["e\u{301}x"]);
+    }
+
+    #[test]
+    fn text_rows_hide_concealed_cells() {
+        let frame = RenderFrame {
+            cols: 2,
+            rows: 1,
+            cells: vec![RenderCell {
+                x: 0,
+                y: 0,
+                text_start: 0,
+                text_len: 1,
+                fg: None,
+                bg: None,
+                style: CellStyle {
+                    invisible: true,
+                    ..CellStyle::default()
+                },
+                hyperlink: None,
+            }],
+            text: vec!['x'],
+            ..RenderFrame::default()
+        };
+
+        assert_eq!(frame.text_rows(), [""]);
     }
 }

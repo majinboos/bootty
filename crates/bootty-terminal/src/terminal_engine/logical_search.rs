@@ -22,7 +22,7 @@ pub(super) fn frame_search_matches(frame: &RenderFrame, query: &str) -> Vec<Fram
         return Vec::new();
     }
 
-    let rows = frame_text_rows(frame);
+    let rows = frame.text_rows();
     let mut matches = Vec::new();
     let mut logical = Vec::new();
     let mut positions = Vec::new();
@@ -105,23 +105,4 @@ fn push_position_range(matches: &mut Vec<FrameSelection>, positions: &[(u16, u16
 
 fn search_char(ch: char) -> char {
     ch.to_ascii_lowercase()
-}
-
-fn frame_text_rows(frame: &RenderFrame) -> Vec<String> {
-    let mut rows = vec![vec![' '; usize::from(frame.cols)]; usize::from(frame.rows)];
-    for cell in frame.cells.iter().filter(|cell| cell.text_len > 0) {
-        let Some(row) = rows.get_mut(usize::from(cell.y)) else {
-            continue;
-        };
-        let start = cell.text_start;
-        let end = start.saturating_add(cell.text_len).min(frame.text.len());
-        for (offset, ch) in frame.text[start..end].iter().enumerate() {
-            if let Some(slot) = row.get_mut(usize::from(cell.x).saturating_add(offset)) {
-                *slot = *ch;
-            }
-        }
-    }
-    rows.into_iter()
-        .map(|row| row.into_iter().collect::<String>().trim_end().to_owned())
-        .collect()
 }

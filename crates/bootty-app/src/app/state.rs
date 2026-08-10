@@ -5828,6 +5828,27 @@ impl AppState {
         (Some(session), mux_window, pane)
     }
 
+    fn read_active_terminal(&mut self) -> CommandOutcome {
+        match self.binding.terminal.extract_frame() {
+            Ok(frame) => CommandOutcome::Success {
+                value: serde_json::json!({
+                    "cols": frame.cols,
+                    "rows": frame.rows,
+                    "text": frame.text_rows().join("\n"),
+                    "cursor": frame.cursor.map(|cursor| serde_json::json!({
+                        "x": cursor.x,
+                        "y": cursor.y,
+                    })),
+                }),
+                warnings: Vec::new(),
+            },
+            Err(error) => CommandOutcome::Failed {
+                code: "terminal_read_failed".to_owned(),
+                message: error.to_string(),
+            },
+        }
+    }
+
     fn dispatch_resolved_command(
         &mut self,
         executor: CoreCommandExecutor,
@@ -5878,6 +5899,7 @@ impl AppState {
                     }
                 }
             }
+            CoreCommandExecutor::ReadTerminal => self.read_active_terminal(),
             CoreCommandExecutor::Sidebar(action) => {
                 let previous_error = self.last_error.take();
                 let applied = self.apply_sidebar_action(action);
@@ -12537,6 +12559,30 @@ mod tests {
         assert!(state.last_error().is_some());
         assert_eq!(state.config().window.title, previous_title);
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn app_command_channel_reads_the_active_terminal() {
+        let mut state = test_state();
+        let sender = state.app_command_sender(Caller::Socket);
+        let (response, response_rx) = mpsc::channel();
+        sender
+            .try_send(crate::commands::AppCommandRequest {
+                invocation: CommandInvocation::from_action("terminal.read", Caller::Socket),
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: crate::commands::CommandCancellation::new(),
+                response,
+            })
+            .unwrap();
+
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+
+        let CommandOutcome::Success { value, .. } = response_rx.recv().unwrap() else {
+            panic!("terminal.read failed");
+        };
+        assert!(value["cols"].is_number());
+        assert!(value["rows"].is_number());
+        assert!(value["text"].is_string());
     }
 
     #[test]

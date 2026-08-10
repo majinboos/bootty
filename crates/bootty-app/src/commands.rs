@@ -239,6 +239,7 @@ impl CommandOutcome {
 pub enum CoreCommandExecutor {
     Keybind(KeybindAction),
     Sidebar(SidebarAction),
+    ReadTerminal,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -258,6 +259,8 @@ struct RegisteredCommand {
 enum CommandExecutorResolver {
     Keybind,
     Sidebar(SidebarAction),
+    ReadTerminal,
+    WriteTerminal,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -314,6 +317,10 @@ impl CommandRegistry {
                 CoreCommandExecutor::Keybind(action)
             }
             CommandExecutorResolver::Sidebar(action) => CoreCommandExecutor::Sidebar(action),
+            CommandExecutorResolver::ReadTerminal => CoreCommandExecutor::ReadTerminal,
+            CommandExecutorResolver::WriteTerminal => CoreCommandExecutor::Keybind(
+                KeybindAction::Write(invocation.arguments[0].as_bytes().to_vec()),
+            ),
         };
         Ok(ResolvedCommandInvocation {
             descriptor,
@@ -354,6 +361,42 @@ impl CommandRegistry {
                 RegisteredCommand {
                     descriptor,
                     executor: CommandExecutorResolver::Sidebar(action),
+                },
+            );
+        }
+        for (descriptor, executor) in [
+            (
+                CommandDescriptor {
+                    id: "terminal.read".to_owned(),
+                    title: "Read Terminal".to_owned(),
+                    description: "Read the active terminal screen.".to_owned(),
+                    mutation: MutationClass::Read,
+                    arguments: CompactSchema::default(),
+                    target: Some(ResourceKind::Terminal),
+                    palette: false,
+                },
+                CommandExecutorResolver::ReadTerminal,
+            ),
+            (
+                CommandDescriptor {
+                    id: "terminal.write".to_owned(),
+                    title: "Write Terminal".to_owned(),
+                    description: "Write literal text to the active terminal.".to_owned(),
+                    mutation: MutationClass::Write,
+                    arguments: CompactSchema {
+                        arguments: vec![argument("text", ValueType::String)],
+                    },
+                    target: Some(ResourceKind::Terminal),
+                    palette: false,
+                },
+                CommandExecutorResolver::WriteTerminal,
+            ),
+        ] {
+            commands.insert(
+                descriptor.id.clone(),
+                RegisteredCommand {
+                    descriptor,
+                    executor,
                 },
             );
         }
@@ -561,7 +604,7 @@ fn mutation_for(id: &str) -> MutationClass {
         "kill_pane",
         "quit",
     ];
-    const READ_ONLY: &[&str] = &["show_keybinds"];
+    const READ_ONLY: &[&str] = &["show_keybinds", "terminal.read"];
     if DESTRUCTIVE.contains(&id) {
         MutationClass::Destructive
     } else if READ_ONLY.contains(&id) {
@@ -619,7 +662,9 @@ fn target_for(id: &str) -> Option<ResourceKind> {
         | "paste_from_clipboard"
         | "csi"
         | "esc"
-        | "text" => Some(ResourceKind::Terminal),
+        | "text"
+        | "terminal.read"
+        | "terminal.write" => Some(ResourceKind::Terminal),
         _ => None,
     }
 }

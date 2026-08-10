@@ -777,7 +777,7 @@ mod tests {
         let executor = CommandRegistry::core().resolve(invocation?).ok()?.executor;
         match executor {
             CoreCommandExecutor::Keybind(action) => Some(action),
-            CoreCommandExecutor::Sidebar(_) => None,
+            CoreCommandExecutor::Sidebar(_) | CoreCommandExecutor::ReadTerminal => None,
         }
     }
 
