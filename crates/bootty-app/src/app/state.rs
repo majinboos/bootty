@@ -3,8 +3,12 @@ use std::{
     hash::Hasher,
     net::{IpAddr, UdpSocket},
     path::PathBuf,
-    sync::{Arc, mpsc},
-    time::{Duration, Instant},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -38,12 +42,12 @@ use crate::{
     app_actions::{
         AppAction, AppKeyBindings, FontSizeAction, KeybindAction, MuxKeyAction, SidebarAction,
         SidebarKeyBindings, TerminalFindAction, TerminalScrollAction,
-        builtin_app_action_for_direct_key, split_app_actions_for_bindings_with_modifier_sides,
+        builtin_app_invocation_for_direct_key, split_app_actions_for_bindings_with_modifier_sides,
     },
     commands::{
-        AppCommandReceiver, AppCommandSender, Caller, CommandInvocation, CommandOutcome,
-        CommandRegistry, CommandTarget, MutationClass, ResourceKind,
-        app_command_channel_with_repaint,
+        AppCommandReceiver, AppCommandSender, BoundAppCommandSender, Caller, CommandInvocation,
+        CommandOutcome, CommandRegistry, CommandTarget, CoreCommandExecutor, MutationClass,
+        ResourceKind, app_command_channel_with_repaint,
     },
     config::{
         AppearanceMode, AppearanceVariant, BoottyConfig, ConfigState, WindowConfig,
@@ -61,6 +65,7 @@ use crate::{
         router::{RoutedInput, route_events},
         terminal_input_commands_with_wheel_state,
     },
+    input_binding::CopyToClipboard,
     layout::{Direction, Divider, PaneLayout, SplitDirection},
     modifier_remap::ModifierRemapSet,
     mux::{
@@ -78,7 +83,7 @@ use crate::{
     platform::{
         apply_macos_non_native_fullscreen_presentation, macos_handles_non_native_fullscreen_frame,
         read_clipboard_text, restore_macos_presentation, show_desktop_notification,
-        write_clipboard_text,
+        write_clipboard_html, write_clipboard_text,
     },
     renderer::{RendererMetrics, TerminalRenderSource, TerminalWidget},
     scheduler::{RepaintScheduler, RepaintSignal},
@@ -117,6 +122,24 @@ use crate::terminal::{KeyInput, TerminalKey};
 use bootty_terminal::terminal_engine::TerminalCopyModeMotion;
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
+static NEXT_WINDOW_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn process_command_handle() -> String {
+    static HANDLE: OnceLock<String> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{}:{nanos:032x}", std::process::id())
+        })
+        .clone()
+}
+
+fn next_window_command_generation() -> u64 {
+    NEXT_WINDOW_COMMAND_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 /// Session-finder heading for sessions running in a backend that no Space has claimed.
 const UNCLAIMED_SESSIONS_LABEL: &str = "No space";
 
@@ -193,6 +216,7 @@ pub struct SpaceSummary {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AppEffect {
     CloseWindow,
+    QuitApplication,
     SetWindowTitle(String),
     SetFullscreen(bool),
     SetMaximized(bool),
@@ -550,7 +574,7 @@ impl BindingRuntime {
             persisted_sessions_restored: false,
         };
         if let Some(error) = remote_error {
-            binding.mux.set_error(Some(error));
+            binding.mux.set_availability_error(Some(error));
         }
         binding
     }
@@ -602,7 +626,7 @@ impl BindingRuntime {
         }
         self.reattach = None;
         self.remote_attach_started = None;
-        self.mux.set_error(None);
+        self.mux.set_availability_error(None);
         true
     }
 
@@ -770,7 +794,7 @@ impl SpaceRuntime {
                     repaint.clone(),
                 );
                 if workspace_binding.unavailable() {
-                    runtime.mux.set_error(Some(
+                    runtime.mux.set_availability_error(Some(
                         "binding unavailable; reconnect to restore it".to_owned(),
                     ));
                 }
@@ -918,6 +942,9 @@ fn network_signature() -> Option<IpAddr> {
 
 pub struct AppState {
     window_state_key: String,
+    command_instance_handle: String,
+    command_instance_generation: u64,
+    command_window_generation: u64,
     binding: BindingRuntime,
     inactive_bindings: Vec<BindingRuntime>,
     active_space_id: SpaceId,
@@ -1329,9 +1356,15 @@ impl AppState {
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
         let (app_command_tx, app_command_rx) =
             app_command_channel_with_repaint(64, repaint.clone());
+        let command_instance_handle = process_command_handle();
+        let command_instance_generation = 1;
+        let command_window_generation = next_window_command_generation();
 
         Ok(Self {
             window_state_key,
+            command_instance_handle,
+            command_instance_generation,
+            command_window_generation,
             binding,
             inactive_bindings,
             active_space_id,
@@ -2718,7 +2751,7 @@ impl AppState {
         }
     }
 
-    fn split_focused_pane(&mut self, direction: SplitDirection) {
+    fn split_focused_pane(&mut self, direction: SplitDirection, target_pane_id: Option<&str>) {
         let session = self
             .binding
             .mux
@@ -2732,7 +2765,7 @@ impl AppState {
                 &mux_config,
                 MuxCommand::SplitPane {
                     session_id: session,
-                    pane_id: None,
+                    pane_id: target_pane_id.map(str::to_owned),
                     direction: mux_split_direction(direction),
                 },
             );
@@ -2740,17 +2773,18 @@ impl AppState {
         }
         let backend = selected_backend(&mux_config);
         let key = self.current_window_key();
-        let focused = self
-            .binding
-            .pane_layouts
-            .get(&key)
-            .map(|layout| layout.focused().to_owned())
-            .or_else(|| {
-                self.binding
-                    .mux
-                    .selected_session_anchor()
-                    .and_then(|anchor| anchor.pane_id.clone())
-            });
+        let focused = target_pane_id.map(str::to_owned).or_else(|| {
+            self.binding
+                .pane_layouts
+                .get(&key)
+                .map(|layout| layout.focused().to_owned())
+                .or_else(|| {
+                    self.binding
+                        .mux
+                        .selected_session_anchor()
+                        .and_then(|anchor| anchor.pane_id.clone())
+                })
+        });
         self.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
@@ -3904,11 +3938,26 @@ impl AppState {
                 self.input_focus = InputFocus::Terminal;
             }
             CommandPaletteEvent::Run(command) => {
-                // Close the palette now; run the command on the next input pass,
-                // where the viewport snapshot and effect sink are available.
+                // Resolve the user's current context before another queued caller can change it.
                 self.input_focus = InputFocus::Terminal;
-                self.pending_command =
-                    CommandInvocation::from_catalog(command, Caller::CommandPalette);
+                let Some(mut invocation) =
+                    CommandInvocation::from_catalog(command, Caller::CommandPalette)
+                else {
+                    return;
+                };
+                if let Some(kind) = CommandRegistry::core()
+                    .describe(&invocation.command)
+                    .and_then(|descriptor| descriptor.target)
+                {
+                    let Some(target) = self.current_command_target_for(&invocation.command, kind)
+                    else {
+                        self.pending_command = None;
+                        self.last_error = Some(format!("no current {kind:?} target is available"));
+                        return;
+                    };
+                    invocation.target = Some(target);
+                }
+                self.pending_command = Some(invocation);
             }
         }
     }
@@ -4374,7 +4423,7 @@ impl AppState {
         } = inputs;
         let mut effects = Vec::new();
 
-        self.drain_app_commands(now, viewport, &mut effects);
+        self.drain_app_commands(viewport, &mut effects);
 
         // A command-palette choice from the previous frame runs as soon as viewport/effects are
         // available, before mux refresh can retarget selected-window actions back to backend-active.
@@ -5099,7 +5148,7 @@ impl AppState {
                 Ok(()) => {
                     effects.push(AppEffect::RequestRepaint);
                     if copy_on_select {
-                        self.copy_terminal_selection_if_any();
+                        self.copy_terminal_selection_if_any(CopyToClipboard::Mixed);
                     }
                 }
                 Err(error) => self.last_error = Some(error.to_string()),
@@ -5336,7 +5385,7 @@ impl AppState {
         } else {
             route_events(self.input_focus, events)
         };
-        let sidebar_count = self.handle_sidebar_input(routed.ui_events);
+        let sidebar_count = self.handle_sidebar_input(routed.ui_events, viewport, effects);
         let events = if terminal_input_enabled || self.terminal_find_dialog.is_some() {
             routed.terminal_events
         } else {
@@ -5435,7 +5484,9 @@ impl AppState {
                     continue;
                 }
             }
-            if direct_copy_shortcut_pressed(input) && self.copy_terminal_selection_if_any() {
+            if direct_copy_shortcut_pressed(input)
+                && self.copy_terminal_selection_if_any(CopyToClipboard::Mixed)
+            {
                 continue;
             }
             if let Some(invocation) = self.app_key_bindings.invocation_for_input(input) {
@@ -5445,12 +5496,8 @@ impl AppState {
                 self.dispatch_command(invocation, viewport, effects);
                 continue;
             }
-            if builtin_app_action_for_direct_key(input).is_some() {
-                self.dispatch_command(
-                    CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding),
-                    viewport,
-                    effects,
-                );
+            if let Some(invocation) = builtin_app_invocation_for_direct_key(input) {
+                self.dispatch_command(invocation, viewport, effects);
                 continue;
             }
             if copy_mode_active {
@@ -5464,7 +5511,12 @@ impl AppState {
         count
     }
 
-    fn handle_sidebar_input(&mut self, events: Vec<egui::Event>) -> usize {
+    fn handle_sidebar_input(
+        &mut self,
+        events: Vec<egui::Event>,
+        viewport: ViewportSnapshot,
+        effects: &mut Vec<AppEffect>,
+    ) -> usize {
         if self.input_focus != InputFocus::Sidebar {
             return 0;
         }
@@ -5482,49 +5534,36 @@ impl AppState {
             else {
                 continue;
             };
-            let Some(action) = self.sidebar_key_bindings.action_for_key(key, modifiers) else {
+            let Some(invocation) = self.sidebar_key_bindings.invocation_for_key(key, modifiers)
+            else {
                 continue;
             };
-            match action {
-                SidebarAction::Ignore => {}
-                SidebarAction::PreviousSession => {
-                    self.move_sidebar_hover(-1);
-                }
-                SidebarAction::NextSession => {
-                    self.move_sidebar_hover(1);
-                }
-                SidebarAction::ActivateSession => {
-                    self.activate_sidebar_hovered_session();
-                }
-                SidebarAction::FocusTerminal => {
-                    self.input_focus = InputFocus::Terminal;
-                }
-            }
+            self.dispatch_command(invocation, viewport, effects);
         }
         count
     }
 
-    pub fn app_command_sender(&self) -> AppCommandSender {
-        self.app_command_tx.clone()
+    /// Returns a non-blocking sender for producers outside the UI-owner call stack.
+    ///
+    /// UI code dispatches directly and must not synchronously wait on this channel's response.
+    pub fn app_command_sender(&self, caller: Caller) -> BoundAppCommandSender {
+        self.app_command_tx.for_caller(caller)
     }
 
-    fn drain_app_commands(
-        &mut self,
-        now: Instant,
-        viewport: ViewportSnapshot,
-        effects: &mut Vec<AppEffect>,
-    ) {
+    fn drain_app_commands(&mut self, viewport: ViewportSnapshot, effects: &mut Vec<AppEffect>) {
+        let mut drained = 0;
         for _ in 0..32 {
             let request = match self.app_command_rx.try_recv() {
                 Ok(request) => request,
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             };
+            drained += 1;
             let outcome = if request.cancellation.is_cancelled() {
                 CommandOutcome::Failed {
                     code: "cancelled".to_owned(),
                     message: "command was cancelled".to_owned(),
                 }
-            } else if now >= request.deadline {
+            } else if Instant::now() >= request.deadline {
                 CommandOutcome::Failed {
                     code: "deadline_exceeded".to_owned(),
                     message: "command deadline expired".to_owned(),
@@ -5533,6 +5572,9 @@ impl AppState {
                 self.dispatch_command(request.invocation, viewport, effects)
             };
             let _ = request.response.send(outcome);
+        }
+        if drained == 32 {
+            effects.push(AppEffect::RequestRepaint);
         }
     }
 
@@ -5550,6 +5592,7 @@ impl AppState {
             }
         };
         let target = match self.resolve_command_target(
+            &resolved.invocation.command,
             resolved.descriptor.target,
             resolved.invocation.target.as_ref(),
         ) {
@@ -5560,6 +5603,10 @@ impl AppState {
             }
         };
         resolved.invocation.target = target;
+        if let Some(outcome) = self.preflight_command(&resolved.executor) {
+            self.last_error = command_outcome_message(&outcome);
+            return outcome;
+        }
         if resolved.descriptor.mutation == MutationClass::Destructive
             && matches!(
                 resolved.invocation.caller,
@@ -5573,15 +5620,33 @@ impl AppState {
             };
         }
         self.dispatch_resolved_command(
-            resolved.action,
-            resolved.invocation.caller,
+            resolved.executor,
+            resolved.invocation.target.as_ref(),
             viewport,
             effects,
         )
     }
 
+    fn preflight_command(&self, executor: &CoreCommandExecutor) -> Option<CommandOutcome> {
+        let CoreCommandExecutor::Keybind(KeybindAction::Mux(action)) = executor else {
+            return None;
+        };
+        let operation = self.mux_operation_for_action(*action)?;
+        if let Some(message) = self.binding.mux.unavailable_reason() {
+            return Some(CommandOutcome::Unavailable {
+                message: message.to_owned(),
+            });
+        }
+        command_outcome_for_binding_operation(
+            self.binding
+                .mux
+                .operation_outcome(&self.binding.multiplexer, operation),
+        )
+    }
+
     fn resolve_command_target(
         &self,
+        command: &str,
         expected: Option<ResourceKind>,
         supplied: Option<&CommandTarget>,
     ) -> Result<Option<CommandTarget>, CommandOutcome> {
@@ -5599,7 +5664,7 @@ impl AppState {
                 message: format!("command requires a {expected:?} target"),
             });
         }
-        let Some(current) = self.current_command_target(expected) else {
+        let Some(current) = self.current_command_target_for(command, expected) else {
             return Err(CommandOutcome::Unavailable {
                 message: format!("no current {expected:?} target is available"),
             });
@@ -5612,30 +5677,56 @@ impl AppState {
         Ok(Some(current))
     }
 
+    fn current_command_target_for(
+        &self,
+        command: &str,
+        kind: ResourceKind,
+    ) -> Option<CommandTarget> {
+        let target = self.current_command_target(kind);
+        if target.is_some() || command != "new_tab" || kind != ResourceKind::Session {
+            return target;
+        }
+        self.current_command_target(ResourceKind::Binding)
+            .map(|binding| CommandTarget {
+                kind,
+                handle: serde_json::to_string(&("no-session", &binding.handle))
+                    .expect("serialize empty session target"),
+                generation: binding.generation,
+            })
+    }
+
     fn current_command_target(&self, kind: ResourceKind) -> Option<CommandTarget> {
-        let process = std::process::id().to_string();
+        let process = self.command_instance_handle.clone();
         let window = &self.window_state_key;
         let scope = self.binding.scope;
         let space = scope.space_id().persistence_value().to_string();
         let binding = scope.binding_id().persistence_value().to_string();
-        let binding_handle =
-            serde_json::to_string(&[&process, window, &space, &binding]).expect("serialize target");
+        let binding_generation = self.binding.mux.binding_generation();
+        let binding_handle = serde_json::to_string(&(
+            &process,
+            window,
+            self.command_window_generation,
+            &space,
+            &binding,
+            binding_generation,
+        ))
+        .expect("serialize target");
         let (session, mux_window, pane) = self.selected_mux_resource_path();
         let target = match kind {
             ResourceKind::Instance => CommandTarget {
                 kind,
                 handle: process,
-                generation: 1,
+                generation: self.command_instance_generation,
             },
             ResourceKind::ApplicationWindow => CommandTarget {
                 kind,
                 handle: serde_json::to_string(&[&process, window]).expect("serialize target"),
-                generation: 1,
+                generation: self.command_window_generation,
             },
             ResourceKind::Binding => CommandTarget {
                 kind,
                 handle: binding_handle,
-                generation: self.binding.mux.binding_generation(),
+                generation: binding_generation,
             },
             ResourceKind::Session => {
                 let session = session?;
@@ -5643,7 +5734,7 @@ impl AppState {
                     kind,
                     handle: serde_json::to_string(&[&binding_handle, &session])
                         .expect("serialize target"),
-                    generation: self.binding.mux.session_generation(&session).unwrap_or(1),
+                    generation: self.binding.mux.session_generation(&session)?,
                 }
             }
             ResourceKind::MuxWindow => {
@@ -5652,11 +5743,7 @@ impl AppState {
                     kind,
                     handle: serde_json::to_string(&[&binding_handle, &session, &mux_window])
                         .expect("serialize target"),
-                    generation: self
-                        .binding
-                        .mux
-                        .window_generation(&session, &mux_window)
-                        .unwrap_or(1),
+                    generation: self.binding.mux.window_generation(&session, &mux_window)?,
                 }
             }
             ResourceKind::Pane => {
@@ -5668,21 +5755,33 @@ impl AppState {
                     generation: self
                         .binding
                         .mux
-                        .pane_generation(&session, &mux_window, &pane)
-                        .unwrap_or(1),
+                        .pane_generation(&session, &mux_window, &pane)?,
                 }
             }
             ResourceKind::Terminal => {
-                let (session, mux_window, pane) = (session?, mux_window?, pane?);
+                let (handle, generation) = match (session, mux_window, pane) {
+                    (Some(session), Some(mux_window), Some(pane)) => (
+                        serde_json::to_string(&(&binding_handle, &session, &mux_window, &pane))
+                            .expect("serialize target"),
+                        self.binding
+                            .mux
+                            .terminal_generation(&session, &mux_window, &pane)?,
+                    ),
+                    (Some(session), _, _) => (
+                        serde_json::to_string(&(&binding_handle, &session))
+                            .expect("serialize target"),
+                        self.binding.mux.session_generation(&session)?,
+                    ),
+                    (None, _, _) => (
+                        serde_json::to_string(&(&binding_handle, "active_terminal"))
+                            .expect("serialize target"),
+                        binding_generation,
+                    ),
+                };
                 CommandTarget {
                     kind,
-                    handle: serde_json::to_string(&[&binding_handle, &session, &mux_window, &pane])
-                        .expect("serialize target"),
-                    generation: self
-                        .binding
-                        .mux
-                        .terminal_generation(&session, &mux_window, &pane)
-                        .unwrap_or(1),
+                    handle,
+                    generation,
                 }
             }
         };
@@ -5707,39 +5806,130 @@ impl AppState {
                     .find(|candidate| candidate.id == session)
                     .and_then(|candidate| candidate.active_window_id.clone())
             });
-        (Some(session), mux_window, anchor.pane_id.clone())
+        let pane = if self.uses_native_terminal_layout() {
+            self.binding.terminal.focused_pane_id().map(|pane_id| {
+                decode_scoped_pane_id(pane_id).map_or_else(
+                    || pane_id.to_owned(),
+                    |(scope, pane_id)| {
+                        debug_assert_eq!(scope, self.binding.scope);
+                        pane_id
+                    },
+                )
+            })
+        } else {
+            anchor.pane_id.clone()
+        };
+        (Some(session), mux_window, pane)
     }
 
     fn dispatch_resolved_command(
         &mut self,
-        action: KeybindAction,
-        _caller: Caller,
+        executor: CoreCommandExecutor,
+        target: Option<&CommandTarget>,
         viewport: ViewportSnapshot,
         effects: &mut Vec<AppEffect>,
     ) -> CommandOutcome {
-        if let KeybindAction::Mux(mux_action) = &action
-            && let Some(operation) = Self::mux_operation_for_action(*mux_action)
-            && let Some(outcome) = command_outcome_for_binding_operation(
-                self.binding
-                    .mux
-                    .operation_outcome(&self.binding.multiplexer, operation),
-            )
-        {
-            self.last_error = command_outcome_message(&outcome);
-            return outcome;
-        }
-        let previous_error = self.last_error.take();
-        self.apply_keybind_action(action, viewport, effects);
-        match self.last_error.clone() {
-            Some(message) => CommandOutcome::Failed {
-                code: "execution_failed".to_owned(),
-                message,
-            },
-            None => {
-                self.last_error = previous_error;
-                CommandOutcome::success()
+        match executor {
+            CoreCommandExecutor::Keybind(action) => {
+                if action == KeybindAction::App(AppAction::ReloadConfig) {
+                    let reloaded = self.reload_config(effects);
+                    if reloaded {
+                        let path = self.config().config_path.clone();
+                        self.config_hot_reload.refresh_after_reload(&path);
+                        return self.last_error.clone().map_or_else(
+                            CommandOutcome::success,
+                            |warning| {
+                                CommandOutcome::success_with_warning(
+                                    "configuration_warning",
+                                    warning,
+                                )
+                            },
+                        );
+                    }
+                    return CommandOutcome::Failed {
+                        code: "execution_failed".to_owned(),
+                        message: self
+                            .last_error
+                            .clone()
+                            .unwrap_or_else(|| "configuration reload failed".to_owned()),
+                    };
+                }
+                let previous_error = self.last_error.take();
+                let needs_repaint = matches!(action, KeybindAction::Scroll(_));
+                self.apply_resolved_keybind_action(action, target, viewport, effects);
+                self.binding.mux.synchronize_resource_generations();
+                if needs_repaint {
+                    effects.push(AppEffect::RequestRepaint);
+                }
+                match self.last_error.clone() {
+                    Some(message) => CommandOutcome::Failed {
+                        code: "execution_failed".to_owned(),
+                        message,
+                    },
+                    None => {
+                        self.last_error = previous_error;
+                        CommandOutcome::success()
+                    }
+                }
+            }
+            CoreCommandExecutor::Sidebar(action) => {
+                let previous_error = self.last_error.take();
+                let applied = self.apply_sidebar_action(action);
+                if !applied {
+                    self.last_error = previous_error;
+                    return CommandOutcome::Unavailable {
+                        message: "no session is available to activate".to_owned(),
+                    };
+                }
+                match self.last_error.clone() {
+                    Some(message) => CommandOutcome::Failed {
+                        code: "execution_failed".to_owned(),
+                        message,
+                    },
+                    None => {
+                        self.last_error = previous_error;
+                        CommandOutcome::success()
+                    }
+                }
             }
         }
+    }
+    fn apply_resolved_keybind_action(
+        &mut self,
+        action: KeybindAction,
+        target: Option<&CommandTarget>,
+        viewport: ViewportSnapshot,
+        effects: &mut Vec<AppEffect>,
+    ) {
+        if let KeybindAction::Mux(action) = action {
+            let target_id = |target: &CommandTarget| {
+                serde_json::from_str::<Vec<String>>(&target.handle)
+                    .expect("validated mux target")
+                    .pop()
+                    .expect("mux target identity")
+            };
+            let window_id = target
+                .filter(|target| target.kind == ResourceKind::MuxWindow)
+                .map(target_id);
+            let pane_id = target
+                .filter(|target| target.kind == ResourceKind::Pane)
+                .map(target_id);
+            self.apply_mux_key_action_to_target(action, window_id, pane_id);
+            effects.push(AppEffect::RequestRepaint);
+        } else {
+            self.apply_keybind_action(action, viewport, effects);
+        }
+    }
+
+    fn apply_sidebar_action(&mut self, action: SidebarAction) -> bool {
+        match action {
+            SidebarAction::Ignore => {}
+            SidebarAction::PreviousSession => self.move_sidebar_hover(-1),
+            SidebarAction::NextSession => self.move_sidebar_hover(1),
+            SidebarAction::ActivateSession => return self.activate_sidebar_hovered_session(),
+            SidebarAction::FocusTerminal => self.input_focus = InputFocus::Terminal,
+        }
+        true
     }
 
     fn apply_keybind_action(
@@ -5791,27 +5981,38 @@ impl AppState {
                 self.open_edit_space_dialog_from_ui(self.active_space_id);
                 effects.push(AppEffect::RequestRepaint);
             }
+            KeybindAction::App(AppAction::Quit) => {
+                effects.push(AppEffect::QuitApplication);
+            }
             KeybindAction::App(AppAction::CreateSpace) => {
                 self.open_create_space_dialog_from_ui();
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::CloseSpace) => {
-                self.close_space_from_ui(self.active_space_id);
+                if !self.close_space_from_ui(self.active_space_id) {
+                    self.last_error = Some("the last space cannot be closed".to_owned());
+                }
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::NextSpace) => {
                 if self.activate_relative_space(1) {
                     effects.push(AppEffect::RequestRepaint);
+                } else {
+                    self.last_error = Some("no other space is available".to_owned());
                 }
             }
             KeybindAction::App(AppAction::PreviousSpace) => {
                 if self.activate_relative_space(-1) {
                     effects.push(AppEffect::RequestRepaint);
+                } else {
+                    self.last_error = Some("no other space is available".to_owned());
                 }
             }
             KeybindAction::App(AppAction::SelectSpace(index)) => {
                 if self.select_space(index) {
                     effects.push(AppEffect::RequestRepaint);
+                } else {
+                    self.last_error = Some(format!("space {index} is unavailable"));
                 }
             }
             KeybindAction::App(AppAction::ShowKeybinds) => {
@@ -5885,8 +6086,8 @@ impl AppState {
             }
             KeybindAction::Font(action) => self.apply_font_size_action(action, effects),
             KeybindAction::Find(action) => self.apply_terminal_find_action(action, effects),
-            KeybindAction::CopyToClipboard => {
-                self.copy_terminal_selection_or_request_copy(effects);
+            KeybindAction::CopyToClipboard(format) => {
+                self.copy_terminal_selection_or_request_copy(format, effects);
             }
             KeybindAction::CopyMode => {
                 self.enter_terminal_copy_mode(effects);
@@ -5910,27 +6111,53 @@ impl AppState {
         let Some(index) = events.iter().position(copy_shortcut_pressed) else {
             return 0;
         };
-        if !self.copy_terminal_selection_if_any() {
+        if !self.copy_terminal_selection_if_any(CopyToClipboard::Mixed) {
             return 0;
         }
         events.remove(index);
         1
     }
 
-    fn copy_terminal_selection_if_any(&mut self) -> bool {
-        match self
-            .binding
-            .terminal
-            .format_selection(TerminalSelectionFormat::PlainText)
-        {
-            Ok(Some(bytes)) => {
-                let text = String::from_utf8_lossy(&bytes);
-                if let Err(error) = write_clipboard_text(&text) {
-                    self.last_error = Some(error.to_string());
-                }
-                true
+    fn write_terminal_selection_to_clipboard(&mut self, format: CopyToClipboard) -> Result<bool> {
+        let mut selection = |format| self.binding.terminal.format_selection(format);
+        match format {
+            CopyToClipboard::Plain => {
+                let Some(bytes) = selection(TerminalSelectionFormat::PlainText)? else {
+                    return Ok(false);
+                };
+                write_clipboard_text(&String::from_utf8_lossy(&bytes))?;
             }
-            Ok(None) => false,
+            CopyToClipboard::Vt => {
+                let Some(bytes) = selection(TerminalSelectionFormat::Vt)? else {
+                    return Ok(false);
+                };
+                write_clipboard_text(&String::from_utf8_lossy(&bytes))?;
+            }
+            CopyToClipboard::Html => {
+                let Some(bytes) = selection(TerminalSelectionFormat::Html)? else {
+                    return Ok(false);
+                };
+                write_clipboard_html(&String::from_utf8_lossy(&bytes), None)?;
+            }
+            CopyToClipboard::Mixed => {
+                let Some(plain) = selection(TerminalSelectionFormat::PlainText)? else {
+                    return Ok(false);
+                };
+                let Some(html) = selection(TerminalSelectionFormat::Html)? else {
+                    return Ok(false);
+                };
+                write_clipboard_html(
+                    &String::from_utf8_lossy(&html),
+                    Some(&String::from_utf8_lossy(&plain)),
+                )?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn copy_terminal_selection_if_any(&mut self, format: CopyToClipboard) -> bool {
+        match self.write_terminal_selection_to_clipboard(format) {
+            Ok(copied) => copied,
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 false
@@ -5938,8 +6165,12 @@ impl AppState {
         }
     }
 
-    fn copy_terminal_selection_or_request_copy(&mut self, effects: &mut Vec<AppEffect>) {
-        if !self.copy_terminal_selection_if_any() {
+    fn copy_terminal_selection_or_request_copy(
+        &mut self,
+        format: CopyToClipboard,
+        effects: &mut Vec<AppEffect>,
+    ) {
+        if !self.copy_terminal_selection_if_any(format) {
             effects.push(AppEffect::RequestCopy);
         }
     }
@@ -5971,7 +6202,7 @@ impl AppState {
             remote.host, reattach.attempts
         );
         self.last_error = Some(error.clone());
-        self.binding.mux.set_error(Some(error));
+        self.binding.mux.set_availability_error(Some(error));
         self.binding.reattach = Some(reattach);
     }
 
@@ -5985,7 +6216,7 @@ impl AppState {
             remote.host, reattach.attempts
         );
         self.last_error = Some(error.clone());
-        self.binding.mux.set_error(Some(error));
+        self.binding.mux.set_availability_error(Some(error));
         self.binding.reattach = Some(reattach);
     }
 
@@ -6014,7 +6245,7 @@ impl AppState {
                 .is_some_and(|reattach| reattach.started)
         {
             self.binding.reattach = None;
-            self.binding.mux.set_error(None);
+            self.binding.mux.set_availability_error(None);
         }
     }
 
@@ -6106,7 +6337,7 @@ impl AppState {
         binding.remote_attach_started = Some(now);
         binding
             .mux
-            .set_error(Some(format!("reconnecting to {}", remote.host)));
+            .set_availability_error(Some(format!("reconnecting to {}", remote.host)));
         binding.terminal.discard_active_pane();
         true
     }
@@ -6114,9 +6345,16 @@ impl AppState {
     // active terminal is dropped here so its PTY is reaped; sync_mux_anchor then attaches whatever
     // pane the mux selected next (or idle when the session has no tabs left).
     fn close_active_pane(&mut self) {
+        self.close_target_pane(None);
+    }
+
+    fn close_target_pane(&mut self, target_pane_id: Option<&str>) {
         if self.uses_native_terminal_layout() {
-            if let Some(focused) = self.focused_pane() {
-                self.close_pane(&focused);
+            if let Some(pane_id) = target_pane_id
+                .map(str::to_owned)
+                .or_else(|| self.focused_pane())
+            {
+                self.close_pane(&pane_id);
             }
             return;
         }
@@ -6132,7 +6370,7 @@ impl AppState {
             &mux_config,
             MuxCommand::ClosePane {
                 session_id,
-                pane_id: None,
+                pane_id: target_pane_id.map(str::to_owned),
             },
         );
         self.binding.terminal.discard_active_pane();
@@ -6164,8 +6402,11 @@ impl AppState {
         let _ = self.sync_terminal_panes();
     }
 
-    fn mux_operation_for_action(action: MuxKeyAction) -> Option<BindingOperation> {
+    fn mux_operation_for_action(&self, action: MuxKeyAction) -> Option<BindingOperation> {
         match action {
+            MuxKeyAction::NewTab if self.binding.mux.selected_session().is_none() => {
+                Some(BindingOperation::CreateProjectSession)
+            }
             MuxKeyAction::NewTab => Some(BindingOperation::CreateWindow),
             MuxKeyAction::NextTab
             | MuxKeyAction::PreviousTab
@@ -6187,6 +6428,15 @@ impl AppState {
     }
 
     fn apply_mux_key_action(&mut self, action: MuxKeyAction) {
+        self.apply_mux_key_action_to_target(action, None, None);
+    }
+
+    fn apply_mux_key_action_to_target(
+        &mut self,
+        action: MuxKeyAction,
+        target_window_id: Option<String>,
+        target_pane_id: Option<String>,
+    ) {
         if self.apply_session_navigation_action(action) {
             return;
         }
@@ -6195,17 +6445,17 @@ impl AppState {
             return;
         }
         if matches!(action, MuxKeyAction::ClosePane) {
-            self.close_active_pane();
+            self.close_target_pane(target_pane_id.as_deref());
             return;
         }
         // On the native engine, killing a pane means removing the focused split leaf and collapsing
         // the layout, same as closing it. Other backends keep tmux/zellij kill-pane semantics.
         if self.uses_native_terminal_layout() && matches!(action, MuxKeyAction::KillPane) {
-            self.close_active_pane();
+            self.close_target_pane(target_pane_id.as_deref());
             return;
         }
         if let MuxKeyAction::SplitPane(direction) = action {
-            self.split_focused_pane(direction);
+            self.split_focused_pane(direction, target_pane_id.as_deref());
             return;
         }
         // On the native engine, directional pane selection moves focus geometrically across the
@@ -6280,23 +6530,27 @@ impl AppState {
             }
             MuxKeyAction::SelectPane(direction) => MuxCommand::SelectPane {
                 session_id: selected_session,
+                window_id: target_window_id.clone(),
                 direction,
             },
             MuxKeyAction::NextPane => MuxCommand::SelectNextPane {
                 session_id: selected_session,
+                window_id: target_window_id.clone(),
             },
             MuxKeyAction::PreviousPane => MuxCommand::SelectPreviousPane {
                 session_id: selected_session,
+                window_id: target_window_id.clone(),
             },
             MuxKeyAction::KillPane => MuxCommand::KillPane {
                 session_id: selected_session,
-                pane_id: None,
+                pane_id: target_pane_id.clone(),
             },
             MuxKeyAction::ClosePane => {
                 unreachable!("close pane is handled before the command match")
             }
             MuxKeyAction::TogglePaneZoom => MuxCommand::TogglePaneZoom {
                 session_id: selected_session,
+                pane_id: target_pane_id.clone(),
             },
             MuxKeyAction::NextSession
             | MuxKeyAction::PreviousSession
@@ -6335,12 +6589,14 @@ impl AppState {
         self.sidebar_hovered_session = targets.get(next).cloned();
     }
 
-    fn activate_sidebar_hovered_session(&mut self) {
+    fn activate_sidebar_hovered_session(&mut self) -> bool {
         self.ensure_sidebar_hovered_session();
-        if let Some(target) = self.sidebar_hovered_session.clone() {
-            self.activate_scoped_session_from_ui(&target);
-        }
+        let activated = self
+            .sidebar_hovered_session
+            .clone()
+            .is_some_and(|target| self.activate_scoped_session_from_ui(&target));
         self.input_focus = InputFocus::Terminal;
+        activated
     }
 
     fn sidebar_hovered_index(&self) -> Option<usize> {
@@ -8798,12 +9054,16 @@ mod tests {
             config.input.backend_keybinds.tmux = vec!["f1=previous_tab".to_owned()];
         });
         assert_eq!(
-            state.app_key_bindings.action_for_key_with_modifier_sides(
-                egui::Key::F1,
-                egui::Modifiers::NONE,
-                ModifierSideState::default(),
-            ),
-            Some(KeybindAction::Mux(MuxKeyAction::NextTab))
+            state
+                .app_key_bindings
+                .invocation_for_key_with_modifier_sides(
+                    egui::Key::F1,
+                    egui::Modifiers::NONE,
+                    ModifierSideState::default(),
+                )
+                .expect("native binding")
+                .command,
+            "next_tab"
         );
         let remote_scope = MuxScope::new(
             state.binding.scope.space_id(),
@@ -8839,12 +9099,16 @@ mod tests {
         );
 
         assert_eq!(
-            state.app_key_bindings.action_for_key_with_modifier_sides(
-                egui::Key::F1,
-                egui::Modifiers::NONE,
-                ModifierSideState::default(),
-            ),
-            Some(KeybindAction::Mux(MuxKeyAction::PreviousTab))
+            state
+                .app_key_bindings
+                .invocation_for_key_with_modifier_sides(
+                    egui::Key::F1,
+                    egui::Modifiers::NONE,
+                    ModifierSideState::default(),
+                )
+                .expect("tmux binding")
+                .command,
+            "previous_tab"
         );
         assert_eq!(
             state.multiplexer_backend(),
@@ -8996,7 +9260,7 @@ mod tests {
         state.sidebar_hovered_session = Some(targets[previous_index].clone());
         state.move_sidebar_hover(1);
         assert_eq!(state.sidebar_hovered_session.as_ref(), Some(&remote_target));
-        state.activate_sidebar_hovered_session();
+        assert!(state.activate_sidebar_hovered_session());
         assert_eq!(state.mux_scope(), remote_scope);
     }
 
@@ -10250,36 +10514,53 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_keybinds_map_configured_navigation_without_default_escape() {
+    fn sidebar_keybinds_produce_registry_backed_invocations() {
         let bindings =
             SidebarKeyBindings::from_keybinds(&BoottyConfig::default().input.sidebar_keybind)
                 .expect("default sidebar keybinds");
-
-        assert_eq!(
-            bindings.action_for_key(egui::Key::J, egui::Modifiers::NONE),
-            Some(SidebarAction::NextSession)
-        );
-        assert_eq!(
-            bindings.action_for_key(egui::Key::ArrowUp, egui::Modifiers::NONE),
-            Some(SidebarAction::PreviousSession)
-        );
-        assert_eq!(
-            bindings.action_for_key(
+        let cases = [
+            (
+                egui::Key::J,
+                egui::Modifiers::NONE,
+                SidebarAction::NextSession,
+            ),
+            (
+                egui::Key::ArrowUp,
+                egui::Modifiers::NONE,
+                SidebarAction::PreviousSession,
+            ),
+            (
                 egui::Key::N,
                 egui::Modifiers {
                     ctrl: true,
                     ..Default::default()
-                }
+                },
+                SidebarAction::NextSession,
             ),
-            Some(SidebarAction::NextSession)
-        );
-        assert_eq!(
-            bindings.action_for_key(egui::Key::Enter, egui::Modifiers::NONE),
-            Some(SidebarAction::ActivateSession)
-        );
-        assert_eq!(
-            bindings.action_for_key(egui::Key::Escape, egui::Modifiers::NONE),
-            None
+            (
+                egui::Key::Enter,
+                egui::Modifiers::NONE,
+                SidebarAction::ActivateSession,
+            ),
+        ];
+
+        for (key, modifiers, action) in cases {
+            let invocation = bindings
+                .invocation_for_key(key, modifiers)
+                .expect("configured sidebar binding");
+            assert_eq!(invocation.caller, Caller::Keybinding);
+            assert_eq!(
+                CommandRegistry::core()
+                    .resolve(invocation)
+                    .unwrap()
+                    .executor,
+                CoreCommandExecutor::Sidebar(action)
+            );
+        }
+        assert!(
+            bindings
+                .invocation_for_key(egui::Key::Escape, egui::Modifiers::NONE)
+                .is_none()
         );
     }
 
@@ -10316,27 +10597,42 @@ mod tests {
     fn sidebar_focus_consumes_keys_and_enter_returns_terminal_focus() {
         let mut state = test_state();
         state.input_focus = InputFocus::Sidebar;
+        let viewport = ViewportSnapshot::default();
+        let mut effects = Vec::new();
 
         assert_eq!(
-            state.handle_sidebar_input(vec![
-                key_event(egui::Key::J, egui::Modifiers::NONE),
-                egui::Event::Text("j".to_owned()),
-            ]),
+            state.handle_sidebar_input(
+                vec![
+                    key_event(egui::Key::J, egui::Modifiers::NONE),
+                    egui::Event::Text("j".to_owned()),
+                ],
+                viewport,
+                &mut effects,
+            ),
             2
         );
         assert_eq!(state.input_focus, InputFocus::Sidebar);
 
         assert_eq!(
-            state.handle_sidebar_input(vec![key_event(egui::Key::Escape, egui::Modifiers::NONE)]),
+            state.handle_sidebar_input(
+                vec![key_event(egui::Key::Escape, egui::Modifiers::NONE)],
+                viewport,
+                &mut effects,
+            ),
             1
         );
         assert_eq!(state.input_focus, InputFocus::Sidebar);
 
         assert_eq!(
-            state.handle_sidebar_input(vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)]),
+            state.handle_sidebar_input(
+                vec![key_event(egui::Key::Enter, egui::Modifiers::NONE)],
+                viewport,
+                &mut effects,
+            ),
             1
         );
         assert_eq!(state.input_focus, InputFocus::Terminal);
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -10951,6 +11247,20 @@ mod tests {
         );
 
         assert_eq!(effects, vec![AppEffect::CloseWindow]);
+    }
+
+    #[test]
+    fn quit_action_emits_instance_quit_effect() {
+        let mut state = test_state();
+        let mut effects = Vec::new();
+
+        state.apply_keybind_action(
+            KeybindAction::App(AppAction::Quit),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+
+        assert_eq!(effects, vec![AppEffect::QuitApplication]);
     }
 
     #[test]
@@ -11777,7 +12087,7 @@ mod tests {
         let mut effects = Vec::new();
 
         state.apply_keybind_action(
-            KeybindAction::CopyToClipboard,
+            KeybindAction::CopyToClipboard(CopyToClipboard::Mixed),
             ViewportSnapshot::default(),
             &mut effects,
         );
@@ -11817,6 +12127,59 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_rejects_a_missing_target_before_queueing() {
+        let mut state = test_state();
+        assert!(state.current_command_target(ResourceKind::Pane).is_none());
+
+        state.apply_command_palette_event(
+            CommandPaletteDialog::open(&[]),
+            CommandPaletteEvent::Run(crate::action_catalog::Command::KillPane),
+        );
+
+        assert!(state.pending_command.is_none());
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("no current Pane target"))
+        );
+    }
+
+    #[test]
+    fn command_palette_pins_the_binding_selected_by_the_user() {
+        let mut state = test_state();
+        let home = state.active_space_id();
+        assert!(state.create_space_from_ui(
+            "Work",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let space_count = state.space_summaries().len();
+
+        state.apply_command_palette_event(
+            CommandPaletteDialog::open(&[]),
+            CommandPaletteEvent::Run(crate::action_catalog::Command::CloseSpace),
+        );
+        assert_eq!(
+            state
+                .pending_command
+                .as_ref()
+                .and_then(|invocation| invocation.target.as_ref())
+                .map(|target| target.kind),
+            Some(ResourceKind::Binding)
+        );
+
+        assert!(state.activate_space_from_ui(home));
+        let invocation = state.pending_command.take().unwrap();
+        let outcome =
+            state.dispatch_command(invocation, ViewportSnapshot::default(), &mut Vec::new());
+
+        assert!(matches!(outcome, CommandOutcome::StaleTarget { .. }));
+        assert_eq!(state.space_summaries().len(), space_count);
+    }
+
+    #[test]
     fn egui_keybinding_dispatches_sidebar_command() {
         let mut state = test_state();
         state.app_key_bindings =
@@ -11838,6 +12201,45 @@ mod tests {
 
         assert_eq!(state.config().chrome.sidebar, !before);
         assert!(effects.contains(&AppEffect::RequestRepaint));
+    }
+    #[test]
+    fn dispatcher_validation_and_outcomes_are_equivalent_for_every_caller() {
+        let callers = [
+            Caller::CommandPalette,
+            Caller::Keybinding,
+            Caller::BuiltinKeybinding,
+            Caller::Cli,
+            Caller::Socket,
+            Caller::Luau,
+            Caller::Internal,
+        ];
+
+        for caller in callers {
+            let mut state = test_state();
+            let mut effects = Vec::new();
+            let invalid = state.dispatch_command(
+                CommandInvocation::from_action("select_tab:nope", caller),
+                ViewportSnapshot::default(),
+                &mut effects,
+            );
+            assert!(matches!(
+                invalid,
+                CommandOutcome::Failed { code, .. } if code == "invalid_arguments"
+            ));
+            assert!(effects.is_empty());
+
+            let before = state.config().chrome.sidebar;
+            assert_eq!(
+                state.dispatch_command(
+                    CommandInvocation::from_action("toggle_sidebar_visibility", caller),
+                    ViewportSnapshot::default(),
+                    &mut effects,
+                ),
+                CommandOutcome::success()
+            );
+            assert_eq!(state.config().chrome.sidebar, !before);
+            assert!(effects.contains(&AppEffect::RequestRepaint));
+        }
     }
 
     #[test]
@@ -11866,7 +12268,7 @@ mod tests {
     fn app_command_channel_runs_on_the_ui_thread() {
         let mut state = test_state();
         let before = state.config().chrome.sidebar;
-        let sender = state.app_command_sender();
+        let sender = state.app_command_sender(Caller::Socket);
         let (response, response_rx) = mpsc::channel();
         sender
             .try_send(crate::commands::AppCommandRequest {
@@ -11891,7 +12293,7 @@ mod tests {
     fn app_command_channel_rejects_cancelled_and_expired_requests() {
         let mut state = test_state();
         let before = state.config().chrome.sidebar;
-        let sender = state.app_command_sender();
+        let sender = state.app_command_sender(Caller::Socket);
         let cancellation = crate::commands::CommandCancellation::new();
         cancellation.cancel();
 
@@ -11973,6 +12375,64 @@ mod tests {
             CommandOutcome::StaleTarget { .. }
         ));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn missing_session_target_is_unavailable() {
+        let mut state = test_state();
+        assert_eq!(state.current_command_target(ResourceKind::Session), None);
+
+        let mut effects = Vec::new();
+        assert!(matches!(
+            state.dispatch_command(
+                CommandInvocation::from_action("rename_session", Caller::Keybinding),
+                ViewportSnapshot::default(),
+                &mut effects,
+            ),
+            CommandOutcome::Unavailable { .. }
+        ));
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn new_tab_command_creates_a_session_when_none_is_selected() {
+        let mut state = test_state();
+        assert!(state.binding.mux.selected_session().is_none());
+        let empty_session_target = state
+            .current_command_target_for("new_tab", ResourceKind::Session)
+            .expect("new tab must bind the empty session slot");
+
+        let outcome = state.dispatch_command(
+            CommandInvocation::from_action("new_tab", Caller::Keybinding),
+            ViewportSnapshot::default(),
+            &mut Vec::new(),
+        );
+
+        assert_eq!(outcome, CommandOutcome::success());
+        assert!(state.binding.mux.selected_session().is_some());
+
+        let mut delayed = CommandInvocation::from_action("new_tab", Caller::CommandPalette);
+        delayed.target = Some(empty_session_target);
+        assert!(matches!(
+            state.dispatch_command(delayed, ViewportSnapshot::default(), &mut Vec::new()),
+            CommandOutcome::StaleTarget { .. }
+        ));
+    }
+
+    #[test]
+    fn copy_command_remains_available_before_mux_selection() {
+        let mut state = test_state();
+        assert!(state.binding.mux.selected_session().is_none());
+        let mut effects = Vec::new();
+
+        let outcome = state.dispatch_command(
+            CommandInvocation::from_action("copy_to_clipboard", Caller::Keybinding),
+            ViewportSnapshot::default(),
+            &mut effects,
+        );
+
+        assert_eq!(outcome, CommandOutcome::success());
+        assert_eq!(effects, [AppEffect::RequestCopy]);
     }
 
     #[test]

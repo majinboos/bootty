@@ -497,6 +497,13 @@ impl BoottyApp {
                 AppEffect::CloseWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+                AppEffect::QuitApplication => {
+                    let viewport_ids =
+                        ctx.input(|input| input.raw.viewports.keys().copied().collect::<Vec<_>>());
+                    for viewport_id in viewport_ids {
+                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+                    }
+                }
                 AppEffect::SetWindowTitle(title) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
                 }

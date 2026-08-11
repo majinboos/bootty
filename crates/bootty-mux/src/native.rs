@@ -592,18 +592,38 @@ impl MuxBackend for NativeBackend {
             } => state.split_pane(&session_id, pane_id.as_deref()),
             MuxCommand::SelectPane {
                 session_id,
+                window_id,
                 direction,
-            } => match direction {
-                super::command::MuxDirection::Left | super::command::MuxDirection::Up => {
-                    state.select_relative_pane(&session_id, -1);
+            } => {
+                if let Some(window_id) = window_id {
+                    state.activate_window(&session_id, &window_id);
                 }
-                super::command::MuxDirection::Right | super::command::MuxDirection::Down => {
-                    state.select_relative_pane(&session_id, 1);
+                match direction {
+                    super::command::MuxDirection::Left | super::command::MuxDirection::Up => {
+                        state.select_relative_pane(&session_id, -1);
+                    }
+                    super::command::MuxDirection::Right | super::command::MuxDirection::Down => {
+                        state.select_relative_pane(&session_id, 1);
+                    }
                 }
-            },
-            MuxCommand::SelectNextPane { session_id } => state.select_relative_pane(&session_id, 1),
-            MuxCommand::SelectPreviousPane { session_id } => {
-                state.select_relative_pane(&session_id, -1)
+            }
+            MuxCommand::SelectNextPane {
+                session_id,
+                window_id,
+            } => {
+                if let Some(window_id) = window_id {
+                    state.activate_window(&session_id, &window_id);
+                }
+                state.select_relative_pane(&session_id, 1);
+            }
+            MuxCommand::SelectPreviousPane {
+                session_id,
+                window_id,
+            } => {
+                if let Some(window_id) = window_id {
+                    state.activate_window(&session_id, &window_id);
+                }
+                state.select_relative_pane(&session_id, -1);
             }
             MuxCommand::KillPane {
                 session_id,

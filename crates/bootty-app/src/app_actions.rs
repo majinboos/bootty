@@ -10,7 +10,7 @@ use crate::{
     input::terminal_key,
     input_binding::{
         AppearanceChoice, BindingAction, BindingElement, BindingKey, BindingTrigger,
-        NavigateSearch, PaneDirection, parse_action, parse_binding_elements,
+        CopyToClipboard, NavigateSearch, PaneDirection, parse_action, parse_binding_elements,
     },
     mux::command::MuxDirection,
     terminal::{KeyInput, KeyMods, TerminalKey},
@@ -25,6 +25,7 @@ pub enum AppAction {
     SessionPicker,
     CommandPalette,
     Close,
+    Quit,
     ToggleFullscreen,
     ToggleSidebarFocus,
     ToggleSidebarVisibility,
@@ -61,7 +62,7 @@ pub enum KeybindAction {
     Write(Vec<u8>),
     Font(FontSizeAction),
     Find(TerminalFindAction),
-    CopyToClipboard,
+    CopyToClipboard(CopyToClipboard),
     CopyMode,
     PasteFromClipboard,
 }
@@ -108,7 +109,6 @@ pub enum FontSizeAction {
 #[derive(Clone, Debug)]
 struct BoundCommand {
     action_name: String,
-    action: KeybindAction,
 }
 
 impl BoundCommand {
@@ -140,10 +140,30 @@ pub enum SidebarAction {
     FocusTerminal,
 }
 
+impl SidebarAction {
+    pub const ALL: [Self; 5] = [
+        Self::Ignore,
+        Self::PreviousSession,
+        Self::NextSession,
+        Self::ActivateSession,
+        Self::FocusTerminal,
+    ];
+
+    pub const fn command_id(self) -> &'static str {
+        match self {
+            Self::Ignore => "ui.sidebar.ignore",
+            Self::PreviousSession => "ui.sidebar.previous_session",
+            Self::NextSession => "ui.sidebar.next_session",
+            Self::ActivateSession => "ui.sidebar.activate_session",
+            Self::FocusTerminal => "ui.sidebar.focus_terminal",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SidebarKeyBinding {
     trigger: BindingTrigger,
-    action: SidebarAction,
+    command: &'static str,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -173,16 +193,13 @@ impl AppKeyBindings {
                     }
                     BindingElement::Binding(binding) => {
                         let action_name = binding.action.format_entry();
-                        let action = keybind_action(binding.action).map_err(|error| {
+                        keybind_action(binding.action).map_err(|error| {
                             anyhow::anyhow!("unsupported keybind {entry:?}: {error}")
                         })?;
                         bindings.push(AppKeyBinding {
                             leader: pending_leader.take(),
                             trigger: binding.trigger,
-                            command: BoundCommand {
-                                action_name,
-                                action,
-                            },
+                            command: BoundCommand { action_name },
                         });
                     }
                     BindingElement::Chain(_) => {
@@ -200,20 +217,6 @@ impl AppKeyBindings {
         })
     }
 
-    pub fn action_for_key_with_modifier_sides(
-        &mut self,
-        key: egui::Key,
-        modifiers: egui::Modifiers,
-        modifier_sides: ModifierSideState,
-    ) -> Option<KeybindAction> {
-        self.command_for_candidates(binding_triggers_for_egui_key_with_modifier_sides(
-            key,
-            modifiers,
-            modifier_sides,
-        ))
-        .map(|command| command.action)
-    }
-
     pub fn invocation_for_key_with_modifier_sides(
         &mut self,
         key: egui::Key,
@@ -226,19 +229,6 @@ impl AppKeyBindings {
             modifier_sides,
         ))
         .map(|command| command.invocation())
-    }
-    pub fn action_for_scroll_with_modifier_sides(
-        &mut self,
-        up: bool,
-        modifiers: egui::Modifiers,
-        modifier_sides: ModifierSideState,
-    ) -> Option<KeybindAction> {
-        self.command_for_candidates(binding_triggers_for_egui_scroll_with_modifier_sides(
-            up,
-            modifiers,
-            modifier_sides,
-        ))
-        .map(|command| command.action)
     }
 
     pub fn invocation_for_scroll_with_modifier_sides(
@@ -253,11 +243,6 @@ impl AppKeyBindings {
             modifier_sides,
         ))
         .map(|command| command.invocation())
-    }
-
-    pub fn action_for_input(&mut self, input: KeyInput) -> Option<KeybindAction> {
-        self.command_for_candidates(binding_triggers_for_key_input(input))
-            .map(|command| command.action)
     }
 
     pub fn invocation_for_input(&mut self, input: KeyInput) -> Option<CommandInvocation> {
@@ -281,7 +266,6 @@ impl AppKeyBindings {
                 .or_else(|| {
                     Some(BoundCommand {
                         action_name: "ignore".to_owned(),
-                        action: KeybindAction::App(AppAction::Ignore),
                     })
                 });
         }
@@ -295,7 +279,6 @@ impl AppKeyBindings {
             self.active_leader = Some(leader);
             return Some(BoundCommand {
                 action_name: "ignore".to_owned(),
-                action: KeybindAction::App(AppAction::Ignore),
             });
         }
 
@@ -314,29 +297,30 @@ impl SidebarKeyBindings {
         for entry in keybinds {
             let (trigger, action) = split_sidebar_binding(entry)
                 .ok_or_else(|| anyhow::anyhow!("invalid sidebar keybind {entry:?}"))?;
+            let action = sidebar_action(action).map_err(|error| {
+                anyhow::anyhow!("unsupported sidebar keybind {entry:?}: {error}")
+            })?;
             bindings.push(SidebarKeyBinding {
                 trigger: BindingTrigger::from_str(trigger).map_err(|error| {
                     anyhow::anyhow!("invalid sidebar keybind {entry:?}: {error:?}")
                 })?,
-                action: sidebar_action(action).map_err(|error| {
-                    anyhow::anyhow!("unsupported sidebar keybind {entry:?}: {error}")
-                })?,
+                command: action.command_id(),
             });
         }
         Ok(Self { bindings })
     }
 
-    pub fn action_for_key(
+    pub fn invocation_for_key(
         &self,
         key: egui::Key,
         modifiers: egui::Modifiers,
-    ) -> Option<SidebarAction> {
+    ) -> Option<CommandInvocation> {
         let candidates = binding_triggers_for_egui_key(key, modifiers);
         self.bindings.iter().find_map(|binding| {
             candidates
                 .iter()
                 .any(|candidate| candidate == &binding.trigger)
-                .then_some(binding.action)
+                .then(|| CommandInvocation::from_action(binding.command, Caller::Keybinding))
         })
     }
 }
@@ -396,11 +380,7 @@ pub fn split_app_actions_for_bindings_with_modifier_sides(
                 ..
             } => app_key_bindings
                 .invocation_for_key_with_modifier_sides(*key, *modifiers, modifier_sides)
-                .or_else(|| {
-                    builtin_app_action_for_key(*key, *modifiers).map(|_| {
-                        CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding)
-                    })
-                }),
+                .or_else(|| builtin_app_invocation_for_key(*key, *modifiers)),
             egui::Event::MouseWheel {
                 delta, modifiers, ..
             } if delta.y != 0.0 => app_key_bindings.invocation_for_scroll_with_modifier_sides(
@@ -425,10 +405,10 @@ pub fn split_app_actions_for_bindings_with_modifier_sides(
 
 // Safety net for new-session even when keybinds are cleared: Cmd+N on macOS, Ctrl+Shift+N
 // elsewhere (matching the platform default tables).
-pub fn builtin_app_action_for_key(
+pub fn builtin_app_invocation_for_key(
     key: egui::Key,
     modifiers: egui::Modifiers,
-) -> Option<KeybindAction> {
+) -> Option<CommandInvocation> {
     let matches = if cfg!(target_os = "macos") {
         (modifiers.command || modifiers.mac_cmd)
             && !modifiers.alt
@@ -438,22 +418,23 @@ pub fn builtin_app_action_for_key(
         // egui inflates `command` from `ctrl` off macOS, so it is not checked here.
         modifiers.ctrl && modifiers.shift && !modifiers.alt
     };
-    (key == egui::Key::N && matches).then_some(KeybindAction::App(AppAction::NewMuxSession))
+    (key == egui::Key::N && matches)
+        .then(|| CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding))
 }
 
-pub fn builtin_app_action_for_direct_key(input: KeyInput) -> Option<KeybindAction> {
+pub fn builtin_app_invocation_for_direct_key(input: KeyInput) -> Option<CommandInvocation> {
     let matches = if cfg!(target_os = "macos") {
         input.mods.command && !input.mods.alt && !input.mods.ctrl && !input.mods.shift
     } else {
         input.mods.ctrl && input.mods.shift && !input.mods.alt && !input.mods.command
     };
-    (input.key == TerminalKey::N && matches).then_some(KeybindAction::App(AppAction::NewMuxSession))
+    (input.key == TerminalKey::N && matches)
+        .then(|| CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding))
 }
 
 /// Resolve a snake_case binding-action name (e.g. `"rename_session"`) to its
 /// runnable [`KeybindAction`], or `None` if it is unknown or has no app behavior.
-/// The command palette uses this to dispatch its catalog entries through the same
-/// path as keybindings.
+/// [`crate::commands::CommandRegistry`] uses this to resolve core keybinding executors.
 pub fn keybind_action_for_name(name: &str) -> Option<KeybindAction> {
     keybind_action(parse_action(name).ok()?).ok()
 }
@@ -466,9 +447,8 @@ fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
         BindingAction::NewMuxSession => Ok(KeybindAction::App(AppAction::NewMuxSession)),
         BindingAction::SessionPicker => Ok(KeybindAction::App(AppAction::SessionPicker)),
         BindingAction::CommandPalette => Ok(KeybindAction::App(AppAction::CommandPalette)),
-        BindingAction::CloseWindow | BindingAction::Quit => {
-            Ok(KeybindAction::App(AppAction::Close))
-        }
+        BindingAction::CloseWindow => Ok(KeybindAction::App(AppAction::Close)),
+        BindingAction::Quit => Ok(KeybindAction::App(AppAction::Quit)),
         BindingAction::CloseSurface => Ok(KeybindAction::Mux(MuxKeyAction::ClosePane)),
         BindingAction::ToggleFullscreen => Ok(KeybindAction::App(AppAction::ToggleFullscreen)),
         BindingAction::ToggleSidebarFocus => Ok(KeybindAction::App(AppAction::ToggleSidebarFocus)),
@@ -546,7 +526,7 @@ fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
         }
         BindingAction::ResetFontSize => Ok(KeybindAction::Font(FontSizeAction::Reset)),
         BindingAction::SetFontSize(size) => Ok(KeybindAction::Font(FontSizeAction::Set(size))),
-        BindingAction::CopyToClipboard(_) => Ok(KeybindAction::CopyToClipboard),
+        BindingAction::CopyToClipboard(format) => Ok(KeybindAction::CopyToClipboard(format)),
         BindingAction::CopyMode => Ok(KeybindAction::CopyMode),
         BindingAction::PasteFromClipboard => Ok(KeybindAction::PasteFromClipboard),
         unsupported => anyhow::bail!("{} has no Bootty app behavior", unsupported.format_entry()),
@@ -791,13 +771,42 @@ fn binding_char_for_egui_key(key: egui::Key) -> Option<char> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{CommandRegistry, CoreCommandExecutor};
+
+    fn resolved_keybind_action(invocation: Option<CommandInvocation>) -> Option<KeybindAction> {
+        let executor = CommandRegistry::core().resolve(invocation?).ok()?.executor;
+        match executor {
+            CoreCommandExecutor::Keybind(action) => Some(action),
+            CoreCommandExecutor::Sidebar(_) => None,
+        }
+    }
+
+    fn keybind_action_for_key(
+        bindings: &mut AppKeyBindings,
+        key: egui::Key,
+        modifiers: egui::Modifiers,
+        modifier_sides: ModifierSideState,
+    ) -> Option<KeybindAction> {
+        resolved_keybind_action(bindings.invocation_for_key_with_modifier_sides(
+            key,
+            modifiers,
+            modifier_sides,
+        ))
+    }
+
+    fn keybind_action_for_input(
+        bindings: &mut AppKeyBindings,
+        input: KeyInput,
+    ) -> Option<KeybindAction> {
+        resolved_keybind_action(bindings.invocation_for_input(input))
+    }
 
     fn action_for_key(
         bindings: &mut AppKeyBindings,
         key: egui::Key,
         modifiers: egui::Modifiers,
     ) -> Option<KeybindAction> {
-        bindings.action_for_key_with_modifier_sides(key, modifiers, ModifierSideState::default())
+        keybind_action_for_key(bindings, key, modifiers, ModifierSideState::default())
     }
 
     fn split_app_actions_for_bindings(
@@ -812,13 +821,29 @@ mod tests {
         let actions = invocations
             .into_iter()
             .map(|invocation| {
-                crate::commands::CommandRegistry::core()
-                    .resolve(invocation)
-                    .expect("test command")
-                    .action
+                resolved_keybind_action(Some(invocation)).expect("test keybind command")
             })
             .collect();
         (events, actions)
+    }
+
+    #[test]
+    fn sidebar_keybindings_create_registry_backed_invocations() {
+        let bindings = SidebarKeyBindings::from_keybinds(&["j=next_session".to_owned()])
+            .expect("sidebar binding");
+
+        let invocation = bindings
+            .invocation_for_key(egui::Key::J, egui::Modifiers::NONE)
+            .expect("configured invocation");
+        assert_eq!(invocation.caller, Caller::Keybinding);
+        assert_eq!(invocation.command, SidebarAction::NextSession.command_id());
+        assert_eq!(
+            CommandRegistry::core()
+                .resolve(invocation)
+                .unwrap()
+                .executor,
+            CoreCommandExecutor::Sidebar(SidebarAction::NextSession)
+        );
     }
 
     #[test]
@@ -959,7 +984,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            bindings.action_for_key_with_modifier_sides(
+            keybind_action_for_key(
+                &mut bindings,
                 egui::Key::Comma,
                 egui::Modifiers {
                     shift: true,
@@ -975,32 +1001,38 @@ mod tests {
         );
 
         assert_eq!(
-            bindings.action_for_input(KeyInput {
-                key: TerminalKey::Comma,
-                mods: crate::terminal::KeyMods {
-                    shift: true,
-                    alt: true,
-                    right_alt: true,
-                    ..Default::default()
+            keybind_action_for_input(
+                &mut bindings,
+                KeyInput {
+                    key: TerminalKey::Comma,
+                    mods: crate::terminal::KeyMods {
+                        shift: true,
+                        alt: true,
+                        right_alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                    utf8: Some("<"),
+                    unshifted: Some(','),
                 },
-                repeat: false,
-                utf8: Some("<"),
-                unshifted: Some(','),
-            }),
+            ),
             Some(KeybindAction::Mux(MuxKeyAction::MoveTab(-1)))
         );
         assert_eq!(
-            bindings.action_for_input(KeyInput {
-                key: TerminalKey::Period,
-                mods: crate::terminal::KeyMods {
-                    shift: true,
-                    alt: true,
-                    ..Default::default()
+            keybind_action_for_input(
+                &mut bindings,
+                KeyInput {
+                    key: TerminalKey::Period,
+                    mods: crate::terminal::KeyMods {
+                        shift: true,
+                        alt: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                    utf8: Some(">"),
+                    unshifted: Some('.'),
                 },
-                repeat: false,
-                utf8: Some(">"),
-                unshifted: Some('.'),
-            }),
+            ),
             Some(KeybindAction::Mux(MuxKeyAction::MoveTab(1)))
         );
     }
@@ -1041,7 +1073,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                bindings.action_for_key_with_modifier_sides(
+                keybind_action_for_key(
+                    &mut bindings,
                     egui::Key::Comma,
                     egui::Modifiers {
                         shift: true,
@@ -1053,13 +1086,16 @@ mod tests {
                 Some(KeybindAction::Mux(MuxKeyAction::MoveTab(-1)))
             );
             assert_eq!(
-                bindings.action_for_input(KeyInput {
-                    key: TerminalKey::Comma,
-                    mods,
-                    repeat: false,
-                    utf8: Some("<"),
-                    unshifted: Some(','),
-                }),
+                keybind_action_for_input(
+                    &mut bindings,
+                    KeyInput {
+                        key: TerminalKey::Comma,
+                        mods,
+                        repeat: false,
+                        utf8: Some("<"),
+                        unshifted: Some(','),
+                    },
+                ),
                 Some(KeybindAction::Mux(MuxKeyAction::MoveTab(-1)))
             );
         }
@@ -1080,15 +1116,21 @@ mod tests {
             }
         };
 
-        let action = builtin_app_action_for_key(egui::Key::N, modifiers);
+        let invocation = builtin_app_invocation_for_key(egui::Key::N, modifiers);
 
-        assert_eq!(action, Some(KeybindAction::App(AppAction::NewMuxSession)));
+        assert_eq!(
+            invocation,
+            Some(CommandInvocation::from_action(
+                "new_mux_session",
+                Caller::BuiltinKeybinding
+            ))
+        );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn builtin_macos_cmd_n_creates_mux_session_not_terminal_input() {
-        let action = builtin_app_action_for_key(
+        let invocation = builtin_app_invocation_for_key(
             egui::Key::N,
             egui::Modifiers {
                 mac_cmd: true,
@@ -1096,7 +1138,13 @@ mod tests {
             },
         );
 
-        assert_eq!(action, Some(KeybindAction::App(AppAction::NewMuxSession)));
+        assert_eq!(
+            invocation,
+            Some(CommandInvocation::from_action(
+                "new_mux_session",
+                Caller::BuiltinKeybinding
+            ))
+        );
     }
 
     #[test]
@@ -1114,7 +1162,7 @@ mod tests {
             }
         };
 
-        let action = builtin_app_action_for_direct_key(KeyInput {
+        let invocation = builtin_app_invocation_for_direct_key(KeyInput {
             key: TerminalKey::N,
             mods,
             repeat: false,
@@ -1122,7 +1170,13 @@ mod tests {
             unshifted: Some('n'),
         });
 
-        assert_eq!(action, Some(KeybindAction::App(AppAction::NewMuxSession)));
+        assert_eq!(
+            invocation,
+            Some(CommandInvocation::from_action(
+                "new_mux_session",
+                Caller::BuiltinKeybinding
+            ))
+        );
     }
 
     #[test]
@@ -1218,17 +1272,20 @@ mod tests {
         ])
         .unwrap();
 
-        let action = bindings.action_for_input(KeyInput {
-            key: TerminalKey::N,
-            mods: crate::terminal::KeyMods {
-                alt: true,
-                right_alt: true,
-                ..Default::default()
+        let action = keybind_action_for_input(
+            &mut bindings,
+            KeyInput {
+                key: TerminalKey::N,
+                mods: crate::terminal::KeyMods {
+                    alt: true,
+                    right_alt: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                utf8: Some("n"),
+                unshifted: Some('n'),
             },
-            repeat: false,
-            utf8: Some("n"),
-            unshifted: Some('n'),
-        });
+        );
 
         assert_eq!(action, Some(KeybindAction::Mux(MuxKeyAction::NextTab)));
     }
@@ -1241,7 +1298,8 @@ mod tests {
         ])
         .unwrap();
 
-        let action = bindings.action_for_key_with_modifier_sides(
+        let action = keybind_action_for_key(
+            &mut bindings,
             egui::Key::P,
             egui::Modifiers {
                 alt: true,
@@ -1264,29 +1322,35 @@ mod tests {
         ])
         .unwrap();
 
-        let left_action = bindings.action_for_input(KeyInput {
-            key: TerminalKey::N,
-            mods: crate::terminal::KeyMods {
-                shift: true,
-                alt: true,
-                ..Default::default()
+        let left_action = keybind_action_for_input(
+            &mut bindings,
+            KeyInput {
+                key: TerminalKey::N,
+                mods: crate::terminal::KeyMods {
+                    shift: true,
+                    alt: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                utf8: Some("N"),
+                unshifted: Some('n'),
             },
-            repeat: false,
-            utf8: Some("N"),
-            unshifted: Some('n'),
-        });
-        let right_action = bindings.action_for_input(KeyInput {
-            key: TerminalKey::N,
-            mods: crate::terminal::KeyMods {
-                shift: true,
-                alt: true,
-                right_alt: true,
-                ..Default::default()
+        );
+        let right_action = keybind_action_for_input(
+            &mut bindings,
+            KeyInput {
+                key: TerminalKey::N,
+                mods: crate::terminal::KeyMods {
+                    shift: true,
+                    alt: true,
+                    right_alt: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                utf8: Some("N"),
+                unshifted: Some('n'),
             },
-            repeat: false,
-            utf8: Some("N"),
-            unshifted: Some('n'),
-        });
+        );
 
         assert_eq!(left_action, Some(KeybindAction::Mux(MuxKeyAction::NextTab)));
         assert_eq!(
@@ -1393,16 +1457,19 @@ mod tests {
             Some(KeybindAction::Write(b"\x1b090;8~".to_vec()))
         );
         assert_eq!(
-            bindings.action_for_input(KeyInput {
-                key: TerminalKey::B,
-                mods: crate::terminal::KeyMods {
-                    command: true,
-                    ..Default::default()
+            keybind_action_for_input(
+                &mut bindings,
+                KeyInput {
+                    key: TerminalKey::B,
+                    mods: crate::terminal::KeyMods {
+                        command: true,
+                        ..Default::default()
+                    },
+                    repeat: false,
+                    utf8: Some("b"),
+                    unshifted: Some('b'),
                 },
-                repeat: false,
-                utf8: Some("b"),
-                unshifted: Some('b'),
-            }),
+            ),
             Some(KeybindAction::Write(b"\x1b090;8~".to_vec()))
         );
         assert_eq!(
@@ -1427,7 +1494,7 @@ mod tests {
         );
         assert_eq!(
             action_for_key(&mut bindings, egui::Key::C, cmd),
-            Some(KeybindAction::CopyToClipboard)
+            Some(KeybindAction::CopyToClipboard(CopyToClipboard::Mixed))
         );
         assert_eq!(
             action_for_key(&mut bindings, egui::Key::V, cmd),
@@ -1447,7 +1514,7 @@ mod tests {
         );
         assert_eq!(
             action_for_key(&mut bindings, egui::Key::Q, cmd),
-            Some(KeybindAction::App(AppAction::Close))
+            Some(KeybindAction::App(AppAction::Quit))
         );
         assert_eq!(
             action_for_key(
@@ -1513,16 +1580,19 @@ mod tests {
             (TerminalKey::C, 'c', AppAction::EditSpace),
         ] {
             assert_eq!(
-                bindings.action_for_input(KeyInput {
-                    key,
-                    mods: crate::terminal::KeyMods {
-                        ctrl: true,
-                        ..Default::default()
+                keybind_action_for_input(
+                    &mut bindings,
+                    KeyInput {
+                        key,
+                        mods: crate::terminal::KeyMods {
+                            ctrl: true,
+                            ..Default::default()
+                        },
+                        repeat: false,
+                        utf8: None,
+                        unshifted: Some(unshifted),
                     },
-                    repeat: false,
-                    utf8: None,
-                    unshifted: Some(unshifted),
-                }),
+                ),
                 Some(KeybindAction::App(action))
             );
         }
@@ -1548,16 +1618,19 @@ mod tests {
             .keybinds_for_backend(crate::config::MultiplexerBackendConfig::Native);
         let mut bindings = AppKeyBindings::from_keybinds(&keybinds).unwrap();
 
-        let action = bindings.action_for_input(KeyInput {
-            key: TerminalKey::T,
-            mods: crate::terminal::KeyMods {
-                command: true,
-                ..Default::default()
+        let action = keybind_action_for_input(
+            &mut bindings,
+            KeyInput {
+                key: TerminalKey::T,
+                mods: crate::terminal::KeyMods {
+                    command: true,
+                    ..Default::default()
+                },
+                repeat: false,
+                utf8: Some("t"),
+                unshifted: Some('t'),
             },
-            repeat: false,
-            utf8: Some("t"),
-            unshifted: Some('t'),
-        });
+        );
 
         assert_eq!(action, Some(KeybindAction::Mux(MuxKeyAction::NewTab)));
     }

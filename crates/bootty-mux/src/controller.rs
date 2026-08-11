@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +30,11 @@ pub const MUX_SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// a frame, and nobody is reading the sidebar, so it drops to a cadence that still notices sessions
 /// coming and going without paying 4 processes a second to watch them.
 pub const MUX_SESSION_REFRESH_INTERVAL_UNFOCUSED: Duration = Duration::from_secs(2);
+static NEXT_BINDING_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_binding_generation() -> u64 {
+    NEXT_BINDING_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// The session-poll cadence a window with this focus state should use.
 pub fn mux_session_refresh_interval(focused: bool) -> Duration {
@@ -230,11 +238,11 @@ fn command_session_id(command: &MuxCommand) -> &str {
         | MuxCommand::MoveWindowPreservingSelection { session_id, .. }
         | MuxCommand::SplitPane { session_id, .. }
         | MuxCommand::SelectPane { session_id, .. }
-        | MuxCommand::SelectNextPane { session_id }
-        | MuxCommand::SelectPreviousPane { session_id }
+        | MuxCommand::SelectNextPane { session_id, .. }
+        | MuxCommand::SelectPreviousPane { session_id, .. }
         | MuxCommand::KillPane { session_id, .. }
         | MuxCommand::ClosePane { session_id, .. }
-        | MuxCommand::TogglePaneZoom { session_id }
+        | MuxCommand::TogglePaneZoom { session_id, .. }
         | MuxCommand::CreateProjectSession { session_id, .. }
         | MuxCommand::CreateWorktreeSession { session_id, .. }
         | MuxCommand::RenameSession { session_id, .. }
@@ -343,7 +351,9 @@ impl MuxResourceKey {
 pub struct BindingMuxController {
     controller: MuxController,
     last_error: Option<String>,
+    availability_error: Option<String>,
     refresh_completed: bool,
+    refresh_failed: bool,
     binding_generation: u64,
     resource_generations: BTreeMap<MuxResourceKey, u64>,
     observed_resources: BTreeMap<MuxResourceKey, String>,
@@ -361,8 +371,10 @@ impl BindingMuxController {
         Self {
             controller: MuxController::with_scope(scope),
             last_error: None,
+            availability_error: None,
             refresh_completed: false,
-            binding_generation: 1,
+            refresh_failed: false,
+            binding_generation: next_binding_generation(),
             resource_generations: BTreeMap::new(),
             observed_resources: BTreeMap::new(),
             observed_backend: None,
@@ -373,8 +385,10 @@ impl BindingMuxController {
         Self {
             controller: MuxController::new(),
             last_error: None,
+            availability_error: None,
             refresh_completed: false,
-            binding_generation: 1,
+            refresh_failed: false,
+            binding_generation: next_binding_generation(),
             resource_generations: BTreeMap::new(),
             observed_resources: BTreeMap::new(),
             observed_backend: None,
@@ -386,6 +400,15 @@ impl BindingMuxController {
 
     pub fn set_error(&mut self, error: Option<String>) {
         self.last_error = error;
+    }
+
+    pub fn set_availability_error(&mut self, error: Option<String>) {
+        self.availability_error.clone_from(&error);
+        self.last_error = error;
+    }
+
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.availability_error.as_deref()
     }
 
     pub fn take_refresh_completed(&mut self) -> bool {
@@ -404,6 +427,9 @@ impl BindingMuxController {
         let Some(scope) = self.controller.scope else {
             return BindingOperationOutcome::Supported(());
         };
+        if self.availability_error.is_some() {
+            return BindingOperationOutcome::Unavailable;
+        }
         if self
             .controller
             .build_backend(config)
@@ -458,29 +484,26 @@ impl BindingMuxController {
                     MuxResourceKey::Window(session.id.clone(), window.id.clone()),
                     String::new(),
                 );
-                for pane in &window.panes {
+                for pane in std::iter::once(&window.anchor).chain(&window.panes) {
                     let Some(pane_id) = &pane.pane_id else {
                         continue;
                     };
                     let path = (session.id.clone(), window.id.clone(), pane_id.clone());
+                    let occupant = format!("{:?}:{:?}", pane.pane_pid, pane.process);
                     current.insert(
                         MuxResourceKey::Pane(path.0.clone(), path.1.clone(), path.2.clone()),
-                        String::new(),
+                        occupant.clone(),
                     );
-                    current.insert(
-                        MuxResourceKey::Terminal(path.0, path.1, path.2),
-                        format!("{:?}:{:?}", pane.pane_pid, pane.process),
-                    );
+                    current.insert(MuxResourceKey::Terminal(path.0, path.1, path.2), occupant);
                 }
             }
         }
         for (key, fingerprint) in &current {
             let reappeared = !self.observed_resources.contains_key(key);
-            let occupant_changed = matches!(key, MuxResourceKey::Terminal(..))
-                && self
-                    .observed_resources
-                    .get(key)
-                    .is_some_and(|previous| previous != fingerprint);
+            let occupant_changed = self
+                .observed_resources
+                .get(key)
+                .is_some_and(|previous| previous != fingerprint);
             match self.resource_generations.get_mut(key) {
                 Some(generation) if reappeared || occupant_changed => {
                     *generation = generation.saturating_add(1);
@@ -494,15 +517,42 @@ impl BindingMuxController {
         self.observed_resources = current;
     }
 
+    pub fn synchronize_resource_generations(&mut self) {
+        self.record_resource_snapshot();
+    }
+
+    pub fn create_project_session(
+        &mut self,
+        request: NewMuxSessionRequest,
+        repaint: &RepaintHandle,
+        config: &MultiplexerConfig,
+    ) {
+        self.controller
+            .create_project_session(request, repaint, config);
+        self.record_resource_snapshot();
+    }
+
+    pub fn execute_command(
+        &mut self,
+        repaint: &RepaintHandle,
+        config: &MultiplexerConfig,
+        command: MuxCommand,
+    ) {
+        self.controller.execute_command(repaint, config, command);
+        self.record_resource_snapshot();
+    }
+
     pub fn refresh_sessions(
         &mut self,
         repaint: &RepaintHandle,
         config: &MultiplexerConfig,
     ) -> Option<String> {
-        let recovering = self.last_error.is_some();
+        let recovering = self.refresh_failed;
         let error = self.controller.refresh_sessions(repaint, config);
         if let Some(error) = &error {
             self.last_error = Some(error.clone());
+            self.refresh_failed = true;
+            self.availability_error = Some(error.clone());
         } else if self.controller.take_refresh_completed() {
             let backend = self.controller.current_backend;
             let backend_changed = self
@@ -514,6 +564,8 @@ impl BindingMuxController {
             }
             self.observed_backend = backend;
             self.last_error = None;
+            self.availability_error = None;
+            self.refresh_failed = false;
             self.refresh_completed = true;
             self.record_resource_snapshot();
         }
@@ -2097,7 +2149,7 @@ mod tests {
 
         binding.controller.sessions[0].windows[0].panes[0].pane_pid = Some(11);
         binding.record_resource_snapshot();
-        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(1));
+        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(2));
         assert_eq!(binding.terminal_generation("$1", "@1", "%1"), Some(2));
 
         binding.controller.sessions.clear();
@@ -2107,7 +2159,7 @@ mod tests {
 
         assert_eq!(binding.session_generation("$1"), Some(2));
         assert_eq!(binding.window_generation("$1", "@1"), Some(2));
-        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(2));
+        assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(3));
         assert_eq!(binding.terminal_generation("$1", "@1", "%1"), Some(3));
     }
 
@@ -2145,6 +2197,40 @@ mod tests {
         assert_eq!(second.sessions()[0].name, "second");
         assert_eq!(first.last_error(), Some("first binding failed"));
         assert_eq!(second.last_error(), None);
+    }
+
+    #[test]
+    fn failed_binding_reports_operations_as_unavailable() {
+        let mut binding = BindingMuxController::new(MuxScope::new(
+            SpaceId::from_persistence(1),
+            BindingId::from_persistence(1),
+        ));
+        binding.set_availability_error(Some("SSH profile missing".to_owned()));
+
+        assert_eq!(
+            binding.operation_outcome(
+                &MultiplexerConfig::default(),
+                BindingOperation::CreateWindow,
+            ),
+            BindingOperationOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn prior_command_errors_do_not_make_the_binding_unavailable() {
+        let mut binding = BindingMuxController::new(MuxScope::new(
+            SpaceId::from_persistence(1),
+            BindingId::from_persistence(1),
+        ));
+        binding.set_error(Some("previous command failed".to_owned()));
+
+        assert_ne!(
+            binding.operation_outcome(
+                &MultiplexerConfig::default(),
+                BindingOperation::CreateWindow,
+            ),
+            BindingOperationOutcome::Unavailable
+        );
     }
     #[test]
     fn successful_binding_refresh_clears_only_that_bindings_error() {

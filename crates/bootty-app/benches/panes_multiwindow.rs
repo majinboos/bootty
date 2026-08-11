@@ -4,6 +4,7 @@ mod paint_plan_fixtures;
 
 use bootty_app::{
     app_actions::{AppKeyBindings, KeybindAction, MuxKeyAction},
+    commands::{CommandRegistry, CoreCommandExecutor},
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::TerminalSurface,
     paint_plan::PaintPlanner,
@@ -457,11 +458,20 @@ fn bench_tab_keybind_lookup(c: &mut Criterion) {
         b.iter(|| {
             let mut hits = 0_u8;
             for input in &inputs {
+                let executor =
+                    bindings
+                        .invocation_for_input(black_box(*input))
+                        .and_then(|invocation| {
+                            CommandRegistry::core()
+                                .resolve(invocation)
+                                .ok()
+                                .map(|resolved| resolved.executor)
+                        });
                 if matches!(
-                    bindings.action_for_input(black_box(*input)),
-                    Some(KeybindAction::Mux(
+                    executor,
+                    Some(CoreCommandExecutor::Keybind(KeybindAction::Mux(
                         MuxKeyAction::NextTab | MuxKeyAction::SelectTab(_)
-                    ))
+                    )))
                 ) {
                     hits = hits.saturating_add(1);
                 }
