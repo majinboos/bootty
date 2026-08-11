@@ -1,0 +1,3 @@
+{"request":{"sdk":"v2.session.wait","method":"POST","path":"/api/session/ses_unavailable_opaque/wait"},"response":{"error":{"name":"OperationUnavailableError","status":503}},"assert":{"available":false}}
+{"request":{"sdk":"v2.session.compact","method":"POST","path":"/api/session/ses_unavailable_opaque/compact"},"response":{"error":{"name":"OperationUnavailableError","status":503}},"assert":{"available":false}}
+{"request":{"kind":"quota"},"response":{"availability":"unavailable_without_native_fact"}}

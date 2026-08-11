@@ -1,0 +1,9 @@
+{"hook_event_name":"SessionStart","source":"startup"}
+{"hook_event_name":"NotACodexHook","session_id":"sess-invalid"}
+{"hook_event_name":"PreToolUse","session_id":"sess-invalid","turn_id":"turn-invalid","tool_name":"Bash","tool_input":{}}
+{"method":7,"params":{}}
+{"method":"turn/completed","params":{"threadId":"thread-invalid"}}
+{"method":"item/started","params":{"threadId":"thread-invalid","turnId":"turn-invalid","item":{"type":"commandExecution"}}}
+{"id":"response-without-result"}
+{"id":"both-result-and-error","result":{},"error":{"code":-1,"message":"invalid"}}
+{"method":"thread/status/changed","params":"not-an-object"}

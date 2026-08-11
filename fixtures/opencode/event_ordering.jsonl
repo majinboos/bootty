@@ -1,0 +1,4 @@
+{"id":"evt_o9_durable_2","type":"session.next.text.ended","durable":{"aggregateID":"ses_order_opaque","seq":2,"version":1},"data":{"timestamp":1730000000002,"sessionID":"ses_order_opaque","assistantMessageID":"msg_order_opaque","textID":"txt_order_opaque","text":"final"}}
+{"id":"evt_o9_live","type":"session.next.text.delta","data":{"timestamp":1730000000001,"sessionID":"ses_order_opaque","assistantMessageID":"msg_order_opaque","textID":"txt_order_opaque","delta":"frag"}}
+{"id":"evt_o9_durable_1","type":"session.next.prompt.admitted","durable":{"aggregateID":"ses_order_opaque","seq":1,"version":1},"data":{"timestamp":1730000000000,"sessionID":"ses_order_opaque","messageID":"msg_prompt_order","prompt":{"parts":[]},"delivery":"queue"}}
+{"assert":{"preserve_arrival_order":true,"preserve":["aggregateID","seq","version","id"],"live_delta_is_replay_boundary":false,"sort_by_arrival_timestamp":false}}

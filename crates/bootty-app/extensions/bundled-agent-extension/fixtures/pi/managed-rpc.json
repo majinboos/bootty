@@ -1,0 +1,231 @@
+[
+  {
+    "source": "rpc",
+    "type": "session_start",
+    "sessionId": "pi-rpc-session-01",
+    "reason": "startup",
+    "cwd": "/work/pi-demo",
+    "sessionFile": "/work/pi-demo/.pi/agent/sessions/rpc-01.jsonl",
+    "sequence": 1
+  },
+  {
+    "source": "rpc",
+    "id": "request-prompt-01",
+    "type": "response",
+    "command": "prompt",
+    "success": true,
+    "data": {},
+    "sequence": 2
+  },
+  {
+    "source": "rpc",
+    "type": "agent_start",
+    "sessionId": "pi-rpc-session-01",
+    "sequence": 3
+  },
+  {
+    "source": "rpc",
+    "type": "turn_start",
+    "sessionId": "pi-rpc-session-01",
+    "sequence": 4
+  },
+  {
+    "source": "rpc",
+    "type": "message_start",
+    "sessionId": "pi-rpc-session-01",
+    "message": { "id": "rpc-msg-01", "role": "assistant", "content": [] },
+    "sequence": 5
+  },
+  {
+    "source": "rpc",
+    "type": "tool_execution_start",
+    "sessionId": "pi-rpc-session-01",
+    "toolCallId": "rpc-tool-opaque-1",
+    "toolName": "bash",
+    "args": { "command": "printf authoritative" },
+    "sequence": 10
+  },
+  {
+    "source": "rpc",
+    "type": "tool_execution_start",
+    "sessionId": "pi-rpc-session-01",
+    "toolCallId": "rpc-tool-opaque-2",
+    "toolName": "read",
+    "args": { "path": "src/lib.rs" },
+    "sequence": 11
+  },
+  {
+    "source": "rpc",
+    "type": "tool_execution_update",
+    "sessionId": "pi-rpc-session-01",
+    "toolCallId": "rpc-tool-opaque-2",
+    "partialResult": { "bytes": 128 },
+    "sequence": 12
+  },
+  {
+    "source": "rpc",
+    "type": "tool_execution_end",
+    "sessionId": "pi-rpc-session-01",
+    "toolCallId": "rpc-tool-opaque-2",
+    "result": { "text": "fn main() {}" },
+    "isError": false,
+    "sequence": 13
+  },
+  {
+    "source": "rpc",
+    "type": "tool_execution_update",
+    "sessionId": "pi-rpc-session-01",
+    "toolCallId": "rpc-tool-opaque-1",
+    "partialResult": { "stdout": "authoritative" },
+    "sequence": 14
+  },
+  {
+    "source": "rpc",
+    "type": "tool_execution_end",
+    "sessionId": "pi-rpc-session-01",
+    "toolCallId": "rpc-tool-opaque-1",
+    "result": { "exitCode": 0 },
+    "isError": false,
+    "sequence": 15
+  },
+  {
+    "source": "rpc",
+    "type": "message_end",
+    "sessionId": "pi-rpc-session-01",
+    "message": {
+      "id": "rpc-msg-01",
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "The answer is authoritative." }],
+      "usage": {
+        "input": 210,
+        "output": 42,
+        "cacheRead": 20,
+        "cacheWrite": 0,
+        "reasoning": 12,
+        "totalTokens": 252,
+        "cost": { "input": 0.0021, "output": 0.001, "cacheRead": 0.0001, "cacheWrite": 0, "total": 0.0032 }
+      }
+    },
+    "sequence": 16
+  },
+  {
+    "source": "rpc",
+    "type": "turn_end",
+    "sessionId": "pi-rpc-session-01",
+    "message": { "id": "rpc-msg-01", "role": "assistant" },
+    "toolResults": [
+      { "toolCallId": "rpc-tool-opaque-2", "isError": false },
+      { "toolCallId": "rpc-tool-opaque-1", "isError": false }
+    ],
+    "sequence": 17
+  },
+  {
+    "source": "rpc",
+    "type": "agent_end",
+    "sessionId": "pi-rpc-session-01",
+    "messages": [{ "id": "rpc-msg-01", "role": "assistant" }],
+    "willRetry": true,
+    "sequence": 18
+  },
+  {
+    "source": "rpc",
+    "type": "compaction_start",
+    "sessionId": "pi-rpc-session-01",
+    "reason": "overflow",
+    "willRetry": true,
+    "sequence": 19
+  },
+  {
+    "source": "rpc",
+    "type": "compaction_end",
+    "sessionId": "pi-rpc-session-01",
+    "reason": "overflow",
+    "willRetry": true,
+    "compactionEntry": { "id": "rpc-entry-compact" },
+    "sequence": 20
+  },
+  {
+    "source": "rpc",
+    "type": "agent_settled",
+    "sessionId": "pi-rpc-session-01",
+    "sequence": 21
+  },
+  {
+    "source": "rpc",
+    "id": "request-state-01",
+    "type": "response",
+    "command": "get_state",
+    "success": true,
+    "data": {
+      "sessionId": "pi-rpc-session-01",
+      "thinkingLevel": "high",
+      "isStreaming": false,
+      "isCompacting": false,
+      "sessionFile": "/work/pi-demo/.pi/agent/sessions/rpc-01.jsonl",
+      "messageCount": 8,
+      "pendingMessageCount": 0
+    },
+    "sequence": 22
+  },
+  {
+    "source": "rpc",
+    "id": "request-stats-01",
+    "type": "response",
+    "command": "get_session_stats",
+    "success": true,
+    "data": {
+      "sessionId": "pi-rpc-session-01",
+      "userMessageCount": 3,
+      "assistantMessageCount": 4,
+      "toolCallCount": 2,
+      "totalMessageCount": 9,
+      "tokens": { "input": 640, "output": 210, "cacheRead": 80, "cacheWrite": 0, "total": 850 },
+      "cost": { "input": 0.0064, "output": 0.005, "cacheRead": 0.0004, "cacheWrite": 0, "total": 0.0118 },
+      "contextUsage": { "tokens": 850, "contextWindow": 200000, "percent": 0.425 }
+    },
+    "sequence": 23
+  },
+  {
+    "source": "rpc",
+    "id": "request-model-01",
+    "type": "response",
+    "command": "set_model",
+    "success": true,
+    "data": { "provider": "openai", "id": "gpt-5", "reasoning": true },
+    "sequence": 24
+  },
+  {
+    "source": "rpc",
+    "type": "thinking_level_changed",
+    "sessionId": "pi-rpc-session-01",
+    "level": "high",
+    "sequence": 25
+  },
+  {
+    "source": "rpc",
+    "id": "request-new-01",
+    "type": "response",
+    "command": "new_session",
+    "success": true,
+    "data": { "cancelled": false },
+    "sequence": 26
+  },
+  {
+    "source": "rpc",
+    "id": "request-fork-01",
+    "type": "response",
+    "command": "fork",
+    "success": true,
+    "data": { "text": "forked prompt", "cancelled": false },
+    "sequence": 27
+  },
+  {
+    "source": "rpc",
+    "id": "request-shutdown-01",
+    "type": "response",
+    "command": "abort",
+    "success": true,
+    "data": {},
+    "sequence": 28
+  }
+]

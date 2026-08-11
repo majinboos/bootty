@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "ConfigChange",
+  "hook_id": "hook-config-1",
+  "session_id": "session-opaque-1",
+  "source": "project_settings",
+  "file_path": "/work/repo/.claude/settings.json"
+}

@@ -1,0 +1,5 @@
+{"id":"evt_o1_status","type":"session.status","data":{"sessionID":"ses_o1_opaque","status":{"type":"busy"}}}
+{"id":"evt_o1_permission","type":"permission.asked","data":{"id":"per_o1_opaque","sessionID":"ses_o1_opaque","permission":"file.write","patterns":["src/**"],"metadata":{"source":"plugin"},"always":[],"tool":{"messageID":"msg_o1","callID":"call_o1"}}}
+{"id":"evt_o1_part","type":"message.part.updated","data":{"sessionID":"ses_o1_opaque","part":{"id":"prt_o1","sessionID":"ses_o1_opaque","messageID":"msg_o1","type":"text","text":"authoritative part"},"time":1730000000000}}
+{"id":"evt_o1_diff","type":"session.diff","data":{"sessionID":"ses_o1_opaque","diff":[{"file":"src/main.ts","before":"old","after":"new","additions":1,"deletions":1}]}}
+{"id":"evt_o1_tui","type":"tui.command.execute","data":{"command":"prompt.submit"}}

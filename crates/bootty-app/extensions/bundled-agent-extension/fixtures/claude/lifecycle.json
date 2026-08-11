@@ -1,0 +1,12 @@
+{
+  "hook_event_name": "SubagentStop",
+  "hook_id": "hook-subagent-stop-1",
+  "session_id": "session-opaque-1",
+  "agent_id": "agent-opaque-1",
+  "agent_type": "Explore",
+  "agent_transcript_path": "/opaque/subagents/agent-opaque-1.jsonl",
+  "stop_hook_active": false,
+  "last_assistant_message": "found the authoritative result",
+  "background_tasks": [],
+  "session_crons": []
+}

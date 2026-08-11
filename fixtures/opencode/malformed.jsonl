@@ -1,0 +1,5 @@
+{"fixture":"missing_type","payload":{"id":"evt_bad_type"},"expected":{"diagnostic":"adapter.malformed_payload"}}
+{"fixture":"status_without_status","payload":{"id":"evt_bad_status","type":"session.status","data":{"sessionID":"ses_bad_status"}},"expected":{"diagnostic":"adapter.malformed_payload"}}
+{"fixture":"permission_without_session","payload":{"id":"evt_bad_permission","type":"permission.asked","data":{"id":"per_bad"}},"expected":{"diagnostic":"adapter.malformed_payload"}}
+{"fixture":"invalid_sse","frame":"data: {not-json}\n\n","expected":{"diagnostic":"adapter.malformed_payload"}}
+{"fixture":"unknown_event","payload":{"id":"evt_unknown","type":"future.event.v9","data":{"sessionID":"ses_future","opaqueField":"preserve"}},"expected":{"diagnostic":"adapter.unknown_event","forward":true}}

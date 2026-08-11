@@ -1,0 +1,144 @@
+{
+  "id": "claude",
+  "provider": "claude",
+  "name": "Claude Code",
+  "version": 1,
+  "entrypoint": "adapter.luau",
+  "assets": {
+    "hook_script": "hook.sh",
+    "hooks_config": "hooks.json",
+    "installed_hook_script": "~/.config/bootty/agents/claude-hook.sh",
+    "hook_command": "~/.config/bootty/agents/claude-hook.sh --event <hook_event_name>"
+  },
+  "protocol": {
+    "interactive": {
+      "transport": "hooks",
+      "input": "authoritative-json",
+      "hook_handler": "command-or-http",
+      "ordering": "native-arrival-only",
+      "controls": {
+        "prompt": "unavailable",
+        "follow_up": "unavailable",
+        "interrupt": "unavailable",
+        "cancel_queued": "unavailable",
+        "model": "unavailable",
+        "permission_mode": "unavailable",
+        "task_stop": "unavailable",
+        "close": "unavailable"
+      },
+      "authority": "hook-payload-only"
+    },
+    "managed": {
+      "transport": "stream-json-ndjson",
+      "command": "claude",
+      "args": [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--include-hook-events",
+        "--forward-subagent-text",
+        "--replay-user-messages"
+      ],
+      "input": "SDKUserMessage",
+      "output": "SDKMessage",
+      "control": "SDKControlRequest",
+      "ordering": "native-arrival-only",
+      "authority": "stream-json-payload-only",
+      "limits": {
+        "stdin_bytes": 10485760,
+        "settings_file_bytes": 2097152,
+        "hook_output_chars": 10000,
+        "output_drain_seconds": 30,
+        "mcp_startup_seconds": 30,
+        "session_end_default_seconds": 1.5,
+        "session_end_max_seconds": 60,
+        "stop_continuation_limit": 8
+      }
+    }
+  },
+  "hooks": {
+    "session": {
+      "events": ["SessionStart", "SessionEnd"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "prompt": {
+      "events": ["UserPromptSubmit", "UserPromptExpansion"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "tool": {
+      "events": ["PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "permission": {
+      "events": ["PermissionRequest", "PermissionDenied", "Elicitation", "ElicitationResult"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "notification": {
+      "events": ["Notification", "MessageDisplay"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "subagent": {
+      "events": ["SubagentStart", "SubagentStop"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "stop": {
+      "events": ["Stop", "StopFailure"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "compaction": {
+      "events": ["PreCompact", "PostCompact"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "task": {
+      "events": ["TaskCreated", "TaskCompleted", "TeammateIdle"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "worktree": {
+      "events": ["WorktreeCreate", "WorktreeRemove"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "configuration": {
+      "events": ["Setup", "ConfigChange", "InstructionsLoaded", "CwdChanged", "DirectoryAdded", "FileChanged"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    }
+  },
+  "capabilities": {
+    "interactive_hooks": true,
+    "managed_stream_json": true,
+    "partial_messages": true,
+    "hook_events": true,
+    "subagent_text_forwarding": true,
+    "replay_user_messages": true,
+    "global_sequence": false,
+    "transcript_realtime": false,
+    "interactive_external_control": false,
+    "worktree_uuid": false,
+    "configuration_uuid": false
+  }
+}

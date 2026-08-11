@@ -1,0 +1,12 @@
+[
+  { "source": "hook", "sessionId": "pi-bad-01" },
+  { "source": "hook", "event": "not_a_pi_event", "sessionId": "pi-bad-02" },
+  { "source": "hook", "event": "agent_start" },
+  { "source": "hook", "event": "agent_start", "sessionId": "pi-bad-03", "sequence": "not-a-number" },
+  { "source": "hook", "event": "agent_start", "sessionId": "pi-bad-04", "toolCallId": { "opaque": true } },
+  { "source": "rpc", "type": "response", "id": "bad-response-01", "success": true },
+  { "source": "rpc", "type": "response", "id": "bad-response-02", "command": "get_state", "success": "yes" },
+  { "source": "rpc", "type": "unknown_rpc_event", "sessionId": "pi-bad-05" },
+  { "source": "terminal", "type": "agent_start", "sessionId": "pi-bad-06" },
+  { "source": "hook", "event": "message_update", "sessionId": "pi-bad-07", "message": { "id": "" } }
+]

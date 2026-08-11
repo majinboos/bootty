@@ -1,0 +1,5 @@
+{
+  "hook_event_name": "UnsupportedFutureEvent",
+  "session_id": "session-opaque-1",
+  "message": "must be rejected, not inferred"
+}

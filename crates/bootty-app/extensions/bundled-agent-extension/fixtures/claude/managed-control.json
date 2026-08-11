@@ -1,0 +1,8 @@
+{
+  "type": "control_request",
+  "request_id": "request-opaque-1",
+  "request": {
+    "subtype": "interrupt",
+    "cancel_queued": true
+  }
+}

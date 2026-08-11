@@ -1,0 +1,418 @@
+{
+  "id": "opencode",
+  "provider": "opencode",
+  "name": "OpenCode",
+  "version": "1.18.16",
+  "source_revision": "d041eee55c4b669f583fcbe0eb73e78d53393ae8",
+  "schema_version": 1,
+  "adapter_id": "opencode",
+  "kind": "plugin_and_server_sse",
+  "source": "adapters/opencode/plugin.ts",
+  "entrypoint": "adapter.luau",
+  "native": {
+    "package": "opencode",
+    "version": "1.18.16",
+    "source_revision": "d041eee55c4b669f583fcbe0eb73e78d53393ae8",
+    "protocol": "plugin_and_server",
+    "identity": {
+      "session": "sessionID",
+      "message": "messageID",
+      "part": "partID",
+      "permission_v1": "id/requestID",
+      "permission_v2": "id/requestID",
+      "event": "id",
+      "tool": "callID",
+      "durable": "aggregateID/seq/version"
+    }
+  },
+  "protocol": {
+    "interactive": {
+      "transport": "plugin",
+      "input": "authoritative-event-json",
+      "hook": "Hooks.event",
+      "permission_hook": "Hooks.permission.ask",
+      "ordering": "native-arrival-only",
+      "authority": "plugin-hook-payload-only",
+      "controls": {
+        "prompt": "unavailable",
+        "steer": "unavailable",
+        "follow_up": "unavailable",
+        "abort": "unavailable",
+        "completion": "status-only"
+      }
+    },
+    "managed": {
+      "transport": "http-sse-sdk",
+      "command": ["opencode", "serve"],
+      "sdk": "@opencode-ai/sdk/v2",
+      "sse": "GET /api/event",
+      "schema_inspection": "required-before-version-sensitive-decoding",
+      "ordering": "preserve-native-arrival-and-durable-sequence",
+      "authority": "server-sse-and-sdk-payload-only"
+    }
+  },
+  "existing": {
+    "mode": "interactive",
+    "source": "plugin",
+    "plugin_module": "@opencode-ai/plugin",
+    "plugin_factory": "Plugin",
+    "hooks": {
+      "event": {
+        "call": "Hooks.event",
+        "input": "{ event }",
+        "authoritative": true
+      },
+      "permission": {
+        "call": "Hooks.permission.ask",
+        "input": "{ permission, status }",
+        "authoritative": true,
+        "reply_values": ["ask", "allow", "deny"]
+      }
+    },
+    "events": {
+      "session": [
+        "session.created",
+        "session.updated",
+        "session.deleted",
+        "session.status",
+        "session.idle",
+        "session.error",
+        "session.diff",
+        "session.compacted"
+      ],
+      "message_parts": [
+        "message.updated",
+        "message.removed",
+        "message.part.updated",
+        "message.part.removed",
+        "message.part.delta"
+      ],
+      "permissions": [
+        "permission.asked",
+        "permission.replied",
+        "permission.v2.asked",
+        "permission.v2.replied"
+      ],
+      "tool": [
+        "session.next.tool.input.started",
+        "session.next.tool.input.delta",
+        "session.next.tool.input.ended",
+        "session.next.tool.called",
+        "session.next.tool.progress",
+        "session.next.tool.success",
+        "session.next.tool.failed"
+      ],
+      "compaction": [
+        "session.next.compaction.started",
+        "session.next.compaction.delta",
+        "session.next.compaction.ended"
+      ],
+      "tui": [
+        "tui.prompt.append",
+        "tui.command.execute",
+        "tui.toast.show",
+        "tui.session.select"
+      ],
+      "session_next": [
+        "session.next.prompt.admitted",
+        "session.next.prompted",
+        "session.next.agent.switched",
+        "session.next.model.switched",
+        "session.next.step.started",
+        "session.next.step.ended",
+        "session.next.step.failed",
+        "session.next.text.started",
+        "session.next.text.delta",
+        "session.next.text.ended",
+        "session.next.reasoning.started",
+        "session.next.reasoning.delta",
+        "session.next.reasoning.ended",
+        "session.next.retried",
+        "session.next.revert.staged",
+        "session.next.revert.cleared",
+        "session.next.revert.committed"
+      ]
+    },
+    "controls": {
+      "prompt": "unavailable",
+      "steer": "unavailable",
+      "follow_up": "unavailable",
+      "abort": "unavailable",
+      "permission": "permission.ask",
+      "completion": "status_only"
+    },
+    "fidelity": {
+      "native_ids": "opaque",
+      "sequence": "preserve_durable_only",
+      "partial_facts": true,
+      "terminal_association": "host_supplied_only",
+      "completion": "never_infer_from_event_absence_or_disconnect"
+    }
+  },
+  "managed": {
+    "mode": "server",
+    "launcher": {
+      "executable": "opencode",
+      "arguments": ["serve"],
+      "transport": "local_process_ipc",
+      "endpoint_default": "http://127.0.0.1:4096",
+      "hostname_default": "127.0.0.1",
+      "port_default": 4096,
+      "startup_timeout_ms": 5000
+    },
+    "server": {
+      "sse": {
+        "method": "GET",
+        "path": "/api/event",
+        "sdk_operation": "v2.event.subscribe",
+        "data": "generated V2 event union",
+        "cursor": "unsupported",
+        "last_event_id": "unsupported",
+        "replay": "unsupported",
+        "reconnect": "new_live_subscription",
+        "backoff": "bounded_exponential"
+      },
+      "sdk": {
+        "current": "@opencode-ai/sdk/v2",
+        "legacy": "@opencode-ai/sdk",
+        "directory_header": "x-opencode-directory",
+        "workspace_header": "x-opencode-workspace",
+        "runtime_schema_inspection": true
+      },
+      "auth": {
+        "scheme": "http_basic",
+        "only_when_password_configured": true,
+        "username_env": "OPENCODE_SERVER_USERNAME",
+        "password_env": "OPENCODE_SERVER_PASSWORD",
+        "default_username": "opencode",
+        "plaintext_fallback": false
+      },
+      "discovery": {
+        "mdns": "optional",
+        "service_prefix": "opencode-",
+        "default_domain": "opencode.local",
+        "trusted_endpoint_required": true
+      }
+    },
+    "controls": {
+      "create": {
+        "version": "v2",
+        "sdk_operation": "v2.session.create",
+        "method": "POST",
+        "path": "/api/session",
+        "payload_fields": ["id", "agent", "model", "location"]
+      },
+      "prompt": {
+        "version": "v2",
+        "sdk_operation": "v2.session.prompt",
+        "method": "POST",
+        "path": "/api/session/:sessionID/prompt",
+        "payload_fields": ["id", "prompt", "delivery", "resume"],
+        "delivery_values": ["steer", "queue"]
+      },
+      "abort": {
+        "version": "v2",
+        "sdk_operation": "v2.session.interrupt",
+        "method": "POST",
+        "path": "/api/session/:sessionID/interrupt",
+        "idle_result": "explicit_noop"
+      },
+      "permission": {
+        "version": "v2",
+        "sdk_operation": "v2.session.permission.reply",
+        "method": "POST",
+        "path": "/api/session/:sessionID/permission/:requestID/reply",
+        "payload_fields": ["reply", "message"],
+        "reply_values": ["once", "always", "reject"]
+      },
+      "legacy_v1": {
+        "create": "session.create",
+        "prompt": "session.prompt",
+        "prompt_async": "session.prompt_async",
+        "abort": "session.abort",
+        "permission": "permission.respond",
+        "permission_path": "/session/:sessionID/permissions/:permissionID",
+        "supported_as": "versioned_fallback"
+      },
+      "wait": {
+        "version": "v2",
+        "sdk_operation": "v2.session.wait",
+        "availability": "unsupported_by_current_core",
+        "error": "OperationUnavailableError"
+      },
+      "compact": {
+        "version": "v2",
+        "sdk_operation": "v2.session.compact",
+        "availability": "unsupported_by_current_core",
+        "error": "OperationUnavailableError"
+      },
+      "cursor_replay": "unsupported",
+      "quota": "unavailable_without_native_fact",
+      "completion": "status_or_terminal_event_only"
+    },
+    "fidelity": {
+      "native_ids": "opaque",
+      "sequence": "preserve_aggregateID_seq_version",
+      "live_deltas": "preserve_but_not_replay_boundary",
+      "missing_facts": "omit",
+      "reconnect": "availability_transition_only",
+      "completion": "never_infer_from_sse_disconnect_or_process_exit"
+    }
+  },
+  "runtime_schema_inspection": {
+    "required": true,
+    "purpose": "Discover the running SDK/event union before decoding version-sensitive names",
+    "inputs": ["generated_sdk_schema", "event_manifest", "server_capabilities"],
+    "preserve_unknown_events": true,
+    "do_not_alias_without_source_version": true,
+    "version_sensitive": {
+      "permission": ["permission.asked", "permission.replied", "permission.v2.asked", "permission.v2.replied"],
+      "session": ["session.status", "session.idle", "session.next.*"],
+      "compaction": ["session.compacted", "session.next.compaction.started", "session.next.compaction.ended"],
+      "tool": ["session.next.tool.*"],
+      "tui": ["tui.*"]
+    },
+    "diagnostic_on_unavailable_schema": true
+  },
+  "normalized_envelope": {
+    "required": ["adapter", "kind", "native_id", "facts"],
+    "optional": ["adapter_session_id", "sequence", "terminal_id", "process_id", "raw"],
+    "adapter_value": "opencode",
+    "id_policy": "opaque_strings_or_numbers_preserved_without_reformatting",
+    "fact_policy": "only_fields_present_and_schema_validated"
+  },
+  "hooks": {
+    "plugin": {
+      "events": [
+        "session.created",
+        "session.updated",
+        "session.deleted",
+        "message.updated",
+        "message.removed",
+        "message.part.updated",
+        "message.part.removed",
+        "message.part.delta",
+        "permission.asked",
+        "permission.replied",
+        "permission.v2.asked",
+        "permission.v2.replied",
+        "session.status",
+        "session.idle",
+        "session.error",
+        "session.compacted",
+        "session.diff",
+        "session.next.compaction.started",
+        "session.next.compaction.ended",
+        "session.next.tool.called",
+        "session.next.tool.progress",
+        "session.next.tool.success",
+        "session.next.tool.failed",
+        "tui.prompt.append",
+        "tui.command.execute",
+        "tui.toast.show",
+        "tui.session.select"
+      ],
+      "input": "event-hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "permission": {
+      "hook": "permission.ask",
+      "input": "permission-and-mutable-status",
+      "authoritative": true,
+      "forward": "normalize"
+    }
+  },
+  "capabilities": {
+    "existing": ["session", "message_parts", "permissions", "status", "idle", "error", "compaction", "diff", "tool", "tui"],
+    "managed": ["server_sse", "sdk_v2", "sdk_v1_fallback", "session_create", "prompt", "interrupt", "permission_reply", "runtime_schema"],
+    "unsupported": ["cursor_replay", "wait", "compact", "quota", "inferred_completion"]
+  },
+  "fidelity": {
+    "existing": "plugin hooks only; preserve opaque IDs and present facts; no controls beyond permission hook",
+    "managed": "V2 server SSE/SDK with V1 fallback; inspect runtime schema and preserve source event names",
+    "ordering": "preserve native arrival and durable aggregateID/seq/version; never synthesize replay",
+    "optional_facts": "omit absent usage, provider, model, error detail, terminal, and sequence facts"
+  },
+  "diagnostics": {
+    "malformed_payload": "adapter.malformed_payload",
+    "unknown_event": "adapter.unknown_event",
+    "schema_unavailable": "adapter.schema_unavailable",
+    "unsupported_control": "adapter.unsupported_control",
+    "stale_session": "adapter.stale_session",
+    "reconnect": "adapter.reconnected",
+    "invalid_sse": "adapter.invalid_sse",
+    "severity": ["info", "warning", "error"],
+    "raw_policy": "diagnostics_may_include_input_raw_but_normalized_facts_never_infer"
+  },
+  "installation": {
+    "kind": "plugin",
+    "files": [
+      {
+        "id": "opencode.plugin",
+        "scope": "config_directory",
+        "path": "plugins/bootty.ts",
+        "source": "plugin.ts"
+      }
+    ],
+    "config_files": ["opencode.jsonc", "opencode.json", "config.json"],
+    "config_directories": ["global_xdg", "project_opencode", "home_opencode", "OPENCODE_CONFIG_DIR"],
+    "plugin_key": "plugin",
+    "merge": {
+      "preserve_unrelated": true,
+      "deep_merge": true,
+      "deduplicate": "package_name_or_exact_file_url",
+      "resolve_paths_relative_to_declaring_config": true,
+      "idempotent": true,
+      "transactional": true
+    },
+    "confirmation": "common_dispatcher_required"
+  },
+  "installer": {
+    "transactional": true,
+    "idempotent": true,
+    "preserve_unrelated": true,
+    "show_exact_changes": true,
+    "confirmation": "common_dispatcher",
+    "destructive_confirmation": true,
+    "files": [
+      {"path": "plugins/bootty.ts", "scope": "config_directory", "operation": "merge_plugin"},
+      {"path": "opencode.jsonc", "scope": "config_directory", "operation": "merge_plugin"},
+      {"path": "opencode.json", "scope": "config_directory", "operation": "merge_plugin"}
+    ],
+    "handler": {
+      "source": "plugin.ts",
+      "preserve_existing_plugins": true
+    }
+  },
+  "fixtures": [
+    "fixtures/opencode/plugin_ingress.jsonl",
+    "fixtures/opencode/v1_permission.jsonl",
+    "fixtures/opencode/v2_permission.jsonl",
+    "fixtures/opencode/v2_create.jsonl",
+    "fixtures/opencode/v2_prompt.jsonl",
+    "fixtures/opencode/v2_interrupt.jsonl",
+    "fixtures/opencode/v1_prompt_async.jsonl",
+    "fixtures/opencode/sse_reconnect.jsonl",
+    "fixtures/opencode/event_ordering.jsonl",
+    "fixtures/opencode/config_merge.jsonl",
+    "fixtures/opencode/auth_discovery.jsonl",
+    "fixtures/opencode/unavailable_controls.jsonl",
+    "fixtures/opencode/malformed.jsonl"
+  ],
+  "fixture_paths": [
+    "fixtures/opencode/plugin_ingress.jsonl",
+    "fixtures/opencode/v1_permission.jsonl",
+    "fixtures/opencode/v2_permission.jsonl",
+    "fixtures/opencode/v2_create.jsonl",
+    "fixtures/opencode/v2_prompt.jsonl",
+    "fixtures/opencode/v2_interrupt.jsonl",
+    "fixtures/opencode/v1_prompt_async.jsonl",
+    "fixtures/opencode/sse_reconnect.jsonl",
+    "fixtures/opencode/event_ordering.jsonl",
+    "fixtures/opencode/config_merge.jsonl",
+    "fixtures/opencode/auth_discovery.jsonl",
+    "fixtures/opencode/unavailable_controls.jsonl",
+    "fixtures/opencode/malformed.jsonl"
+  ]
+}

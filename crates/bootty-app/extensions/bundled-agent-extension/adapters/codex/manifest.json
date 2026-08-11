@@ -1,0 +1,325 @@
+{
+  "id": "codex",
+  "provider": "codex",
+  "name": "OpenAI Codex CLI",
+  "version": "0.0.0",
+  "source_revision": "50ef7395faee1d0e2d01730f9636aa0601c7be3",
+  "schema_version": 1,
+  "adapter_id": "codex",
+  "kind": "hooks_and_app_server",
+  "source": "adapters/codex/adapter.luau",
+  "entrypoint": "adapter.luau",
+  "native": {
+    "package": "codex",
+    "version": "0.0.0",
+    "source_revision": "50ef7395faee1d0e2d01730f9636aa0601c7be3",
+    "protocol": "hooks_and_app_server",
+    "identity": {
+      "hook_session": "session_id",
+      "hook_turn": "turn_id",
+      "hook_tool": "tool_use_id",
+      "hook_agent": "agent_id",
+      "thread": "thread.id/threadId",
+      "thread_session": "thread.sessionId",
+      "turn": "turn.id/turnId",
+      "item": "item.id/itemId",
+      "approval": "request_id/approvalId/RPC id",
+      "request": "RPC id"
+    }
+  },
+  "protocol": {
+    "interactive": {
+      "transport": "hooks",
+      "input": "authoritative-json-stdin",
+      "hook_handler": "command",
+      "ordering": "native-arrival-only",
+      "authority": "hook-payload-only",
+      "controls": {
+        "prompt": "unavailable",
+        "steer": "unavailable",
+        "follow_up": "unavailable",
+        "abort": "unavailable",
+        "wait": "unavailable",
+        "completion": "hook-observation-only",
+        "permission": "hook-decision-only"
+      }
+    },
+    "managed": {
+      "transport": "app-server-stdio-jsonl",
+      "command": ["codex", "app-server"],
+      "input": "JSON-RPC-shaped request",
+      "output": "JSON-RPC-shaped response-or-notification",
+      "handshake": "initialize then initialized",
+      "ordering": "preserve-native-arrival-only",
+      "authority": "typed-app-server-payload-only",
+      "jsonrpc_header": "omitted-by-native-stdio-protocol"
+    }
+  },
+  "existing": {
+    "mode": "interactive",
+    "source": "hooks",
+    "hook_handler": "command",
+    "input": "one JSON object on stdin",
+    "hooks": {
+      "session": {
+        "events": ["SessionStart", "SessionEnd"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "prompt": {
+        "events": ["UserPromptSubmit"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "tool": {
+        "events": ["PreToolUse", "PostToolUse"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "permission": {
+        "events": ["PermissionRequest"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "compaction": {
+        "events": ["PreCompact", "PostCompact"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "subagent": {
+        "events": ["SubagentStart", "SubagentStop"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "stop": {
+        "events": ["Stop"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "end": {
+        "events": ["SessionEnd"],
+        "authoritative": true,
+        "forward": "normalize"
+      }
+    },
+    "fidelity": {
+      "native_ids": "opaque",
+      "sequence": "not supplied by hook protocol",
+      "partial_facts": true,
+      "terminal_association": "host-supplied-only",
+      "transcript_path": "metadata-only; never read by adapter"
+    }
+  },
+  "managed": {
+    "mode": "app_server",
+    "launcher": {
+      "executable": "codex",
+      "arguments": ["app-server"],
+      "transport": "stdio_jsonl",
+      "framing": "LF-delimited JSON",
+      "startup": "initialize/initialized handshake"
+    },
+    "handshake": {
+      "request": "initialize",
+      "acknowledgement": "initialized",
+      "client_info_required": ["name", "title", "version"],
+      "capabilities": ["experimentalApi", "requestAttestation", "optOutNotificationMethods", "extensions", "mcpServerOpenaiFormElicitation"],
+      "experimental_gate": true
+    },
+    "notifications": {
+      "thread": ["thread/started", "thread/status/changed", "thread/closed"],
+      "turn": ["turn/started", "turn/completed"],
+      "item": ["item/started", "item/completed", "item/agentMessage/delta", "item/commandExecution/outputDelta", "item/commandExecution/terminalInteraction", "item/fileChange/outputDelta", "item/mcpToolCall/progress", "item/reasoning/summaryTextDelta", "item/reasoning/summaryPartAdded"],
+      "approval": ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval", "serverRequest/resolved"],
+      "plan": ["turn/plan/updated", "item/plan/delta"],
+      "compaction": ["item/started", "item/completed", "thread/compacted", "item/started(type=contextCompaction)", "item/completed(type=contextCompaction)", "thread/compacted(deprecated)"],
+      "interruption": ["turn/completed", "turn/completed(status=interrupted)"],
+      "token": ["thread/tokenUsage/updated"],
+      "hook": ["hook/started", "hook/completed"]
+    },
+    "server_requests": {
+      "approval": ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"],
+      "response_correlation": "RPC id and optional approvalId are opaque"
+    },
+    "methods": [
+      "initialize",
+      "initialized",
+      "thread/start",
+      "thread/resume",
+      "thread/fork",
+      "thread/unsubscribe",
+      "thread/archive",
+      "thread/delete",
+      "thread/unarchive",
+      "thread/settings/update",
+      "thread/inject_items",
+      "thread/compact/start",
+      "thread/shellCommand",
+      "turn/start",
+      "turn/steer",
+      "turn/interrupt"
+    ],
+    "control_methods": ["thread/start", "thread/resume", "thread/fork", "thread/compact/start", "turn/start", "turn/steer", "turn/interrupt", "thread/unsubscribe", "thread/archive", "thread/delete", "thread/unarchive", "thread/settings/update", "thread/inject_items", "thread/shellCommand"],
+    "controls": {
+      "prompt": "turn/start",
+      "steer": "turn/steer with expectedTurnId",
+      "follow_up": "turn/steer with expectedTurnId",
+      "abort": "turn/interrupt; terminal status is interrupted",
+      "wait": "unsupported; observe typed notifications",
+      "completion": "turn/completed status only",
+      "permission": "typed approval request response",
+      "compaction": "thread/compact/start and contextCompaction item",
+      "thread_resume": "thread/resume",
+      "thread_fork": "thread/fork",
+      "shutdown": "transport/process lifecycle; never synthesize completion"
+    },
+    "version_sensitive_methods": ["thread/backgroundTerminals/*", "command/exec*", "rawResponse/*", "thread/realtime/*", "process/*"]
+  },
+  "hooks": {
+    "session": {
+      "events": ["SessionStart", "SessionEnd"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "prompt": {
+      "events": ["UserPromptSubmit"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "tool": {
+      "events": ["PreToolUse", "PostToolUse"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "permission": {
+      "events": ["PermissionRequest"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "compaction": {
+      "events": ["PreCompact", "PostCompact"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "subagent": {
+      "events": ["SubagentStart", "SubagentStop"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "stop": {
+      "events": ["Stop"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    },
+    "end": {
+      "events": ["SessionEnd"],
+      "input": "hook-json",
+      "authoritative": true,
+      "forward": "normalize"
+    }
+  },
+  "capabilities": {
+    "existing": ["session", "prompt_observation", "tool_observation", "permission_observation", "compaction_observation", "subagent_observation", "stop_observation", "end_observation"],
+    "managed": ["thread", "turn", "item", "approval", "plan", "compaction", "interruption", "token_usage", "prompt", "steer", "follow_up", "abort", "thread_resume", "thread_fork"],
+    "unsupported": ["existing_prompt_control", "existing_steer", "existing_follow_up", "existing_abort", "existing_wait", "universal_cost", "rate_limit", "terminal_association", "inferred_completion", "transcript_stream"],
+    "partial": ["usage", "reasoning", "permission", "hook_order"]
+  },
+  "normalized_envelope": {
+    "required": ["adapter", "kind", "native_id", "facts"],
+    "optional": ["adapter_session_id", "sequence", "terminal_id", "process_id", "raw"],
+    "adapter_value": "codex",
+    "id_policy": "opaque strings or numbers preserved without reformatting",
+    "fact_policy": "only fields present in schema-valid native payloads; absent fields omitted",
+    "raw_policy": "retain original hook or app-server object for diagnostics and forward compatibility"
+  },
+  "fidelity_limits": [
+    "transcript_path is metadata only; transcript files are not stable and are never read",
+    "terminal text, screen state, process names, and transcript tails are never authoritative",
+    "hook handlers do not provide a global sequence or total order; preserve only supplied sequence metadata",
+    "thread/completed is authoritative only with its native status; turn interruption is status=interrupted",
+    "contextCompaction item is preferred over deprecated thread/compacted",
+    "token usage is present only when thread/tokenUsage/updated is emitted; no universal cost or rate limit fact",
+    "approval requests are server requests correlated by opaque RPC/request/approval IDs",
+    "existing interactive hooks expose no documented prompt, steer, follow-up, interrupt, wait, or close control",
+    "managed prompt admission is not turn completion; observe turn and item notifications",
+    "unknown app-server notifications are retained as raw protocol data and never aliased without a source schema"
+  ],
+  "diagnostics": {
+    "malformed_payload": "adapter.malformed_event",
+    "malformed_json": "adapter.malformed_json",
+    "unknown_hook": "adapter.malformed_event",
+    "unknown_notification": "adapter.unknown_notification",
+    "unsupported_control": "adapter.unsupported_control",
+    "stale_session": "adapter.stale_session",
+    "reconnect": "adapter.reconnected",
+    "handshake": "adapter.handshake",
+    "host_limit": "adapter.host_limit",
+    "raw_policy": "diagnostics preserve raw input; normalized facts never infer",
+    "severity": ["info", "warning", "error"]
+  },
+  "installation": {
+    "kind": "hooks",
+    "assets": {
+      "hooks_json": "hooks.json",
+      "config_toml": "config.toml",
+      "handler_command": "bootty command agents.ingest --adapter codex --stdin-json"
+    },
+    "config_files": ["~/.codex/hooks.json", "~/.codex/config.toml", ".codex/hooks.json", ".codex/config.toml"],
+    "managed_hooks": "Codex managed hooks are enabled only when hooks/list confirms discovery",
+    "merge": {
+      "preserve_unrelated": true,
+      "append_handlers": true,
+      "idempotent": true,
+      "transactional": true,
+      "project_requires_trust": true
+    },
+    "confirmation": "common_dispatcher_required"
+  },
+  "installer": {
+    "transactional": true,
+    "idempotent": true,
+    "preserve_unrelated": true,
+    "show_exact_changes": true,
+    "confirmation": "common_dispatcher",
+    "destructive_confirmation": true,
+    "files": [
+      {"path": "hooks.json", "scope": "bundle", "operation": "copy_as_hooks_json_source", "format": "json"},
+      {"path": "config.toml", "scope": "bundle", "operation": "copy_as_inline_hooks_source", "format": "toml"},
+      {"path": "~/.codex/hooks.json", "format": "json", "scope": "user", "operation": "merge_hooks_append"},
+      {"path": "~/.codex/config.toml", "format": "toml", "scope": "user", "operation": "merge_hooks_append"},
+      {"path": ".codex/hooks.json", "format": "json", "scope": "project", "operation": "merge_hooks_append_trusted_only"},
+      {"path": ".codex/config.toml", "format": "toml", "scope": "project", "operation": "merge_hooks_append_trusted_only"}
+    ],
+    "handler": {
+      "type": "command",
+      "command": "bootty command agents.ingest --adapter codex --stdin-json",
+      "stdin": "one JSON hook object",
+      "preserve_existing_handlers": true
+    },
+    "managed_hooks": {
+      "supported": true,
+      "trust": "managed hooks bypass user trust; do not claim active until hooks/list confirms"
+    }
+  },
+  "fixtures": [
+    "fixtures/codex/hooks.jsonl",
+    "fixtures/codex/app-server.jsonl",
+    "fixtures/codex/controls.jsonl",
+    "fixtures/codex/malformed.jsonl",
+    "fixtures/codex/unknown.jsonl"
+  ],
+  "fixture_paths": [
+    "fixtures/codex/hooks.jsonl",
+    "fixtures/codex/app-server.jsonl",
+    "fixtures/codex/controls.jsonl",
+    "fixtures/codex/malformed.jsonl",
+    "fixtures/codex/unknown.jsonl"
+  ]
+}

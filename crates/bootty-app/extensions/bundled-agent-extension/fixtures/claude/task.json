@@ -1,0 +1,8 @@
+{
+  "hook_event_name": "TaskCreated",
+  "hook_id": "hook-task-1",
+  "session_id": "session-opaque-1",
+  "task_id": "task-opaque-1",
+  "task_subject": "review adapter events",
+  "task_description": "Check authoritative lifecycle facts"
+}

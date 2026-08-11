@@ -1,0 +1,30 @@
+{"method":"initialize","id":0,"params":{"clientInfo":{"name":"bootty","title":"Bootty Codex adapter","version":"0.0.1"},"capabilities":{"experimentalApi":true}}}
+{"id":0,"result":{"userAgent":"codex/0.0.0","codexHome":"/home/test/.codex","platformFamily":"unix","platformOs":"macos"}}
+{"method":"initialized","params":{}}
+{"method":"thread/start","id":1,"params":{"cwd":"/workspace/project","ephemeral":true}}
+{"id":1,"result":{"thread":{"id":"thread-opaque","sessionId":"session-opaque","cwd":"/workspace/project","ephemeral":true}}}
+{"method":"thread/started","params":{"thread":{"id":"thread-opaque","sessionId":"session-opaque","status":"idle","cwd":"/workspace/project"}}}
+{"method":"thread/status/changed","params":{"threadId":"thread-opaque","status":{"type":"active","activeFlags":[]}}}
+{"method":"turn/start","id":2,"params":{"threadId":"thread-opaque","input":[{"type":"text","text":"List the files"}]}}
+{"id":2,"result":{"turn":{"id":"turn-opaque","status":"inProgress"}}}
+{"method":"turn/started","params":{"threadId":"thread-opaque","turn":{"id":"turn-opaque","status":"inProgress"}}}
+{"method":"item/started","params":{"threadId":"thread-opaque","turnId":"turn-opaque","item":{"type":"agentMessage","id":"item-message-opaque"}}}
+{"method":"item/agentMessage/delta","params":{"threadId":"thread-opaque","turnId":"turn-opaque","itemId":"item-message-opaque","delta":"Listing files"}}
+{"method":"item/completed","params":{"threadId":"thread-opaque","turnId":"turn-opaque","item":{"type":"agentMessage","id":"item-message-opaque","text":"Listing files"}}}
+{"method":"item/started","params":{"threadId":"thread-opaque","turnId":"turn-opaque","item":{"type":"commandExecution","id":"item-command-opaque","command":"ls"}}}
+{"method":"item/commandExecution/outputDelta","params":{"threadId":"thread-opaque","turnId":"turn-opaque","itemId":"item-command-opaque","delta":"README.md\\n"}}
+{"method":"item/commandExecution/requestApproval","id":"approval-command-opaque","params":{"threadId":"thread-opaque","turnId":"turn-opaque","itemId":"item-command-opaque","approvalId":"approval-subcommand-opaque","command":"ls"}}
+{"id":"approval-command-opaque","result":{"decision":"accept"}}
+{"method":"serverRequest/resolved","params":{"threadId":"thread-opaque","turnId":"turn-opaque","requestId":"approval-command-opaque","result":{"decision":"accept"}}}
+{"method":"item/completed","params":{"threadId":"thread-opaque","turnId":"turn-opaque","item":{"type":"commandExecution","id":"item-command-opaque","status":"completed","exitCode":0}}}
+{"method":"turn/plan/updated","params":{"threadId":"thread-opaque","turnId":"turn-opaque","explanation":"Inspecting the workspace","plan":[{"step":"List files","status":"completed"},{"step":"Report results","status":"inProgress"}]}}
+{"method":"item/plan/delta","params":{"threadId":"thread-opaque","turnId":"turn-opaque","itemId":"item-plan-opaque","delta":"Report results"}}
+{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-opaque","turnId":"turn-opaque","tokenUsage":{"total":{"inputTokens":120,"cachedInputTokens":12,"outputTokens":40,"reasoningOutputTokens":4},"last":{"inputTokens":60,"cachedInputTokens":6,"outputTokens":20,"reasoningOutputTokens":2},"modelContextWindow":128000}}}
+{"method":"item/started","params":{"threadId":"thread-opaque","turnId":"turn-opaque","item":{"type":"contextCompaction","id":"item-compaction-opaque"}}}
+{"method":"item/completed","params":{"threadId":"thread-opaque","turnId":"turn-opaque","item":{"type":"contextCompaction","id":"item-compaction-opaque"}}}
+{"method":"turn/completed","params":{"threadId":"thread-opaque","turn":{"id":"turn-opaque","status":"completed"}}}
+{"method":"turn/interrupt","id":3,"params":{"threadId":"thread-opaque","turnId":"turn-next-opaque"}}
+{"id":3,"result":{}}
+{"method":"turn/completed","params":{"threadId":"thread-opaque","turn":{"id":"turn-next-opaque","status":"interrupted"}}}
+{"method":"thread/compacted","params":{"threadId":"thread-opaque","turnId":"turn-next-opaque"}}
+{"method":"thread/closed","params":{"threadId":"thread-opaque","reason":"archive"}}

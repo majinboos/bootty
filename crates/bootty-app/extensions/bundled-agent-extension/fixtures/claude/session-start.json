@@ -1,0 +1,11 @@
+{
+  "hook_event_name": "SessionStart",
+  "hook_id": "hook-session-start-1",
+  "session_id": "session-opaque-1",
+  "prompt_id": "prompt-opaque-1",
+  "cwd": "/work/repo",
+  "source": "startup",
+  "model": "claude-sonnet-5",
+  "permission_mode": "default",
+  "transcript_path": "/opaque/session.jsonl"
+}

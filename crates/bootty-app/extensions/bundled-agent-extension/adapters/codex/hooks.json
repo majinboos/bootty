@@ -1,0 +1,130 @@
+{
+  "description": "Bootty Codex adapter command hooks",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name SessionStart --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name SessionEnd --stdin-json",
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name UserPromptSubmit --stdin-json",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name PreToolUse --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name PermissionRequest --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name PostToolUse --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name PreCompact --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "manual|auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name PostCompact --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name SubagentStart --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name SubagentStop --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bootty command agents.ingest --adapter codex --event-name Stop --stdin-json",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

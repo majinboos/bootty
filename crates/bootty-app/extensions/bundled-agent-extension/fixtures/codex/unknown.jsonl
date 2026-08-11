@@ -1,0 +1,2 @@
+{"method":"thread/futureNotification","params":{"threadId":"thread-opaque","futureField":"preserve-me"}}
+{"method":"future/noIdentity","params":{}}

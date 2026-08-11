@@ -1,0 +1,7 @@
+{
+  "hook_event_name": "PostCompact",
+  "hook_id": "hook-compact-1",
+  "session_id": "session-opaque-1",
+  "trigger": "manual",
+  "compact_summary": "preserved decisions and open work"
+}

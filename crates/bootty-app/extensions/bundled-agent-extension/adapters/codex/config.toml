@@ -1,0 +1,83 @@
+[features]
+hooks = true
+
+[[hooks.SessionStart]]
+matcher = "startup|resume|clear|compact"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name SessionStart --stdin-json"
+timeout = 600
+
+[[hooks.SessionEnd]]
+matcher = "other"
+
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name SessionEnd --stdin-json"
+timeout = 1
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name UserPromptSubmit --stdin-json"
+timeout = 30
+
+[[hooks.PreToolUse]]
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name PreToolUse --stdin-json"
+timeout = 600
+
+[[hooks.PermissionRequest]]
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name PermissionRequest --stdin-json"
+timeout = 600
+
+[[hooks.PostToolUse]]
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name PostToolUse --stdin-json"
+timeout = 600
+
+[[hooks.PreCompact]]
+matcher = "manual|auto"
+
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name PreCompact --stdin-json"
+timeout = 600
+
+[[hooks.PostCompact]]
+matcher = "manual|auto"
+
+[[hooks.PostCompact.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name PostCompact --stdin-json"
+timeout = 600
+
+[[hooks.SubagentStart]]
+
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name SubagentStart --stdin-json"
+timeout = 600
+
+[[hooks.SubagentStop]]
+
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name SubagentStop --stdin-json"
+timeout = 600
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "bootty command agents.ingest --adapter codex --event-name Stop --stdin-json"
+timeout = 600

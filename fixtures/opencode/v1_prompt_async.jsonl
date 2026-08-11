@@ -1,0 +1,3 @@
+{"request":{"sdk":"session.prompt_async","method":"POST","path":"/session/ses_async_opaque/prompt_async","body":{"parts":[{"type":"text","text":"run asynchronously"}]}},"response":{"status":204},"assert":{"completion_source":"subsequent_authoritative_events"}}
+{"id":"evt_o7_started","type":"session.status","data":{"sessionID":"ses_async_opaque","status":{"type":"busy"}}}
+{"id":"evt_o7_idle","type":"session.idle","data":{"sessionID":"ses_async_opaque"}}

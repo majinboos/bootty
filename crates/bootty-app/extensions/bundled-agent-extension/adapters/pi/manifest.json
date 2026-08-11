@@ -1,0 +1,277 @@
+{
+  "id": "pi",
+  "provider": "pi",
+  "name": "Pi",
+  "version": "0.84.1",
+  "schema_version": 1,
+  "adapter_id": "pi",
+  "kind": "typescript_extension_and_rpc",
+  "source": "adapters/pi/adapter.luau",
+  "entrypoint": "adapter.luau",
+  "native": {
+    "package": "@earendil-works/pi-coding-agent",
+    "executable": "pi",
+    "version": "0.84.1",
+    "protocol": "typescript_extension_and_rpc",
+    "identity": {
+      "session": "sessionManager.getSessionId/sessionId",
+      "entry": "entryId/entry.id",
+      "message": "message.id",
+      "tool": "toolCallId",
+      "model": "provider+model.id",
+      "request": "RPC id",
+      "event": "eventId when supplied"
+    }
+  },
+  "protocol": {
+    "interactive": {
+      "transport": "typescript_extension",
+      "input": "authoritative-extension-event-object",
+      "hook": "pi.on(eventName, handler)",
+      "ordering": "native-arrival-only",
+      "authority": "extension-hook-payload-and-context-only",
+      "controls": {
+        "prompt": "input hook observation only",
+        "steer": "input hook observation only",
+        "follow_up": "input hook observation only",
+        "abort": "ctx.abort when invoked by native extension context",
+        "wait": "agent_settled observation",
+        "shutdown": "ctx.shutdown when invoked by native extension context"
+      }
+    },
+    "managed": {
+      "transport": "stdio_jsonl",
+      "command": ["pi", "--mode", "rpc"],
+      "input": "RPC command object",
+      "output": "response or asynchronous event object",
+      "framing": "LF-delimited JSON; optional CR stripped",
+      "ordering": "preserve-native-arrival-only",
+      "authority": "RPC response/event payload only",
+      "request_id": "optional opaque id echoed by response",
+      "event_ids": "not guaranteed"
+    }
+  },
+  "existing": {
+    "mode": "interactive",
+    "source": "extension_hook",
+    "entrypoint": "adapters/pi/extension.ts",
+    "install_path": "~/.pi/agent/extensions/bootty.ts",
+    "registration": "pi.on",
+    "hooks": {
+      "session": {
+        "events": ["session_start", "session_info_changed", "session_before_switch", "session_before_fork", "session_shutdown"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "prompt": {
+        "events": ["input", "before_agent_start"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "turn": {
+        "events": ["agent_start", "agent_end", "agent_settled", "turn_start", "turn_end"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "message": {
+        "events": ["message_start", "message_update", "message_end"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "tool": {
+        "events": ["tool_execution_start", "tool_execution_update", "tool_execution_end", "tool_call", "tool_result"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "model": {
+        "events": ["model_select", "thinking_level_select"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "usage": {
+        "events": ["message_start", "message_update", "message_end", "turn_end"],
+        "authoritative": true,
+        "forward": "normalize"
+      },
+      "compaction": {
+        "events": ["session_before_compact", "session_compact"],
+        "authoritative": true,
+        "forward": "normalize"
+      }
+    },
+    "fidelity": {
+      "native_ids": "opaque",
+      "sequence": "preserve only when supplied by host/context",
+      "partial_facts": true,
+      "terminal_association": "host-supplied-only",
+      "completion": "agent_settled-only; never infer from agent_end or hook absence"
+    }
+  },
+  "managed": {
+    "mode": "rpc",
+    "launcher": {
+      "executable": "pi",
+      "arguments": ["--mode", "rpc"],
+      "transport": "stdio_jsonl",
+      "framing": "LF-delimited JSON",
+      "stdout": "protocol-only",
+      "stderr": "diagnostic-channel"
+    },
+    "events": {
+      "lifecycle": ["agent_start", "agent_end", "agent_settled", "turn_start", "turn_end"],
+      "message": ["message_start", "message_update", "message_end"],
+      "tool": ["tool_execution_start", "tool_execution_update", "tool_execution_end"],
+      "session": ["session_info_changed", "entry_appended", "queue_update"],
+      "model": ["thinking_level_changed"],
+      "compaction": ["compaction_start", "compaction_end"],
+      "retry": ["auto_retry_start", "auto_retry_end", "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished"],
+      "extension": ["extension_error"]
+    },
+    "commands": [
+      "prompt", "steer", "follow_up", "abort", "get_state", "new_session", "switch_session", "fork", "clone",
+      "get_fork_messages", "get_entries", "get_tree", "get_messages", "set_session_name", "set_model", "cycle_model",
+      "get_available_models", "set_thinking_level", "cycle_thinking_level", "get_available_thinking_levels",
+      "set_steering_mode", "set_follow_up_mode", "compact", "set_auto_compaction", "get_session_stats",
+      "set_auto_retry", "abort_retry", "bash", "abort_bash", "export_html"
+    ],
+    "controls": {
+      "prompt": "prompt; streamingBehavior steer or followUp when already streaming",
+      "steer": "steer",
+      "follow_up": "follow_up",
+      "abort": "abort",
+      "state": "get_state",
+      "session_new": "new_session",
+      "session_switch": "switch_session",
+      "session_fork": "fork",
+      "session_clone": "clone",
+      "entries": "get_entries with opaque since cursor",
+      "tree": "get_tree",
+      "model": "set_model/cycle_model",
+      "reasoning": "set_thinking_level/cycle_thinking_level",
+      "compaction": "compact",
+      "stats": "get_session_stats",
+      "retry": "set_auto_retry/abort_retry",
+      "wait": "unsupported; observe agent_settled",
+      "shutdown": "EOF, SIGHUP, or SIGTERM; no RPC shutdown command"
+    },
+    "fidelity": {
+      "native_ids": "opaque",
+      "sequence": "preserve only supplied sequence; never arrival-index",
+      "message_update": "delta-only on wire; final message_end is authoritative",
+      "tool_order": "correlate by toolCallId; parallel updates and completion order may differ",
+      "prompt_response": "admission/queue acknowledgement, not completion",
+      "completion": "agent_settled-only; agent_end may carry willRetry"
+    }
+  },
+  "hooks": {
+    "extension": {
+      "entrypoint": "adapters/pi/extension.ts",
+      "events": [
+        "session_start", "session_info_changed", "session_before_switch", "session_before_fork", "session_before_compact", "session_compact", "session_shutdown",
+        "input", "before_agent_start", "agent_start", "agent_end", "agent_settled", "turn_start", "turn_end",
+        "message_start", "message_update", "message_end", "tool_execution_start", "tool_execution_update", "tool_execution_end",
+        "tool_call", "tool_result", "model_select", "thinking_level_select"
+      ],
+      "input": "extension-event-object",
+      "authoritative": true,
+      "forward": "normalize"
+    }
+  },
+  "capabilities": {
+    "existing": ["lifecycle", "prompt_observation", "turn_observation", "message", "tool", "model", "reasoning", "usage", "cost", "compaction", "session_switch", "session_fork", "shutdown", "settled"],
+    "managed": ["lifecycle", "message", "turn", "tool", "model", "reasoning", "usage", "cost", "compaction", "session_switch", "session_fork", "shutdown", "settled", "prompt", "steer", "follow_up", "abort", "state", "stats", "retry"],
+    "unsupported": ["interactive_external_prompt_control", "interactive_external_steer", "interactive_external_follow_up", "interactive_external_wait", "rpc_wait", "rpc_shutdown_command", "permission_decision_event", "rate_limit", "quota", "universal_billing", "inferred_completion", "terminal_association"],
+    "partial": ["usage", "reasoning", "cost", "hook_order", "message_deltas", "compaction_retry"]
+  },
+  "normalized_envelope": {
+    "required": ["adapter", "kind", "native_id", "facts"],
+    "optional": ["adapter_session_id", "sequence", "terminal_id", "process_id", "raw"],
+    "adapter_value": "pi",
+    "id_policy": "opaque strings or numbers preserved without reformatting",
+    "fact_policy": "only fields explicitly present in authoritative hook/RPC payloads; absent fields omitted",
+    "raw_policy": "retain original authoritative hook/RPC object for diagnostics and forward compatibility"
+  },
+  "fidelity": {
+    "existing": "extension hooks only; preserve native IDs and present facts; no external control claims",
+    "managed": "pi --mode rpc commands and asynchronous events over LF JSONL; preserve native arrival and opaque IDs",
+    "ordering": "preserve native arrival and supplied sequence; never synthesize ordering",
+    "optional_facts": "omit absent usage, reasoning, cost, terminal, process, and sequence facts"
+  },
+  "fidelity_limits": [
+    "agent_end is an intermediate outcome; agent_settled is the authoritative no-continuation boundary",
+    "RPC message_update contains deltas only; message_end.message is authoritative for the final message",
+    "tool execution updates and ends can interleave; toolCallId is the only tool correlation identity",
+    "the extension API has no dedicated permission-decision, rate-limit, quota, or independent billing event",
+    "usage, reasoning, and cost remain absent when the provider omits them",
+    "session_before_switch and session_before_fork are preflight hooks; cancelled responses are refusals",
+    "RPC has no shutdown command; EOF, SIGHUP, or SIGTERM terminate the managed worker",
+    "prompt responses acknowledge admission or queueing, not completion",
+    "terminal text, process names, screen state, and transcript tails are never authoritative"
+  ],
+  "diagnostics": {
+    "malformed_payload": "adapter.malformed_event",
+    "malformed_json": "adapter.malformed_json",
+    "unknown_hook": "adapter.unsupported_event",
+    "unknown_rpc_event": "adapter.unsupported_event",
+    "unsupported_control": "adapter.unsupported_control",
+    "stale_session": "adapter.stale_session",
+    "reconnect": "adapter.reconnected",
+    "host_limit": "adapter.host_limit",
+    "raw_policy": "diagnostics preserve raw input; normalized facts never infer",
+    "severity": ["info", "warning", "error"]
+  },
+  "installation": {
+    "kind": "typescript_extension",
+    "files": [
+      {
+        "id": "pi.extension",
+        "scope": "home",
+        "path": "~/.pi/agent/extensions/bootty.ts",
+        "source": "adapters/pi/extension.ts"
+      }
+    ],
+    "config_directory": "~/.pi/agent",
+    "project_config_directory": ".pi",
+    "project_trust_required": true,
+    "merge": {
+      "preserve_unrelated": true,
+      "append_extension": true,
+      "idempotent": true,
+      "transactional": true,
+      "show_exact_changes": true
+    },
+    "confirmation": "common_dispatcher_required",
+    "destructive_confirmation": true
+  },
+  "installer": {
+    "transactional": true,
+    "idempotent": true,
+    "preserve_unrelated": true,
+    "show_exact_changes": true,
+    "confirmation": "common_dispatcher",
+    "destructive_confirmation": true,
+    "files": [
+      { "path": "~/.pi/agent/extensions/bootty.ts", "format": "typescript", "scope": "user", "operation": "write_exact_source" },
+      { "path": ".pi/extensions/bootty.ts", "format": "typescript", "scope": "project", "operation": "write_exact_source_trusted_only" }
+    ],
+    "source": "adapters/pi/extension.ts",
+    "handler": {
+      "type": "command",
+      "command": "bootty command agents.ingest --adapter pi --stdin-json",
+      "stdin": "one normalized JSON event",
+      "preserve_existing_extensions": true
+    }
+  },
+  "fixtures": [
+    "fixtures/pi/existing-hooks.json",
+    "fixtures/pi/managed-rpc.json",
+    "fixtures/pi/session-operations.json",
+    "fixtures/pi/malformed-events.json"
+  ],
+  "fixture_paths": [
+    "fixtures/pi/existing-hooks.json",
+    "fixtures/pi/managed-rpc.json",
+    "fixtures/pi/session-operations.json",
+    "fixtures/pi/malformed-events.json"
+  ]
+}

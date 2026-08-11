@@ -1,0 +1,17 @@
+{
+  "type": "system",
+  "subtype": "init",
+  "uuid": "22222222-2222-4222-8222-222222222222",
+  "session_id": "session-managed-1",
+  "claude_code_version": "2.1.227",
+  "cwd": "/work/repo",
+  "tools": ["Read"],
+  "mcp_servers": [],
+  "model": "claude-sonnet-5",
+  "permissionMode": "default",
+  "slash_commands": [],
+  "output_style": "default",
+  "skills": [],
+  "plugins": [],
+  "capabilities": ["interrupt_receipt_v1", "interrupt_cancel_queued_v1"]
+}

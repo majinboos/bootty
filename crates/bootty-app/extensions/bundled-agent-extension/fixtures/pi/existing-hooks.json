@@ -1,0 +1,202 @@
+[
+  {
+    "source": "hook",
+    "event": "session_start",
+    "sessionId": "pi-hook-session-01",
+    "reason": "startup",
+    "cwd": "/work/pi-demo",
+    "sessionFile": "/work/pi-demo/.pi/agent/sessions/session-01.jsonl",
+    "mode": "tui",
+    "sequence": 1
+  },
+  {
+    "source": "hook",
+    "event": "input",
+    "sessionId": "pi-hook-session-01",
+    "text": "inspect the failing test",
+    "inputSource": "interactive",
+    "sequence": 2
+  },
+  {
+    "source": "hook",
+    "event": "before_agent_start",
+    "sessionId": "pi-hook-session-01",
+    "prompt": "inspect the failing test",
+    "sequence": 3
+  },
+  {
+    "source": "hook",
+    "event": "agent_start",
+    "sessionId": "pi-hook-session-01",
+    "sequence": 4
+  },
+  {
+    "source": "hook",
+    "event": "turn_start",
+    "sessionId": "pi-hook-session-01",
+    "turnIndex": 0,
+    "timestamp": 1786432000000,
+    "sequence": 5
+  },
+  {
+    "source": "hook",
+    "event": "message_start",
+    "sessionId": "pi-hook-session-01",
+    "message": {
+      "id": "msg-user-01",
+      "role": "user",
+      "content": [{ "type": "text", "text": "inspect the failing test" }]
+    },
+    "sequence": 6
+  },
+  {
+    "source": "hook",
+    "event": "message_update",
+    "sessionId": "pi-hook-session-01",
+    "message": {
+      "id": "msg-assistant-01",
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "I will inspect the test." }],
+      "usage": {
+        "input": 120,
+        "output": 14,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 134,
+        "cost": { "input": 0.0012, "output": 0.0004, "cacheRead": 0, "cacheWrite": 0, "total": 0.0016 }
+      }
+    },
+    "assistantMessageEvent": { "type": "text_delta", "delta": "I will inspect the test." },
+    "sequence": 7
+  },
+  {
+    "source": "hook",
+    "event": "tool_execution_start",
+    "sessionId": "pi-hook-session-01",
+    "toolCallId": "tool-call-opaque-a",
+    "toolName": "bash",
+    "args": { "command": "cargo test -p demo" },
+    "sequence": 8
+  },
+  {
+    "source": "hook",
+    "event": "tool_execution_update",
+    "sessionId": "pi-hook-session-01",
+    "toolCallId": "tool-call-opaque-a",
+    "toolName": "bash",
+    "partialResult": { "stdout": "running 1 test\n" },
+    "sequence": 9
+  },
+  {
+    "source": "hook",
+    "event": "tool_execution_end",
+    "sessionId": "pi-hook-session-01",
+    "toolCallId": "tool-call-opaque-a",
+    "toolName": "bash",
+    "result": { "exitCode": 0, "stdout": "ok\n" },
+    "isError": false,
+    "sequence": 10
+  },
+  {
+    "source": "hook",
+    "event": "message_end",
+    "sessionId": "pi-hook-session-01",
+    "message": {
+      "id": "msg-assistant-01",
+      "role": "assistant",
+      "content": [{ "type": "text", "text": "The test passes." }],
+      "usage": {
+        "input": 120,
+        "output": 32,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 8,
+        "totalTokens": 152,
+        "cost": { "input": 0.0012, "output": 0.0008, "cacheRead": 0, "cacheWrite": 0, "total": 0.002 }
+      }
+    },
+    "sequence": 11
+  },
+  {
+    "source": "hook",
+    "event": "turn_end",
+    "sessionId": "pi-hook-session-01",
+    "turnIndex": 0,
+    "message": { "id": "msg-assistant-01", "role": "assistant" },
+    "toolResults": [{ "toolCallId": "tool-call-opaque-a", "isError": false }],
+    "sequence": 12
+  },
+  {
+    "source": "hook",
+    "event": "agent_end",
+    "sessionId": "pi-hook-session-01",
+    "messages": [{ "id": "msg-assistant-01", "role": "assistant" }],
+    "willRetry": false,
+    "sequence": 13
+  },
+  {
+    "source": "hook",
+    "event": "agent_settled",
+    "sessionId": "pi-hook-session-01",
+    "sequence": 14
+  },
+  {
+    "source": "hook",
+    "event": "model_select",
+    "sessionId": "pi-hook-session-01",
+    "model": { "provider": "openai", "id": "gpt-5" },
+    "previousModel": { "provider": "openai", "id": "gpt-4.1" },
+    "selectionSource": "set",
+    "sequence": 15
+  },
+  {
+    "source": "hook",
+    "event": "thinking_level_select",
+    "sessionId": "pi-hook-session-01",
+    "level": "high",
+    "previousLevel": "medium",
+    "sequence": 16
+  },
+  {
+    "source": "hook",
+    "event": "session_before_compact",
+    "sessionId": "pi-hook-session-01",
+    "reason": "manual",
+    "preparation": { "tokens": 190000 },
+    "branchEntries": ["entry-a", "entry-b"],
+    "willRetry": false,
+    "sequence": 17
+  },
+  {
+    "source": "hook",
+    "event": "session_compact",
+    "sessionId": "pi-hook-session-01",
+    "reason": "manual",
+    "compactionEntry": { "id": "entry-compact", "usage": { "input": 20, "output": 4, "totalTokens": 24 } },
+    "fromExtension": false,
+    "sequence": 18
+  },
+  {
+    "source": "hook",
+    "event": "session_before_switch",
+    "sessionId": "pi-hook-session-01",
+    "reason": "resume",
+    "targetSessionFile": "/work/pi-demo/.pi/agent/sessions/session-02.jsonl",
+    "sequence": 19
+  },
+  {
+    "source": "hook",
+    "event": "session_before_fork",
+    "sessionId": "pi-hook-session-01",
+    "entryId": "entry-b",
+    "position": "before",
+    "sequence": 20
+  },
+  {
+    "source": "hook",
+    "event": "session_shutdown",
+    "sessionId": "pi-hook-session-01",
+    "reason": "quit",
+    "sequence": 21
+  }
+]

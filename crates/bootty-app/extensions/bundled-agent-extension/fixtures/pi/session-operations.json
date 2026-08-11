@@ -1,0 +1,97 @@
+[
+  {
+    "source": "rpc",
+    "id": "entries-01",
+    "type": "response",
+    "command": "get_entries",
+    "success": true,
+    "data": {
+      "entries": [
+        { "id": "entry-a1", "parentId": null, "timestamp": "2026-08-11T08:00:00.000Z" },
+        { "id": "entry-b2", "parentId": "entry-a1", "timestamp": "2026-08-11T08:00:01.000Z" }
+      ],
+      "leafId": "entry-b2",
+      "sessionId": "pi-rpc-session-02"
+    }
+  },
+  {
+    "source": "rpc",
+    "id": "entries-02",
+    "type": "response",
+    "command": "get_entries",
+    "success": false,
+    "error": "Unknown since cursor: entry-missing"
+  },
+  {
+    "source": "rpc",
+    "id": "tree-01",
+    "type": "response",
+    "command": "get_tree",
+    "success": true,
+    "data": {
+      "tree": [
+        { "id": "entry-a1", "parentId": null, "children": ["entry-b2"] },
+        { "id": "entry-b2", "parentId": "entry-a1", "children": [] }
+      ],
+      "leafId": "entry-b2",
+      "sessionId": "pi-rpc-session-02"
+    }
+  },
+  {
+    "source": "rpc",
+    "id": "fork-messages-01",
+    "type": "response",
+    "command": "get_fork_messages",
+    "success": true,
+    "data": {
+      "messages": [{ "entryId": "entry-a1", "text": "continue from here" }],
+      "sessionId": "pi-rpc-session-02"
+    }
+  },
+  {
+    "source": "rpc",
+    "id": "fork-01",
+    "type": "response",
+    "command": "fork",
+    "success": true,
+    "data": { "text": "continue from here", "cancelled": false, "sessionId": "pi-rpc-session-03" }
+  },
+  {
+    "source": "rpc",
+    "id": "clone-01",
+    "type": "response",
+    "command": "clone",
+    "success": true,
+    "data": { "cancelled": false, "sessionId": "pi-rpc-session-04" }
+  },
+  {
+    "source": "rpc",
+    "id": "switch-01",
+    "type": "response",
+    "command": "switch_session",
+    "success": true,
+    "data": { "cancelled": true, "sessionId": "pi-rpc-session-02" }
+  },
+  {
+    "source": "rpc",
+    "id": "switch-02",
+    "type": "response",
+    "command": "switch_session",
+    "success": true,
+    "data": { "cancelled": false, "sessionId": "pi-rpc-session-05" }
+  },
+  {
+    "source": "hook",
+    "event": "session_before_switch",
+    "sessionId": "pi-rpc-session-02",
+    "reason": "resume",
+    "targetSessionFile": "/work/pi-demo/.pi/agent/sessions/session-05.jsonl"
+  },
+  {
+    "source": "hook",
+    "event": "session_before_fork",
+    "sessionId": "pi-rpc-session-02",
+    "entryId": "entry-b2",
+    "position": "at"
+  }
+]

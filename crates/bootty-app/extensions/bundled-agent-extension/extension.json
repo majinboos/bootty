@@ -1,0 +1,9 @@
+{
+  "id": "bootty.agents",
+  "name": "Bundled agent orchestration",
+  "version": "1.0.0",
+  "entrypoint": "agent_extension.luau",
+  "storage_namespace": "agents",
+  "bundled": true,
+  "default_enabled": true
+}

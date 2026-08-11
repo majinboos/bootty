@@ -1,0 +1,6 @@
+{"id":10,"method":"initialize","params":{"clientInfo":{"name":"bootty","title":"Bootty Codex adapter","version":"0.0.1"},"capabilities":{"experimentalApi":true}}}
+{"id":11,"method":"thread/start","params":{"cwd":"/workspace/project","ephemeral":true,"model":"gpt-5-codex"}}
+{"id":12,"method":"turn/start","params":{"threadId":"thread-opaque","input":[{"type":"text","text":"Review this change"}]}}
+{"id":13,"method":"turn/steer","params":{"threadId":"thread-opaque","expectedTurnId":"turn-opaque","input":[{"type":"text","text":"Focus on tests"}]}}
+{"id":14,"method":"turn/interrupt","params":{"threadId":"thread-opaque","turnId":"turn-opaque"}}
+{"id":15,"result":{"decision":"acceptForSession"}}

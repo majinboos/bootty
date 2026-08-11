@@ -1,0 +1,4 @@
+{"scope":"global","path":"$XDG_CONFIG_HOME/opencode/opencode.json","config":{"plugin":["npm:@acme/bootty@1","file:///global/bootty.ts","npm:unrelated@1"]}}
+{"scope":"project","path":"/workspace/.opencode/opencode.jsonc","config":{"plugin":["npm:@acme/bootty@2","file:///workspace/bootty.ts","npm:unrelated@1"]}}
+{"scope":"runtime","path":"OPENCODE_CONFIG_CONTENT","config":{"plugin":["npm:@acme/other@1"]}}
+{"assert":{"merge":"deep","identity":["package_name","exact_file_url"],"winner":{"package":"npm:@acme/bootty@2","file":"file:///workspace/bootty.ts"},"preserve":["npm:unrelated@1","npm:@acme/other@1"],"resolve_relative_to":"declaring_config_file"}}

@@ -1,0 +1,3 @@
+{"id":"evt_o2_asked","type":"permission.asked","data":{"id":"per_v1_opaque","sessionID":"ses_v1_opaque","permission":"shell","patterns":["npm test"],"metadata":{"scope":"project"},"always":[],"tool":{"messageID":"msg_v1","callID":"call_v1"}}}
+{"id":"evt_o2_replied","type":"permission.replied","data":{"sessionID":"ses_v1_opaque","requestID":"per_v1_opaque","reply":"once"}}
+{"request":{"method":"POST","path":"/session/ses_v1_opaque/permissions/per_v1_opaque","body":{"response":"once"}},"response":{"status":200,"body":true}}

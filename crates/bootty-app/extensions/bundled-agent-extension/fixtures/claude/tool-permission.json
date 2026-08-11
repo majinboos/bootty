@@ -1,0 +1,14 @@
+{
+  "hook_event_name": "PreToolUse",
+  "hook_id": "hook-tool-pre-1",
+  "session_id": "session-opaque-1",
+  "tool_name": "Bash",
+  "tool_input": { "command": "npm test" },
+  "tool_use_id": "toolu-opaque-1",
+  "cwd": "/work/repo",
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "ask",
+    "permissionDecisionReason": "native permission policy"
+  }
+}

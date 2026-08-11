@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "PreToolUse",
+  "hook_id": "hook-malformed-1",
+  "tool_name": "Bash",
+  "tool_input": { "command": "echo missing tool id" }
+}
