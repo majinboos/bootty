@@ -33,6 +33,7 @@ pub enum TmuxParseError {
     MissingEntry,
     ExtraEntry,
     FormatError,
+    UnknownNotification,
     SyntaxError,
     ChecksumMismatch,
 }
@@ -158,6 +159,11 @@ pub struct TmuxClientSessionChangedNotification {
     pub session_id: usize,
     pub name: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TmuxSessionWindowChangedNotification {
+    pub session_id: usize,
+    pub window_id: usize,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TmuxControlNotification {
@@ -166,6 +172,8 @@ pub enum TmuxControlNotification {
     Output(TmuxOutputNotification),
     SessionChanged(TmuxSessionChangedNotification),
     SessionsChanged,
+    SessionRenamed(TmuxIdNameNotification),
+    SessionWindowChanged(TmuxSessionWindowChangedNotification),
     LayoutChange(TmuxLayoutChangeNotification),
     WindowAdd {
         id: usize,
@@ -384,6 +392,8 @@ impl TmuxViewerState {
                 Vec::new()
             }
             TmuxControlNotification::SessionsChanged
+            | TmuxControlNotification::SessionRenamed(_)
+            | TmuxControlNotification::SessionWindowChanged(_)
             | TmuxControlNotification::BlockError(_)
             | TmuxControlNotification::UnlinkedWindowAdd { .. }
             | TmuxControlNotification::WindowClose { .. }
@@ -777,6 +787,24 @@ fn parse_tmux_control_notification(
                 },
             ))
         }
+        "%session-renamed" => {
+            let (id, name) = split_tmux_control_rest(rest)?;
+            Ok(TmuxControlNotification::SessionRenamed(
+                TmuxIdNameNotification {
+                    id: parse_prefixed_tmux_number(id, '$')?,
+                    name: name.to_owned(),
+                },
+            ))
+        }
+        "%session-window-changed" => {
+            let parts = split_tmux_control_fields::<2>(rest)?;
+            Ok(TmuxControlNotification::SessionWindowChanged(
+                TmuxSessionWindowChangedNotification {
+                    session_id: parse_prefixed_tmux_number(parts[0], '$')?,
+                    window_id: parse_prefixed_tmux_number(parts[1], '@')?,
+                },
+            ))
+        }
         "%window-add" => Ok(TmuxControlNotification::WindowAdd {
             id: parse_prefixed_tmux_number(rest, '@')?,
         }),
@@ -832,7 +860,7 @@ fn parse_tmux_control_notification(
                 },
             ))
         }
-        _ => Err(TmuxParseError::FormatError),
+        _ => Err(TmuxParseError::UnknownNotification),
     }
 }
 
@@ -1495,7 +1523,7 @@ mod tests {
         let mut forward_compatible = TmuxControlParser::default();
         assert_eq!(
             forward_compatible.put_bytes(b"%future-notification @42\n"),
-            Err(TmuxParseError::FormatError)
+            Err(TmuxParseError::UnknownNotification)
         );
         assert_eq!(
             forward_compatible.put_bytes(b"%unlinked-window-add @42\n"),

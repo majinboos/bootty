@@ -27,11 +27,9 @@ impl ConfigHotReload {
         }
         self.last_check = now;
         let current = self.snapshot.refresh_known_paths();
-        if current == self.snapshot {
-            return false;
-        }
-        self.snapshot = current;
-        true
+        // The caller advances the baseline only after a reload commits. Keeping this snapshot
+        // dirty makes parse, validation, and persistence failures retryable.
+        current != self.snapshot
     }
 
     pub fn refresh_after_reload(&mut self, path: &Path) {
@@ -85,5 +83,21 @@ mod tests {
         let mut next = previous.clone();
         next.window.macos_titlebar_style = MacosTitlebarStyle::Hidden;
         assert!(new_session_only_config_changed(&previous, &next));
+    }
+
+    #[test]
+    fn failed_reload_keeps_watcher_dirty_until_refresh() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "title = \"before\"\n").expect("initial config");
+        let mut watcher = ConfigHotReload::new(&path);
+        std::fs::write(&path, "title = \"after\"\n").expect("changed config");
+
+        let first_check = Instant::now() + CONFIG_HOT_RELOAD_INTERVAL;
+        assert!(watcher.changed(first_check));
+        assert!(watcher.changed(first_check + CONFIG_HOT_RELOAD_INTERVAL));
+
+        watcher.refresh_after_reload(&path);
+        assert!(!watcher.changed(first_check + CONFIG_HOT_RELOAD_INTERVAL * 2));
     }
 }

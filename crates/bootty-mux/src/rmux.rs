@@ -4,6 +4,7 @@ use rmux_sdk::{Rmux, SessionName};
 
 use crate::operation::{
     MuxAllocatedResources, MuxBackendCommandCompletion, MuxBackendOperationError, MuxEventTarget,
+    RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
 };
 
 #[cfg(feature = "app")]
@@ -14,8 +15,13 @@ use crate::rmux_bridge::{
 
 #[cfg(feature = "app")]
 use super::{
-    backend::{MuxBackend, MuxEvent, MuxEventCapability, MuxEventTopic},
-    capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
+    backend::{
+        MuxBackend, MuxEvent, MuxEventCapability, MuxEventTopic, MuxScopedExecutionPrecondition,
+    },
+    capability::{
+        BindingCapabilityDescriptor, BindingOperation, BindingOperationAvailability,
+        BindingOperationOutcome,
+    },
     controller::MuxScope,
 };
 use super::{
@@ -28,7 +34,7 @@ use super::{
 
 const RMUX_FIELD_SEPARATOR: char = '\u{1f}';
 pub(crate) const RMUX_WINDOW_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{window_name}\u{1f}#{window_layout}";
-pub(crate) const RMUX_PANE_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{pane_tty}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_current_command}\u{1f}#{pane_lifecycle_generation}";
+pub(crate) const RMUX_PANE_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{pane_tty}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_current_command}\u{1f}#{pane_lifecycle_generation}\u{1f}#{pid}";
 
 pub trait RmuxSessionClient {
     fn snapshot(&self) -> Result<MuxSnapshot>;
@@ -101,6 +107,20 @@ pub trait RmuxSessionClient {
         BindingOperationOutcome::Unsupported
     }
 
+    /// Executes a preconditioned command at the client's serialized mutation boundary. Clients
+    /// without a server-side conditional protocol fail closed rather than snapshot-then-send.
+    #[cfg(feature = "app")]
+    fn execute_checked(
+        &self,
+        _command: MuxCommand,
+        _precondition: &MuxScopedExecutionPrecondition,
+    ) -> Result<()> {
+        Err(MuxBackendOperationError::unsupported(
+            "rmux client lacks an atomic checked mutation protocol",
+        )
+        .into())
+    }
+
     #[cfg(feature = "app")]
     fn event_capabilities(&self) -> Vec<MuxEventCapability> {
         MuxEventTopic::ALL
@@ -121,6 +141,8 @@ pub trait RmuxSessionClient {
     fn drain_events(&self, _scope: MuxScope, _maximum: usize) -> Vec<MuxEvent> {
         Vec::new()
     }
+    #[cfg(feature = "app")]
+    fn release_event_scope(&self, _scope: MuxScope) {}
 
     #[cfg(feature = "app")]
     fn topology_invalidated(&self) {}
@@ -367,6 +389,39 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
         RmuxBackend::execute(self, command)
     }
 
+    fn execute_checked(
+        &mut self,
+        scope: MuxScope,
+        command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<Result<()>> {
+        self.authoritative_completion = None;
+        let descriptor = self.capabilities(scope);
+        descriptor.invoke(
+            descriptor.request(command.operation()),
+            BindingOperationAvailability::Available,
+            || {
+                if let Some(precondition) = precondition {
+                    if precondition.scope != scope {
+                        return Err(MuxBackendOperationError::stale(
+                            "rmux mux binding scope changed",
+                        )
+                        .into());
+                    }
+                    // rmux's `if-shell` evaluates its predicate and only then queues the nested
+                    // command. The state lock is released between those steps, so it is not a
+                    // compare-and-swap boundary. Without a server-side CAS request, executing the
+                    // command would let a replacement occupant receive a stale mutation.
+                    return Err(MuxBackendOperationError::unsupported(
+                        RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
+                    )
+                    .into());
+                }
+                self.execute(command)
+            },
+        )
+    }
+
     fn execute_session_launch(
         &mut self,
         plan: MuxSessionLaunchPlan,
@@ -422,6 +477,9 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
     fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
         self.client.drain_events(scope, maximum)
     }
+    fn release_event_scope(&mut self, scope: MuxScope) {
+        self.client.release_event_scope(scope);
+    }
 
     fn take_authoritative_completion(&mut self) -> Option<MuxBackendCommandCompletion> {
         RmuxBackend::take_authoritative_completion(self)
@@ -452,6 +510,17 @@ pub fn rmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
             BindingOperation::RenameSession,
             BindingOperation::DitchSession,
         ],
+    )
+}
+
+/// These operations address an existing rmux resource and therefore need the checked mutation
+/// seam. rmux currently has no server-side compare-and-swap request, so the binding reports them
+/// unavailable before dispatch while the direct backend seam returns a typed `Unsupported`.
+#[cfg(feature = "app")]
+pub(crate) fn rmux_operation_requires_checked_boundary(operation: BindingOperation) -> bool {
+    !matches!(
+        operation,
+        BindingOperation::CreateProjectSession | BindingOperation::CreateWorktreeSession
     )
 }
 
@@ -513,6 +582,7 @@ impl RmuxSessionClient for SdkRmuxClient {
             BindingOperationOutcome::Stale => BindingOperationOutcome::Stale,
         }
     }
+
     fn ensure_session(&self, session_name: &str, cwd: &str) -> Result<()> {
         rmux_execute(MuxCommand::CreateProjectSession {
             session_id: session_name.to_owned(),
@@ -676,6 +746,10 @@ impl RmuxSessionClient for SdkRmuxClient {
     fn drain_events(&self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
         crate::rmux_events::drain_events(scope, maximum)
     }
+    #[cfg(feature = "app")]
+    fn release_event_scope(&self, scope: MuxScope) {
+        crate::rmux_events::release_event_scope(scope);
+    }
 
     #[cfg(feature = "app")]
     fn topology_invalidated(&self) {
@@ -710,7 +784,8 @@ pub(crate) struct RmuxPaneRow {
     pub(crate) active: bool,
     pub(crate) cwd: Option<String>,
     pub(crate) process: Option<String>,
-    /// Rmux's lifecycle generation distinguishes process replacements that retain pane identity.
+    /// Rmux's lifecycle generation is monotonic for a pane within one daemon connection. It is
+    /// embedded in the opaque occupant handle so a queued command cannot cross a replacement.
     pub(crate) occupant_id: Option<String>,
 }
 
@@ -877,21 +952,25 @@ fn parse_window_row(line: &str) -> Result<RmuxWindowRow> {
 }
 
 fn parse_pane_row(line: &str) -> Result<RmuxPaneRow> {
-    let mut fields = line.splitn(9, RMUX_FIELD_SEPARATOR);
+    let mut fields = line.splitn(10, RMUX_FIELD_SEPARATOR);
     let session_name = next_rmux_field(&mut fields, "pane session")?.to_owned();
     let window_id = next_rmux_field(&mut fields, "pane window id")?.to_owned();
     let pane_id = next_rmux_field(&mut fields, "pane id")?.to_owned();
     let terminal_id = non_empty_rmux_field(next_rmux_field(&mut fields, "pane terminal id")?);
     let index = next_rmux_field(&mut fields, "pane index")?
         .parse::<u32>()
-        .with_context(|| format!("invalid rmux pane index in {line:?}"))?;
+        .with_context(|| format!("invalid rmux pane index in line {line:?}"))?;
     let active = parse_rmux_bool(next_rmux_field(&mut fields, "pane active")?);
     let cwd = non_empty_rmux_field(next_rmux_field(&mut fields, "pane cwd")?);
     let process = non_empty_rmux_field(next_rmux_field(&mut fields, "pane process")?);
-    let occupant_id = fields
-        .next()
-        .and_then(non_empty_rmux_field)
-        .map(|generation| format!("rmux:{pane_id}:generation:{generation}"));
+    let generation = fields.next().and_then(non_empty_rmux_field);
+    let server_pid = fields.next().and_then(|value| value.parse::<u32>().ok());
+    let occupant_id = generation.map(|generation| {
+        server_pid.map_or_else(
+            || format!("rmux:{pane_id}:generation:{generation}"),
+            |server_pid| format!("rmux:{pane_id}:server_pid={server_pid}:generation:{generation}"),
+        )
+    });
     Ok(RmuxPaneRow {
         session_name,
         window_id,
@@ -1075,7 +1154,11 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
+    #[cfg(feature = "app")]
+    use crate::backend::{MuxBackend, MuxEventPayload, MuxRebaseReason};
     use crate::command::{MuxCommand, MuxDirection, MuxPaneResize};
+    #[cfg(feature = "app")]
+    use crate::controller::{BindingId, MuxScope, SpaceId};
     #[cfg(feature = "app")]
     use rmux_sdk::{PaneId, TerminalSizeSpec};
 
@@ -1226,6 +1309,18 @@ mod tests {
         fn snapshot(&self) -> Result<MuxSnapshot> {
             self.calls.borrow_mut().push(vec!["snapshot".to_owned()]);
             Ok(self.snapshot.clone())
+        }
+
+        #[cfg(feature = "app")]
+        fn execute_checked(
+            &self,
+            _command: MuxCommand,
+            _precondition: &MuxScopedExecutionPrecondition,
+        ) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(vec!["execute_checked".to_owned()]);
+            Err(MuxBackendOperationError::stale("target changed").into())
         }
 
         fn ensure_session(&self, session_name: &str, cwd: &str) -> Result<()> {
@@ -1612,6 +1707,77 @@ mod tests {
             ]);
             Ok(())
         }
+    }
+    #[cfg(feature = "app")]
+    #[test]
+    fn local_rmux_scope_release_allows_a_recreated_binding_to_bootstrap() {
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(61_001),
+            BindingId::from_persistence(62_001),
+        );
+        let mut backend = RmuxBackend::new();
+
+        let first = backend.drain_events(scope, 8);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].revision, 1);
+        assert!(matches!(
+            &first[0].payload,
+            MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Bootstrap
+            }
+        ));
+
+        backend.release_event_scope(scope);
+
+        let recreated = backend.drain_events(scope, 8);
+        assert_eq!(recreated.len(), 1);
+        assert_eq!(recreated[0].revision, 1);
+        assert!(matches!(
+            &recreated[0].payload,
+            MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Bootstrap
+            }
+        ));
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn rmux_checked_mutation_is_typed_unsupported_before_client_side_effect() {
+        let client = RecordingClient::default();
+        let calls = client.calls.clone();
+        let mut backend = RmuxBackend::with_client(client);
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(71),
+            BindingId::from_persistence(72),
+        );
+        let precondition = MuxScopedExecutionPrecondition {
+            scope,
+            target: MuxEventTarget::session("project"),
+            occupant_fingerprint: None,
+            binding_generation: None,
+            occupant_generation: None,
+        };
+        let outcome = backend.execute_checked(
+            scope,
+            MuxCommand::RenameSession {
+                session_id: "project".to_owned(),
+                name: "replacement".to_owned(),
+            },
+            Some(&precondition),
+        );
+        assert!(matches!(
+            outcome,
+            BindingOperationOutcome::Supported(Err(error))
+                if matches!(
+                    error.downcast_ref::<MuxBackendOperationError>(),
+                    Some(MuxBackendOperationError::Unsupported(message))
+                        if message == RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON
+                )
+        ));
+        assert!(
+            calls.borrow().is_empty(),
+            "rmux must reject a checked mutation before invoking the client"
+        );
     }
 
     #[test]
@@ -2315,6 +2481,20 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn rmux_lifecycle_generation_is_part_of_the_opaque_occupant_handle() {
+        let first = parse_pane_row("alpha\x1f@10\x1f%1\x1ft1\x1f0\x1f1\x1f/repo\x1fzsh\x1f1")
+            .expect("initial pane row");
+        let replacement = parse_pane_row("alpha\x1f@10\x1f%1\x1ft1\x1f0\x1f1\x1f/repo\x1fzsh\x1f2")
+            .expect("replacement pane row");
+
+        assert_ne!(first.occupant_id, replacement.occupant_id);
+        assert_eq!(
+            replacement.occupant_id.as_deref(),
+            Some("rmux:%1:generation:2")
+        );
+    }
+
     #[test]
     fn rmux_snapshot_presents_full_session_windows_and_panes() {
         let windows = vec![

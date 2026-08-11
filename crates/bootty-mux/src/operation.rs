@@ -46,6 +46,10 @@ impl MuxEventTarget {
     }
 }
 
+/// Stable reason returned when rmux cannot provide an atomic checked mutation boundary.
+pub const RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON: &str =
+    "requires atomic checked execution unsupported by rmux protocol";
+
 /// A backend-owned failure classification retained across local and remote operation seams.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuxBackendOperationError {

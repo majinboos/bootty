@@ -893,13 +893,13 @@ impl RecordingMuxState {
     }
 
     fn tmux_command(&mut self, args: &[String]) -> Result<String> {
+        if Self::is_authoritative_tmux_snapshot_command(args) {
+            return Ok(self.tmux_snapshot());
+        }
         let command = args
             .first()
             .map(String::as_str)
             .ok_or_else(|| Self::failed("recording tmux command was empty"))?;
-        if command == "list-sessions" {
-            return Ok(self.tmux_snapshot());
-        }
         self.take_fault()?;
         match command {
             "new-session" => self.tmux_new_session(args),
@@ -979,6 +979,27 @@ impl RecordingMuxState {
                 "recording tmux does not recognize command {command:?}"
             ))),
         }
+    }
+    fn is_authoritative_tmux_snapshot_command(args: &[String]) -> bool {
+        let [
+            session_format,
+            separator,
+            command,
+            all_panes,
+            format_flag,
+            pane_format,
+        ] = args
+        else {
+            return false;
+        };
+        session_format
+            == "s\x1f#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pid}"
+            && separator == ";"
+            && command == "list-panes"
+            && all_panes == "-a"
+            && format_flag == "-F"
+            && pane_format
+                == "p\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pid}"
     }
 
     fn tmux_new_session(&mut self, args: &[String]) -> Result<String> {
@@ -2498,6 +2519,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_name.to_owned(),
                 cwd: "/repo".to_owned(),
             },
+            None,
         ),
     );
     let mut current = snapshot(&adapter, "after project create");
@@ -2525,6 +2547,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: "contract-worktree".to_owned(),
                 cwd: "/worktree".to_owned(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after worktree create");
@@ -2545,6 +2568,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             MuxCommand::DitchSession {
                 session_id: worktree_session_id.clone(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after worktree ditch");
@@ -2565,6 +2589,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 cwd: Some("/repo/child".to_owned()),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after new window");
@@ -2592,6 +2617,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 window_id: secondary_window_id.clone(),
                 name: "renamed-child".to_owned(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after rename window");
@@ -2616,6 +2642,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 window_id: primary_window_id.clone(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after first window activation");
@@ -2651,7 +2678,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             secondary_window_id.clone(),
         ),
     ] {
-        assert_supported(label, adapter.backend.execute_checked(scope, command));
+        assert_supported(label, adapter.backend.execute_checked(scope, command, None));
         current = snapshot(&adapter, label);
         assert_eq!(
             active_window(session_by_id(&current, &project_session_id)).id,
@@ -2670,6 +2697,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 window_id: Some(secondary_window_id.clone()),
                 delta: -1,
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after move window");
@@ -2706,6 +2734,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 index: 2,
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after window index activation");
@@ -2722,6 +2751,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 window_id: secondary_window_id.clone(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "before pane mutations");
@@ -2739,6 +2769,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 pane_id: Some(source_pane_id.clone()),
                 direction: MuxSplitDirection::Right,
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after split pane");
@@ -2804,7 +2835,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             source_pane_id.clone(),
         ),
     ] {
-        assert_supported(label, adapter.backend.execute_checked(scope, command));
+        assert_supported(label, adapter.backend.execute_checked(scope, command, None));
         current = snapshot(&adapter, label);
         assert_eq!(
             active_pane_id(active_window(session_by_id(&current, &project_session_id))),
@@ -2823,6 +2854,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             session_id: project_session_id.clone(),
             window_id: None,
         },
+        None,
     );
     if adapter.profile.last_pane {
         assert_supported("last pane", last);
@@ -2854,6 +2886,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             pane_id: Some(split_pane_id.clone()),
             adjustment: invalid_resize,
         },
+        None,
     );
     if adapter.profile.resize {
         assert!(
@@ -2887,6 +2920,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 cells: 3,
             },
         },
+        None,
     );
     if let Some((columns, rows)) = geometry_before {
         assert_supported("resize pane", resize);
@@ -2911,6 +2945,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             session_id: project_session_id.clone(),
             pane_id: Some(split_pane_id.clone()),
         },
+        None,
     );
     if adapter.profile.zoom {
         assert_supported("toggle zoom", zoom);
@@ -2932,6 +2967,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 pane_id: Some(source_pane_id.clone()),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after kill pane");
@@ -2959,6 +2995,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 pane_id: Some(source_pane_id.clone()),
             },
+            None,
         ),
     );
     assert_eq!(
@@ -2976,6 +3013,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 pane_id: Some(split_pane_id.clone()),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after close final pane");
@@ -3002,6 +3040,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                     window_id: primary_window_id.clone(),
                     name: "must-not-apply".to_owned(),
                 },
+                None,
             ),
         );
     } else {
@@ -3012,6 +3051,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 MuxCommand::CreateSession {
                     plan: invalid_launch_plan(),
                 },
+                None,
             ),
         );
     }
@@ -3030,6 +3070,7 @@ fn run_contract(mut adapter: ContractAdapter) {
                 session_id: project_session_id.clone(),
                 name: "contract-project-renamed".to_owned(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after session rename");
@@ -3047,6 +3088,7 @@ fn run_contract(mut adapter: ContractAdapter) {
             MuxCommand::DitchSession {
                 session_id: project_session_id.clone(),
             },
+            None,
         ),
     );
     current = snapshot(&adapter, "after project ditch");

@@ -3,9 +3,10 @@ use std::{path::Path, sync::Arc};
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
 use super::{
-    backend::{MuxBackend, MuxBackendOperationError},
+    backend::{MuxBackend, MuxBackendOperationError, MuxScopedExecutionPrecondition},
     capability::BindingOperationOutcome,
     command::MuxSessionLaunchPlan,
+    controller::MuxScope,
     native::NativeBackend,
     process::SystemCommandRunner,
     remote_space::RemoteSpaceBackend,
@@ -33,6 +34,18 @@ impl MuxBackend for UnavailableBackend {
 
     fn execute(&mut self, _command: crate::command::MuxCommand) -> anyhow::Result<()> {
         Err(MuxBackendOperationError::Unavailable(self.message.clone()).into())
+    }
+
+    fn execute_checked(
+        &mut self,
+        _scope: MuxScope,
+        _command: crate::command::MuxCommand,
+        _precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<anyhow::Result<()>> {
+        BindingOperationOutcome::Supported(Err(MuxBackendOperationError::Unavailable(
+            self.message.clone(),
+        )
+        .into()))
     }
 
     fn execute_session_launch(

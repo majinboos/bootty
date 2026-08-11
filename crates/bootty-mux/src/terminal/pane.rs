@@ -608,6 +608,11 @@ impl BackendPaneTerminal {
         let Some((backend, runtime)) = self.native_runtime_identity(target) else {
             return;
         };
+        if observations.side_effects_lagged
+            && backend.publish_runtime_side_effect_lag(&runtime).is_err()
+        {
+            return;
+        }
         for output in observations.output {
             let result = match output {
                 TerminalOutputObservation::Bytes { sequence, bytes } => {
@@ -2458,6 +2463,7 @@ mod tests {
                     bytes: b"runtime output".to_vec(),
                 }],
                 side_effects: vec![TerminalSideEffect::WindowTitle("runtime title".to_owned())],
+                side_effects_lagged: true,
             },
             drops: None,
         });
@@ -2466,6 +2472,12 @@ mod tests {
 
         terminal.drain_native_window();
         let events = backend.drain_events(scope, 8);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.topic == MuxEventTopic::SnapshotRebased),
+            "side-effect lag must request an authoritative rebase"
+        );
         let output = events
             .iter()
             .find(|event| event.topic == MuxEventTopic::TerminalOutput)

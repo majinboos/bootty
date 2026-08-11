@@ -353,6 +353,121 @@
       "id": "ui.sidebar.previous_session",
       "kind": "alias",
       "command": "session.previous"
+    },
+    {
+      "id": "activate_key_table",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "activate_key_table_once",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "adjust_selection",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "clear_screen",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "copy_title_to_clipboard",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "copy_url_to_clipboard",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "deactivate_all_key_tables",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "deactivate_key_table",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "end_key_sequence",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "jump_to_prompt",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "paste_from_selection",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "reset",
+      "kind": "unsupported",
+      "reason": "binding reset edits configuration and is not a runtime command"
+    },
+    {
+      "id": "scroll_page_fractional",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "scroll_to_row",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "scroll_to_selection",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "select_all",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "set_surface_title",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "set_tab_title",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "toggle_mouse_reporting",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "unbind",
+      "kind": "unsupported",
+      "reason": "binding removal edits configuration and is not a runtime command"
+    },
+    {
+      "id": "write_scrollback_file",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "write_screen_file",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
+    },
+    {
+      "id": "write_selection_file",
+      "kind": "unsupported",
+      "reason": "parsed binding action is not executable by Bootty"
     }
   ]
 }

@@ -512,6 +512,11 @@
       "command": "terminal.broadcast_input"
     },
     {
+      "id": "Rmux::cmd",
+      "kind": "unsupported",
+      "reason": "raw rmux command escape is outside Bootty's typed command surface"
+    },
+    {
       "id": "Rmux::capabilities",
       "kind": "descriptor",
       "command": "backend.capabilities"
@@ -540,6 +545,11 @@
       "id": "Rmux::find_panes",
       "kind": "descriptor",
       "command": "pane.find"
+    },
+    {
+      "id": "Rmux::find_sessions",
+      "kind": "descriptor",
+      "command": "session.list"
     },
     {
       "id": "Rmux::get_pane_by_id",
@@ -590,6 +600,11 @@
       "id": "Rmux::session",
       "kind": "descriptor",
       "command": "session.get"
+    },
+    {
+      "id": "Rmux::tracing",
+      "kind": "unsupported",
+      "reason": "SDK tracing configuration is not a Bootty command"
     },
     {
       "id": "Rmux::set_default_timeout",

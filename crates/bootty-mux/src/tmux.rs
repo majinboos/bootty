@@ -5,8 +5,11 @@ use std::collections::BTreeMap;
 use super::process::SystemCommandRunner;
 #[cfg(feature = "app")]
 use super::{
-    backend::{MuxBackend, MuxEvent, MuxEventCapability},
-    capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
+    backend::{MuxBackend, MuxEvent, MuxEventCapability, MuxScopedExecutionPrecondition},
+    capability::{
+        BindingCapabilityDescriptor, BindingOperation, BindingOperationAvailability,
+        BindingOperationOutcome,
+    },
     controller::MuxScope,
     tmux_control::TmuxControlRunner,
 };
@@ -26,6 +29,8 @@ use super::{
 const TMUX_FIELD_SEPARATOR: char = '\x1f';
 /// Line tags for the combined session/pane snapshot. Sessions and panes come from one tmux
 /// invocation, so each line says which list it belongs to.
+#[cfg(feature = "app")]
+const TMUX_STALE_TARGET_MARKER: &str = "bootty-stale-target";
 const TMUX_SESSION_LINE_TAG: char = 's';
 const TMUX_PANE_LINE_TAG: char = 'p';
 
@@ -60,12 +65,13 @@ struct TmuxLaunchSessionTarget {
 pub type DefaultTmuxRunner = TmuxControlRunner;
 #[cfg(not(feature = "app"))]
 pub type DefaultTmuxRunner = SystemCommandRunner;
-
 #[derive(Clone, Debug)]
 pub struct TmuxBackend<R = DefaultTmuxRunner> {
     program: String,
     runner: R,
     completion: Option<MuxBackendCommandCompletion>,
+    #[cfg(feature = "app")]
+    checked_precondition: Option<MuxScopedExecutionPrecondition>,
 }
 
 #[cfg(feature = "app")]
@@ -94,17 +100,13 @@ impl<R> TmuxBackend<R> {
             program: program.into(),
             runner,
             completion: None,
+            #[cfg(feature = "app")]
+            checked_precondition: None,
         }
     }
 }
 
 impl<R: CommandRunner> TmuxBackend<R> {
-    fn run(&self, args: &[&str]) -> Result<String> {
-        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let output = self.runner.run(&self.program, &args)?;
-        require_success(&self.program, &args, output)
-    }
-
     fn run_snapshot(&self, args: &[&str]) -> Result<Option<String>> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let output = self.runner.run(&self.program, &args)?;
@@ -118,17 +120,109 @@ impl<R: CommandRunner> TmuxBackend<R> {
     }
 
     fn run_owned(&self, args: Vec<String>) -> Result<String> {
-        let output = self.runner.run(&self.program, &args)?;
-        require_success(&self.program, &args, output)
-    }
-
-    fn run_last_pane(&self, target: String) -> Result<String> {
-        let args = vec!["last-pane".to_owned(), "-t".to_owned(), target];
+        #[cfg(feature = "app")]
+        if let Some(precondition) = self.checked_precondition.as_ref() {
+            return self.run_conditional_owned(args, precondition);
+        }
         let output = self.runner.run(&self.program, &args)?;
         if output.success {
             return Ok(output.stdout);
         }
+        let message = tmux_command_failure_message(&output.stderr);
+        let error = if tmux_target_not_found(&message) {
+            MuxBackendOperationError::Stale(message)
+        } else {
+            MuxBackendOperationError::Failed(message)
+        };
+        Err(error.into())
+    }
 
+    #[cfg(feature = "app")]
+    fn run_conditional_owned(
+        &self,
+        args: Vec<String>,
+        precondition: &MuxScopedExecutionPrecondition,
+    ) -> Result<String> {
+        let target = precondition
+            .target
+            .pane_id
+            .as_deref()
+            .or(precondition.target.window_id.as_deref())
+            .or(precondition.target.session_id.as_deref())
+            .ok_or_else(|| {
+                MuxBackendOperationError::stale("tmux checked target has no identity")
+            })?;
+        let equality = |field: &str, expected: &str| {
+            let mut predicate = String::from("#{==:#{");
+            predicate.push_str(field);
+            predicate.push_str("},");
+            predicate.push_str(expected);
+            predicate.push('}');
+            predicate
+        };
+        let mut predicates = vec![equality(
+            "session_id",
+            precondition
+                .target
+                .session_id
+                .as_deref()
+                .unwrap_or_default(),
+        )];
+        if let Some(window_id) = precondition.target.window_id.as_deref() {
+            predicates.push(equality("window_id", window_id));
+        }
+        if let Some(pane_id) = precondition.target.pane_id.as_deref() {
+            predicates.push(equality("pane_id", pane_id));
+        }
+        if let Some(terminal_id) = precondition.target.terminal_id.as_deref() {
+            predicates.push(equality("pane_tty", terminal_id));
+        }
+        if let Some(pid) = precondition
+            .target
+            .occupant
+            .as_ref()
+            .and_then(|occupant| occupant.pid)
+        {
+            predicates.push(equality("pane_pid", &pid.to_string()));
+        }
+        if let Some(server_pid) = precondition
+            .occupant_fingerprint
+            .as_deref()
+            .and_then(tmux_server_pid_from_occupant_id)
+        {
+            predicates.push(equality("pid", server_pid));
+        }
+        let condition = predicates
+            .into_iter()
+            .reduce(|left, right| {
+                let mut condition = String::from("#{&&:");
+                condition.push_str(&left);
+                condition.push(',');
+                condition.push_str(&right);
+                condition.push('}');
+                condition
+            })
+            .expect("tmux checked target always has a session identity");
+        let command = tmux_command_string(&args);
+        let conditional_args = vec![
+            "if-shell".to_owned(),
+            "-F".to_owned(),
+            "-t".to_owned(),
+            target.to_owned(),
+            condition,
+            command,
+            format!("display-message -p '{TMUX_STALE_TARGET_MARKER}'"),
+        ];
+        let output = self.runner.run(&self.program, &conditional_args)?;
+        if output.success {
+            if output.stdout.trim() == TMUX_STALE_TARGET_MARKER {
+                return Err(MuxBackendOperationError::stale(
+                    "tmux checked target changed before mutation",
+                )
+                .into());
+            }
+            return Ok(output.stdout);
+        }
         let message = tmux_command_failure_message(&output.stderr);
         let error = if tmux_target_not_found(&message) {
             MuxBackendOperationError::Stale(message)
@@ -139,11 +233,21 @@ impl<R: CommandRunner> TmuxBackend<R> {
     }
 
     fn run_owned_allow_server_exit(&self, args: Vec<String>) -> Result<String> {
-        let output = self.runner.run(&self.program, &args)?;
-        if !output.success && tmux_server_exited(&output.stderr) {
-            return Ok(String::new());
+        #[cfg(feature = "app")]
+        if let Some(precondition) = self.checked_precondition.as_ref() {
+            return self.run_conditional_owned(args, precondition);
         }
-        require_success(&self.program, &args, output)
+        let output = self.runner.run(&self.program, &args)?;
+        if output.success || tmux_server_exited(&output.stderr) {
+            return Ok(output.stdout);
+        }
+        let message = tmux_command_failure_message(&output.stderr);
+        let error = if tmux_target_not_found(&message) {
+            MuxBackendOperationError::Stale(message)
+        } else {
+            MuxBackendOperationError::Failed(message)
+        };
+        Err(error.into())
     }
 
     fn run_disowned_owned(&self, args: Vec<String>) -> Result<String> {
@@ -157,14 +261,12 @@ impl<R: CommandRunner> TmuxBackend<R> {
         // One tmux process for both lists: the snapshot polls several times a second, and a
         // second invocation doubled that process churn for no extra information.
         let Some(combined) = self.run_snapshot(&[
-            "list-sessions",
-            "-F",
-            "s\x1f#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            "s\x1f#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pid}",
             ";",
             "list-panes",
             "-a",
             "-F",
-            "p\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            "p\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pid}",
         ])? else {
             return Ok(MuxSnapshot::default());
         };
@@ -526,8 +628,16 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 // active-window move behavior after selecting the requested source window.
                 let target = if delta < 0 { "-1" } else { "+1" };
                 for _ in 0..delta.unsigned_abs() {
-                    self.run(&["swap-window", "-t", target])?;
-                    self.run(&["select-window", "-t", target])?;
+                    self.run_owned(vec![
+                        "swap-window".to_owned(),
+                        "-t".to_owned(),
+                        target.to_owned(),
+                    ])?;
+                    self.run_owned(vec![
+                        "select-window".to_owned(),
+                        "-t".to_owned(),
+                        target.to_owned(),
+                    ])?;
                 }
             }
             MuxCommand::MoveWindowPreservingSelection {
@@ -541,8 +651,16 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 }
                 let target = if delta < 0 { "-1" } else { "+1" };
                 for _ in 0..delta.unsigned_abs() {
-                    self.run(&["swap-window", "-t", target])?;
-                    self.run(&["select-window", "-t", target])?;
+                    self.run_owned(vec![
+                        "swap-window".to_owned(),
+                        "-t".to_owned(),
+                        target.to_owned(),
+                    ])?;
+                    self.run_owned(vec![
+                        "select-window".to_owned(),
+                        "-t".to_owned(),
+                        target.to_owned(),
+                    ])?;
                 }
                 self.run_owned(vec![
                     "select-window".into(),
@@ -608,7 +726,11 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 session_id,
                 window_id,
             } => {
-                self.run_last_pane(window_id.unwrap_or(session_id))?;
+                self.run_owned(vec![
+                    "last-pane".to_owned(),
+                    "-t".to_owned(),
+                    window_id.unwrap_or(session_id),
+                ])?;
             }
             MuxCommand::KillPane {
                 session_id,
@@ -696,6 +818,13 @@ fn tmux_shell_command(argv: &[String]) -> String {
         command.push('\'');
     }
     command
+}
+
+fn tmux_command_string(argv: &[String]) -> String {
+    tmux_shell_command(argv)
+        .strip_prefix("exec ")
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn tmux_resize_args(target: String, adjustment: MuxPaneResize) -> Result<Vec<String>> {
@@ -870,6 +999,30 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
         TmuxBackend::execute(self, command)
     }
 
+    fn execute_checked(
+        &mut self,
+        scope: MuxScope,
+        command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<Result<()>> {
+        self.completion = None;
+        if precondition.is_some_and(|precondition| precondition.scope != scope) {
+            return BindingOperationOutcome::Supported(Err(MuxBackendOperationError::stale(
+                "tmux mux binding scope changed",
+            )
+            .into()));
+        }
+        self.checked_precondition = precondition.cloned();
+        let descriptor = self.capabilities(scope);
+        let outcome = descriptor.invoke(
+            descriptor.request(command.operation()),
+            BindingOperationAvailability::Available,
+            || self.execute(command),
+        );
+        self.checked_precondition = None;
+        outcome
+    }
+
     fn execute_session_launch(
         &mut self,
         plan: MuxSessionLaunchPlan,
@@ -1031,26 +1184,65 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
         .lines()
         .filter(|line| !line.trim().is_empty())
     {
-        let mut fields = tmux_fields(line, 6).into_iter();
-        let id = fields.next().context("tmux snapshot missing session id")?;
+        let mut fields = tmux_fields(line, 7);
+        let plain_underscore = line.contains('_')
+            && !line.contains(TMUX_FIELD_SEPARATOR)
+            && !line.contains('\t')
+            && !line.contains("\\t");
+        let has_terminal_field = fields.len() >= 9
+            && fields
+                .get(5)
+                .is_some_and(|terminal| terminal.is_empty() || terminal.starts_with("/dev/"));
+        if plain_underscore && !has_terminal_field {
+            let with_pid = underscore_joined_tmux_fields(line, 6);
+            fields = if with_pid
+                .get(5)
+                .is_some_and(|pid| pid.parse::<u32>().is_ok())
+            {
+                with_pid
+            } else {
+                underscore_joined_tmux_fields(line, 5)
+            };
+        }
+        let id = fields
+            .first()
+            .cloned()
+            .context("tmux snapshot missing session id")?;
         let name = fields
-            .next()
+            .get(1)
             .filter(|value| !value.is_empty())
+            .cloned()
             .unwrap_or_else(|| id.clone());
-        let attached = fields.next().is_some_and(|value| value != "0");
-        let _windows = fields.next();
-        let pane_id = fields.next().filter(|value| !value.is_empty());
-        let pane_pid = fields.next().and_then(|value| value.parse().ok());
-        let cwd = fields.next().filter(|value| !value.is_empty());
-        let process = fields.next().filter(|value| !value.is_empty());
-        let occupant_id = tmux_occupant_id(&id, pane_id.as_deref(), pane_pid);
+        let attached = fields.get(2).is_some_and(|value| value != "0");
+        let pane_id = fields.get(4).filter(|value| !value.is_empty()).cloned();
+        let server_pid = fields.get(9).and_then(|value| value.parse::<u32>().ok());
+        let (terminal_id, pane_pid, cwd_index) = if fields.len() >= 9 {
+            (
+                fields.get(5).filter(|value| !value.is_empty()).cloned(),
+                fields.get(6).and_then(|value| value.parse().ok()),
+                7,
+            )
+        } else if fields.len() >= 8 {
+            (None, fields.get(5).and_then(|value| value.parse().ok()), 6)
+        } else {
+            (None, None, 5)
+        };
+        let cwd = fields
+            .get(cwd_index)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let process = fields
+            .get(cwd_index + 1)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let occupant_id = tmux_occupant_id_with_server(pane_id.as_deref(), pane_pid, server_pid);
         sessions.push(MuxSession {
             id: id.clone(),
-            name: name.clone(),
+            name,
             active: attached,
             anchor: MuxPaneAnchor {
                 session_id: id,
-                terminal_id: None,
+                terminal_id,
                 pane_id,
                 pane_pid,
                 cwd,
@@ -1072,16 +1264,36 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
     })
 }
 
-/// A pane PID is the strongest occupant identity tmux reports. Pane IDs identify the terminal
-/// across window moves, while cwd and foreground-command changes describe the same occupant.
-fn tmux_occupant_id(
-    session_id: &str,
+/// Tmux pane IDs are stable for the lifetime of a server connection. A pane PID is the strongest
+/// occupant handle, and the server PID distinguishes a fresh server that can reuse pane IDs.
+fn tmux_occupant_id_with_server(
     pane_id: Option<&str>,
     pane_pid: Option<u32>,
+    server_pid: Option<u32>,
 ) -> Option<String> {
     let pane_id = pane_id?;
-    let pane_pid = pane_pid?;
-    Some(format!("tmux:{session_id}:{pane_id}:pid={pane_pid}"))
+    Some(match (server_pid, pane_pid) {
+        (Some(server_pid), Some(pane_pid)) => {
+            format!("tmux:{pane_id}:server_pid={server_pid}:pid={pane_pid}")
+        }
+        (Some(server_pid), None) => format!("tmux:{pane_id}:server_pid={server_pid}:lifecycle=0"),
+        (None, Some(pane_pid)) => format!("tmux:{pane_id}:pid={pane_pid}"),
+        (None, None) => format!("tmux:{pane_id}:lifecycle=0"),
+    })
+}
+
+/// Compatibility helper for parser/unit callers that do not have a server identity.
+#[cfg(test)]
+fn tmux_occupant_id(pane_id: Option<&str>, pane_pid: Option<u32>) -> Option<String> {
+    tmux_occupant_id_with_server(pane_id, pane_pid, None)
+}
+fn tmux_server_pid_from_occupant_id(identity: &str) -> Option<&str> {
+    identity
+        .split_once(":server_pid=")?
+        .1
+        .split(':')
+        .next()
+        .filter(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// tmux reports `hidden` for a pane with no progress, and an empty state for versions that
@@ -1110,9 +1322,15 @@ fn furthest_along(
 
 fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<()> {
     for line in panes_output.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = tmux_fields(line, 10);
+        let mut fields = tmux_fields(line, 11);
         if fields.len() == 1 && line.contains('_') {
-            fields = underscore_joined_tmux_fields(line, 10);
+            fields = underscore_joined_tmux_fields(line, 11);
+            if fields.len() == 1 {
+                fields = underscore_joined_tmux_fields(line, 10);
+            }
+            if fields.len() == 1 {
+                fields = underscore_joined_tmux_fields(line, 9);
+            }
         }
         if fields.len() < 9 {
             continue;
@@ -1130,20 +1348,34 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
         let window_active = fields[4] != "0";
         let pane_active = fields[5] != "0";
         let pane_id = (!fields[6].is_empty()).then(|| fields[6].clone());
-        let (pane_pid, progress, cwd_index) = if fields.len() >= 12 {
+        let server_pid = fields.get(13).and_then(|value| value.parse::<u32>().ok());
+        let (terminal_id, pane_pid, pane_pid_reported, progress, cwd_index) = if fields.len() >= 13
+        {
             (
+                fields.get(7).filter(|value| !value.is_empty()).cloned(),
+                fields[8].parse().ok(),
+                true,
+                tmux_pane_progress(fields.get(9).cloned(), fields.get(10).cloned()),
+                11,
+            )
+        } else if fields.len() >= 12 {
+            (
+                None,
                 fields[7].parse().ok(),
+                true,
                 tmux_pane_progress(fields.get(8).cloned(), fields.get(9).cloned()),
                 10,
             )
         } else if fields.len() >= 11 {
             (
                 None,
+                None,
+                false,
                 tmux_pane_progress(fields.get(7).cloned(), fields.get(8).cloned()),
                 9,
             )
         } else {
-            (None, None, 7)
+            (None, None, false, None, 7)
         };
         let cwd = fields
             .get(cwd_index)
@@ -1159,10 +1391,18 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
         if window_active {
             session.active_window_id = Some(window_id.clone());
         }
-        if session.anchor.pane_id.as_deref() == pane_id.as_deref() && fields.len() >= 12 {
-            session.anchor.pane_pid = pane_pid;
-            session.anchor.occupant_id =
-                tmux_occupant_id(&session_id, session.anchor.pane_id.as_deref(), pane_pid);
+        if session.anchor.pane_id.as_deref() == pane_id.as_deref() {
+            if terminal_id.is_some() {
+                session.anchor.terminal_id.clone_from(&terminal_id);
+            }
+            if pane_pid_reported {
+                session.anchor.pane_pid = pane_pid;
+                session.anchor.occupant_id = tmux_occupant_id_with_server(
+                    session.anchor.pane_id.as_deref(),
+                    pane_pid,
+                    server_pid,
+                );
+            }
         }
         if let Some(window) = session
             .windows
@@ -1173,11 +1413,15 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
                 window.anchor = MuxPaneAnchor {
                     session_id: session_id.clone(),
                     pane_id: pane_id.clone(),
-                    terminal_id: None,
+                    terminal_id: terminal_id.clone(),
                     pane_pid,
                     cwd: cwd.clone(),
                     process: process.clone(),
-                    occupant_id: tmux_occupant_id(&session_id, pane_id.as_deref(), pane_pid),
+                    occupant_id: tmux_occupant_id_with_server(
+                        pane_id.as_deref(),
+                        pane_pid,
+                        server_pid,
+                    ),
                 };
             }
             // A window's bar stands for every pane in it, so the busiest pane wins.
@@ -1185,9 +1429,9 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
             continue;
         }
         let anchor = MuxPaneAnchor {
-            occupant_id: tmux_occupant_id(&session_id, pane_id.as_deref(), pane_pid),
+            occupant_id: tmux_occupant_id_with_server(pane_id.as_deref(), pane_pid, server_pid),
             session_id,
-            terminal_id: None,
+            terminal_id,
             pane_id,
             pane_pid,
             cwd,
@@ -2185,7 +2429,79 @@ mod tests {
 
         let anchor = &snapshot.sessions[0].anchor;
         assert_eq!(anchor.pane_pid, Some(5252));
-        assert_eq!(anchor.occupant_id.as_deref(), Some("tmux:$1:%3:pid=5252"));
+        assert_eq!(anchor.occupant_id.as_deref(), Some("tmux:%3:pid=5252"));
+    }
+
+    #[test]
+    fn tmux_occupant_handle_changes_when_server_replaces_a_pane_process() {
+        let first = tmux_occupant_id(Some("%7"), Some(120));
+        let same_process = tmux_occupant_id(Some("%7"), Some(120));
+        let replacement = tmux_occupant_id(Some("%7"), Some(121));
+
+        assert_eq!(first, same_process);
+        assert_ne!(first, replacement);
+        assert_eq!(replacement.as_deref(), Some("tmux:%7:pid=121"));
+    }
+
+    #[test]
+    fn tmux_checked_mutation_uses_server_side_target_conditional() {
+        let runner = RecordingRunner {
+            calls: Rc::default(),
+            stdout: Rc::new(RefCell::new(VecDeque::from([
+                TMUX_STALE_TARGET_MARKER.to_owned()
+            ]))),
+            stderr: Rc::default(),
+            success: Rc::default(),
+        };
+        let calls = runner.calls.clone();
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+        let scope = crate::controller::MuxScope::new(
+            crate::controller::SpaceId::from_persistence(7),
+            crate::controller::BindingId::from_persistence(8),
+        );
+        let precondition = MuxScopedExecutionPrecondition {
+            scope,
+            target: MuxEventTarget::pane(
+                "$1",
+                "@1",
+                "%1",
+                "/dev/ttys001",
+                Some(crate::backend::MuxOccupantIdentity {
+                    backend_identity: "tmux:%1:pid=42".to_owned(),
+                    pid: Some(42),
+                    process: Some("zsh".to_owned()),
+                }),
+            ),
+            occupant_fingerprint: Some("tmux:%1:pid=42".to_owned()),
+            binding_generation: None,
+            occupant_generation: None,
+        };
+        let outcome = backend.execute_checked(
+            scope,
+            MuxCommand::RenameWindow {
+                session_id: "$1".to_owned(),
+                window_id: "@1".to_owned(),
+                name: "replacement".to_owned(),
+            },
+            Some(&precondition),
+        );
+        assert!(matches!(
+            outcome,
+            BindingOperationOutcome::Supported(Err(error))
+                if matches!(
+                    error.downcast_ref::<MuxBackendOperationError>(),
+                    Some(MuxBackendOperationError::Stale(_))
+                )
+        ));
+        let recorded = calls.borrow();
+        let call = &recorded[0].argv;
+        assert_eq!(call.get(1).map(String::as_str), Some("if-shell"));
+        assert!(call.iter().any(|argument| argument.contains("pane_pid")));
+        assert!(call.iter().any(|argument| argument.contains("%1")));
+        assert!(
+            call.iter()
+                .any(|argument| argument.contains(TMUX_STALE_TARGET_MARKER))
+        );
     }
 
     #[test]

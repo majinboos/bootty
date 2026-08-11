@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -120,10 +122,17 @@ fn path_identity(path: &str) -> Option<String> {
     Some(identity)
 }
 
-pub fn add_worktree(repo_dir: &str, branch: &str) -> Result<String, String> {
+pub fn add_worktree(repo_dir: &Path, branch: &str) -> Result<PathBuf, String> {
     let path = new_worktree_path(repo_dir, branch)?;
     let mut command = Command::new("git");
-    command.args(["-C", repo_dir, "worktree", "add", "-b", branch, &path]);
+    command
+        .arg("-C")
+        .arg(repo_dir)
+        .arg("worktree")
+        .arg("add")
+        .arg("-b")
+        .arg(branch)
+        .arg(&path);
     hide_command_window(&mut command);
     let output = command
         .output()
@@ -278,39 +287,44 @@ fn parse_git_worktree_list(text: &str) -> Vec<WorktreePickerEntry> {
     entries
 }
 
-fn new_worktree_path(repo_dir: &str, branch: &str) -> Result<String, String> {
-    let main = main_worktree(repo_dir).unwrap_or_else(|| repo_dir.to_owned());
-    let main = Path::new(&main);
+fn new_worktree_path(repo_dir: &Path, branch: &str) -> Result<PathBuf, String> {
+    let main = main_worktree(repo_dir).unwrap_or_else(|| repo_dir.to_path_buf());
     let parent = main
         .parent()
         .ok_or_else(|| "repository has no parent directory".to_owned())?;
     let repo_name = main
         .file_name()
-        .and_then(|name| name.to_str())
         .ok_or_else(|| "could not read repository name".to_owned())?;
-    Ok(parent
-        .join(format!("{}-{}", repo_name, branch.replace('/', "-")))
-        .to_string_lossy()
-        .into_owned())
+    let mut name = repo_name.to_os_string();
+    name.push("-");
+    name.push(branch.replace('/', "-"));
+    Ok(parent.join(name))
 }
 
-fn main_worktree(cwd: &str) -> Option<String> {
+fn main_worktree(cwd: &Path) -> Option<PathBuf> {
     let mut command = Command::new("git");
-    command.args([
-        "-C",
-        cwd,
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-    ]);
+    command
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("--path-format=absolute")
+        .arg("--git-common-dir");
     hide_command_window(&mut command);
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
-    Path::new(String::from_utf8_lossy(&output.stdout).trim())
-        .parent()
-        .map(|parent| parent.to_string_lossy().into_owned())
+    let path = output
+        .stdout
+        .strip_suffix(b"\n")
+        .unwrap_or(&output.stdout)
+        .strip_suffix(b"\r")
+        .unwrap_or(output.stdout.strip_suffix(b"\n").unwrap_or(&output.stdout));
+    #[cfg(unix)]
+    let path = PathBuf::from(OsString::from_vec(path.to_vec()));
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8(path.to_vec()).ok()?);
+    path.parent().map(Path::to_path_buf)
 }
 
 fn session_name_for_path(path: &str) -> &str {

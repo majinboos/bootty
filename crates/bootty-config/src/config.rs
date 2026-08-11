@@ -2,7 +2,8 @@ use std::{
     collections::{BTreeMap, HashSet},
     env,
     ffi::OsString,
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -1397,20 +1398,81 @@ impl ConfigDocument {
     }
 
     pub fn write_to_disk(&self) -> ConfigResult<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                ConfigLoadError::new(format!(
-                    "failed to create config directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        fs::write(&self.path, self.to_toml_string()).map_err(|error| {
+        let parent = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|error| {
             ConfigLoadError::new(format!(
-                "failed to write config file {}: {error}",
-                self.path.display()
+                "failed to create config directory {}: {error}",
+                parent.display()
             ))
-        })
+        })?;
+
+        let existing_permissions = fs::metadata(&self.path)
+            .ok()
+            .map(|metadata| metadata.permissions());
+        let contents = self.to_toml_string();
+        let mut temporary_path = None;
+        // Keep the temporary name until rename succeeds so every pre-rename failure can clean it.
+        let result = (|| -> io::Result<()> {
+            let mut temporary = None;
+            let mut open_error = None;
+            for attempt in 0..100u32 {
+                let name = self.path.file_name().map_or_else(
+                    || "config".to_owned(),
+                    |name| name.to_string_lossy().into_owned(),
+                );
+                let candidate =
+                    parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), attempt));
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(file) => {
+                        temporary = Some((candidate, file));
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => {
+                        open_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let Some((path, mut file)) = temporary else {
+                return Err(open_error.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "could not allocate a unique config temporary file",
+                    )
+                }));
+            };
+            temporary_path = Some(path.clone());
+            file.write_all(contents.as_bytes())?;
+            file.flush()?;
+            if let Some(permissions) = existing_permissions.clone() {
+                fs::set_permissions(&path, permissions)?;
+            }
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&path, &self.path)?;
+            temporary_path = None;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Some(path) = temporary_path {
+                let _ = fs::remove_file(path);
+            }
+            return Err(ConfigLoadError::new(format!(
+                "failed to atomically write config file {}: {error}",
+                self.path.display()
+            )));
+        }
+        Ok(())
     }
 }
 

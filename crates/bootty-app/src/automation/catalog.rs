@@ -1007,6 +1007,51 @@ mod tests {
     }
 
     #[test]
+    fn task_control_result_schemas_match_the_task_status_envelope() {
+        let catalog = canonical_catalog();
+        for command in ["task.status", "task.cancel"] {
+            let schema = &catalog
+                .descriptor(command)
+                .expect("task control descriptor")
+                .result_schema;
+            assert_eq!(schema.value_type, CatalogValueType::Object, "{command}");
+            let task = schema.properties.get("task").expect("task envelope");
+            assert_eq!(task.value_type, CatalogValueType::Object, "{command}");
+            assert_eq!(
+                task.properties.get("id").map(|field| field.value_type),
+                Some(CatalogValueType::String),
+                "{command} task id"
+            );
+            assert_eq!(
+                task.properties
+                    .get("owner_pid")
+                    .map(|field| field.value_type),
+                Some(CatalogValueType::Integer),
+                "{command} owner pid"
+            );
+            let state = task.properties.get("state").expect("task state");
+            assert_eq!(
+                state.value_type,
+                CatalogValueType::Object,
+                "{command} state"
+            );
+            assert_eq!(
+                state.properties.get("status").map(|field| field.value_type),
+                Some(CatalogValueType::String),
+                "{command} state status"
+            );
+            assert_eq!(
+                state
+                    .properties
+                    .get("outcome")
+                    .map(|field| field.value_type),
+                Some(CatalogValueType::Object),
+                "{command} state outcome"
+            );
+        }
+    }
+
+    #[test]
     fn named_metadata_defects_remain_explicit() {
         let catalog = canonical_catalog();
         let neighbor = catalog.descriptor("pane.neighbor").expect("pane.neighbor");

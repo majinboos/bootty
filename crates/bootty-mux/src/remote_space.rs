@@ -3,8 +3,10 @@ use anyhow::{Context, Result};
 use bootty_config::config::MultiplexerBackendConfig;
 
 use crate::{
-    backend::{MuxBackend, MuxBackendOperationError},
-    capability::{BindingCapabilityDescriptor, BindingOperationOutcome},
+    backend::{MuxBackend, MuxBackendOperationError, MuxScopedExecutionPrecondition},
+    capability::{
+        BindingCapabilityDescriptor, BindingOperationAvailability, BindingOperationOutcome,
+    },
     command::{MuxCommand, MuxSessionLaunchPlan},
     controller::MuxScope,
     operation::MuxBackendCommandCompletion,
@@ -90,6 +92,34 @@ impl MuxBackend for RemoteSpaceBackend {
         self.completion = decode_remote_operation_completion(&output)
             .context("decode remote Space command completion")?;
         Ok(())
+    }
+
+    fn execute_checked(
+        &mut self,
+        scope: MuxScope,
+        command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<Result<()>> {
+        let descriptor = self.capabilities(scope);
+        descriptor.invoke(
+            descriptor.request(command.operation()),
+            BindingOperationAvailability::Available,
+            || {
+                if let Some(precondition) = precondition {
+                    if precondition.scope != scope {
+                        return Err(MuxBackendOperationError::stale(
+                            "remote binding scope changed",
+                        )
+                        .into());
+                    }
+                    return Err(MuxBackendOperationError::unsupported(
+                        "remote backend lacks an atomic checked mutation protocol",
+                    )
+                    .into());
+                }
+                self.execute(command)
+            },
+        )
     }
 
     fn execute_session_launch(

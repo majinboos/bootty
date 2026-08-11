@@ -433,8 +433,8 @@
     },
     {
       "id": "Request::SelectPane",
-      "kind": "descriptor",
-      "command": "pane.select"
+      "kind": "unsupported",
+      "reason": "rmux pane selection fields exceed Bootty's sidebar-only focus command"
     },
     {
       "id": "Request::SelectPaneAdjacent",

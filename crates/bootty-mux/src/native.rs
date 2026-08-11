@@ -8,11 +8,9 @@ use anyhow::Result;
 
 use super::{
     backend::{
-        MuxAllocatedResources, MuxAllocatedWindow, MuxBackend, MuxBackendCommandCompletion,
-        MuxBackendOperationError, MuxEvent, MuxEventCapability, MuxEventCursor, MuxEventDraft,
-        MuxEventPayload, MuxEventProvenance, MuxEventQueue, MuxEventTarget, MuxEventTopic,
-        MuxForegroundState, MuxOccupantIdentity, MuxPaneOption, MuxPaneState, MuxRebaseReason,
-        MuxTopologyChange,
+        MuxBackend, MuxEvent, MuxEventCapability, MuxEventCursor, MuxEventDraft, MuxEventPayload,
+        MuxEventProvenance, MuxEventQueue, MuxEventTopic, MuxForegroundState, MuxPaneOption,
+        MuxPaneState, MuxScopedExecutionPrecondition, MuxTopologyChange,
     },
     capability::{
         BindingCapabilityDescriptor, BindingOperation, BindingOperationAvailability,
@@ -23,6 +21,10 @@ use super::{
         MuxSplitDirection,
     },
     controller::MuxScope,
+    operation::{
+        MuxAllocatedResources, MuxAllocatedWindow, MuxBackendCommandCompletion,
+        MuxBackendOperationError, MuxEventTarget, MuxOccupantIdentity,
+    },
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxPaneSplitDirection, MuxSession, MuxSnapshot, MuxWindow,
     },
@@ -199,7 +201,6 @@ struct NativeMuxState {
     next_occupant: u64,
     runtime_states: HashMap<NativePaneRuntimeIdentity, NativePaneRuntimeState>,
     events: MuxEventQueue,
-    event_stream_started: bool,
 }
 
 impl NativeMuxState {
@@ -217,7 +218,6 @@ impl NativeMuxState {
             next_occupant: 1,
             runtime_states: HashMap::new(),
             events: MuxEventQueue::for_backend(backend_identity),
-            event_stream_started: false,
         }
     }
 
@@ -1167,6 +1167,7 @@ impl NativeMuxState {
             })
             .expect("validated native runtime lease remains present");
         pane.occupant_id = occupant_id;
+        pane.cwd = PathBuf::from(&pane.launch.cwd);
         self.runtime_states.remove(previous);
         let current = self.runtime_context(&previous.session_id, &previous.pane_id, None)?;
         Ok((old, current))
@@ -1684,11 +1685,19 @@ fn default_window_name() -> String {
         .unwrap_or_else(|| "shell".to_owned())
 }
 
+#[cfg(test)]
+type NativeMutationBarrier = Arc<(
+    std::sync::mpsc::SyncSender<()>,
+    Mutex<std::sync::mpsc::Receiver<()>>,
+)>;
+
 pub struct NativeBackend {
     state: Arc<Mutex<NativeMuxState>>,
     // This result belongs to the backend instance that executed the command, not its shared
     // workspace state.
     authoritative_completion: Option<MuxBackendCommandCompletion>,
+    #[cfg(test)]
+    mutation_barrier: Option<NativeMutationBarrier>,
 }
 
 impl Clone for NativeBackend {
@@ -1696,6 +1705,8 @@ impl Clone for NativeBackend {
         Self {
             state: Arc::clone(&self.state),
             authoritative_completion: None,
+            #[cfg(test)]
+            mutation_barrier: self.mutation_barrier.clone(),
         }
     }
 }
@@ -1747,6 +1758,8 @@ impl NativeBackend {
                 )))
             })),
             authoritative_completion: None,
+            #[cfg(test)]
+            mutation_barrier: None,
         }
     }
 
@@ -1755,7 +1768,13 @@ impl NativeBackend {
         Self {
             state: Arc::new(Mutex::new(state)),
             authoritative_completion: None,
+            mutation_barrier: None,
         }
+    }
+
+    #[cfg(test)]
+    fn set_mutation_barrier(&mut self, barrier: NativeMutationBarrier) {
+        self.mutation_barrier = Some(barrier);
     }
 
     #[cfg(test)]
@@ -1857,6 +1876,19 @@ impl NativeBackend {
             resume_sequence,
             missed_events,
         );
+        Ok(())
+    }
+
+    pub(crate) fn publish_runtime_side_effect_lag(
+        &self,
+        runtime: &NativePaneRuntimeIdentity,
+    ) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("native mux state lock poisoned"))?;
+        state.runtime_context(&runtime.session_id, &runtime.pane_id, Some(runtime))?;
+        state.events.publish_rebase(MuxEventProvenance::Native);
         Ok(())
     }
 
@@ -2012,90 +2044,36 @@ impl Default for NativeBackend {
     }
 }
 
-impl MuxBackend for NativeBackend {
-    fn snapshot(&self) -> Result<MuxSnapshot> {
-        self.state
-            .lock()
-            .map(|state| state.snapshot())
-            .map_err(|_| anyhow::anyhow!("native mux state lock poisoned"))
-    }
-
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
-        BindingCapabilityDescriptor::new(
-            scope,
-            [
-                BindingOperation::ActivateWindow,
-                BindingOperation::CreateWindow,
-                BindingOperation::RenameWindow,
-                BindingOperation::NavigateWindow,
-                BindingOperation::MoveWindow,
-                BindingOperation::SplitPane,
-                BindingOperation::NavigatePane,
-                BindingOperation::ClosePane,
-                BindingOperation::CreateProjectSession,
-                BindingOperation::CreateWorktreeSession,
-                BindingOperation::RenameSession,
-                BindingOperation::DitchSession,
-            ],
-        )
-    }
-
-    fn event_capabilities(&self) -> Vec<MuxEventCapability> {
-        MuxEventTopic::ALL
-            .into_iter()
-            .map(|topic| match topic {
-                MuxEventTopic::TopologyChanged
-                | MuxEventTopic::TerminalOutput
-                | MuxEventTopic::PaneStateChanged
-                | MuxEventTopic::PaneOccupantReplaced
-                | MuxEventTopic::PaneClosed
-                | MuxEventTopic::BackendLagged
-                | MuxEventTopic::SnapshotRebased => MuxEventCapability::available(topic),
-                MuxEventTopic::PaneTitleChanged
-                | MuxEventTopic::PaneOptionsChanged
-                | MuxEventTopic::PaneForegroundChanged
-                | MuxEventTopic::PaneCwdChanged => MuxEventCapability::best_effort(
-                    topic,
-                    "the native terminal runtime must publish this direct observation; no polling adapter fabricates it",
-                ),
-                MuxEventTopic::BackendDisconnected => MuxEventCapability::unsupported(
-                    topic,
-                    "the in-process native backend has no independently disconnectable event transport",
-                ),
-            })
-            .collect()
-    }
-
-    fn start_event_stream(&mut self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.event_stream_started {
-            return;
-        }
-        state.event_stream_started = true;
-        state.events.publish(MuxEventDraft::rebase(
-            MuxEventProvenance::Native,
-            MuxRebaseReason::Bootstrap,
-        ));
-    }
-
-    fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.events.drain(scope, maximum)
-    }
-
-    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+impl NativeBackend {
+    fn execute_with_precondition(
+        &mut self,
+        command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> Result<()> {
         self.authoritative_completion = None;
         let event_command = command.clone();
+        #[cfg(test)]
+        if let Some(barrier) = &self.mutation_barrier {
+            barrier.0.send(()).expect("native mutation barrier entry");
+            barrier
+                .1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("native mutation barrier release");
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("native mux state lock poisoned"))?;
+        if let Some(precondition) = precondition
+            && !precondition.matches_snapshot(&state.snapshot())
+        {
+            return Err(MuxBackendOperationError::stale(
+                "native mux command target changed before mutation",
+            )
+            .into());
+        }
         state.validate_command_target(&command)?;
 
         // A destructive mutation must retain the precise lease it consumed. In particular,
@@ -2276,18 +2254,103 @@ impl MuxBackend for NativeBackend {
         self.authoritative_completion = Some(completion);
         Ok(())
     }
+}
+impl MuxBackend for NativeBackend {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        self.state
+            .lock()
+            .map(|state| state.snapshot())
+            .map_err(|_| anyhow::anyhow!("native mux state lock poisoned"))
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(
+            scope,
+            [
+                BindingOperation::ActivateWindow,
+                BindingOperation::CreateWindow,
+                BindingOperation::RenameWindow,
+                BindingOperation::NavigateWindow,
+                BindingOperation::MoveWindow,
+                BindingOperation::SplitPane,
+                BindingOperation::NavigatePane,
+                BindingOperation::ClosePane,
+                BindingOperation::CreateProjectSession,
+                BindingOperation::CreateWorktreeSession,
+                BindingOperation::RenameSession,
+                BindingOperation::DitchSession,
+            ],
+        )
+    }
+
+    fn event_capabilities(&self) -> Vec<MuxEventCapability> {
+        MuxEventTopic::ALL
+            .into_iter()
+            .map(|topic| match topic {
+                MuxEventTopic::TopologyChanged
+                | MuxEventTopic::TerminalOutput
+                | MuxEventTopic::PaneStateChanged
+                | MuxEventTopic::PaneOccupantReplaced
+                | MuxEventTopic::PaneClosed
+                | MuxEventTopic::BackendLagged
+                | MuxEventTopic::SnapshotRebased => MuxEventCapability::available(topic),
+                MuxEventTopic::PaneTitleChanged
+                | MuxEventTopic::PaneOptionsChanged
+                | MuxEventTopic::PaneForegroundChanged
+                | MuxEventTopic::PaneCwdChanged => MuxEventCapability::best_effort(
+                    topic,
+                    "the native terminal runtime must publish this direct observation; no polling adapter fabricates it",
+                ),
+                MuxEventTopic::BackendDisconnected => MuxEventCapability::unsupported(
+                    topic,
+                    "the in-process native backend has no independently disconnectable event transport",
+                ),
+            })
+            .collect()
+    }
+
+    fn start_event_stream(&mut self) {
+        // Bootstrap is scoped to the first `drain_events` call for each binding.
+    }
+    fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .events
+            .drain_with_initial_rebase(scope, maximum, MuxEventProvenance::Native)
+    }
+    fn release_event_scope(&mut self, scope: MuxScope) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.events.remove_scope(scope);
+    }
+
+    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        self.execute_with_precondition(command, None)
+    }
 
     fn execute_checked(
         &mut self,
         scope: MuxScope,
         command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
     ) -> BindingOperationOutcome<Result<()>> {
         self.authoritative_completion = None;
+        if precondition.is_some_and(|precondition| precondition.scope != scope) {
+            return BindingOperationOutcome::Supported(Err(MuxBackendOperationError::stale(
+                "native mux binding scope changed",
+            )
+            .into()));
+        }
         let descriptor = self.capabilities(scope);
         descriptor.invoke(
             descriptor.request(command.operation()),
             BindingOperationAvailability::Available,
-            || self.execute(command),
+            || self.execute_with_precondition(command, precondition),
         )
     }
 
@@ -2323,12 +2386,13 @@ impl MuxBackend for NativeBackend {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::{Arc, Barrier},
+        sync::{Arc, Barrier, Mutex},
         thread,
     };
 
     use super::*;
     use crate::{
+        backend::MuxRebaseReason,
         capability::BindingOperationOutcome,
         command::{
             MuxPaneLaunch, MuxPaneLaunchPlan, MuxSessionLaunchPlan, MuxSplitDirection,
@@ -2424,33 +2488,63 @@ mod tests {
     }
 
     #[test]
-    fn native_event_stream_starts_with_one_bootstrap_rebase() {
+    fn native_event_stream_gives_each_scope_a_bootstrap_rebase() {
         let mut backend = NativeBackend::with_state(NativeMuxState::new());
         let mut clone = backend.clone();
+        let first_scope = native_scope();
+        let second_scope = native_scope_for_binding(3);
 
         backend.start_event_stream();
         clone.start_event_stream();
 
-        let events = backend.drain_events(native_scope(), 8);
-        assert_eq!(events.len(), 1);
-        let event = &events[0];
-        assert_eq!(event.topic, MuxEventTopic::SnapshotRebased);
-        assert_eq!(event.provenance, MuxEventProvenance::Native);
-        assert_eq!(event.scope, native_scope());
-        assert_eq!(event.revision, 1);
+        let first = backend.drain_events(first_scope, 8);
+        let second = clone.drain_events(second_scope, 8);
+        for (events, scope) in [(&first, first_scope), (&second, second_scope)] {
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.topic, MuxEventTopic::SnapshotRebased);
+            assert_eq!(event.provenance, MuxEventProvenance::Native);
+            assert_eq!(event.scope, scope);
+            assert_eq!(event.revision, 1);
+            assert!(matches!(
+                &event.payload,
+                MuxEventPayload::Rebase {
+                    reason: MuxRebaseReason::Bootstrap
+                }
+            ));
+        }
+        assert!(backend.drain_events(first_scope, 8).is_empty());
+        assert!(clone.drain_events(second_scope, 8).is_empty());
+    }
+    #[test]
+    fn native_scope_release_allows_a_recreated_binding_to_bootstrap_again() {
+        let mut backend = NativeBackend::with_state(NativeMuxState::new());
+        let scope = native_scope();
+
+        let first = backend.drain_events(scope, 8);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].revision, 1);
+        backend.release_event_scope(scope);
+
+        let recreated = backend.drain_events(scope, 8);
+        assert_eq!(recreated.len(), 1);
+        assert_eq!(recreated[0].revision, 1);
         assert!(matches!(
-            &event.payload,
+            &recreated[0].payload,
             MuxEventPayload::Rebase {
                 reason: MuxRebaseReason::Bootstrap
             }
         ));
-        assert!(backend.drain_events(native_scope(), 8).is_empty());
     }
 
     fn native_scope() -> MuxScope {
+        native_scope_for_binding(2)
+    }
+
+    fn native_scope_for_binding(binding_id: i64) -> MuxScope {
         MuxScope::new(
             crate::controller::SpaceId::from_persistence(1),
-            crate::controller::BindingId::from_persistence(2),
+            crate::controller::BindingId::from_persistence(binding_id),
         )
     }
 
@@ -2889,6 +2983,7 @@ mod tests {
                 MuxCommand::ActivateLastWindow {
                     session_id: "local".to_owned(),
                 },
+                None,
             ),
             BindingOperationOutcome::Supported(Err(_))
         ));
@@ -2908,10 +3003,90 @@ mod tests {
                     session_id: "local".to_owned(),
                     pane_id: None,
                 },
+                None,
             ),
             BindingOperationOutcome::Unsupported
         ));
         assert!(backend.take_authoritative_completion().is_none());
+    }
+
+    #[test]
+    fn native_checked_command_rejects_replaced_occupant_at_mutation_boundary() {
+        let mut backend = NativeBackend::with_state(local_state());
+        let scope = native_scope();
+        let previous = backend
+            .start_pane_runtime("local", "pane-1")
+            .expect("start native runtime");
+        let before = backend.snapshot().expect("snapshot before queued command");
+        let pane = &before.sessions[0].windows[0].anchor;
+        let occupant_id = pane.occupant_id.clone().expect("native occupant identity");
+        let precondition = MuxScopedExecutionPrecondition {
+            scope,
+            target: MuxEventTarget::pane(
+                "local",
+                "tab-1",
+                "pane-1",
+                pane.terminal_id.clone().expect("native terminal identity"),
+                Some(MuxOccupantIdentity {
+                    backend_identity: occupant_id.clone(),
+                    pid: pane.pane_pid,
+                    process: pane.process.clone(),
+                }),
+            ),
+            occupant_fingerprint: Some(occupant_id),
+            binding_generation: None,
+            occupant_generation: Some(1),
+        };
+        assert!(precondition.matches_snapshot(&before));
+
+        let command_precondition = precondition.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        backend.set_mutation_barrier(Arc::new((entered_tx, Mutex::new(release_rx))));
+
+        let mut command_backend = backend.clone();
+        let command = thread::spawn(move || {
+            command_backend.execute_checked(
+                scope,
+                MuxCommand::ClosePane {
+                    session_id: "local".to_owned(),
+                    pane_id: Some("pane-1".to_owned()),
+                },
+                Some(&command_precondition),
+            )
+        });
+        entered_rx
+            .recv()
+            .expect("checked command reached the final backend boundary");
+
+        let replacement_backend = backend.clone();
+        replacement_backend
+            .restart_pane_runtime(&previous)
+            .expect("replace native occupant while command is paused");
+        release_tx
+            .send(())
+            .expect("release checked command after replacement");
+
+        let outcome = command.join().expect("checked command thread");
+        let error = match outcome {
+            BindingOperationOutcome::Supported(Err(error)) => error,
+            other => panic!("replaced occupant must be stale, got {other:?}"),
+        };
+        assert!(matches!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(MuxBackendOperationError::Stale(_))
+        ));
+        assert!(
+            backend
+                .snapshot()
+                .expect("snapshot after stale command")
+                .sessions[0]
+                .windows[0]
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id.as_deref() == Some("pane-1")),
+            "replacement pane must remain unchanged"
+        );
     }
 
     #[test]

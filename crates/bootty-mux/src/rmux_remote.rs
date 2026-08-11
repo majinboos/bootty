@@ -31,7 +31,9 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::{
     backend::MuxBackendOperationError,
     command::MuxCommand,
-    operation::{MuxBackendCommandCompletion, MuxEventTarget},
+    operation::{
+        MuxBackendCommandCompletion, MuxEventTarget, RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
+    },
     rmux_bridge::{
         RmuxPaneEvent, RmuxPaneTarget, open_rmux_pane_io, resize_rmux_pane,
         resolve_rmux_pane_target, rmux_execute, rmux_launch_session, rmux_snapshot,
@@ -44,8 +46,11 @@ use crate::{
     backend::{
         MuxBackend, MuxEvent, MuxEventCapability, MuxEventDraft, MuxEventPayload,
         MuxEventProvenance, MuxEventQueue, MuxEventTopic, MuxRebaseReason,
+        MuxScopedExecutionPrecondition,
     },
-    capability::{BindingCapabilityDescriptor, BindingOperationOutcome},
+    capability::{
+        BindingCapabilityDescriptor, BindingOperationAvailability, BindingOperationOutcome,
+    },
     command::MuxSessionLaunchPlan,
     controller::{BindingId, MuxScope, SpaceId},
     process::{CommandOutput, CommandRunner, SystemCommandRunner},
@@ -77,6 +82,10 @@ enum RemoteRmuxRequest {
     Snapshot,
     Execute {
         command: MuxCommand,
+    },
+    ExecuteChecked {
+        command: MuxCommand,
+        precondition: Box<MuxScopedExecutionPrecondition>,
     },
     ResolvePane {
         session: String,
@@ -137,10 +146,6 @@ impl RemoteRmuxOperationError {
             }
             None => Self::Failed(bounded_remote_rmux_error_message(&error.to_string())),
         }
-    }
-
-    fn failed(message: impl AsRef<str>) -> Self {
-        Self::Failed(bounded_remote_rmux_error_message(message.as_ref()))
     }
 
     #[cfg(feature = "app")]
@@ -508,6 +513,34 @@ impl MuxBackend for RemoteRmuxBackend {
         Ok(())
     }
 
+    fn execute_checked(
+        &mut self,
+        scope: MuxScope,
+        command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<Result<()>> {
+        let descriptor = self.capabilities(scope);
+        descriptor.invoke(
+            descriptor.request(command.operation()),
+            BindingOperationAvailability::Available,
+            || {
+                if let Some(precondition) = precondition {
+                    if precondition.scope != scope {
+                        return Err(MuxBackendOperationError::stale(
+                            "remote rmux binding scope changed",
+                        )
+                        .into());
+                    }
+                    return Err(MuxBackendOperationError::unsupported(
+                        RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
+                    )
+                    .into());
+                }
+                self.execute(command)
+            },
+        )
+    }
+
     fn execute_session_launch(
         &mut self,
         plan: MuxSessionLaunchPlan,
@@ -549,6 +582,9 @@ impl MuxBackend for RemoteRmuxBackend {
 
     fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
         self.events.drain(scope, maximum)
+    }
+    fn release_event_scope(&mut self, scope: MuxScope) {
+        self.events.remove_scope(scope);
     }
 }
 
@@ -697,7 +733,16 @@ pub fn run_remote_rmux_command(payload: &str) -> Result<i32> {
                 println!("{}", serde_json::to_string(&rmux_snapshot()?)?);
             }
             RemoteRmuxRequest::Execute { command } => {
-                write_remote_operation_completion(execute_remote_rmux(command)?)?;
+                write_remote_operation_completion(execute_remote_rmux(command, None)?)?;
+            }
+            RemoteRmuxRequest::ExecuteChecked {
+                command,
+                precondition,
+            } => {
+                write_remote_operation_completion(execute_remote_rmux(
+                    command,
+                    Some(*precondition),
+                )?)?;
             }
             RemoteRmuxRequest::ResolvePane { session, pane } => {
                 let resolution = resolve_remote_pane(session, pane, resolve_rmux_pane_target);
@@ -737,7 +782,10 @@ pub fn run_remote_rmux_command(payload: &str) -> Result<i32> {
     }
 }
 
-fn execute_remote_rmux(command: MuxCommand) -> Result<Option<MuxBackendCommandCompletion>> {
+fn execute_remote_rmux(
+    command: MuxCommand,
+    precondition: Option<MuxScopedExecutionPrecondition>,
+) -> Result<Option<MuxBackendCommandCompletion>> {
     let completion = match command {
         MuxCommand::CreateSession { plan } => {
             plan.validate()?;
@@ -755,6 +803,12 @@ fn execute_remote_rmux(command: MuxCommand) -> Result<Option<MuxBackendCommandCo
             })
         }
         command => {
+            if precondition.is_some() {
+                return Err(MuxBackendOperationError::unsupported(
+                    "remote rmux lacks an atomic checked mutation protocol",
+                )
+                .into());
+            }
             rmux_execute(command)?;
             None
         }
@@ -894,7 +948,7 @@ fn pane_frame(event: RmuxPaneEvent) -> RemotePaneFrame {
             RemotePaneFrame::KeyboardProtocol(URL_SAFE_NO_PAD.encode(bytes))
         }
         RmuxPaneEvent::Error(error) => {
-            RemotePaneFrame::Error(RemoteRmuxOperationError::failed(error))
+            RemotePaneFrame::Error(RemoteRmuxOperationError::from_error(&error))
         }
     }
 }
@@ -1020,7 +1074,8 @@ fn spawn_output(
             .and_then(decode_frame);
             match result {
                 Ok(event) => {
-                    if output_tx.send(event).is_err() {
+                    let terminal_error = matches!(&event, RmuxPaneEvent::Error(_));
+                    if output_tx.send(event).is_err() || terminal_error {
                         return;
                     }
                 }
@@ -1052,7 +1107,7 @@ fn decode_frame(frame: RemotePaneFrame) -> Result<RmuxPaneEvent> {
                 .decode(bytes)
                 .context("decode remote terminal protocol")?,
         ),
-        RemotePaneFrame::Error(error) => return Err(error.into_error()),
+        RemotePaneFrame::Error(error) => RmuxPaneEvent::Error(error.into_error()),
     })
 }
 
@@ -1465,6 +1520,32 @@ mod tests {
 
     #[cfg(feature = "app")]
     #[test]
+    fn pane_frames_preserve_typed_stale_errors() {
+        let event = RmuxPaneEvent::Error(
+            MuxBackendOperationError::Stale("pane vanished before stream open".to_owned()).into(),
+        );
+        let frame = pane_frame(event);
+
+        assert!(matches!(
+            &frame,
+            RemotePaneFrame::Error(RemoteRmuxOperationError::Stale(message))
+                if message == "pane vanished before stream open"
+        ));
+
+        let decoded = decode_frame(frame).expect("decode stale pane frame");
+        let RmuxPaneEvent::Error(error) = decoded else {
+            panic!("expected stale pane error event");
+        };
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Stale(
+                "pane vanished before stream open".to_owned()
+            ))
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
     fn pane_frames_preserve_lag_recovery_bytes() {
         let bytes = vec![0x1b, b'[', b'm'];
         let event = RmuxPaneEvent::Chunks(vec![PaneOutputChunk::Lag(rmux_sdk::PaneLagNotice {
@@ -1545,29 +1626,62 @@ mod tests {
                 bytes: b"second".to_vec(),
             },
         );
+        let bootstrap_draft =
+            MuxEventDraft::rebase(MuxEventProvenance::RmuxSdk, MuxRebaseReason::Bootstrap);
+        backend.events.publish(bootstrap_draft.clone());
+
         backend.events.publish(first_draft.clone());
         backend.events.publish(second_draft.clone());
 
+        let bootstrap = backend.drain_events(scope, 1);
         let first = backend.drain_events(scope, 1);
         let second = backend.drain_events(scope, 1);
+        let other_bootstrap = backend.drain_events(other_scope, 1);
         let other_binding = backend.drain_events(other_scope, 2);
 
+        assert_eq!(bootstrap.len(), 1);
+        assert_eq!(bootstrap[0].revision, 1);
+        assert!(matches!(
+            &bootstrap[0].payload,
+            MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Bootstrap
+            }
+        ));
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].revision, 1);
+        assert_eq!(first[0].revision, 2);
         assert_eq!(first[0].cursor, first_draft.cursor);
         assert_eq!(first[0].target, Some(target.clone()));
         assert_eq!(first[0].provenance, MuxEventProvenance::RmuxSdk);
         assert!(first[0].backend_identity.starts_with("rmux:remote:"));
         assert_eq!(second.len(), 1);
-        assert_eq!(second[0].revision, 2);
+        assert_eq!(second[0].revision, 3);
         assert_eq!(second[0].cursor, second_draft.cursor);
+        assert_eq!(
+            other_bootstrap
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         assert_eq!(
             other_binding
                 .iter()
                 .map(|event| event.revision)
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![2, 3]
         );
+        backend.release_event_scope(other_scope);
+        backend.release_event_scope(scope);
+        backend.events.publish(bootstrap_draft);
+        let recreated = backend.drain_events(scope, 1);
+        assert_eq!(recreated.len(), 1);
+        assert_eq!(recreated[0].revision, 1);
+        assert!(matches!(
+            &recreated[0].payload,
+            MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Bootstrap
+            }
+        ));
     }
 
     #[cfg(feature = "app")]
@@ -1576,8 +1690,9 @@ mod tests {
         let output = match decode_frame(RemotePaneFrame::Error(
             RemoteRmuxOperationError::Unavailable("daemon unavailable".to_owned()),
         )) {
-            Err(error) => error,
-            Ok(_) => panic!("error frame must decode as an operation error"),
+            Ok(RmuxPaneEvent::Error(error)) => error,
+            Ok(_) => panic!("expected an operation error event"),
+            Err(error) => panic!("error frame failed to decode: {error:#}"),
         };
         let input = match decode_remote_pane_input_frame(RemotePaneInputFrame::Error(
             RemoteRmuxOperationError::Stale("pane changed".to_owned()),

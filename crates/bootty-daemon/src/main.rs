@@ -1,6 +1,6 @@
 mod catalog;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use catalog::{Backend, Catalog};
@@ -134,7 +134,7 @@ fn run_remote_worktree(args: &[String]) -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string(
-                    &bootty_mux::project::add_worktree(&project, &branch)
+                    &bootty_mux::project::add_worktree(Path::new(&project), &branch)
                         .map_err(anyhow::Error::msg)?
                 )?
             );

@@ -1,8 +1,8 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
         mpsc,
     },
     thread,
@@ -22,6 +22,7 @@ use crate::{
     capability::{BindingOperation, BindingOperationAvailability, BindingOperationOutcome},
     command::{MuxCommand, MuxPaneLaunchPlan, MuxSessionLaunchPlan, MuxSessionLaunchPlanError},
     config::{BackendFactory, build_backend_with, selected_backend},
+    rmux::rmux_operation_requires_checked_boundary,
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxSession, MuxSnapshot, selection_after_refresh,
         session_matches,
@@ -67,8 +68,20 @@ struct SessionRefreshRequest {
     config: MultiplexerConfig,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct CommandCancellation(Arc<AtomicU8>);
+#[derive(Clone, Debug)]
+pub struct CommandCancellation {
+    state: Arc<AtomicU8>,
+    requested: Arc<AtomicBool>,
+}
+
+impl Default for CommandCancellation {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(Self::PENDING)),
+            requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 impl CommandCancellation {
     const PENDING: u8 = 0;
@@ -79,8 +92,14 @@ impl CommandCancellation {
         Self::default()
     }
 
-    pub fn cancel(&self) -> bool {
-        self.0
+    /// Requests cancellation without changing a started operation's lifecycle state.
+    ///
+    /// A pending operation still transitions to `CANCELLED` so queue consumers can skip it.
+    /// Once an operation has started, the independent request flag lets the operation observe
+    /// cancellation and reconcile its actual completion without pretending it never ran.
+    pub fn request_cancel(&self) -> bool {
+        self.requested.store(true, Ordering::Release);
+        self.state
             .compare_exchange(
                 Self::PENDING,
                 Self::CANCELLED,
@@ -90,16 +109,27 @@ impl CommandCancellation {
             .is_ok()
     }
 
+    pub fn cancel(&self) -> bool {
+        self.request_cancel()
+    }
+
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire) == Self::CANCELLED
+        self.state.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    pub fn is_cancel_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
     }
 
     pub fn is_started(&self) -> bool {
-        self.0.load(Ordering::Acquire) == Self::STARTED
+        self.state.load(Ordering::Acquire) == Self::STARTED
     }
 
     pub fn try_start(&self) -> bool {
-        self.0
+        if self.is_cancel_requested() {
+            return false;
+        }
+        self.state
             .compare_exchange(
                 Self::PENDING,
                 Self::STARTED,
@@ -107,6 +137,7 @@ impl CommandCancellation {
                 Ordering::Acquire,
             )
             .is_ok()
+            && !self.is_cancel_requested()
     }
 }
 
@@ -1000,7 +1031,7 @@ fn execute_backend_command_with_generation_guards(
         resource_generation_guard,
         binding_generation_guard,
     )?;
-    execution_outcome(backend.execute_checked(scope, command))
+    execution_outcome(backend.execute_checked(scope, command, precondition))
 }
 
 fn command_error_from_backend(error: anyhow::Error) -> MuxCommandError {
@@ -1375,8 +1406,30 @@ pub struct MuxEventObservation {
     /// The event target's resource generation after this event's transition.
     pub target_generation: Option<u64>,
     /// The replaced or closed target's resource generation before its
-    /// transition, when the event retires a terminal occupant.
+    /// transition, when the event retires a target resource.
     pub retired_target_generation: Option<u64>,
+}
+const MAX_DEFERRED_UNKNOWN_TARGET_EVENTS: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DeferredMuxEventKey {
+    binding_generation: u64,
+    backend_identity: String,
+    session_id: Option<String>,
+    window_id: Option<String>,
+    pane_id: Option<String>,
+    terminal_id: Option<String>,
+    occupant_generation: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredMuxEvent {
+    key: DeferredMuxEventKey,
+    event: MuxEvent,
+}
+fn is_authoritative_close_event(event: &MuxEvent) -> bool {
+    event.topic == crate::backend::MuxEventTopic::PaneClosed
+        && matches!(&event.payload, MuxEventPayload::Closed { .. })
 }
 
 pub struct BindingMuxController {
@@ -1387,16 +1440,24 @@ pub struct BindingMuxController {
     refresh_failed: bool,
     binding_generation: Arc<AtomicU64>,
     resource_generations: BTreeMap<MuxResourceKey, u64>,
+    /// Retired generations remain addressable for delayed authoritative close/replacement events.
+    tombstoned_resource_generations: BTreeMap<MuxResourceKey, u64>,
+    next_resource_generation: u64,
     observed_resources: BTreeMap<MuxResourceKey, String>,
     authoritative_occupants: BTreeMap<MuxResourceKey, String>,
     /// Exact resources committed by a backend create completion. A flat tmux
     /// snapshot reports only its attach anchor, so it cannot retire siblings.
     authoritative_allocations: BTreeSet<MuxResourceKey>,
+    /// Pane close evidence retained until an authoritative snapshot rebase. Event batches can
+    /// split one session/window teardown across multiple drains.
+    authoritative_closed_targets: BTreeMap<MuxResourceKey, MuxEventTarget>,
     execution_resource_generations: Arc<Mutex<BTreeMap<MuxResourceKey, u64>>>,
     observed_backend: Option<MultiplexerBackendConfig>,
     /// Cache key is the complete binding configuration, not merely backend kind: remote server
     /// identity and transport changes must never retain another server's event stream.
     event_backend: Option<(MultiplexerConfig, Box<dyn MuxBackend>)>,
+    deferred_unknown_events: VecDeque<DeferredMuxEvent>,
+    deferred_refresh_completed: bool,
 }
 
 impl Default for BindingMuxController {
@@ -1420,12 +1481,17 @@ impl BindingMuxController {
             refresh_failed: false,
             binding_generation,
             resource_generations: BTreeMap::new(),
+            tombstoned_resource_generations: BTreeMap::new(),
+            next_resource_generation: 1,
             observed_resources: BTreeMap::new(),
             authoritative_occupants: BTreeMap::new(),
             authoritative_allocations: BTreeSet::new(),
+            authoritative_closed_targets: BTreeMap::new(),
             execution_resource_generations,
             observed_backend: None,
             event_backend: None,
+            deferred_unknown_events: VecDeque::new(),
+            deferred_refresh_completed: false,
         }
     }
 
@@ -1443,10 +1509,15 @@ impl BindingMuxController {
             refresh_failed: false,
             binding_generation,
             resource_generations: BTreeMap::new(),
+            tombstoned_resource_generations: BTreeMap::new(),
+            next_resource_generation: 1,
             observed_resources: BTreeMap::new(),
             authoritative_occupants: BTreeMap::new(),
             authoritative_allocations: BTreeSet::new(),
+            authoritative_closed_targets: BTreeMap::new(),
             execution_resource_generations,
+            deferred_unknown_events: VecDeque::new(),
+            deferred_refresh_completed: false,
             observed_backend: None,
             event_backend: None,
         }
@@ -1495,6 +1566,14 @@ impl BindingMuxController {
             .map_or_else(Vec::new, |backend| backend.drain_events(scope, maximum));
         self.observe_backend_events(events)
     }
+    fn release_event_scope(&mut self) {
+        let Some(scope) = self.controller.scope else {
+            return;
+        };
+        if let Some((_, backend)) = self.event_backend.as_mut() {
+            backend.release_event_scope(scope);
+        }
+    }
 
     fn ensure_event_backend(
         &mut self,
@@ -1506,15 +1585,29 @@ impl BindingMuxController {
             .is_none_or(|(cached, _)| cached != config)
         {
             let replaced = self.event_backend.is_some();
+            if replaced {
+                self.release_event_scope();
+            }
             let mut backend = self.controller.build_backend(config);
             backend.start_event_stream();
             self.event_backend = Some((config.clone(), backend));
             if replaced {
                 self.advance_binding_generation();
                 self.observed_resources.clear();
+                self.tombstoned_resource_generations.clear();
                 self.authoritative_occupants.clear();
                 self.authoritative_allocations.clear();
+                self.authoritative_closed_targets.clear();
+                self.deferred_unknown_events.clear();
+                self.deferred_refresh_completed = false;
                 self.synchronize_execution_resource_generations();
+                self.controller.apply_snapshot(
+                    selected_backend(config),
+                    MuxSnapshot::default(),
+                    None,
+                    None,
+                );
+                self.controller.refresh_on_next_frame();
             }
         }
         self.event_backend
@@ -1524,9 +1617,30 @@ impl BindingMuxController {
 
     fn observe_backend_events(&mut self, events: Vec<MuxEvent>) -> Vec<MuxEventObservation> {
         let mut refresh = false;
-        let mut observations = Vec::with_capacity(events.len());
-        for event in events {
+        let binding_generation = self.binding_generation();
+        self.deferred_unknown_events
+            .retain(|deferred| deferred.key.binding_generation == binding_generation);
+        let mut pending_events =
+            Vec::with_capacity(events.len() + self.deferred_unknown_events.len());
+        if self.deferred_refresh_completed {
+            self.deferred_refresh_completed = false;
+            let deferred = std::mem::take(&mut self.deferred_unknown_events);
+            pending_events.extend(deferred.into_iter().filter_map(|deferred| {
+                (deferred.key.binding_generation == binding_generation
+                    && self.event_belongs_to_binding(&deferred.event)
+                    && !self.deferred_event_is_stale(&deferred))
+                .then_some(deferred.event)
+            }));
+        }
+        pending_events.extend(events);
+        let mut observations = Vec::with_capacity(pending_events.len());
+        for event in pending_events {
+            if self.has_deferred_event_target(&event) {
+                refresh |= self.defer_unknown_target_event(event, &mut observations);
+                continue;
+            }
             if !self.event_belongs_to_binding(&event) {
+                refresh |= self.defer_unknown_target_event(event, &mut observations);
                 continue;
             }
             if matches!(
@@ -1537,8 +1651,12 @@ impl BindingMuxController {
             ) {
                 self.advance_binding_generation();
                 self.observed_resources.clear();
+                self.tombstoned_resource_generations.clear();
                 self.authoritative_occupants.clear();
                 self.authoritative_allocations.clear();
+                self.authoritative_closed_targets.clear();
+                self.deferred_unknown_events.clear();
+                self.deferred_refresh_completed = false;
                 self.synchronize_execution_resource_generations();
             }
             if self.has_stale_non_replacement_pane_occupant(&event) {
@@ -1559,13 +1677,18 @@ impl BindingMuxController {
                 });
                 continue;
             }
-            let retired_target_generation = matches!(
-                event.topic,
-                crate::backend::MuxEventTopic::PaneOccupantReplaced
-                    | crate::backend::MuxEventTopic::PaneClosed
-            )
+            let retired_target_generation = (event.topic
+                == crate::backend::MuxEventTopic::PaneOccupantReplaced
+                || is_authoritative_close_event(&event))
             .then(|| self.retired_event_target_generation(&event))
             .flatten();
+            if is_authoritative_close_event(&event)
+                && let Some(target) = event.target.as_ref()
+            {
+                self.remember_closed_target(target);
+                self.retire_event_target(target);
+                self.retire_closed_parent_generations();
+            }
             if event.topic != crate::backend::MuxEventTopic::PaneClosed
                 && let Some(target) = &event.target
             {
@@ -1584,6 +1707,114 @@ impl BindingMuxController {
             self.controller.refresh_on_next_frame();
         }
         observations
+    }
+
+    fn deferred_event_key(&self, event: &MuxEvent) -> Option<DeferredMuxEventKey> {
+        let target = event.target.as_ref()?;
+        Some(DeferredMuxEventKey {
+            binding_generation: self.binding_generation(),
+            backend_identity: event.backend_identity.clone(),
+            session_id: target.session_id.clone(),
+            window_id: target.window_id.clone(),
+            pane_id: target.pane_id.clone(),
+            terminal_id: target.terminal_id.clone(),
+            occupant_generation: target
+                .occupant
+                .as_ref()
+                .map(|occupant| occupant.backend_identity.clone())
+                .or_else(|| event.cursor.as_ref().map(|cursor| cursor.stream.clone())),
+        })
+    }
+
+    fn deferred_event_is_stale(&self, deferred: &DeferredMuxEvent) -> bool {
+        let Some(target) = deferred.event.target.as_ref() else {
+            return false;
+        };
+        let Some(expected_occupant) = target
+            .occupant
+            .as_ref()
+            .map(|occupant| occupant.backend_identity.as_str())
+        else {
+            return false;
+        };
+        let (Some(session_id), Some(window_id), Some(resource_id)) = (
+            target.session_id.as_deref(),
+            target.window_id.as_deref(),
+            target.terminal_id.as_deref().or(target.pane_id.as_deref()),
+        ) else {
+            return false;
+        };
+        let key = if target.terminal_id.is_some() {
+            MuxResourceKey::Terminal(
+                session_id.to_owned(),
+                window_id.to_owned(),
+                resource_id.to_owned(),
+            )
+        } else {
+            MuxResourceKey::Pane(
+                session_id.to_owned(),
+                window_id.to_owned(),
+                resource_id.to_owned(),
+            )
+        };
+        self.authoritative_occupants
+            .get(&key)
+            .is_some_and(|current| current != expected_occupant)
+    }
+
+    fn has_deferred_event_target(&self, event: &MuxEvent) -> bool {
+        let Some(key) = self.deferred_event_key(event) else {
+            return false;
+        };
+        self.deferred_unknown_events.iter().any(|deferred| {
+            deferred.key.binding_generation == key.binding_generation
+                && deferred.key.backend_identity == key.backend_identity
+                && deferred.key.session_id == key.session_id
+                && deferred.key.window_id == key.window_id
+                && deferred.key.pane_id == key.pane_id
+                && deferred.key.terminal_id == key.terminal_id
+        })
+    }
+
+    fn defer_unknown_target_event(
+        &mut self,
+        event: MuxEvent,
+        observations: &mut Vec<MuxEventObservation>,
+    ) -> bool {
+        if self.controller.scope != Some(event.scope) {
+            return false;
+        }
+        let Some(target) = event.target.as_ref() else {
+            return false;
+        };
+        if target.session_id.is_none() {
+            return false;
+        }
+        let Some(key) = self.deferred_event_key(&event) else {
+            return false;
+        };
+        if self.deferred_unknown_events.len() >= MAX_DEFERRED_UNKNOWN_TARGET_EVENTS {
+            self.deferred_unknown_events.clear();
+            let overflow_event = MuxEvent {
+                topic: crate::backend::MuxEventTopic::SnapshotRebased,
+                cursor: None,
+                target: None,
+                payload: MuxEventPayload::Rebase {
+                    reason: MuxRebaseReason::QueueOverflow,
+                },
+                ..event
+            };
+            observations.push(MuxEventObservation {
+                binding_generation: self.binding_generation(),
+                target_generation: None,
+                retired_target_generation: None,
+                event: overflow_event,
+            });
+            return true;
+        }
+        self.deferred_unknown_events
+            .push_back(DeferredMuxEvent { key, event });
+        true
     }
 
     fn event_belongs_to_binding(&self, event: &MuxEvent) -> bool {
@@ -1637,6 +1868,7 @@ impl BindingMuxController {
     fn target_is_known_or_tombstoned(&self, target: &MuxEventTarget) -> bool {
         self.resource_generations
             .keys()
+            .chain(self.tombstoned_resource_generations.keys())
             .any(|key| key.matches_target(target))
     }
 
@@ -1669,7 +1901,10 @@ impl BindingMuxController {
             (None, None, None) => MuxResourceKey::Session(session_id.to_owned()),
             _ => return None,
         };
-        self.resource_generations.get(&key).copied()
+        self.resource_generations
+            .get(&key)
+            .copied()
+            .or_else(|| self.tombstoned_resource_generations.get(&key).copied())
     }
 
     fn has_stale_non_replacement_pane_occupant(&self, event: &MuxEvent) -> bool {
@@ -1732,33 +1967,190 @@ impl BindingMuxController {
             window_id.to_owned(),
             pane_id.to_owned(),
         );
+        let mut updates = vec![(pane_key, fingerprint.clone())];
         if let Some(terminal_id) = target.terminal_id.as_deref() {
-            self.record_authoritative_occupant_for_key(pane_key, fingerprint.clone());
-            self.record_authoritative_occupant_for_key(
+            updates.push((
                 MuxResourceKey::Terminal(
                     session_id.to_owned(),
                     window_id.to_owned(),
                     terminal_id.to_owned(),
                 ),
                 fingerprint,
-            );
-        } else {
-            self.record_authoritative_occupant_for_key(pane_key, fingerprint);
+            ));
+        }
+        let mut changed_keys = Vec::new();
+        for (key, fingerprint) in updates {
+            if self.record_authoritative_occupant_for_key(key.clone(), fingerprint) {
+                changed_keys.push(key);
+            }
+        }
+        self.assign_resource_generation_epoch(changed_keys);
+        self.synchronize_execution_resource_generations();
+    }
+
+    fn record_authoritative_occupant_for_key(
+        &mut self,
+        key: MuxResourceKey,
+        fingerprint: String,
+    ) -> bool {
+        let previous_authoritative = self
+            .authoritative_occupants
+            .insert(key.clone(), fingerprint.clone());
+        let was_current = self.resource_is_current(&key);
+        let generation_changed = previous_authoritative
+            .as_deref()
+            .is_some_and(|previous| previous != fingerprint.as_str())
+            || !was_current
+            || !self.resource_generations.contains_key(&key);
+        self.observed_resources.insert(key, fingerprint);
+        generation_changed
+    }
+    fn remember_closed_target(&mut self, target: &MuxEventTarget) {
+        let (Some(session_id), Some(window_id), Some(pane_id)) = (
+            target.session_id.as_deref(),
+            target.window_id.as_deref(),
+            target.pane_id.as_deref(),
+        ) else {
+            return;
+        };
+        self.authoritative_closed_targets.insert(
+            MuxResourceKey::Pane(
+                session_id.to_owned(),
+                window_id.to_owned(),
+                pane_id.to_owned(),
+            ),
+            target.clone(),
+        );
+    }
+
+    fn retire_event_target(&mut self, target: &MuxEventTarget) {
+        let Some(session_id) = target.session_id.as_deref() else {
+            return;
+        };
+        let keys = match (
+            target.window_id.as_deref(),
+            target.pane_id.as_deref(),
+            target.terminal_id.as_deref(),
+        ) {
+            (Some(window_id), Some(pane_id), Some(terminal_id)) => vec![
+                MuxResourceKey::Pane(
+                    session_id.to_owned(),
+                    window_id.to_owned(),
+                    pane_id.to_owned(),
+                ),
+                MuxResourceKey::Terminal(
+                    session_id.to_owned(),
+                    window_id.to_owned(),
+                    terminal_id.to_owned(),
+                ),
+            ],
+            (Some(window_id), Some(pane_id), None) => vec![MuxResourceKey::Pane(
+                session_id.to_owned(),
+                window_id.to_owned(),
+                pane_id.to_owned(),
+            )],
+            (Some(window_id), None, None) => vec![MuxResourceKey::Window(
+                session_id.to_owned(),
+                window_id.to_owned(),
+            )],
+            (None, None, None) => vec![MuxResourceKey::Session(session_id.to_owned())],
+            _ => return,
+        };
+        for key in keys {
+            self.retire_resource_key(key);
         }
         self.synchronize_execution_resource_generations();
     }
 
-    fn record_authoritative_occupant_for_key(&mut self, key: MuxResourceKey, fingerprint: String) {
-        let previous = self
-            .authoritative_occupants
-            .insert(key.clone(), fingerprint.clone());
-        let was_current = self.resource_is_current(&key);
-        if previous.is_some_and(|previous| previous != fingerprint) || !was_current {
-            let generation = self.resource_generations.entry(key.clone()).or_insert(0);
-            *generation = generation.saturating_add(1);
+    fn tombstone_resource_key(&mut self, key: &MuxResourceKey) {
+        if let Some(generation) = self.resource_generations.remove(key) {
+            self.tombstoned_resource_generations
+                .insert(key.clone(), generation);
         }
-        self.observed_resources.insert(key, fingerprint);
     }
+
+    fn retire_resource_key(&mut self, key: MuxResourceKey) {
+        self.observed_resources.remove(&key);
+        self.authoritative_occupants.remove(&key);
+        self.authoritative_allocations.remove(&key);
+        self.tombstone_resource_key(&key);
+    }
+
+    fn retire_closed_parent_generations(&mut self) {
+        let closed_targets = self
+            .authoritative_closed_targets
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let closed_panes = closed_targets
+            .iter()
+            .filter_map(|target| {
+                Some((
+                    target.session_id.as_deref()?.to_owned(),
+                    target.window_id.as_deref()?.to_owned(),
+                    target.pane_id.as_deref()?.to_owned(),
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        if closed_panes.is_empty() {
+            return;
+        }
+
+        let mut closed_windows = BTreeSet::new();
+        let mut closed_sessions = BTreeSet::new();
+        for session in self.controller.sessions() {
+            let mut session_panes = Vec::new();
+            for window in &session.windows {
+                let pane_ids = std::iter::once(&window.anchor)
+                    .chain(&window.panes)
+                    .filter_map(|pane| pane.pane_id.as_deref())
+                    .collect::<Vec<_>>();
+                if pane_ids.is_empty() {
+                    continue;
+                }
+                session_panes.extend(
+                    pane_ids
+                        .iter()
+                        .map(|pane_id| (window.id.as_str(), *pane_id)),
+                );
+                if pane_ids.iter().all(|pane_id| {
+                    closed_panes.contains(&(
+                        session.id.clone(),
+                        window.id.clone(),
+                        (*pane_id).to_owned(),
+                    ))
+                }) {
+                    closed_windows.insert((session.id.clone(), window.id.clone()));
+                }
+            }
+            if !session_panes.is_empty()
+                && session_panes.iter().all(|(window_id, pane_id)| {
+                    closed_panes.contains(&(
+                        session.id.clone(),
+                        (*window_id).to_owned(),
+                        (*pane_id).to_owned(),
+                    ))
+                })
+            {
+                closed_sessions.insert(session.id.clone());
+            }
+        }
+
+        for (session_id, window_id) in closed_windows {
+            let key = MuxResourceKey::Window(session_id, window_id);
+            if self.resource_is_current(&key) {
+                self.retire_resource_key(key);
+            }
+        }
+        for session_id in closed_sessions {
+            let key = MuxResourceKey::Session(session_id);
+            if self.resource_is_current(&key) {
+                self.retire_resource_key(key);
+            }
+        }
+        self.synchronize_execution_resource_generations();
+    }
+
     fn advance_binding_generation(&self) {
         let _ = self.binding_generation.fetch_update(
             Ordering::AcqRel,
@@ -1780,6 +2172,13 @@ impl BindingMuxController {
             return BindingOperationOutcome::Supported(());
         };
         if self.availability_error.is_some() {
+            return BindingOperationOutcome::Unavailable;
+        }
+        if matches!(selected_backend(config), MultiplexerBackendConfig::Rmux)
+            && rmux_operation_requires_checked_boundary(operation)
+        {
+            // rmux has no server-side CAS for a queued target mutation. Keep the command
+            // registry's dynamic outcome aligned with the backend's fail-closed checked seam.
             return BindingOperationOutcome::Unavailable;
         }
         if self
@@ -1910,26 +2309,33 @@ impl BindingMuxController {
                 .map(|(key, generation)| (key.clone(), *generation)),
         );
     }
+    fn allocate_resource_generation(&mut self) -> u64 {
+        let generation = self.next_resource_generation;
+        self.next_resource_generation = self.next_resource_generation.saturating_add(1);
+        generation
+    }
 
-    fn issue_authoritative_resource(&mut self, key: MuxResourceKey) {
-        if !self.resource_is_current(&key) {
-            let generation = self.resource_generations.entry(key.clone()).or_insert(0);
-            *generation = generation.saturating_add(1);
-        } else {
-            self.resource_generations.entry(key.clone()).or_insert(1);
+    fn assign_resource_generation_epoch(&mut self, keys: impl IntoIterator<Item = MuxResourceKey>) {
+        let keys = keys.into_iter().collect::<BTreeSet<_>>();
+        if keys.is_empty() {
+            return;
         }
-        self.authoritative_allocations.insert(key);
+        let generation = self.allocate_resource_generation();
+        for key in keys {
+            self.resource_generations.insert(key.clone(), generation);
+            self.tombstoned_resource_generations.remove(&key);
+        }
     }
 
     fn record_authoritative_allocation(&mut self, allocated: &MuxAllocatedResources) {
-        self.issue_authoritative_resource(MuxResourceKey::Session(allocated.session_id.clone()));
+        let mut keys = vec![MuxResourceKey::Session(allocated.session_id.clone())];
         for window in &allocated.windows {
-            self.issue_authoritative_resource(MuxResourceKey::Window(
+            keys.push(MuxResourceKey::Window(
                 allocated.session_id.clone(),
                 window.window_id.clone(),
             ));
             for pane_id in &window.pane_ids {
-                self.issue_authoritative_resource(MuxResourceKey::Pane(
+                keys.push(MuxResourceKey::Pane(
                     allocated.session_id.clone(),
                     window.window_id.clone(),
                     pane_id.clone(),
@@ -1938,41 +2344,78 @@ impl BindingMuxController {
                 // terminal identity. Snapshot or completion targets supply that distinct ID.
             }
         }
+        let new_keys = keys
+            .iter()
+            .filter(|key| {
+                !self.resource_is_current(key) || !self.resource_generations.contains_key(*key)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !new_keys.is_empty() {
+            let session_key = MuxResourceKey::Session(allocated.session_id.clone());
+            let generation = self
+                .resource_generations
+                .get(&session_key)
+                .copied()
+                .or_else(|| {
+                    keys.iter()
+                        .find_map(|key| self.resource_generations.get(key).copied())
+                })
+                .unwrap_or_else(|| self.allocate_resource_generation());
+            for key in new_keys {
+                self.resource_generations.insert(key.clone(), generation);
+                self.tombstoned_resource_generations.remove(&key);
+            }
+        }
+        for key in keys {
+            self.authoritative_allocations.insert(key);
+        }
     }
 
     fn record_authoritative_target(&mut self, target: &MuxEventTarget) {
         let Some(session_id) = target.session_id.as_deref() else {
             return;
         };
-        let key = match (
+        let keys = match (
             target.window_id.as_deref(),
             target.pane_id.as_deref(),
             target.terminal_id.as_deref(),
         ) {
-            (Some(window_id), Some(pane_id), Some(terminal_id)) => {
-                self.issue_authoritative_resource(MuxResourceKey::Pane(
+            (Some(window_id), Some(pane_id), Some(terminal_id)) => vec![
+                MuxResourceKey::Pane(
                     session_id.to_owned(),
                     window_id.to_owned(),
                     pane_id.to_owned(),
-                ));
+                ),
                 MuxResourceKey::Terminal(
                     session_id.to_owned(),
                     window_id.to_owned(),
                     terminal_id.to_owned(),
-                )
-            }
-            (Some(window_id), Some(pane_id), None) => MuxResourceKey::Pane(
+                ),
+            ],
+            (Some(window_id), Some(pane_id), None) => vec![MuxResourceKey::Pane(
                 session_id.to_owned(),
                 window_id.to_owned(),
                 pane_id.to_owned(),
-            ),
-            (Some(window_id), None, None) => {
-                MuxResourceKey::Window(session_id.to_owned(), window_id.to_owned())
-            }
-            (None, None, None) => MuxResourceKey::Session(session_id.to_owned()),
+            )],
+            (Some(window_id), None, None) => vec![MuxResourceKey::Window(
+                session_id.to_owned(),
+                window_id.to_owned(),
+            )],
+            (None, None, None) => vec![MuxResourceKey::Session(session_id.to_owned())],
             _ => return,
         };
-        self.issue_authoritative_resource(key);
+        let new_keys = keys
+            .iter()
+            .filter(|key| {
+                !self.resource_is_current(key) || !self.resource_generations.contains_key(*key)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.assign_resource_generation_epoch(new_keys);
+        for key in keys {
+            self.authoritative_allocations.insert(key);
+        }
         if target.occupant.is_some() {
             self.record_authoritative_occupant(target);
         }
@@ -2036,6 +2479,25 @@ impl BindingMuxController {
                     || flat_windows.contains(&(session_id.as_str(), window_id.as_str()))
             }
         });
+        let retired_keys = {
+            let authoritative_allocations = &self.authoritative_allocations;
+            self.resource_generations
+                .keys()
+                .filter(|key| {
+                    !current.contains_key(*key) && !authoritative_allocations.contains(*key)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for key in retired_keys {
+            self.tombstone_resource_key(&key);
+        }
+        self.tombstoned_resource_generations
+            .retain(|key, _| !current.contains_key(key));
+        let authoritative_allocations = &self.authoritative_allocations;
+        self.resource_generations
+            .retain(|key, _| current.contains_key(key) || authoritative_allocations.contains(key));
+        let mut changed_keys = Vec::new();
         for (key, fingerprint) in &current {
             let reappeared = !self.observed_resources.contains_key(key);
             let occupant_changed = self
@@ -2043,16 +2505,14 @@ impl BindingMuxController {
                 .get(key)
                 .is_some_and(|previous| previous != fingerprint);
             let issued_authoritatively = self.authoritative_allocations.contains(key);
-            match self.resource_generations.get_mut(key) {
-                Some(generation) if (reappeared && !issued_authoritatively) || occupant_changed => {
-                    *generation = generation.saturating_add(1);
-                }
-                Some(_) => {}
-                None => {
-                    self.resource_generations.insert(key.clone(), 1);
-                }
+            if (reappeared && !issued_authoritatively)
+                || occupant_changed
+                || !self.resource_generations.contains_key(key)
+            {
+                changed_keys.push(key.clone());
             }
         }
+        self.assign_resource_generation_epoch(changed_keys);
         self.authoritative_occupants
             .retain(|key, _| current.contains_key(key));
         self.observed_resources = current;
@@ -2061,6 +2521,7 @@ impl BindingMuxController {
 
     pub fn synchronize_resource_generations(&mut self) {
         self.record_resource_snapshot();
+        self.authoritative_closed_targets.clear();
     }
 
     /// Queue or synchronously execute one immutable recursive session launch.
@@ -2109,7 +2570,7 @@ impl BindingMuxController {
             session_id: session_id.to_owned(),
         };
         match self.controller.scope {
-            Some(scope) => execution_outcome(backend.execute_checked(scope, command))?,
+            Some(scope) => execution_outcome(backend.execute_checked(scope, command, None))?,
             None => backend
                 .execute(command)
                 .map_err(command_error_from_backend)?,
@@ -2118,6 +2579,7 @@ impl BindingMuxController {
         self.controller
             .apply_refreshed_snapshot(backend_kind, snapshot);
         self.record_resource_snapshot();
+        self.authoritative_closed_targets.clear();
         Ok(())
     }
 
@@ -2140,8 +2602,11 @@ impl BindingMuxController {
             if recovering || backend_changed {
                 self.advance_binding_generation();
                 self.observed_resources.clear();
+                self.tombstoned_resource_generations.clear();
                 self.authoritative_occupants.clear();
                 self.authoritative_allocations.clear();
+                self.deferred_unknown_events.clear();
+                self.deferred_refresh_completed = false;
             }
             self.observed_backend = backend;
             self.last_error = None;
@@ -2149,6 +2614,10 @@ impl BindingMuxController {
             self.refresh_failed = false;
             self.refresh_completed = true;
             self.record_resource_snapshot();
+            if !self.deferred_unknown_events.is_empty() {
+                self.deferred_refresh_completed = true;
+            }
+            self.authoritative_closed_targets.clear();
         }
         error
     }
@@ -2175,6 +2644,9 @@ impl BindingMuxController {
         self.last_error = result.as_ref().err().map(ToString::to_string);
         if let Ok(completion) = &result {
             self.record_resource_snapshot();
+            if completion.snapshot.is_some() {
+                self.authoritative_closed_targets.clear();
+            }
             if let Some(allocated) = completion.allocated() {
                 self.record_authoritative_allocation(allocated);
             }
@@ -2184,6 +2656,12 @@ impl BindingMuxController {
             self.synchronize_execution_resource_generations();
         }
         result
+    }
+}
+impl Drop for BindingMuxController {
+    fn drop(&mut self) {
+        self.advance_binding_generation();
+        self.release_event_scope();
     }
 }
 
@@ -2330,6 +2808,10 @@ impl MuxController {
     pub fn refresh_on_next_frame(&mut self) {
         self.current_backend = None;
         self.last_session_refresh = None;
+        if self.session_refresh_pending {
+            self.session_refresh_generation = self.session_refresh_generation.wrapping_add(1);
+            self.session_refresh_pending = false;
+        }
     }
 
     pub fn sessions(&self) -> &[MuxSession] {
@@ -4096,6 +4578,20 @@ mod tests {
         fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
             Ok(())
         }
+
+        fn execute_checked(
+            &mut self,
+            scope: MuxScope,
+            command: MuxCommand,
+            _precondition: Option<&MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<anyhow::Result<()>> {
+            let descriptor = self.capabilities(scope);
+            descriptor.invoke(
+                descriptor.request(command.operation()),
+                BindingOperationAvailability::Available,
+                || self.execute(command),
+            )
+        }
     }
 
     fn controller_with_backend(sessions: Vec<MuxSession>) -> MuxController {
@@ -4192,6 +4688,20 @@ mod tests {
             Ok(())
         }
 
+        fn execute_checked(
+            &mut self,
+            scope: MuxScope,
+            command: MuxCommand,
+            _precondition: Option<&MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<anyhow::Result<()>> {
+            let descriptor = self.capabilities(scope);
+            descriptor.invoke(
+                descriptor.request(command.operation()),
+                BindingOperationAvailability::Available,
+                || self.execute(command),
+            )
+        }
+
         fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
             command_capabilities(scope)
         }
@@ -4239,6 +4749,20 @@ mod tests {
             Ok(())
         }
 
+        fn execute_checked(
+            &mut self,
+            scope: MuxScope,
+            command: MuxCommand,
+            _precondition: Option<&MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<anyhow::Result<()>> {
+            let descriptor = self.capabilities(scope);
+            descriptor.invoke(
+                descriptor.request(command.operation()),
+                BindingOperationAvailability::Available,
+                || self.execute(command),
+            )
+        }
+
         fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
             command_capabilities(scope)
         }
@@ -4268,6 +4792,20 @@ mod tests {
                         .expect("release first command");
                 }
                 Ok(())
+            }
+
+            fn execute_checked(
+                &mut self,
+                scope: MuxScope,
+                command: MuxCommand,
+                _precondition: Option<&MuxScopedExecutionPrecondition>,
+            ) -> BindingOperationOutcome<anyhow::Result<()>> {
+                let descriptor = self.capabilities(scope);
+                descriptor.invoke(
+                    descriptor.request(command.operation()),
+                    BindingOperationAvailability::Available,
+                    || self.execute(command),
+                )
             }
         }
 
@@ -4969,10 +5507,406 @@ mod tests {
         binding.controller.sessions = vec![work];
         binding.record_resource_snapshot();
 
-        assert_eq!(binding.session_generation("$1"), Some(2));
-        assert_eq!(binding.window_generation("$1", "@1"), Some(2));
+        assert_eq!(binding.session_generation("$1"), Some(3));
+        assert_eq!(binding.window_generation("$1", "@1"), Some(3));
         assert_eq!(binding.pane_generation("$1", "@1", "%1"), Some(3));
         assert_eq!(binding.terminal_generation("$1", "@1", "t1"), Some(3));
+    }
+
+    #[test]
+    fn resource_generations_bound_live_inventory_through_replacements_and_removals() {
+        let pane = MuxPaneAnchor {
+            session_id: "$1".to_owned(),
+            pane_id: Some("%1".to_owned()),
+            terminal_id: Some("t1".to_owned()),
+            pane_pid: Some(10),
+            cwd: None,
+            process: Some("zsh".to_owned()),
+            occupant_id: None,
+        };
+        let mut editor = window("@1", 1);
+        editor.anchor = pane.clone();
+        editor.panes = vec![pane];
+        let mut work = session("$1", "work");
+        work.active_window_id = Some("@1".to_owned());
+        work.windows = vec![editor];
+        let mut binding = BindingMuxController::default();
+        binding.controller.sessions = vec![work];
+        binding.record_resource_snapshot();
+
+        let session_generation = binding
+            .session_generation("$1")
+            .expect("session generation");
+        let window_generation = binding
+            .window_generation("$1", "@1")
+            .expect("window generation");
+        let pane_generation = binding
+            .pane_generation("$1", "@1", "%1")
+            .expect("pane generation");
+        assert_eq!(session_generation, 1);
+        assert_eq!(window_generation, 1);
+        assert_eq!(pane_generation, 1);
+        assert_eq!(binding.resource_generations.len(), 4);
+
+        binding.record_resource_snapshot();
+        assert_eq!(binding.session_generation("$1"), Some(session_generation));
+        assert_eq!(
+            binding.window_generation("$1", "@1"),
+            Some(window_generation)
+        );
+        assert_eq!(
+            binding.pane_generation("$1", "@1", "%1"),
+            Some(pane_generation)
+        );
+        assert_eq!(binding.resource_generations.len(), 4);
+
+        binding.controller.sessions[0].windows[0].panes[0].pane_pid = Some(11);
+        binding.record_resource_snapshot();
+        let replaced_generation = binding
+            .pane_generation("$1", "@1", "%1")
+            .expect("replaced pane generation");
+        assert!(replaced_generation > pane_generation);
+        assert_eq!(binding.session_generation("$1"), Some(session_generation));
+        assert_eq!(
+            binding.window_generation("$1", "@1"),
+            Some(window_generation)
+        );
+        assert_eq!(binding.resource_generations.len(), 4);
+
+        for iteration in 2_u32..32 {
+            let empty_anchor = MuxPaneAnchor {
+                session_id: "$1".to_owned(),
+                pane_id: None,
+                terminal_id: None,
+                pane_pid: None,
+                cwd: None,
+                process: None,
+                occupant_id: None,
+            };
+            binding.controller.sessions[0].windows[0].anchor = empty_anchor;
+            binding.controller.sessions[0].windows[0].panes.clear();
+            binding.record_resource_snapshot();
+            assert_eq!(binding.resource_generations.len(), 2);
+            assert_eq!(binding.session_generation("$1"), Some(session_generation));
+            assert_eq!(
+                binding.window_generation("$1", "@1"),
+                Some(window_generation)
+            );
+
+            let pane_id = format!("%{iteration}");
+            let pane = MuxPaneAnchor {
+                session_id: "$1".to_owned(),
+                pane_id: Some(pane_id.clone()),
+                terminal_id: Some(format!("t{iteration}")),
+                pane_pid: Some(10 + iteration),
+                cwd: None,
+                process: Some(format!("shell-{iteration}")),
+                occupant_id: None,
+            };
+            binding.controller.sessions[0].windows[0].anchor = pane.clone();
+            binding.controller.sessions[0].windows[0].panes = vec![pane];
+            binding.record_resource_snapshot();
+            let generation = binding
+                .pane_generation("$1", "@1", &pane_id)
+                .expect("new pane generation");
+            assert!(generation > replaced_generation);
+            assert_eq!(binding.resource_generations.len(), 4);
+            assert_eq!(binding.session_generation("$1"), Some(session_generation));
+            assert_eq!(
+                binding.window_generation("$1", "@1"),
+                Some(window_generation)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_target_state_replays_after_topology_refresh() {
+        let scope = command_scope();
+        let mut binding = BindingMuxController::new(scope);
+        let occupant = MuxOccupantIdentity {
+            backend_identity: "rmux:%1:generation:1".to_owned(),
+            pid: Some(7),
+            process: Some("shell".to_owned()),
+        };
+        let target = MuxEventTarget::pane("$new", "@1", "%1", "t1", Some(occupant.clone()));
+        let topology = MuxEvent {
+            backend_identity: "rmux:test".to_owned(),
+            scope,
+            revision: 1,
+            cursor: None,
+            topic: crate::backend::MuxEventTopic::TopologyChanged,
+            provenance: crate::backend::MuxEventProvenance::RmuxSdk,
+            target: None,
+            payload: MuxEventPayload::Topology {
+                change: crate::backend::MuxTopologyChange::Mutation,
+            },
+        };
+        let state = MuxEvent {
+            backend_identity: "rmux:test".to_owned(),
+            scope,
+            revision: 2,
+            cursor: None,
+            topic: crate::backend::MuxEventTopic::PaneStateChanged,
+            provenance: crate::backend::MuxEventProvenance::RmuxSdk,
+            target: Some(target.clone()),
+            payload: MuxEventPayload::PaneState {
+                state: crate::backend::MuxPaneState {
+                    title: Some("ready".to_owned()),
+                    options: vec![crate::backend::MuxPaneOption {
+                        name: "mode".to_owned(),
+                        value: "vi".to_owned(),
+                    }],
+                    foreground: None,
+                },
+            },
+        };
+        let observations = binding.observe_backend_events(vec![topology, state]);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].event.topic,
+            crate::backend::MuxEventTopic::TopologyChanged
+        );
+        assert_eq!(binding.deferred_unknown_events.len(), 1);
+
+        let pane = MuxPaneAnchor {
+            session_id: "$new".to_owned(),
+            pane_id: Some("%1".to_owned()),
+            terminal_id: Some("t1".to_owned()),
+            pane_pid: Some(7),
+            cwd: None,
+            process: Some("shell".to_owned()),
+            occupant_id: Some(occupant.backend_identity),
+        };
+        let mut refreshed_window = window("@1", 0);
+        refreshed_window.anchor = pane.clone();
+        refreshed_window.panes = vec![pane];
+        let mut refreshed_session = session("$new", "new");
+        refreshed_session.active_window_id = Some("@1".to_owned());
+        refreshed_session.windows = vec![refreshed_window];
+        binding.controller.apply_refreshed_snapshot(
+            MultiplexerBackendConfig::Rmux,
+            snapshot_of(vec![refreshed_session]),
+        );
+        binding.record_resource_snapshot();
+        binding.deferred_refresh_completed = true;
+
+        let replayed = binding.observe_backend_events(Vec::new());
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].event.target, Some(target));
+        match &replayed[0].event.payload {
+            MuxEventPayload::PaneState { state } => {
+                assert_eq!(state.title.as_deref(), Some("ready"));
+                assert_eq!(state.options[0].name, "mode");
+                assert_eq!(state.options[0].value, "vi");
+            }
+            payload => panic!("expected pane state replay, got {payload:?}"),
+        }
+        assert!(binding.deferred_unknown_events.is_empty());
+    }
+
+    #[test]
+    fn authoritative_close_retires_session_and_window_across_limited_drains() {
+        let scope = command_scope();
+        let snapshot = targeted_snapshot();
+        let mut binding = BindingMuxController::new(scope);
+        binding.controller.sessions = snapshot.sessions.clone();
+        binding.synchronize_resource_generations();
+
+        let session_precondition = binding
+            .controller
+            .capture_execution_precondition(&MuxCommand::RenameSession {
+                session_id: "$1".to_owned(),
+                name: "replacement".to_owned(),
+            })
+            .expect("session precondition")
+            .expect("session target");
+        let window_precondition = binding
+            .controller
+            .capture_execution_precondition(&MuxCommand::RenameWindow {
+                session_id: "$1".to_owned(),
+                window_id: "@old".to_owned(),
+                name: "replacement-window".to_owned(),
+            })
+            .expect("window precondition")
+            .expect("window target");
+        let pane_precondition = binding
+            .controller
+            .capture_execution_precondition(&MuxCommand::ResizePane {
+                session_id: "$1".to_owned(),
+                pane_id: Some("%old".to_owned()),
+                adjustment: MuxPaneResize::Directional {
+                    direction: MuxDirection::Right,
+                    cells: 1,
+                },
+            })
+            .expect("pane precondition")
+            .expect("pane target");
+        let pane_guard = binding
+            .controller
+            .execution_resource_generation_guard(Some(&pane_precondition))
+            .expect("pane generation guard");
+        let session_guard = binding
+            .controller
+            .execution_resource_generation_guard(Some(&session_precondition))
+            .expect("session generation guard");
+        let window_guard = binding
+            .controller
+            .execution_resource_generation_guard(Some(&window_precondition))
+            .expect("window generation guard");
+
+        struct CloseEventBackend {
+            events: Vec<MuxEvent>,
+        }
+
+        impl MuxBackend for CloseEventBackend {
+            fn snapshot(&self) -> anyhow::Result<MuxSnapshot> {
+                Ok(MuxSnapshot::default())
+            }
+
+            fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn execute_checked(
+                &mut self,
+                scope: MuxScope,
+                command: MuxCommand,
+                _precondition: Option<&MuxScopedExecutionPrecondition>,
+            ) -> BindingOperationOutcome<anyhow::Result<()>> {
+                let descriptor = self.capabilities(scope);
+                descriptor.invoke(
+                    descriptor.request(command.operation()),
+                    BindingOperationAvailability::Available,
+                    || self.execute(command),
+                )
+            }
+
+            fn drain_events(&mut self, _scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
+                let count = self.events.len().min(maximum);
+                self.events.drain(..count).collect()
+            }
+        }
+
+        let close_event = |revision, target| MuxEvent {
+            backend_identity: "tmux-control".to_owned(),
+            scope,
+            revision,
+            cursor: None,
+            topic: crate::backend::MuxEventTopic::PaneClosed,
+            provenance: crate::backend::MuxEventProvenance::TmuxSnapshotFallback,
+            target: Some(target),
+            payload: MuxEventPayload::Closed {
+                reason: "authoritative inventory close".to_owned(),
+            },
+        };
+        let old_window = &snapshot.sessions[0].windows[0];
+        let new_window = &snapshot.sessions[0].windows[1];
+        let config = MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..Default::default()
+        };
+        binding.event_backend = Some((
+            config.clone(),
+            Box::new(CloseEventBackend {
+                events: vec![
+                    close_event(
+                        1,
+                        pane_event_target("$1", &old_window.id, &old_window.anchor),
+                    ),
+                    close_event(
+                        2,
+                        pane_event_target("$1", &new_window.id, &new_window.anchor),
+                    ),
+                ],
+            }),
+        ));
+
+        let first = binding.drain_events(&config, 1);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].retired_target_generation, Some(1));
+        assert_eq!(
+            first[0]
+                .event
+                .target
+                .as_ref()
+                .and_then(|target| target.terminal_id.as_deref()),
+            Some("t-old")
+        );
+        assert!(
+            first[0]
+                .event
+                .target
+                .as_ref()
+                .and_then(|target| target.occupant.as_ref())
+                .is_some()
+        );
+        assert_eq!(binding.session_generation("$1"), Some(1));
+        assert_eq!(binding.window_generation("$1", "@old"), None);
+        assert_eq!(binding.authoritative_closed_targets.len(), 1);
+        assert_eq!(binding.pane_generation("$1", "@old", "%old"), None);
+        assert_eq!(binding.terminal_generation("$1", "@old", "t-old"), None);
+        assert!(!pane_guard.is_current());
+        assert!(session_guard.is_current());
+        assert!(!window_guard.is_current());
+
+        let second = binding.drain_events(&config, 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].retired_target_generation, Some(1));
+        assert_eq!(binding.session_generation("$1"), None);
+        assert_eq!(binding.window_generation("$1", "@old"), None);
+        assert_eq!(binding.authoritative_closed_targets.len(), 2);
+        assert!(!session_guard.is_current());
+        assert!(!window_guard.is_current());
+
+        let mut replacement = snapshot;
+        replacement.sessions[0].name = "replacement".to_owned();
+        binding.controller.sessions = replacement.sessions;
+        binding.synchronize_resource_generations();
+        assert!(binding.authoritative_closed_targets.is_empty());
+        assert!(!session_guard.is_current());
+        assert!(!window_guard.is_current());
+    }
+
+    #[test]
+    fn topology_invalidation_does_not_retire_session_or_window() {
+        let scope = command_scope();
+        let snapshot = targeted_snapshot();
+        let mut binding = BindingMuxController::new(scope);
+        binding.controller.sessions = snapshot.sessions;
+        binding.synchronize_resource_generations();
+        let precondition = binding
+            .controller
+            .capture_execution_precondition(&MuxCommand::RenameWindow {
+                session_id: "$1".to_owned(),
+                window_id: "@old".to_owned(),
+                name: "renamed".to_owned(),
+            })
+            .expect("window precondition")
+            .expect("window target");
+        let guard = binding
+            .controller
+            .execution_resource_generation_guard(Some(&precondition))
+            .expect("window generation guard");
+
+        binding.observe_backend_events(vec![MuxEvent {
+            backend_identity: "tmux-control".to_owned(),
+            scope,
+            revision: 1,
+            cursor: None,
+            topic: crate::backend::MuxEventTopic::TopologyChanged,
+            provenance: crate::backend::MuxEventProvenance::TmuxControl,
+            target: Some(MuxEventTarget {
+                session_id: Some("$1".to_owned()),
+                window_id: Some("@old".to_owned()),
+                ..Default::default()
+            }),
+            payload: MuxEventPayload::Topology {
+                change: crate::backend::MuxTopologyChange::Invalidated,
+            },
+        }]);
+
+        assert!(guard.is_current());
+        assert_eq!(binding.window_generation("$1", "@old"), Some(1));
     }
 
     #[test]
@@ -5076,6 +6010,20 @@ mod tests {
 
             fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
                 Ok(())
+            }
+
+            fn execute_checked(
+                &mut self,
+                scope: MuxScope,
+                command: MuxCommand,
+                _precondition: Option<&MuxScopedExecutionPrecondition>,
+            ) -> BindingOperationOutcome<anyhow::Result<()>> {
+                let descriptor = self.capabilities(scope);
+                descriptor.invoke(
+                    descriptor.request(command.operation()),
+                    BindingOperationAvailability::Available,
+                    || self.execute(command),
+                )
             }
 
             fn drain_events(&mut self, _scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
@@ -5474,6 +6422,20 @@ mod tests {
                 Ok(())
             }
 
+            fn execute_checked(
+                &mut self,
+                scope: MuxScope,
+                command: MuxCommand,
+                _precondition: Option<&MuxScopedExecutionPrecondition>,
+            ) -> BindingOperationOutcome<anyhow::Result<()>> {
+                let descriptor = self.capabilities(scope);
+                descriptor.invoke(
+                    descriptor.request(command.operation()),
+                    BindingOperationAvailability::Available,
+                    || self.execute(command),
+                )
+            }
+
             fn start_event_stream(&mut self) {
                 self.starts.fetch_add(1, Ordering::AcqRel);
             }
@@ -5514,10 +6476,16 @@ mod tests {
 
         binding.event_capabilities(&first);
         let initial_generation = binding.binding_generation();
+        binding.controller.sessions = vec![session("$1", "stale")];
         binding.event_capabilities(&replacement);
 
         assert_eq!(starts.load(Ordering::Acquire), 2);
         assert_eq!(binding.binding_generation(), initial_generation + 1);
+        assert!(
+            binding.sessions().is_empty(),
+            "a replacement backend must not inherit the prior backend snapshot"
+        );
+        assert!(binding.controller.last_session_refresh.is_none());
     }
 
     #[test]
@@ -5574,6 +6542,42 @@ mod tests {
     }
 
     #[test]
+    fn rmux_checked_mutations_are_advertised_unavailable() {
+        let binding = BindingMuxController::new(MuxScope::new(
+            SpaceId::from_persistence(1),
+            BindingId::from_persistence(1),
+        ));
+        let config = MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Rmux,
+            ..Default::default()
+        };
+
+        for operation in [
+            BindingOperation::CreateWindow,
+            BindingOperation::NavigateWindow,
+            BindingOperation::MoveWindow,
+            BindingOperation::SplitPane,
+            BindingOperation::NavigatePane,
+            BindingOperation::LastPane,
+            BindingOperation::ResizePane,
+            BindingOperation::ClosePane,
+            BindingOperation::TogglePaneZoom,
+            BindingOperation::RenameSession,
+            BindingOperation::DitchSession,
+        ] {
+            assert_eq!(
+                binding.operation_outcome(&config, operation),
+                BindingOperationOutcome::Unavailable,
+                "{operation:?}"
+            );
+        }
+        assert_eq!(
+            binding.operation_outcome(&config, BindingOperation::CreateProjectSession),
+            BindingOperationOutcome::Supported(())
+        );
+    }
+
+    #[test]
     fn prior_command_errors_do_not_make_the_binding_unavailable() {
         let mut binding = BindingMuxController::new(MuxScope::new(
             SpaceId::from_persistence(1),
@@ -5604,6 +6608,20 @@ mod tests {
 
         assert_eq!(first.last_error(), None);
         assert_eq!(second.last_error(), Some("second remains failed"));
+    }
+
+    #[test]
+    fn forced_refresh_invalidates_an_in_flight_snapshot() {
+        let mut binding = BindingMuxController::default();
+        binding.controller.session_refresh_generation = 7;
+        binding.controller.session_refresh_pending = true;
+        binding.controller.last_session_refresh = Some(Instant::now());
+
+        binding.refresh_on_next_frame();
+
+        assert_eq!(binding.controller.session_refresh_generation, 8);
+        assert!(!binding.controller.session_refresh_pending);
+        assert!(binding.controller.last_session_refresh.is_none());
     }
 
     #[test]

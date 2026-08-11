@@ -23,7 +23,7 @@ use super::{
     controller::MuxScope,
     process::{CommandOutput, CommandRunner, SystemCommandRunner},
     ssh::SshRemote,
-    tmux_protocol::{TmuxControlNotification, TmuxControlParser},
+    tmux_protocol::{TmuxControlNotification, TmuxControlParser, TmuxParseError},
 };
 
 /// tmux commands that only read state, and so can be answered by a client shared with every other
@@ -42,7 +42,7 @@ const READY_TOKEN: &str = "bootty-control-ready";
 /// An all-pane inventory is taken immediately after the control handshake, then refreshed from
 /// bootty's normal chained snapshot replies. Its cwd and current-command fields describe
 /// foreground state; only the pane PID can confirm a lifecycle change.
-const PANE_INVENTORY_QUERY: &str = "list-panes -a -F 'p\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}'";
+const PANE_INVENTORY_QUERY: &str = "list-panes -a -F 'p\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}'";
 
 /// Runs read-only tmux queries through a shared control-mode client, and everything else as its own
 /// process. Falls back to a process whenever the client is unavailable, so tmux versions without
@@ -137,7 +137,8 @@ impl CommandRunner for TmuxControlRunner {
     }
 
     fn drain_mux_events(&self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
-        self.events.drain(scope, maximum)
+        self.events
+            .drain_with_initial_rebase(scope, maximum, MuxEventProvenance::TmuxControl)
     }
 }
 
@@ -313,12 +314,17 @@ fn read_replies(
                 return;
             }
             Ok(read) => {
-                // A newer tmux can add a notification that this parser does not understand. That
-                // does not prove a sequence gap, so preserve the established reply fallback rather
-                // than inventing a rebase for ordinary forward-compatible traffic.
                 for &byte in &bytes[..read] {
-                    let Ok(Some(notification)) = parser.put(byte) else {
-                        continue;
+                    let notification = match next_control_notification(&mut parser, byte) {
+                        Ok(Some(notification)) => notification,
+                        Ok(None) => continue,
+                        Err(reason) => {
+                            mapper
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .control_degraded(&events, reason);
+                            return;
+                        }
                     };
                     match notification {
                         TmuxControlNotification::BlockEnd(body) => {
@@ -342,6 +348,17 @@ fn read_replies(
     }
 }
 
+fn next_control_notification(
+    parser: &mut TmuxControlParser,
+    byte: u8,
+) -> std::result::Result<Option<TmuxControlNotification>, MuxRebaseReason> {
+    match parser.put(byte) {
+        Err(TmuxParseError::UnknownNotification) => Ok(None),
+        Err(_) => Err(MuxRebaseReason::SequenceGap),
+        Ok(notification) => Ok(notification),
+    }
+}
+
 fn send_reply(replies: &Sender<Reply>, body: String, error: bool) -> bool {
     let (acknowledge, acknowledged) = sync_channel(0);
     replies
@@ -359,6 +376,7 @@ struct TmuxEventMapper {
     output_sequences: HashMap<usize, u64>,
     pane_lifecycle_epochs: HashMap<usize, u64>,
     pane_targets: HashMap<usize, MuxEventTarget>,
+    pane_placements: HashMap<usize, Vec<MuxEventTarget>>,
     pane_cwds: HashMap<usize, Option<String>>,
     pane_foregrounds: HashMap<usize, Option<MuxForegroundState>>,
     unknown_output_targets: HashSet<usize>,
@@ -378,7 +396,7 @@ impl TmuxEventMapper {
             TmuxControlNotification::Output(output) => {
                 // A binding-level fallback would misattribute these bytes to an arbitrary pane.
                 // Drop them with an explicit rebase until inventory supplies the exact target.
-                let Some(target) = self.pane_targets.get(&output.pane_id).cloned() else {
+                let Some(targets) = self.pane_placements.get(&output.pane_id).cloned() else {
                     if self.unknown_output_targets.insert(output.pane_id) {
                         self.topology(events, None);
                         events.publish(MuxEventDraft::rebase(
@@ -401,18 +419,21 @@ impl TmuxEventMapper {
                         .or_insert(1);
                     *sequence
                 };
-                events.publish(MuxEventDraft::new(
-                    MuxEventTopic::TerminalOutput,
-                    MuxEventProvenance::TmuxControl,
-                    Some(target),
-                    Some(MuxEventCursor::new(
-                        format!("tmux-output:{}:lifecycle:{epoch}", output.pane_id),
-                        sequence,
-                    )),
-                    MuxEventPayload::Output {
-                        bytes: decode_tmux_control_output(&output.data),
-                    },
-                ));
+                let bytes = decode_tmux_control_output(&output.data);
+                for target in targets {
+                    events.publish(MuxEventDraft::new(
+                        MuxEventTopic::TerminalOutput,
+                        MuxEventProvenance::TmuxControl,
+                        Some(target),
+                        Some(MuxEventCursor::new(
+                            format!("tmux-output:{}:lifecycle:{epoch}", output.pane_id),
+                            sequence,
+                        )),
+                        MuxEventPayload::Output {
+                            bytes: bytes.clone(),
+                        },
+                    ));
+                }
             }
             TmuxControlNotification::SessionChanged(session) => {
                 self.topology(
@@ -421,28 +442,34 @@ impl TmuxEventMapper {
                 );
             }
             TmuxControlNotification::SessionsChanged => self.topology(events, None),
-            TmuxControlNotification::LayoutChange(layout) => {
-                self.topology(events, self.target_for_window(layout.window_id))
+            TmuxControlNotification::SessionRenamed(session) => {
+                self.topology(
+                    events,
+                    Some(MuxEventTarget::session(format!("${}", session.id))),
+                );
             }
-            TmuxControlNotification::WindowAdd { id } => {
-                self.topology(events, self.target_for_window(id));
+            TmuxControlNotification::SessionWindowChanged(change) => {
+                self.topology(
+                    events,
+                    Some(MuxEventTarget {
+                        session_id: Some(format!("${}", change.session_id)),
+                        window_id: Some(format!("@{}", change.window_id)),
+                        ..Default::default()
+                    }),
+                );
             }
-            TmuxControlNotification::UnlinkedWindowAdd { .. } => self.topology(events, None),
-            TmuxControlNotification::WindowClose { id }
-            | TmuxControlNotification::UnlinkedWindowClose { id } => self.close_window(id, events),
-            TmuxControlNotification::WindowRenamed(window) => {
-                self.topology(events, self.target_for_window(window.id));
+            TmuxControlNotification::LayoutChange(_)
+            | TmuxControlNotification::WindowAdd { .. }
+            | TmuxControlNotification::UnlinkedWindowAdd { .. }
+            | TmuxControlNotification::WindowClose { .. }
+            | TmuxControlNotification::UnlinkedWindowClose { .. }
+            | TmuxControlNotification::WindowRenamed(_)
+            | TmuxControlNotification::UnlinkedWindowRenamed(_)
+            | TmuxControlNotification::WindowPaneChanged(_) => {
+                self.topology(events, None);
             }
-            TmuxControlNotification::UnlinkedWindowRenamed(_) => self.topology(events, None),
-            TmuxControlNotification::WindowPaneChanged(change) => {
-                let target = self.pane_targets.get_mut(&change.pane_id).map(|target| {
-                    target.window_id = Some(format!("@{}", change.window_id));
-                    target.clone()
-                });
-                self.topology(events, target);
-            }
-            TmuxControlNotification::PaneModeChanged { pane_id } => {
-                self.topology(events, self.pane_targets.get(&pane_id).cloned());
+            TmuxControlNotification::PaneModeChanged { .. } => {
+                self.topology(events, None);
             }
             TmuxControlNotification::ClientSessionChanged(change) => {
                 self.topology(
@@ -459,7 +486,8 @@ impl TmuxEventMapper {
     }
 
     fn record_snapshot(&mut self, snapshot: &str, events: &MuxEventQueue) {
-        let mut refreshed = HashMap::new();
+        let mut refreshed: HashMap<usize, MuxEventTarget> = HashMap::new();
+        let mut refreshed_placements: HashMap<usize, Vec<MuxEventTarget>> = HashMap::new();
         let mut refreshed_cwds = HashMap::new();
         let mut refreshed_foregrounds = HashMap::new();
         let mut malformed_pane_row = false;
@@ -469,20 +497,38 @@ impl TmuxEventMapper {
             };
             let fields = line.split('\x1f').collect::<Vec<_>>();
             let parsed = match fields.as_slice() {
+                [session, window, pane, terminal, pid, cwd, process] => pane_target(
+                    session,
+                    window,
+                    pane,
+                    (Some(terminal), Some(pid)),
+                    cwd,
+                    process,
+                    &self.pane_lifecycle_epochs,
+                ),
                 [session, window, pane, pid, cwd, process] => pane_target(
                     session,
                     window,
                     pane,
-                    Some(pid),
+                    (None, Some(pid)),
                     cwd,
                     process,
+                    &self.pane_lifecycle_epochs,
+                ),
+                fields if fields.len() >= 13 => pane_target(
+                    fields[0],
+                    fields[1],
+                    fields[6],
+                    (Some(fields[7]), Some(fields[8])),
+                    fields[11],
+                    fields[12],
                     &self.pane_lifecycle_epochs,
                 ),
                 fields if fields.len() >= 12 => pane_target(
                     fields[0],
                     fields[1],
                     fields[6],
-                    Some(fields[7]),
+                    (None, Some(fields[7])),
                     fields[10],
                     fields[11],
                     &self.pane_lifecycle_epochs,
@@ -491,7 +537,7 @@ impl TmuxEventMapper {
                     fields[0],
                     fields[1],
                     fields[6],
-                    None,
+                    (None, None),
                     fields[9],
                     fields[10],
                     &self.pane_lifecycle_epochs,
@@ -502,13 +548,35 @@ impl TmuxEventMapper {
                 malformed_pane_row = true;
                 continue;
             };
-            refreshed.insert(pane_id, target);
-            refreshed_cwds.insert(pane_id, cwd);
+            refreshed_placements
+                .entry(pane_id)
+                .or_default()
+                .push(target.clone());
+            let replace = refreshed.get(&pane_id).is_none_or(|existing| {
+                (
+                    target.session_id.as_deref(),
+                    target.window_id.as_deref(),
+                    target.pane_id.as_deref(),
+                ) < (
+                    existing.session_id.as_deref(),
+                    existing.window_id.as_deref(),
+                    existing.pane_id.as_deref(),
+                )
+            });
+            if replace {
+                refreshed.insert(pane_id, target);
+                refreshed_cwds.insert(pane_id, cwd);
+            }
         }
         if malformed_pane_row {
             return;
         }
         for (pane_id, target) in &mut refreshed {
+            if target.terminal_id.is_none()
+                && let Some(previous) = self.pane_targets.get(pane_id)
+            {
+                target.terminal_id.clone_from(&previous.terminal_id);
+            }
             let previous_pid = self
                 .pane_targets
                 .get(pane_id)
@@ -519,11 +587,24 @@ impl TmuxEventMapper {
                 let epoch = self.advance_pane_lifecycle_epoch(*pane_id);
                 self.output_sequences.remove(pane_id);
                 set_tmux_target_lifecycle_epoch(target, epoch);
-            } else if target_pid.is_none()
-                && let (Some(previous_pid), Some(occupant)) =
-                    (previous_pid, target.occupant.as_mut())
-            {
-                occupant.pid = Some(previous_pid);
+            } else if let (Some(previous), Some(occupant)) = (
+                self.pane_targets
+                    .get(pane_id)
+                    .and_then(|target| target.occupant.as_ref()),
+                target.occupant.as_mut(),
+            ) {
+                occupant
+                    .backend_identity
+                    .clone_from(&previous.backend_identity);
+                if occupant.pid.is_none() {
+                    occupant.pid = previous.pid;
+                }
+            }
+            if let Some(placements) = refreshed_placements.get_mut(pane_id) {
+                for placement in placements {
+                    placement.terminal_id.clone_from(&target.terminal_id);
+                    placement.occupant.clone_from(&target.occupant);
+                }
             }
         }
         for (pane_id, target) in &refreshed {
@@ -536,51 +617,91 @@ impl TmuxEventMapper {
             );
         }
 
-        let previous = std::mem::take(&mut self.pane_targets);
-        let topology_changed = previous.len() != refreshed.len()
-            || refreshed
-                .keys()
-                .any(|pane_id| !previous.contains_key(pane_id));
+        let previous_placements = std::mem::take(&mut self.pane_placements);
+        let topology_changed = previous_placements.len() != refreshed_placements.len()
+            || refreshed_placements.iter().any(|(pane_id, current)| {
+                previous_placements
+                    .get(pane_id)
+                    .is_none_or(|previous| previous.len() != current.len())
+            });
         let previous_cwds = std::mem::take(&mut self.pane_cwds);
         let previous_foregrounds = std::mem::take(&mut self.pane_foregrounds);
-        for (pane_id, target) in &refreshed {
-            self.publish_target_delta(
-                events,
-                previous.get(pane_id).map(|target| TmuxPaneObservation {
-                    target,
-                    cwd: previous_cwds.get(pane_id).and_then(|cwd| cwd.as_deref()),
-                    foreground: previous_foregrounds
-                        .get(pane_id)
-                        .and_then(|foreground| foreground.as_ref()),
-                }),
-                TmuxPaneObservation {
-                    target,
-                    cwd: refreshed_cwds.get(pane_id).and_then(|cwd| cwd.as_deref()),
-                    foreground: refreshed_foregrounds
-                        .get(pane_id)
-                        .and_then(|foreground| foreground.as_ref()),
-                },
-            );
+        for (pane_id, previous_targets) in &previous_placements {
+            let Some(current_targets) = refreshed_placements.get(pane_id) else {
+                continue;
+            };
+            for target in previous_targets {
+                if current_targets
+                    .iter()
+                    .any(|current| same_tmux_placement(target, current))
+                {
+                    continue;
+                }
+                events.publish(MuxEventDraft::new(
+                    MuxEventTopic::PaneClosed,
+                    MuxEventProvenance::TmuxSnapshotFallback,
+                    Some(tmux_placement_close_target(target)),
+                    None,
+                    MuxEventPayload::Closed {
+                        reason: "pane placement absent from authoritative tmux inventory"
+                            .to_owned(),
+                    },
+                ));
+            }
         }
-        for (pane_id, target) in previous {
+        for (pane_id, placements) in &refreshed_placements {
+            for target in placements {
+                let previous_target = previous_placements.get(pane_id).and_then(|targets| {
+                    targets
+                        .iter()
+                        .find(|previous| same_tmux_placement(previous, target))
+                        .or_else(|| {
+                            (targets.len() == placements.len())
+                                .then(|| targets.first())
+                                .flatten()
+                        })
+                });
+                self.publish_target_delta(
+                    events,
+                    previous_target.map(|target| TmuxPaneObservation {
+                        target,
+                        cwd: previous_cwds.get(pane_id).and_then(|cwd| cwd.as_deref()),
+                        foreground: previous_foregrounds
+                            .get(pane_id)
+                            .and_then(|foreground| foreground.as_ref()),
+                    }),
+                    TmuxPaneObservation {
+                        target,
+                        cwd: refreshed_cwds.get(pane_id).and_then(|cwd| cwd.as_deref()),
+                        foreground: refreshed_foregrounds
+                            .get(pane_id)
+                            .and_then(|foreground| foreground.as_ref()),
+                    },
+                );
+            }
+        }
+        for (pane_id, targets) in previous_placements {
             if refreshed.contains_key(&pane_id) {
                 continue;
             }
             self.output_sequences.remove(&pane_id);
             self.pane_lifecycle_epochs.remove(&pane_id);
             self.unknown_output_targets.remove(&pane_id);
-            events.publish(MuxEventDraft::new(
-                MuxEventTopic::PaneClosed,
-                MuxEventProvenance::TmuxSnapshotFallback,
-                Some(target),
-                None,
-                MuxEventPayload::Closed {
-                    reason: "pane absent from authoritative tmux inventory".to_owned(),
-                },
-            ));
+            for target in targets {
+                events.publish(MuxEventDraft::new(
+                    MuxEventTopic::PaneClosed,
+                    MuxEventProvenance::TmuxSnapshotFallback,
+                    Some(target),
+                    None,
+                    MuxEventPayload::Closed {
+                        reason: "pane absent from authoritative tmux inventory".to_owned(),
+                    },
+                ));
+            }
         }
         self.unknown_output_targets.clear();
         self.pane_targets = refreshed;
+        self.pane_placements = refreshed_placements;
         self.pane_cwds = refreshed_cwds;
         self.pane_foregrounds = refreshed_foregrounds;
         if topology_changed {
@@ -654,57 +775,6 @@ impl TmuxEventMapper {
         *epoch
     }
 
-    fn close_window(&mut self, window_id: usize, events: &MuxEventQueue) {
-        let window_id = format!("@{window_id}");
-        let pane_ids = self
-            .pane_targets
-            .iter()
-            .filter_map(|(pane_id, target)| {
-                (target.window_id.as_deref() == Some(window_id.as_str())).then_some(*pane_id)
-            })
-            .collect::<Vec<_>>();
-        let topology_target = pane_ids.first().and_then(|pane_id| {
-            self.pane_targets.get(pane_id).map(|target| MuxEventTarget {
-                session_id: target.session_id.clone(),
-                window_id: target.window_id.clone(),
-                ..Default::default()
-            })
-        });
-        for pane_id in pane_ids {
-            let target = self
-                .pane_targets
-                .remove(&pane_id)
-                .expect("pane collected from tmux target map");
-            self.pane_cwds.remove(&pane_id);
-            self.pane_foregrounds.remove(&pane_id);
-            self.output_sequences.remove(&pane_id);
-            self.pane_lifecycle_epochs.remove(&pane_id);
-            self.unknown_output_targets.remove(&pane_id);
-            events.publish(MuxEventDraft::new(
-                MuxEventTopic::PaneClosed,
-                MuxEventProvenance::TmuxControl,
-                Some(target),
-                None,
-                MuxEventPayload::Closed {
-                    reason: "tmux window closed".to_owned(),
-                },
-            ));
-        }
-        self.topology(events, topology_target);
-    }
-
-    fn target_for_window(&self, window_id: usize) -> Option<MuxEventTarget> {
-        let window_id = format!("@{window_id}");
-        self.pane_targets
-            .values()
-            .find(|target| target.window_id.as_deref() == Some(window_id.as_str()))
-            .map(|target| MuxEventTarget {
-                session_id: target.session_id.clone(),
-                window_id: Some(window_id),
-                ..Default::default()
-            })
-    }
-
     fn topology(&self, events: &MuxEventQueue, target: Option<MuxEventTarget>) {
         events.publish(MuxEventDraft::new(
             MuxEventTopic::TopologyChanged,
@@ -734,11 +804,12 @@ fn pane_target(
     session_id: &str,
     window_id: &str,
     pane_id: &str,
-    pid: Option<&str>,
+    identity: (Option<&str>, Option<&str>),
     cwd: &str,
     process: &str,
     lifecycle_epochs: &HashMap<usize, u64>,
 ) -> Option<(usize, MuxEventTarget, Option<String>)> {
+    let (terminal_id, pid) = identity;
     let pane_number = pane_id.strip_prefix('%').unwrap_or(pane_id).parse().ok()?;
     let pid = pid.and_then(|value| value.parse::<u32>().ok());
     let cwd = (!cwd.is_empty()).then(|| cwd.to_owned());
@@ -754,7 +825,9 @@ fn pane_target(
             session_id: Some(session_id.to_owned()),
             window_id: Some(window_id.to_owned()),
             pane_id: Some(pane_id.to_owned()),
-            terminal_id: None,
+            terminal_id: terminal_id
+                .filter(|terminal_id| !terminal_id.is_empty())
+                .map(str::to_owned),
             occupant: Some(occupant),
         },
         cwd,
@@ -774,6 +847,21 @@ fn set_tmux_target_lifecycle_epoch(target: &mut MuxEventTarget, lifecycle_epoch:
         process.as_deref(),
         lifecycle_epoch,
     ));
+}
+
+fn same_tmux_placement(left: &MuxEventTarget, right: &MuxEventTarget) -> bool {
+    left.session_id == right.session_id
+        && left.window_id == right.window_id
+        && left.pane_id == right.pane_id
+}
+/// Retire one linked placement without retiring the pane's shared watcher identity.
+fn tmux_placement_close_target(target: &MuxEventTarget) -> MuxEventTarget {
+    MuxEventTarget {
+        session_id: target.session_id.clone(),
+        window_id: target.window_id.clone(),
+        pane_id: target.pane_id.clone(),
+        ..MuxEventTarget::default()
+    }
 }
 
 fn same_tmux_occupant(left: &MuxEventTarget, right: &MuxEventTarget) -> bool {
@@ -818,8 +906,15 @@ fn tmux_occupant_identity(
     process: Option<&str>,
     lifecycle_epoch: u64,
 ) -> MuxOccupantIdentity {
+    let backend_identity = match (pid, lifecycle_epoch) {
+        (Some(pid), 0) => format!("tmux:{pane_id}:pid={pid}"),
+        (Some(pid), lifecycle_epoch) => {
+            format!("tmux:{pane_id}:lifecycle={lifecycle_epoch}:pid={pid}")
+        }
+        (None, lifecycle_epoch) => format!("tmux:{pane_id}:lifecycle={lifecycle_epoch}"),
+    };
     MuxOccupantIdentity {
-        backend_identity: format!("tmux:{pane_id}:lifecycle={lifecycle_epoch}"),
+        backend_identity,
         pid,
         process: process.map(str::to_owned),
     }
@@ -886,13 +981,7 @@ impl TmuxControlRunner {
             }),
             // A client that timed out or errored cannot be trusted to still be in step with its
             // replies, so it goes rather than risk answering the next query with this one's output.
-            Err(error) => {
-                Self::publish_snapshot_fallback(
-                    &self.events,
-                    format!(
-                        "tmux control mode stopped answering; using snapshot fallback: {error}"
-                    ),
-                );
+            Err(_) => {
                 slot.client = None;
                 slot.retry_after = Some(Instant::now() + RESTART_BACKOFF);
                 None
@@ -923,11 +1012,7 @@ impl TmuxControlRunner {
                 slot.retry_after = None;
                 true
             }
-            Err(error) => {
-                Self::publish_snapshot_fallback(
-                    &self.events,
-                    format!("tmux control mode unavailable; using snapshot fallback: {error}"),
-                );
+            Err(_) => {
                 slot.retry_after = Some(Instant::now() + RESTART_BACKOFF);
                 false
             }
@@ -1057,7 +1142,9 @@ mod tests {
         cwd: &str,
         command: &str,
     ) -> String {
-        format!("p\x1f$1\x1f@{window_id}\x1f%{pane_id}\x1f{pid}\x1f{cwd}\x1f{command}\n")
+        format!(
+            "p\x1f$1\x1f@{window_id}\x1f%{pane_id}\x1f/dev/ttys{pane_id}\x1f{pid}\x1f{cwd}\x1f{command}\n"
+        )
     }
 
     fn initialized_mapper(inventory: &str) -> (TmuxEventMapper, MuxEventQueue, MuxScope) {
@@ -1067,6 +1154,20 @@ mod tests {
         mapper.record_snapshot(inventory, &queue);
         let _ = queue.drain(scope, 16);
         (mapper, queue, scope)
+    }
+
+    #[test]
+    fn control_parser_ignores_unknown_notifications_but_rebases_on_malformed_known_ones() {
+        let mut parser = TmuxControlParser::default();
+        for byte in b"%future-notification @42\n" {
+            assert_eq!(next_control_notification(&mut parser, *byte), Ok(None));
+        }
+
+        let mut result = Ok(None);
+        for byte in b"%window-add not-a-window\n" {
+            result = next_control_notification(&mut parser, *byte);
+        }
+        assert_eq!(result, Err(MuxRebaseReason::SequenceGap));
     }
 
     fn output_cursor(
@@ -1097,6 +1198,102 @@ mod tests {
             cwd: Some(cwd.to_owned()),
             executable: None,
         }
+    }
+
+    #[test]
+    fn linked_pane_output_is_published_for_every_session_placement() {
+        let first = pane_inventory(3, 2, 42, "/repo", "zsh");
+        let second = first.replacen("$1", "$2", 1);
+        let (mut mapper, queue, scope) = initialized_mapper(&format!("{first}{second}"));
+
+        mapper.publish(
+            TmuxControlNotification::Output(crate::tmux_protocol::TmuxOutputNotification {
+                pane_id: 3,
+                data: b"linked".to_vec(),
+            }),
+            &queue,
+        );
+
+        let events = queue.drain(scope, 16);
+        let sessions = events
+            .iter()
+            .filter(|event| event.topic == MuxEventTopic::TerminalOutput)
+            .filter_map(|event| {
+                event
+                    .target
+                    .as_ref()
+                    .and_then(|target| target.session_id.clone())
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(sessions, HashSet::from(["$1".to_owned(), "$2".to_owned()]));
+    }
+    #[test]
+    fn unlinking_linked_pane_retires_only_removed_placement_and_keeps_output_alive() {
+        let linked = format!(
+            "{}{}",
+            pane_inventory(3, 2, 42, "/repo", "zsh"),
+            pane_inventory(3, 4, 42, "/repo", "zsh"),
+        );
+        let remaining = pane_inventory(3, 4, 42, "/repo", "zsh");
+        let (mut mapper, queue, scope) = initialized_mapper(&linked);
+
+        mapper.record_snapshot(&remaining, &queue);
+        let events = queue.drain(scope, 16);
+        let closed = events
+            .iter()
+            .find(|event| event.topic == MuxEventTopic::PaneClosed)
+            .expect("removed linked placement close");
+        let closed_target = closed.target.as_ref().expect("closed placement target");
+        assert_eq!(closed_target.session_id.as_deref(), Some("$1"));
+        assert_eq!(closed_target.window_id.as_deref(), Some("@2"));
+        assert_eq!(closed_target.pane_id.as_deref(), Some("%3"));
+        assert!(closed_target.terminal_id.is_none());
+        assert!(closed_target.occupant.is_none());
+        assert_eq!(
+            mapper.pane_placements.get(&3).map(|targets| targets.len()),
+            Some(1)
+        );
+        assert_eq!(
+            mapper
+                .pane_placements
+                .get(&3)
+                .and_then(|targets| targets[0].window_id.as_deref()),
+            Some("@4")
+        );
+
+        mapper.publish(
+            TmuxControlNotification::Output(crate::tmux_protocol::TmuxOutputNotification {
+                pane_id: 3,
+                data: b"remaining".to_vec(),
+            }),
+            &queue,
+        );
+        let output = queue
+            .drain(scope, 16)
+            .into_iter()
+            .find(|event| event.topic == MuxEventTopic::TerminalOutput)
+            .expect("remaining linked placement output");
+        assert_eq!(
+            output
+                .target
+                .as_ref()
+                .and_then(|target| target.window_id.as_deref()),
+            Some("@4")
+        );
+        assert_eq!(
+            output
+                .target
+                .as_ref()
+                .and_then(|target| target.terminal_id.as_deref()),
+            Some("/dev/ttys3")
+        );
+        assert!(
+            output
+                .target
+                .as_ref()
+                .and_then(|target| target.occupant.as_ref())
+                .is_some()
+        );
     }
 
     #[test]
@@ -1161,12 +1358,52 @@ mod tests {
         );
 
         let events = runner.events.drain(scope(), 16);
+        assert_eq!(events.len(), 2);
         assert!(
             events
                 .iter()
                 .any(|event| event.topic == MuxEventTopic::TopologyChanged)
         );
         assert!(events.iter().any(MuxEvent::requires_rebase));
+    }
+
+    #[test]
+    fn tmux_event_subscriptions_receive_one_ordered_bootstrap_each() {
+        let runner = TmuxControlRunner::default();
+        let first_scope = scope();
+        let second_scope = MuxScope::new(
+            crate::controller::SpaceId::from_persistence(1),
+            crate::controller::BindingId::from_persistence(3),
+        );
+
+        let first = runner.drain_mux_events(first_scope, 16);
+        let second = runner.drain_mux_events(second_scope, 16);
+        for events in [first, second] {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].topic, MuxEventTopic::SnapshotRebased);
+            assert_eq!(
+                events[0].payload,
+                MuxEventPayload::Rebase {
+                    reason: MuxRebaseReason::Bootstrap,
+                }
+            );
+        }
+
+        runner.events.publish(MuxEventDraft::new(
+            MuxEventTopic::TopologyChanged,
+            MuxEventProvenance::TmuxControl,
+            None,
+            None,
+            MuxEventPayload::Topology {
+                change: MuxTopologyChange::Invalidated,
+            },
+        ));
+        for scope in [first_scope, second_scope] {
+            let events = runner.drain_mux_events(scope, 16);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].topic, MuxEventTopic::TopologyChanged);
+        }
+        assert!(runner.drain_mux_events(first_scope, 16).is_empty());
     }
 
     #[test]
@@ -1177,7 +1414,10 @@ mod tests {
             crate::controller::SpaceId::from_persistence(1),
             crate::controller::BindingId::from_persistence(2),
         );
-        mapper.record_snapshot("p\x1f$1\x1f@2\x1f%3\x1f42\x1f/repo\x1fzsh\n", &queue);
+        mapper.record_snapshot(
+            "p\x1f$1\x1f@2\x1f%3\x1f/dev/ttys3\x1f42\x1f/repo\x1fzsh\n",
+            &queue,
+        );
         let _ = queue.drain(scope, 8);
 
         mapper.record_snapshot("", &queue);
@@ -1194,11 +1434,24 @@ mod tests {
                 .and_then(|target| target.pane_id.as_deref()),
             Some("%3")
         );
+        assert_eq!(
+            closed
+                .target
+                .as_ref()
+                .and_then(|target| target.terminal_id.as_deref()),
+            Some("/dev/ttys3")
+        );
+        assert!(
+            closed
+                .target
+                .as_ref()
+                .and_then(|target| target.occupant.as_ref())
+                .is_some()
+        );
         assert!(mapper.pane_targets.is_empty());
         assert!(mapper.pane_cwds.is_empty());
         assert!(mapper.output_sequences.is_empty());
         assert!(mapper.pane_lifecycle_epochs.is_empty());
-        assert!(mapper.pane_foregrounds.is_empty());
     }
 
     #[test]
@@ -1503,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_move_retargets_without_replacing_the_occupant_or_rebasing_output() {
+    fn active_pane_notification_defers_placement_changes_to_inventory() {
         let initial_inventory = pane_inventory(3, 2, 42, "/repo", "zsh");
         let moved_inventory = pane_inventory(3, 4, 42, "/repo", "zsh");
         let (mut mapper, queue, scope) = initialized_mapper(&initial_inventory);
@@ -1522,25 +1775,26 @@ mod tests {
 
         assert_eq!(move_events.len(), 1);
         assert_eq!(move_events[0].topic, MuxEventTopic::TopologyChanged);
-        assert_eq!(
-            move_events[0]
-                .target
-                .as_ref()
-                .and_then(|target| target.window_id.as_deref()),
-            Some("@4")
-        );
+        assert!(move_events[0].target.is_none());
         assert_eq!(
             mapper
                 .pane_targets
                 .get(&3)
                 .and_then(|target| target.window_id.as_deref()),
-            Some("@4")
+            Some("@2")
         );
 
         mapper.record_snapshot(&moved_inventory, &queue);
+        let inventory_events = queue.drain(scope, 16);
         assert!(
-            queue.drain(scope, 16).is_empty(),
-            "the matching inventory is only a retarget, not an occupant replacement"
+            inventory_events
+                .iter()
+                .any(|event| event.topic == MuxEventTopic::TopologyChanged)
+        );
+        assert!(
+            inventory_events
+                .iter()
+                .all(|event| event.topic != MuxEventTopic::PaneOccupantReplaced)
         );
         assert_eq!(
             mapper
@@ -1566,10 +1820,24 @@ mod tests {
         mapper.record_snapshot(&moved_inventory, &queue);
         let events = queue.drain(scope, 16);
 
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].topic, MuxEventTopic::TopologyChanged);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].topic, MuxEventTopic::PaneClosed);
         assert_eq!(
             events[0]
+                .target
+                .as_ref()
+                .and_then(|target| target.window_id.as_deref()),
+            Some("@2")
+        );
+        assert!(
+            events[0]
+                .target
+                .as_ref()
+                .is_some_and(|target| target.terminal_id.is_none() && target.occupant.is_none())
+        );
+        assert_eq!(events[1].topic, MuxEventTopic::TopologyChanged);
+        assert_eq!(
+            events[1]
                 .target
                 .as_ref()
                 .and_then(|target| target.window_id.as_deref()),
@@ -1594,61 +1862,54 @@ mod tests {
         assert_eq!(second_cursor.sequence, first_cursor.sequence + 1);
     }
     #[test]
-    fn window_close_notifications_close_known_panes_and_invalidate_topology() {
+    fn window_close_notifications_defer_pane_retirement_to_inventory() {
         let inventory = format!(
             "{}{}",
             pane_inventory(3, 2, 42, "/repo", "zsh"),
             pane_inventory(5, 4, 43, "/other", "fish"),
         );
-        for notification in [
-            TmuxControlNotification::WindowClose { id: 2 },
+        let (mut mapper, queue, scope) = initialized_mapper(&inventory);
+
+        mapper.publish(TmuxControlNotification::WindowClose { id: 2 }, &queue);
+        let events = queue.drain(scope, 16);
+
+        assert_eq!(events.len(), 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.topic != MuxEventTopic::PaneClosed)
+        );
+        let topology = events
+            .iter()
+            .find(|event| event.topic == MuxEventTopic::TopologyChanged)
+            .expect("topology invalidation");
+        assert!(topology.target.is_none());
+        assert!(mapper.pane_targets.contains_key(&3));
+        assert!(mapper.pane_targets.contains_key(&5));
+
+        mapper.record_snapshot(&pane_inventory(5, 4, 43, "/other", "fish"), &queue);
+        let refresh_events = queue.drain(scope, 16);
+        assert!(
+            refresh_events
+                .iter()
+                .any(|event| event.topic == MuxEventTopic::PaneClosed)
+        );
+    }
+
+    #[test]
+    fn unlinking_a_window_alias_preserves_its_shared_panes() {
+        let inventory = pane_inventory(3, 2, 42, "/repo", "zsh");
+        let (mut mapper, queue, scope) = initialized_mapper(&inventory);
+
+        mapper.publish(
             TmuxControlNotification::UnlinkedWindowClose { id: 2 },
-        ] {
-            let (mut mapper, queue, scope) = initialized_mapper(&inventory);
+            &queue,
+        );
+        let events = queue.drain(scope, 16);
 
-            mapper.publish(notification, &queue);
-            let events = queue.drain(scope, 16);
-
-            assert_eq!(events.len(), 2);
-            let closed = events
-                .iter()
-                .find(|event| event.topic == MuxEventTopic::PaneClosed)
-                .expect("closed pane event");
-            assert_eq!(
-                closed
-                    .target
-                    .as_ref()
-                    .and_then(|target| target.pane_id.as_deref()),
-                Some("%3")
-            );
-            assert_eq!(
-                closed
-                    .target
-                    .as_ref()
-                    .and_then(|target| target.occupant.as_ref())
-                    .and_then(|occupant| occupant.pid),
-                Some(42)
-            );
-            let topology = events
-                .iter()
-                .find(|event| event.topic == MuxEventTopic::TopologyChanged)
-                .expect("topology invalidation");
-            assert_eq!(
-                topology
-                    .target
-                    .as_ref()
-                    .and_then(|target| target.window_id.as_deref()),
-                Some("@2")
-            );
-            assert!(!mapper.pane_targets.contains_key(&3));
-            assert!(mapper.pane_targets.contains_key(&5));
-
-            mapper.record_snapshot(&pane_inventory(5, 4, 43, "/other", "fish"), &queue);
-            assert!(
-                queue.drain(scope, 16).is_empty(),
-                "the subsequent inventory must not repeat an immediate close"
-            );
-        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].topic, MuxEventTopic::TopologyChanged);
+        assert!(mapper.pane_targets.contains_key(&3));
     }
 
     #[test]
@@ -1741,7 +2002,10 @@ mod tests {
             crate::controller::SpaceId::from_persistence(1),
             crate::controller::BindingId::from_persistence(2),
         );
-        mapper.record_snapshot("p\x1f$1\x1f@2\x1f%3\x1f42\x1f/repo\x1fzsh\n", &queue);
+        mapper.record_snapshot(
+            "p\x1f$1\x1f@2\x1f%3\x1f/dev/ttys003\x1f42\x1f/repo\x1fzsh\n",
+            &queue,
+        );
         let _ = queue.drain(scope, 8);
 
         mapper.publish(
@@ -1766,7 +2030,7 @@ mod tests {
         assert_eq!(target.session_id.as_deref(), Some("$1"));
         assert_eq!(target.window_id.as_deref(), Some("@2"));
         assert_eq!(target.pane_id.as_deref(), Some("%3"));
-        assert_eq!(target.terminal_id, None);
+        assert_eq!(target.terminal_id.as_deref(), Some("/dev/ttys003"));
         assert_eq!(
             target.occupant.as_ref().and_then(|occupant| occupant.pid),
             Some(42)

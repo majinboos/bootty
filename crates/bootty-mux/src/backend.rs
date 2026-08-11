@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    mem::size_of,
     sync::{Arc, Mutex},
 };
 
@@ -7,9 +8,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    capability::{
-        BindingCapabilityDescriptor, BindingOperationAvailability, BindingOperationOutcome,
-    },
+    capability::{BindingCapabilityDescriptor, BindingOperationOutcome},
     command::{MuxCommand, MuxSessionLaunchPlan},
     controller::MuxScope,
     snapshot::{MuxPaneAnchor, MuxSnapshot},
@@ -292,6 +291,9 @@ struct MuxEventQueueState {
     backend_identity: String,
     events: VecDeque<QueuedMuxEvent>,
     subscribers: HashMap<MuxScope, QueueCursor>,
+    /// Scopes released while another binding keeps the backend queue alive. A recreated scope
+    /// starts after all currently retained events and receives only its fresh bootstrap.
+    released_scopes: HashSet<MuxScope>,
     bytes: usize,
     next_event_id: u64,
     max_events: usize,
@@ -308,6 +310,7 @@ struct QueuedMuxEvent {
 struct QueueCursor {
     next_event_id: u64,
     next_revision: u64,
+    initial_rebase: Option<(MuxEventProvenance, MuxRebaseReason)>,
 }
 
 impl Default for MuxEventQueue {
@@ -339,6 +342,7 @@ impl MuxEventQueue {
                 backend_identity: backend_identity.into(),
                 events: VecDeque::new(),
                 subscribers: HashMap::new(),
+                released_scopes: HashSet::new(),
                 bytes: 0,
                 next_event_id: 1,
                 max_events: max_events.max(3),
@@ -383,6 +387,15 @@ impl MuxEventQueue {
         state.replace_with_gap(gap, rebase);
     }
 
+    /// Replaces retained backend events with an explicit snapshot-rebase marker.
+    pub fn publish_rebase(&self, provenance: MuxEventProvenance) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.replace_with_rebase_from(provenance);
+    }
+
     /// Drains this scope's cursor without I/O. Other scopes retain their cursors and observe the
     /// same drafts with revisions monotonic for their own binding.
     pub fn drain(&self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
@@ -397,23 +410,47 @@ impl MuxEventQueue {
             .events
             .front()
             .map_or(state.next_event_id, |event| event.id);
-        let (next_event_id, next_revision) = {
-            let cursor = state.subscribers.entry(scope).or_insert(QueueCursor {
-                next_event_id: first_available,
-                next_revision: 1,
-            });
-            (cursor.next_event_id, cursor.next_revision)
+        let initial_next_event_id = if state.released_scopes.remove(&scope) {
+            state.next_event_id
+        } else {
+            first_available
         };
+        let (next_event_id, next_revision, initial_rebase) = {
+            let cursor = state.subscribers.entry(scope).or_insert(QueueCursor {
+                next_event_id: initial_next_event_id,
+                next_revision: 1,
+                initial_rebase: None,
+            });
+            (
+                cursor.next_event_id,
+                cursor.next_revision,
+                cursor.initial_rebase.take(),
+            )
+        };
+        let initial_count = if initial_rebase.is_some() { 1 } else { 0 };
         let queued = state
             .events
             .iter()
             .filter(|event| event.id >= next_event_id)
-            .take(maximum)
+            .take(maximum.saturating_sub(initial_count))
             .map(|event| (event.id, event.draft.clone()))
             .collect::<Vec<_>>();
         let backend_identity = state.backend_identity.clone();
         let mut revision = next_revision;
-        let mut events = Vec::with_capacity(queued.len());
+        let mut events = Vec::with_capacity(queued.len().saturating_add(initial_count));
+        if let Some((provenance, reason)) = initial_rebase {
+            events.push(MuxEvent {
+                backend_identity: backend_identity.clone(),
+                scope,
+                revision,
+                cursor: None,
+                topic: MuxEventTopic::SnapshotRebased,
+                provenance,
+                target: None,
+                payload: MuxEventPayload::Rebase { reason },
+            });
+            revision = revision.saturating_add(1);
+        }
         let mut resume_at = next_event_id;
         for (id, draft) in queued {
             events.push(MuxEvent {
@@ -435,10 +472,66 @@ impl MuxEventQueue {
             .expect("cursor was inserted before draining");
         cursor.next_event_id = resume_at;
         cursor.next_revision = revision;
-        // Retain until the bounded source history rolls over. A binding can begin draining after
-        // another binding and must still receive retained observations rather than inherit that
-        // binding's destructive queue position.
+        // Retain the shared history for active scopes; a released scope is explicitly rebased
+        // to the current tail when it subscribes again.
         events
+    }
+    /// Drains a scope, inserting an initial rebase at the scope's first subscription.
+    ///
+    /// The baseline is tracked on the scope cursor rather than published into shared history, so
+    /// each subscriber receives exactly one bootstrap without replaying another scope's baseline.
+    pub(crate) fn drain_with_initial_rebase(
+        &self,
+        scope: MuxScope,
+        maximum: usize,
+        provenance: MuxEventProvenance,
+    ) -> Vec<MuxEvent> {
+        if maximum == 0 {
+            return Vec::new();
+        }
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !state.subscribers.contains_key(&scope) {
+                let first_event = if state.released_scopes.remove(&scope) {
+                    state.next_event_id
+                } else {
+                    state
+                        .events
+                        .front()
+                        .map_or(state.next_event_id, |event| event.id)
+                };
+                state.subscribers.insert(
+                    scope,
+                    QueueCursor {
+                        next_event_id: first_event,
+                        next_revision: 1,
+                        initial_rebase: Some((provenance, MuxRebaseReason::Bootstrap)),
+                    },
+                );
+            }
+        }
+        self.drain(scope, maximum)
+    }
+    /// Releases a scope cursor when its binding is torn down, allowing a later binding with the
+    /// same persisted scope identity to receive a fresh bootstrap.
+    pub(crate) fn remove_scope(&self, scope: MuxScope) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let removed = state.subscribers.remove(&scope).is_some();
+        if removed {
+            state.released_scopes.insert(scope);
+        }
+        if state.subscribers.is_empty() {
+            state.events.clear();
+            state.bytes = 0;
+            state.released_scopes.clear();
+        }
+        removed
     }
 }
 
@@ -461,6 +554,10 @@ impl MuxEventQueueState {
     }
 
     fn replace_with_rebase(&mut self) {
+        self.replace_with_rebase_from(MuxEventProvenance::Queue);
+    }
+
+    fn replace_with_rebase_from(&mut self, provenance: MuxEventProvenance) {
         let expected_sequence = self
             .events
             .front()
@@ -473,10 +570,10 @@ impl MuxEventQueueState {
         for cursor in self.subscribers.values_mut() {
             cursor.next_event_id = resume_sequence;
         }
-        self.push_unchecked(
+        self.push_rebase_pair(
             MuxEventDraft::new(
                 MuxEventTopic::BackendLagged,
-                MuxEventProvenance::Queue,
+                provenance,
                 None,
                 Some(MuxEventCursor::new("backend-event-queue", resume_sequence)),
                 MuxEventPayload::Gap {
@@ -485,11 +582,7 @@ impl MuxEventQueueState {
                     missed_events,
                 },
             ),
-            0,
-        );
-        self.push_unchecked(
-            MuxEventDraft::rebase(MuxEventProvenance::Queue, MuxRebaseReason::QueueOverflow),
-            0,
+            MuxEventDraft::rebase(provenance, MuxRebaseReason::QueueOverflow),
         );
     }
 
@@ -500,8 +593,25 @@ impl MuxEventQueueState {
         for cursor in self.subscribers.values_mut() {
             cursor.next_event_id = resume_sequence;
         }
-        self.push_unchecked(gap, 0);
-        self.push_unchecked(rebase, 0);
+        self.push_rebase_pair(gap, rebase);
+    }
+
+    fn push_rebase_pair(&mut self, mut gap: MuxEventDraft, rebase: MuxEventDraft) {
+        let rebase_bytes = rebase.approximate_bytes();
+        let mut gap_bytes = gap.approximate_bytes();
+        if gap_bytes.saturating_add(rebase_bytes) > self.max_bytes {
+            // Gap payload facts remain authoritative without opaque target/cursor strings. Strip
+            // those optional fields before dropping the safety rebase altogether.
+            gap.target = None;
+            gap.cursor = None;
+            gap_bytes = gap.approximate_bytes();
+        }
+        if gap_bytes.saturating_add(rebase_bytes) <= self.max_bytes {
+            self.push_unchecked(gap, gap_bytes);
+            self.push_unchecked(rebase, rebase_bytes);
+        } else if rebase_bytes <= self.max_bytes {
+            self.push_unchecked(rebase, rebase_bytes);
+        }
     }
 
     fn push_unchecked(&mut self, draft: MuxEventDraft, bytes: usize) {
@@ -514,6 +624,7 @@ impl MuxEventQueueState {
 
 impl MuxEventDraft {
     fn approximate_bytes(&self) -> usize {
+        let cursor = self.cursor.as_ref().map_or(0, |cursor| cursor.stream.len());
         let target = self.target.as_ref().map_or(0, |target| {
             target
                 .session_id
@@ -522,25 +633,29 @@ impl MuxEventDraft {
                 .saturating_add(target.window_id.as_ref().map_or(0, String::len))
                 .saturating_add(target.pane_id.as_ref().map_or(0, String::len))
                 .saturating_add(target.terminal_id.as_ref().map_or(0, String::len))
-                .saturating_add(
-                    target
-                        .occupant
-                        .as_ref()
-                        .map_or(0, |occupant| occupant.backend_identity.len()),
-                )
+                .saturating_add(target.occupant.as_ref().map_or(0, occupant_bytes))
         });
         let payload = match &self.payload {
             MuxEventPayload::Topology { .. } | MuxEventPayload::Rebase { .. } => 0,
             MuxEventPayload::Output { bytes } => bytes.len(),
-            MuxEventPayload::PaneState { state } => {
-                state.title.as_ref().map_or(0, String::len).saturating_add(
+            MuxEventPayload::PaneState { state } => state
+                .title
+                .as_ref()
+                .map_or(0, String::len)
+                .saturating_add(
                     state
                         .options
-                        .iter()
-                        .map(|option| option.name.len().saturating_add(option.value.len()))
-                        .sum::<usize>(),
+                        .capacity()
+                        .saturating_mul(size_of::<MuxPaneOption>())
+                        .saturating_add(
+                            state
+                                .options
+                                .iter()
+                                .map(|option| option.name.len().saturating_add(option.value.len()))
+                                .sum::<usize>(),
+                        ),
                 )
-            }
+                .saturating_add(foreground_bytes(&state.foreground)),
             MuxEventPayload::Title {
                 old_title,
                 new_title,
@@ -565,12 +680,8 @@ impl MuxEventDraft {
                 new_occupant,
             } => old_occupant
                 .as_ref()
-                .map_or(0, |occupant| occupant.backend_identity.len())
-                .saturating_add(
-                    new_occupant
-                        .as_ref()
-                        .map_or(0, |occupant| occupant.backend_identity.len()),
-                ),
+                .map_or(0, occupant_bytes)
+                .saturating_add(new_occupant.as_ref().map_or(0, occupant_bytes)),
             MuxEventPayload::Foreground {
                 old_state,
                 new_state,
@@ -580,8 +691,15 @@ impl MuxEventDraft {
             }
             MuxEventPayload::Gap { .. } => 0,
         };
-        target.saturating_add(payload)
+        cursor.saturating_add(target).saturating_add(payload)
     }
+}
+
+fn occupant_bytes(occupant: &MuxOccupantIdentity) -> usize {
+    occupant
+        .backend_identity
+        .len()
+        .saturating_add(occupant.process.as_ref().map_or(0, String::len))
 }
 
 fn foreground_bytes(state: &Option<MuxForegroundState>) -> usize {
@@ -651,6 +769,15 @@ impl MuxScopedExecutionPrecondition {
         {
             return false;
         }
+        if let Some(expected) = &self.target.occupant {
+            let actual_backend_identity = snapshot_occupant_fingerprint(pane);
+            if actual_backend_identity.as_deref() != Some(expected.backend_identity.as_str())
+                || expected.pid != pane.pane_pid
+                || expected.process.as_deref() != pane.process.as_deref()
+            {
+                return false;
+            }
+        }
         self.occupant_fingerprint
             .as_ref()
             .is_none_or(|fingerprint| {
@@ -719,6 +846,8 @@ pub trait MuxBackend {
             })
             .collect()
     }
+    /// Releases any retained per-scope event cursor when a binding is torn down or replaced.
+    fn release_event_scope(&mut self, _scope: MuxScope) {}
 
     /// Starts any persistent observer owned by this backend. It is intentionally separate from
     /// `drain_events`: draining is a pure cursor operation and must never perform backend I/O.
@@ -730,25 +859,25 @@ pub trait MuxBackend {
         Vec::new()
     }
 
+    /// Executes a target-mutating command only after checking the complete queue-time
+    /// precondition at the adapter's final mutation boundary. Every adapter must implement this
+    /// explicitly; inheriting an unchecked command path would permit a reused target ID to receive
+    /// a stale command.
     fn execute_checked(
         &mut self,
         scope: MuxScope,
         command: MuxCommand,
-    ) -> BindingOperationOutcome<Result<()>> {
-        let descriptor = self.capabilities(scope);
-        descriptor.invoke(
-            descriptor.request(command.operation()),
-            BindingOperationAvailability::Available,
-            || self.execute(command),
-        )
-    }
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<Result<()>>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        capability::{BINDING_CAPABILITY_DESCRIPTOR_VERSION, BindingOperation},
+        capability::{
+            BINDING_CAPABILITY_DESCRIPTOR_VERSION, BindingOperation, BindingOperationAvailability,
+        },
         controller::{BindingId, SpaceId},
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     };
@@ -774,6 +903,19 @@ mod tests {
         fn execute(&mut self, command: MuxCommand) -> Result<()> {
             self.commands.push(command);
             Ok(())
+        }
+        fn execute_checked(
+            &mut self,
+            scope: MuxScope,
+            command: MuxCommand,
+            _precondition: Option<&MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<Result<()>> {
+            let descriptor = self.capabilities(scope);
+            descriptor.invoke(
+                descriptor.request(command.operation()),
+                BindingOperationAvailability::Available,
+                || self.execute(command),
+            )
         }
     }
 
@@ -850,6 +992,7 @@ mod tests {
             MuxCommand::DitchSession {
                 session_id: "project".to_owned(),
             },
+            None,
         );
 
         assert!(matches!(outcome, BindingOperationOutcome::Unsupported));
@@ -979,6 +1122,30 @@ mod tests {
         }));
     }
     #[test]
+    fn oversized_gap_target_is_coalesced_without_bypassing_byte_limit() {
+        let queue = MuxEventQueue::with_limits(8, 128);
+        let scope = MuxScope::new(SpaceId::from_persistence(6), BindingId::from_persistence(7));
+        let huge = "x".repeat(4096);
+        queue.publish_gap(
+            MuxEventProvenance::RmuxSdk,
+            Some(MuxEventTarget::pane(&huge, &huge, &huge, &huge, None)),
+            Some(MuxEventCursor::new(huge, 9)),
+            7,
+            9,
+            2,
+        );
+
+        let observed = queue.drain(scope, 8);
+        let gap = observed
+            .iter()
+            .find(|event| matches!(&event.payload, MuxEventPayload::Gap { .. }))
+            .expect("bounded gap remains observable");
+        assert!(gap.target.is_none());
+        assert!(gap.cursor.is_none());
+        assert!(observed.iter().any(MuxEvent::requires_rebase));
+    }
+
+    #[test]
     fn fanout_cursors_keep_bindings_isolated_and_backend_partitioned() {
         let queue = MuxEventQueue::with_backend_limits("rmux:server-a", 8, 1024);
         let first_scope =
@@ -999,5 +1166,94 @@ mod tests {
         assert_eq!(first[0].cursor, second[0].cursor);
         assert_eq!(first[0].revision, 1);
         assert_eq!(second[0].revision, 1);
+    }
+    #[test]
+    fn released_scope_restarts_after_retained_history_without_replaying_stale_events() {
+        let queue = MuxEventQueue::with_backend_limits("rmux:server-a", 8, 1024);
+        let first_scope =
+            MuxScope::new(SpaceId::from_persistence(2), BindingId::from_persistence(4));
+        let sibling_scope =
+            MuxScope::new(SpaceId::from_persistence(2), BindingId::from_persistence(5));
+        queue.publish(output_event(11));
+
+        let first = queue.drain_with_initial_rebase(first_scope, 8, MuxEventProvenance::RmuxSdk);
+        let sibling =
+            queue.drain_with_initial_rebase(sibling_scope, 8, MuxEventProvenance::RmuxSdk);
+        assert_eq!(first.len(), 2);
+        assert_eq!(sibling.len(), 2);
+
+        assert!(queue.remove_scope(first_scope));
+        queue.publish(output_event(12));
+        let recreated =
+            queue.drain_with_initial_rebase(first_scope, 8, MuxEventProvenance::RmuxSdk);
+        assert_eq!(recreated.len(), 1);
+        assert_eq!(recreated[0].revision, 1);
+        assert!(matches!(
+            &recreated[0].payload,
+            MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Bootstrap
+            }
+        ));
+        assert!(queue.remove_scope(sibling_scope));
+    }
+
+    #[test]
+    fn queue_byte_budget_accounts_for_complete_owned_event_content() {
+        let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+        let draft = MuxEventDraft::new(
+            MuxEventTopic::PaneStateChanged,
+            MuxEventProvenance::Native,
+            Some(MuxEventTarget::pane(
+                "session",
+                "window",
+                "pane",
+                "terminal",
+                Some(MuxOccupantIdentity {
+                    backend_identity: "occupant-backend".to_owned(),
+                    pid: Some(7),
+                    process: Some("occupant-process".to_owned()),
+                }),
+            )),
+            Some(MuxEventCursor::new("state-stream", 9)),
+            MuxEventPayload::PaneState {
+                state: MuxPaneState {
+                    title: Some("title".to_owned()),
+                    options: vec![
+                        MuxPaneOption {
+                            name: "option".to_owned(),
+                            value: "value".to_owned(),
+                        },
+                        MuxPaneOption {
+                            name: String::new(),
+                            value: String::new(),
+                        },
+                    ],
+                    foreground: Some(MuxForegroundState {
+                        pid: Some(8),
+                        command: Some("command".to_owned()),
+                        cwd: Some("/cwd".to_owned()),
+                        executable: Some("executable".to_owned()),
+                    }),
+                },
+            },
+        );
+        let bytes = draft.approximate_bytes();
+        assert!(bytes > 1);
+
+        let fits = MuxEventQueue::with_limits(8, bytes);
+        fits.publish(draft.clone());
+        let observed = fits.drain(scope, 8);
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].topic, MuxEventTopic::PaneStateChanged);
+
+        let over = MuxEventQueue::with_limits(8, bytes - 1);
+        over.publish(draft);
+        let overflow = over.drain(scope, 8);
+        assert!(overflow.iter().any(MuxEvent::requires_rebase));
+        assert!(
+            !overflow
+                .iter()
+                .any(|event| event.topic == MuxEventTopic::PaneStateChanged)
+        );
     }
 }

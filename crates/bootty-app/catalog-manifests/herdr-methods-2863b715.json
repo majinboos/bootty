@@ -248,8 +248,8 @@
     },
     {
       "id": "pane.split",
-      "kind": "descriptor",
-      "command": "pane.split"
+      "kind": "unsupported",
+      "reason": "HerdR split parameters exceed Bootty's directional split contract"
     },
     {
       "id": "pane.swap",
@@ -263,8 +263,8 @@
     },
     {
       "id": "pane.zoom",
-      "kind": "descriptor",
-      "command": "pane.zoom"
+      "kind": "unsupported",
+      "reason": "HerdR explicit zoom modes exceed Bootty's toggle-only zoom contract"
     },
     {
       "id": "ping",

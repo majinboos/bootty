@@ -16,7 +16,7 @@ use std::{
 use std::process::Command as ProcessCommand;
 
 use crate::benchmark_trace::{BenchmarkTrace, TraceValue};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
@@ -64,7 +64,8 @@ pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
 
 const MAX_RUNTIME_OUTPUT_OBSERVATIONS: usize = 256;
 const MAX_RUNTIME_OUTPUT_OBSERVATION_BYTES: usize = 1_048_576;
-
+const MAX_RUNTIME_SIDE_EFFECT_OBSERVATIONS: usize = 256;
+const MAX_RUNTIME_SIDE_EFFECT_BYTES: usize = 1_048_576;
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSessionConfig {
     pub launch: SessionLaunchConfig,
@@ -100,6 +101,8 @@ pub enum TerminalOutputObservation {
 pub struct TerminalRuntimeObservations {
     pub output: Vec<TerminalOutputObservation>,
     pub side_effects: Vec<TerminalSideEffect>,
+    /// A side-effect queue overflow discarded history and requires an authoritative refresh.
+    pub side_effects_lagged: bool,
 }
 
 struct TerminalObservationBuffer {
@@ -108,8 +111,9 @@ struct TerminalObservationBuffer {
     output_bytes: usize,
     overflow_from: Option<u64>,
     side_effects: VecDeque<TerminalSideEffect>,
+    side_effect_bytes: usize,
+    side_effects_lagged: bool,
 }
-
 impl TerminalObservationBuffer {
     fn new() -> Self {
         Self {
@@ -118,6 +122,8 @@ impl TerminalObservationBuffer {
             output_bytes: 0,
             overflow_from: None,
             side_effects: VecDeque::new(),
+            side_effect_bytes: 0,
+            side_effects_lagged: false,
         }
     }
 
@@ -141,7 +147,53 @@ impl TerminalObservationBuffer {
     }
 
     fn record_side_effect(&mut self, effect: TerminalSideEffect) {
+        let effect_bytes = side_effect_bytes(&effect);
+        let replaceable_kind = replaceable_side_effect_kind(&effect);
+
+        if let Some(kind) = replaceable_kind
+            && let Some(index) = self
+                .side_effects
+                .iter()
+                .position(|queued| replaceable_side_effect_kind(queued) == Some(kind))
+        {
+            let old_bytes = side_effect_bytes(
+                self.side_effects
+                    .get(index)
+                    .expect("side-effect index came from the queue"),
+            );
+            let retained_bytes = self.side_effect_bytes.saturating_sub(old_bytes);
+            if effect_bytes <= MAX_RUNTIME_SIDE_EFFECT_BYTES
+                && retained_bytes.saturating_add(effect_bytes) <= MAX_RUNTIME_SIDE_EFFECT_BYTES
+            {
+                let _old = std::mem::replace(
+                    self.side_effects
+                        .get_mut(index)
+                        .expect("side-effect index came from the queue"),
+                    effect,
+                );
+                self.side_effect_bytes = retained_bytes.saturating_add(effect_bytes);
+                return;
+            }
+            self.mark_side_effects_lagged();
+            return;
+        }
+
+        if effect_bytes > MAX_RUNTIME_SIDE_EFFECT_BYTES
+            || self.side_effects.len() >= MAX_RUNTIME_SIDE_EFFECT_OBSERVATIONS
+            || self.side_effect_bytes.saturating_add(effect_bytes) > MAX_RUNTIME_SIDE_EFFECT_BYTES
+        {
+            self.mark_side_effects_lagged();
+            return;
+        }
+
+        self.side_effect_bytes = self.side_effect_bytes.saturating_add(effect_bytes);
         self.side_effects.push_back(effect);
+    }
+
+    fn mark_side_effects_lagged(&mut self) {
+        self.side_effects.clear();
+        self.side_effect_bytes = 0;
+        self.side_effects_lagged = true;
     }
 
     fn drain(&mut self) -> TerminalRuntimeObservations {
@@ -165,12 +217,65 @@ impl TerminalObservationBuffer {
                 .map(|(sequence, bytes)| TerminalOutputObservation::Bytes { sequence, bytes }),
         );
         self.output_bytes = 0;
+        let side_effects = self.side_effects.drain(..).collect();
+        let side_effects_lagged = std::mem::take(&mut self.side_effects_lagged);
+        self.side_effect_bytes = 0;
         TerminalRuntimeObservations {
             output,
-            side_effects: self.side_effects.drain(..).collect(),
+            side_effects,
+            side_effects_lagged,
         }
     }
 }
+
+fn replaceable_side_effect_kind(
+    effect: &TerminalSideEffect,
+) -> Option<core::mem::Discriminant<TerminalSideEffect>> {
+    match effect {
+        TerminalSideEffect::WindowTitle(_)
+        | TerminalSideEffect::WindowIcon(_)
+        | TerminalSideEffect::MouseShape(_)
+        | TerminalSideEffect::KittyTextSizing(_)
+        | TerminalSideEffect::ConEmuControl(_)
+        | TerminalSideEffect::ConEmuProgress { .. }
+        | TerminalSideEffect::Iterm2UserVarPorts(_)
+        | TerminalSideEffect::Iterm2Control(_) => Some(std::mem::discriminant(effect)),
+        _ => None,
+    }
+}
+
+fn side_effect_bytes(effect: &TerminalSideEffect) -> usize {
+    use std::mem::size_of;
+
+    size_of::<TerminalSideEffect>().saturating_add(match effect {
+        TerminalSideEffect::Bell
+        | TerminalSideEffect::FocusWindow
+        | TerminalSideEffect::ReportCellSize => 0,
+        TerminalSideEffect::ClipboardWrite(value)
+        | TerminalSideEffect::WindowTitle(value)
+        | TerminalSideEffect::WindowIcon(value)
+        | TerminalSideEffect::MouseShape(value)
+        | TerminalSideEffect::SemanticPrompt(value)
+        | TerminalSideEffect::KittyTextSizing(value)
+        | TerminalSideEffect::ConEmuControl(value)
+        | TerminalSideEffect::Iterm2Control(value)
+        | TerminalSideEffect::Iterm2File(value)
+        | TerminalSideEffect::OpenUrl(value)
+        | TerminalSideEffect::ReportVariable(value) => value.capacity(),
+        TerminalSideEffect::ClipboardQuery { selection } => selection.capacity(),
+        TerminalSideEffect::DesktopNotification { title, body } => {
+            title.capacity().saturating_add(body.capacity())
+        }
+        TerminalSideEffect::ConEmuProgress { state, .. } => state.capacity(),
+        TerminalSideEffect::Iterm2UserVarPorts(ports) => {
+            ports.capacity().saturating_mul(size_of::<u16>())
+        }
+        TerminalSideEffect::UnsupportedHostCommand { protocol, command } => {
+            protocol.capacity().saturating_add(command.capacity())
+        }
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLaunchConfig {
     /// Process launched directly through the PTY command builder. Unlike `shell`, a relative
@@ -247,6 +352,114 @@ type SpawnedPty = (
     Box<dyn Child + Send + Sync>,
     Option<String>,
 );
+
+/// Keeps a just-spawned PTY child armed until all of the setup that can fail has
+/// completed. Dropping the master before waiting is important: it wakes a child
+/// that is blocked in the slave side of the PTY, so the wait cannot leave a
+/// failed launch behind.
+struct SpawnedPtyGuard {
+    master: Option<Box<dyn MasterPty + Send>>,
+    child: Option<Box<dyn Child + Send + Sync>>,
+}
+
+impl SpawnedPtyGuard {
+    fn new(master: Box<dyn MasterPty + Send>, child: Box<dyn Child + Send + Sync>) -> Self {
+        Self {
+            master: Some(master),
+            child: Some(child),
+        }
+    }
+
+    fn master(&self) -> &dyn MasterPty {
+        self.master
+            .as_deref()
+            .expect("spawned PTY guard must retain its master")
+    }
+
+    fn disarm(mut self) -> (Box<dyn MasterPty + Send>, Box<dyn Child + Send + Sync>) {
+        (
+            self.master
+                .take()
+                .expect("spawned PTY guard must retain its master"),
+            self.child
+                .take()
+                .expect("spawned PTY guard must retain its child"),
+        )
+    }
+
+    fn terminate(&mut self) {
+        // Close the PTY before waiting so the slave side observes the failed
+        // setup and cannot keep the exact child alive indefinitely.
+        drop(self.master.take());
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for SpawnedPtyGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+type PreparedPty = (
+    Box<dyn MasterPty + Send>,
+    Arc<Mutex<Box<dyn Write + Send>>>,
+    Receiver<Vec<u8>>,
+    Box<dyn Child + Send + Sync>,
+);
+
+fn setup_spawned_pty(
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+    clone_reader: impl FnOnce(&dyn MasterPty) -> Result<Box<dyn Read + Send>>,
+    take_writer: impl FnOnce(&dyn MasterPty) -> Result<Box<dyn Write + Send>>,
+    spawn_reader: impl FnOnce(Box<dyn Read + Send>, SyncSender<Vec<u8>>) -> Result<()>,
+) -> Result<PreparedPty> {
+    let guard = SpawnedPtyGuard::new(master, child);
+    let reader = clone_reader(guard.master())?;
+    let writer = Arc::new(Mutex::new(take_writer(guard.master())?));
+    let (tx, rx) = mpsc::sync_channel(MAX_READER_QUEUE_CHUNKS);
+    spawn_reader(reader, tx)?;
+    let (master, child) = guard.disarm();
+    Ok((master, writer, rx, child))
+}
+
+fn validate_launch_config(config: &SessionLaunchConfig) -> Result<()> {
+    if let Some(cwd) = &config.working_directory {
+        if cwd.as_os_str().is_empty() {
+            bail!("terminal working directory must not be empty");
+        }
+        if cwd.to_string_lossy().contains('\0') {
+            bail!("terminal working directory contains NUL");
+        }
+        if !cwd.is_dir() {
+            bail!(
+                "terminal working directory is not a directory: {}",
+                cwd.display()
+            );
+        }
+    }
+    if let Some(program) = &config.program {
+        if program.is_empty() {
+            bail!("terminal argv program must not be empty");
+        }
+        if program.contains('\0') {
+            bail!("terminal argv program contains NUL");
+        }
+    }
+    if let Some(shell) = &config.shell
+        && shell.contains('\0')
+    {
+        bail!("terminal shell path contains NUL");
+    }
+    if config.args.iter().any(|arg| arg.contains('\0')) {
+        bail!("terminal argv argument contains NUL");
+    }
+    Ok(())
+}
 
 type RepaintWakeup = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -354,6 +567,7 @@ impl TerminalSession {
     ) -> Result<Self> {
         let (pty_master, pty_writer, pty_rx, child, tty_name) =
             spawn_shell(geometry, &config.launch)?;
+        let spawned = SpawnedPtyGuard::new(pty_master, child);
         let (command_tx, command_rx) = mpsc::channel();
         let latest_frame = Arc::new(PublishedFrame::new());
         let latest_drain = Arc::new(Mutex::new(DrainStats::default()));
@@ -386,6 +600,7 @@ impl TerminalSession {
             side_effect_pane_id: config.side_effect_pane_id,
             benchmark_trace,
         })?;
+        let (pty_master, child) = spawned.disarm();
 
         Ok(Self {
             command_tx,
@@ -1622,6 +1837,7 @@ fn is_managed_launch_env(name: &str) -> bool {
 }
 
 fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Result<SpawnedPty> {
+    validate_launch_config(config)?;
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: geometry.rows,
@@ -1669,40 +1885,47 @@ fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Resu
         .slave
         .spawn_command(command)
         .context("spawn shell in PTY")?;
-
-    let mut reader = pair.master.try_clone_reader()?;
-    let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
-    let (tx, rx) = mpsc::sync_channel(MAX_READER_QUEUE_CHUNKS);
-
-    thread::spawn(move || {
-        let mut buf = [0_u8; 8192];
-        let mut compactor = CursorHomeFloodCompactor::default();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    if let Some(bytes) = compactor.finish() {
-                        let _ = tx.send(bytes);
+    let (pty_master, writer, rx, child) = setup_spawned_pty(
+        pair.master,
+        child,
+        |master| master.try_clone_reader().context("clone PTY reader"),
+        |master| master.take_writer().context("take PTY writer"),
+        |mut reader, tx| {
+            thread::Builder::new()
+                .name("bootty-pty-reader".to_owned())
+                .spawn(move || {
+                    let mut buf = [0_u8; 8192];
+                    let mut compactor = CursorHomeFloodCompactor::default();
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => {
+                                if let Some(bytes) = compactor.finish() {
+                                    let _ = tx.send(bytes);
+                                }
+                                break;
+                            }
+                            Ok(n) => {
+                                if let Some(bytes) = compactor.compact(buf[..n].to_vec())
+                                    && tx.send(bytes).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(bytes) = compactor.finish() {
+                                    let _ = tx.send(bytes);
+                                }
+                                break;
+                            }
+                        }
                     }
-                    break;
-                }
-                Ok(n) => {
-                    if let Some(bytes) = compactor.compact(buf[..n].to_vec())
-                        && tx.send(bytes).is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    if let Some(bytes) = compactor.finish() {
-                        let _ = tx.send(bytes);
-                    }
-                    break;
-                }
-            }
-        }
-    });
+                })
+                .map(|_| ())
+                .context("spawn PTY reader worker")
+        },
+    )?;
 
-    Ok((pair.master, writer, rx, child, tty_name))
+    Ok((pty_master, writer, rx, child, tty_name))
 }
 
 pub fn configured_user_shell() -> Option<String> {
@@ -1922,6 +2145,84 @@ mod tests {
             elapsed_us: 0,
         };
         assert_eq!(drain_slice_len(nearly_full, MAX_DRAIN_SLICE_BYTES), 7);
+    }
+    #[test]
+    fn side_effect_count_overflow_discards_history() {
+        let mut buffer = TerminalObservationBuffer::new();
+        for _ in 0..MAX_RUNTIME_SIDE_EFFECT_OBSERVATIONS {
+            buffer.record_side_effect(TerminalSideEffect::Bell);
+        }
+        assert_eq!(
+            buffer.side_effects.len(),
+            MAX_RUNTIME_SIDE_EFFECT_OBSERVATIONS
+        );
+
+        buffer.record_side_effect(TerminalSideEffect::Bell);
+
+        assert!(buffer.side_effects.is_empty());
+        assert!(buffer.side_effects_lagged);
+    }
+
+    #[test]
+    fn oversized_side_effect_triggers_lag_without_queueing() {
+        let mut buffer = TerminalObservationBuffer::new();
+        let payload = "x".repeat(MAX_RUNTIME_SIDE_EFFECT_BYTES);
+
+        buffer.record_side_effect(TerminalSideEffect::ClipboardWrite(payload));
+
+        assert!(buffer.side_effects.is_empty());
+        assert!(buffer.side_effects_lagged);
+    }
+
+    #[test]
+    fn replaceable_side_effect_keeps_only_latest_state() {
+        let mut buffer = TerminalObservationBuffer::new();
+        buffer.record_side_effect(TerminalSideEffect::WindowTitle("old".to_owned()));
+        buffer.record_side_effect(TerminalSideEffect::WindowTitle("new".to_owned()));
+
+        assert_eq!(buffer.side_effects.len(), 1);
+        assert!(matches!(
+            buffer.side_effects.front(),
+            Some(TerminalSideEffect::WindowTitle(title)) if title == "new"
+        ));
+        assert_eq!(
+            buffer.side_effect_bytes,
+            side_effect_bytes(&TerminalSideEffect::WindowTitle("new".to_owned()))
+        );
+        assert!(!buffer.side_effects_lagged);
+    }
+
+    #[test]
+    fn side_effect_drain_resets_byte_accounting() {
+        let mut buffer = TerminalObservationBuffer::new();
+        buffer.record_side_effect(TerminalSideEffect::WindowTitle("title".to_owned()));
+        let drained = buffer.drain();
+
+        assert_eq!(drained.side_effects.len(), 1);
+        assert!(matches!(
+            drained.side_effects.first(),
+            Some(TerminalSideEffect::WindowTitle(title)) if title == "title"
+        ));
+        assert_eq!(buffer.side_effect_bytes, 0);
+        assert!(!buffer.side_effects_lagged);
+
+        buffer.record_side_effect(TerminalSideEffect::WindowTitle("next".to_owned()));
+        assert_eq!(buffer.side_effects.len(), 1);
+        assert!(!buffer.side_effects_lagged);
+    }
+
+    #[test]
+    fn side_effect_overflow_drain_exposes_explicit_rebase_signal() {
+        let mut buffer = TerminalObservationBuffer::new();
+        for _ in 0..=MAX_RUNTIME_SIDE_EFFECT_OBSERVATIONS {
+            buffer.record_side_effect(TerminalSideEffect::Bell);
+        }
+
+        let drained = buffer.drain();
+
+        assert!(drained.side_effects.is_empty());
+        assert!(drained.side_effects_lagged);
+        assert!(!buffer.drain().side_effects_lagged);
     }
 
     #[test]
@@ -2734,6 +3035,176 @@ mod tests {
                 killed: self.killed.clone(),
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct SetupMasterPty;
+
+    impl MasterPty for SetupMasterPty {
+        fn resize(&self, _size: PtySize) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> anyhow::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+
+        fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send>> {
+            Ok(Box::new(std::io::empty()))
+        }
+
+        fn take_writer(&self) -> anyhow::Result<Box<dyn Write + Send>> {
+            Ok(Box::new(std::io::sink()))
+        }
+        #[cfg(unix)]
+        fn process_group_leader(&self) -> Option<i32> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn as_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
+        #[cfg(unix)]
+        fn tty_name(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct SetupChild {
+        killed: Arc<AtomicUsize>,
+        waited: Arc<AtomicUsize>,
+    }
+
+    impl portable_pty::ChildKiller for SetupChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(SetupChildKiller {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
+    impl Child for SetupChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.waited.fetch_add(1, Ordering::SeqCst);
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    #[derive(Debug)]
+    struct SetupChildKiller {
+        killed: Arc<AtomicUsize>,
+    }
+
+    impl portable_pty::ChildKiller for SetupChildKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self {
+                killed: self.killed.clone(),
+            })
+        }
+    }
+
+    fn setup_child() -> (
+        Box<dyn Child + Send + Sync>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let waited = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(SetupChild {
+                killed: killed.clone(),
+                waited: waited.clone(),
+            }),
+            killed,
+            waited,
+        )
+    }
+
+    #[test]
+    fn clone_reader_failure_reaps_spawned_child() {
+        let (child, killed, waited) = setup_child();
+        let result = setup_spawned_pty(
+            Box::new(SetupMasterPty),
+            child,
+            |_| Err(anyhow::anyhow!("injected clone-reader failure")),
+            |_| unreachable!("writer setup must not run after clone failure"),
+            |_, _| unreachable!("worker setup must not run after clone failure"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert_eq!(waited.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn take_writer_failure_reaps_spawned_child() {
+        let (child, killed, waited) = setup_child();
+        let result = setup_spawned_pty(
+            Box::new(SetupMasterPty),
+            child,
+            |_| Ok(Box::new(std::io::empty()) as Box<dyn Read + Send>),
+            |_| Err(anyhow::anyhow!("injected take-writer failure")),
+            |_, _| unreachable!("worker setup must not run after writer failure"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert_eq!(waited.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reader_worker_spawn_failure_reaps_spawned_child() {
+        let (child, killed, waited) = setup_child();
+        let result = setup_spawned_pty(
+            Box::new(SetupMasterPty),
+            child,
+            |_| Ok(Box::new(std::io::empty()) as Box<dyn Read + Send>),
+            |_| Ok(Box::new(std::io::sink()) as Box<dyn Write + Send>),
+            |_, _| Err(anyhow::anyhow!("injected worker spawn failure")),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert_eq!(waited.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalid_launch_paths_and_argv_are_rejected_before_pty_open() {
+        let mut config = SessionLaunchConfig {
+            working_directory: Some(PathBuf::from("/path/that/does/not/exist")),
+            ..Default::default()
+        };
+        assert!(validate_launch_config(&config).is_err());
+
+        config.working_directory = None;
+        config.args = vec!["bad\0argument".to_owned()];
+        assert!(validate_launch_config(&config).is_err());
     }
 
     #[test]

@@ -11296,12 +11296,13 @@ fn remove_ditch_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::CommandRegistry;
     use crate::config::{MultiplexerBackendConfig, WindowFullscreen};
     use crate::mux::{
         backend::{
             MuxAllocatedResources, MuxAllocatedWindow, MuxBackend, MuxBackendCommandCompletion,
         },
-        capability::BindingCapabilityDescriptor,
+        capability::{BindingCapabilityDescriptor, BindingOperationAvailability},
         command::{
             MuxCommand, MuxDirection, MuxPaneLaunch, MuxPaneLaunchPlan, MuxPaneResize,
             MuxSessionLaunchPlan, MuxSplitDirection, MuxSplitLaunch, MuxWindowLaunchPlan,
@@ -13355,6 +13356,20 @@ mod tests {
             Ok(())
         }
 
+        fn execute_checked(
+            &mut self,
+            scope: MuxScope,
+            command: MuxCommand,
+            _precondition: Option<&crate::mux::backend::MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<anyhow::Result<()>> {
+            let descriptor = self.capabilities(scope);
+            descriptor.invoke(
+                descriptor.request(command.operation()),
+                BindingOperationAvailability::Available,
+                || self.execute(command),
+            )
+        }
+
         fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
             self.events.drain(scope, maximum)
         }
@@ -13478,6 +13493,20 @@ mod tests {
 
         fn execute(&mut self, _command: MuxCommand) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        fn execute_checked(
+            &mut self,
+            scope: MuxScope,
+            command: MuxCommand,
+            _precondition: Option<&crate::mux::backend::MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<anyhow::Result<()>> {
+            let descriptor = self.capabilities(scope);
+            descriptor.invoke(
+                descriptor.request(command.operation()),
+                BindingOperationAvailability::Available,
+                || self.execute(command),
+            )
         }
 
         fn session_launch_capability(

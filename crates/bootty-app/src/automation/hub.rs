@@ -1,12 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::commands::{CommandCancellation, CommandInvocation, CommandTarget};
 
@@ -18,6 +18,8 @@ pub const EVENT_QUEUE_BYTE_LIMIT: usize = 512 * 1024;
 pub const EVENT_TOPIC_LIMIT: usize = 128;
 pub const MAX_REGISTERED_EVENT_TOPICS: usize = 256;
 pub const TERMINAL_OUTPUT_STREAM_LIMIT: usize = 64;
+const MAX_SNAPSHOT_SOURCES: usize = 16;
+const MAX_SNAPSHOT_SOURCE_BYTES: usize = 128;
 pub const TERMINAL_OUTPUT_BYTE_LIMIT: usize = 512 * 1024;
 pub const COMMAND_COMPLETED_TOPIC: &str = "command.completed";
 pub const TERMINAL_OUTPUT_TOPIC: &str = "terminal.output";
@@ -341,6 +343,11 @@ impl AutomationHub {
     pub fn register_event_topic(&self, topic: impl AsRef<str>) -> Result<(), AutomationError> {
         self.events.register_topic(topic)
     }
+    /// Retires an extension-owned topic and all subscriptions that selected
+    /// it. Built-in topics are never removed by extension cleanup.
+    pub fn unregister_event_topic(&self, topic: &str) -> Result<(), AutomationError> {
+        self.events.unregister_topic(topic)
+    }
 
     pub fn publish_event(&self, publication: EventPublication) -> Result<u64, AutomationError> {
         self.events.publish(publication)
@@ -352,6 +359,24 @@ impl AutomationHub {
         snapshot: Value,
     ) -> Result<u64, AutomationError> {
         self.events.publish_with_snapshot(publication, snapshot)
+    }
+
+    pub fn publish_event_with_snapshot_source(
+        &self,
+        publication: EventPublication,
+        source: impl Into<String>,
+        snapshot: Value,
+    ) -> Result<u64, AutomationError> {
+        self.events
+            .publish_with_snapshot_source(publication, source, snapshot)
+    }
+
+    pub fn publish_events_with_snapshot_sources(
+        &self,
+        publications: impl IntoIterator<Item = (EventPublication, Vec<(String, String, Value)>)>,
+    ) -> Result<Vec<u64>, AutomationError> {
+        self.events
+            .publish_batch_with_snapshot_sources(publications)
     }
 
     pub fn publish_terminal_output(
@@ -396,6 +421,13 @@ impl AutomationHub {
         self.events.disconnect_owner(owner);
         self.tasks.cancel_owner(owner);
     }
+    pub fn disconnect_owner_checked(
+        &self,
+        owner: &OwnerIdentity,
+    ) -> Result<usize, AutomationError> {
+        self.events.disconnect_owner(owner);
+        self.tasks.cancel_owner_checked(owner)
+    }
 
     pub fn reap_dead_owners(&self) {
         let owners = self
@@ -413,6 +445,13 @@ impl AutomationHub {
                 self.disconnect_owner(&owner);
             }
         }
+    }
+    pub fn cancel_all_tasks_checked(&self) -> Result<usize, AutomationError> {
+        self.tasks.cancel_all_checked()
+    }
+
+    pub fn cancel_tasks_in_scope_checked(&self, scope: &str) -> Result<usize, AutomationError> {
+        self.tasks.cancel_scope_checked(scope)
     }
 
     pub fn cancel_all_tasks(&self) {
@@ -456,10 +495,17 @@ impl AutomationHub {
             }
         };
         if initialize {
-            self.events.set_snapshot(
+            self.events.replace_snapshot_fragments(
                 scope.clone(),
                 "extension.reloaded",
-                json!({"modules": []}),
+                [
+                    (
+                        "runtime".to_owned(),
+                        json!({"modules": [], "commands": [], "events": []}),
+                    ),
+                    ("status".to_owned(), json!({"modules": []})),
+                    ("sidebar".to_owned(), json!({"modules": []})),
+                ],
             )?;
             self.metadata.install_snapshot(&scope)?;
             self.tasks.install_snapshot(&scope)?;
@@ -481,8 +527,11 @@ impl AutomationHub {
 #[derive(Clone)]
 pub struct EventHub {
     state: Arc<Mutex<EventState>>,
+    metadata_state: Arc<Mutex<Option<Weak<Mutex<MetadataState>>>>>,
     #[cfg(test)]
     before_publication_lock: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    #[cfg(test)]
+    before_publication_notified: Arc<Mutex<bool>>,
 }
 
 struct EventState {
@@ -491,8 +540,10 @@ struct EventState {
     subscriptions: BTreeMap<String, SubscriptionRecord>,
     retired_subscriptions: BTreeSet<String>,
     retired_subscription_order: VecDeque<String>,
+    retired_subscription_watermark: u64,
     revisions: BTreeMap<String, u64>,
     snapshots: BTreeMap<String, BTreeMap<String, Value>>,
+    snapshot_fragments: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
     live_binding_scopes: BTreeSet<String>,
     output_streams: BTreeMap<String, TerminalOutputStream>,
     output_stream_order: VecDeque<String>,
@@ -507,19 +558,41 @@ impl EventHub {
                 registered_topics: BTreeSet::new(),
                 next_subscription: 1,
                 subscriptions: BTreeMap::new(),
-                revisions: BTreeMap::new(),
                 retired_subscriptions: BTreeSet::new(),
                 retired_subscription_order: VecDeque::new(),
+                retired_subscription_watermark: 0,
+                revisions: BTreeMap::new(),
                 snapshots: BTreeMap::new(),
+                snapshot_fragments: BTreeMap::new(),
                 live_binding_scopes: BTreeSet::new(),
                 output_streams: BTreeMap::new(),
                 output_stream_order: VecDeque::new(),
                 output_tombstones: BTreeMap::new(),
                 output_tombstone_order: VecDeque::new(),
             })),
+            metadata_state: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             before_publication_lock: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            before_publication_notified: Arc::new(Mutex::new(false)),
         }
+    }
+
+    fn set_metadata_state(&self, state: Weak<Mutex<MetadataState>>) {
+        *lock(&self.metadata_state) = Some(state);
+    }
+
+    fn reap_expired_metadata_before_poll(&self) -> Result<(), AutomationError> {
+        let metadata_state = lock(&self.metadata_state).clone();
+        let Some(metadata_state) = metadata_state.and_then(|state| state.upgrade()) else {
+            return Ok(());
+        };
+        MetadataHub {
+            state: metadata_state,
+            events: self.clone(),
+        }
+        .reap_expired()
+        .map(|_| ())
     }
 
     pub fn register_topic(&self, topic: impl AsRef<str>) -> Result<(), AutomationError> {
@@ -536,16 +609,62 @@ impl EventHub {
         Ok(())
     }
 
+    pub fn unregister_topic(&self, topic: &str) -> Result<(), AutomationError> {
+        validate_topic_name(topic)?;
+        if BUILTIN_EVENT_TOPICS.contains(&topic) {
+            return Err(AutomationError::new(
+                -32603,
+                "built-in event topics cannot be unregistered",
+            ));
+        }
+        let mut state = lock(&self.state);
+        if !state.registered_topics.remove(topic) {
+            return Ok(());
+        }
+        let removed = state
+            .subscriptions
+            .iter()
+            .filter(|(_, subscription)| subscription.topics.contains(topic))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in removed {
+            state.subscriptions.remove(&id);
+            retire_subscription_locked(&mut state, id);
+        }
+        for snapshots in state.snapshots.values_mut() {
+            snapshots.remove(topic);
+        }
+        for fragments in state.snapshot_fragments.values_mut() {
+            fragments.remove(topic);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn set_before_publication_lock(&self, sender: Option<std::sync::mpsc::Sender<()>>) {
+        *lock(&self.before_publication_notified) = false;
         *lock(&self.before_publication_lock) = sender;
     }
 
     #[cfg(test)]
     fn notify_before_publication_lock(&self) {
-        if let Some(sender) = lock(&self.before_publication_lock).clone() {
+        let should_notify = {
+            let mut notified = lock(&self.before_publication_notified);
+            if *notified {
+                false
+            } else {
+                *notified = true;
+                true
+            }
+        };
+        if should_notify && let Some(sender) = lock(&self.before_publication_lock).clone() {
             let _ = sender.send(());
         }
+    }
+
+    #[cfg(test)]
+    fn clear_before_publication_notification(&self) {
+        *lock(&self.before_publication_notified) = false;
     }
 
     pub fn topic_registered(&self, topic: &str) -> bool {
@@ -599,6 +718,12 @@ impl EventHub {
         }
         let mut state = lock(&self.state);
         validate_subscription_topics(&state, &topics)?;
+        if is_binding_scope(&scope) && !state.live_binding_scopes.contains(&scope) {
+            return Err(AutomationError::new(
+                -32006,
+                "binding event scope is not live",
+            ));
+        }
         reap_dead_subscriptions(&mut state);
         if state.subscriptions.len() >= MAX_SUBSCRIPTIONS {
             return Err(AutomationError::new(-32001, "subscription limit reached"));
@@ -637,6 +762,7 @@ impl EventHub {
         owner: &OwnerIdentity,
         cursor: u64,
     ) -> Result<EventDelivery, AutomationError> {
+        self.reap_expired_metadata_before_poll()?;
         let mut state = lock(&self.state);
         let (scope, cursor, events) = {
             let record = owned_subscription(&mut state, subscription, owner)?;
@@ -728,6 +854,39 @@ impl EventHub {
         Ok(())
     }
 
+    /// Replaces all source fragments for one authoritative topic and stores
+    /// their merged view for subscriptions and rebases.
+    pub fn replace_snapshot_fragments(
+        &self,
+        scope: impl Into<String>,
+        topic: impl Into<String>,
+        fragments: impl IntoIterator<Item = (String, Value)>,
+    ) -> Result<(), AutomationError> {
+        let scope = scope.into();
+        let topic = topic.into();
+        if scope.is_empty() {
+            return Err(AutomationError::new(
+                -32602,
+                "event scope must not be empty",
+            ));
+        }
+        let fragments = fragments.into_iter().collect::<BTreeMap<_, _>>();
+        let mut state = lock(&self.state);
+        validate_snapshot_fragments_locked(&state, &topic, &fragments)?;
+        let merged = merge_snapshot_fragments(&fragments);
+        state
+            .snapshot_fragments
+            .entry(scope.clone())
+            .or_default()
+            .insert(topic.clone(), fragments);
+        state
+            .snapshots
+            .entry(scope)
+            .or_default()
+            .insert(topic, merged);
+        Ok(())
+    }
+
     /// Atomically replaces authoritative source snapshots and refreshes the
     /// terminal-output index from the streams retained for this scope.
     pub fn replace_snapshots_with_terminal_output(
@@ -785,7 +944,7 @@ impl EventHub {
             .iter()
             .filter(|(_, stream)| stream.scope == scope && is_retired(&stream.target))
             .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
         let tombstone_keys = state
             .output_tombstones
             .keys()
@@ -795,6 +954,15 @@ impl EventHub {
                     .map(|_| key.clone())
             })
             .collect::<Vec<_>>();
+
+        let snapshot = if stream_keys.is_empty() && tombstone_keys.is_empty() {
+            None
+        } else {
+            validate_registered_topic(&state, TERMINAL_OUTPUT_TOPIC)?;
+            let snapshot = terminal_output_snapshot_excluding(&state, scope, &stream_keys);
+            validate_snapshot_size(&snapshot)?;
+            Some(snapshot)
+        };
 
         for key in &stream_keys {
             state.output_streams.remove(key);
@@ -809,10 +977,7 @@ impl EventHub {
             .output_tombstone_order
             .retain(|key| !tombstone_keys.contains(key));
 
-        if !stream_keys.is_empty() || !tombstone_keys.is_empty() {
-            validate_registered_topic(&state, TERMINAL_OUTPUT_TOPIC)?;
-            let snapshot = terminal_output_snapshot(&state, scope);
-            validate_snapshot_size(&snapshot)?;
+        if let Some(snapshot) = snapshot {
             state
                 .snapshots
                 .entry(scope.to_owned())
@@ -855,15 +1020,19 @@ impl EventHub {
         owner: &OwnerIdentity,
     ) -> Result<EventRebase, AutomationError> {
         let mut state = lock(&self.state);
-        let (scope, topics, cursor) = {
+        let (scope, topics) = {
+            let record = owned_subscription(&mut state, subscription, owner)?;
+            (record.scope.clone(), record.topics.clone())
+        };
+        let snapshot = snapshot_locked(&state, &scope, &topics)?;
+        let cursor = {
             let record = owned_subscription(&mut state, subscription, owner)?;
             record.events.clear();
             record.queued_bytes = 0;
             record.gap = None;
             record.cursor = record.sequence;
-            (record.scope.clone(), record.topics.clone(), record.cursor)
+            record.cursor
         };
-        let snapshot = snapshot_locked(&state, &scope, &topics)?;
         Ok(EventRebase {
             subscription: subscription.to_owned(),
             scope,
@@ -874,8 +1043,9 @@ impl EventHub {
     }
 
     pub fn publish(&self, publication: EventPublication) -> Result<u64, AutomationError> {
-        let mut state = lock(&self.state);
-        publish_locked(&mut state, publication)
+        let mut batch = self.begin_publication_batch();
+        let prepared = batch.prepare(publication, std::iter::empty())?;
+        Ok(batch.commit_one(prepared))
     }
 
     pub fn publish_with_snapshot(
@@ -901,13 +1071,55 @@ impl EventHub {
                 "event scope must not be empty",
             ));
         }
+        let mut batch = self.begin_publication_batch();
+        let prepared = batch.prepare(publication, snapshots)?;
+        Ok(batch.commit_one(prepared))
+    }
+
+    pub fn publish_with_snapshot_source(
+        &self,
+        publication: EventPublication,
+        source: impl Into<String>,
+        snapshot: Value,
+    ) -> Result<u64, AutomationError> {
+        let topic = publication.topic.clone();
+        let mut revisions = self.publish_batch_with_snapshot_sources([(
+            publication,
+            vec![(topic, source.into(), snapshot)],
+        )])?;
+        Ok(revisions
+            .pop()
+            .expect("single publication yields one revision"))
+    }
+
+    /// Preflights and commits every event and source-fragment update while
+    /// holding one event-state lock. No event or snapshot is committed if any
+    /// publication fails validation.
+    pub fn publish_batch_with_snapshot_sources(
+        &self,
+        publications: impl IntoIterator<Item = (EventPublication, Vec<(String, String, Value)>)>,
+    ) -> Result<Vec<u64>, AutomationError> {
+        let mut batch = self.begin_publication_batch();
+        let prepared = publications
+            .into_iter()
+            .map(|(publication, sources)| {
+                batch.prepare_with_sources(publication, std::iter::empty(), sources)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(batch.commit_all(prepared))
+    }
+
+    fn begin_publication_batch(&self) -> EventPublicationBatch<'_> {
         #[cfg(test)]
         self.notify_before_publication_lock();
-        let snapshots = snapshots.into_iter().collect::<BTreeMap<_, _>>();
-        let mut state = lock(&self.state);
-        validate_registered_topic(&state, &publication.topic)?;
-        replace_snapshots_locked(&mut state, &publication.scope, snapshots)?;
-        publish_locked(&mut state, publication)
+        EventPublicationBatch {
+            #[cfg(test)]
+            hub: self,
+            state: lock(&self.state),
+            revisions: BTreeMap::new(),
+            sequences: BTreeMap::new(),
+            pending_fragments: BTreeMap::new(),
+        }
     }
 
     pub fn publish_terminal_output(
@@ -926,82 +1138,43 @@ impl EventHub {
         }
         let mut state = lock(&self.state);
         validate_registered_topic(&state, TERMINAL_OUTPUT_TOPIC)?;
-        let key = terminal_output_key(&scope, &target);
-        let mut affected_scopes = BTreeSet::from([scope.clone()]);
-        if !state.output_streams.contains_key(&key) {
-            while state.output_streams.len() >= TERMINAL_OUTPUT_STREAM_LIMIT {
+        let projection = terminal_output_projection(&state, &scope, &target, &payload)?;
+        let publication = EventPublication::new(
+            scope,
+            TERMINAL_OUTPUT_TOPIC,
+            provenance,
+            Some(target),
+            json!({"cursor": projection.stream.cursor, "data": payload}),
+        );
+        validate_publication_locked(&state, &publication)?;
+
+        let new_stream = !state.output_streams.contains_key(&projection.key);
+        if new_stream {
+            for _ in 0..projection.order_pops {
                 let Some(oldest) = state.output_stream_order.pop_front() else {
                     break;
                 };
                 if let Some(removed) = state.output_streams.remove(&oldest) {
-                    affected_scopes.insert(removed.scope.clone());
                     remember_output_tombstone(&mut state, oldest, removed.cursor);
                 }
             }
-            let previous_cursor = state.output_tombstones.remove(&key).unwrap_or(0);
-            state.output_tombstone_order.retain(|known| known != &key);
-            state.output_stream_order.push_back(key.clone());
-            state.output_streams.insert(
-                key.clone(),
-                TerminalOutputStream {
-                    scope: scope.clone(),
-                    target: target.clone(),
-                    cursor: previous_cursor,
-                    retained_bytes: 0,
-                    chunks: VecDeque::new(),
-                },
-            );
+            state.output_tombstones.remove(&projection.key);
+            state
+                .output_tombstone_order
+                .retain(|known| known != &projection.key);
+            state.output_stream_order.push_back(projection.key.clone());
         }
-        let cursor = {
-            let stream = state
-                .output_streams
-                .get_mut(&key)
-                .expect("terminal output stream was inserted");
-            stream.cursor = stream
-                .cursor
-                .checked_add(1)
-                .ok_or_else(|| AutomationError::new(-32003, "terminal output cursor exhausted"))?;
-            let cursor = stream.cursor;
-            let bytes = value_size(&payload)?;
-            if bytes > TERMINAL_OUTPUT_BYTE_LIMIT {
-                stream.chunks.clear();
-                stream.retained_bytes = 0;
-            } else {
-                stream.retained_bytes += bytes;
-                stream.chunks.push_back(TerminalOutputChunk {
-                    cursor,
-                    payload: payload.clone(),
-                });
-                while stream.retained_bytes > TERMINAL_OUTPUT_BYTE_LIMIT {
-                    let Some(removed) = stream.chunks.pop_front() else {
-                        break;
-                    };
-                    stream.retained_bytes = stream
-                        .retained_bytes
-                        .saturating_sub(value_size(&removed.payload)?);
-                }
-            }
-            cursor
-        };
-        for affected_scope in affected_scopes {
-            let snapshot = terminal_output_snapshot(&state, &affected_scope);
-            validate_snapshot_size(&snapshot)?;
+        state
+            .output_streams
+            .insert(projection.key, projection.stream);
+        for (affected_scope, snapshot) in projection.snapshots {
             state
                 .snapshots
                 .entry(affected_scope)
                 .or_default()
                 .insert(TERMINAL_OUTPUT_TOPIC.to_owned(), snapshot);
         }
-        publish_locked(
-            &mut state,
-            EventPublication::new(
-                scope,
-                TERMINAL_OUTPUT_TOPIC,
-                provenance,
-                Some(target),
-                json!({"cursor": cursor, "data": payload}),
-            ),
-        )
+        Ok(publish_locked_prevalidated(&mut state, publication))
     }
 
     pub fn terminal_output_after(
@@ -1056,6 +1229,153 @@ impl EventHub {
             .collect()
     }
 }
+struct EventPublicationBatch<'a> {
+    #[cfg(test)]
+    hub: &'a EventHub,
+    state: MutexGuard<'a, EventState>,
+    revisions: BTreeMap<String, u64>,
+    sequences: BTreeMap<String, u64>,
+    pending_fragments: BTreeMap<(String, String), BTreeMap<String, Value>>,
+}
+
+struct PreparedEventPublication {
+    publication: EventPublication,
+    snapshots: BTreeMap<String, Value>,
+    snapshot_fragments: Vec<(String, String, Value)>,
+}
+
+impl EventPublicationBatch<'_> {
+    fn prepare(
+        &mut self,
+        publication: EventPublication,
+        snapshots: impl IntoIterator<Item = (String, Value)>,
+    ) -> Result<PreparedEventPublication, AutomationError> {
+        self.prepare_with_sources(publication, snapshots, std::iter::empty())
+    }
+
+    fn prepare_with_sources(
+        &mut self,
+        publication: EventPublication,
+        snapshots: impl IntoIterator<Item = (String, Value)>,
+        source_snapshots: impl IntoIterator<Item = (String, String, Value)>,
+    ) -> Result<PreparedEventPublication, AutomationError> {
+        let snapshots = snapshots.into_iter().collect::<BTreeMap<_, _>>();
+        let source_snapshots = source_snapshots.into_iter().collect::<Vec<_>>();
+        validate_snapshots_locked(&self.state, &snapshots)?;
+        let mut candidates = BTreeMap::<(String, String), BTreeMap<String, Value>>::new();
+        for (topic, source, snapshot) in &source_snapshots {
+            let key = (publication.scope.clone(), topic.clone());
+            let fragments = candidates.entry(key.clone()).or_insert_with(|| {
+                self.pending_fragments
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| {
+                        self.state
+                            .snapshot_fragments
+                            .get(&publication.scope)
+                            .and_then(|topics| topics.get(topic))
+                            .cloned()
+                    })
+                    .unwrap_or_default()
+            });
+            fragments.insert(source.clone(), snapshot.clone());
+        }
+        for ((_, topic), fragments) in &candidates {
+            validate_snapshot_fragments_locked(&self.state, topic, fragments)?;
+        }
+        validate_publication_shape_locked(&self.state, &publication)?;
+        let revision = self
+            .revisions
+            .get(&publication.scope)
+            .copied()
+            .or_else(|| self.state.revisions.get(&publication.scope).copied())
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| AutomationError::new(-32003, "event revision exhausted"))?;
+        let mut sequences = Vec::new();
+        for (subscription_id, subscription) in &self.state.subscriptions {
+            if subscription.scope != publication.scope
+                || !subscription.topics.contains(&publication.topic)
+            {
+                continue;
+            }
+            let sequence = self
+                .sequences
+                .get(subscription_id)
+                .copied()
+                .unwrap_or(subscription.sequence)
+                .checked_add(1)
+                .ok_or_else(|| AutomationError::new(-32003, "event sequence exhausted"))?;
+            let event = EventEnvelope {
+                sequence,
+                scope: publication.scope.clone(),
+                revision,
+                topic: publication.topic.clone(),
+                provenance: publication.provenance.clone(),
+                target: publication.target.clone(),
+                payload: publication.payload.clone(),
+            };
+            value_size(&event)?;
+            sequences.push((subscription_id.clone(), sequence));
+        }
+        self.revisions.insert(publication.scope.clone(), revision);
+        for (subscription_id, sequence) in sequences {
+            self.sequences.insert(subscription_id, sequence);
+        }
+        for (key, fragments) in candidates {
+            self.pending_fragments.insert(key, fragments);
+        }
+        Ok(PreparedEventPublication {
+            publication,
+            snapshots,
+            snapshot_fragments: source_snapshots,
+        })
+    }
+
+    fn commit_one(&mut self, prepared: PreparedEventPublication) -> u64 {
+        let PreparedEventPublication {
+            publication,
+            snapshots,
+            snapshot_fragments,
+        } = prepared;
+        replace_snapshots_prevalidated(&mut self.state, &publication.scope, snapshots);
+        for (topic, source, snapshot) in snapshot_fragments {
+            replace_snapshot_fragment_prevalidated(
+                &mut self.state,
+                &publication.scope,
+                &topic,
+                &source,
+                snapshot,
+            );
+        }
+        publish_locked_prevalidated(&mut self.state, publication)
+    }
+
+    fn commit_all(&mut self, prepared: Vec<PreparedEventPublication>) -> Vec<u64> {
+        prepared
+            .into_iter()
+            .map(|prepared| self.commit_one(prepared))
+            .collect()
+    }
+
+    fn replace_snapshots(
+        &mut self,
+        scope: &str,
+        snapshots: impl IntoIterator<Item = (String, Value)>,
+    ) -> Result<(), AutomationError> {
+        let snapshots = snapshots.into_iter().collect::<BTreeMap<_, _>>();
+        validate_snapshots_locked(&self.state, &snapshots)?;
+        replace_snapshots_prevalidated(&mut self.state, scope, snapshots);
+        Ok(())
+    }
+}
+
+impl Drop for EventPublicationBatch<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.hub.clear_before_publication_notification();
+    }
+}
 
 struct SubscriptionRecord {
     owner: OwnerIdentity,
@@ -1077,6 +1397,7 @@ struct SubscriptionGap {
     sequence: u64,
 }
 
+#[derive(Clone)]
 struct TerminalOutputStream {
     scope: String,
     target: CommandTarget,
@@ -1085,24 +1406,73 @@ struct TerminalOutputStream {
     chunks: VecDeque<TerminalOutputChunk>,
 }
 
+struct TerminalOutputProjection {
+    key: String,
+    stream: TerminalOutputStream,
+    order_pops: usize,
+    evicted_keys: BTreeSet<String>,
+    snapshots: BTreeMap<String, Value>,
+}
+
 fn terminal_output_snapshot(state: &EventState, scope: &str) -> Value {
+    terminal_output_snapshot_excluding(state, scope, &BTreeSet::new())
+}
+
+fn terminal_output_snapshot_excluding(
+    state: &EventState,
+    scope: &str,
+    excluded: &BTreeSet<String>,
+) -> Value {
     let streams = state
         .output_streams
-        .values()
-        .filter(|stream| stream.scope == scope)
-        .map(|stream| {
-            json!({
-                "target": &stream.target,
-                "cursor": stream.cursor,
-                "retained_from": stream
-                    .chunks
-                    .front()
-                    .map(|chunk| chunk.cursor)
-                    .unwrap_or_else(|| stream.cursor.saturating_add(1)),
-            })
-        })
+        .iter()
+        .filter(|(key, stream)| stream.scope == scope && !excluded.contains(key.as_str()))
+        .map(|(key, stream)| (key.clone(), terminal_output_snapshot_entry(stream)))
         .collect::<Vec<_>>();
-    json!({"streams": streams})
+    terminal_output_snapshot_value(streams)
+}
+
+fn terminal_output_snapshot_with_projection(
+    state: &EventState,
+    scope: &str,
+    projection: &TerminalOutputProjection,
+) -> Value {
+    let mut streams = state
+        .output_streams
+        .iter()
+        .filter(|(key, stream)| key.as_str() != projection.key.as_str() && stream.scope == scope)
+        .map(|(key, stream)| (key.clone(), terminal_output_snapshot_entry(stream)))
+        .collect::<Vec<_>>();
+    streams.retain(|(key, _)| !projection.evicted_keys.contains(key));
+    if projection.stream.scope == scope {
+        streams.push((
+            projection.key.clone(),
+            terminal_output_snapshot_entry(&projection.stream),
+        ));
+    }
+    terminal_output_snapshot_value(streams)
+}
+
+fn terminal_output_snapshot_value(mut streams: Vec<(String, Value)>) -> Value {
+    streams.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    json!({
+        "streams": streams
+            .into_iter()
+            .map(|(_, stream)| stream)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn terminal_output_snapshot_entry(stream: &TerminalOutputStream) -> Value {
+    json!({
+        "target": &stream.target,
+        "cursor": stream.cursor,
+        "retained_from": stream
+            .chunks
+            .front()
+            .map(|chunk| chunk.cursor)
+            .unwrap_or_else(|| stream.cursor.saturating_add(1)),
+    })
 }
 
 fn remember_output_tombstone(state: &mut EventState, key: String, cursor: u64) {
@@ -1116,6 +1486,108 @@ fn remember_output_tombstone(state: &mut EventState, key: String, cursor: u64) {
         state.output_tombstone_order.push_back(key.clone());
     }
     state.output_tombstones.insert(key, cursor);
+}
+fn terminal_output_projection(
+    state: &EventState,
+    scope: &str,
+    target: &CommandTarget,
+    payload: &Value,
+) -> Result<TerminalOutputProjection, AutomationError> {
+    value_size(target)?;
+    let payload_bytes = value_size(payload)?;
+    let key = terminal_output_key(scope, target);
+    let existing = state.output_streams.get(&key);
+    let mut affected_scopes = BTreeSet::from([scope.to_owned()]);
+    let mut evicted_keys = BTreeSet::new();
+    let mut order_pops = 0;
+    if existing.is_none() {
+        let mut remaining = state.output_streams.len();
+        for oldest in &state.output_stream_order {
+            if remaining < TERMINAL_OUTPUT_STREAM_LIMIT {
+                break;
+            }
+            order_pops += 1;
+            if let Some(removed) = state.output_streams.get(oldest) {
+                remaining -= 1;
+                evicted_keys.insert(oldest.clone());
+                affected_scopes.insert(removed.scope.clone());
+            }
+        }
+    }
+
+    let previous_cursor = existing
+        .map(|stream| stream.cursor)
+        .or_else(|| state.output_tombstones.get(&key).copied())
+        .unwrap_or(0);
+    let cursor = previous_cursor
+        .checked_add(1)
+        .ok_or_else(|| AutomationError::new(-32003, "terminal output cursor exhausted"))?;
+    let (retained_bytes, chunks) = if payload_bytes > TERMINAL_OUTPUT_BYTE_LIMIT {
+        (0, VecDeque::new())
+    } else {
+        let mut chunks = existing
+            .map(|stream| stream.chunks.clone())
+            .unwrap_or_default();
+        let mut retained_bytes = existing.map(|stream| stream.retained_bytes).unwrap_or(0);
+        retained_bytes = retained_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| AutomationError::new(-32003, "terminal output size exhausted"))?;
+        chunks.push_back(TerminalOutputChunk {
+            cursor,
+            payload: payload.clone(),
+        });
+        while retained_bytes > TERMINAL_OUTPUT_BYTE_LIMIT {
+            let Some(removed) = chunks.pop_front() else {
+                break;
+            };
+            retained_bytes = retained_bytes.saturating_sub(value_size(&removed.payload)?);
+        }
+        (retained_bytes, chunks)
+    };
+    let projection = TerminalOutputProjection {
+        key,
+        stream: TerminalOutputStream {
+            scope: scope.to_owned(),
+            target: target.clone(),
+            cursor,
+            retained_bytes,
+            chunks,
+        },
+        order_pops,
+        evicted_keys,
+        snapshots: BTreeMap::new(),
+    };
+    let mut projection = projection;
+    for affected_scope in affected_scopes {
+        let snapshot =
+            terminal_output_snapshot_with_projection(state, &affected_scope, &projection);
+        validate_snapshot_size(&snapshot)?;
+        projection.snapshots.insert(affected_scope, snapshot);
+    }
+    Ok(projection)
+}
+
+fn is_binding_scope(scope: &str) -> bool {
+    scope.starts_with("binding:")
+}
+
+fn subscription_sequence(subscription: &str) -> Option<u64> {
+    subscription.strip_prefix("subscription-")?.parse().ok()
+}
+
+fn retire_subscription_locked(state: &mut EventState, subscription: String) {
+    if let Some(sequence) = subscription_sequence(&subscription) {
+        state.retired_subscription_watermark = state.retired_subscription_watermark.max(sequence);
+    }
+    if state.retired_subscriptions.insert(subscription.clone()) {
+        state.retired_subscription_order.push_back(subscription);
+    }
+    while state.retired_subscription_order.len() > MAX_SUBSCRIPTIONS {
+        let Some(oldest) = state.retired_subscription_order.pop_front() else {
+            break;
+        };
+        state.retired_subscriptions.remove(&oldest);
+    }
 }
 
 fn validate_topic_name(topic: &str) -> Result<(), AutomationError> {
@@ -1147,24 +1619,105 @@ fn validate_subscription_topics(
     Ok(())
 }
 
+fn validate_snapshots_locked(
+    state: &EventState,
+    snapshots: &BTreeMap<String, Value>,
+) -> Result<(), AutomationError> {
+    for (topic, snapshot) in snapshots {
+        validate_registered_topic(state, topic)?;
+        validate_snapshot_size(snapshot)?;
+    }
+    Ok(())
+}
+
+fn validate_snapshot_fragments_locked(
+    state: &EventState,
+    topic: &str,
+    fragments: &BTreeMap<String, Value>,
+) -> Result<(), AutomationError> {
+    validate_registered_topic(state, topic)?;
+    if fragments.is_empty() || fragments.len() > MAX_SNAPSHOT_SOURCES {
+        return Err(AutomationError::new(
+            -32602,
+            "invalid snapshot source count",
+        ));
+    }
+    for source in fragments {
+        if source.0.is_empty() || source.0.len() > MAX_SNAPSHOT_SOURCE_BYTES {
+            return Err(AutomationError::new(-32602, "invalid snapshot source name"));
+        }
+        validate_snapshot_size(source.1)?;
+    }
+    validate_snapshot_size(&merge_snapshot_fragments(fragments))
+}
+
+fn merge_snapshot_fragments(fragments: &BTreeMap<String, Value>) -> Value {
+    let mut merged = Map::new();
+    merged.insert(
+        "runtime".to_owned(),
+        fragments.get("runtime").cloned().unwrap_or(Value::Null),
+    );
+    let mut hosts = Map::new();
+    for (source, snapshot) in fragments {
+        if source != "runtime" {
+            hosts.insert(source.clone(), snapshot.clone());
+        }
+    }
+    merged.insert("hosts".to_owned(), Value::Object(hosts));
+    Value::Object(merged)
+}
+
 fn replace_snapshots_locked(
     state: &mut EventState,
     scope: &str,
     snapshots: BTreeMap<String, Value>,
 ) -> Result<(), AutomationError> {
-    for (topic, snapshot) in &snapshots {
-        validate_registered_topic(state, topic)?;
-        validate_snapshot_size(snapshot)?;
+    validate_snapshots_locked(state, &snapshots)?;
+    replace_snapshots_prevalidated(state, scope, snapshots);
+    Ok(())
+}
+
+fn replace_snapshots_prevalidated(
+    state: &mut EventState,
+    scope: &str,
+    snapshots: BTreeMap<String, Value>,
+) {
+    if let Some(fragments) = state.snapshot_fragments.get_mut(scope) {
+        for topic in snapshots.keys() {
+            fragments.remove(topic);
+        }
     }
     let state_snapshots = state.snapshots.entry(scope.to_owned()).or_default();
     for (topic, snapshot) in snapshots {
         state_snapshots.insert(topic, snapshot);
     }
-    Ok(())
+}
+
+fn replace_snapshot_fragment_prevalidated(
+    state: &mut EventState,
+    scope: &str,
+    topic: &str,
+    source: &str,
+    snapshot: Value,
+) {
+    let fragments = state
+        .snapshot_fragments
+        .entry(scope.to_owned())
+        .or_default()
+        .entry(topic.to_owned())
+        .or_default();
+    fragments.insert(source.to_owned(), snapshot);
+    let merged = merge_snapshot_fragments(fragments);
+    state
+        .snapshots
+        .entry(scope.to_owned())
+        .or_default()
+        .insert(topic.to_owned(), merged);
 }
 
 fn purge_retired_scope_locked(state: &mut EventState, scope: &str) {
     state.snapshots.remove(scope);
+    state.snapshot_fragments.remove(scope);
     state.revisions.remove(scope);
     let retired_subscriptions = state
         .subscriptions
@@ -1176,14 +1729,7 @@ fn purge_retired_scope_locked(state: &mut EventState, scope: &str) {
         .subscriptions
         .retain(|_, subscription| subscription.scope != scope);
     for subscription in retired_subscriptions {
-        if state.retired_subscriptions.insert(subscription.clone()) {
-            state.retired_subscription_order.push_back(subscription);
-        }
-    }
-    while state.retired_subscription_order.len() > MAX_SUBSCRIPTIONS {
-        if let Some(subscription) = state.retired_subscription_order.pop_front() {
-            state.retired_subscriptions.remove(&subscription);
-        }
+        retire_subscription_locked(state, subscription);
     }
 
     let stream_keys = state
@@ -1218,22 +1764,63 @@ fn terminal_output_key_target(key: &str) -> Option<(String, CommandTarget)> {
     serde_json::from_str(key).ok()
 }
 
-fn publish_locked(
-    state: &mut EventState,
-    publication: EventPublication,
-) -> Result<u64, AutomationError> {
+fn validate_publication_shape_locked(
+    state: &EventState,
+    publication: &EventPublication,
+) -> Result<(), AutomationError> {
     if publication.scope.is_empty() {
         return Err(AutomationError::new(
             -32602,
             "event scope must not be empty",
         ));
     }
-    validate_registered_topic(state, &publication.topic)?;
+    validate_registered_topic(state, &publication.topic)
+}
+
+fn validate_publication_locked(
+    state: &EventState,
+    publication: &EventPublication,
+) -> Result<(), AutomationError> {
+    validate_publication_shape_locked(state, publication)?;
+    let revision = state
+        .revisions
+        .get(&publication.scope)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| AutomationError::new(-32003, "event revision exhausted"))?;
+    for subscription in state.subscriptions.values() {
+        if subscription.scope != publication.scope
+            || !subscription.topics.contains(&publication.topic)
+        {
+            continue;
+        }
+        let sequence = subscription
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| AutomationError::new(-32003, "event sequence exhausted"))?;
+        let event = EventEnvelope {
+            sequence,
+            scope: publication.scope.clone(),
+            revision,
+            topic: publication.topic.clone(),
+            provenance: publication.provenance.clone(),
+            target: publication.target.clone(),
+            payload: publication.payload.clone(),
+        };
+        value_size(&event)?;
+    }
+    Ok(())
+}
+
+fn publish_locked_prevalidated(state: &mut EventState, publication: EventPublication) -> u64 {
     let revision = state
         .revisions
         .entry(publication.scope.clone())
         .or_default();
-    *revision += 1;
+    *revision = (*revision)
+        .checked_add(1)
+        .expect("publication revision was prevalidated");
     let revision = *revision;
     for subscription in state.subscriptions.values_mut() {
         if subscription.scope != publication.scope
@@ -1241,7 +1828,10 @@ fn publish_locked(
         {
             continue;
         }
-        subscription.sequence += 1;
+        subscription.sequence = subscription
+            .sequence
+            .checked_add(1)
+            .expect("publication sequence was prevalidated");
         if subscription.gap.is_some() || subscription.events.len() >= EVENT_QUEUE_LIMIT {
             subscription.events.clear();
             subscription.queued_bytes = 0;
@@ -1259,9 +1849,13 @@ fn publish_locked(
             target: publication.target.clone(),
             payload: publication.payload.clone(),
         };
-        let bytes = value_size(&event)?;
+        let bytes = value_size(&event).expect("publication event was prevalidated");
         if bytes > EVENT_QUEUE_BYTE_LIMIT
-            || subscription.queued_bytes + bytes > EVENT_QUEUE_BYTE_LIMIT
+            || subscription
+                .queued_bytes
+                .checked_add(bytes)
+                .expect("event queue bytes were prevalidated")
+                > EVENT_QUEUE_BYTE_LIMIT
         {
             subscription.events.clear();
             subscription.queued_bytes = 0;
@@ -1273,7 +1867,7 @@ fn publish_locked(
         subscription.queued_bytes += bytes;
         subscription.events.push_back(QueuedEvent { bytes, event });
     }
-    Ok(revision)
+    revision
 }
 
 fn snapshot_locked(
@@ -1362,22 +1956,27 @@ fn owned_subscription<'a>(
     subscription: &str,
     owner: &OwnerIdentity,
 ) -> Result<&'a mut SubscriptionRecord, AutomationError> {
-    if state.retired_subscriptions.contains(subscription) {
-        return Err(AutomationError::new(
+    if let Some(record) = state.subscriptions.get_mut(subscription) {
+        if &record.owner != owner {
+            return Err(AutomationError::new(
+                -32006,
+                "subscription is owned by another process",
+            ));
+        }
+        return Ok(record);
+    }
+    let retired = state.retired_subscriptions.contains(subscription)
+        || subscription_sequence(subscription).is_some_and(|sequence| {
+            sequence != 0 && sequence <= state.retired_subscription_watermark
+        });
+    if retired {
+        Err(AutomationError::new(
             -32006,
             "subscription event scope is not live",
-        ));
+        ))
+    } else {
+        Err(AutomationError::new(-32602, "unknown subscription"))
     }
-    let Some(record) = state.subscriptions.get_mut(subscription) else {
-        return Err(AutomationError::new(-32602, "unknown subscription"));
-    };
-    if &record.owner != owner {
-        return Err(AutomationError::new(
-            -32006,
-            "subscription is owned by another process",
-        ));
-    }
-    Ok(record)
 }
 
 fn reap_dead_subscriptions(state: &mut EventState) {
@@ -1409,16 +2008,13 @@ struct MetadataKey {
 
 impl MetadataHub {
     fn new(events: EventHub) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(MetadataState {
-                next_generation: 1,
-                records: BTreeMap::new(),
-            })),
-            events,
-        }
+        let state = Arc::new(Mutex::new(MetadataState {
+            next_generation: 1,
+            records: BTreeMap::new(),
+        }));
+        events.set_metadata_state(Arc::downgrade(&state));
+        Self { state, events }
     }
-    /// Installs the current metadata store as bootstrap state for both
-    /// metadata lifecycle topics without manufacturing a lifecycle event.
     pub fn install_snapshot(&self, scope: &str) -> Result<(), AutomationError> {
         if scope.is_empty() {
             return Err(AutomationError::new(
@@ -1427,10 +2023,10 @@ impl MetadataHub {
             ));
         }
         self.reap_expired()?;
+        let mut batch = self.events.begin_publication_batch();
         let state = lock(&self.state);
         let snapshot = metadata_snapshot(&state, scope);
-        self.events
-            .replace_snapshots(scope, metadata_source_snapshots(snapshot))
+        batch.replace_snapshots(scope, metadata_source_snapshots(snapshot))
     }
 
     pub fn publish(
@@ -1456,8 +2052,9 @@ impl MetadataHub {
             &publication.key,
             publication.target.as_ref(),
         );
+        let mut batch = self.events.begin_publication_batch();
         let mut state = lock(&self.state);
-        let previous = state.records.get(&key).cloned();
+        let previous = state.records.get(&key);
         if previous.is_none() && state.records.len() >= MAX_METADATA_RECORDS {
             return Err(AutomationError::new(
                 -32001,
@@ -1465,45 +2062,34 @@ impl MetadataHub {
             ));
         }
         let generation = state.next_generation;
-        state.next_generation = generation
+        let next_generation = generation
             .checked_add(1)
             .ok_or_else(|| AutomationError::new(-32003, "metadata generation exhausted"))?;
         let record = MetadataRecord {
-            scope: publication.scope,
-            namespace: publication.namespace,
-            key: publication.key,
-            target: publication.target,
-            value: publication.value,
+            scope: publication.scope.clone(),
+            namespace: publication.namespace.clone(),
+            key: publication.key.clone(),
+            target: publication.target.clone(),
+            value: publication.value.clone(),
             expires_at_ms: publication.expires_at_ms,
-            provenance: publication.provenance,
+            provenance: publication.provenance.clone(),
             generation,
         };
-        state.records.insert(key.clone(), record.clone());
-        let snapshot = metadata_snapshot(&state, &record.scope);
-        if let Err(error) = validate_snapshot_size(&snapshot) {
-            match previous {
-                Some(previous) => {
-                    state.records.insert(key, previous);
-                }
-                None => {
-                    state.records.remove(&key);
-                }
-            }
-            return Err(error);
-        }
-        self.events.publish_with_snapshots(
-            EventPublication::new(
-                record.scope.clone(),
-                "metadata.changed",
-                record.provenance.clone(),
-                record.target.clone(),
-                json!({"operation": "published", "metadata": record.clone()}),
-            ),
-            metadata_source_snapshots(snapshot),
-        )?;
+        let snapshot = metadata_snapshot_with_record(&state, &key, &record);
+        let event = EventPublication::new(
+            record.scope.clone(),
+            "metadata.changed",
+            record.provenance.clone(),
+            record.target.clone(),
+            json!({"operation": "published", "metadata": record.clone()}),
+        );
+        let sources = metadata_source_snapshots(snapshot);
+        let prepared = batch.prepare(event, sources.iter().cloned())?;
+        state.next_generation = next_generation;
+        state.records.insert(key, record.clone());
+        batch.commit_one(prepared);
         Ok(record)
     }
-
     pub fn clear(
         &self,
         scope: &str,
@@ -1515,24 +2101,26 @@ impl MetadataHub {
         validate_metadata_identity(scope, namespace, key)?;
         self.reap_expired()?;
         let metadata_key = metadata_key(scope, namespace, key, target);
+        let mut batch = self.events.begin_publication_batch();
         let mut state = lock(&self.state);
-        let Some(record) = state.records.remove(&metadata_key) else {
+        let Some(record) = state.records.get(&metadata_key).cloned() else {
             return Ok(None);
         };
-        let snapshot = metadata_snapshot(&state, scope);
-        self.events.publish_with_snapshots(
-            EventPublication::new(
-                scope.to_owned(),
-                "metadata.changed",
-                provenance,
-                record.target.clone(),
-                json!({"operation": "cleared", "metadata": record.clone()}),
-            ),
-            metadata_source_snapshots(snapshot),
-        )?;
+        let excluded = BTreeSet::from([metadata_key.clone()]);
+        let snapshot = metadata_snapshot_excluding(&state, scope, &excluded);
+        let event = EventPublication::new(
+            scope.to_owned(),
+            "metadata.changed",
+            provenance,
+            record.target.clone(),
+            json!({"operation": "cleared", "metadata": record.clone()}),
+        );
+        let sources = metadata_source_snapshots(snapshot);
+        let prepared = batch.prepare(event, sources.iter().cloned())?;
+        state.records.remove(&metadata_key);
+        batch.commit_one(prepared);
         Ok(Some(record))
     }
-
     pub fn get(
         &self,
         scope: &str,
@@ -1569,6 +2157,7 @@ impl MetadataHub {
     }
 
     pub fn reap_expired_at(&self, now_ms: u64) -> Result<usize, AutomationError> {
+        let mut batch = self.events.begin_publication_batch();
         let mut state = lock(&self.state);
         let expired_keys = state
             .records
@@ -1580,42 +2169,52 @@ impl MetadataHub {
             })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
+        let expired_key_set = expired_keys.iter().cloned().collect::<BTreeSet<_>>();
         let records = expired_keys
-            .into_iter()
-            .filter_map(|key| state.records.remove(&key))
+            .iter()
+            .filter_map(|key| state.records.get(key).cloned())
             .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Ok(0);
+        }
         let snapshots = records
             .iter()
             .map(|record| record.scope.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .map(|scope| {
-                let snapshot = metadata_snapshot(&state, &scope);
-                (scope, snapshot)
+                (
+                    scope.clone(),
+                    metadata_snapshot_excluding(&state, &scope, &expired_key_set),
+                )
             })
             .collect::<BTreeMap<_, _>>();
-        let count = records.len();
-        for record in records {
+        let mut prepared = Vec::with_capacity(records.len());
+        for record in &records {
             let snapshot = snapshots
                 .get(&record.scope)
                 .expect("every expired metadata scope has a snapshot")
                 .clone();
-            self.events.publish_with_snapshots(
-                EventPublication::new(
-                    record.scope.clone(),
-                    "metadata.expired",
-                    json!({
-                        "source": "metadata",
-                        "operation": "expired",
-                        "published_by": record.provenance.clone(),
-                    }),
-                    record.target.clone(),
-                    json!({"metadata": record}),
-                ),
-                metadata_source_snapshots(snapshot),
-            )?;
+            let event = EventPublication::new(
+                record.scope.clone(),
+                "metadata.expired",
+                json!({
+                    "source": "metadata",
+                    "operation": "expired",
+                    "published_by": record.provenance.clone(),
+                }),
+                record.target.clone(),
+                json!({"metadata": record.clone()}),
+            );
+            let sources = metadata_source_snapshots(snapshot);
+            prepared.push(batch.prepare(event, sources.iter().cloned())?);
         }
-        Ok(count)
+
+        for key in &expired_keys {
+            state.records.remove(key);
+        }
+        batch.commit_all(prepared);
+        Ok(records.len())
     }
 }
 
@@ -1665,15 +2264,36 @@ fn metadata_key(
 }
 
 fn metadata_snapshot(state: &MetadataState, scope: &str) -> Value {
+    metadata_snapshot_excluding(state, scope, &BTreeSet::new())
+}
+
+fn metadata_snapshot_excluding(
+    state: &MetadataState,
+    scope: &str,
+    excluded: &BTreeSet<MetadataKey>,
+) -> Value {
     let records = state
         .records
-        .values()
-        .filter(|record| record.scope == scope)
-        .cloned()
+        .iter()
+        .filter(|(key, record)| record.scope == scope && !excluded.contains(key))
+        .map(|(_, record)| record.clone())
         .collect::<Vec<_>>();
     json!({"records": records})
 }
-
+fn metadata_snapshot_with_record(
+    state: &MetadataState,
+    key: &MetadataKey,
+    replacement: &MetadataRecord,
+) -> Value {
+    let mut records = BTreeMap::new();
+    for (existing_key, record) in &state.records {
+        if record.scope == replacement.scope {
+            records.insert(existing_key, record);
+        }
+    }
+    records.insert(key, replacement);
+    json!({"records": records.values().collect::<Vec<_>>()})
+}
 fn metadata_source_snapshots(snapshot: Value) -> [(String, Value); 2] {
     [
         ("metadata.changed".to_owned(), snapshot.clone()),
@@ -1693,12 +2313,14 @@ pub struct TaskHub {
     events: EventHub,
 }
 
+#[derive(Clone)]
 struct TaskHubState {
     next_task: u64,
     tasks: BTreeMap<String, TaskRecord>,
     completed_tasks: VecDeque<String>,
 }
 
+#[derive(Clone)]
 struct TaskRecord {
     owner: OwnerIdentity,
     scope: String,
@@ -1818,10 +2440,10 @@ impl TaskHub {
         Ok(status)
     }
 
-    pub fn remove(&self, task: &str) {
+    pub fn remove_checked(&self, task: &str) -> Result<(), AutomationError> {
         let mut state = lock(&self.state);
         let Some(record) = state.tasks.remove(task) else {
-            return;
+            return Ok(());
         };
         let completed_tasks = state.completed_tasks.clone();
         state.completed_tasks.retain(|completed| completed != task);
@@ -1830,10 +2452,96 @@ impl TaskHub {
             task: task_status(task, &record),
             operation: "removed",
         };
-        if self.publish_task_change_locked(&state, change).is_err() {
+        if let Err(error) = self.publish_task_change_locked(&state, change) {
             let _ = state.tasks.insert(task.to_owned(), record);
             state.completed_tasks = completed_tasks;
+            return Err(error);
         }
+        Ok(())
+    }
+    /// Cancels and removes a task only after the authoritative lifecycle
+    /// publication batch has committed. A failed publication leaves the task
+    /// and its cancellation token untouched for a later retry.
+    pub fn terminate_checked(&self, task: &str) -> Result<(), AutomationError> {
+        let mut state = lock(&self.state);
+        let mut cancelling = state.clone();
+        let Some(record) = cancelling.tasks.get_mut(task) else {
+            return Ok(());
+        };
+        let was_running = matches!(record.state, TaskState::Running);
+        if was_running {
+            record.state = TaskState::Cancelling;
+        }
+        let mut removed = cancelling.clone();
+        let Some(removed_record) = removed.tasks.remove(task) else {
+            return Ok(());
+        };
+        removed
+            .completed_tasks
+            .retain(|completed| completed != task);
+        let removed_change = TaskChange {
+            scope: removed_record.scope.clone(),
+            task: task_status(task, &removed_record),
+            operation: "removed",
+        };
+        if was_running {
+            let Some(cancelling_record) = cancelling.tasks.get(task) else {
+                return Ok(());
+            };
+            let cancelling_change = TaskChange {
+                scope: cancelling_record.scope.clone(),
+                task: task_status(task, cancelling_record),
+                operation: "cancelling",
+            };
+            self.publish_task_change_sequence_locked(vec![
+                (&cancelling, cancelling_change),
+                (&removed, removed_change),
+            ])?;
+        } else {
+            self.publish_task_change_locked(&removed, removed_change)?;
+        }
+
+        if let Some(actual) = state.tasks.get_mut(task) {
+            let _ = actual.cancellation.cancel();
+        }
+        state.tasks.remove(task);
+        state.completed_tasks.retain(|completed| completed != task);
+        Ok(())
+    }
+    /// Shutdown-only task teardown. Ownership is checked before mutation, but
+    /// external publication cannot veto cancellation/removal because shutdown
+    /// has no retry worker to preserve a live task.
+    pub fn terminate_force_checked(
+        &self,
+        task: &str,
+        owner: &OwnerIdentity,
+    ) -> Result<(), AutomationError> {
+        let mut state = lock(&self.state);
+        let _ = owned_task(&state, task, owner)?;
+        let mut candidate = state.clone();
+        let Some(removed_record) = candidate.tasks.remove(task) else {
+            return Ok(());
+        };
+        candidate
+            .completed_tasks
+            .retain(|completed| completed != task);
+        let change = TaskChange {
+            scope: removed_record.scope.clone(),
+            task: task_status(task, &removed_record),
+            operation: "removed",
+        };
+        let publication = self.publish_task_change_locked(&candidate, change);
+
+        if let Some(actual) = state.tasks.get_mut(task) {
+            let _ = actual.cancellation.cancel();
+        }
+        state.tasks.remove(task);
+        state.completed_tasks.retain(|completed| completed != task);
+        publication
+    }
+
+    pub fn remove(&self, task: &str) {
+        let _ = self.remove_checked(task);
     }
 
     /// Completes a task without allowing an unretainable result to restore its
@@ -1887,11 +2595,12 @@ impl TaskHub {
 
     pub fn cancel(&self, task: &str, owner: &OwnerIdentity) -> Result<TaskStatus, AutomationError> {
         let mut state = lock(&self.state);
+        if !matches!(owned_task(&state, task, owner)?.state, TaskState::Running) {
+            return Ok(task_status(task, owned_task(&state, task, owner)?));
+        }
+        let mut candidate = state.clone();
         let (status, change) = {
-            let record = owned_task_mut(&mut state, task, owner)?;
-            if !matches!(record.state, TaskState::Running) {
-                return Ok(task_status(task, record));
-            }
+            let record = owned_task_mut(&mut candidate, task, owner)?;
             record.state = TaskState::Cancelling;
             let status = task_status(task, record);
             let change = TaskChange {
@@ -1901,45 +2610,41 @@ impl TaskHub {
             };
             (status, change)
         };
-        if let Err(error) = task_change_snapshot(&state, &change) {
-            state
-                .tasks
-                .get_mut(task)
-                .expect("task exists while its state lock is held")
-                .state = TaskState::Running;
-            return Err(error);
-        }
-        if !state
-            .tasks
-            .get(task)
-            .expect("task exists while its state lock is held")
-            .cancellation
-            .cancel()
-        {
-            let record = state
-                .tasks
-                .get_mut(task)
-                .expect("task exists while its state lock is held");
-            record.state = TaskState::Running;
-            return Ok(task_status(task, record));
-        }
-        self.publish_task_change_locked(&state, change)?;
+        self.publish_task_change_locked(&candidate, change)?;
+        let record = owned_task_mut(&mut state, task, owner)?;
+        record.state = TaskState::Cancelling;
+        let _ = record.cancellation.cancel();
         Ok(status)
     }
 
-    pub fn cancel_owner(&self, owner: &OwnerIdentity) -> usize {
+    pub fn cancel_owner_checked(&self, owner: &OwnerIdentity) -> Result<usize, AutomationError> {
         self.cancel_matching(|record| &record.owner == owner)
     }
 
-    pub fn cancel_scope(&self, scope: &str) -> usize {
+    pub fn cancel_owner(&self, owner: &OwnerIdentity) -> usize {
+        self.cancel_owner_checked(owner).unwrap_or(0)
+    }
+
+    pub fn cancel_scope_checked(&self, scope: &str) -> Result<usize, AutomationError> {
         self.cancel_matching(|record| record.scope.as_str() == scope)
     }
 
-    pub fn cancel_all(&self) {
-        self.cancel_matching(|_| true);
+    pub fn cancel_scope(&self, scope: &str) -> usize {
+        self.cancel_scope_checked(scope).unwrap_or(0)
     }
 
-    fn cancel_matching(&self, mut matches: impl FnMut(&TaskRecord) -> bool) -> usize {
+    pub fn cancel_all_checked(&self) -> Result<usize, AutomationError> {
+        self.cancel_matching(|_| true)
+    }
+
+    pub fn cancel_all(&self) {
+        let _ = self.cancel_all_checked();
+    }
+
+    fn cancel_matching(
+        &self,
+        mut matches: impl FnMut(&TaskRecord) -> bool,
+    ) -> Result<usize, AutomationError> {
         let mut state = lock(&self.state);
         let tasks = state
             .tasks
@@ -1948,74 +2653,35 @@ impl TaskHub {
             .map(|(task, _)| task.clone())
             .collect::<Vec<_>>();
         if tasks.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
+        let mut candidate = state.clone();
         for task in &tasks {
-            state
-                .tasks
-                .get_mut(task)
-                .expect("task ID came from the task index")
-                .state = TaskState::Cancelling;
+            if let Some(record) = candidate.tasks.get_mut(task) {
+                record.state = TaskState::Cancelling;
+            }
         }
-        let candidates = tasks
+        let changes = tasks
             .iter()
-            .map(|task| {
-                let record = state
-                    .tasks
-                    .get(task)
-                    .expect("task ID came from the task index");
-                TaskChange {
+            .filter_map(|task| {
+                candidate.tasks.get(task).map(|record| TaskChange {
                     scope: record.scope.clone(),
                     task: task_status(task, record),
-                    operation: "cancelling",
-                }
-            })
-            .collect::<Vec<_>>();
-        if self
-            .validate_task_changes_locked(&state, &candidates)
-            .is_err()
-        {
-            for task in tasks {
-                state
-                    .tasks
-                    .get_mut(&task)
-                    .expect("task ID came from the task index")
-                    .state = TaskState::Running;
-            }
-            return 0;
-        }
-
-        let changes = tasks
-            .into_iter()
-            .filter_map(|task| {
-                let record = state
-                    .tasks
-                    .get_mut(&task)
-                    .expect("task ID came from the task index");
-                if !record.cancellation.cancel() {
-                    record.state = TaskState::Running;
-                    return None;
-                }
-                Some(TaskChange {
-                    scope: record.scope.clone(),
-                    task: task_status(&task, record),
                     operation: "cancelling",
                 })
             })
             .collect::<Vec<_>>();
-        let count = changes.len();
-        if count == 0 {
-            return 0;
+        self.validate_task_changes_locked(&candidate, &changes)?;
+        self.publish_task_changes_locked(&candidate, changes)?;
+        for task in &tasks {
+            if let Some(record) = state.tasks.get_mut(task) {
+                record.state = TaskState::Cancelling;
+                let _ = record.cancellation.cancel();
+            }
         }
-        // The first preflight bounded every candidate snapshot; tasks whose
-        // cancellation raced a start were restored to the smaller `running`
-        // representation above.
-        self.publish_task_changes_locked(&state, changes)
-            .expect("validated task changes use the permanently registered task.changed topic");
-        count
+        Ok(tasks.len())
     }
-
     fn validate_task_changes_locked(
         &self,
         state: &TaskHubState,
@@ -2032,9 +2698,36 @@ impl TaskHub {
         state: &TaskHubState,
         changes: Vec<TaskChange>,
     ) -> Result<(), AutomationError> {
-        for change in changes {
-            self.publish_task_change_locked(state, change)?;
+        self.publish_task_change_sequence_locked(
+            changes.into_iter().map(|change| (state, change)).collect(),
+        )
+    }
+
+    fn publish_task_change_sequence_locked(
+        &self,
+        changes: Vec<(&TaskHubState, TaskChange)>,
+    ) -> Result<(), AutomationError> {
+        let mut batch = self.events.begin_publication_batch();
+        let mut prepared = Vec::with_capacity(changes.len());
+        for (state, change) in changes {
+            let snapshot = task_change_snapshot(state, &change)?;
+            let TaskChange {
+                scope,
+                task,
+                operation,
+            } = change;
+            prepared.push(batch.prepare(
+                EventPublication::new(
+                    scope.clone(),
+                    "task.changed",
+                    json!({"owner_pid": task.owner_pid}),
+                    None,
+                    json!({"operation": operation, "task": task}),
+                ),
+                [("task.changed".to_owned(), snapshot)],
+            )?);
         }
+        let _ = batch.commit_all(prepared);
         Ok(())
     }
 
@@ -2053,24 +2746,7 @@ impl TaskHub {
         state: &TaskHubState,
         change: TaskChange,
     ) -> Result<(), AutomationError> {
-        let snapshot = task_change_snapshot(state, &change)?;
-        let TaskChange {
-            scope,
-            task,
-            operation,
-        } = change;
-        self.events
-            .publish_with_snapshot(
-                EventPublication::new(
-                    scope,
-                    "task.changed",
-                    json!({"owner_pid": task.owner_pid}),
-                    None,
-                    json!({"operation": operation, "task": task}),
-                ),
-                snapshot,
-            )
-            .map(|_| ())
+        self.publish_task_changes_locked(state, vec![change])
     }
 }
 
@@ -2254,9 +2930,312 @@ mod tests {
     }
 
     #[test]
+    fn extension_snapshot_fragments_merge_and_rebase_as_one_union() {
+        let hub = AutomationHub::new();
+        let scope = "instance:extension-fragments".to_owned();
+        hub.bind_instance_scope(scope.clone()).unwrap();
+        let owner = owner();
+        let subscription = hub
+            .events()
+            .subscribe(
+                owner.clone(),
+                BTreeSet::from(["extension.reloaded".to_owned()]),
+                scope.clone(),
+            )
+            .unwrap()
+            .subscription;
+        let publish = |source: &str, snapshot: Value, generation: u64| {
+            hub.publish_event_with_snapshot_source(
+                EventPublication::new(
+                    scope.clone(),
+                    "extension.reloaded",
+                    json!({"source": source}),
+                    None,
+                    json!({"source": source, "generation": generation}),
+                ),
+                source,
+                snapshot,
+            )
+            .unwrap();
+        };
+        publish(
+            "runtime",
+            json!({"modules": [{"extension_id": "agents", "generation": 1}]}),
+            1,
+        );
+        publish(
+            "status",
+            json!({"modules": [{"extension_id": "status", "generation": 2}]}),
+            2,
+        );
+        publish(
+            "sidebar",
+            json!({"modules": [{"extension_id": "sidebar", "generation": 3}]}),
+            3,
+        );
+        let topics = BTreeSet::from(["extension.reloaded".to_owned()]);
+        let snapshot = hub.events().snapshot(&scope, &topics).unwrap();
+        assert_eq!(
+            snapshot.snapshots["extension.reloaded"]["runtime"]["modules"][0]["extension_id"],
+            "agents"
+        );
+        assert_eq!(
+            snapshot.snapshots["extension.reloaded"]["hosts"]["status"]["modules"][0]["extension_id"],
+            "status"
+        );
+        assert_eq!(
+            snapshot.snapshots["extension.reloaded"]["hosts"]["sidebar"]["modules"][0]["extension_id"],
+            "sidebar"
+        );
+
+        for generation in 0..=EVENT_QUEUE_LIMIT {
+            publish(
+                "runtime",
+                json!({"modules": [{"extension_id": "agents", "generation": generation}]}),
+                generation as u64,
+            );
+        }
+        assert_eq!(
+            hub.events()
+                .poll(&subscription, &owner, 0)
+                .unwrap_err()
+                .code,
+            -32005
+        );
+        let rebase = hub.events().rebase(&subscription, &owner).unwrap();
+        assert_eq!(
+            rebase.snapshot.snapshots["extension.reloaded"]["runtime"]["modules"][0]["generation"],
+            EVENT_QUEUE_LIMIT as u64
+        );
+        assert_eq!(
+            rebase.snapshot.snapshots["extension.reloaded"]["hosts"]["status"]["modules"][0]["extension_id"],
+            "status"
+        );
+        assert_eq!(
+            rebase.snapshot.snapshots["extension.reloaded"]["hosts"]["sidebar"]["modules"][0]["extension_id"],
+            "sidebar"
+        );
+    }
+
+    #[test]
+    fn snapshot_source_batch_preflights_without_partial_delivery() {
+        let hub = AutomationHub::new();
+        let scope = "instance:extension-batch".to_owned();
+        hub.bind_instance_scope(scope.clone()).unwrap();
+        let owner = owner();
+        let subscription = hub
+            .events()
+            .subscribe(
+                owner.clone(),
+                BTreeSet::from(["extension.reloaded".to_owned()]),
+                scope.clone(),
+            )
+            .unwrap()
+            .subscription;
+        let oversized = Value::String("x".repeat(EVENT_QUEUE_BYTE_LIMIT));
+        let result = hub.events().publish_batch_with_snapshot_sources(vec![
+            (
+                EventPublication::new(
+                    scope.clone(),
+                    "extension.reloaded",
+                    Value::Null,
+                    None,
+                    json!({"first": true}),
+                ),
+                vec![(
+                    "extension.reloaded".to_owned(),
+                    "status".to_owned(),
+                    json!({"modules": [{"extension_id": "status"}]}),
+                )],
+            ),
+            (
+                EventPublication::new(
+                    scope.clone(),
+                    "extension.reloaded",
+                    Value::Null,
+                    None,
+                    json!({"second": true}),
+                ),
+                vec![(
+                    "extension.reloaded".to_owned(),
+                    "sidebar".to_owned(),
+                    oversized,
+                )],
+            ),
+        ]);
+        assert_eq!(result.unwrap_err().code, -32003);
+        let snapshot = hub
+            .events()
+            .snapshot(&scope, &BTreeSet::from(["extension.reloaded".to_owned()]))
+            .unwrap();
+        assert_eq!(
+            snapshot.snapshots["extension.reloaded"]["hosts"]["status"]["modules"],
+            json!([])
+        );
+        assert!(
+            hub.events()
+                .poll(&subscription, &owner, 0)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn oversized_rebase_snapshot_is_non_destructive() {
+        let hub = AutomationHub::new();
+        let scope = "instance:oversized-rebase".to_owned();
+        let topics = BTreeSet::from([
+            COMMAND_COMPLETED_TOPIC.to_owned(),
+            "topology.changed".to_owned(),
+        ]);
+        let oversized = Value::String("x".repeat(EVENT_QUEUE_BYTE_LIMIT / 2 - 16));
+        hub.events()
+            .replace_snapshots(
+                scope.clone(),
+                [
+                    (COMMAND_COMPLETED_TOPIC.to_owned(), oversized.clone()),
+                    ("topology.changed".to_owned(), oversized),
+                ],
+            )
+            .unwrap();
+        let subscription = hub
+            .events()
+            .subscribe(owner(), topics.clone(), scope.clone())
+            .unwrap()
+            .subscription;
+        for sequence in 0..=EVENT_QUEUE_LIMIT {
+            hub.publish_event(EventPublication::new(
+                scope.clone(),
+                COMMAND_COMPLETED_TOPIC,
+                Value::Null,
+                None,
+                json!({"sequence": sequence}),
+            ))
+            .unwrap();
+        }
+        let before = hub.events().poll(&subscription, &owner(), 0).unwrap_err();
+        let before_data = before.data.unwrap();
+        let sequence = before_data["sequence"].as_u64().unwrap();
+        assert_eq!(before_data["cursor"], 0);
+
+        let error = hub.events().rebase(&subscription, &owner()).unwrap_err();
+        assert_eq!(error.code, -32003);
+        let after = hub.events().poll(&subscription, &owner(), 0).unwrap_err();
+        let after_data = after.data.unwrap();
+        assert_eq!(after.code, -32005);
+        assert_eq!(after_data["cursor"], 0);
+        assert_eq!(after_data["sequence"], sequence);
+
+        hub.events()
+            .replace_snapshots(
+                scope.clone(),
+                [
+                    (COMMAND_COMPLETED_TOPIC.to_owned(), json!({"ready": true})),
+                    ("topology.changed".to_owned(), json!({"ready": true})),
+                ],
+            )
+            .unwrap();
+        let rebase = hub.events().rebase(&subscription, &owner()).unwrap();
+        assert_eq!(rebase.cursor, sequence);
+    }
+
+    #[test]
+    fn oversized_terminal_output_snapshot_does_not_advance_stream() {
+        let hub = AutomationHub::new();
+        let scope = "instance:oversized-output";
+        let target = CommandTarget {
+            kind: ResourceKind::Terminal,
+            handle: "terminal".to_owned(),
+            generation: 1,
+        };
+        hub.publish_terminal_output(scope, Value::Null, target.clone(), Value::Null)
+            .unwrap();
+        let oversized = CommandTarget {
+            kind: ResourceKind::Terminal,
+            handle: "x".repeat(EVENT_QUEUE_BYTE_LIMIT),
+            generation: 1,
+        };
+        let error = hub
+            .publish_terminal_output(scope, Value::Null, oversized.clone(), Value::Null)
+            .unwrap_err();
+        assert_eq!(error.code, -32003);
+        let retained = hub.terminal_output_after(scope, &target, 0).unwrap();
+        assert_eq!(retained.cursor, 1);
+        assert_eq!(retained.chunks.len(), 1);
+        let missing = hub.terminal_output_after(scope, &oversized, 0).unwrap_err();
+        assert_eq!(missing.data.unwrap()["stream_cursor"], 0);
+    }
+
+    #[test]
+    fn binding_scope_retirement_wins_and_replacement_is_distinct() {
+        let hub = AutomationHub::new();
+        let old_scope = "binding:1:1".to_owned();
+        let replacement_scope = old_scope.clone();
+        hub.events()
+            .replace_live_binding_scopes([old_scope.clone()]);
+        hub.events()
+            .set_snapshot(
+                old_scope.clone(),
+                "topology.changed",
+                json!({"generation": 1}),
+            )
+            .unwrap();
+        let old = hub
+            .events()
+            .subscribe(
+                owner(),
+                ["topology.changed".to_owned()].into_iter().collect(),
+                old_scope.clone(),
+            )
+            .unwrap();
+        hub.events().replace_live_binding_scopes(std::iter::empty());
+        let retired = hub
+            .events()
+            .subscribe(
+                owner(),
+                ["topology.changed".to_owned()].into_iter().collect(),
+                old_scope,
+            )
+            .unwrap_err();
+        assert_eq!(retired.code, -32006);
+
+        hub.events()
+            .replace_live_binding_scopes([replacement_scope.clone()]);
+        hub.events()
+            .set_snapshot(
+                replacement_scope.clone(),
+                "topology.changed",
+                json!({"generation": 2}),
+            )
+            .unwrap();
+        let replacement = hub
+            .events()
+            .subscribe(
+                owner(),
+                ["topology.changed".to_owned()].into_iter().collect(),
+                replacement_scope.clone(),
+            )
+            .unwrap();
+        assert_ne!(old.subscription, replacement.subscription);
+        let replacement_snapshot = hub
+            .events()
+            .snapshot(
+                &replacement_scope,
+                &["topology.changed".to_owned()].into_iter().collect(),
+            )
+            .unwrap();
+        assert_eq!(
+            replacement_snapshot.snapshots["topology.changed"]["generation"],
+            2
+        );
+    }
+
+    #[test]
     fn reconnect_replaces_binding_snapshot_before_gap_rebase() {
         let hub = AutomationHub::new();
         let scope = "binding:space:binding".to_owned();
+        hub.events().replace_live_binding_scopes([scope.clone()]);
         let topic = "backend.rebased".to_owned();
         hub.events()
             .replace_snapshots_with_terminal_output(
@@ -2346,6 +3325,40 @@ mod tests {
         let reused_pid = OwnerIdentity::new(7, 12);
         assert_eq!(
             hub.tasks().status(&task.id, &reused_pid).unwrap_err().code,
+            -32006
+        );
+    }
+    #[test]
+    fn unregister_topic_retired_subscriptions_remain_bounded_and_stale() {
+        let hub = AutomationHub::new();
+        let scope = "instance:topic-churn".to_owned();
+        let mut first_subscription = None;
+        for index in 0..(MAX_SUBSCRIPTIONS * 2) {
+            let topic = format!("extension.churn_{index}");
+            hub.events().register_topic(&topic).unwrap();
+            let subscription = hub
+                .events()
+                .subscribe(
+                    owner(),
+                    [topic.clone()].into_iter().collect(),
+                    scope.clone(),
+                )
+                .unwrap()
+                .subscription;
+            if first_subscription.is_none() {
+                first_subscription = Some(subscription);
+            }
+            hub.events().unregister_topic(&topic).unwrap();
+        }
+        let state = lock(&hub.events().state);
+        assert!(state.retired_subscriptions.len() <= MAX_SUBSCRIPTIONS);
+        assert!(state.retired_subscription_watermark >= (MAX_SUBSCRIPTIONS * 2) as u64);
+        drop(state);
+        assert_eq!(
+            hub.events()
+                .poll(&first_subscription.unwrap(), &owner(), 0)
+                .unwrap_err()
+                .code,
             -32006
         );
     }
@@ -2699,6 +3712,33 @@ mod tests {
     }
 
     #[test]
+    fn force_termination_removes_task_when_publication_fails() {
+        let tasks = TaskHub::new(EventHub::new());
+        let task = "task-force";
+        let cancellation = CommandCancellation::new();
+        {
+            let mut state = lock(&tasks.state);
+            state.tasks.insert(
+                task.to_owned(),
+                TaskRecord {
+                    owner: owner(),
+                    scope: "instance:test".to_owned(),
+                    cancellation: cancellation.clone(),
+                    state: TaskState::Running,
+                },
+            );
+        }
+
+        let error = tasks
+            .terminate_force_checked(task, &owner())
+            .expect_err("unregistered task topic should reject publication");
+
+        assert_eq!(error.code, -32602);
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(tasks.status(task, &owner()).unwrap_err().code, -32602);
+    }
+
+    #[test]
     fn command_completion_keeps_target_and_provenance() {
         let hub = AutomationHub::new();
         let scope = "instance:test".to_owned();
@@ -2738,6 +3778,146 @@ mod tests {
         assert_eq!(event.provenance["caller"], "socket");
         assert_eq!(event.provenance["owner_pid"], 7);
         assert_eq!(event.target.unwrap().handle, "pane-4");
+    }
+
+    #[test]
+    fn metadata_clear_rejects_oversized_result_without_removing_record() {
+        let hub = AutomationHub::new();
+        let scope = "instance:metadata-clear".to_owned();
+        let clear_key = metadata_key(&scope, "test", "clear", None);
+        let remaining_key = metadata_key(&scope, "test", "remaining", None);
+        let clear_record = MetadataRecord {
+            scope: scope.clone(),
+            namespace: "test".to_owned(),
+            key: "clear".to_owned(),
+            target: None,
+            value: Value::Null,
+            expires_at_ms: None,
+            provenance: Value::Null,
+            generation: 1,
+        };
+        let remaining_record = MetadataRecord {
+            scope: scope.clone(),
+            namespace: "test".to_owned(),
+            key: "remaining".to_owned(),
+            target: None,
+            value: Value::String("x".repeat(EVENT_QUEUE_BYTE_LIMIT)),
+            expires_at_ms: None,
+            provenance: Value::Null,
+            generation: 2,
+        };
+        {
+            let mut metadata_state = lock(&hub.metadata().state);
+            metadata_state
+                .records
+                .insert(clear_key.clone(), clear_record.clone());
+            metadata_state
+                .records
+                .insert(remaining_key, remaining_record);
+        }
+        let error = hub
+            .metadata()
+            .clear(&scope, "test", "clear", None, Value::Null)
+            .unwrap_err();
+        assert_eq!(error.code, -32003);
+        let metadata_state = lock(&hub.metadata().state);
+        assert_eq!(metadata_state.records.get(&clear_key), Some(&clear_record));
+    }
+
+    #[test]
+    fn metadata_expiry_preflights_all_scopes_before_removing_any_record() {
+        let hub = AutomationHub::new();
+        let first_scope = "instance:expiry-a".to_owned();
+        let second_scope = "instance:expiry-b".to_owned();
+        let first_key = metadata_key(&first_scope, "test", "expired", None);
+        let second_key = metadata_key(&second_scope, "test", "expired", None);
+        let remaining_key = metadata_key(&second_scope, "test", "remaining", None);
+        {
+            let mut metadata_state = lock(&hub.metadata().state);
+            metadata_state.records.insert(
+                first_key.clone(),
+                MetadataRecord {
+                    scope: first_scope,
+                    namespace: "test".to_owned(),
+                    key: "expired".to_owned(),
+                    target: None,
+                    value: Value::Null,
+                    expires_at_ms: Some(10),
+                    provenance: Value::Null,
+                    generation: 1,
+                },
+            );
+            metadata_state.records.insert(
+                second_key.clone(),
+                MetadataRecord {
+                    scope: second_scope.clone(),
+                    namespace: "test".to_owned(),
+                    key: "expired".to_owned(),
+                    target: None,
+                    value: Value::Null,
+                    expires_at_ms: Some(10),
+                    provenance: Value::Null,
+                    generation: 2,
+                },
+            );
+            metadata_state.records.insert(
+                remaining_key.clone(),
+                MetadataRecord {
+                    scope: second_scope,
+                    namespace: "test".to_owned(),
+                    key: "remaining".to_owned(),
+                    target: None,
+                    value: Value::String("x".repeat(EVENT_QUEUE_BYTE_LIMIT)),
+                    expires_at_ms: None,
+                    provenance: Value::Null,
+                    generation: 3,
+                },
+            );
+        }
+        let error = hub.metadata().reap_expired_at(10).unwrap_err();
+        assert_eq!(error.code, -32003);
+        let metadata_state = lock(&hub.metadata().state);
+        assert!(metadata_state.records.contains_key(&first_key));
+        assert!(metadata_state.records.contains_key(&second_key));
+        assert!(metadata_state.records.contains_key(&remaining_key));
+    }
+
+    #[test]
+    fn polling_reaps_metadata_ttl_without_an_app_frame() {
+        let hub = AutomationHub::new();
+        let scope = "instance:metadata-poll-ttl".to_owned();
+        let topics = ["metadata.changed".to_owned(), "metadata.expired".to_owned()]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let subscription = hub
+            .events()
+            .subscribe(owner(), topics, scope.clone())
+            .unwrap()
+            .subscription;
+        let expires_at_ms = unix_time_ms().unwrap().saturating_add(5);
+        hub.metadata()
+            .publish(MetadataPublication::new(
+                scope,
+                "test",
+                "ttl",
+                None,
+                Value::Null,
+                Some(expires_at_ms),
+                Value::Null,
+            ))
+            .unwrap();
+        while unix_time_ms().unwrap() < expires_at_ms {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let delivery = hub.events().poll(&subscription, &owner(), 0).unwrap();
+        assert_eq!(
+            delivery
+                .events
+                .iter()
+                .map(|event| event.topic.as_str())
+                .collect::<Vec<_>>(),
+            vec!["metadata.changed", "metadata.expired"]
+        );
     }
 
     #[test]

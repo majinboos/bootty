@@ -631,6 +631,15 @@ mod tests {
         fn execute(&mut self, _command: MuxCommand) -> Result<()> {
             unreachable!("preflight must not execute")
         }
+
+        fn execute_checked(
+            &mut self,
+            _scope: bootty_mux::controller::MuxScope,
+            _command: MuxCommand,
+            _precondition: Option<&bootty_mux::backend::MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<Result<()>> {
+            BindingOperationOutcome::Unsupported
+        }
     }
 
     fn test_session(id: &str, name: &str) -> bootty_mux::snapshot::MuxSession {
@@ -713,6 +722,27 @@ mod tests {
             Ok(())
         }
 
+        fn execute_checked(
+            &mut self,
+            scope: bootty_mux::controller::MuxScope,
+            command: MuxCommand,
+            precondition: Option<&bootty_mux::backend::MuxScopedExecutionPrecondition>,
+        ) -> BindingOperationOutcome<Result<()>> {
+            if let Some(precondition) = precondition {
+                if precondition.scope != scope {
+                    return BindingOperationOutcome::Supported(Err(
+                        MuxBackendOperationError::stale("remote binding scope changed").into(),
+                    ));
+                }
+                return BindingOperationOutcome::Supported(Err(
+                    MuxBackendOperationError::unsupported(
+                        "remote backend lacks an atomic checked mutation protocol",
+                    )
+                    .into(),
+                ));
+            }
+            BindingOperationOutcome::Supported(self.execute(command))
+        }
         fn session_launch_capability(
             &self,
             _plan: &MuxSessionLaunchPlan,

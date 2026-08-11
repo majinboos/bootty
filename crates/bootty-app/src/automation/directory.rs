@@ -20,13 +20,21 @@ use std::{
 
 use fs4::{FileExt, TryLockError};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
 const LOCK_FILE_NAME: &str = ".directory-claims.lock";
+const MUTATION_LEASE_DIRECTORY: &str = ".bootty-mutation-leases";
+const WORKTREE_METADATA_FILE: &str = "bootty-worktree.json";
 const LOCK_RETRY: Duration = Duration::from_millis(10);
 const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 static UNIQUE_SUFFIX: AtomicU64 = AtomicU64::new(0);
 static PROCESS_LOCK: Mutex<()> = Mutex::new(());
+static IN_FLIGHT_REMOVALS: Mutex<Vec<(ClaimOwner, WorktreeRef)>> = Mutex::new(Vec::new());
+
+#[cfg(all(test, unix))]
+static FAILING_SYNC_DIRECTORY: Mutex<Option<(PathBuf, usize)>> = Mutex::new(None);
 
 /// A Bootty process and generation.  IDs are opaque and must not be presented as display names.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -110,7 +118,7 @@ pub struct RepositoryRef {
 impl RepositoryRef {
     /// Repository equality intentionally ignores the optional, discoverable main-worktree root.
     pub fn same_identity(&self, other: &Self) -> bool {
-        self.common_git_dir == other.common_git_dir
+        same_path_identity(&self.common_git_dir, &other.common_git_dir)
     }
 }
 
@@ -140,13 +148,22 @@ impl WorktreeRef {
     /// The identity is independent of branch/head observations and management metadata.
     pub fn same_identity(&self, other: &Self) -> bool {
         self.repository.same_identity(&other.repository)
-            && self.git_dir == other.git_dir
-            && self.path == other.path
+            && same_path_identity(&self.git_dir, &other.git_dir)
+            && same_path_identity(&self.path, &other.path)
+    }
+
+    /// Compare the immutable observations required before a destructive removal.
+    pub fn same_removal_target(&self, other: &Self) -> bool {
+        self.same_identity(other)
+            && self.branch == other.branch
+            && self.head == other.head
+            && self.created_by == other.created_by
+            && self.managed_by_bootty == other.managed_by_bootty
     }
 
     /// Linked worktrees have a per-worktree Git directory rather than the repository common dir.
     pub fn is_linked(&self) -> bool {
-        self.git_dir != self.repository.common_git_dir
+        !same_path_identity(&self.git_dir, &self.repository.common_git_dir)
     }
 }
 
@@ -177,7 +194,7 @@ impl DirectoryRef {
 
     /// Directory equality is canonical-path equality; Git metadata may legitimately change later.
     pub fn same_location(&self, other: &Self) -> bool {
-        self.canonical_path == other.canonical_path
+        same_path_identity(&self.canonical_path, &other.canonical_path)
     }
 }
 
@@ -265,12 +282,44 @@ impl ClaimOwner {
     }
 }
 
+/// Durable phase of one worktree-removal intent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorktreeRemovalPhase {
+    #[default]
+    CallbackInProgress,
+    CallbackCompleted,
+}
+
+/// Exact token used to resume claim cleanup after a destructive callback committed.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorktreeRemovalRecovery {
+    pub worktree: WorktreeRef,
+    pub token: String,
+}
+
+/// A durable marker for a worktree removal in flight or needing recovery.  Claims remain
+/// safety-visible while the marker exists so concurrent cwd observations can merge safely.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct WorktreeRemovalIntent {
+    pub worktree: WorktreeRef,
+    pub since_revision: u64,
+    #[serde(default)]
+    pub token: String,
+    #[serde(default)]
+    pub phase: WorktreeRemovalPhase,
+    #[serde(default)]
+    pub claims: Vec<DirectoryClaim>,
+}
+
 /// A serializable, atomically-published snapshot for one Bootty instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirectoryClaimsSnapshot {
     pub owner: ClaimOwner,
     pub revision: u64,
     pub claims: Vec<DirectoryClaim>,
+    #[serde(default)]
+    pub removal_intents: Vec<WorktreeRemovalIntent>,
 }
 
 #[derive(Serialize)]
@@ -278,6 +327,7 @@ struct DirectoryClaimsSnapshotRef<'a> {
     owner: &'a ClaimOwner,
     revision: u64,
     claims: &'a [DirectoryClaim],
+    removal_intents: &'a [WorktreeRemovalIntent],
 }
 
 /// Determines whether an owner is proven dead.  Implementations must return `false` when they
@@ -360,6 +410,33 @@ pub enum DirectoryClaimsError {
     StaleConfirmation {
         assessment: Box<WorktreeRemovalAssessment>,
     },
+    StaleRemovalTarget {
+        expected: Box<WorktreeRef>,
+        actual: Option<Box<WorktreeRef>>,
+    },
+    RemovalInProgress {
+        worktree: Box<WorktreeRef>,
+    },
+    /// The destructive callback committed, but claim cleanup is still recoverable with this
+    /// exact token and target.
+    PartialCleanup {
+        recovery: Box<WorktreeRemovalRecovery>,
+        revision: u64,
+        message: String,
+    },
+    StaleRecovery {
+        worktree: Box<WorktreeRef>,
+    },
+    RecoveryRequiresCallback {
+        worktree: Box<WorktreeRef>,
+    },
+    /// The snapshot target was published, but rollback durability could not be proven.  Memory
+    /// has been reconciled to the published revision; callers must not retry as if no mutation
+    /// occurred.
+    PublicationCommitted {
+        revision: u64,
+        message: String,
+    },
     RemovalFailed {
         message: String,
     },
@@ -393,8 +470,43 @@ impl fmt::Display for DirectoryClaimsError {
             }
             Self::ConfirmationRequired { .. } => formatter
                 .write_str("worktree removal needs confirmation for active cross-session claims"),
-            Self::StaleConfirmation { .. } => formatter
-                .write_str("worktree removal confirmation does not match the final active claims"),
+            Self::StaleConfirmation { .. } => {
+                formatter.write_str("worktree removal confirmation is stale")
+            }
+            Self::StaleRemovalTarget { expected, .. } => write!(
+                formatter,
+                "worktree removal target changed before deletion: {:?}",
+                expected.path
+            ),
+            Self::RemovalInProgress { worktree } => {
+                write!(
+                    formatter,
+                    "worktree removal is already in progress for {:?}",
+                    worktree.path
+                )
+            }
+            Self::PartialCleanup {
+                recovery, message, ..
+            } => write!(
+                formatter,
+                "worktree removal cleanup is partial for {:?}: {message}",
+                recovery.worktree.path
+            ),
+            Self::StaleRecovery { worktree } => write!(
+                formatter,
+                "worktree removal recovery token does not match {:?}",
+                worktree.path
+            ),
+            Self::RecoveryRequiresCallback { worktree } => write!(
+                formatter,
+                "worktree removal recovery requires an explicit callback for {:?}",
+                worktree.path
+            ),
+            Self::PublicationCommitted { revision, message } => write!(
+                formatter,
+                "claims publication at revision {revision} is committed with indeterminate \
+                 durability: {message}"
+            ),
             Self::RemovalFailed { message } => {
                 write!(formatter, "worktree removal failed: {message}")
             }
@@ -442,10 +554,7 @@ pub fn canonicalize_local_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
                     continue;
                 }
                 let parent = resolved.join("..");
-                match fs::canonicalize(parent) {
-                    Ok(parent) => resolved = parent,
-                    Err(_) => return Ok(normalize_absolute_path(&absolute)),
-                }
+                resolved = fs::canonicalize(parent)?;
             }
             std::path::Component::Normal(component) if nonexistent_tail.is_empty() => {
                 let candidate = resolved.join(component);
@@ -459,10 +568,7 @@ pub fn canonicalize_local_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
                     {
                         nonexistent_tail.push(component.to_owned());
                     }
-                    // A permission or I/O failure should not make an otherwise usable local
-                    // reference disappear.  The normalized absolute form remains stable and
-                    // serializable.
-                    Err(_) => return Ok(normalize_absolute_path(&absolute)),
+                    Err(error) => return Err(error),
                 }
             }
             std::path::Component::Normal(component) => nonexistent_tail.push(component.to_owned()),
@@ -473,6 +579,26 @@ pub fn canonicalize_local_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
         resolved.push(component);
     }
     Ok(resolved)
+}
+
+fn same_path_identity(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let left_public = left.strip_prefix("/private/var");
+        let right_public = right.strip_prefix("/var");
+        if let (Ok(left_public), Ok(right_public)) = (left_public, right_public) {
+            return left_public == right_public;
+        }
+        let left_public = left.strip_prefix("/var");
+        let right_public = right.strip_prefix("/private/var");
+        if let (Ok(left_public), Ok(right_public)) = (left_public, right_public) {
+            return left_public == right_public;
+        }
+    }
+    false
 }
 
 /// Default owner-private location for per-instance directory-claim snapshots.
@@ -496,10 +622,26 @@ struct DirectoryClaimsInner {
     state: Mutex<ClaimState>,
 }
 
+struct RemovalInFlight {
+    owner: ClaimOwner,
+    worktree: WorktreeRef,
+}
+
+impl Drop for RemovalInFlight {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = IN_FLIGHT_REMOVALS.lock() {
+            registry.retain(|(owner, worktree)| {
+                owner != &self.owner || !worktree.same_identity(&self.worktree)
+            });
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct ClaimState {
     revision: u64,
     claims: Vec<DirectoryClaim>,
+    removal_intents: Vec<WorktreeRemovalIntent>,
 }
 
 impl ClaimState {
@@ -516,6 +658,7 @@ impl ClaimState {
             owner,
             revision: self.revision,
             claims: self.claims.clone(),
+            removal_intents: self.removal_intents.clone(),
         }
     }
 }
@@ -556,20 +699,58 @@ impl DirectoryClaims {
             let _lock = snapshots.acquire_global_lock()?;
             snapshots.read_own_snapshot_locked()?
         };
-        let should_publish = initial_snapshot.is_none();
+        let mut should_publish = initial_snapshot.is_none();
         let state = match initial_snapshot {
             Some(snapshot) => {
-                let revision = snapshot.revision.max(
-                    snapshot
-                        .claims
+                let mut claims = snapshot.claims;
+                claims.sort();
+                let mut removal_intents = snapshot.removal_intents;
+                removal_intents.sort();
+                let mut revision = snapshot.revision.max(
+                    claims
                         .iter()
                         .map(|claim| claim.since_revision)
+                        .chain(removal_intents.iter().map(|intent| intent.since_revision))
                         .max()
                         .unwrap_or(0),
                 );
-                let mut claims = snapshot.claims;
-                claims.sort();
-                ClaimState { revision, claims }
+                let mut migrated = false;
+                for intent in &mut removal_intents {
+                    if intent.token.is_empty() {
+                        intent.token = format!("legacy-{}", unique_suffix());
+                        migrated = true;
+                    }
+                    if intent.claims.is_empty() {
+                        let matching =
+                            claims
+                                .iter()
+                                .filter(|claim| {
+                                    claim.directory.worktree.as_ref().is_some_and(|claimed| {
+                                        claimed.same_identity(&intent.worktree)
+                                    })
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                        if !matching.is_empty() {
+                            intent.claims = matching;
+                            migrated = true;
+                        }
+                    }
+                }
+                if migrated {
+                    revision = revision
+                        .checked_add(1)
+                        .ok_or(DirectoryClaimsError::RevisionExhausted)?;
+                    for intent in &mut removal_intents {
+                        intent.since_revision = revision;
+                    }
+                    should_publish = true;
+                }
+                ClaimState {
+                    revision,
+                    claims,
+                    removal_intents,
+                }
             }
             None => ClaimState::default(),
         };
@@ -610,6 +791,24 @@ impl DirectoryClaims {
         }
 
         let _lock = self.inner.snapshots.acquire_global_lock()?;
+        let intent_worktree =
+            match self
+                .in_flight_removal_for_directory(&directory)?
+                .or_else(|| {
+                    state
+                        .removal_intents
+                        .iter()
+                        .find(|intent| removal_intent_matches_directory(intent, &directory))
+                        .map(|intent| intent.worktree.clone())
+                }) {
+                Some(worktree) => Some(worktree),
+                None => self.has_live_removal_intent_locked(&directory)?,
+            };
+        if let Some(worktree) = intent_worktree {
+            return Err(DirectoryClaimsError::RemovalInProgress {
+                worktree: Box::new(worktree),
+            });
+        }
         let warning = self.warning_from_active_locked(&claimant, &directory)?;
         let mut next = state.clone();
         let revision = next.next_revision()?;
@@ -623,8 +822,7 @@ impl DirectoryClaims {
         };
         next.claims.push(claim.clone());
         next.claims.sort();
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(DirectoryClaimUpdate {
             revision,
             claim,
@@ -654,6 +852,24 @@ impl DirectoryClaims {
         }
 
         let _lock = self.inner.snapshots.acquire_global_lock()?;
+        let intent_worktree =
+            match self
+                .in_flight_removal_for_directory(&directory)?
+                .or_else(|| {
+                    state
+                        .removal_intents
+                        .iter()
+                        .find(|intent| removal_intent_matches_directory(intent, &directory))
+                        .map(|intent| intent.worktree.clone())
+                }) {
+                Some(worktree) => Some(worktree),
+                None => self.has_live_removal_intent_locked(&directory)?,
+            };
+        if let Some(worktree) = intent_worktree {
+            return Err(DirectoryClaimsError::RemovalInProgress {
+                worktree: Box::new(worktree),
+            });
+        }
         let warning = self.warning_from_active_locked(&claimant, &directory)?;
         let mut next = state.clone();
         next.claims.retain(|claim| {
@@ -670,8 +886,7 @@ impl DirectoryClaims {
         };
         next.claims.push(claim.clone());
         next.claims.sort();
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(DirectoryClaimUpdate {
             revision,
             claim,
@@ -699,8 +914,7 @@ impl DirectoryClaims {
         let mut next = state.clone();
         next.claims.retain(|claim| !has_claimant(claim, claimant));
         let revision = next.next_revision()?;
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(Some(revision))
     }
 
@@ -725,8 +939,7 @@ impl DirectoryClaims {
             !(claim.source == DirectoryClaimSource::Observed && has_claimant(claim, claimant))
         });
         let revision = next.next_revision()?;
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(Some(revision))
     }
 
@@ -750,8 +963,7 @@ impl DirectoryClaims {
         let mut next = state.clone();
         next.claims.retain(|claim| !has_window_claim(claim, window));
         let revision = next.next_revision()?;
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(Some(revision))
     }
 
@@ -786,8 +998,7 @@ impl DirectoryClaims {
         let mut next = state.clone();
         next.claims.retain(|claim| !is_stale(claim));
         let revision = next.next_revision()?;
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(Some(revision))
     }
 
@@ -851,10 +1062,10 @@ impl DirectoryClaims {
         let mut next = ClaimState {
             revision: state.revision,
             claims: rebased_claims,
+            removal_intents: state.removal_intents.clone(),
         };
         let revision = next.next_revision()?;
-        self.inner.snapshots.write_snapshot_locked(&next)?;
-        *state = next;
+        self.persist_state(&mut state, next)?;
         Ok(Some(revision))
     }
 
@@ -882,6 +1093,22 @@ impl DirectoryClaims {
     pub fn snapshot(&self) -> Result<DirectoryClaimsSnapshot, DirectoryClaimsError> {
         let state = self.state()?;
         Ok(state.snapshot(self.inner.snapshots.owner.clone()))
+    }
+    /// Return exact tokens for removal intents that need lifecycle recovery.  Callback-in-progress
+    /// entries are returned too; callers must use authoritative target observation before choosing
+    /// an explicit callback retry.
+    pub fn pending_worktree_removals(
+        &self,
+    ) -> Result<Vec<WorktreeRemovalRecovery>, DirectoryClaimsError> {
+        let state = self.state()?;
+        Ok(state
+            .removal_intents
+            .iter()
+            .map(|intent| WorktreeRemovalRecovery {
+                worktree: intent.worktree.clone(),
+                token: intent.token.clone(),
+            })
+            .collect())
     }
 
     /// Return all live, discoverable claims for one exact canonical directory.
@@ -954,37 +1181,416 @@ impl DirectoryClaims {
         self.assess_worktree_removal_locked(worktree, requester_session)
     }
 
-    /// Execute the supplied Git/worktree remover only after a final, globally locked snapshot
-    /// reread.  The callback runs under the same lock, so every publisher is serialized with the
-    /// safety decision.  It must not call back into this `DirectoryClaims` instance.
+    /// Serialize Git worktree mutations for one repository identity across processes. The lease
+    /// is held for the entire callback supplied by `operation`.
+    pub fn with_worktree_mutation_lease<T, E>(
+        &self,
+        repository: &RepositoryRef,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<DirectoryClaimsError>,
+    {
+        let _lease = WorktreeMutationLease::acquire(repository).map_err(E::from)?;
+        operation()
+    }
+    fn in_flight_removal_for_directory(
+        &self,
+        directory: &DirectoryRef,
+    ) -> Result<Option<WorktreeRef>, DirectoryClaimsError> {
+        let registry = IN_FLIGHT_REMOVALS
+            .lock()
+            .map_err(|_| DirectoryClaimsError::StatePoisoned)?;
+        Ok(registry
+            .iter()
+            .find(|(_, worktree)| worktree_matches_directory(worktree, directory))
+            .map(|(_, worktree)| worktree.clone()))
+    }
+    fn begin_removal(
+        &self,
+        worktree: &WorktreeRef,
+    ) -> Result<RemovalInFlight, DirectoryClaimsError> {
+        let owner = self.inner.snapshots.owner.clone();
+        let mut registry = IN_FLIGHT_REMOVALS
+            .lock()
+            .map_err(|_| DirectoryClaimsError::StatePoisoned)?;
+        if registry.iter().any(|(existing_owner, existing_worktree)| {
+            existing_owner == &owner && existing_worktree.same_identity(worktree)
+        }) {
+            return Err(DirectoryClaimsError::RemovalInProgress {
+                worktree: Box::new(worktree.clone()),
+            });
+        }
+        registry.push((owner.clone(), worktree.clone()));
+        Ok(RemovalInFlight {
+            owner,
+            worktree: worktree.clone(),
+        })
+    }
+
+    /// Execute the supplied Git/worktree remover after a final locked snapshot reread and
+    /// filesystem rehydration.  A durable removal intent keeps claims safety-visible while the
+    /// callback runs without the global lock; finalization reacquires the lock and merges the
+    /// latest authoritative local state.
     pub fn remove_worktree(
         &self,
         worktree: &WorktreeRef,
         request: &WorktreeRemovalRequest,
         remove: impl FnOnce(&WorktreeRef) -> Result<(), String>,
     ) -> Result<WorktreeRemovalAssessment, DirectoryClaimsError> {
-        // Every local publisher obtains state before the global lock.  Preserve that ordering so
-        // a concurrent observed-cwd update cannot slip between final recheck and removal.
-        let _state = self.state()?;
-        let _lock = self.inner.snapshots.acquire_global_lock()?;
-        let assessment =
-            self.assess_worktree_removal_locked(worktree, request.requester_session.as_ref())?;
-
-        if !assessment.conflicting_claims.is_empty() {
-            let Some(confirmation) = request.confirmation.as_ref() else {
-                return Err(DirectoryClaimsError::ConfirmationRequired {
-                    assessment: Box::new(assessment),
-                });
+        let _in_flight = self.begin_removal(worktree)?;
+        let _mutation_lease = WorktreeMutationLease::acquire(&worktree.repository)?;
+        let (assessment, recovery) = {
+            let mut state = self.state()?;
+            let _lock = self.inner.snapshots.acquire_global_lock()?;
+            let Some(actual) = rehydrate_removal_target(worktree) else {
+                return Err(stale_removal_target(worktree, None));
             };
-            if !confirmation_matches(confirmation, &assessment) {
-                return Err(DirectoryClaimsError::StaleConfirmation {
-                    assessment: Box::new(assessment),
+            if !worktree.same_removal_target(&actual) {
+                return Err(stale_removal_target(worktree, Some(actual)));
+            }
+            let (snapshots, _) = self.inner.snapshots.read_live_snapshots_locked()?;
+            if snapshots.into_iter().any(|snapshot| {
+                snapshot.owner != self.inner.snapshots.owner
+                    && snapshot
+                        .removal_intents
+                        .iter()
+                        .any(|intent| intent.worktree.same_identity(worktree))
+            }) {
+                return Err(DirectoryClaimsError::RemovalInProgress {
+                    worktree: Box::new(worktree.clone()),
                 });
             }
+
+            let assessment =
+                self.assess_worktree_removal_locked(worktree, request.requester_session.as_ref())?;
+            if !assessment.conflicting_claims.is_empty() {
+                let Some(confirmation) = request.confirmation.as_ref() else {
+                    return Err(DirectoryClaimsError::ConfirmationRequired {
+                        assessment: Box::new(assessment),
+                    });
+                };
+                if !confirmation_matches(confirmation, &assessment) {
+                    return Err(DirectoryClaimsError::StaleConfirmation {
+                        assessment: Box::new(assessment),
+                    });
+                }
+            }
+
+            // Keep claims in the published state while the unbounded callback runs.  The
+            // callback-in-progress phase is the crash-safe authorization record: recovery never
+            // blindly invokes an opaque destructive callback from this phase.
+            let token = unique_suffix();
+            let mut next = state.clone();
+            next.next_revision()?;
+            let mut claims = assessment.active_claims.clone();
+            claims.sort();
+            next.removal_intents.push(WorktreeRemovalIntent {
+                worktree: worktree.clone(),
+                since_revision: next.revision,
+                token: token.clone(),
+                phase: WorktreeRemovalPhase::CallbackInProgress,
+                claims,
+            });
+            next.removal_intents.sort();
+            self.persist_state(&mut state, next)?;
+            (
+                assessment,
+                WorktreeRemovalRecovery {
+                    worktree: worktree.clone(),
+                    token,
+                },
+            )
+        };
+        let actual = rehydrate_removal_target(worktree);
+        if !actual
+            .as_ref()
+            .is_some_and(|actual| worktree.same_removal_target(actual))
+        {
+            let stale = stale_removal_target(worktree, actual);
+            let mut state = self.state()?;
+            let _lock = self.inner.snapshots.acquire_global_lock()?;
+            return match self.clear_removal_intent_locked(&mut state, &recovery) {
+                Ok(()) => Err(stale),
+                Err(error) => Err(DirectoryClaimsError::PublicationCommitted {
+                    revision: state.revision,
+                    message: format!(
+                        "worktree removal target changed before deletion; intent \
+                         reconciliation is indeterminate: {error}"
+                    ),
+                }),
+            };
         }
 
-        remove(worktree).map_err(|message| DirectoryClaimsError::RemovalFailed { message })?;
-        Ok(assessment)
+        let removal = remove(worktree);
+        let mut state = self.state()?;
+        let _lock = self.inner.snapshots.acquire_global_lock()?;
+        match removal {
+            Ok(()) => {
+                // Record the irreversible callback before attempting to remove claims.  A
+                // one-shot publication failure is retried here; after this point any error is
+                // returned with the exact recovery token and callback is never repeated.
+                match self.mark_callback_completed_locked(&mut state, &recovery) {
+                    Ok(()) => {}
+                    Err(first_error @ DirectoryClaimsError::PublicationCommitted { .. }) => {
+                        return Err(partial_cleanup(
+                            &recovery,
+                            state.revision,
+                            first_error.to_string(),
+                        ));
+                    }
+                    Err(first_error) => {
+                        if let Err(error) =
+                            self.mark_callback_completed_locked(&mut state, &recovery)
+                        {
+                            return Err(partial_cleanup(
+                                &recovery,
+                                state.revision,
+                                format!(
+                                    "callback completion publication failed: {first_error}; retry \
+                                     failed: {error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                match self.finalize_worktree_removal_locked(&mut state, &recovery) {
+                    Ok(()) => Ok(assessment),
+                    Err(error) => Err(partial_cleanup(
+                        &recovery,
+                        state.revision,
+                        error.to_string(),
+                    )),
+                }
+            }
+            Err(message) => match self.clear_removal_intent_locked(&mut state, &recovery) {
+                Ok(()) => Err(DirectoryClaimsError::RemovalFailed { message }),
+                Err(error) => Err(DirectoryClaimsError::PublicationCommitted {
+                    revision: state.revision,
+                    message: format!(
+                        "worktree removal callback failed: {message}; intent reconciliation \
+                         is indeterminate: {error}"
+                    ),
+                }),
+            },
+        }
+    }
+
+    /// Resume claim cleanup for a callback-completed intent without invoking the destructive
+    /// callback again.  The recovery token and complete target identity must match exactly.
+    pub fn resume_worktree_removal(
+        &self,
+        recovery: &WorktreeRemovalRecovery,
+    ) -> Result<(), DirectoryClaimsError> {
+        let _in_flight = self.begin_removal(&recovery.worktree)?;
+        let _mutation_lease = WorktreeMutationLease::acquire(&recovery.worktree.repository)?;
+        let mut state = self.state()?;
+        let _lock = self.inner.snapshots.acquire_global_lock()?;
+        let Some(intent) = find_removal_intent(&state, recovery) else {
+            if !state.claims.iter().any(|claim| {
+                claim
+                    .directory
+                    .worktree
+                    .as_ref()
+                    .is_some_and(|claimed| claimed.same_identity(&recovery.worktree))
+            }) {
+                return Ok(());
+            }
+            return Err(DirectoryClaimsError::StaleRecovery {
+                worktree: Box::new(recovery.worktree.clone()),
+            });
+        };
+        if intent.phase == WorktreeRemovalPhase::CallbackInProgress {
+            match rehydrate_removal_target(&recovery.worktree) {
+                None if !recovery.worktree.path.exists() => {
+                    if let Err(error) = self.mark_callback_completed_locked(&mut state, recovery) {
+                        return Err(partial_cleanup(recovery, state.revision, error.to_string()));
+                    }
+                }
+                None => {
+                    return Err(DirectoryClaimsError::StaleRecovery {
+                        worktree: Box::new(recovery.worktree.clone()),
+                    });
+                }
+                Some(actual) if recovery.worktree.same_removal_target(&actual) => {
+                    return Err(DirectoryClaimsError::RecoveryRequiresCallback {
+                        worktree: Box::new(recovery.worktree.clone()),
+                    });
+                }
+                Some(_) => {
+                    return Err(DirectoryClaimsError::StaleRecovery {
+                        worktree: Box::new(recovery.worktree.clone()),
+                    });
+                }
+            }
+        }
+        match self.finalize_worktree_removal_locked(&mut state, recovery) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(partial_cleanup(recovery, state.revision, error.to_string())),
+        }
+    }
+
+    /// Explicitly retry an authorized callback-in-progress intent when authoritative observation
+    /// proves the exact original target is still present.  This is never selected implicitly by
+    /// recovery, and the token prevents an unrelated caller from taking over.
+    pub fn retry_worktree_removal(
+        &self,
+        recovery: &WorktreeRemovalRecovery,
+        remove: impl FnOnce(&WorktreeRef) -> Result<(), String>,
+    ) -> Result<WorktreeRemovalAssessment, DirectoryClaimsError> {
+        let _in_flight = self.begin_removal(&recovery.worktree)?;
+        let _mutation_lease = WorktreeMutationLease::acquire(&recovery.worktree.repository)?;
+        let assessment = {
+            let state = self.state()?;
+            let _lock = self.inner.snapshots.acquire_global_lock()?;
+            let Some(intent) = find_removal_intent(&state, recovery) else {
+                return Err(DirectoryClaimsError::StaleRecovery {
+                    worktree: Box::new(recovery.worktree.clone()),
+                });
+            };
+            if intent.phase != WorktreeRemovalPhase::CallbackInProgress {
+                return Err(DirectoryClaimsError::StaleRecovery {
+                    worktree: Box::new(recovery.worktree.clone()),
+                });
+            }
+            let Some(actual) = rehydrate_removal_target(&recovery.worktree) else {
+                return Err(DirectoryClaimsError::StaleRecovery {
+                    worktree: Box::new(recovery.worktree.clone()),
+                });
+            };
+            if !recovery.worktree.same_removal_target(&actual) {
+                return Err(DirectoryClaimsError::StaleRecovery {
+                    worktree: Box::new(recovery.worktree.clone()),
+                });
+            }
+            self.assess_worktree_removal_locked(&recovery.worktree, None)?
+        };
+        let removal = remove(&recovery.worktree);
+        let mut state = self.state()?;
+        let _lock = self.inner.snapshots.acquire_global_lock()?;
+        match removal {
+            Ok(()) => {
+                match self.mark_callback_completed_locked(&mut state, recovery) {
+                    Ok(()) => {}
+                    Err(first_error @ DirectoryClaimsError::PublicationCommitted { .. }) => {
+                        return Err(partial_cleanup(
+                            recovery,
+                            state.revision,
+                            first_error.to_string(),
+                        ));
+                    }
+                    Err(first_error) => {
+                        if let Err(error) =
+                            self.mark_callback_completed_locked(&mut state, recovery)
+                        {
+                            return Err(partial_cleanup(
+                                recovery,
+                                state.revision,
+                                format!(
+                                    "callback completion publication failed: {first_error}; retry \
+                                     failed: {error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                match self.finalize_worktree_removal_locked(&mut state, recovery) {
+                    Ok(()) => Ok(assessment),
+                    Err(error) => Err(partial_cleanup(recovery, state.revision, error.to_string())),
+                }
+            }
+            Err(message) => match self.clear_removal_intent_locked(&mut state, recovery) {
+                Ok(()) => Err(DirectoryClaimsError::RemovalFailed { message }),
+                Err(error) => Err(DirectoryClaimsError::PublicationCommitted {
+                    revision: state.revision,
+                    message: format!(
+                        "worktree removal callback retry failed: {message}; intent \
+                         reconciliation is indeterminate: {error}"
+                    ),
+                }),
+            },
+        }
+    }
+
+    fn mark_callback_completed_locked(
+        &self,
+        state: &mut ClaimState,
+        recovery: &WorktreeRemovalRecovery,
+    ) -> Result<(), DirectoryClaimsError> {
+        let Some(intent) = find_removal_intent(state, recovery) else {
+            return Err(DirectoryClaimsError::StaleRecovery {
+                worktree: Box::new(recovery.worktree.clone()),
+            });
+        };
+        if intent.phase == WorktreeRemovalPhase::CallbackCompleted {
+            return Ok(());
+        }
+        let mut next = state.clone();
+        let matches = |intent: &WorktreeRemovalIntent| {
+            intent.token == recovery.token
+                && intent.worktree.same_removal_target(&recovery.worktree)
+        };
+        let Some(intent) = next
+            .removal_intents
+            .iter_mut()
+            .find(|intent| matches(intent))
+        else {
+            return Err(DirectoryClaimsError::StaleRecovery {
+                worktree: Box::new(recovery.worktree.clone()),
+            });
+        };
+        intent.phase = WorktreeRemovalPhase::CallbackCompleted;
+        next.next_revision()?;
+        if let Some(intent) = next
+            .removal_intents
+            .iter_mut()
+            .find(|intent| matches(intent))
+        {
+            intent.since_revision = next.revision;
+        }
+        self.persist_state(state, next)
+    }
+
+    fn clear_removal_intent_locked(
+        &self,
+        state: &mut ClaimState,
+        recovery: &WorktreeRemovalRecovery,
+    ) -> Result<(), DirectoryClaimsError> {
+        if find_removal_intent(state, recovery).is_none() {
+            return Ok(());
+        }
+        let mut next = state.clone();
+        next.removal_intents.retain(|intent| {
+            !(intent.token == recovery.token
+                && intent.worktree.same_removal_target(&recovery.worktree))
+        });
+        next.next_revision()?;
+        self.persist_state(state, next)
+    }
+
+    fn finalize_worktree_removal_locked(
+        &self,
+        state: &mut ClaimState,
+        recovery: &WorktreeRemovalRecovery,
+    ) -> Result<(), DirectoryClaimsError> {
+        let Some(intent) = find_removal_intent(state, recovery) else {
+            return Ok(());
+        };
+        if intent.phase != WorktreeRemovalPhase::CallbackCompleted {
+            return Err(DirectoryClaimsError::RecoveryRequiresCallback {
+                worktree: Box::new(recovery.worktree.clone()),
+            });
+        }
+
+        let mut next = state.clone();
+        let claims = intent.claims;
+        next.removal_intents.retain(|candidate| {
+            !(candidate.token == recovery.token
+                && candidate.worktree.same_removal_target(&recovery.worktree))
+        });
+        next.claims.retain(|claim| !claims.contains(claim));
+        next.next_revision()?;
+        self.persist_state(state, next)
     }
 
     fn publish_current(&self) -> Result<(), DirectoryClaimsError> {
@@ -993,6 +1599,37 @@ impl DirectoryClaims {
         self.inner.snapshots.write_snapshot_locked(&state)
     }
 
+    fn persist_state(
+        &self,
+        state: &mut ClaimState,
+        next: ClaimState,
+    ) -> Result<(), DirectoryClaimsError> {
+        match self.inner.snapshots.write_snapshot_locked(&next) {
+            Ok(()) => {
+                *state = next;
+                Ok(())
+            }
+            Err(error @ DirectoryClaimsError::PublicationCommitted { .. }) => {
+                // The publication target is visible but its directory durability is uncertain;
+                // reconcile memory to that revision and make the outcome non-retryable.
+                *state = next;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn has_live_removal_intent_locked(
+        &self,
+        directory: &DirectoryRef,
+    ) -> Result<Option<WorktreeRef>, DirectoryClaimsError> {
+        let (snapshots, _) = self.inner.snapshots.read_live_snapshots_locked()?;
+        Ok(snapshots
+            .into_iter()
+            .flat_map(|snapshot| snapshot.removal_intents)
+            .find(|intent| removal_intent_matches_directory(intent, directory))
+            .map(|intent| intent.worktree))
+    }
     fn warning_from_active_locked(
         &self,
         claimant: &ClaimantRef,
@@ -1051,8 +1688,91 @@ fn confirmation_matches(
     confirmation: &WorktreeRemovalConfirmation,
     assessment: &WorktreeRemovalAssessment,
 ) -> bool {
-    confirmation.worktree.same_identity(&assessment.worktree)
+    confirmation
+        .worktree
+        .same_removal_target(&assessment.worktree)
         && confirmation.conflicting_claims == assessment.conflicting_claims
+}
+
+#[derive(Deserialize)]
+struct PersistedRemovalWorktreeMetadata {
+    worktree: WorktreeRef,
+}
+
+fn rehydrate_removal_target(expected: &WorktreeRef) -> Option<WorktreeRef> {
+    let directory = DirectoryRef::resolve(&expected.path).ok()?;
+    let mut actual = directory.worktree?;
+    if !actual.same_identity(expected) {
+        return Some(actual);
+    }
+
+    let metadata_path = actual.git_dir.join(WORKTREE_METADATA_FILE);
+    match fs::read(metadata_path) {
+        Ok(bytes) => {
+            let metadata =
+                serde_json::from_slice::<PersistedRemovalWorktreeMetadata>(&bytes).ok()?;
+            if !metadata.worktree.same_identity(&actual) {
+                return None;
+            }
+            actual.created_by = metadata.worktree.created_by;
+            actual.managed_by_bootty = metadata.worktree.managed_by_bootty;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    Some(actual)
+}
+
+fn stale_removal_target(
+    expected: &WorktreeRef,
+    actual: Option<WorktreeRef>,
+) -> DirectoryClaimsError {
+    DirectoryClaimsError::StaleRemovalTarget {
+        expected: Box::new(expected.clone()),
+        actual: actual.map(Box::new),
+    }
+}
+fn find_removal_intent(
+    state: &ClaimState,
+    recovery: &WorktreeRemovalRecovery,
+) -> Option<WorktreeRemovalIntent> {
+    state
+        .removal_intents
+        .iter()
+        .find(|intent| {
+            intent.token == recovery.token
+                && intent.worktree.same_removal_target(&recovery.worktree)
+        })
+        .cloned()
+}
+
+fn partial_cleanup(
+    recovery: &WorktreeRemovalRecovery,
+    revision: u64,
+    message: String,
+) -> DirectoryClaimsError {
+    DirectoryClaimsError::PartialCleanup {
+        recovery: Box::new(recovery.clone()),
+        revision,
+        message,
+    }
+}
+
+fn removal_intent_matches_directory(
+    intent: &WorktreeRemovalIntent,
+    directory: &DirectoryRef,
+) -> bool {
+    worktree_matches_directory(&intent.worktree, directory)
+}
+fn worktree_matches_directory(worktree: &WorktreeRef, directory: &DirectoryRef) -> bool {
+    directory
+        .canonical_path
+        .ancestors()
+        .any(|ancestor| same_path_identity(ancestor, &worktree.path))
+        || directory
+            .worktree
+            .as_ref()
+            .is_some_and(|other| worktree.same_identity(other))
 }
 
 fn has_claimant(claim: &DirectoryClaim, claimant: &ClaimantRef) -> bool {
@@ -1198,6 +1918,7 @@ impl SnapshotStore {
             owner: &self.owner,
             revision: state.revision,
             claims: &state.claims,
+            removal_intents: &state.removal_intents,
         };
         let bytes = serde_json::to_vec(&snapshot).map_err(json_to_io)?;
         let target = self.snapshot_path(state.revision);
@@ -1211,19 +1932,48 @@ impl SnapshotStore {
         match fs::hard_link(&temporary, &target) {
             Ok(()) => {
                 let _ = fs::remove_file(&temporary);
-                // The revision link is the publication point.  Persist it before pruning any
-                // older recoverable snapshot, and never roll back in-memory state after it exists.
-                if sync_snapshot_directory(&self.directory).is_ok() {
+                // The revision link is the publication point.  If its directory fsync fails,
+                // first try to remove the link and durably restore the prior snapshot set.  A
+                // caller may retry only when that rollback is proven.
+                let Err(publication_error) = sync_snapshot_directory(&self.directory) else {
                     self.remove_superseded_own_snapshots_locked(state.revision);
-                    let _ = sync_snapshot_directory(&self.directory);
+                    return Ok(());
+                };
+                let remove_result = fs::remove_file(&target);
+                let rollback_sync = sync_snapshot_directory(&self.directory);
+                if remove_result.is_ok() && rollback_sync.is_ok() {
+                    return Err(publication_error.into());
                 }
-                Ok(())
+
+                let mut message = format!(
+                    "directory fsync after revision publication failed: {publication_error}"
+                );
+                if let Err(error) = remove_result {
+                    message.push_str(&format!("; published target rollback failed: {error}"));
+                }
+                if let Err(error) = rollback_sync {
+                    message.push_str(&format!("; rollback durability is unverified: {error}"));
+                }
+                Err(DirectoryClaimsError::PublicationCommitted {
+                    revision: state.revision,
+                    message,
+                })
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let existing = fs::read(&target);
                 let _ = fs::remove_file(&temporary);
                 match existing {
-                    Ok(existing) if existing == bytes => Ok(()),
+                    Ok(existing) if existing == bytes => {
+                        match sync_snapshot_directory(&self.directory) {
+                            Ok(()) => Ok(()),
+                            Err(error) => Err(DirectoryClaimsError::PublicationCommitted {
+                                revision: state.revision,
+                                message: format!(
+                                    "existing published target durability is unverified: {error}"
+                                ),
+                            }),
+                        }
+                    }
                     Ok(_) => Err(error.into()),
                     Err(error) => Err(error.into()),
                 }
@@ -1307,7 +2057,14 @@ impl SnapshotStore {
             if snapshot
                 .claims
                 .iter()
-                .any(|claim| claim.since_revision > snapshot.revision)
+                .map(|claim| claim.since_revision)
+                .chain(
+                    snapshot
+                        .removal_intents
+                        .iter()
+                        .map(|intent| intent.since_revision),
+                )
+                .any(|since_revision| since_revision > snapshot.revision)
             {
                 return Err(DirectoryClaimsError::UntrustedSnapshot { path });
             }
@@ -1341,6 +2098,59 @@ impl SnapshotStore {
     ) -> Result<(Vec<DirectoryClaimsSnapshot>, usize), DirectoryClaimsError> {
         self.read_snapshots_locked(true)
     }
+}
+
+struct WorktreeMutationLease {
+    _file: File,
+}
+
+impl WorktreeMutationLease {
+    fn acquire(repository: &RepositoryRef) -> Result<Self, DirectoryClaimsError> {
+        let common_git_dir = fs::canonicalize(&repository.common_git_dir)
+            .unwrap_or_else(|_| repository.common_git_dir.clone());
+        let lease_directory = common_git_dir.join(MUTATION_LEASE_DIRECTORY);
+        fs::create_dir_all(&lease_directory)?;
+        set_owner_only_directory(&lease_directory)?;
+        let lease_path = lease_directory.join(format!(
+            "repository-{key:016x}.lock",
+            key = mutation_lease_key(&common_git_dir)
+        ));
+        let file = open_owner_only_lock_file(&lease_path)?;
+        let began = Instant::now();
+        loop {
+            match FileExt::try_lock(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) if began.elapsed() < LOCK_WAIT => {
+                    thread::sleep(LOCK_RETRY);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    return Err(DirectoryClaimsError::LockTimeout { path: lease_path });
+                }
+                Err(TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+fn mutation_lease_key(common_git_dir: &Path) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    #[cfg(unix)]
+    {
+        for byte in common_git_dir.as_os_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        for byte in common_git_dir.to_string_lossy().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    hash
 }
 
 struct GlobalLock {
@@ -1390,24 +2200,6 @@ fn open_owner_only_lock_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn normalize_absolute_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if normalized.file_name().is_some() {
-                    normalized.pop();
-                }
-            }
-            std::path::Component::Normal(component) => normalized.push(component),
-        }
-    }
-    normalized
-}
-
 fn detect_worktree(canonical_path: &Path) -> Option<WorktreeRef> {
     for worktree_path in canonical_path.ancestors() {
         let marker = worktree_path.join(".git");
@@ -1441,18 +2233,22 @@ fn git_directory_from_marker(marker: &Path, worktree_path: &Path) -> Option<Path
         return None;
     }
 
-    let contents = fs::read_to_string(marker).ok()?;
-    let target = contents
-        .lines()
-        .next()?
-        .trim()
-        .strip_prefix("gitdir:")?
-        .trim();
-    let target = Path::new(target);
+    let contents = fs::read(marker).ok()?;
+    let line = contents.split(|byte| *byte == b'\n').next()?;
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let target = line.strip_prefix(b"gitdir:")?;
+    let target = target.strip_prefix(b" ").unwrap_or(target);
+    if target.is_empty() {
+        return None;
+    }
+    #[cfg(unix)]
+    let target = PathBuf::from(std::ffi::OsString::from_vec(target.to_vec()));
+    #[cfg(not(unix))]
+    let target = PathBuf::from(String::from_utf8(target.to_vec()).ok()?);
     let target = if target.is_absolute() {
-        target.to_path_buf()
+        target
     } else {
-        worktree_path.join(target)
+        marker.parent().unwrap_or(worktree_path).join(target)
     };
     let target = fs::canonicalize(target).ok()?;
     target.is_dir().then_some(target)
@@ -1567,8 +2363,44 @@ fn write_owner_only_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     set_owner_only_file(path)
 }
 
+#[cfg(all(test, unix))]
+fn fail_next_snapshot_directory_sync(path: &Path) {
+    fail_snapshot_directory_sync_after(path, 0);
+}
+
+#[cfg(all(test, unix))]
+fn fail_snapshot_directory_sync_after(path: &Path, successful_syncs: usize) {
+    *FAILING_SYNC_DIRECTORY
+        .lock()
+        .expect("sync failure hook lock") = Some((path.to_path_buf(), successful_syncs));
+}
+
+#[cfg(all(test, unix))]
+fn consume_snapshot_directory_sync_failure(path: &Path) -> bool {
+    let mut failing = FAILING_SYNC_DIRECTORY
+        .lock()
+        .expect("sync failure hook lock");
+    let Some((failing_path, remaining)) = failing.as_mut() else {
+        return false;
+    };
+    if failing_path != path {
+        return false;
+    }
+    if *remaining == 0 {
+        *failing = None;
+        true
+    } else {
+        *remaining -= 1;
+        false
+    }
+}
+
 #[cfg(unix)]
 fn sync_snapshot_directory(path: &Path) -> io::Result<()> {
+    #[cfg(all(test, unix))]
+    if consume_snapshot_directory_sync_failure(path) {
+        return Err(io::Error::other("injected directory sync failure"));
+    }
     File::open(path)?.sync_all()
 }
 
@@ -1612,7 +2444,11 @@ fn set_owner_only_file(_path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, sync::Arc};
+    use std::{
+        cell::Cell,
+        sync::{Arc, mpsc::channel},
+        thread,
+    };
 
     use tempfile::tempdir;
 
@@ -1705,6 +2541,30 @@ mod tests {
             created_by: None,
             managed_by_bootty: false,
         };
+        fs::create_dir_all(repository.common_git_dir.join("refs/heads")).unwrap();
+        fs::write(
+            repository.common_git_dir.join("HEAD"),
+            format!("ref: refs/heads/{name}\n"),
+        )
+        .unwrap();
+        fs::write(
+            repository.common_git_dir.join("refs/heads").join(name),
+            "deadbeef\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&worktree.git_dir).unwrap();
+        fs::write(worktree.git_dir.join("commondir"), "../..\n").unwrap();
+        fs::write(
+            worktree.git_dir.join("HEAD"),
+            format!("ref: refs/heads/{name}\n"),
+        )
+        .unwrap();
+        fs::create_dir_all(&worktree.path).unwrap();
+        fs::write(
+            worktree.path.join(".git"),
+            format!("gitdir: {}\n", worktree.git_dir.display()),
+        )
+        .unwrap();
         let directory = DirectoryRef {
             canonical_path: worktree.path.join("src"),
             repository: Some(repository),
@@ -1757,6 +2617,47 @@ mod tests {
         assert_eq!(worktree.head.as_deref(), Some("topic-head"));
         assert!(worktree.is_linked());
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn path_resolution_preserves_non_utf8_gitdir_marker_for_claims() {
+        let temporary = tempdir().unwrap();
+        let root = canonicalize_local_path(temporary.path()).unwrap();
+        let repository = root.join("repository");
+        let common_git_dir = repository.join(".git");
+        fs::create_dir_all(common_git_dir.join("refs/heads")).unwrap();
+        fs::write(common_git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(common_git_dir.join("refs/heads/main"), "main-head\n").unwrap();
+
+        let linked = root.join("linked");
+        let invalid_name = std::ffi::OsString::from_vec(b"linked-\xFF".to_vec());
+        let linked_git_dir = common_git_dir.join("worktrees").join(invalid_name);
+        fs::create_dir_all(&linked_git_dir).unwrap();
+        fs::write(linked_git_dir.join("commondir"), "../..\n").unwrap();
+        fs::write(linked_git_dir.join("HEAD"), "ref: refs/heads/topic\n").unwrap();
+        fs::write(common_git_dir.join("refs/heads/topic"), "topic-head\n").unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        let mut marker_contents = b"gitdir: ".to_vec();
+        marker_contents.extend_from_slice(linked_git_dir.as_os_str().as_bytes());
+        marker_contents.extend_from_slice(b"\r\n");
+        fs::write(linked.join(".git"), marker_contents).unwrap();
+
+        let resolved = DirectoryRef::resolve(linked.join("src/missing")).unwrap();
+        let worktree = resolved.worktree.as_ref().unwrap();
+        assert_eq!(worktree.git_dir, linked_git_dir);
+        assert_eq!(worktree.repository.common_git_dir, common_git_dir);
+
+        let claims = claims(temporary.path(), owner("one", 100));
+        claims
+            .record_launch(claimant("one", "session", "terminal"), resolved)
+            .unwrap();
+        let snapshot = claims.snapshot().unwrap();
+        let claimed_worktree = snapshot
+            .claims
+            .first()
+            .and_then(|claim| claim.directory.worktree.as_ref())
+            .unwrap();
+        assert_eq!(claimed_worktree.git_dir, linked_git_dir);
+    }
 
     #[test]
     fn launch_claims_are_many_to_many_and_immutable() {
@@ -1785,6 +2686,40 @@ mod tests {
             claims.record_launch(first, directory(temporary.path().join("other"))),
             Err(DirectoryClaimsError::ImmutableLaunchIntent { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_failure_rolls_back_an_uncommitted_revision() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let before = claims.snapshot().unwrap();
+
+        fail_next_snapshot_directory_sync(temporary.path());
+        let result = claims.record_launch(
+            claimant("one", "session", "terminal"),
+            directory(temporary.path().join("project")),
+        );
+
+        assert!(matches!(result, Err(DirectoryClaimsError::Io(_))));
+        assert_eq!(claims.snapshot().unwrap(), before);
+        assert!(
+            !claims
+                .inner
+                .snapshots
+                .snapshot_path(before.revision + 1)
+                .exists()
+        );
+        let _lock = claims.inner.snapshots.acquire_global_lock().unwrap();
+        assert_eq!(
+            claims
+                .inner
+                .snapshots
+                .read_own_snapshot_locked()
+                .unwrap()
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -1978,6 +2913,24 @@ mod tests {
             Err(DirectoryClaimsError::StaleConfirmation { .. })
         ));
 
+        let mut changed_target = worktree.clone();
+        changed_target.head = Some("replacement-head".to_owned());
+        let changed_confirmation = WorktreeRemovalConfirmation {
+            worktree: changed_target,
+            conflicting_claims: assessment.conflicting_claims.clone(),
+        };
+        assert!(matches!(
+            first.remove_worktree(
+                &worktree,
+                &WorktreeRemovalRequest {
+                    requester_session: request.requester_session.clone(),
+                    confirmation: Some(changed_confirmation),
+                },
+                |_| Ok(()),
+            ),
+            Err(DirectoryClaimsError::StaleConfirmation { .. })
+        ));
+
         let confirmed_request = WorktreeRemovalRequest {
             requester_session: request.requester_session,
             confirmation: Some(confirmation),
@@ -1992,6 +2945,382 @@ mod tests {
         assert!(allowed.get());
     }
 
+    #[test]
+    fn worktree_removal_rejects_a_replaced_registration_before_callback() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let (_, worktree) = linked_directory(temporary.path(), "linked");
+        let (_, replacement) = linked_directory(temporary.path(), "replacement");
+        fs::write(
+            worktree.path.join(".git"),
+            format!("gitdir: {}\n", replacement.git_dir.display()),
+        )
+        .unwrap();
+
+        let invoked = Cell::new(false);
+        let result = claims.remove_worktree(&worktree, &WorktreeRemovalRequest::default(), |_| {
+            invoked.set(true);
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(DirectoryClaimsError::StaleRemovalTarget { .. })
+        ));
+        assert!(!invoked.get());
+        assert!(claims.snapshot().unwrap().removal_intents.is_empty());
+    }
+
+    #[test]
+    fn worktree_removal_rejects_untrusted_management_metadata() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let (_, worktree) = linked_directory(temporary.path(), "linked");
+        fs::write(worktree.git_dir.join(WORKTREE_METADATA_FILE), b"not-json").unwrap();
+
+        let invoked = Cell::new(false);
+        let result = claims.remove_worktree(&worktree, &WorktreeRemovalRequest::default(), |_| {
+            invoked.set(true);
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(DirectoryClaimsError::StaleRemovalTarget { .. })
+        ));
+        assert!(!invoked.get());
+        assert!(claims.snapshot().unwrap().removal_intents.is_empty());
+    }
+
+    #[test]
+    fn successful_worktree_removal_releases_the_owners_deleted_worktree_claims() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let (directory, worktree) = linked_directory(temporary.path(), "linked");
+        let claimant = claimant("one", "session", "terminal");
+        claims.record_launch(claimant.clone(), directory).unwrap();
+
+        claims
+            .remove_worktree(
+                &worktree,
+                &WorktreeRemovalRequest {
+                    requester_session: Some(claimant.session),
+                    confirmation: None,
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert!(claims.snapshot().unwrap().claims.is_empty());
+    }
+
+    #[test]
+    fn failed_worktree_removal_clears_intent_and_restores_claims() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let (directory, worktree) = linked_directory(temporary.path(), "linked");
+        let claimant = claimant("one", "session", "terminal");
+        claims.record_launch(claimant.clone(), directory).unwrap();
+        let before = claims.snapshot().unwrap();
+
+        let invoked = Cell::new(false);
+        let result = claims.remove_worktree(
+            &worktree,
+            &WorktreeRemovalRequest {
+                requester_session: Some(claimant.session),
+                confirmation: None,
+            },
+            |_| {
+                invoked.set(true);
+                Err("worktree identity changed".to_owned())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(DirectoryClaimsError::RemovalFailed { .. })
+        ));
+        assert!(invoked.get());
+
+        let after = claims.snapshot().unwrap();
+        assert_eq!(after.revision, before.revision + 2);
+        assert_eq!(after.claims, before.claims);
+        assert!(after.removal_intents.is_empty());
+        let _lock = claims.inner.snapshots.acquire_global_lock().unwrap();
+        assert_eq!(
+            claims
+                .inner
+                .snapshots
+                .read_own_snapshot_locked()
+                .unwrap()
+                .unwrap(),
+            after
+        );
+    }
+
+    #[test]
+    fn slow_worktree_removal_allows_concurrent_observed_cwd_updates() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let (launch_directory, worktree) = linked_directory(temporary.path(), "linked");
+        let claimant = claimant("one", "session", "terminal");
+        claims
+            .record_launch(claimant.clone(), launch_directory)
+            .unwrap();
+
+        let removing = claims.clone();
+        let removal_claimant = claimant.clone();
+        let (started_tx, started_rx) = channel();
+        let (continue_tx, continue_rx) = channel();
+        let removal_thread = thread::spawn(move || {
+            removing.remove_worktree(
+                &worktree,
+                &WorktreeRemovalRequest {
+                    requester_session: Some(removal_claimant.session),
+                    confirmation: None,
+                },
+                |_| {
+                    started_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    Err("simulated callback failure".to_owned())
+                },
+            )
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let observing = claims.clone();
+        let observed_claimant = claimant.clone();
+        let observed_directory = directory(temporary.path().join("observed"));
+        let (observed_tx, observed_rx) = channel();
+        let observe_thread = thread::spawn(move || {
+            observed_tx
+                .send(observing.observe_cwd(observed_claimant, observed_directory))
+                .unwrap();
+        });
+        let observed_result = observed_rx.recv_timeout(std::time::Duration::from_secs(1));
+        continue_tx.send(()).unwrap();
+        let removal_result = removal_thread.join().unwrap();
+        observe_thread.join().unwrap();
+        let observed_update = observed_result.expect("observe_cwd should not wait for Git removal");
+
+        assert!(observed_update.is_ok());
+        assert!(matches!(
+            removal_result,
+            Err(DirectoryClaimsError::RemovalFailed { .. })
+        ));
+
+        let snapshot = claims.snapshot().unwrap();
+        assert!(snapshot.removal_intents.is_empty());
+        assert!(snapshot.claims.iter().any(|claim| {
+            claim.source == DirectoryClaimSource::Observed
+                && claim.directory == directory(temporary.path().join("observed"))
+        }));
+    }
+    #[test]
+    fn active_worktree_removal_blocks_duplicate_and_new_claims() {
+        let temporary = tempdir().unwrap();
+        let claims = claims(temporary.path(), owner("one", 100));
+        let (directory, worktree) = linked_directory(temporary.path(), "linked");
+        let removing = claims.clone();
+        let removing_worktree = worktree.clone();
+        let (started_tx, started_rx) = channel();
+        let (continue_tx, continue_rx) = channel();
+        let removal_thread = thread::spawn(move || {
+            removing.remove_worktree(
+                &removing_worktree,
+                &WorktreeRemovalRequest::default(),
+                |_| {
+                    started_tx.send(()).unwrap();
+                    continue_rx.recv().unwrap();
+                    Err("simulated callback failure".to_owned())
+                },
+            )
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let mut duplicate = worktree.clone();
+        duplicate.branch = Some("different-branch".to_owned());
+        let duplicate_claims = DirectoryClaims::at_with_liveness(
+            temporary.path(),
+            owner("one", 100),
+            Arc::new(NeverDead),
+        )
+        .unwrap();
+        let duplicate_called = Cell::new(false);
+        let duplicate_result = duplicate_claims.remove_worktree(
+            &duplicate,
+            &WorktreeRemovalRequest::default(),
+            |_| {
+                duplicate_called.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            duplicate_result,
+            Err(DirectoryClaimsError::RemovalInProgress { .. })
+        ));
+        assert!(!duplicate_called.get());
+
+        let other_claims = DirectoryClaims::at_with_liveness(
+            temporary.path(),
+            owner("two", 200),
+            Arc::new(NeverDead),
+        )
+        .unwrap();
+        let observed =
+            other_claims.observe_cwd(claimant("two", "observe", "terminal"), directory.clone());
+        assert!(matches!(
+            observed,
+            Err(DirectoryClaimsError::RemovalInProgress { .. })
+        ));
+        let metadata_less_directory = DirectoryRef {
+            canonical_path: worktree.path.join("src"),
+            repository: None,
+            worktree: None,
+        };
+        let observed_without_git = other_claims.observe_cwd(
+            claimant("two", "observe-without-git", "terminal"),
+            metadata_less_directory,
+        );
+        assert!(matches!(
+            observed_without_git,
+            Err(DirectoryClaimsError::RemovalInProgress { .. })
+        ));
+        let launched = other_claims.record_launch(claimant("two", "launch", "terminal"), directory);
+        assert!(matches!(
+            launched,
+            Err(DirectoryClaimsError::RemovalInProgress { .. })
+        ));
+
+        continue_tx.send(()).unwrap();
+        assert!(matches!(
+            removal_thread.join().unwrap(),
+            Err(DirectoryClaimsError::RemovalFailed { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn callback_in_progress_recovery_requires_explicit_callback() {
+        let temporary = tempdir().unwrap();
+        let (directory, worktree) = linked_directory(temporary.path(), "linked");
+        let owner = owner("one", 100);
+        let claims = claims(temporary.path(), owner.clone());
+        let launch_claim = claims
+            .record_launch(claimant("one", "session", "terminal"), directory)
+            .unwrap()
+            .claim;
+        let recovery = WorktreeRemovalRecovery {
+            worktree: worktree.clone(),
+            token: "recovery-token".to_owned(),
+        };
+        {
+            let mut state = claims.state().unwrap();
+            let _lock = claims.inner.snapshots.acquire_global_lock().unwrap();
+            let mut next = state.clone();
+            next.next_revision().unwrap();
+            next.removal_intents.push(WorktreeRemovalIntent {
+                worktree: worktree.clone(),
+                since_revision: next.revision,
+                token: recovery.token.clone(),
+                phase: WorktreeRemovalPhase::CallbackInProgress,
+                claims: vec![launch_claim],
+            });
+            claims.persist_state(&mut state, next).unwrap();
+        }
+        drop(claims);
+        let claims =
+            DirectoryClaims::at_with_liveness(temporary.path(), owner, Arc::new(NeverDead))
+                .unwrap();
+
+        assert!(matches!(
+            claims.resume_worktree_removal(&recovery),
+            Err(DirectoryClaimsError::RecoveryRequiresCallback { .. })
+        ));
+
+        let (_, replacement) = linked_directory(temporary.path(), "replacement");
+        fs::write(
+            worktree.path.join(".git"),
+            format!("gitdir: {}\n", replacement.git_dir.display()),
+        )
+        .unwrap();
+        let callback_count = Cell::new(0);
+        assert!(matches!(
+            claims.retry_worktree_removal(&recovery, |_| {
+                callback_count.set(callback_count.get() + 1);
+                Ok(())
+            }),
+            Err(DirectoryClaimsError::StaleRecovery { .. })
+        ));
+        assert_eq!(callback_count.get(), 0);
+
+        fs::write(
+            worktree.path.join(".git"),
+            format!("gitdir: {}\n", worktree.git_dir.display()),
+        )
+        .unwrap();
+        claims
+            .retry_worktree_removal(&recovery, |_| {
+                callback_count.set(callback_count.get() + 1);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(callback_count.get(), 1);
+        assert!(claims.snapshot().unwrap().removal_intents.is_empty());
+        assert!(claims.snapshot().unwrap().claims.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_removal_with_unpersisted_cleanup_keeps_intent_recoverable() {
+        let temporary = tempdir().unwrap();
+        let owner = owner("one", 100);
+        let claims = claims(temporary.path(), owner.clone());
+        let (directory, worktree) = linked_directory(temporary.path(), "linked");
+        let claimant = claimant("one", "session", "terminal");
+        claims.record_launch(claimant.clone(), directory).unwrap();
+
+        let claims_directory = temporary.path().to_path_buf();
+        let callback_count = Cell::new(0);
+        let result = claims.remove_worktree(
+            &worktree,
+            &WorktreeRemovalRequest {
+                requester_session: Some(claimant.session),
+                confirmation: None,
+            },
+            |_| {
+                callback_count.set(callback_count.get() + 1);
+                fail_snapshot_directory_sync_after(&claims_directory, 1);
+                Ok(())
+            },
+        );
+        let recovery = match result {
+            Err(DirectoryClaimsError::PartialCleanup { recovery, .. }) => *recovery,
+            other => panic!("expected recoverable cleanup, got {other:?}"),
+        };
+        assert_eq!(callback_count.get(), 1);
+        assert_eq!(claims.snapshot().unwrap().removal_intents.len(), 1);
+        assert_eq!(
+            claims.snapshot().unwrap().removal_intents[0].phase,
+            WorktreeRemovalPhase::CallbackCompleted
+        );
+
+        drop(claims);
+        let reopened =
+            DirectoryClaims::at_with_liveness(temporary.path(), owner, Arc::new(NeverDead))
+                .unwrap();
+        assert_eq!(
+            reopened.pending_worktree_removals().unwrap(),
+            vec![recovery.clone()]
+        );
+        reopened.resume_worktree_removal(&recovery).unwrap();
+        assert!(reopened.snapshot().unwrap().removal_intents.is_empty());
+        assert!(reopened.snapshot().unwrap().claims.is_empty());
+    }
     #[test]
     fn close_releases_all_claims_for_only_the_removed_occupant() {
         let temporary = tempdir().unwrap();

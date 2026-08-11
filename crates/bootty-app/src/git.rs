@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,30 +48,46 @@ pub struct WorktreeStatus {
 /// Inspect the git state of `cwd`. Any git failure yields a safe, empty status
 /// (`in_repo == false`), so callers only ever offer "kill session".
 pub fn status(cwd: &str) -> WorktreeStatus {
+    status_path(Path::new(cwd)).unwrap_or_default()
+}
+
+/// Inspect a worktree through its exact filesystem path.
+///
+/// The string-facing [`status`] API is intentionally best-effort for UI refreshes,
+/// but removal validation must distinguish a failed lookup from a clean tree.
+fn status_path(cwd: &Path) -> Result<WorktreeStatus, String> {
     let mut status = WorktreeStatus::default();
-    if read(cwd, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
-        return status;
+    let inside = read_path(cwd, &["rev-parse", "--is-inside-work-tree"])?;
+    if trim_git_line(&inside) != b"true" {
+        return Ok(status);
     }
     status.in_repo = true;
-    // A linked worktree's own git dir differs from the shared common dir.
-    if let (Some(git_dir), Some(common)) = (
-        read(cwd, &["rev-parse", "--absolute-git-dir"]),
-        read(
-            cwd,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        ),
-    ) {
-        status.is_linked_worktree = git_dir != common;
-    }
-    status.branch = read(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    status.dirty = read(cwd, &["status", "--porcelain"]).is_some_and(|out| !out.is_empty());
-    if let Some(count) =
-        read(cwd, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|out| out.parse().ok())
+
+    let git_dir = read_path(cwd, &["rev-parse", "--absolute-git-dir"])?;
+    let common = read_path(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    status.is_linked_worktree = trim_git_line(&git_dir) != trim_git_line(&common);
+
+    status.branch = read_path(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .map(|out| String::from_utf8_lossy(trim_git_line(&out)).into_owned())
+        .filter(|branch| !branch.is_empty());
+    let porcelain = read_path(cwd, &["status", "--porcelain"])?;
+    status.dirty = !porcelain.is_empty();
+    if let Some(count) = read_path(cwd, &["rev-list", "--count", "@{u}..HEAD"])
+        .ok()
+        .and_then(|out| String::from_utf8_lossy(trim_git_line(&out)).parse().ok())
     {
         status.has_upstream = true;
         status.unpushed = count;
     }
-    status
+    Ok(status)
+}
+
+fn trim_git_line(output: &[u8]) -> &[u8] {
+    output.strip_suffix(b"\n").unwrap_or(output)
 }
 
 /// Detach HEAD in `worktree_path`, freeing its branch while keeping the
@@ -247,12 +264,22 @@ fn persist_worktree_metadata(worktree: &WorktreeRef) -> Result<(), WorktreeServi
         ".{WORKTREE_METADATA_FILE}.{}.tmp",
         std::process::id()
     ));
-    fs::write(&temporary, bytes).map_err(|error| WorktreeServiceError::Git {
+    let mut file = fs::File::create(&temporary).map_err(|error| WorktreeServiceError::Git {
         message: format!("could not persist worktree metadata at {path:?}: {error}"),
     })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| WorktreeServiceError::Git {
+            message: format!("could not persist worktree metadata at {path:?}: {error}"),
+        })?;
     fs::rename(&temporary, &path).map_err(|error| WorktreeServiceError::Git {
         message: format!("could not publish worktree metadata at {path:?}: {error}"),
-    })
+    })?;
+    fs::File::open(&worktree.git_dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| WorktreeServiceError::Git {
+            message: format!("could not make worktree metadata durable at {path:?}: {error}"),
+        })
 }
 
 fn hydrate_worktree_metadata(
@@ -282,6 +309,13 @@ fn hydrate_worktree_metadata(
     worktree.created_by = persisted.worktree.created_by;
     worktree.managed_by_bootty = persisted.worktree.managed_by_bootty;
     Ok(worktree)
+}
+
+#[derive(Clone, Debug)]
+struct CreatedBranch {
+    repository: RepositoryRef,
+    reference: String,
+    oid: String,
 }
 
 /// The sole production interface for directory and Git-worktree lifecycle
@@ -364,7 +398,7 @@ impl WorktreeService {
 
     /// Return one exact worktree identity and its independently observed state.
     pub fn get(&self, path: impl AsRef<Path>) -> Result<WorktreeDetails, WorktreeServiceError> {
-        let worktree = hydrate_worktree_metadata(self.resolve_worktree(path)?)?;
+        let worktree = self.resolve_worktree(path)?;
         self.details_for(worktree)
     }
 
@@ -399,8 +433,18 @@ impl WorktreeService {
     fn create_after_add(
         &self,
         request: WorktreeCreateRequest,
-        add: impl FnOnce(&str, &str) -> Result<String, String>,
-        resolve_created: impl FnOnce(&str) -> Result<DirectoryRef, WorktreeServiceError>,
+        add: impl FnOnce(&Path, &str) -> Result<PathBuf, String>,
+        resolve_created: impl FnOnce(&Path) -> Result<DirectoryRef, WorktreeServiceError>,
+        persist_metadata: impl FnOnce(&WorktreeRef) -> Result<(), WorktreeServiceError>,
+    ) -> Result<WorktreeDetails, WorktreeServiceError> {
+        self.create_after_add_unlocked(request, add, resolve_created, persist_metadata)
+    }
+
+    fn create_after_add_unlocked(
+        &self,
+        request: WorktreeCreateRequest,
+        add: impl FnOnce(&Path, &str) -> Result<PathBuf, String>,
+        resolve_created: impl FnOnce(&Path) -> Result<DirectoryRef, WorktreeServiceError>,
         persist_metadata: impl FnOnce(&WorktreeRef) -> Result<(), WorktreeServiceError>,
     ) -> Result<WorktreeDetails, WorktreeServiceError> {
         let repository_directory = self.resolve(&request.repository_path)?;
@@ -410,37 +454,59 @@ impl WorktreeService {
                 .ok_or_else(|| WorktreeServiceError::NotRepository {
                     path: repository_directory.canonical_path.clone(),
                 })?;
-        let repository_path = repository_directory
-            .canonical_path
-            .to_string_lossy()
-            .into_owned();
-        let created_path = add(&repository_path, &request.branch)
-            .map_err(|message| WorktreeServiceError::Git { message })?;
+        let repository_path = repository_directory.canonical_path.clone();
+        let attempt = self.claims.with_worktree_mutation_lease(&repository, || {
+            let created_path = add(&repository_path, &request.branch)
+                .map_err(|message| WorktreeServiceError::Git { message })?;
 
-        let mut created_worktree = None;
-        let created = (|| {
-            let created_directory = resolve_created(&created_path)?;
-            let mut worktree =
-                created_directory
-                    .worktree
-                    .ok_or_else(|| WorktreeServiceError::NotWorktree {
-                        path: PathBuf::from(&created_path),
-                    })?;
-            if !worktree.repository.same_identity(&repository) {
-                return Err(WorktreeServiceError::IdentityChanged {
-                    path: worktree.path,
+            let mut created_worktree = None;
+            let mut created_branch = None;
+            let created = (|| {
+                let created_directory = resolve_created(&created_path)?;
+                let mut worktree = created_directory.worktree.ok_or_else(|| {
+                    WorktreeServiceError::NotWorktree {
+                        path: created_path.clone(),
+                    }
+                })?;
+                if !worktree.repository.same_identity(&repository) {
+                    return Err(WorktreeServiceError::IdentityChanged {
+                        path: worktree.path,
+                    });
+                }
+                let Some(branch) = worktree.branch.clone() else {
+                    return Err(WorktreeServiceError::IdentityChanged {
+                        path: worktree.path,
+                    });
+                };
+                let Some(oid) = worktree.head.clone() else {
+                    return Err(WorktreeServiceError::IdentityChanged {
+                        path: worktree.path,
+                    });
+                };
+                if branch != request.branch || oid.is_empty() {
+                    return Err(WorktreeServiceError::IdentityChanged {
+                        path: worktree.path,
+                    });
+                }
+                created_branch = Some(CreatedBranch {
+                    repository: worktree.repository.clone(),
+                    reference: format!("refs/heads/{branch}"),
+                    oid,
                 });
-            }
-            worktree.created_by = Some(WorktreeCreator {
-                instance: self.instance.clone(),
-                caller: request.caller,
-            });
-            worktree.managed_by_bootty = request.managed_by_bootty;
-            created_worktree = Some(worktree.clone());
-            persist_metadata(&worktree)?;
-            self.details_for(worktree)
-        })();
+                worktree.created_by = Some(WorktreeCreator {
+                    instance: self.instance.clone(),
+                    caller: request.caller.clone(),
+                });
+                worktree.managed_by_bootty = request.managed_by_bootty;
+                created_worktree = Some(worktree.clone());
+                persist_metadata(&worktree)?;
+                self.details_for(worktree)
+            })();
 
+            Ok::<_, WorktreeServiceError>((created_path, created, created_worktree, created_branch))
+        })?;
+
+        let (created_path, created, created_worktree, created_branch) = attempt;
         match created {
             Ok(details) => Ok(details),
             Err(error) => {
@@ -451,36 +517,75 @@ impl WorktreeService {
                         ),
                     });
                 };
-                match self.rollback_created_worktree(worktree) {
-                    Ok(()) => Err(error),
-                    Err(rollback_error) => Err(WorktreeServiceError::Git {
+                let Some(created_branch) = created_branch.as_ref() else {
+                    return Err(WorktreeServiceError::Git {
+                        message: format!(
+                            "{error}; could not safely roll back newly added worktree at {created_path:?}: could not establish the created branch identity"
+                        ),
+                    });
+                };
+                if let Err(rollback_error) =
+                    self.rollback_created_worktree(worktree, created_branch)
+                {
+                    return Err(WorktreeServiceError::Git {
                         message: format!(
                             "{error}; could not safely roll back newly added worktree at {created_path:?}: {rollback_error}"
                         ),
-                    }),
+                    });
                 }
+                let current_repository = self
+                    .resolve(&request.repository_path)
+                    .ok()
+                    .and_then(|directory| directory.repository);
+                if current_repository
+                    .as_ref()
+                    .is_none_or(|current| !current.same_identity(&created_branch.repository))
+                {
+                    return Err(WorktreeServiceError::Git {
+                        message: format!(
+                            "{error}; removed the newly added worktree at {created_path:?}, but \
+                             could not prove the creating repository still owns branch {:?}",
+                            created_branch.reference
+                        ),
+                    });
+                }
+                delete_created_branch(&repository_path, created_branch).map_err(
+                    |rollback_error| WorktreeServiceError::Git {
+                        message: format!(
+                            "{error}; removed the newly added worktree at {created_path:?}, but \
+                             could not roll back its new branch {:?}: {rollback_error}",
+                            request.branch
+                        ),
+                    },
+                )?;
+                Err(error)
             }
         }
     }
 
-    /// Roll back a known creation only while claims are globally locked and
-    /// the checkout still resolves to that exact worktree identity.
+    /// Roll back a known creation through the claims store's final identity
+    /// recheck, and remove the checkout only while it still names the exact
+    /// worktree that was added.
     fn rollback_created_worktree(
         &self,
         expected: &WorktreeRef,
+        created_branch: &CreatedBranch,
     ) -> Result<(), WorktreeServiceError> {
         let mut final_validation_error = None;
+        let observed = self.resolve_worktree(&expected.path)?;
+        let mut claims_expected = expected.clone();
+        claims_expected.created_by = observed.created_by;
+        claims_expected.managed_by_bootty = observed.managed_by_bootty;
         let result = self.claims.remove_worktree(
-            expected,
+            &claims_expected,
             &WorktreeRemovalRequest {
                 requester_session: None,
                 confirmation: None,
             },
             |expected| {
-                let actual = match self
-                    .resolve_worktree(&expected.path)
-                    .and_then(|resolved| validate_removal_target(expected, resolved, true))
-                {
+                let actual = match self.resolve_worktree(&expected.path).and_then(|resolved| {
+                    validate_created_rollback_target(expected, resolved, created_branch)
+                }) {
                     Ok(actual) => actual,
                     Err(error) => {
                         final_validation_error = Some(error);
@@ -493,7 +598,15 @@ impl WorktreeService {
         if let Some(error) = final_validation_error {
             return Err(error);
         }
-        result.map(|_| ()).map_err(Into::into)
+        match result {
+            Ok(_) => Ok(()),
+            Err(DirectoryClaimsError::StaleRemovalTarget { .. }) => {
+                Err(WorktreeServiceError::IdentityChanged {
+                    path: expected.path.clone(),
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Remove one linked worktree after a final globally locked active-claim
@@ -538,7 +651,15 @@ impl WorktreeService {
         if let Some(error) = final_validation_error {
             return Err(error);
         }
-        result.map_err(Into::into)
+        match result {
+            Ok(assessment) => Ok(assessment),
+            Err(DirectoryClaimsError::StaleRemovalTarget { .. }) => {
+                Err(WorktreeServiceError::IdentityChanged {
+                    path: request.worktree.path,
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn resolve_worktree(
@@ -546,14 +667,18 @@ impl WorktreeService {
         path: impl AsRef<Path>,
     ) -> Result<WorktreeRef, WorktreeServiceError> {
         let directory = self.resolve(path)?;
-        directory.worktree.ok_or(WorktreeServiceError::NotWorktree {
-            path: directory.canonical_path,
-        })
+        let worktree = directory
+            .worktree
+            .ok_or(WorktreeServiceError::NotWorktree {
+                path: directory.canonical_path,
+            })?;
+        hydrate_worktree_metadata(worktree)
     }
-
     fn details_for(&self, worktree: WorktreeRef) -> Result<WorktreeDetails, WorktreeServiceError> {
         let claims = self.claims.claims_for_worktree(&worktree)?;
-        let dirty = status(&worktree.path.to_string_lossy()).dirty;
+        let dirty = status_path(&worktree.path)
+            .map_err(|message| WorktreeServiceError::Git { message })?
+            .dirty;
         Ok(WorktreeDetails {
             worktree,
             dirty,
@@ -562,12 +687,35 @@ impl WorktreeService {
     }
 }
 
+fn validate_created_rollback_target(
+    expected: &WorktreeRef,
+    actual: WorktreeRef,
+    created_branch: &CreatedBranch,
+) -> Result<WorktreeRef, WorktreeServiceError> {
+    let expected_branch = created_branch.reference.strip_prefix("refs/heads/");
+    let actual_branch_oid = branch_oid(&created_branch.repository, &created_branch.reference)
+        .map_err(|message| WorktreeServiceError::Git { message })?;
+    if !actual.same_identity(expected)
+        || !actual.repository.same_identity(&created_branch.repository)
+        || actual.branch.as_deref() != expected_branch
+        || actual.head.as_deref() != Some(created_branch.oid.as_str())
+        || actual_branch_oid != created_branch.oid
+    {
+        return Err(WorktreeServiceError::IdentityChanged {
+            path: expected.path.clone(),
+        });
+    }
+    let mut rollback_expected = expected.clone();
+    rollback_expected.created_by = actual.created_by.clone();
+    rollback_expected.managed_by_bootty = actual.managed_by_bootty;
+    validate_removal_target(&rollback_expected, actual, true)
+}
 fn validate_removal_target(
     expected: &WorktreeRef,
     actual: WorktreeRef,
     force: bool,
 ) -> Result<WorktreeRef, WorktreeServiceError> {
-    if !actual.same_identity(expected) {
+    if !actual.same_removal_target(expected) {
         return Err(WorktreeServiceError::IdentityChanged {
             path: expected.path.clone(),
         });
@@ -575,7 +723,11 @@ fn validate_removal_target(
     if !actual.is_linked() {
         return Err(WorktreeServiceError::NotLinkedWorktree { path: actual.path });
     }
-    if status(&actual.path.to_string_lossy()).dirty && !force {
+    if !force
+        && status_path(&actual.path)
+            .map_err(|message| WorktreeServiceError::Git { message })?
+            .dirty
+    {
         return Err(WorktreeServiceError::DirtyWorktree { path: actual.path });
     }
     Ok(actual)
@@ -618,7 +770,7 @@ fn path_from_git_porcelain(path: &[u8]) -> Option<PathBuf> {
 /// Create a new linked worktree on a fresh `branch` off the repo containing
 /// `repo_dir`, returning the new worktree path (a sibling dir named
 /// `<repo>-<branch-slug>`).
-pub fn add_worktree(repo_dir: &str, branch: &str) -> Result<String, String> {
+pub fn add_worktree(repo_dir: &Path, branch: &str) -> Result<PathBuf, String> {
     bootty_mux::project::add_worktree(repo_dir, branch)
 }
 
@@ -630,6 +782,112 @@ pub fn delete_branch(repo_dir: &str, branch: &str, force: bool) -> Result<(), St
         repo_dir,
         &["branch", if force { "-D" } else { "-d" }, branch],
     )
+}
+
+fn branch_oid(repository: &RepositoryRef, reference: &str) -> Result<String, String> {
+    let output = read_git_dir_bytes(
+        &repository.common_git_dir,
+        &["rev-parse", "--verify", reference],
+    )
+    .ok_or_else(|| format!("could not read created branch reference {reference:?}"))?;
+    String::from_utf8(output)
+        .map_err(|error| format!("created branch reference {reference:?} was not UTF-8: {error}"))
+        .map(|oid| oid.trim().to_owned())
+}
+
+fn delete_created_branch(repository_path: &Path, expected: &CreatedBranch) -> Result<(), String> {
+    let actual_oid = branch_oid(&expected.repository, &expected.reference)?;
+    if actual_oid != expected.oid {
+        return Err(format!(
+            "created branch reference {:?} changed from {} to {}; leaving it intact",
+            expected.reference, expected.oid, actual_oid
+        ));
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(&expected.repository.common_git_dir)
+        .arg("update-ref")
+        .arg("-d")
+        .arg(&expected.reference)
+        .arg(&expected.oid);
+    hide_command_window(&mut command);
+    run_git_command(command).map_err(|error| {
+        format!(
+            "could not delete created branch {:?} at repository {repository_path:?}: {error}",
+            expected.reference
+        )
+    })
+}
+
+fn repository_for_path(repo_dir: &str) -> Result<RepositoryRef, String> {
+    DirectoryRef::resolve(repo_dir)
+        .map_err(|error| format!("could not resolve repository {repo_dir:?}: {error}"))?
+        .repository
+        .ok_or_else(|| format!("path {repo_dir:?} is not a Git repository"))
+}
+
+#[derive(Clone, Debug)]
+pub struct BranchRemovalTarget {
+    repository: RepositoryRef,
+    reference: String,
+    oid: String,
+}
+
+/// Capture the repository identity and object ID for a local branch before a
+/// destructive cleanup.
+pub fn capture_branch_removal_target(
+    repo_dir: &str,
+    branch: &str,
+) -> Result<BranchRemovalTarget, String> {
+    let repository = repository_for_path(repo_dir)?;
+    let reference = format!("refs/heads/{branch}");
+    let oid = branch_oid(&repository, &reference)?;
+    Ok(BranchRemovalTarget {
+        repository,
+        reference,
+        oid,
+    })
+}
+
+/// Delete a branch only if its repository identity and object ID are unchanged.
+///
+/// The expected object ID is passed to `git update-ref` as its old value, so a
+/// concurrent re-point leaves the branch intact instead of deleting unrelated
+/// work.
+pub fn delete_branch_if_unchanged(
+    repo_dir: &str,
+    target: &BranchRemovalTarget,
+) -> Result<(), String> {
+    let current_repository = repository_for_path(repo_dir)?;
+    if !current_repository.same_identity(&target.repository) {
+        return Err(format!(
+            "repository identity changed at {repo_dir:?}; leaving branch {:?} intact",
+            target.reference
+        ));
+    }
+    let actual_oid = branch_oid(&target.repository, &target.reference)?;
+    if actual_oid != target.oid {
+        return Err(format!(
+            "branch {:?} changed from {} to {}; leaving it intact",
+            target.reference, target.oid, actual_oid
+        ));
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(&target.repository.common_git_dir)
+        .arg("update-ref")
+        .arg("-d")
+        .arg(&target.reference)
+        .arg(&target.oid);
+    hide_command_window(&mut command);
+    run_git_command(command).map_err(|error| {
+        format!(
+            "could not delete branch {:?} at repository {:?}: {error}",
+            target.reference, target.repository.common_git_dir
+        )
+    })
 }
 
 /// The main working tree directory for the repo containing `cwd` — the parent
@@ -653,7 +911,7 @@ pub fn suggested_session_name(cwd: &str) -> String {
     let Some(worktree) = worktree_root(cwd) else {
         return crate::strings::session_name_for_path(cwd);
     };
-    let status = status(&worktree);
+    let status = status_path(Path::new(&worktree)).unwrap_or_default();
 
     let group = main_worktree(&worktree)
         .as_deref()
@@ -693,6 +951,7 @@ const MAX_WATCHED_WORKTREES: usize = 64;
 struct WorktreeWatch {
     revision: Arc<AtomicU64>,
     paths: Vec<PathBuf>,
+    last_used: u64,
 }
 
 /// Revision counter and filesystem roots per worktree, shared with the watcher's event thread.
@@ -701,6 +960,11 @@ type WorktreeRevisions = Arc<Mutex<HashMap<PathBuf, WorktreeWatch>>>;
 fn worktree_revisions() -> &'static WorktreeRevisions {
     static REVISIONS: OnceLock<WorktreeRevisions> = OnceLock::new();
     REVISIONS.get_or_init(WorktreeRevisions::default)
+}
+static WORKTREE_ACCESS_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+fn next_worktree_access() -> u64 {
+    WORKTREE_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 /// One watcher for every worktree: each `notify` watcher owns an event thread, and a thread per
@@ -733,9 +997,10 @@ pub fn worktree_revision(cwd: &str) -> u64 {
         return 0;
     };
     let root = paths[0].clone();
-    if let Ok(revisions) = worktree_revisions().lock()
-        && let Some(watched) = revisions.get(&root)
+    if let Ok(mut revisions) = worktree_revisions().lock()
+        && let Some(watched) = revisions.get_mut(&root)
     {
+        watched.last_used = next_worktree_access();
         return watched.revision.load(Ordering::Relaxed);
     }
 
@@ -749,7 +1014,17 @@ pub fn worktree_revision(cwd: &str) -> u64 {
         return 0;
     };
     if revisions.len() >= MAX_WATCHED_WORKTREES {
-        return 0;
+        let candidate = revisions
+            .iter()
+            .min_by_key(|(root, watched)| (root.exists(), watched.last_used))
+            .map(|(root, _)| root.clone());
+        if let Some(candidate) = candidate
+            && let Some(evicted) = revisions.remove(&candidate)
+        {
+            for path in evicted.paths {
+                let _ = watcher.unwatch(&path);
+            }
+        }
     }
     let mut registered: Vec<PathBuf> = Vec::new();
     for path in &paths {
@@ -766,6 +1041,7 @@ pub fn worktree_revision(cwd: &str) -> u64 {
         WorktreeWatch {
             revision: Arc::new(AtomicU64::new(1)),
             paths,
+            last_used: next_worktree_access(),
         },
     );
     1
@@ -812,8 +1088,18 @@ fn git_dir(cwd: &Path) -> Option<PathBuf> {
             return Some(candidate);
         }
         if candidate.is_file() {
-            let pointer = std::fs::read_to_string(&candidate).ok()?;
-            let target = Path::new(pointer.trim().strip_prefix("gitdir:")?.trim()).to_path_buf();
+            let pointer = std::fs::read(&candidate).ok()?;
+            let line = pointer.split(|byte| *byte == b'\n').next()?;
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let target = line.strip_prefix(b"gitdir:")?;
+            let target = target.strip_prefix(b" ").unwrap_or(target);
+            if target.is_empty() {
+                return None;
+            }
+            #[cfg(unix)]
+            let target = PathBuf::from(OsString::from_vec(target.to_vec()));
+            #[cfg(not(unix))]
+            let target = PathBuf::from(String::from_utf8(target.to_vec()).ok()?);
             return Some(if target.is_absolute() {
                 target
             } else {
@@ -825,18 +1111,25 @@ fn git_dir(cwd: &Path) -> Option<PathBuf> {
 }
 
 fn read(cwd: &str, args: &[&str]) -> Option<String> {
-    bootty_runtime::perf::record_subprocess("git read");
-    let output = git_command(cwd, args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    read_path(Path::new(cwd), args)
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output).trim().to_owned())
 }
 
 fn read_bytes(cwd: &str, args: &[&str]) -> Option<Vec<u8>> {
+    read_path(Path::new(cwd), args).ok()
+}
+
+fn read_path(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     bootty_runtime::perf::record_subprocess("git read");
-    let output = git_command(cwd, args).output().ok()?;
-    output.status.success().then_some(output.stdout)
+    let output = git_command_path(cwd, args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 fn read_git_dir_bytes(git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -863,6 +1156,10 @@ fn run_git_command(mut command: Command) -> Result<(), String> {
 }
 
 fn git_command(cwd: &str, args: &[&str]) -> Command {
+    git_command_path(Path::new(cwd), args)
+}
+
+fn git_command_path(cwd: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd).args(args);
     hide_command_window(&mut command);
@@ -898,6 +1195,7 @@ mod tests {
                     PathBuf::from("/worktree"),
                     PathBuf::from("/repo/.git/worktrees/feature"),
                 ],
+                last_used: 0,
             },
         );
 
@@ -1020,13 +1318,18 @@ mod tests {
         }
     }
 
-    fn add_worktree_at(repository: &str, branch: &str, path: &Path) -> Result<String, String> {
-        let path = path.to_string_lossy().into_owned();
-        run(repository, &["worktree", "add", "-b", branch, &path])?;
-        Ok(path)
+    fn add_worktree_at(repository: &Path, branch: &str, path: &Path) -> Result<PathBuf, String> {
+        let repository = repository
+            .to_str()
+            .ok_or_else(|| "repository path was not UTF-8".to_owned())?;
+        let path_string = path
+            .to_str()
+            .ok_or_else(|| "worktree path was not UTF-8".to_owned())?;
+        run(repository, &["worktree", "add", "-b", branch, path_string])?;
+        Ok(path.to_path_buf())
     }
 
-    fn resolve_created_worktree(created: &str) -> Result<DirectoryRef, WorktreeServiceError> {
+    fn resolve_created_worktree(created: &Path) -> Result<DirectoryRef, WorktreeServiceError> {
         Ok(DirectoryRef::resolve(created).map_err(DirectoryClaimsError::from)?)
     }
 
@@ -1168,6 +1471,55 @@ mod tests {
         assert!(status(worktree.to_str().unwrap()).dirty);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_rejects_dirty_non_utf8_worktree_without_lossy_lookup() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let non_utf8_name = OsString::from_vec(b"non-utf8-\xff".to_vec());
+        let path = root.path().join(non_utf8_name);
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&main)
+            .args(["worktree", "add", "-b", "non-utf8"])
+            .arg(&path)
+            .output()
+            .expect("add non-UTF-8 worktree");
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("non-utf8-removal").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "non-utf8-removal".to_owned(),
+                generation: 1,
+            },
+        );
+        let details = service.get(&path).expect("resolve non-UTF-8 worktree");
+        fs::write(details.worktree.path.join("dirty"), "wip").expect("dirty worktree");
+
+        let result = service.remove(WorktreeRemoveRequest {
+            worktree: details.worktree,
+            force: false,
+            requester_session: None,
+            confirmation: None,
+        });
+        assert!(matches!(
+            result,
+            Err(WorktreeServiceError::DirtyWorktree { .. })
+        ));
+        assert!(
+            path.exists(),
+            "dirty worktree must survive a non-forced removal"
+        );
+    }
+
     #[test]
     fn status_outside_a_repo_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1270,22 +1622,37 @@ mod tests {
     #[test]
     fn add_worktree_creates_a_linked_checkout_on_a_new_branch() {
         let (_root, main, _worktree) = repo_with_worktree();
-        let created = add_worktree(main.to_str().unwrap(), "wip/login").expect("add worktree");
+        let created = add_worktree(&main, "wip/login").expect("add worktree");
 
-        assert!(
-            Path::new(&created).is_dir(),
-            "worktree dir missing: {created}"
-        );
+        assert!(created.is_dir(), "worktree dir missing: {created:?}");
         // Slashes in the branch become dashes in the sibling directory name.
         assert!(
             created.ends_with("main-wip-login"),
-            "unexpected path: {created}"
+            "unexpected path: {created:?}"
         );
-        let added = status(&created);
-        assert!(added.is_linked_worktree);
+        let created_string = created.to_str().expect("created path");
+        let added = status(created_string);
         assert_eq!(added.branch.as_deref(), Some("wip/login"));
     }
 
+    #[test]
+    fn branch_cas_leaves_a_repointed_branch_intact() {
+        let (_root, main, _worktree) = repo_with_worktree();
+        let target =
+            capture_branch_removal_target(main.to_str().unwrap(), "main").expect("capture branch");
+        git_ok(&main, &["commit", "--allow-empty", "-q", "-m", "repoint"]);
+
+        let result = delete_branch_if_unchanged(main.to_str().unwrap(), &target);
+        assert!(
+            result.is_err(),
+            "a repointed branch must fail the compare-and-delete"
+        );
+        assert_eq!(
+            read(main.to_str().unwrap(), &["rev-parse", "refs/heads/main"]).as_deref(),
+            read(main.to_str().unwrap(), &["rev-parse", "HEAD"]).as_deref(),
+            "the repointed branch must remain attached to the replacement commit"
+        );
+    }
     #[test]
     fn service_creates_and_removes_a_worktree_without_session_lifecycle() {
         let (root, main, _worktree) = repo_with_worktree();
@@ -1450,12 +1817,13 @@ mod tests {
             },
             move |repository, branch| {
                 let created = add_worktree(repository, branch)?;
-                *captured_path.lock().expect("created path lock") = Some(PathBuf::from(&created));
+
+                *captured_path.lock().expect("created path lock") = Some(created.clone());
                 Ok(created)
             },
             |created| {
                 Ok(DirectoryRef {
-                    canonical_path: PathBuf::from(created),
+                    canonical_path: created.to_path_buf(),
                     repository: None,
                     worktree: None,
                 })
@@ -1528,6 +1896,77 @@ mod tests {
         assert!(
             !inventory.contains("rollback-known"),
             "locked rollback must remove the worktree registration: {inventory}"
+        );
+        let branches = read(
+            main.to_str().expect("main path"),
+            &["branch", "--list", "rollback-known"],
+        )
+        .expect("branch list");
+        assert!(
+            branches.trim().is_empty(),
+            "rollback must remove the branch created with the worktree: {branches}"
+        );
+    }
+    #[test]
+    fn service_rollback_leaves_repointed_created_worktree_intact() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("rollback-branch-repoint").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "rollback-branch-repoint".to_owned(),
+                generation: 1,
+            },
+        );
+        let created_path = root.path().join("rollback-branch-repoint");
+        let add_path = created_path.clone();
+        let branch_main = main.clone();
+        let result = service.create_after_add(
+            WorktreeCreateRequest {
+                repository_path: main.clone(),
+                branch: "rollback-branch-repoint".to_owned(),
+                managed_by_bootty: true,
+                caller: "test".to_owned(),
+            },
+            move |repository, branch| add_worktree_at(repository, branch, &add_path),
+            resolve_created_worktree,
+            move |worktree| {
+                git_ok(
+                    &branch_main,
+                    &["commit", "--allow-empty", "-q", "-m", "repoint"],
+                );
+                let oid = read(
+                    branch_main.to_str().expect("main path"),
+                    &["rev-parse", "HEAD"],
+                )
+                .expect("replacement commit");
+                let reference = "refs/heads/rollback-branch-repoint";
+                git_ok(&branch_main, &["update-ref", reference, oid.as_str()]);
+                injected_post_add_failure(worktree)
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorktreeServiceError::Git { ref message })
+                if message.contains("could not safely roll back")
+                    && message.contains("identity changed")
+        ));
+        assert!(
+            created_path.exists(),
+            "a changed created worktree identity must survive partial rollback"
+        );
+        let branches = read(
+            main.to_str().expect("main path"),
+            &["branch", "--list", "rollback-branch-repoint"],
+        )
+        .expect("branch list");
+        assert!(
+            branches.contains("rollback-branch-repoint"),
+            "a concurrently repointed branch must survive: {branches}"
         );
     }
 

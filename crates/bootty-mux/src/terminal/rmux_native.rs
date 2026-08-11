@@ -55,7 +55,7 @@ pub(super) struct RmuxNativeTerminal {
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_output_len: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
-    error_rx: mpsc::Receiver<String>,
+    error_rx: mpsc::Receiver<anyhow::Error>,
     geometry: TerminalGeometry,
     display_scale: f32,
     render_cell: CellMetrics,
@@ -148,7 +148,7 @@ struct RmuxWorkerConfig {
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_output_len: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
-    error_tx: mpsc::Sender<String>,
+    error_tx: mpsc::Sender<anyhow::Error>,
     repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     waiting_initial_remote_frame: bool,
 }
@@ -173,7 +173,7 @@ struct RmuxWorker {
     pending_restore_output: RmuxOutputBacklog,
     pending_output_len: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
-    error_tx: mpsc::Sender<String>,
+    error_tx: mpsc::Sender<anyhow::Error>,
     repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     side_effect_tx: Option<mpsc::Sender<TerminalSideEffectEvent>>,
     side_effect_pane_id: Option<String>,
@@ -358,7 +358,7 @@ impl RmuxNativeTerminal {
             error = Some(next);
         }
         if let Some(error) = error {
-            anyhow::bail!(error);
+            return Err(error);
         }
         Ok(())
     }
@@ -869,6 +869,18 @@ impl RmuxWorker {
                     buffered_chunks,
                     capture,
                 } => {
+                    let empty_capture = capture.is_empty();
+                    let empty_restore = buffered_chunks.is_empty() && empty_capture;
+                    // An empty capture is still an authoritative initial-frame
+                    // boundary. Mark the current engine state dirty so a quiet
+                    // pane publishes a frame and wakes its renderer.
+                    if empty_capture {
+                        self.waiting_initial_remote_frame = false;
+                        self.mark_unpublished_frame();
+                        if empty_restore {
+                            self.force_next_frame_publish = true;
+                        }
+                    }
                     for chunk in buffered_chunks {
                         collected_chunks += 1;
                         if let Some(bytes) = pane_output_chunk_bytes(chunk) {
@@ -899,7 +911,7 @@ impl RmuxWorker {
                     self.engine.write_vt(&bytes);
                 }
                 RmuxPaneEvent::Error(error) => {
-                    self.send_error(anyhow::anyhow!(error));
+                    self.send_error(error);
                     self.output_closed = true;
                     self.closed.store(true, Ordering::Relaxed);
                     break;
@@ -1101,7 +1113,7 @@ impl RmuxWorker {
     }
 
     fn send_error(&self, error: anyhow::Error) {
-        let _ = self.error_tx.send(error.to_string());
+        let _ = self.error_tx.send(error);
     }
 }
 
@@ -1242,6 +1254,57 @@ mod tests {
         assert!(closed.load(Ordering::Relaxed));
     }
 
+    #[test]
+    fn pane_worker_preserves_typed_stale_errors() -> Result<()> {
+        let (output_tx, output_rx) = mpsc::channel();
+        let (input_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, result_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        let (error_tx, error_rx) = mpsc::channel();
+        let latest_frame = Arc::new(RmuxPublishedFrame::new());
+        let closed = Arc::new(AtomicBool::new(false));
+
+        spawn_rmux_terminal_worker(RmuxWorkerConfig {
+            pane_io: RmuxPaneIo {
+                output_rx,
+                input_tx,
+                resize_tx,
+                result_rx,
+            },
+            geometry: test_geometry(),
+            terminal_config: test_config(),
+            command_rx,
+            latest_frame,
+            latest_drain: Arc::new(Mutex::new(DrainStats::default())),
+            pending_output_len: Arc::new(AtomicUsize::new(0)),
+            closed,
+            error_tx,
+            repaint_wakeup: test_repaint_callback(),
+            waiting_initial_remote_frame: true,
+        })?;
+
+        output_tx.send(RmuxPaneEvent::Error(
+            crate::operation::MuxBackendOperationError::Stale(
+                "pane vanished before stream open".to_owned(),
+            )
+            .into(),
+        ))?;
+
+        let error = error_rx
+            .recv_timeout(Duration::from_millis(500))
+            .context("wait for typed pane worker error")?;
+        assert_eq!(
+            error.downcast_ref::<crate::operation::MuxBackendOperationError>(),
+            Some(&crate::operation::MuxBackendOperationError::Stale(
+                "pane vanished before stream open".to_owned()
+            ))
+        );
+
+        let _ = command_tx.send(RmuxTerminalCommand::Stop);
+        Ok(())
+    }
+
     fn test_geometry() -> TerminalGeometry {
         TerminalGeometry {
             cols: 80,
@@ -1308,6 +1371,7 @@ mod tests {
             if Instant::now() >= deadline {
                 break false;
             }
+
             std::thread::park_timeout(Duration::from_millis(1));
         };
         let _ = command_tx.send(RmuxTerminalCommand::Stop);
@@ -1315,6 +1379,59 @@ mod tests {
         assert!(
             published,
             "an interrupted synchronized-output restore suppressed the initial frame"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_restore_publishes_initial_frame_and_releases_wait() -> Result<()> {
+        let (output_tx, output_rx) = mpsc::channel();
+        let (input_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (resize_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, result_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        let (error_tx, _) = mpsc::channel();
+        let latest_frame = Arc::new(RmuxPublishedFrame::new());
+        let closed = Arc::new(AtomicBool::new(false));
+        spawn_rmux_terminal_worker(RmuxWorkerConfig {
+            pane_io: RmuxPaneIo {
+                output_rx,
+                input_tx,
+                resize_tx,
+                result_rx,
+            },
+            geometry: test_geometry(),
+            terminal_config: test_config(),
+            command_rx,
+            latest_frame: Arc::clone(&latest_frame),
+            latest_drain: Arc::new(Mutex::new(DrainStats::default())),
+            pending_output_len: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::clone(&closed),
+            error_tx,
+            repaint_wakeup: test_repaint_callback(),
+            waiting_initial_remote_frame: true,
+        })?;
+        output_tx.send(RmuxPaneEvent::Restore {
+            buffered_chunks: Vec::new(),
+            capture: Vec::new(),
+        })?;
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let published = loop {
+            let frame = latest_frame.load()?;
+            if frame.cols == test_geometry().cols && frame.rows == test_geometry().rows {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
+        };
+        let _ = command_tx.send(RmuxTerminalCommand::Stop);
+
+        assert!(
+            published,
+            "an empty restore must release initial-frame waiting and publish the engine frame"
         );
         Ok(())
     }

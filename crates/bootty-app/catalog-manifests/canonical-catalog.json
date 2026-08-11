@@ -2,7 +2,7 @@
   "schema_version": 1,
   "expected_descriptor_count": 310,
   "expected_namespace_count": 39,
-  "expected_source_entry_count": 649,
+  "expected_source_entry_count": 675,
   "source_manifest_inventory": {
     "bootty_actions": {
       "entry_ids": [
@@ -75,7 +75,30 @@
         "ui.sidebar.focus_terminal",
         "ui.sidebar.ignore",
         "ui.sidebar.next_session",
-        "ui.sidebar.previous_session"
+        "ui.sidebar.previous_session",
+        "activate_key_table",
+        "activate_key_table_once",
+        "adjust_selection",
+        "clear_screen",
+        "copy_title_to_clipboard",
+        "copy_url_to_clipboard",
+        "deactivate_all_key_tables",
+        "deactivate_key_table",
+        "end_key_sequence",
+        "jump_to_prompt",
+        "paste_from_selection",
+        "reset",
+        "scroll_page_fractional",
+        "scroll_to_row",
+        "scroll_to_selection",
+        "select_all",
+        "set_surface_title",
+        "set_tab_title",
+        "toggle_mouse_reporting",
+        "unbind",
+        "write_scrollback_file",
+        "write_screen_file",
+        "write_selection_file"
       ]
     },
     "bundled_extensions": {
@@ -572,12 +595,14 @@
         "PaneSplitBuilder::title",
         "PaneStateEventStream::next",
         "Rmux::broadcast",
+        "Rmux::cmd",
         "Rmux::capabilities",
         "Rmux::connect",
         "Rmux::connect_or_start",
         "Rmux::connect_or_start_at",
         "Rmux::ensure_session",
         "Rmux::find_panes",
+        "Rmux::find_sessions",
         "Rmux::get_pane_by_id",
         "Rmux::get_pane_by_title",
         "Rmux::has_capability",
@@ -588,6 +613,7 @@
         "Rmux::pane",
         "Rmux::pane_by_id",
         "Rmux::session",
+        "Rmux::tracing",
         "Rmux::set_default_timeout",
         "Rmux::shutdown",
         "Rmux::stop_all_web_shares",
@@ -3908,7 +3934,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4011,7 +4037,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "destructive",
@@ -4279,7 +4305,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4353,7 +4379,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4388,7 +4414,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4423,7 +4449,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4458,7 +4484,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4493,7 +4519,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -4568,7 +4594,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5155,7 +5181,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5195,12 +5221,12 @@
         "type": "object"
       },
       "targets": [
-        "window"
+        "pane"
       ],
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5266,7 +5292,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5299,7 +5325,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5344,7 +5370,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5378,7 +5404,7 @@
       "availability": {
         "core": "available",
         "native": "unsupported",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5580,7 +5606,7 @@
       "availability": {
         "core": "available",
         "native": "unsupported",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5613,7 +5639,7 @@
       "availability": {
         "core": "available",
         "native": "unsupported",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "write",
@@ -5967,7 +5993,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "destructive",
@@ -6000,7 +6026,7 @@
       "availability": {
         "core": "available",
         "native": "conditional",
-        "rmux": "conditional",
+        "rmux": "unavailable",
         "tmux": "conditional"
       },
       "mutation": "destructive",
@@ -9674,8 +9700,27 @@
       "result_schema": {
         "type": "object",
         "properties": {
-          "task_id": {
-            "type": "string"
+          "task": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "owner_pid": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string"
+                  },
+                  "outcome": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -9752,8 +9797,27 @@
       "result_schema": {
         "type": "object",
         "properties": {
-          "task_id": {
-            "type": "string"
+          "task": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "owner_pid": {
+                "type": "integer"
+              },
+              "state": {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "type": "string"
+                  },
+                  "outcome": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
           }
         }
       },
@@ -10628,7 +10692,16 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string"
+        },
+        {
+          "name": "state",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "array",
         "items": {
@@ -10667,7 +10740,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10703,7 +10782,22 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "stream",
+          "type": "string"
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "minimum": 1
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10739,7 +10833,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10753,7 +10853,7 @@
         "rmux": "unavailable",
         "tmux": "unavailable"
       },
-      "mutation": "write",
+      "mutation": "read",
       "palette": {
         "visible": false,
         "category": "agents",
@@ -10776,7 +10876,33 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "cwd",
+          "type": "string"
+        },
+        {
+          "name": "argv",
+          "type": "array"
+        },
+        {
+          "name": "environment",
+          "type": "object"
+        },
+        {
+          "name": "prompt",
+          "type": "string"
+        },
+        {
+          "name": "managed",
+          "type": "boolean"
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10812,7 +10938,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10848,7 +10980,18 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10884,7 +11027,22 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "prompt",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10912,13 +11070,26 @@
       "id": "agents.send_text",
       "title": "Text Send Agents",
       "description": "Send literal text to an agent terminal.",
-      "aliases": [],
+      "aliases": [
+        "agent.send_text"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10955,7 +11126,18 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "keys",
+          "type": "array",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -10992,7 +11174,18 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "timeout_ms",
+          "type": "integer",
+          "minimum": 0
+        }
+      ],
       "result_schema": {
         "type": "object",
         "properties": {
@@ -11011,7 +11204,7 @@
         "rmux": "unavailable",
         "tmux": "unavailable"
       },
-      "mutation": "write",
+      "mutation": "read",
       "palette": {
         "visible": false,
         "category": "agents",
@@ -11025,13 +11218,21 @@
       "id": "agents.pause",
       "title": "Pause Agents",
       "description": "Pause an agent where its native adapter supports it.",
-      "aliases": [],
+      "aliases": [
+        "agent.pause"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11059,13 +11260,21 @@
       "id": "agents.resume",
       "title": "Resume Agents",
       "description": "Resume a paused agent.",
-      "aliases": [],
+      "aliases": [
+        "agent.resume"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11093,13 +11302,21 @@
       "id": "agents.retry",
       "title": "Retry Agents",
       "description": "Retry failed agent work where supported.",
-      "aliases": [],
+      "aliases": [
+        "agent.retry"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11127,13 +11344,21 @@
       "id": "agents.abort",
       "title": "Abort Agents",
       "description": "Abort the current agent turn or process.",
-      "aliases": [],
+      "aliases": [
+        "agent.abort"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11169,7 +11394,18 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "surface",
+          "type": "object",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11206,7 +11442,12 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11236,14 +11477,21 @@
       "title": "Report Agents",
       "description": "Ingest an authoritative normalized agent update.",
       "aliases": [
-        "pane.report_agent"
+        "pane.report_agent",
+        "agent.report"
       ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11272,14 +11520,26 @@
       "title": "Session Report Agents",
       "description": "Associate a native agent session with Bootty resources.",
       "aliases": [
-        "pane.report_agent_session"
+        "pane.report_agent_session",
+        "agent.report_session"
       ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "native_session_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11316,7 +11576,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11353,7 +11619,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "agent_id",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11429,7 +11701,12 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "manifest_id",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11458,13 +11735,20 @@
       "id": "agents.integration.list",
       "title": "List Integration Agents",
       "description": "List adapter integrations supported by the Luau bundle.",
-      "aliases": [],
+      "aliases": [
+        "agent.integration.list"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "array",
         "items": {
@@ -11504,7 +11788,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11541,7 +11831,13 @@
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11570,13 +11866,21 @@
       "id": "agents.integration.setup",
       "title": "Setup Integration Agents",
       "description": "Configure an installed adapter from bundle-owned manifests.",
-      "aliases": [],
+      "aliases": [
+        "agent.integration.setup"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string",
+          "required": true
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11605,13 +11909,20 @@
       "id": "agents.integration.doctor",
       "title": "Doctor Integration Agents",
       "description": "Diagnose agent adapter installation and connectivity.",
-      "aliases": [],
+      "aliases": [
+        "agent.integration.doctor"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "provider",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "object"
       },
@@ -11640,13 +11951,29 @@
       "id": "agents.ingest",
       "title": "Ingest Agents",
       "description": "Receive authoritative native adapter events.",
-      "aliases": [],
+      "aliases": [
+        "agent.ingest"
+      ],
       "origin": {
         "kind": "extension",
         "extension_id": "bootty.agents",
         "generation": 0
       },
-      "argument_schema": [],
+      "argument_schema": [
+        {
+          "name": "event",
+          "type": "object",
+          "required": true
+        },
+        {
+          "name": "adapter",
+          "type": "string"
+        },
+        {
+          "name": "event_name",
+          "type": "string"
+        }
+      ],
       "result_schema": {
         "type": "object"
       },

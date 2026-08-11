@@ -2,8 +2,11 @@ use anyhow::Result;
 
 #[cfg(feature = "app")]
 use super::{
-    backend::{MuxBackend, MuxBackendOperationError},
-    capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
+    backend::{MuxBackend, MuxBackendOperationError, MuxScopedExecutionPrecondition},
+    capability::{
+        BindingCapabilityDescriptor, BindingOperation, BindingOperationAvailability,
+        BindingOperationOutcome,
+    },
     command::MuxSessionLaunchPlan,
     controller::MuxScope,
 };
@@ -129,6 +132,32 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
         ZellijBackend::execute(self, command)
+    }
+
+    fn execute_checked(
+        &mut self,
+        scope: MuxScope,
+        command: MuxCommand,
+        precondition: Option<&MuxScopedExecutionPrecondition>,
+    ) -> BindingOperationOutcome<Result<()>> {
+        if precondition.is_some_and(|precondition| precondition.scope != scope) {
+            return BindingOperationOutcome::Supported(Err(MuxBackendOperationError::stale(
+                "zellij mux binding scope changed",
+            )
+            .into()));
+        }
+        if precondition.is_some() {
+            return BindingOperationOutcome::Supported(Err(MuxBackendOperationError::unsupported(
+                "zellij has no server-side conditional mutation protocol",
+            )
+            .into()));
+        }
+        let descriptor = self.capabilities(scope);
+        descriptor.invoke(
+            descriptor.request(command.operation()),
+            BindingOperationAvailability::Available,
+            || self.execute(command),
+        )
     }
 
     fn execute_session_launch(

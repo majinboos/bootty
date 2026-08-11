@@ -39,11 +39,15 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::{
+    backend::MuxScopedExecutionPrecondition,
     command::{
         MuxCommand, MuxDirection, MuxPaneLaunch, MuxPaneLaunchPlan, MuxPaneResize,
         MuxSessionLaunchPlan, MuxSplitDirection,
     },
-    operation::{MuxAllocatedResources, MuxAllocatedWindow, MuxBackendOperationError},
+    operation::{
+        MuxAllocatedResources, MuxAllocatedWindow, MuxBackendOperationError,
+        RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
+    },
     rmux::{
         RmuxWindowRow, list_pane_rows, list_window_rows, rmux_request, rmux_request_checked,
         rmux_response_checked, session_from_rows,
@@ -353,7 +357,10 @@ async fn active_rmux_pane(rmux: &Rmux, session_name: SessionName) -> Result<Pane
     let window = session.window(window_index);
     let panes = window.panes().await?;
     let pane_id = select_active_rmux_pane(&panes)?.id;
-    session.pane_by_id(pane_id).await.map_err(Into::into)
+    session
+        .pane_by_id(pane_id)
+        .await
+        .map_err(map_rmux_pane_lookup_error)
 }
 
 async fn rmux_window_id(window: &Window) -> Result<String> {
@@ -572,7 +579,7 @@ pub(crate) enum RmuxPaneEvent {
     Chunks(Vec<PaneOutputChunk>),
     KeyboardProtocol(Vec<u8>),
 
-    Error(String),
+    Error(anyhow::Error),
 }
 
 pub(crate) struct RmuxPaneIo {
@@ -591,7 +598,6 @@ struct RmuxBridge {
 struct RmuxSnapshotRequest {
     result_tx: mpsc::Sender<Result<MuxSnapshot>>,
 }
-
 enum RmuxControlRequest {
     Execute {
         command: MuxCommand,
@@ -646,7 +652,6 @@ pub(crate) fn rmux_snapshot() -> Result<MuxSnapshot> {
         .map_err(|_| anyhow::anyhow!("rmux snapshot worker stopped"))?;
     recv_bridge_result(result_rx, "rmux snapshot worker")
 }
-
 pub(crate) fn rmux_execute(command: MuxCommand) -> Result<()> {
     request_control_sync(|result_tx| RmuxControlRequest::Execute { command, result_tx })
 }
@@ -899,7 +904,8 @@ fn run_control_worker(request_rx: mpsc::Receiver<RmuxControlRequest>) {
     while let Ok(request) = request_rx.recv() {
         match request {
             RmuxControlRequest::Execute { command, result_tx } => {
-                let _ = result_tx.send(runtime.block_on(state.execute(command)));
+                let result = runtime.block_on(state.execute_checked(command, None));
+                let _ = result_tx.send(result);
             }
             RmuxControlRequest::LaunchSession { plan, result_tx } => {
                 let _ = result_tx.send(runtime.block_on(state.launch_session(plan)));
@@ -983,6 +989,20 @@ impl RmuxBridgeState {
         }
     }
 
+    async fn execute_checked(
+        &mut self,
+        command: MuxCommand,
+        precondition: Option<MuxScopedExecutionPrecondition>,
+    ) -> Result<()> {
+        if precondition.is_some() {
+            return Err(MuxBackendOperationError::unsupported(
+                RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
+            )
+            .into());
+        }
+        self.execute(command).await
+    }
+
     async fn snapshot_current_sessions(&mut self) -> Result<MuxSnapshot> {
         let names = self.list_session_names().await?;
         let rmux = self.rmux().await?;
@@ -1013,9 +1033,30 @@ impl RmuxBridgeState {
     }
 
     async fn resolve_pane_target(&mut self, target: RmuxPaneTarget) -> Result<RmuxPaneTarget> {
+        let first = self.resolve_pane_target_once(&target).await;
+        match first {
+            Ok(target) => Ok(target),
+            Err(error) if should_reset_rmux_connection(&error) => {
+                self.rmux = None;
+                let retry = self.resolve_pane_target_once(&target).await;
+                if let Err(error) = &retry
+                    && should_reset_rmux_connection(error)
+                {
+                    self.rmux = None;
+                }
+                retry
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn resolve_pane_target_once(
+        &mut self,
+        target: &RmuxPaneTarget,
+    ) -> Result<RmuxPaneTarget> {
         let session_name = target.session_name()?.to_string();
         let rmux = self.rmux().await?;
-        let pane = pane_for_target(rmux, &target).await?;
+        let pane = pane_for_target(rmux, target).await?;
         Ok(RmuxPaneTarget::new(
             session_name,
             Some(rmux_pane_id(&pane).await?),
@@ -1641,7 +1682,6 @@ async fn snapshot_session(rmux: &Rmux, name: &SessionName) -> Result<crate::snap
     let panes = list_pane_rows(rmux, name).await?;
     Ok(session_from_rows(&session_name, &windows, &panes))
 }
-
 async fn run_pane_io(
     target: RmuxPaneTarget,
     max_scrollback: usize,
@@ -1658,12 +1698,40 @@ async fn run_pane_io(
         &mut resize_rx,
         &result_tx,
     )
-    .await;
+    .await
+    .map_err(map_rmux_pane_error);
     if let Err(error) = result {
-        let text = error.to_string();
+        let event_error = clone_rmux_pane_error(&error);
         let _ = result_tx.send(Err(error));
-        let _ = output_tx.send(RmuxPaneEvent::Error(text));
+        let _ = output_tx.send(RmuxPaneEvent::Error(event_error));
     }
+}
+
+fn map_rmux_pane_error(error: anyhow::Error) -> anyhow::Error {
+    let stale = error.chain().find_map(|cause| {
+        let rmux_error = cause.downcast_ref::<RmuxError>()?;
+        match rmux_error {
+            RmuxError::PaneNotFound {
+                session_name,
+                pane_id,
+                ..
+            } => Some((session_name.to_string(), pane_id.to_string())),
+            _ => None,
+        }
+    });
+    stale.map_or(error, |(session_name, pane_id)| {
+        stale_rmux_target(format!(
+            "rmux pane {pane_id} is not present in session {session_name}"
+        ))
+    })
+}
+
+fn clone_rmux_pane_error(error: &anyhow::Error) -> anyhow::Error {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<MuxBackendOperationError>().cloned())
+        .map(anyhow::Error::new)
+        .unwrap_or_else(|| anyhow::anyhow!(error.to_string()))
 }
 
 async fn replay_retained_terminal_protocol(
@@ -2308,7 +2376,9 @@ fn append_restore_underline_color_sgr(params: &mut Vec<String>, color: PaneColor
         PaneColor::Ansi { index } => params.push(format!("58;5;{}", index.min(7))),
         PaneColor::BrightAnsi { index } => params.push(format!("58;5;{}", index.min(7) + 8)),
         PaneColor::Indexed { index } => params.push(format!("58;5;{index}")),
-        PaneColor::Rgb { red, green, blue } => params.push(format!("58;2;{red};{green};{blue}")),
+        PaneColor::Rgb { red, green, blue } => {
+            params.push(format!("58;2;{red};{green};{blue}"));
+        }
         PaneColor::Encoded { value } => {
             append_restore_underline_color_sgr(params, PaneColor::from_encoded(value));
         }
@@ -2334,10 +2404,26 @@ where
     tokio::time::timeout(timeout, capture).await.ok().flatten()
 }
 
+fn map_rmux_pane_lookup_error(error: RmuxError) -> anyhow::Error {
+    match error {
+        RmuxError::PaneNotFound {
+            session_name,
+            pane_id,
+            ..
+        } => stale_rmux_target(format!(
+            "rmux pane {pane_id} is not present in session {session_name}"
+        )),
+        error => error.into(),
+    }
+}
+
 async fn pane_for_target(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<Pane> {
     let session_name = target.session_name()?;
     match target.pane_id()? {
-        Some(pane_id) => Ok(rmux.pane_by_id(session_name, pane_id).await?),
+        Some(pane_id) => rmux
+            .pane_by_id(session_name, pane_id)
+            .await
+            .map_err(map_rmux_pane_lookup_error),
         None => active_rmux_pane(rmux, session_name).await,
     }
 }
@@ -2366,6 +2452,23 @@ mod tests {
             error.downcast_ref::<MuxBackendOperationError>(),
             Some(&MuxBackendOperationError::Failed(
                 "rmux pane resize requires every supplied dimension to be positive".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn pane_worker_error_clone_preserves_typed_backend_outcome() {
+        let error = anyhow::Error::new(MuxBackendOperationError::Stale(
+            "pane vanished before stream open".to_owned(),
+        ))
+        .context("open rmux pane");
+
+        let cloned = clone_rmux_pane_error(&error);
+
+        assert_eq!(
+            cloned.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Stale(
+                "pane vanished before stream open".to_owned()
             ))
         );
     }

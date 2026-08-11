@@ -219,20 +219,29 @@ captures the wheel as well as the keyboard, so wheel triggers can be bound
 without hand-editing the config.
 
 Reload validates the full effective config first. If parsing, theme resolution,
-modifier remap parsing, keybind parsing, or live terminal color/cursor
-application fails, the current in-memory config remains active.
+modifier remap parsing, keybind parsing, or live terminal color/cursor/feature
+application fails, the current in-memory config remains active. Live changes to
+`[multiplexer]` are intentionally rejected because changing a backend in an
+existing window is not supported; Bootty keeps the previous config and runtime
+and reports that a restart is required.
+
+Rejected reloads leave the watcher baseline unchanged, so the same file is
+retried on the next poll (and by the manual reload action). Restore the prior
+configuration or restart Bootty to clear a rejected `[multiplexer]` change.
 
 Libghostty-vt logs are bridged to stderr. Set `BOOTTY_LIBGHOSTTY_LOG=error|warn|info|debug|off` to adjust verbosity; unset defaults to warnings and errors.
 
 Live-applied fields:
 
 - `[chrome]` sidebar/status visibility, layout, and inactive panel dimming
-- `[multiplexer]` backend selection and backend UI mode
 - `[input]` modifier remaps, macOS Option-as-Meta mode, global keybinds, and sidebar keybinds
 - `theme`, `[colors]` terminal defaults, `[cursor]` defaults, `[font]` metrics,
   and `[session].glyph-protocol`
 - `[window].title`
 - `[diagnostics].stability-trace`
+
+`[multiplexer]` backend and connection changes are not live-applied; restart
+Bootty after changing them.
 
 New-session/new-window-only fields:
 

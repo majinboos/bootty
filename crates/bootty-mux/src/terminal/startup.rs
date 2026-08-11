@@ -289,11 +289,18 @@ impl TerminalRuntime for StartingNativeTerminal {
     }
 
     fn child_exited(&mut self) -> Result<bool> {
-        Ok(self
-            .ready_terminal()?
-            .map(TerminalSession::child_exited)
-            .transpose()?
-            .unwrap_or(false))
+        match self.ready_terminal() {
+            Ok(Some(terminal)) => terminal.child_exited(),
+            Ok(None) => Ok(false),
+            Err(error) => {
+                // A startup/configuration error means this pane can never become a
+                // live runtime. Report it through the existing native-exit path so
+                // the owner retires the pane and its launch identity instead of
+                // rendering the startup placeholder forever.
+                self.startup_error.get_or_insert_with(|| error.to_string());
+                Ok(true)
+            }
+        }
     }
 
     fn tty_name(&self) -> Option<&str> {
@@ -371,5 +378,44 @@ impl TerminalRuntime for StartingNativeTerminal {
             input,
             scroll_delta,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_error_is_reported_as_native_exit() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err("injected native startup failure".to_owned()))
+            .expect("startup receiver exists");
+        let geometry = TerminalGeometry {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let mut terminal = StartingNativeTerminal {
+            rx,
+            terminal: None,
+            geometry,
+            display_scale: 1.0,
+            render_cell: CellMetrics::new(10.0, 20.0),
+            pending_colors: None,
+            pending_cursor: None,
+            pending_features: None,
+            pending_commands: VecDeque::new(),
+            startup_error: None,
+        };
+
+        assert!(
+            TerminalRuntime::child_exited(&mut terminal)
+                .expect("startup failure is a terminal pane state")
+        );
+        assert!(
+            terminal.extract_frame().is_err(),
+            "failed native startup must not remain a placeholder runtime"
+        );
     }
 }

@@ -1,8 +1,20 @@
 use std::{
     collections::HashSet,
+    fs,
     path::{Path, PathBuf},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use anyhow::{Context, Result, bail};
 use bootty_mux::{
@@ -19,7 +31,56 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Deserialize, Serialize};
 use toml_edit::DocumentMut;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LeaseFileIdentity {
+    first: u64,
+    second: u64,
+}
+
+#[cfg(unix)]
+fn lease_metadata_identity(metadata: &fs::Metadata) -> LeaseFileIdentity {
+    LeaseFileIdentity {
+        first: metadata.dev(),
+        second: metadata.ino(),
+    }
+}
+
+#[cfg(windows)]
+fn lease_metadata_identity(metadata: &fs::Metadata) -> LeaseFileIdentity {
+    LeaseFileIdentity {
+        first: u64::from(metadata.volume_serial_number().unwrap_or_default()),
+        second: metadata.file_index().unwrap_or_default(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn lease_metadata_identity(metadata: &fs::Metadata) -> LeaseFileIdentity {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos() as u64)
+        .unwrap_or_default();
+    LeaseFileIdentity {
+        first: metadata.len(),
+        second: modified,
+    }
+}
+
+fn lease_path_identity(path: &Path) -> Option<LeaseFileIdentity> {
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| lease_metadata_identity(&metadata))
+}
+
+fn lease_path_matches(path: &Path, expected: LeaseFileIdentity) -> bool {
+    lease_path_identity(path) == Some(expected)
+}
+
 pub const CATALOG_VERSION: u32 = 3;
+const SESSION_RESERVATION_LEASE_SECONDS: i64 = 60;
+const SESSION_RESERVATION_RENEWAL_SECONDS: u64 = 20;
+static LEASE_TOMBSTONE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -111,6 +172,7 @@ struct LegacyConfig {
 
 pub struct Catalog {
     connection: Connection,
+    path: PathBuf,
 }
 
 /// A durable claim made before a backend can create a session.
@@ -139,7 +201,198 @@ impl SessionReservation {
         }
     }
 }
+struct SessionReservationLease {
+    stop: mpsc::Sender<()>,
+    healthy: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
 
+impl SessionReservationLease {
+    fn start(
+        path: &Path,
+        backend: Backend,
+        space_id: &str,
+        session_id: &str,
+        token: &str,
+    ) -> Result<Self> {
+        let lease_path = reservation_lease_path(path, token);
+        let owner_connection = Connection::open(&lease_path)
+            .with_context(|| format!("open session reservation lease {}", lease_path.display()))?;
+        let owner_identity = lease_path_identity(&lease_path)
+            .context("session reservation lease identity disappeared after open")?;
+        owner_connection.busy_timeout(Duration::ZERO)?;
+        owner_connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS owner_lock (id INTEGER PRIMARY KEY);
+             DELETE FROM owner_lock;
+             INSERT INTO owner_lock (id) VALUES (1);
+             BEGIN IMMEDIATE;",
+        )?;
+
+        let (stop, receiver) = mpsc::channel();
+        let healthy = Arc::new(AtomicBool::new(true));
+        let worker_healthy = Arc::clone(&healthy);
+        let catalog_path = path.to_owned();
+        let backend = backend.name().to_owned();
+        let space_id = space_id.to_owned();
+        let session_id = session_id.to_owned();
+        let token = token.to_owned();
+        let worker_lease_path = lease_path.clone();
+        let worker_identity = owner_identity;
+        let worker = std::thread::spawn(move || {
+            let owner_connection = owner_connection;
+            let connection = if let Ok(connection) = Connection::open(catalog_path) {
+                let _ = connection.busy_timeout(Duration::from_secs(5));
+                connection
+            } else {
+                // The owner lock remains held while the heartbeat connection is unavailable.
+                // Do not treat a transient catalog-open failure as proof of lease loss.
+                let _ = receiver.recv();
+                let tombstone = rename_lease_sidecar(&worker_lease_path, worker_identity);
+                drop(owner_connection);
+                remove_lease_tombstone(tombstone);
+                return;
+            };
+            let interval = Duration::from_secs(SESSION_RESERVATION_RENEWAL_SECONDS);
+            loop {
+                match receiver.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let tombstone = rename_lease_sidecar(&worker_lease_path, worker_identity);
+                        drop(owner_connection);
+                        remove_lease_tombstone(tombstone);
+                        break;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        let Ok(expires_at) = unix_timestamp().and_then(|now| {
+                            now.checked_add(SESSION_RESERVATION_LEASE_SECONDS)
+                                .context("session reservation lease overflow")
+                        }) else {
+                            // A local clock/overflow failure is not evidence that ownership
+                            // changed; leave the live owner lock as the liveness proof.
+                            continue;
+                        };
+                        if let Ok(updated) = connection.execute(
+                            "UPDATE remote_space_sessions
+                             SET reservation_expires_at = ?4
+                             WHERE backend = ?1 AND session_name = ?2
+                               AND state = 'reserved' AND reservation_token = ?3",
+                            params![backend, session_id, token, expires_at],
+                        ) {
+                            if updated > 0 {
+                                worker_healthy.store(true, Ordering::Release);
+                            } else {
+                                let ownership = connection
+                                    .query_row(
+                                        "SELECT space_id, state, reservation_token
+                                     FROM remote_space_sessions
+                                     WHERE backend = ?1 AND session_name = ?2",
+                                        params![backend, session_id],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, String>(0)?,
+                                                row.get::<_, String>(1)?,
+                                                row.get::<_, Option<String>>(2)?,
+                                            ))
+                                        },
+                                    )
+                                    .optional();
+                                match ownership {
+                                    Ok(Some((owner, state, row_token)))
+                                        if owner == space_id
+                                            && ((state == "active" && row_token.is_none())
+                                                || (state == "reserved"
+                                                    && row_token.as_deref()
+                                                        == Some(token.as_str()))) =>
+                                    {
+                                        // A concurrent authoritative snapshot may have already
+                                        // promoted this same owner's reservation.
+                                        worker_healthy.store(true, Ordering::Release);
+                                    }
+                                    Ok(Some(_) | None) => {
+                                        // The exact owner/token no longer exists.
+                                        worker_healthy.store(false, Ordering::Release);
+                                    }
+                                    Err(_) => {
+                                        // A busy/locked inspection is transient; retry later.
+                                    }
+                                }
+                            }
+                        } else {
+                            // Busy/locked and other I/O errors are transient. The next
+                            // interval retries while the owner lock continues protecting
+                            // the reservation from authoritative reclaim.
+                        }
+                    }
+                }
+            }
+        });
+        Ok(Self {
+            stop,
+            healthy,
+            worker: Some(worker),
+        })
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for SessionReservationLease {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct SessionOperationLease {
+    connection: Option<Connection>,
+    lease_path: PathBuf,
+    identity: LeaseFileIdentity,
+}
+
+impl SessionOperationLease {
+    fn start(path: &Path, backend: Backend, session_id: &str) -> Result<Self> {
+        let lease_path = session_operation_lease_path(path, backend, session_id);
+        let connection = Connection::open(&lease_path)
+            .with_context(|| format!("open session operation lease {}", lease_path.display()))?;
+        let identity = lease_path_identity(&lease_path)
+            .context("session operation lease identity disappeared after open")?;
+        connection.busy_timeout(Duration::ZERO)?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS owner_lock (id INTEGER PRIMARY KEY);
+             DELETE FROM owner_lock;
+             INSERT INTO owner_lock (id) VALUES (1);
+             BEGIN IMMEDIATE;",
+        )?;
+        Ok(Self {
+            connection: Some(connection),
+            lease_path,
+            identity,
+        })
+    }
+    fn start_many(path: &Path, backend: Backend, session_names: &[&str]) -> Result<Vec<Self>> {
+        let mut ordered = session_names.to_vec();
+        ordered.sort_unstable();
+        ordered.dedup();
+        let mut leases = Vec::with_capacity(ordered.len());
+        for session_name in ordered {
+            leases.push(Self::start(path, backend, session_name)?);
+        }
+        Ok(leases)
+    }
+}
+
+impl Drop for SessionOperationLease {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let tombstone = rename_lease_sidecar(&self.lease_path, self.identity);
+            drop(connection);
+            remove_lease_tombstone(tombstone);
+        }
+    }
+}
 impl Catalog {
     pub fn open(path: &Path) -> Result<Self> {
         let legacy = default_legacy_catalog();
@@ -160,6 +413,13 @@ impl Catalog {
              CREATE TABLE IF NOT EXISTS daemon_metadata (
                  key TEXT PRIMARY KEY
              );
+             CREATE TABLE IF NOT EXISTS catalog_revisions (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 revision INTEGER NOT NULL
+             );
+             INSERT INTO catalog_revisions (id, revision)
+             SELECT 1, 0
+             WHERE NOT EXISTS (SELECT 1 FROM catalog_revisions WHERE id = 1);
              CREATE TABLE IF NOT EXISTS remote_spaces (
                  id TEXT PRIMARY KEY,
                  name TEXT NOT NULL UNIQUE,
@@ -168,19 +428,55 @@ impl Catalog {
              );
              CREATE TABLE IF NOT EXISTS remote_space_sessions (
                  space_id TEXT NOT NULL REFERENCES remote_spaces(id) ON DELETE CASCADE,
-                 session_name TEXT NOT NULL UNIQUE,
+                 backend TEXT NOT NULL,
+                 session_name TEXT NOT NULL,
                  position INTEGER NOT NULL,
                  state TEXT NOT NULL DEFAULT 'active'
                      CHECK (state IN ('active', 'reserved')),
                  reservation_token TEXT,
+                 ownership_revision INTEGER NOT NULL DEFAULT 0,
+                 reservation_expires_at INTEGER,
                  CHECK (
-                     (state = 'active' AND reservation_token IS NULL)
-                     OR (state = 'reserved' AND reservation_token IS NOT NULL)
+                     (state = 'active' AND reservation_token IS NULL
+                         AND reservation_expires_at IS NULL)
+                     OR (state = 'reserved' AND reservation_token IS NOT NULL
+                         AND reservation_expires_at IS NOT NULL)
                  ),
+                 UNIQUE (backend, session_name),
                  PRIMARY KEY (space_id, session_name)
+             );
+             CREATE TABLE IF NOT EXISTS remote_space_session_intents (
+                 token TEXT PRIMARY KEY,
+                 space_id TEXT NOT NULL REFERENCES remote_spaces(id) ON DELETE CASCADE,
+                 backend TEXT NOT NULL,
+                 kind TEXT NOT NULL CHECK (kind IN ('rename', 'ditch')),
+                 old_name TEXT NOT NULL,
+                 new_name TEXT,
+                 ownership_revision INTEGER NOT NULL,
+                 intent_revision INTEGER NOT NULL,
+                 CHECK (
+                     (kind = 'rename' AND new_name IS NOT NULL)
+                     OR (kind = 'ditch' AND new_name IS NULL)
+                 ),
+                 UNIQUE (backend, old_name)
+             );
+             CREATE TABLE IF NOT EXISTS remote_space_session_conflicts (
+                 id INTEGER PRIMARY KEY,
+                 source_rowid INTEGER NOT NULL,
+                 space_id TEXT NOT NULL,
+                 backend TEXT NOT NULL,
+                 session_name TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 state TEXT NOT NULL,
+                 reservation_token TEXT,
+                 reservation_expires_at INTEGER,
+                 reason TEXT NOT NULL
              );",
         )?;
-        let mut catalog = Self { connection };
+        let mut catalog = Self {
+            connection,
+            path: path.to_owned(),
+        };
         catalog.migrate_session_ownership_schema()?;
         catalog.migrate_legacy(legacy)?;
         Ok(catalog)
@@ -188,20 +484,47 @@ impl Catalog {
 
     /// Upgrades the original per-Space membership table into the durable ownership ledger.
     ///
-    /// The old composite key allowed two Spaces to claim the same backend session. Rebuilding is
-    /// necessary because `SQLite` cannot add a unique table constraint in place. If old data is
-    /// already conflicted, the first Space in catalog order retains the legacy claim.
+    /// Ownership is unique within a backend namespace, not across unrelated backends. The
+    /// rebuild is necessary because `SQLite` cannot add or remove a table constraint in place.
+    /// Same-backend legacy conflicts retain the catalog-order winner in the live ledger and keep
+    /// every losing claim in a durable conflict archive instead of silently dropping it.
     fn migrate_session_ownership_schema(&mut self) -> Result<()> {
-        let has_state = table_has_column(&self.connection, "remote_space_sessions", "state")?;
-        let has_reservation_token = table_has_column(
-            &self.connection,
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_backend = table_has_column(&transaction, "remote_space_sessions", "backend")?;
+        let has_state = table_has_column(&transaction, "remote_space_sessions", "state")?;
+        let has_reservation_token =
+            table_has_column(&transaction, "remote_space_sessions", "reservation_token")?;
+        let has_reservation_expires_at = table_has_column(
+            &transaction,
             "remote_space_sessions",
-            "reservation_token",
+            "reservation_expires_at",
         )?;
-        if has_state
+        let has_ownership_revision =
+            table_has_column(&transaction, "remote_space_sessions", "ownership_revision")?;
+        if has_backend
+            && has_state
             && has_reservation_token
-            && table_has_unique_column(&self.connection, "remote_space_sessions", "session_name")?
+            && has_reservation_expires_at
+            && has_ownership_revision
+            && table_has_unique_columns(
+                &transaction,
+                "remote_space_sessions",
+                &["backend", "session_name"],
+            )?
+            && !table_has_unique_columns(&transaction, "remote_space_sessions", &["session_name"])?
         {
+            transaction.execute(
+                "UPDATE catalog_revisions
+                 SET revision = MAX(
+                     revision,
+                     COALESCE((SELECT MAX(ownership_revision) FROM remote_space_sessions), 0)
+                 )
+                 WHERE id = 1",
+                [],
+            )?;
+            transaction.commit()?;
             return Ok(());
         }
 
@@ -215,30 +538,23 @@ impl Catalog {
         } else {
             "NULL"
         };
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source_expires_at = if has_reservation_expires_at {
+            "sessions.reservation_expires_at"
+        } else {
+            "NULL"
+        };
+        let source_ownership_revision = if has_ownership_revision {
+            "COALESCE(sessions.ownership_revision, 0)"
+        } else {
+            "0"
+        };
         transaction.execute_batch(
-            "ALTER TABLE remote_space_sessions RENAME TO remote_space_sessions_legacy;
-             CREATE TABLE remote_space_sessions (
-                 space_id TEXT NOT NULL REFERENCES remote_spaces(id) ON DELETE CASCADE,
-                 session_name TEXT NOT NULL UNIQUE,
-                 position INTEGER NOT NULL,
-                 state TEXT NOT NULL DEFAULT 'active'
-                     CHECK (state IN ('active', 'reserved')),
-                 reservation_token TEXT,
-                 CHECK (
-                     (state = 'active' AND reservation_token IS NULL)
-                     OR (state = 'reserved' AND reservation_token IS NOT NULL)
-                 ),
-                 PRIMARY KEY (space_id, session_name)
-             );",
+            "ALTER TABLE remote_space_sessions RENAME TO remote_space_sessions_legacy;",
         )?;
-        transaction.execute(
-            &format!(
-                "INSERT OR IGNORE INTO remote_space_sessions
-                     (space_id, session_name, position, state, reservation_token)
-                 SELECT sessions.space_id,
+        let legacy_rows = {
+            let mut statement = transaction.prepare(&format!(
+                "SELECT sessions.space_id,
+                        spaces.backend,
                         sessions.session_name,
                         sessions.position,
                         CASE
@@ -250,11 +566,128 @@ impl Catalog {
                             WHEN {source_state} = 'reserved' AND {source_token} IS NOT NULL
                                 THEN {source_token}
                             ELSE NULL
-                        END
+                        END,
+                        CASE
+                            WHEN {source_state} = 'reserved' AND {source_token} IS NOT NULL
+                                THEN COALESCE(
+                                    {source_expires_at},
+                                    CAST(strftime('%s', 'now') AS INTEGER)
+                                        + {SESSION_RESERVATION_LEASE_SECONDS}
+                                )
+                            ELSE NULL
+                        END,
+                        {source_ownership_revision},
+                        sessions.rowid
                  FROM remote_space_sessions_legacy AS sessions
                  JOIN remote_spaces AS spaces ON spaces.id = sessions.space_id
                  ORDER BY spaces.position, spaces.id, sessions.position, sessions.rowid"
-            ),
+            ))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        transaction.execute_batch(
+            "CREATE TABLE remote_space_sessions (
+                 space_id TEXT NOT NULL REFERENCES remote_spaces(id) ON DELETE CASCADE,
+                 backend TEXT NOT NULL,
+                 session_name TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 state TEXT NOT NULL DEFAULT 'active'
+                     CHECK (state IN ('active', 'reserved')),
+                 reservation_token TEXT,
+                 reservation_expires_at INTEGER,
+                 ownership_revision INTEGER NOT NULL DEFAULT 0,
+                 CHECK (
+                     (state = 'active' AND reservation_token IS NULL
+                         AND reservation_expires_at IS NULL)
+                     OR (state = 'reserved' AND reservation_token IS NOT NULL
+                         AND reservation_expires_at IS NOT NULL)
+                 ),
+                 UNIQUE (backend, session_name),
+                 PRIMARY KEY (space_id, session_name)
+             );
+             CREATE TABLE IF NOT EXISTS remote_space_session_conflicts (
+                 id INTEGER PRIMARY KEY,
+                 source_rowid INTEGER NOT NULL,
+                 space_id TEXT NOT NULL,
+                 backend TEXT NOT NULL,
+                 session_name TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 state TEXT NOT NULL,
+                 reservation_token TEXT,
+                 reservation_expires_at INTEGER,
+                 reason TEXT NOT NULL
+             );",
+        )?;
+        let mut owned = HashSet::new();
+        for (
+            space_id,
+            backend,
+            session_name,
+            position,
+            state,
+            reservation_token,
+            reservation_expires_at,
+            ownership_revision,
+            source_rowid,
+        ) in legacy_rows
+        {
+            if owned.insert((backend.clone(), session_name.clone())) {
+                transaction.execute(
+                    "INSERT INTO remote_space_sessions
+                         (space_id, backend, session_name, position, state,
+                          reservation_token, reservation_expires_at, ownership_revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        space_id,
+                        backend,
+                        session_name,
+                        position,
+                        state,
+                        reservation_token,
+                        reservation_expires_at,
+                        ownership_revision
+                    ],
+                )?;
+            } else {
+                transaction.execute(
+                    "INSERT INTO remote_space_session_conflicts
+                         (source_rowid, space_id, backend, session_name, position, state,
+                          reservation_token, reservation_expires_at, reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        source_rowid,
+                        space_id,
+                        backend,
+                        session_name,
+                        position,
+                        state,
+                        reservation_token,
+                        reservation_expires_at,
+                        "duplicate backend/session ownership during catalog migration"
+                    ],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE catalog_revisions
+             SET revision = MAX(
+                 revision,
+                 COALESCE((SELECT MAX(ownership_revision) FROM remote_space_sessions), 0)
+             )
+             WHERE id = 1",
             [],
         )?;
         transaction.execute_batch("DROP TABLE remote_space_sessions_legacy;")?;
@@ -263,19 +696,21 @@ impl Catalog {
     }
 
     fn migrate_legacy(&mut self, legacy: Option<&LegacyCatalog>) -> Result<()> {
-        let migrated = self.connection.query_row(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let migrated = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM daemon_metadata WHERE key = 'legacy_catalog_migrated')",
             [],
             |row| row.get::<_, bool>(0),
         )?;
         if migrated {
+            transaction.commit()?;
             return Ok(());
         }
-        let empty =
-            self.connection
-                .query_row("SELECT COUNT(*) = 0 FROM remote_spaces", [], |row| {
-                    row.get::<_, bool>(0)
-                })?;
+        let empty = transaction.query_row("SELECT COUNT(*) = 0 FROM remote_spaces", [], |row| {
+            row.get::<_, bool>(0)
+        })?;
         if empty && let Some(legacy) = legacy.filter(|legacy| legacy.path.is_file()) {
             let legacy_connection = Connection::open(&legacy.path)
                 .with_context(|| format!("open legacy remote catalog {}", legacy.path.display()))?;
@@ -317,7 +752,7 @@ impl Catalog {
                     })?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 drop(statement);
-                let transaction = self.connection.transaction()?;
+                let mut owned_sessions = HashSet::new();
                 for (id, name, stored_backend, position, binding_id) in rows {
                     let backend = if stored_backend == "inherit" {
                         legacy.inherited_backend
@@ -338,21 +773,42 @@ impl Catalog {
                                 .into_iter()
                                 .enumerate()
                         {
-                            transaction.execute(
-                                "INSERT OR IGNORE INTO remote_space_sessions
-                                 (space_id, session_name, position) VALUES (?1, ?2, ?3)",
-                                params![id, session_name, i64::try_from(session_position)?],
-                            )?;
+                            let position = i64::try_from(session_position)?;
+                            if owned_sessions
+                                .insert((backend.name().to_owned(), session_name.clone()))
+                            {
+                                transaction.execute(
+                                    "INSERT INTO remote_space_sessions
+                                     (space_id, backend, session_name, position)
+                                     VALUES (?1, ?2, ?3, ?4)",
+                                    params![id, backend.name(), session_name, position],
+                                )?;
+                            } else {
+                                transaction.execute(
+                                    "INSERT INTO remote_space_session_conflicts
+                                     (source_rowid, space_id, backend, session_name, position,
+                                      state, reason)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+                                    params![
+                                        position,
+                                        id,
+                                        backend.name(),
+                                        session_name,
+                                        position,
+                                        "duplicate backend/session ownership during legacy app migration"
+                                    ],
+                                )?;
+                            }
                         }
                     }
                 }
-                transaction.commit()?;
             }
         }
-        self.connection.execute(
-            "INSERT INTO daemon_metadata (key) VALUES ('legacy_catalog_migrated')",
+        transaction.execute(
+            "INSERT OR IGNORE INTO daemon_metadata (key) VALUES ('legacy_catalog_migrated')",
             [],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -382,7 +838,9 @@ impl Catalog {
         if requested_name.is_empty() {
             bail!("remote Space name cannot be empty")
         }
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut names = transaction.prepare("SELECT name FROM remote_spaces")?;
         let existing = names
             .query_map([], |row| row.get::<_, String>(0))?
@@ -416,16 +874,114 @@ impl Catalog {
         })
     }
 
-    pub fn snapshot(&mut self, space_id: &str, expected: Backend) -> Result<MuxSnapshot> {
-        let backend = self.space_backend(space_id, expected)?;
-        // The write transaction is the serialization boundary for the backend snapshot and its
-        // ledger reconciliation. A concurrent creator cannot finalize an ownership row between
-        // observing the backend and pruning a missing record.
+    fn begin_session_intent(
+        &mut self,
+        backend: Backend,
+        space_id: &str,
+        kind: &str,
+        old_name: &str,
+        new_name: Option<&str>,
+        ownership_revision: i64,
+    ) -> Result<String> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let intent_revision = Self::next_catalog_revision(&transaction)?;
+        let token = transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+        transaction.execute(
+            "INSERT INTO remote_space_session_intents
+             (token, space_id, backend, kind, old_name, new_name,
+              ownership_revision, intent_revision)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                token,
+                space_id,
+                backend.name(),
+                kind,
+                old_name,
+                new_name,
+                ownership_revision,
+                intent_revision
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(token)
+    }
+
+    fn clear_session_intent(transaction: &Transaction<'_>, token: &str) -> Result<()> {
+        let deleted = transaction.execute(
+            "DELETE FROM remote_space_session_intents WHERE token = ?1",
+            [token],
+        )?;
+        if deleted != 1 {
+            bail!("session mutation intent disappeared before finalization");
+        }
+        Ok(())
+    }
+    fn clear_recovered_session_intent(
+        transaction: &Transaction<'_>,
+        catalog_path: &Path,
+        backend: Backend,
+        token: &str,
+        old_name: &str,
+        new_name: Option<&str>,
+    ) -> Result<()> {
+        Self::clear_session_intent(transaction, token)?;
+        let mut names = vec![old_name];
+        if let Some(new_name) = new_name {
+            names.push(new_name);
+        }
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            remove_stale_session_operation_lease(catalog_path, backend, name)?;
+        }
+        Ok(())
+    }
+
+    fn catalog_revision(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT revision FROM catalog_revisions WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("catalog revision row is missing")
+    }
+
+    fn next_catalog_revision(transaction: &Transaction<'_>) -> Result<i64> {
+        transaction.execute(
+            "UPDATE catalog_revisions SET revision = revision + 1 WHERE id = 1",
+            [],
+        )?;
+        transaction
+            .query_row(
+                "SELECT revision FROM catalog_revisions WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("catalog revision row is missing")
+    }
+
+    pub fn snapshot(&mut self, space_id: &str, expected: Backend) -> Result<MuxSnapshot> {
+        let backend = self.space_backend(space_id, expected)?;
+        let observed_revision = self.catalog_revision()?;
+        // Backend I/O stays outside SQLite write transactions. Reconciliation serializes the
+        // authoritative observation after it returns, without blocking lease renewals while a
+        // remote snapshot is slow.
         let mut snapshot = backend.snapshot()?;
-        Self::reconcile_backend_sessions(&transaction, backend, &snapshot)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::reconcile_backend_sessions(
+            &transaction,
+            &self.path,
+            backend,
+            &snapshot,
+            observed_revision,
+        )?;
         let owned = Self::session_names_in(&transaction, space_id)?;
         transaction.commit()?;
         snapshot
@@ -463,58 +1019,247 @@ impl Catalog {
         space_id: &str,
         command: MuxCommand,
         preflight: Preflight,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         execute: Execute,
     ) -> Result<Option<MuxBackendCommandCompletion>>
     where
         Preflight: FnOnce(&MuxCommand) -> Result<()>,
-        Snapshot: FnOnce() -> Result<MuxSnapshot>,
+        Snapshot: FnMut() -> Result<MuxSnapshot>,
         Execute: FnOnce(MuxCommand) -> Result<Option<MuxBackendCommandCompletion>>,
     {
         // The launch plan and backend capability are untrusted remote input. Do this before
         // taking a snapshot, which can start a backend process, and before every mutation.
         preflight(&command)?;
-        // Keep the ownership ledger locked from immediately before the snapshot until the
-        // reservation is durable. This is SQLite serialization, not a process-local mutex.
+        // Backend I/O stays outside SQLite write transactions so a slow remote cannot block
+        // reservation lease renewal or a competing catalog operation.
+        let observed_revision = self.catalog_revision()?;
+        let initial_snapshot = snapshot()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let snapshot = snapshot()?;
         let created_session = created_session_id(&command).map(str::to_owned);
         let (owned_name, reservation) = if let Some(session_id) = created_session.as_deref() {
             (
                 None,
                 Some(Self::prepare_create_session_in_transaction(
                     &transaction,
+                    &self.path,
                     space_id,
                     backend,
                     session_id,
-                    &snapshot,
+                    &initial_snapshot,
+                    observed_revision,
                 )?),
             )
         } else {
-            Self::reconcile_backend_sessions(&transaction, backend, &snapshot)?;
+            Self::reconcile_backend_sessions(
+                &transaction,
+                &self.path,
+                backend,
+                &initial_snapshot,
+                observed_revision,
+            )?;
             let owned = Self::session_names_in(&transaction, space_id)?;
             (
-                resolve_owned_session_name(&snapshot, &owned, &command, space_id)?,
+                resolve_owned_session_name(&initial_snapshot, &owned, &command, space_id)?,
                 None,
             )
         };
+        let owned_revision = owned_name
+            .as_deref()
+            .map(|name| {
+                transaction.query_row(
+                    "SELECT ownership_revision
+                     FROM remote_space_sessions
+                     WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3",
+                    params![space_id, backend.name(), name],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .transpose()?;
         transaction.commit()?;
-        if matches!(&reservation, Some(SessionReservation::ExistingActive)) {
-            // A completed same-Space request is idempotent. Do not ask the backend to create a
-            // duplicate session merely to repeat the request.
-            return Ok(None);
+        match &reservation {
+            Some(SessionReservation::ExistingActive) => {
+                // A completed same-Space request is idempotent. Do not ask the backend to create
+                // a duplicate session merely to repeat the request.
+                return Ok(None);
+            }
+            Some(SessionReservation::ExistingReserved { .. }) => {
+                bail!("session creation is already in progress for this remote Space");
+            }
+            Some(SessionReservation::Acquired { .. }) | None => {}
         }
+        let mut reservation_lease =
+            match reservation.as_ref().and_then(SessionReservation::new_token) {
+                Some(token) => {
+                    let session_id = created_session
+                        .as_deref()
+                        .context("created session reservation has no session id")?;
+                    match SessionReservationLease::start(
+                        &self.path, backend, space_id, session_id, token,
+                    ) {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            let rollback_result = self
+                                .rollback_session_reservation(backend, space_id, session_id, token);
+                            if let Err(rollback_error) = rollback_result {
+                                return Err(error.context(format!(
+                                "reservation lease startup failed and exact reservation rollback \
+                                 failed; ownership remains reserved: {rollback_error:#}"
+                            )));
+                            }
+                            match reservation_owner_is_live(&self.path, token) {
+                                Ok(false) => {}
+                                Ok(true) => {
+                                    return Err(error.context(
+                                    "reservation lease startup failed; owner lease remains live \
+                                     after rollback",
+                                ));
+                                }
+                                Err(cleanup_error) => {
+                                    return Err(error.context(format!(
+                                        "reservation lease startup rollback succeeded but lease \
+                                     cleanup failed: {cleanup_error:#}"
+                                    )));
+                                }
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                None => None,
+            };
+        if let (Some(session_id), Some(token)) = (
+            created_session.as_deref(),
+            reservation.as_ref().and_then(SessionReservation::new_token),
+        ) && let Err(error) = self.renew_session_reservation(backend, session_id, token)
+        {
+            let rollback_result =
+                self.rollback_session_reservation(backend, space_id, session_id, token);
+            drop(reservation_lease.take());
+            let cleanup_result = reservation_owner_is_live(&self.path, token);
+            if let Err(rollback_error) = rollback_result {
+                return Err(error.context(format!(
+                    "reservation renewal failed and exact reservation rollback failed; \
+                     ownership remains reserved: {rollback_error:#}"
+                )));
+            }
+            match cleanup_result {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(error.context(
+                        "reservation renewal failed and owner lease cleanup remains \
+                         indeterminate",
+                    ));
+                }
+                Err(cleanup_error) => {
+                    return Err(error.context(format!(
+                        "reservation renewal rollback succeeded but lease cleanup failed: \
+                         {cleanup_error:#}"
+                    )));
+                }
+            }
+            return Err(error);
+        }
+
+        let mut operation_names = Vec::new();
+        if let Some(old_name) = owned_name.as_deref() {
+            operation_names.push(old_name);
+            if let MuxCommand::RenameSession { name, .. } = &command {
+                operation_names.push(name.as_str());
+            }
+        }
+        let _operation_leases = if operation_names.is_empty() {
+            None
+        } else {
+            Some(SessionOperationLease::start_many(
+                &self.path,
+                backend,
+                &operation_names,
+            )?)
+        };
+        if let Some(session_name) = owned_name.as_deref() {
+            let expected_revision =
+                owned_revision.context("owned session revision is unavailable")?;
+            self.verify_session_ownership(backend, space_id, session_name, expected_revision)?;
+        }
+        if let (Some(old_name), MuxCommand::RenameSession { name, .. }) =
+            (owned_name.as_deref(), &command)
+        {
+            self.verify_session_rename_target(backend, old_name, name)?;
+        }
+
+        let operation_intent = match (&command, owned_name.as_deref(), owned_revision) {
+            (MuxCommand::RenameSession { name, .. }, Some(old_name), Some(revision)) => {
+                Some(self.begin_session_intent(
+                    backend,
+                    space_id,
+                    "rename",
+                    old_name,
+                    Some(name),
+                    revision,
+                )?)
+            }
+            (MuxCommand::DitchSession { .. }, Some(old_name), Some(revision)) => Some(
+                self.begin_session_intent(backend, space_id, "ditch", old_name, None, revision)?,
+            ),
+            _ => None,
+        };
 
         let completion = match execute(command.clone()) {
             Ok(completion) => completion,
             Err(error) => {
-                if let Some(session_id) = created_session.as_deref()
-                    && let Some(token) =
-                        reservation.as_ref().and_then(SessionReservation::new_token)
-                    && let Err(rollback_error) =
-                        self.rollback_session_reservation(space_id, session_id, token)
+                let Some(session_id) = created_session.as_deref() else {
+                    return Err(error);
+                };
+                let Some(reservation) = reservation.as_ref() else {
+                    return Err(error);
+                };
+                if reservation_lease
+                    .as_ref()
+                    .is_some_and(|lease| !lease.is_healthy())
+                {
+                    return Err(error.context(
+                        "backend session create failed after its catalog reservation lease was \
+                         lost; ownership remains reserved",
+                    ));
+                }
+                let Some(token) = reservation.new_token() else {
+                    return Err(error);
+                };
+                let post_snapshot = match snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(snapshot_error) => {
+                        return Err(error.context(format!(
+                            "backend session create failed and authoritative post-failure \
+                             snapshot failed; ownership remains reserved: {snapshot_error:#}"
+                        )));
+                    }
+                };
+                if post_snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session_matches(session, session_id))
+                {
+                    if let Err(finalize_error) = self.finalize_session_reservation(
+                        backend,
+                        space_id,
+                        session_id,
+                        reservation,
+                    ) {
+                        return Err(error.context(format!(
+                            "backend session create failed after an authoritative snapshot \
+                             observed the session; catalog finalization failed and ownership \
+                             remains reserved: {finalize_error:#}"
+                        )));
+                    }
+                    return Err(error.context(
+                        "backend session create failed after an authoritative snapshot observed \
+                         the session; ownership was retained for reconciliation",
+                    ));
+                }
+                if let Err(rollback_error) =
+                    self.rollback_session_reservation(backend, space_id, session_id, token)
                 {
                     return Err(error.context(format!(
                         "backend session create failed and catalog reservation rollback failed; \
@@ -524,11 +1269,17 @@ impl Catalog {
                 return Err(error);
             }
         };
+        if reservation_lease
+            .as_ref()
+            .is_some_and(|lease| !lease.is_healthy())
+        {
+            bail!("backend session reservation lease was lost; ownership remains reserved");
+        }
 
         if let (Some(session_id), Some(reservation)) =
             (created_session.as_deref(), reservation.as_ref())
         {
-            self.finalize_session_reservation(space_id, session_id, reservation)
+            self.finalize_session_reservation(backend, space_id, session_id, reservation)
                 .with_context(|| {
                     format!(
                         "backend created remote session {session_id}, but catalog finalization \
@@ -539,12 +1290,35 @@ impl Catalog {
             match command {
                 MuxCommand::RenameSession { name, .. } => {
                     if let Some(old_name) = owned_name {
-                        self.rename_session(space_id, &old_name, &name)?;
+                        let expected_revision =
+                            owned_revision.context("owned session revision is unavailable")?;
+                        let intent_token = operation_intent
+                            .as_deref()
+                            .context("rename operation intent is unavailable")?;
+                        self.rename_session(
+                            backend,
+                            space_id,
+                            &old_name,
+                            &name,
+                            expected_revision,
+                            intent_token,
+                        )?;
                     }
                 }
                 MuxCommand::DitchSession { .. } => {
                     if let Some(name) = owned_name {
-                        self.remove_session(space_id, &name)?;
+                        let expected_revision =
+                            owned_revision.context("owned session revision is unavailable")?;
+                        let intent_token = operation_intent
+                            .as_deref()
+                            .context("ditch operation intent is unavailable")?;
+                        self.remove_session(
+                            backend,
+                            space_id,
+                            &name,
+                            expected_revision,
+                            intent_token,
+                        )?;
                     }
                 }
                 _ => {}
@@ -561,28 +1335,38 @@ impl Catalog {
         session_id: &str,
         snapshot: &MuxSnapshot,
     ) -> Result<SessionReservation> {
+        let observed_revision = self.catalog_revision()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let reservation = Self::prepare_create_session_in_transaction(
             &transaction,
+            &self.path,
             space_id,
             backend,
             session_id,
             snapshot,
+            observed_revision,
         )?;
         transaction.commit()?;
         Ok(reservation)
     }
-
     fn prepare_create_session_in_transaction(
         transaction: &Transaction<'_>,
+        catalog_path: &Path,
         space_id: &str,
         backend: Backend,
         session_id: &str,
         snapshot: &MuxSnapshot,
+        observed_revision: i64,
     ) -> Result<SessionReservation> {
-        Self::reconcile_backend_sessions(transaction, backend, snapshot)?;
+        Self::reconcile_backend_sessions(
+            transaction,
+            catalog_path,
+            backend,
+            snapshot,
+            observed_revision,
+        )?;
         let owned = Self::session_names_in(transaction, space_id)?;
         if snapshot
             .sessions
@@ -591,7 +1375,10 @@ impl Catalog {
         {
             bail!("session already belongs to another remote Space")
         }
-        Self::reserve_session_ownership(transaction, space_id, session_id)
+        if session_operation_owner_is_live(catalog_path, backend, session_id)? {
+            bail!("session operation is already in progress for this backend session");
+        }
+        Self::reserve_session_ownership(transaction, space_id, backend, session_id)
     }
 
     fn space_backend(&self, space_id: &str, expected: Backend) -> Result<Backend> {
@@ -634,25 +1421,225 @@ impl Catalog {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Reconciles every Space that addresses the same backend. A session name is globally owned,
-    /// but only an authoritative snapshot from its matching backend may expire an active claim.
-    /// Pending reservations survive a negative snapshot and become active only once observed.
-    fn reconcile_backend_sessions(
+    fn recover_session_intents(
         transaction: &Transaction<'_>,
+        catalog_path: &Path,
         backend: Backend,
         snapshot: &MuxSnapshot,
-    ) -> Result<()> {
+        observed_revision: i64,
+    ) -> Result<HashSet<String>> {
         let alive = snapshot
             .sessions
             .iter()
             .map(|session| session.name.as_str())
             .collect::<HashSet<_>>();
+        let mut statement = transaction.prepare(
+            "SELECT token, space_id, kind, old_name, new_name,
+                    ownership_revision, intent_revision
+             FROM remote_space_session_intents
+             WHERE backend = ?1
+             ORDER BY token",
+        )?;
+        let intents = statement
+            .query_map([backend.name()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        let mut protected = HashSet::new();
+        for (token, space_id, kind, old_name, new_name, ownership_revision, intent_revision) in
+            intents
+        {
+            let operation_owner_live = if intent_revision > observed_revision {
+                false
+            } else {
+                session_operation_owner_is_live(catalog_path, backend, &old_name)?
+                    || new_name
+                        .as_deref()
+                        .map(|name| session_operation_owner_is_live(catalog_path, backend, name))
+                        .transpose()?
+                        .unwrap_or(false)
+            };
+            if intent_revision > observed_revision || operation_owner_live {
+                protected.insert(old_name);
+                if let Some(new_name) = new_name {
+                    protected.insert(new_name);
+                }
+                continue;
+            }
+            let old_alive = alive.contains(old_name.as_str());
+            match (kind.as_str(), new_name.as_deref(), old_alive) {
+                ("ditch", None, false) => {
+                    transaction.execute(
+                        "DELETE FROM remote_space_sessions
+                         WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                           AND state = 'active' AND ownership_revision = ?4",
+                        params![space_id, backend.name(), old_name, ownership_revision],
+                    )?;
+                    Self::clear_recovered_session_intent(
+                        transaction,
+                        catalog_path,
+                        backend,
+                        &token,
+                        &old_name,
+                        None,
+                    )?;
+                }
+                ("ditch", None, true) => {
+                    Self::clear_recovered_session_intent(
+                        transaction,
+                        catalog_path,
+                        backend,
+                        &token,
+                        &old_name,
+                        None,
+                    )?;
+                }
+                ("rename", Some(new_name), true) if !alive.contains(new_name) => {
+                    Self::clear_recovered_session_intent(
+                        transaction,
+                        catalog_path,
+                        backend,
+                        &token,
+                        &old_name,
+                        Some(new_name),
+                    )?;
+                }
+                ("rename", Some(new_name), false) if !alive.contains(new_name) => {
+                    let (source_rowid, position) = transaction
+                        .query_row(
+                            "SELECT rowid, position FROM remote_space_sessions
+                             WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                               AND state = 'active' AND ownership_revision = ?4",
+                            params![space_id, backend.name(), old_name, ownership_revision],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .optional()?
+                        .unwrap_or((ownership_revision, 0));
+                    transaction.execute(
+                        "DELETE FROM remote_space_sessions
+                         WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                           AND state = 'active' AND ownership_revision = ?4",
+                        params![space_id, backend.name(), old_name, ownership_revision],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO remote_space_session_conflicts
+                         (source_rowid, space_id, backend, session_name, position,
+                          state, reason)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6)",
+                        params![
+                            source_rowid,
+                            space_id,
+                            backend.name(),
+                            old_name,
+                            position,
+                            "authoritative_absent mutation intent recovery"
+                        ],
+                    )?;
+                    Self::clear_recovered_session_intent(
+                        transaction,
+                        catalog_path,
+                        backend,
+                        &token,
+                        &old_name,
+                        Some(new_name),
+                    )?;
+                }
+                ("rename", Some(new_name), false) if alive.contains(new_name) => {
+                    let target_exists = transaction
+                        .query_row(
+                            "SELECT 1 FROM remote_space_sessions
+                             WHERE backend = ?1 AND session_name = ?2",
+                            params![backend.name(), new_name],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        .is_some();
+                    if target_exists {
+                        protected.insert(old_name);
+                        protected.insert(new_name.to_owned());
+                        continue;
+                    }
+                    let revision = Self::next_catalog_revision(transaction)?;
+                    let updated = transaction.execute(
+                        "UPDATE remote_space_sessions
+                         SET session_name = ?4, ownership_revision = ?5
+                         WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                           AND state = 'active' AND ownership_revision = ?6",
+                        params![
+                            space_id,
+                            backend.name(),
+                            old_name,
+                            new_name,
+                            revision,
+                            ownership_revision
+                        ],
+                    )?;
+                    if updated == 1 {
+                        Self::clear_recovered_session_intent(
+                            transaction,
+                            catalog_path,
+                            backend,
+                            &token,
+                            &old_name,
+                            Some(new_name),
+                        )?;
+                    } else {
+                        protected.insert(old_name);
+                        protected.insert(new_name.to_owned());
+                    }
+                }
+                _ => {
+                    protected.insert(old_name);
+                    if let Some(new_name) = new_name {
+                        protected.insert(new_name);
+                    }
+                }
+            }
+        }
+        Ok(protected)
+    }
+
+    /// Reconciles every Space that addresses the same backend. A session name is owned within
+    /// that backend namespace, and only an authoritative snapshot from the matching backend may
+    /// expire an active claim. A committed reservation survives a negative snapshot while its
+    /// owner lease is live; after the owner dies, its expired reservation is reclaimable.
+    fn reconcile_backend_sessions(
+        transaction: &Transaction<'_>,
+        catalog_path: &Path,
+        backend: Backend,
+        snapshot: &MuxSnapshot,
+        observed_revision: i64,
+    ) -> Result<()> {
+        let protected_names = Self::recover_session_intents(
+            transaction,
+            catalog_path,
+            backend,
+            snapshot,
+            observed_revision,
+        )?;
+        let alive = snapshot
+            .sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<HashSet<_>>();
+        let now = unix_timestamp()?;
         let sessions = {
             let mut statement = transaction.prepare(
-                "SELECT sessions.space_id, sessions.session_name, sessions.state
+                "SELECT sessions.space_id, sessions.backend, sessions.session_name,
+                        sessions.state, sessions.reservation_token,
+                        sessions.reservation_expires_at, sessions.ownership_revision
                  FROM remote_space_sessions AS sessions
                  JOIN remote_spaces AS spaces ON spaces.id = sessions.space_id
-                 WHERE spaces.backend = ?1
+                 WHERE sessions.backend = ?1 AND spaces.backend = ?1
                  ORDER BY spaces.position, spaces.id, sessions.position",
             )?;
             statement
@@ -661,25 +1648,77 @@ impl Catalog {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, i64>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (space_id, name, state) in sessions {
+        for (
+            space_id,
+            row_backend,
+            name,
+            state,
+            reservation_token,
+            reservation_expires_at,
+            row_revision,
+        ) in sessions
+        {
+            let eligible =
+                row_revision <= observed_revision && !protected_names.contains(name.as_str());
+            let expired_absent_reservation = eligible
+                && state == "reserved"
+                && !alive.contains(name.as_str())
+                && reservation_expires_at.is_some_and(|expires_at| expires_at <= now)
+                && reservation_token
+                    .as_deref()
+                    .map(|token| reservation_owner_is_live(catalog_path, token).map(|live| !live))
+                    .transpose()?
+                    .unwrap_or(false);
             match state.as_str() {
-                "active" if !alive.contains(name.as_str()) => {
+                "active"
+                    if eligible
+                        && !alive.contains(name.as_str())
+                        && !session_operation_owner_is_live(catalog_path, backend, &name)? =>
+                {
                     transaction.execute(
                         "DELETE FROM remote_space_sessions
-                         WHERE space_id = ?1 AND session_name = ?2 AND state = 'active'",
-                        params![space_id, name],
+                         WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                           AND state = 'active' AND ownership_revision = ?4",
+                        params![space_id, row_backend, name, row_revision],
                     )?;
+                    let _revision = Self::next_catalog_revision(transaction)?;
                 }
-                "reserved" if alive.contains(name.as_str()) => {
+                "reserved" if eligible && alive.contains(name.as_str()) => {
+                    let revision = Self::next_catalog_revision(transaction)?;
                     transaction.execute(
                         "UPDATE remote_space_sessions
-                         SET state = 'active', reservation_token = NULL
-                         WHERE space_id = ?1 AND session_name = ?2 AND state = 'reserved'",
-                        params![space_id, name],
+                         SET state = 'active', reservation_token = NULL,
+                             reservation_expires_at = NULL, ownership_revision = ?4
+                         WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                           AND state = 'reserved' AND ownership_revision = ?5",
+                        params![space_id, row_backend, name, revision, row_revision],
+                    )?;
+                }
+                "reserved" if expired_absent_reservation => {
+                    let _revision = Self::next_catalog_revision(transaction)?;
+                    transaction.execute(
+                        "DELETE FROM remote_space_sessions
+                         WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+                           AND state = 'reserved'
+                           AND reservation_token = ?4
+                           AND reservation_expires_at <= ?5
+                           AND ownership_revision = ?6",
+                        params![
+                            space_id,
+                            row_backend,
+                            name,
+                            reservation_token,
+                            now,
+                            row_revision
+                        ],
                     )?;
                 }
                 "active" | "reserved" => {}
@@ -696,10 +1735,17 @@ impl Catalog {
         backend: Backend,
         snapshot: &MuxSnapshot,
     ) -> Result<HashSet<String>> {
+        let observed_revision = self.catalog_revision()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::reconcile_backend_sessions(&transaction, backend, snapshot)?;
+        Self::reconcile_backend_sessions(
+            &transaction,
+            &self.path,
+            backend,
+            snapshot,
+            observed_revision,
+        )?;
         let owned = Self::session_names_in(&transaction, space_id)?;
         transaction.commit()?;
         Ok(owned)
@@ -707,6 +1753,7 @@ impl Catalog {
     fn reserve_session_ownership(
         transaction: &Transaction<'_>,
         space_id: &str,
+        backend: Backend,
         session_id: &str,
     ) -> Result<SessionReservation> {
         let position = transaction.query_row(
@@ -717,12 +1764,25 @@ impl Catalog {
         let token = transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
             row.get::<_, String>(0)
         })?;
+        let reservation_expires_at = unix_timestamp()?
+            .checked_add(SESSION_RESERVATION_LEASE_SECONDS)
+            .context("session reservation lease overflow")?;
+        let ownership_revision = Self::next_catalog_revision(transaction)?;
         let inserted = transaction.execute(
             "INSERT INTO remote_space_sessions
-             (space_id, session_name, position, state, reservation_token)
-             VALUES (?1, ?2, ?3, 'reserved', ?4)
-             ON CONFLICT(session_name) DO NOTHING",
-            params![space_id, session_id, position, &token],
+             (space_id, backend, session_name, position, state, reservation_token,
+              reservation_expires_at, ownership_revision)
+             VALUES (?1, ?2, ?3, ?4, 'reserved', ?5, ?6, ?7)
+             ON CONFLICT(backend, session_name) DO NOTHING",
+            params![
+                space_id,
+                backend.name(),
+                session_id,
+                position,
+                &token,
+                reservation_expires_at,
+                ownership_revision,
+            ],
         )?;
         if inserted == 1 {
             return Ok(SessionReservation::Acquired { token });
@@ -731,8 +1791,9 @@ impl Catalog {
         let (owner, state, token) = transaction
             .query_row(
                 "SELECT space_id, state, reservation_token
-                 FROM remote_space_sessions WHERE session_name = ?1",
-                [session_id],
+                 FROM remote_space_sessions
+                 WHERE backend = ?1 AND session_name = ?2",
+                params![backend.name(), session_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -753,8 +1814,31 @@ impl Catalog {
         }
     }
 
+    fn renew_session_reservation(
+        &self,
+        backend: Backend,
+        session_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        let expires_at = unix_timestamp()?
+            .checked_add(SESSION_RESERVATION_LEASE_SECONDS)
+            .context("session reservation lease overflow")?;
+        let updated = self.connection.execute(
+            "UPDATE remote_space_sessions
+             SET reservation_expires_at = ?4
+             WHERE backend = ?1 AND session_name = ?2
+               AND state = 'reserved' AND reservation_token = ?3",
+            params![backend.name(), session_id, token, expires_at],
+        )?;
+        if updated != 1 {
+            bail!("session reservation was reclaimed before backend execution");
+        }
+        Ok(())
+    }
+
     fn finalize_session_reservation(
         &mut self,
+        backend: Backend,
         space_id: &str,
         session_id: &str,
         reservation: &SessionReservation,
@@ -765,19 +1849,22 @@ impl Catalog {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision = Self::next_catalog_revision(&transaction)?;
         let updated = transaction.execute(
             "UPDATE remote_space_sessions
-             SET state = 'active', reservation_token = NULL
-             WHERE space_id = ?1 AND session_name = ?2
-               AND state = 'reserved' AND reservation_token = ?3",
-            params![space_id, session_id, token],
+             SET state = 'active', reservation_token = NULL, reservation_expires_at = NULL,
+                 ownership_revision = ?5
+             WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+               AND state = 'reserved' AND reservation_token = ?4",
+            params![space_id, backend.name(), session_id, token, revision],
         )?;
         if updated == 0 {
             let existing = transaction
                 .query_row(
                     "SELECT space_id, state, reservation_token
-                     FROM remote_space_sessions WHERE session_name = ?1",
-                    [session_id],
+                     FROM remote_space_sessions
+                     WHERE backend = ?1 AND session_name = ?2",
+                    params![backend.name(), session_id],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -803,8 +1890,80 @@ impl Catalog {
         Ok(())
     }
 
+    fn verify_session_ownership(
+        &self,
+        backend: Backend,
+        space_id: &str,
+        session_name: &str,
+        expected_revision: i64,
+    ) -> Result<()> {
+        let current = self
+            .connection
+            .query_row(
+                "SELECT state, ownership_revision
+                 FROM remote_space_sessions
+                 WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3",
+                params![space_id, backend.name(), session_name],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if !matches!(
+            current,
+            Some((state, revision)) if state == "active" && revision == expected_revision
+        ) {
+            bail!("session ownership changed before backend mutation");
+        }
+        let intent_pending = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM remote_space_session_intents
+                 WHERE backend = ?1 AND old_name = ?2
+             )",
+            params![backend.name(), session_name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if intent_pending {
+            bail!("session mutation intent is pending");
+        }
+        Ok(())
+    }
+
+    fn verify_session_rename_target(
+        &self,
+        backend: Backend,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        if old_name == new_name {
+            return Ok(());
+        }
+        let target_exists = self.connection.query_row(
+            "SELECT EXISTS(
+                     SELECT 1 FROM remote_space_sessions
+                     WHERE backend = ?1 AND session_name = ?2
+                 )",
+            params![backend.name(), new_name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if target_exists {
+            bail!("session rename target {new_name} is already owned or reserved");
+        }
+        let intent_pending = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM remote_space_session_intents
+                 WHERE backend = ?1 AND (old_name = ?2 OR new_name = ?2)
+             )",
+            params![backend.name(), new_name],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if intent_pending {
+            bail!("session rename target {new_name} has a pending mutation");
+        }
+        Ok(())
+    }
+
     fn rollback_session_reservation(
         &mut self,
+        backend: Backend,
         space_id: &str,
         session_id: &str,
         token: &str,
@@ -812,30 +1971,78 @@ impl Catalog {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
+        let _revision = Self::next_catalog_revision(&transaction)?;
+        let deleted = transaction.execute(
             "DELETE FROM remote_space_sessions
-             WHERE space_id = ?1 AND session_name = ?2
-               AND state = 'reserved' AND reservation_token = ?3",
-            params![space_id, session_id, token],
+             WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+               AND state = 'reserved' AND reservation_token = ?4",
+            params![space_id, backend.name(), session_id, token],
         )?;
+        if deleted != 1 {
+            bail!("session ownership changed before reservation rollback");
+        }
         transaction.commit()?;
         Ok(())
     }
 
-    fn rename_session(&self, space_id: &str, old_name: &str, name: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE remote_space_sessions SET session_name = ?3
-             WHERE space_id = ?1 AND session_name = ?2",
-            params![space_id, old_name, name],
+    fn rename_session(
+        &mut self,
+        backend: Backend,
+        space_id: &str,
+        old_name: &str,
+        name: &str,
+        expected_revision: i64,
+        intent_token: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let revision = Self::next_catalog_revision(&transaction)?;
+        let updated = transaction.execute(
+            "UPDATE remote_space_sessions
+             SET session_name = ?4, ownership_revision = ?5
+             WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+               AND state = 'active' AND ownership_revision = ?6",
+            params![
+                space_id,
+                backend.name(),
+                old_name,
+                name,
+                revision,
+                expected_revision
+            ],
         )?;
+        if updated != 1 {
+            bail!("session ownership changed before rename finalization");
+        }
+        Self::clear_session_intent(&transaction, intent_token)?;
+        transaction.commit()?;
         Ok(())
     }
 
-    fn remove_session(&self, space_id: &str, name: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
-            params![space_id, name],
+    fn remove_session(
+        &mut self,
+        backend: Backend,
+        space_id: &str,
+        name: &str,
+        expected_revision: i64,
+        intent_token: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _revision = Self::next_catalog_revision(&transaction)?;
+        let deleted = transaction.execute(
+            "DELETE FROM remote_space_sessions
+             WHERE space_id = ?1 AND backend = ?2 AND session_name = ?3
+               AND state = 'active' AND ownership_revision = ?4",
+            params![space_id, backend.name(), name, expected_revision],
         )?;
+        if deleted != 1 {
+            bail!("session ownership changed before ditch finalization");
+        }
+        Self::clear_session_intent(&transaction, intent_token)?;
+        transaction.commit()?;
         Ok(())
     }
 }
@@ -984,10 +2191,10 @@ fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusql
         .any(|name| name == column))
 }
 
-fn table_has_unique_column(
+fn table_has_unique_columns(
     connection: &Connection,
     table: &str,
-    column: &str,
+    expected: &[&str],
 ) -> rusqlite::Result<bool> {
     let indexes = {
         let mut statement = connection.prepare(&format!("PRAGMA index_list({table})"))?;
@@ -1009,11 +2216,312 @@ fn table_has_unique_column(
                 .query_map([], |row| row.get::<_, String>(2))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        if columns.len() == 1 && columns[0] == column {
+        if columns.len() == expected.len()
+            && columns
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.as_str() == *expected)
+        {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn reservation_lease_path(catalog_path: &Path, token: &str) -> PathBuf {
+    let catalog_name = catalog_path.file_name().map_or_else(
+        || "catalog".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    catalog_path.with_file_name(format!("{catalog_name}.lease-{token}.sqlite3"))
+}
+fn lease_tombstone_path(lease_path: &Path) -> PathBuf {
+    let file_name = lease_path.file_name().map_or_else(
+        || "lease.sqlite3".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let counter = LEASE_TOMBSTONE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    lease_path.with_file_name(format!(
+        "{file_name}.retired-{}-{timestamp}-{counter}",
+        std::process::id()
+    ))
+}
+
+#[derive(Debug)]
+struct RetiredLease {
+    path: PathBuf,
+    identity: LeaseFileIdentity,
+}
+
+fn rename_lease_sidecar(
+    lease_path: &Path,
+    expected_identity: LeaseFileIdentity,
+) -> Option<RetiredLease> {
+    if !lease_path_matches(lease_path, expected_identity) {
+        return None;
+    }
+    let tombstone = lease_tombstone_path(lease_path);
+    fs::rename(lease_path, &tombstone)
+        .ok()
+        .map(|()| RetiredLease {
+            path: tombstone,
+            identity: expected_identity,
+        })
+}
+
+fn remove_lease_tombstone(tombstone: Option<RetiredLease>) {
+    if let Some(tombstone) = tombstone
+        && lease_path_matches(&tombstone.path, tombstone.identity)
+    {
+        let _ = fs::remove_file(tombstone.path);
+    }
+}
+
+/// Checks retired lease sidecars after their canonical path has been renamed while the owner
+/// still holds the `SQLite` lock. A tombstone with a free lock is stale and can be removed; a
+/// locked tombstone proves the owner is still live.
+fn retired_lease_owner_is_live(lease_path: &Path) -> Result<bool> {
+    let Some(parent) = lease_path.parent() else {
+        return Ok(true);
+    };
+    let Some(file_name) = lease_path.file_name().and_then(|name| name.to_str()) else {
+        return Ok(true);
+    };
+    let prefix = format!("{file_name}.retired-");
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "inspect retired session lease sidecars in {}",
+                    parent.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let tombstone = entry.path();
+        let Some(identity) = lease_path_identity(&tombstone) else {
+            return Ok(true);
+        };
+        let Ok(connection) = Connection::open(&tombstone) else {
+            return Ok(true);
+        };
+        connection.busy_timeout(Duration::ZERO)?;
+        match connection.execute_batch("BEGIN IMMEDIATE;") {
+            Ok(()) => {
+                if !lease_path_matches(&tombstone, identity) {
+                    let _ = connection.execute_batch("ROLLBACK;");
+                    drop(connection);
+                    return Ok(true);
+                }
+                let rollback = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                rollback?;
+                if !lease_path_matches(&tombstone, identity) {
+                    return Ok(true);
+                }
+                match fs::remove_file(&tombstone) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("remove stale retired session lease {}", tombstone.display())
+                        });
+                    }
+                }
+            }
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// Removes an unlocked operation sidecar after durable intent recovery.
+fn remove_stale_session_operation_lease(
+    catalog_path: &Path,
+    backend: Backend,
+    session_id: &str,
+) -> Result<()> {
+    let lease_path = session_operation_lease_path(catalog_path, backend, session_id);
+    if !lease_path.exists() {
+        if retired_lease_owner_is_live(&lease_path)? {
+            bail!("session operation lease became live during recovery");
+        }
+        return Ok(());
+    }
+    let identity = lease_path_identity(&lease_path)
+        .context("session operation lease identity disappeared before recovery")?;
+    let connection = Connection::open(&lease_path)
+        .with_context(|| format!("open session operation lease {}", lease_path.display()))?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let tombstone = match connection.execute_batch("BEGIN IMMEDIATE;") {
+        Ok(()) => {
+            if !lease_path_matches(&lease_path, identity) {
+                let _ = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                bail!("session operation lease was replaced during recovery");
+            }
+            let Some(tombstone) = rename_lease_sidecar(&lease_path, identity) else {
+                let _ = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                bail!("session operation lease was replaced during recovery");
+            };
+            Some(tombstone)
+        }
+        Err(error) => {
+            return Err(error).context("session operation lease became live during recovery");
+        }
+    };
+    let rollback = connection.execute_batch("ROLLBACK;");
+    drop(connection);
+    remove_lease_tombstone(tombstone);
+    rollback?;
+    Ok(())
+}
+
+/// Returns true when the owner process still holds its per-reservation `SQLite` lock. An inability
+/// to prove that the lock is free fails closed so a live creator is never stolen.
+fn reservation_owner_is_live(catalog_path: &Path, token: &str) -> Result<bool> {
+    let lease_path = reservation_lease_path(catalog_path, token);
+    if !lease_path.exists() {
+        return retired_lease_owner_is_live(&lease_path);
+    }
+    let Some(identity) = lease_path_identity(&lease_path) else {
+        return Ok(true);
+    };
+    let Ok(connection) = Connection::open(&lease_path) else {
+        return Ok(true);
+    };
+    connection.busy_timeout(Duration::ZERO)?;
+    match connection.execute_batch("BEGIN IMMEDIATE;") {
+        Ok(()) => {
+            if !lease_path_matches(&lease_path, identity) {
+                let _ = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                return Ok(true);
+            }
+            let Some(tombstone) = rename_lease_sidecar(&lease_path, identity) else {
+                let _ = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                return Ok(true);
+            };
+            let rollback = connection.execute_batch("ROLLBACK;");
+            drop(connection);
+            if !lease_path_matches(&tombstone.path, tombstone.identity) {
+                return Ok(true);
+            }
+            remove_lease_tombstone(Some(tombstone));
+            rollback?;
+            Ok(false)
+        }
+        Err(_) => Ok(true),
+    }
+}
+fn session_operation_lease_path(
+    catalog_path: &Path,
+    backend: Backend,
+    session_id: &str,
+) -> PathBuf {
+    let catalog_name = catalog_path.file_name().map_or_else(
+        || "catalog".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let mut session_hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in session_id.as_bytes() {
+        session_hash ^= u64::from(*byte);
+        session_hash = session_hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    let encoded_session = format!("{session_hash:016x}");
+    catalog_path.with_file_name(format!(
+        "{catalog_name}.operation-{}-{encoded_session}.sqlite3",
+        backend.name()
+    ))
+}
+
+/// Returns true when a rename/ditch operation still owns its per-session lock. Failure to prove
+/// that the lock is free fails closed so an in-flight backend mutation cannot be reclaimed.
+fn session_operation_owner_is_live(
+    catalog_path: &Path,
+    backend: Backend,
+    session_id: &str,
+) -> Result<bool> {
+    let lease_path = session_operation_lease_path(catalog_path, backend, session_id);
+    if !lease_path.exists() {
+        return retired_lease_owner_is_live(&lease_path);
+    }
+    let Some(identity) = lease_path_identity(&lease_path) else {
+        return Ok(true);
+    };
+    let Ok(connection) = Connection::open(&lease_path) else {
+        return Ok(true);
+    };
+    connection.busy_timeout(Duration::ZERO)?;
+    match connection.execute_batch("BEGIN IMMEDIATE;") {
+        Ok(()) => {
+            if !lease_path_matches(&lease_path, identity) {
+                let _ = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                return Ok(true);
+            }
+            if session_operation_intent_exists(catalog_path, backend, session_id)? {
+                connection.execute_batch("ROLLBACK;")?;
+                drop(connection);
+                return Ok(false);
+            }
+            let Some(tombstone) = rename_lease_sidecar(&lease_path, identity) else {
+                let _ = connection.execute_batch("ROLLBACK;");
+                drop(connection);
+                return Ok(true);
+            };
+            let rollback = connection.execute_batch("ROLLBACK;");
+            drop(connection);
+            if !lease_path_matches(&tombstone.path, tombstone.identity) {
+                return Ok(true);
+            }
+            remove_lease_tombstone(Some(tombstone));
+            rollback?;
+            Ok(false)
+        }
+        Err(_) => Ok(true),
+    }
+}
+
+fn session_operation_intent_exists(
+    catalog_path: &Path,
+    backend: Backend,
+    session_id: &str,
+) -> Result<bool> {
+    let connection = Connection::open(catalog_path)?;
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM remote_space_session_intents
+                 WHERE backend = ?1 AND (old_name = ?2 OR new_name = ?2)
+             )",
+            params![backend.name(), session_id],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn unix_timestamp() -> Result<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs()
+        .try_into()
+        .context("system clock exceeds the supported timestamp range")
 }
 
 fn unique_name(requested: &str, existing: &HashSet<String>) -> String {
@@ -1114,7 +2622,10 @@ fn created_session_id(command: &MuxCommand) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, collections::BTreeMap};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
+    };
 
     use super::*;
     use bootty_mux::{
@@ -1399,7 +2910,58 @@ mod tests {
     }
 
     #[test]
-    fn legacy_daemon_membership_schema_becomes_a_global_ownership_ledger() {
+    fn legacy_daemon_membership_schema_becomes_a_backend_scoped_ownership_ledger() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daemon.sqlite");
+        let legacy = Connection::open(&path).expect("legacy database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE daemon_metadata (key TEXT PRIMARY KEY);
+                 CREATE TABLE remote_spaces (
+                     id TEXT PRIMARY KEY,
+                     name TEXT NOT NULL UNIQUE,
+                     backend TEXT NOT NULL,
+                     position INTEGER NOT NULL
+                 );
+                 CREATE TABLE remote_space_sessions (
+                     space_id TEXT NOT NULL REFERENCES remote_spaces(id) ON DELETE CASCADE,
+                     session_name TEXT NOT NULL,
+                     position INTEGER NOT NULL,
+                     PRIMARY KEY (space_id, session_name)
+                 );
+                 INSERT INTO remote_spaces VALUES
+                     ('first', 'First', 'tmux', 0),
+                     ('second', 'Second', 'rmux', 1);
+                 INSERT INTO remote_space_sessions VALUES
+                     ('first', 'shared', 0),
+                     ('first', 'first-only', 1),
+                     ('second', 'shared', 0),
+                     ('second', 'second-only', 1);",
+            )
+            .expect("legacy schema");
+        drop(legacy);
+
+        let catalog = Catalog::open_with_legacy(&path, None).expect("migrate catalog");
+
+        assert!(
+            table_has_unique_columns(
+                &catalog.connection,
+                "remote_space_sessions",
+                &["backend", "session_name"],
+            )
+            .expect("unique ownership")
+        );
+        assert_eq!(
+            catalog.session_names("first").expect("first sessions"),
+            HashSet::from(["shared".to_owned(), "first-only".to_owned()])
+        );
+        assert_eq!(
+            catalog.session_names("second").expect("second sessions"),
+            HashSet::from(["shared".to_owned(), "second-only".to_owned()])
+        );
+    }
+    #[test]
+    fn same_backend_legacy_conflicts_are_archived_without_data_loss() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("daemon.sqlite");
         let legacy = Connection::open(&path).expect("legacy database");
@@ -1423,26 +2985,288 @@ mod tests {
                      ('second', 'Second', 'tmux', 1);
                  INSERT INTO remote_space_sessions VALUES
                      ('first', 'shared', 0),
-                     ('first', 'first-only', 1),
-                     ('second', 'shared', 0),
-                     ('second', 'second-only', 1);",
+                     ('second', 'shared', 0);",
             )
             .expect("legacy schema");
         drop(legacy);
 
         let catalog = Catalog::open_with_legacy(&path, None).expect("migrate catalog");
-
-        assert!(
-            table_has_unique_column(&catalog.connection, "remote_space_sessions", "session_name")
-                .expect("unique ownership")
-        );
         assert_eq!(
             catalog.session_names("first").expect("first sessions"),
-            HashSet::from(["shared".to_owned(), "first-only".to_owned()])
+            HashSet::from(["shared".to_owned()])
         );
+        assert!(
+            catalog
+                .session_names("second")
+                .expect("second sessions")
+                .is_empty()
+        );
+        let archived = catalog
+            .connection
+            .query_row(
+                "SELECT space_id, backend, session_name
+                 FROM remote_space_session_conflicts",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .expect("archived conflict");
         assert_eq!(
-            catalog.session_names("second").expect("second sessions"),
-            HashSet::from(["second-only".to_owned()])
+            archived,
+            ("second".to_owned(), "tmux".to_owned(), "shared".to_owned())
+        );
+    }
+
+    #[test]
+    fn same_session_name_can_be_reserved_on_independent_backends() {
+        let (_dir, mut catalog) = catalog();
+        let tmux = catalog.create("Tmux", Backend::Tmux).expect("tmux space");
+        let rmux = catalog.create("Rmux", Backend::Rmux).expect("rmux space");
+
+        assert!(matches!(
+            catalog
+                .prepare_create_session(&tmux.id, Backend::Tmux, "shared", &empty_snapshot())
+                .expect("tmux reservation"),
+            SessionReservation::Acquired { .. }
+        ));
+        assert!(matches!(
+            catalog
+                .prepare_create_session(&rmux.id, Backend::Rmux, "shared", &empty_snapshot())
+                .expect("rmux reservation"),
+            SessionReservation::Acquired { .. }
+        ));
+        let rows = catalog
+            .connection
+            .prepare(
+                "SELECT backend, session_name FROM remote_space_sessions
+                 WHERE session_name = 'shared' ORDER BY backend",
+            )
+            .expect("ownership rows")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query ownership rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect ownership rows");
+        assert_eq!(
+            rows,
+            vec![
+                ("rmux".to_owned(), "shared".to_owned()),
+                ("tmux".to_owned(), "shared".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_absent_reservation_is_reclaimed_but_live_reservation_is_protected() {
+        let (_dir, mut first, mut second, first_space, second_space) = two_catalogs();
+        first
+            .prepare_create_session(
+                &first_space.id,
+                Backend::Tmux,
+                "reclaimable",
+                &empty_snapshot(),
+            )
+            .expect("first reservation");
+
+        assert!(
+            second
+                .prepare_create_session(
+                    &second_space.id,
+                    Backend::Tmux,
+                    "reclaimable",
+                    &empty_snapshot(),
+                )
+                .is_err(),
+            "a live lease must protect the reservation"
+        );
+        first
+            .connection
+            .execute(
+                "UPDATE remote_space_sessions
+                 SET reservation_expires_at = 0
+                 WHERE backend = 'tmux' AND session_name = 'reclaimable'",
+                [],
+            )
+            .expect("expire reservation");
+
+        assert!(matches!(
+            second
+                .prepare_create_session(
+                    &second_space.id,
+                    Backend::Tmux,
+                    "reclaimable",
+                    &empty_snapshot(),
+                )
+                .expect("reclaim expired reservation"),
+            SessionReservation::Acquired { .. }
+        ));
+    }
+    #[test]
+    fn expired_reservation_with_live_owner_lock_cannot_be_reclaimed() {
+        let (_dir, mut first, mut second, first_space, second_space) = two_catalogs();
+        let reservation = first
+            .prepare_create_session(
+                &first_space.id,
+                Backend::Tmux,
+                "live-owner",
+                &empty_snapshot(),
+            )
+            .expect("first reservation");
+        let token = match &reservation {
+            SessionReservation::Acquired { token } => token.clone(),
+            _ => panic!("expected acquired reservation"),
+        };
+        let lease = SessionReservationLease::start(
+            &first.path,
+            Backend::Tmux,
+            &first_space.id,
+            "live-owner",
+            &token,
+        )
+        .expect("start owner lease");
+        first
+            .connection
+            .execute(
+                "UPDATE remote_space_sessions
+                 SET reservation_expires_at = 0
+                 WHERE backend = 'tmux' AND session_name = 'live-owner'",
+                [],
+            )
+            .expect("expire reservation");
+
+        assert!(
+            second
+                .prepare_create_session(
+                    &second_space.id,
+                    Backend::Tmux,
+                    "live-owner",
+                    &empty_snapshot(),
+                )
+                .is_err(),
+            "owner lock must protect a live reservation after lease expiry"
+        );
+        drop(lease);
+        assert!(matches!(
+            second
+                .prepare_create_session(
+                    &second_space.id,
+                    Backend::Tmux,
+                    "live-owner",
+                    &empty_snapshot(),
+                )
+                .expect("reclaim after owner exits"),
+            SessionReservation::Acquired { .. }
+        ));
+    }
+
+    #[test]
+    fn stale_open_cannot_reclaim_a_replacement_operation_lease() {
+        let (_dir, catalog) = catalog();
+        let lease_path = session_operation_lease_path(&catalog.path, Backend::Tmux, "replacement");
+
+        // B opens the old canonical sidecar while A still owns its lock.
+        let owner = Connection::open(&lease_path).expect("open original owner");
+        owner
+            .busy_timeout(Duration::ZERO)
+            .expect("owner busy timeout");
+        owner
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS owner_lock (id INTEGER PRIMARY KEY);
+                 DELETE FROM owner_lock;
+                 INSERT INTO owner_lock (id) VALUES (1);
+                 BEGIN IMMEDIATE;",
+            )
+            .expect("lock original owner");
+        let stale_connection = Connection::open(&lease_path).expect("open stale reader");
+        let stale_identity = lease_path_identity(&lease_path).expect("original identity");
+
+        // A retires/releases the old sidecar; C then creates and locks a replacement at the
+        // canonical path before B finishes its proof.
+        let retired =
+            rename_lease_sidecar(&lease_path, stale_identity).expect("retire original owner");
+        owner
+            .execute_batch("ROLLBACK;")
+            .expect("release original owner");
+        drop(owner);
+        let replacement = Connection::open(&lease_path).expect("open replacement owner");
+        replacement
+            .busy_timeout(Duration::ZERO)
+            .expect("replacement busy timeout");
+        replacement
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS owner_lock (id INTEGER PRIMARY KEY);
+                 DELETE FROM owner_lock;
+                 INSERT INTO owner_lock (id) VALUES (1);
+                 BEGIN IMMEDIATE;",
+            )
+            .expect("lock replacement owner");
+        let replacement_identity = lease_path_identity(&lease_path).expect("replacement identity");
+        assert_ne!(stale_identity, replacement_identity);
+
+        // The owner proof fails closed while C holds the replacement lock.
+        assert!(
+            session_operation_owner_is_live(&catalog.path, Backend::Tmux, "replacement")
+                .expect("replacement owner proof"),
+            "replacement owner must remain protected"
+        );
+        assert!(!lease_path_matches(&lease_path, stale_identity));
+        assert!(
+            rename_lease_sidecar(&lease_path, stale_identity).is_none(),
+            "stale B must not retire C's replacement"
+        );
+        remove_lease_tombstone(Some(RetiredLease {
+            path: lease_path.clone(),
+            identity: stale_identity,
+        }));
+        assert_eq!(lease_path_identity(&lease_path), Some(replacement_identity));
+
+        drop(stale_connection);
+        drop(replacement);
+        remove_lease_tombstone(Some(retired));
+    }
+
+    #[test]
+    fn rename_destination_operation_lease_blocks_concurrent_create() {
+        let (_dir, mut first, mut second, first_space, second_space) = two_catalogs();
+        let reservation = first
+            .prepare_create_session(&first_space.id, Backend::Tmux, "old", &empty_snapshot())
+            .expect("reserve source session");
+        first
+            .finalize_session_reservation(Backend::Tmux, &first_space.id, "old", &reservation)
+            .expect("finalize source session");
+
+        let leases = SessionOperationLease::start_many(&first.path, Backend::Tmux, &["new", "old"])
+            .expect("acquire rename source and destination leases");
+        let error = second
+            .prepare_create_session(&second_space.id, Backend::Tmux, "new", &empty_snapshot())
+            .expect_err("destination create must wait for rename operation");
+        assert!(
+            error
+                .to_string()
+                .contains("session operation is already in progress")
+        );
+        drop(leases);
+        second
+            .prepare_create_session(
+                &second_space.id,
+                Backend::Tmux,
+                "new",
+                &snapshot_with_session("old"),
+            )
+            .expect("reserve destination before rename");
+        let error = first
+            .verify_session_rename_target(Backend::Tmux, "old", "new")
+            .expect_err("rename must reject an existing destination claim");
+        assert!(
+            error
+                .to_string()
+                .contains("session rename target new is already owned or reserved")
         );
     }
 
@@ -1475,7 +3299,8 @@ mod tests {
         let state = first
             .connection
             .query_row(
-                "SELECT state FROM remote_space_sessions WHERE session_name = 'shared'",
+                "SELECT state FROM remote_space_sessions
+                 WHERE backend = 'tmux' AND session_name = 'shared'",
                 [],
                 |row| row.get::<_, String>(0),
             )
@@ -1550,6 +3375,54 @@ mod tests {
             ));
         }
     }
+    #[test]
+    fn backend_failure_with_live_post_snapshot_retains_ownership() {
+        let (_dir, mut catalog) = catalog();
+        let space = catalog.create("Lab", Backend::Tmux).expect("space");
+        let snapshots = Cell::new(0);
+        let error = catalog
+            .execute_with_backend(
+                Backend::Tmux,
+                &space.id,
+                MuxCommand::CreateProjectSession {
+                    session_id: "partially-created".to_owned(),
+                    cwd: "/repo".to_owned(),
+                },
+                |_| Ok(()),
+                || {
+                    let snapshot = if snapshots.replace(snapshots.get() + 1) == 0 {
+                        empty_snapshot()
+                    } else {
+                        snapshot_with_session("partially-created")
+                    };
+                    Ok(snapshot)
+                },
+                |_| Err(anyhow::anyhow!("simulated partial backend failure")),
+            )
+            .expect_err("backend failure");
+
+        assert!(
+            error
+                .to_string()
+                .contains("ownership was retained for reconciliation")
+        );
+        assert!(
+            catalog
+                .session_names(&space.id)
+                .expect("owned sessions")
+                .contains("partially-created")
+        );
+        let state = catalog
+            .connection
+            .query_row(
+                "SELECT state FROM remote_space_sessions
+                 WHERE backend = 'tmux' AND session_name = 'partially-created'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("ownership state");
+        assert_eq!(state, "active");
+    }
 
     #[test]
     fn stale_same_space_ownership_is_pruned_before_create_authorization() {
@@ -1559,7 +3432,7 @@ mod tests {
             .prepare_create_session(&space.id, Backend::Tmux, "stale", &empty_snapshot())
             .expect("reservation");
         catalog
-            .finalize_session_reservation(&space.id, "stale", &reservation)
+            .finalize_session_reservation(Backend::Tmux, &space.id, "stale", &reservation)
             .expect("simulate completed backend create");
 
         assert!(matches!(
@@ -1568,6 +3441,40 @@ mod tests {
                 .expect("recreate after authoritative absence"),
             SessionReservation::Acquired { .. }
         ));
+    }
+
+    #[test]
+    fn same_space_retry_does_not_duplicate_an_in_flight_backend_create() {
+        let (_dir, mut catalog) = catalog();
+        let space = catalog.create("Lab", Backend::Tmux).expect("space");
+        catalog
+            .prepare_create_session(&space.id, Backend::Tmux, "pending", &empty_snapshot())
+            .expect("first reservation");
+        let executed = Cell::new(false);
+
+        let error = catalog
+            .execute_with_backend(
+                Backend::Tmux,
+                &space.id,
+                MuxCommand::CreateProjectSession {
+                    session_id: "pending".to_owned(),
+                    cwd: "/repo".to_owned(),
+                },
+                |_| Ok(()),
+                || Ok(empty_snapshot()),
+                |_| {
+                    executed.set(true);
+                    Ok(None)
+                },
+            )
+            .expect_err("an in-flight create must not be issued twice");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session creation is already in progress")
+        );
+        assert!(!executed.get(), "retry reached the backend");
     }
 
     #[test]
@@ -1582,7 +3489,12 @@ mod tests {
             )
             .expect("first reservation");
         first
-            .finalize_session_reservation(&first_space.id, "reclaimable", &reservation)
+            .finalize_session_reservation(
+                Backend::Tmux,
+                &first_space.id,
+                "reclaimable",
+                &reservation,
+            )
             .expect("simulate completed backend create");
 
         assert!(matches!(
@@ -1605,13 +3517,16 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_reservation_use_one_sqlite_serialization_boundary() {
-        let (_dir, mut first, mut second, first_space, second_space) = two_catalogs();
+    fn backend_io_does_not_hold_the_catalog_write_lock() {
+        let (_dir, mut first, second, first_space, second_space) = two_catalogs();
         second
             .connection
             .busy_timeout(std::time::Duration::ZERO)
             .expect("disable retry while lock is held");
-        let blocked = Cell::new(false);
+        let second = RefCell::new(second);
+        let snapshots = Cell::new(0);
+        let reservation_during_snapshot = Cell::new(false);
+        let reservation_during_execute = Cell::new(false);
 
         let error = first
             .execute_with_backend(
@@ -1623,35 +3538,171 @@ mod tests {
                 },
                 |_| Ok(()),
                 || {
-                    blocked.set(
+                    if snapshots.replace(snapshots.get() + 1) == 0 {
+                        reservation_during_snapshot.set(
+                            second
+                                .borrow_mut()
+                                .prepare_create_session(
+                                    &second_space.id,
+                                    Backend::Tmux,
+                                    "during-snapshot",
+                                    &empty_snapshot(),
+                                )
+                                .is_ok(),
+                        );
+                    }
+                    Ok(empty_snapshot())
+                },
+                |_| {
+                    reservation_during_execute.set(
                         second
+                            .borrow_mut()
                             .prepare_create_session(
                                 &second_space.id,
                                 Backend::Tmux,
-                                "second-create",
+                                "during-execute",
                                 &empty_snapshot(),
                             )
-                            .is_err(),
+                            .is_ok(),
                     );
+                    Err(anyhow::anyhow!("simulated backend failure"))
+                },
+            )
+            .expect_err("backend failure");
+
+        assert!(error.to_string().contains("simulated backend failure"));
+        assert!(reservation_during_snapshot.get());
+        assert!(reservation_during_execute.get());
+    }
+    #[test]
+    fn rename_does_not_mutate_a_recreated_session_after_snapshot() {
+        let (_dir, mut first, mut second, first_space, _second_space) = two_catalogs();
+        let reservation = first
+            .prepare_create_session(&first_space.id, Backend::Tmux, "old", &empty_snapshot())
+            .expect("initial reservation");
+        first
+            .finalize_session_reservation(Backend::Tmux, &first_space.id, "old", &reservation)
+            .expect("initial active ownership");
+        let injected = Cell::new(false);
+        let executed = Cell::new(false);
+        let error = first
+            .execute_with_backend(
+                Backend::Tmux,
+                &first_space.id,
+                MuxCommand::RenameSession {
+                    session_id: "old".to_owned(),
+                    name: "new".to_owned(),
+                },
+                |_| Ok(()),
+                || {
+                    if !injected.replace(true) {
+                        second
+                            .prepare_create_session(
+                                &first_space.id,
+                                Backend::Tmux,
+                                "old",
+                                &empty_snapshot(),
+                            )
+                            .expect("concurrent recreate");
+                    }
+                    Ok(snapshot_with_session("old"))
+                },
+                |_| {
+                    executed.set(true);
+                    Ok(None)
+                },
+            )
+            .expect_err("stale rename must abort before backend mutation");
+        assert!(error.to_string().contains("ownership changed"));
+        assert!(!executed.get());
+    }
+
+    #[test]
+    fn ditch_does_not_delete_a_recreated_session_after_snapshot() {
+        let (_dir, mut first, mut second, first_space, _second_space) = two_catalogs();
+        let reservation = first
+            .prepare_create_session(&first_space.id, Backend::Tmux, "old", &empty_snapshot())
+            .expect("initial reservation");
+        first
+            .finalize_session_reservation(Backend::Tmux, &first_space.id, "old", &reservation)
+            .expect("initial active ownership");
+        let injected = Cell::new(false);
+        let executed = Cell::new(false);
+        let error = first
+            .execute_with_backend(
+                Backend::Tmux,
+                &first_space.id,
+                MuxCommand::DitchSession {
+                    session_id: "old".to_owned(),
+                },
+                |_| Ok(()),
+                || {
+                    if !injected.replace(true) {
+                        second
+                            .prepare_create_session(
+                                &first_space.id,
+                                Backend::Tmux,
+                                "old",
+                                &empty_snapshot(),
+                            )
+                            .expect("concurrent recreate");
+                    }
+                    Ok(snapshot_with_session("old"))
+                },
+                |_| {
+                    executed.set(true);
+                    Ok(None)
+                },
+            )
+            .expect_err("stale ditch must abort before backend mutation");
+        assert!(error.to_string().contains("ownership changed"));
+        assert!(!executed.get());
+    }
+
+    #[test]
+    fn absent_snapshot_does_not_reclaim_a_concurrent_finalized_create() {
+        let (_dir, mut first, mut second, first_space, _second_space) = two_catalogs();
+        let injected = Cell::new(false);
+        let error = first
+            .execute_with_backend(
+                Backend::Tmux,
+                &first_space.id,
+                MuxCommand::CreateProjectSession {
+                    session_id: "new".to_owned(),
+                    cwd: "/repo".to_owned(),
+                },
+                |_| Ok(()),
+                || {
+                    if !injected.replace(true) {
+                        let reservation = second
+                            .prepare_create_session(
+                                &first_space.id,
+                                Backend::Tmux,
+                                "concurrent",
+                                &empty_snapshot(),
+                            )
+                            .expect("concurrent reservation");
+                        second
+                            .finalize_session_reservation(
+                                Backend::Tmux,
+                                &first_space.id,
+                                "concurrent",
+                                &reservation,
+                            )
+                            .expect("concurrent finalization");
+                    }
                     Ok(empty_snapshot())
                 },
                 |_| Err(anyhow::anyhow!("simulated backend failure")),
             )
             .expect_err("backend failure");
-
         assert!(error.to_string().contains("simulated backend failure"));
-        assert!(blocked.get());
-        assert!(matches!(
-            second
-                .prepare_create_session(
-                    &second_space.id,
-                    Backend::Tmux,
-                    "second-create",
-                    &empty_snapshot(),
-                )
-                .expect("reservation after snapshot transaction commits"),
-            SessionReservation::Acquired { .. }
-        ));
+        assert!(
+            first
+                .session_names(&first_space.id)
+                .expect("owned sessions")
+                .contains("concurrent")
+        );
     }
 
     #[test]

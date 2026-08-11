@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -15,8 +15,9 @@ use rmux_sdk::{
 };
 use tokio::{
     runtime::Builder,
-    sync::{mpsc, watch},
-    time::{MissedTickBehavior, interval, sleep},
+    sync::watch,
+    task::JoinHandle,
+    time::{MissedTickBehavior, interval, sleep, timeout},
 };
 
 use crate::{
@@ -31,6 +32,7 @@ use crate::{
 };
 
 const RMUX_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+const RMUX_WATCHER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 /// The pinned SDK exposes authoritative per-pane streams but no server-wide topology stream.
 /// Reconciliation is therefore explicitly best-effort and only establishes/tears down the
 /// authoritative pane watchers; it never fabricates a pane lifecycle observation.
@@ -64,12 +66,21 @@ pub(crate) fn start() {
 }
 
 pub(crate) fn drain_events(scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
-    event_hub().events.drain(scope, maximum)
+    if maximum == 0 {
+        return Vec::new();
+    }
+    let hub = event_hub();
+    hub.subscribe(scope);
+    hub.events
+        .drain_with_initial_rebase(scope, maximum, MuxEventProvenance::RmuxSdk)
+}
+pub(crate) fn release_event_scope(scope: MuxScope) {
+    event_hub().release(scope);
 }
 
 pub(crate) fn topology_invalidated() {
     let hub = event_hub();
-    hub.start();
+    hub.start_if_scoped();
     hub.events.publish(MuxEventDraft::new(
         MuxEventTopic::TopologyChanged,
         MuxEventProvenance::RmuxSdk,
@@ -84,7 +95,7 @@ pub(crate) fn topology_invalidated() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(control) = control.as_ref() {
-        let _ = control.try_send(());
+        let _ = control.send(RmuxHubControl::Invalidate);
     }
 }
 
@@ -124,8 +135,11 @@ impl PaneWatchTarget {
         if self.lifecycle != PaneWatchLifecycle::Active || self.target == target {
             return None;
         }
+        let occupant_changed = occupant_generation(&self.target) != occupant_generation(&target);
         let previous = std::mem::replace(&mut self.target, target);
-        self.generation = self.generation.wrapping_add(1);
+        if occupant_changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
         Some((previous, self.target.clone()))
     }
 
@@ -133,7 +147,9 @@ impl PaneWatchTarget {
         &mut self,
         mut target: MuxEventTarget,
     ) -> Option<(MuxEventTarget, MuxEventTarget)> {
-        if occupant_generation(&target) == occupant_generation(&self.target) {
+        if occupant_generation(&target).is_none()
+            || occupant_generation(&target) == occupant_generation(&self.target)
+        {
             target.occupant = self.target.occupant.clone();
         }
         self.replace(target)
@@ -143,13 +159,22 @@ impl PaneWatchTarget {
         &mut self,
         expected_generation: u64,
         occupant: Option<MuxOccupantIdentity>,
-    ) -> Option<(MuxEventTarget, MuxEventTarget)> {
-        if self.generation != expected_generation {
+    ) -> Option<(MuxEventTarget, MuxEventTarget, bool)> {
+        if self.lifecycle != PaneWatchLifecycle::Active || self.generation != expected_generation {
             return None;
         }
         let mut target = self.target.clone();
         target.occupant = occupant;
-        self.replace(target)
+        let occupant_changed = occupant_generation(&self.target) != occupant_generation(&target);
+        if occupant_changed {
+            // A live SDK refresh discovered a replacement. Retire this exact watcher pair
+            // before changing its target/generation; reconciliation must install the
+            // replacement pair before either stream can publish under the new occupant.
+            self.lifecycle = PaneWatchLifecycle::Retired;
+            self.generation = self.generation.wrapping_add(1);
+        }
+        let previous = std::mem::replace(&mut self.target, target);
+        Some((previous, self.target.clone(), occupant_changed))
     }
 
     fn retire(&mut self) -> bool {
@@ -175,21 +200,101 @@ impl PaneWatchTarget {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RmuxHubControl {
+    Running,
+    Invalidate,
+    Stop,
+}
+
 struct RmuxEventHub {
     events: MuxEventQueue,
     started: Arc<AtomicBool>,
-    controls: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+    controls: Arc<Mutex<Option<watch::Sender<RmuxHubControl>>>>,
+    scopes: Mutex<HashSet<MuxScope>>,
+    lifecycle: Mutex<()>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    release_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
     connection: RmuxConnectionState,
 }
 
 impl RmuxEventHub {
+    fn subscribe(&self, scope: MuxScope) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(scope);
+        self.start_locked();
+    }
+
+    fn release(&self, scope: MuxScope) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let last_scope = {
+            let mut scopes = self
+                .scopes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            scopes.remove(&scope);
+            scopes.is_empty()
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .release_barrier
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            barrier.wait();
+        }
+        self.events.remove_scope(scope);
+        if last_scope {
+            self.stop_locked();
+            self.events.remove_scope(scope);
+        }
+    }
+
     fn start(&self) {
-        if self.started.swap(true, Ordering::AcqRel) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.start_locked();
+    }
+    fn start_if_scoped(&self) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self
+            .scopes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            self.start_locked();
+        }
+    }
+
+    fn start_locked(&self) {
+        if self.started.load(Ordering::Acquire) {
             return;
         }
+        self.started.store(true, Ordering::Release);
+        let (control_tx, control_rx) = watch::channel(RmuxHubControl::Running);
+        *self
+            .controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control_tx);
         let events = self.events.clone();
-        let controls = Arc::clone(&self.controls);
-        let control_slot = Arc::clone(&controls);
+        let control_slot = Arc::clone(&self.controls);
         let connection = self.connection.clone();
         let started = Arc::clone(&self.started);
         let spawn = thread::Builder::new()
@@ -206,23 +311,61 @@ impl RmuxEventHub {
                             &events,
                             format!("rmux event runtime failed to start: {error}"),
                         );
+                        *control_slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                         started.store(false, Ordering::Release);
                         return;
                     }
                 };
-                runtime.block_on(run_event_hub(events, controls, connection));
+                runtime.block_on(run_event_hub(events, connection, control_rx));
                 *control_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                 started.store(false, Ordering::Release);
             });
-        if let Err(error) = spawn {
-            self.started.store(false, Ordering::Release);
-            self.connection.disconnected(
-                &self.events,
-                format!("rmux event worker failed to start: {error}"),
-            );
+        match spawn {
+            Ok(worker) => {
+                *self
+                    .worker
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+            }
+            Err(error) => {
+                *self
+                    .controls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                self.started.store(false, Ordering::Release);
+                self.connection.disconnected(
+                    &self.events,
+                    format!("rmux event worker failed to start: {error}"),
+                );
+            }
         }
+    }
+
+    fn stop_locked(&self) {
+        if let Some(control) = self
+            .controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        {
+            let _ = control.send(RmuxHubControl::Stop);
+        }
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker
+            && worker.thread().id() != thread::current().id()
+        {
+            let _ = worker.join();
+        }
+        self.started.store(false, Ordering::Release);
     }
 }
 
@@ -231,6 +374,11 @@ fn event_hub() -> &'static RmuxEventHub {
         events: MuxEventQueue::for_backend("rmux:local-sdk"),
         started: Arc::new(AtomicBool::new(false)),
         controls: Arc::new(Mutex::new(None)),
+        scopes: Mutex::new(HashSet::new()),
+        lifecycle: Mutex::new(()),
+        worker: Mutex::new(None),
+        #[cfg(test)]
+        release_barrier: Mutex::new(None),
         connection: RmuxConnectionState::default(),
     });
     &HUB
@@ -260,36 +408,45 @@ impl RmuxConnectionState {
             .current
     }
 
-    /// Emits the rebase only after the inventory captured at `inventory_epoch` succeeded.
+    /// Emits an inventory rebase only after the inventory captured at `inventory_epoch` succeeded.
+    /// Initial bootstrap is synthesized per subscriber by `drain_with_initial_rebase` unless it
+    /// also completes a pending reconnect, in which case this publishes the bootstrap directly.
     /// Holding the epoch lock through publication keeps a new disconnect ordered after this
     /// rebase rather than allowing stale inventory to reset newer connection state.
+    fn lock_current_inventory(
+        &self,
+        events: &MuxEventQueue,
+        inventory_epoch: u64,
+        bootstrap: bool,
+    ) -> Option<std::sync::MutexGuard<'_, RmuxReconnectEpoch>> {
+        let mut reconnect = self.reconnect.lock().expect("rmux reconnect epoch lock");
+        if reconnect.current != inventory_epoch {
+            return None;
+        }
+        self.connected();
+        let reconnected = reconnect.pending == Some(inventory_epoch);
+        if reconnected {
+            reconnect.pending = None;
+            events.publish(MuxEventDraft::rebase(
+                MuxEventProvenance::RmuxSdk,
+                if bootstrap {
+                    MuxRebaseReason::Bootstrap
+                } else {
+                    MuxRebaseReason::Reconnect
+                },
+            ));
+        }
+        Some(reconnect)
+    }
+
+    #[cfg(test)]
     fn publish_inventory_rebase(
         &self,
         events: &MuxEventQueue,
         inventory_epoch: u64,
         bootstrap: bool,
     ) {
-        let mut reconnect = self.reconnect.lock().expect("rmux reconnect epoch lock");
-        let inventory_current =
-            !matches!(reconnect.pending, Some(epoch) if epoch > inventory_epoch);
-        if inventory_current {
-            self.connected();
-        }
-        let reconnected = inventory_current
-            && matches!(reconnect.pending, Some(epoch) if epoch <= inventory_epoch);
-        if reconnected {
-            reconnect.pending = None;
-        }
-        let reason = if bootstrap {
-            Some(MuxRebaseReason::Bootstrap)
-        } else if reconnected {
-            Some(MuxRebaseReason::Reconnect)
-        } else {
-            None
-        };
-        if let Some(reason) = reason {
-            events.publish(MuxEventDraft::rebase(MuxEventProvenance::RmuxSdk, reason));
-        }
+        drop(self.lock_current_inventory(events, inventory_epoch, bootstrap));
     }
 
     fn disconnected(&self, events: &MuxEventQueue, reason: String) {
@@ -311,13 +468,9 @@ impl RmuxConnectionState {
 
 async fn run_event_hub(
     events: MuxEventQueue,
-    controls: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     connection: RmuxConnectionState,
+    mut control_rx: watch::Receiver<RmuxHubControl>,
 ) {
-    let (control_tx, mut control_rx) = mpsc::channel(1);
-    *controls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(control_tx);
     let mut watched = BTreeMap::new();
     let mut topology_tick = interval(RMUX_TOPOLOGY_RESCAN_INTERVAL);
     topology_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -326,15 +479,23 @@ async fn run_event_hub(
     loop {
         let inventory_epoch = connection.inventory_epoch();
         let bootstrap = !bootstrapped;
-        match reconcile_panes(
-            &events,
-            &connection,
-            &mut watched,
-            inventory_epoch,
-            bootstrap,
-        )
-        .await
-        {
+        let reconciled = tokio::select! {
+            changed = control_rx.changed() => {
+                if changed.is_err() || *control_rx.borrow() == RmuxHubControl::Stop {
+                    stop_watchers(&mut watched).await;
+                    return;
+                }
+                continue;
+            }
+            result = reconcile_panes(
+                &events,
+                &connection,
+                &mut watched,
+                inventory_epoch,
+                bootstrap,
+            ) => result,
+        };
+        match reconciled {
             Ok(changed) => {
                 if bootstrap {
                     bootstrapped = true;
@@ -355,15 +516,26 @@ async fn run_event_hub(
                     &events,
                     format!("rmux topology reconciliation failed: {error}"),
                 );
-                sleep(RMUX_RECONNECT_DELAY).await;
+                tokio::select! {
+                    _ = sleep(RMUX_RECONNECT_DELAY) => {}
+                    changed = control_rx.changed() => {
+                        if changed.is_err()
+                            || *control_rx.borrow() == RmuxHubControl::Stop
+                        {
+                            stop_watchers(&mut watched).await;
+                            return;
+                        }
+                        continue;
+                    }
+                }
                 continue;
             }
         }
 
         tokio::select! {
-            control = control_rx.recv() => {
-                if control.is_none() {
-                    stop_watchers(&mut watched);
+            changed = control_rx.changed() => {
+                if changed.is_err() || *control_rx.borrow() == RmuxHubControl::Stop {
+                    stop_watchers(&mut watched).await;
                     return;
                 }
             }
@@ -375,8 +547,36 @@ async fn run_event_hub(
 struct PaneWatcher {
     stop: watch::Sender<bool>,
     target: SharedPaneWatchTarget,
+    tasks: Vec<JoinHandle<()>>,
 }
 
+impl PaneWatcher {
+    fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    async fn shutdown(mut self) {
+        self.stop();
+        for mut task in self.tasks.drain(..) {
+            if timeout(RMUX_WATCHER_SHUTDOWN_TIMEOUT, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+}
+
+impl Drop for PaneWatcher {
+    fn drop(&mut self) {
+        self.stop();
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
 fn occupant_generation(target: &MuxEventTarget) -> Option<&str> {
     target
         .occupant
@@ -410,13 +610,19 @@ async fn refresh_watcher_target(
         return;
     };
     let target = target_with_live_occupant(pane, target).await;
-    let mut watched_target = shared_target.lock().expect("pane watcher target lock");
-    let Some((previous, current)) =
-        watched_target.replace_live_occupant(generation, target.occupant)
-    else {
-        return;
+    let (previous, current, generation_changed) = {
+        let mut watched_target = shared_target.lock().expect("pane watcher target lock");
+        let Some((previous, current, generation_changed)) =
+            watched_target.replace_live_occupant(generation, target.occupant)
+        else {
+            return;
+        };
+        (previous, current, generation_changed)
     };
     publish_occupant_replacement(events, &previous, &current);
+    if generation_changed {
+        topology_invalidated();
+    }
 }
 
 fn watcher_is_active(shared_target: &SharedPaneWatchTarget) -> bool {
@@ -435,19 +641,61 @@ fn watcher_needs_reconciliation(watcher: &PaneWatcher) -> bool {
         .needs_reconciliation()
 }
 
-fn retire_watcher(shared_target: &SharedPaneWatchTarget) -> bool {
-    shared_target
-        .lock()
-        .expect("pane watcher target lock")
-        .retire()
+fn retire_watcher_for_generation(
+    shared_target: &SharedPaneWatchTarget,
+    expected_generation: u64,
+) -> bool {
+    let mut watched_target = shared_target.lock().expect("pane watcher target lock");
+    if watched_target.lifecycle != PaneWatchLifecycle::Active
+        || watched_target.generation != expected_generation
+    {
+        return false;
+    }
+    watched_target.retire()
+}
+fn watcher_generation_is_active(
+    shared_target: &SharedPaneWatchTarget,
+    expected_generation: u64,
+) -> bool {
+    let watched_target = shared_target.lock().expect("pane watcher target lock");
+    watched_target.lifecycle == PaneWatchLifecycle::Active
+        && watched_target.generation == expected_generation
 }
 
+fn abort_stale_watcher_source(
+    shared_target: &SharedPaneWatchTarget,
+    source_generation: u64,
+    stop: &watch::Sender<bool>,
+) -> bool {
+    if watcher_generation_is_active(shared_target, source_generation) {
+        return false;
+    }
+    let _ = stop.send(true);
+    true
+}
+
+#[cfg(test)]
 fn publish_for_active_watcher_target(
     shared_target: &SharedPaneWatchTarget,
     publish: impl FnOnce(&MuxEventTarget),
 ) -> bool {
     let watched_target = shared_target.lock().expect("pane watcher target lock");
     if watched_target.lifecycle != PaneWatchLifecycle::Active {
+        return false;
+    }
+    publish(&watched_target.target);
+    true
+}
+
+fn publish_for_watcher_generation(
+    shared_target: &SharedPaneWatchTarget,
+    expected_generation: u64,
+    publish: impl FnOnce(&MuxEventTarget),
+) -> bool {
+    let watched_target = shared_target.lock().expect("pane watcher target lock");
+    if watched_target.lifecycle != PaneWatchLifecycle::Active
+        || watched_target.generation != expected_generation
+    {
         return false;
     }
     publish(&watched_target.target);
@@ -528,7 +776,42 @@ fn close_watcher(
     publish(&target);
     true
 }
+fn close_watcher_for_generation(
+    shared_target: &SharedPaneWatchTarget,
+    expected_generation: u64,
+    publish: impl FnOnce(&MuxEventTarget),
+) -> bool {
+    let mut watched_target = shared_target.lock().expect("pane watcher target lock");
+    if watched_target.lifecycle != PaneWatchLifecycle::Active
+        || watched_target.generation != expected_generation
+    {
+        return false;
+    }
+    watched_target.lifecycle = PaneWatchLifecycle::Closed;
+    watched_target.generation = watched_target.generation.wrapping_add(1);
+    publish(&watched_target.target);
+    true
+}
 
+fn publish_stream_closed_for_generation(
+    events: &MuxEventQueue,
+    shared_target: &SharedPaneWatchTarget,
+    expected_generation: u64,
+    revision: u64,
+    reason: String,
+) -> bool {
+    close_watcher_for_generation(shared_target, expected_generation, |target| {
+        events.publish(MuxEventDraft::new(
+            MuxEventTopic::PaneClosed,
+            MuxEventProvenance::RmuxSdk,
+            Some(target.clone()),
+            Some(state_cursor(target, revision)),
+            MuxEventPayload::Closed { reason },
+        ));
+    })
+}
+
+#[cfg(test)]
 fn publish_stream_closed(
     events: &MuxEventQueue,
     shared_target: &SharedPaneWatchTarget,
@@ -583,8 +866,21 @@ async fn reconcile_panes(
     for (session, row) in &inventory {
         let key = (row.session_name.clone(), row.pane_id.clone());
         discovered.insert(key.clone());
+        let authoritative_target = target_from_row(row);
         if let Some(watcher) = watched.get(&key) {
-            if watcher_needs_reconciliation(watcher) {
+            let current_occupant = watcher
+                .target
+                .lock()
+                .expect("pane watcher target lock")
+                .target
+                .occupant
+                .as_ref()
+                .map(|occupant| occupant.backend_identity.clone());
+            let authoritative_occupant =
+                occupant_generation(&authoritative_target).map(str::to_owned);
+            if watcher_needs_reconciliation(watcher)
+                || (authoritative_occupant.is_some() && current_occupant != authoritative_occupant)
+            {
                 replacements.insert(key.clone());
             } else {
                 continue;
@@ -592,14 +888,45 @@ async fn reconcile_panes(
         }
         let pane_id = parse_pane_id(&row.pane_id).expect("pane id was filtered from inventory");
         let pane = rmux.pane_by_id(session.clone(), pane_id).await?;
-        let target = target_with_live_occupant(&pane, target_from_row(row)).await;
+        let target = target_with_live_occupant(&pane, authoritative_target).await;
         additions.push((key, session.clone(), pane_id, target));
     }
 
-    // List/session/pane acquisition above is complete before this rebase. The following
-    // reconciliation may publish pane drafts, so the controller sees the reset first.
-    connection.publish_inventory_rebase(events, inventory_epoch, bootstrap);
+    // Hold the reconnect epoch lock through watcher mutation. A disconnect that won while the
+    // inventory was in flight makes this inventory stale; a later disconnect is ordered after
+    // these changes and schedules the next authoritative reconciliation.
+    let Some(inventory_guard) =
+        connection.lock_current_inventory(events, inventory_epoch, bootstrap)
+    else {
+        return Ok(false);
+    };
 
+    for (key, _, _, target) in &additions {
+        if !replacements.contains(key) {
+            continue;
+        }
+        let Some(watcher) = watched.get(key) else {
+            continue;
+        };
+        let previous = watcher
+            .target
+            .lock()
+            .expect("replacement watcher target lock")
+            .target
+            .clone();
+        let generation = watcher
+            .target
+            .lock()
+            .expect("replacement watcher generation lock")
+            .snapshot()
+            .map(|(generation, _)| generation);
+        if let Some(generation) = generation
+            && retire_watcher_for_generation(&watcher.target, generation)
+        {
+            watcher.stop();
+        }
+        publish_occupant_replacement(events, &previous, target);
+    }
     let mut changed = false;
     for (_, row) in &inventory {
         let key = (row.session_name.clone(), row.pane_id.clone());
@@ -618,20 +945,31 @@ async fn reconcile_panes(
         .cloned()
         .collect::<Vec<_>>();
     changed |= !additions.is_empty() || !removed.is_empty();
+    let mut retired_watchers = Vec::with_capacity(removed.len());
     for key in removed {
         let absent = !discovered.contains(&key);
         let watcher = watched
             .remove(&key)
             .expect("key was collected from the watch map");
-        let _ = watcher.stop.send(true);
-        if absent {
-            let _ = publish_inventory_closed(events, &watcher.target);
+        let shared_target = watcher.target.clone();
+        let generation = shared_target
+            .lock()
+            .expect("removed watcher target lock")
+            .snapshot()
+            .map(|(generation, _)| generation);
+        if let Some(generation) = generation {
+            let _ = retire_watcher_for_generation(&shared_target, generation);
         }
+        if absent {
+            let _ = publish_inventory_closed(events, &shared_target);
+        }
+        watcher.stop();
+        retired_watchers.push(watcher);
     }
     for (key, session, pane_id, target) in additions {
         let target = Arc::new(Mutex::new(PaneWatchTarget::new(target)));
         let (stop, _) = watch::channel(false);
-        tokio::spawn(watch_output(
+        let output_task = tokio::spawn(watch_output(
             session.clone(),
             pane_id,
             target.clone(),
@@ -639,7 +977,7 @@ async fn reconcile_panes(
             connection.clone(),
             stop.clone(),
         ));
-        tokio::spawn(watch_state(
+        let state_task = tokio::spawn(watch_state(
             session,
             pane_id,
             target.clone(),
@@ -647,14 +985,25 @@ async fn reconcile_panes(
             connection.clone(),
             stop.clone(),
         ));
-        watched.insert(key, PaneWatcher { stop, target });
+        watched.insert(
+            key,
+            PaneWatcher {
+                stop,
+                target,
+                tasks: vec![output_task, state_task],
+            },
+        );
+    }
+    drop(inventory_guard);
+    for watcher in retired_watchers {
+        watcher.shutdown().await;
     }
     Ok(changed)
 }
 
-fn stop_watchers(watched: &mut BTreeMap<PaneWatchKey, PaneWatcher>) {
+async fn stop_watchers(watched: &mut BTreeMap<PaneWatchKey, PaneWatcher>) {
     for (_, watcher) in std::mem::take(watched) {
-        let _ = watcher.stop.send(true);
+        watcher.shutdown().await;
     }
 }
 
@@ -688,10 +1037,17 @@ async fn watch_output(
         if *stop_rx.borrow() || !watcher_is_active(&shared_target) {
             return;
         }
+        let Some((source_generation, _)) = shared_target
+            .lock()
+            .expect("pane watcher target lock")
+            .snapshot()
+        else {
+            return;
+        };
         let mut stream = match pane.output_stream().await {
             Ok(stream) => stream,
             Err(error) => {
-                if !watcher_is_active(&shared_target) {
+                if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                     return;
                 }
                 connection
@@ -702,19 +1058,17 @@ async fn watch_output(
                 continue;
             }
         };
+        if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
+            return;
+        }
         connection.connected();
         loop {
-            refresh_watcher_target(&pane, &shared_target, &events).await;
             if *stop_rx.borrow() || !watcher_is_active(&shared_target) {
                 return;
             }
-            let Some((_, observed_target)) = shared_target
-                .lock()
-                .expect("pane watcher target lock")
-                .snapshot()
-            else {
+            if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                 return;
-            };
+            }
             let item = tokio::select! {
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
@@ -724,36 +1078,64 @@ async fn watch_output(
                 }
                 item = stream.next() => item,
             };
+            if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
+                return;
+            }
             match item {
                 Ok(Some(PaneOutputChunk::Bytes { sequence, bytes })) => {
-                    publish_output_for_target(&events, &observed_target, sequence, bytes);
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| publish_output_for_target(&events, target, sequence, bytes),
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 Ok(Some(PaneOutputChunk::Lag(lag))) => {
-                    publish_output_gap_for_target(
-                        &events,
-                        &observed_target,
-                        lag.expected_sequence,
-                        lag.resume_sequence,
-                        lag.missed_events,
-                    );
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            publish_output_gap_for_target(
+                                &events,
+                                target,
+                                lag.expected_sequence,
+                                lag.resume_sequence,
+                                lag.missed_events,
+                            );
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 Ok(Some(_)) => {
-                    let _ = publish_for_active_watcher_target(&shared_target, |_| {
+                    if !publish_for_watcher_generation(&shared_target, source_generation, |_| {
                         events.publish(MuxEventDraft::rebase(
                             MuxEventProvenance::RmuxSdk,
                             MuxRebaseReason::SequenceGap,
                         ));
-                    });
+                    }) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 Ok(None) => {
-                    if retire_watcher(&shared_target) {
-                        topology_invalidated();
+                    if !retire_watcher_for_generation(&shared_target, source_generation) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
                     }
+                    topology_invalidated();
                     let _ = stop.send(true);
                     return;
                 }
                 Err(error) => {
-                    if !watcher_is_active(&shared_target) {
+                    if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                         return;
                     }
                     connection.disconnected(&events, format!("rmux output stream lost: {error}"));
@@ -797,6 +1179,13 @@ async fn watch_state(
         if *stop_rx.borrow() || !watcher_is_active(&shared_target) {
             return;
         }
+        let Some((source_generation, _)) = shared_target
+            .lock()
+            .expect("pane watcher target lock")
+            .snapshot()
+        else {
+            return;
+        };
         let mut stream = match pane
             .state_events(PaneStateEventsOptions {
                 include_title: true,
@@ -807,7 +1196,7 @@ async fn watch_state(
         {
             Ok(stream) => stream,
             Err(error) => {
-                if !watcher_is_active(&shared_target) {
+                if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                     return;
                 }
                 connection
@@ -818,10 +1207,15 @@ async fn watch_state(
                 continue;
             }
         };
+        if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
+            return;
+        }
         connection.connected();
         loop {
-            refresh_watcher_target(&pane, &shared_target, &events).await;
             if *stop_rx.borrow() || !watcher_is_active(&shared_target) {
+                return;
+            }
+            if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                 return;
             }
             let event = tokio::select! {
@@ -834,14 +1228,20 @@ async fn watch_state(
                 event = stream.next() => match event {
                     Ok(Some(event)) => event,
                     Ok(None) => {
-                        if retire_watcher(&shared_target) {
-                            topology_invalidated();
+                        if !retire_watcher_for_generation(&shared_target, source_generation) {
+                            let _ = abort_stale_watcher_source(
+                                &shared_target,
+                                source_generation,
+                                &stop,
+                            );
+                            return;
                         }
+                        topology_invalidated();
                         let _ = stop.send(true);
                         return;
                     }
                     Err(error) => {
-                        if !watcher_is_active(&shared_target) {
+                        if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                             return;
                         }
                         connection.disconnected(&events, format!("rmux state stream lost: {error}"));
@@ -852,7 +1252,7 @@ async fn watch_state(
                     }
                 },
             };
-            if !watcher_is_active(&shared_target) {
+            if abort_stale_watcher_source(&shared_target, source_generation, &stop) {
                 return;
             }
             match event {
@@ -864,40 +1264,50 @@ async fn watch_state(
                     ..
                 } => {
                     let foreground = foreground.map(foreground_state);
-                    let _ = publish_for_active_watcher_target(&shared_target, |target| {
-                        let cursor = state_cursor(target, revision);
-                        if let Some(cwd) = foreground.as_ref().and_then(|state| state.cwd.clone()) {
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            let cursor = state_cursor(target, revision);
+                            if let Some(cwd) =
+                                foreground.as_ref().and_then(|state| state.cwd.clone())
+                            {
+                                events.publish(MuxEventDraft::new(
+                                    MuxEventTopic::PaneCwdChanged,
+                                    MuxEventProvenance::RmuxSdk,
+                                    Some(target.clone()),
+                                    Some(cursor.clone()),
+                                    MuxEventPayload::Cwd {
+                                        old_cwd: None,
+                                        new_cwd: Some(cwd),
+                                    },
+                                ));
+                            }
                             events.publish(MuxEventDraft::new(
-                                MuxEventTopic::PaneCwdChanged,
+                                MuxEventTopic::PaneStateChanged,
                                 MuxEventProvenance::RmuxSdk,
                                 Some(target.clone()),
-                                Some(cursor.clone()),
-                                MuxEventPayload::Cwd {
-                                    old_cwd: None,
-                                    new_cwd: Some(cwd),
+                                Some(cursor),
+                                MuxEventPayload::PaneState {
+                                    state: MuxPaneState {
+                                        title,
+                                        options: options
+                                            .into_iter()
+                                            .map(|option| MuxPaneOption {
+                                                name: option.name,
+                                                value: option.value,
+                                            })
+                                            .collect(),
+                                        foreground,
+                                    },
                                 },
                             ));
-                        }
-                        events.publish(MuxEventDraft::new(
-                            MuxEventTopic::PaneStateChanged,
-                            MuxEventProvenance::RmuxSdk,
-                            Some(target.clone()),
-                            Some(cursor),
-                            MuxEventPayload::PaneState {
-                                state: MuxPaneState {
-                                    title,
-                                    options: options
-                                        .into_iter()
-                                        .map(|option| MuxPaneOption {
-                                            name: option.name,
-                                            value: option.value,
-                                        })
-                                        .collect(),
-                                    foreground,
-                                },
-                            },
-                        ));
-                    });
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 PaneStateEvent::TitleChanged {
                     revision,
@@ -905,18 +1315,26 @@ async fn watch_state(
                     new_title,
                     ..
                 } => {
-                    let _ = publish_for_active_watcher_target(&shared_target, |target| {
-                        events.publish(MuxEventDraft::new(
-                            MuxEventTopic::PaneTitleChanged,
-                            MuxEventProvenance::RmuxSdk,
-                            Some(target.clone()),
-                            Some(state_cursor(target, revision)),
-                            MuxEventPayload::Title {
-                                old_title: Some(old_title),
-                                new_title: Some(new_title),
-                            },
-                        ));
-                    });
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            events.publish(MuxEventDraft::new(
+                                MuxEventTopic::PaneTitleChanged,
+                                MuxEventProvenance::RmuxSdk,
+                                Some(target.clone()),
+                                Some(state_cursor(target, revision)),
+                                MuxEventPayload::Title {
+                                    old_title: Some(old_title),
+                                    new_title: Some(new_title),
+                                },
+                            ));
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 PaneStateEvent::OptionSet {
                     revision,
@@ -925,19 +1343,27 @@ async fn watch_state(
                     new_value,
                     ..
                 } => {
-                    let _ = publish_for_active_watcher_target(&shared_target, |target| {
-                        events.publish(MuxEventDraft::new(
-                            MuxEventTopic::PaneOptionsChanged,
-                            MuxEventProvenance::RmuxSdk,
-                            Some(target.clone()),
-                            Some(state_cursor(target, revision)),
-                            MuxEventPayload::Option {
-                                name,
-                                old_value,
-                                new_value: Some(new_value),
-                            },
-                        ));
-                    });
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            events.publish(MuxEventDraft::new(
+                                MuxEventTopic::PaneOptionsChanged,
+                                MuxEventProvenance::RmuxSdk,
+                                Some(target.clone()),
+                                Some(state_cursor(target, revision)),
+                                MuxEventPayload::Option {
+                                    name,
+                                    old_value,
+                                    new_value: Some(new_value),
+                                },
+                            ));
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 PaneStateEvent::OptionUnset {
                     revision,
@@ -945,19 +1371,27 @@ async fn watch_state(
                     old_value,
                     ..
                 } => {
-                    let _ = publish_for_active_watcher_target(&shared_target, |target| {
-                        events.publish(MuxEventDraft::new(
-                            MuxEventTopic::PaneOptionsChanged,
-                            MuxEventProvenance::RmuxSdk,
-                            Some(target.clone()),
-                            Some(state_cursor(target, revision)),
-                            MuxEventPayload::Option {
-                                name,
-                                old_value,
-                                new_value: None,
-                            },
-                        ));
-                    });
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            events.publish(MuxEventDraft::new(
+                                MuxEventTopic::PaneOptionsChanged,
+                                MuxEventProvenance::RmuxSdk,
+                                Some(target.clone()),
+                                Some(state_cursor(target, revision)),
+                                MuxEventPayload::Option {
+                                    name,
+                                    old_value,
+                                    new_value: None,
+                                },
+                            ));
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 PaneStateEvent::ForegroundChanged {
                     revision,
@@ -967,67 +1401,92 @@ async fn watch_state(
                 } => {
                     let old_state = foreground_state(old_state);
                     let new_state = foreground_state(new_state);
-                    let _ = publish_for_active_watcher_target(&shared_target, |target| {
-                        let cursor = state_cursor(target, revision);
-                        if old_state.cwd != new_state.cwd {
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            let cursor = state_cursor(target, revision);
+                            if old_state.cwd != new_state.cwd {
+                                events.publish(MuxEventDraft::new(
+                                    MuxEventTopic::PaneCwdChanged,
+                                    MuxEventProvenance::RmuxSdk,
+                                    Some(target.clone()),
+                                    Some(cursor.clone()),
+                                    MuxEventPayload::Cwd {
+                                        old_cwd: old_state.cwd.clone(),
+                                        new_cwd: new_state.cwd.clone(),
+                                    },
+                                ));
+                            }
                             events.publish(MuxEventDraft::new(
-                                MuxEventTopic::PaneCwdChanged,
+                                MuxEventTopic::PaneForegroundChanged,
                                 MuxEventProvenance::RmuxSdk,
                                 Some(target.clone()),
-                                Some(cursor.clone()),
-                                MuxEventPayload::Cwd {
-                                    old_cwd: old_state.cwd.clone(),
-                                    new_cwd: new_state.cwd.clone(),
+                                Some(cursor),
+                                MuxEventPayload::Foreground {
+                                    old_state: Some(old_state),
+                                    new_state: Some(new_state),
                                 },
                             ));
-                        }
-                        events.publish(MuxEventDraft::new(
-                            MuxEventTopic::PaneForegroundChanged,
-                            MuxEventProvenance::RmuxSdk,
-                            Some(target.clone()),
-                            Some(cursor),
-                            MuxEventPayload::Foreground {
-                                old_state: Some(old_state),
-                                new_state: Some(new_state),
-                            },
-                        ));
-                    });
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 PaneStateEvent::Lagged {
                     missed_from_revision,
                     resume_revision,
                 } => {
-                    let _ = publish_for_active_watcher_target(&shared_target, |target| {
-                        events.publish_gap(
-                            MuxEventProvenance::RmuxSdk,
-                            Some(target.clone()),
-                            Some(state_cursor(target, resume_revision)),
-                            missed_from_revision,
-                            resume_revision,
-                            resume_revision.saturating_sub(missed_from_revision),
-                        );
-                    });
+                    if !publish_for_watcher_generation(
+                        &shared_target,
+                        source_generation,
+                        |target| {
+                            events.publish_gap(
+                                MuxEventProvenance::RmuxSdk,
+                                Some(target.clone()),
+                                Some(state_cursor(target, resume_revision)),
+                                missed_from_revision,
+                                resume_revision,
+                                resume_revision.saturating_sub(missed_from_revision),
+                            );
+                        },
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
                 PaneStateEvent::Closed {
                     revision, reason, ..
                 } => {
-                    let _ = publish_stream_closed(
+                    if !publish_stream_closed_for_generation(
                         &events,
                         &shared_target,
+                        source_generation,
                         revision,
                         format!("{reason:?}"),
-                    );
+                    ) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                     topology_invalidated();
                     let _ = stop.send(true);
                     return;
                 }
                 _ => {
-                    let _ = publish_for_active_watcher_target(&shared_target, |_| {
+                    if !publish_for_watcher_generation(&shared_target, source_generation, |_| {
                         events.publish(MuxEventDraft::rebase(
                             MuxEventProvenance::RmuxSdk,
                             MuxRebaseReason::SequenceGap,
                         ));
-                    });
+                    }) {
+                        let _ =
+                            abort_stale_watcher_source(&shared_target, source_generation, &stop);
+                        return;
+                    }
                 }
             }
         }
@@ -1200,7 +1659,71 @@ mod tests {
         PaneWatcher {
             stop,
             target: std::sync::Arc::new(std::sync::Mutex::new(PaneWatchTarget::new(target))),
+            tasks: Vec::new(),
         }
+    }
+    #[test]
+    fn replacement_shutdown_aborts_blocked_stream_task_without_stale_events() {
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            let events = MuxEventQueue::with_backend_limits("rmux:test", 8, 1024);
+            let mut watcher = pane_watcher(pane_target("@old", 1));
+            let shared_target = watcher.target.clone();
+            let source_generation = shared_target
+                .lock()
+                .expect("source watcher target lock")
+                .snapshot()
+                .expect("active source watcher")
+                .0;
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let started = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let stale_events = events.clone();
+            let stale_target = shared_target.clone();
+            let task_dropped = dropped.clone();
+            let task_started = started.clone();
+            let task = tokio::spawn(async move {
+                let _marker = DropMarker(task_dropped);
+                task_started.store(true, Ordering::Release);
+                let _ = release_rx.await;
+                let _ =
+                    publish_for_watcher_generation(&stale_target, source_generation, |target| {
+                        publish_output_for_target(&stale_events, target, 99, b"stale".to_vec())
+                    });
+            });
+            watcher.tasks.push(task);
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+
+            let replacement = MuxOccupantIdentity {
+                backend_identity: "rmux:%3:generation:2".to_owned(),
+                pid: Some(11),
+                process: Some("shell".to_owned()),
+            };
+            let (_, _, changed) = shared_target
+                .lock()
+                .expect("replacement watcher target lock")
+                .replace_live_occupant(source_generation, Some(replacement))
+                .expect("replacement applies to source generation");
+            assert!(changed);
+
+            watcher.shutdown().await;
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(release_tx.send(()).is_err());
+            assert!(events.drain(scope(), 8).is_empty());
+        });
     }
 
     fn publish_state_observation(
@@ -1219,6 +1742,86 @@ mod tests {
                 },
             ));
         })
+    }
+    fn publish_state_observation_for_generation(
+        events: &MuxEventQueue,
+        shared_target: &SharedPaneWatchTarget,
+        expected_generation: u64,
+        revision: u64,
+    ) -> bool {
+        publish_for_watcher_generation(shared_target, expected_generation, |target| {
+            events.publish(MuxEventDraft::new(
+                MuxEventTopic::PaneStateChanged,
+                MuxEventProvenance::RmuxSdk,
+                Some(target.clone()),
+                Some(state_cursor(target, revision)),
+                MuxEventPayload::PaneState {
+                    state: MuxPaneState::default(),
+                },
+            ));
+        })
+    }
+
+    fn test_event_hub() -> RmuxEventHub {
+        RmuxEventHub {
+            events: MuxEventQueue::for_backend("rmux:test"),
+            started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            controls: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            scopes: std::sync::Mutex::new(std::collections::HashSet::new()),
+            lifecycle: std::sync::Mutex::new(()),
+            worker: std::sync::Mutex::new(None),
+            release_barrier: std::sync::Mutex::new(None),
+            connection: RmuxConnectionState::default(),
+        }
+    }
+
+    #[test]
+    fn rmux_hub_stops_after_last_scope_and_restarts_for_recreated_scope() {
+        let first_scope = MuxScope::new(
+            crate::controller::SpaceId::from_persistence(91),
+            BindingId::from_persistence(1),
+        );
+        let sibling_scope = MuxScope::new(
+            crate::controller::SpaceId::from_persistence(91),
+            BindingId::from_persistence(2),
+        );
+        let hub = Arc::new(test_event_hub());
+        hub.release(first_scope);
+        hub.release(sibling_scope);
+
+        hub.subscribe(first_scope);
+        assert!(hub.started.load(Ordering::Acquire));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        *hub.release_barrier
+            .lock()
+            .expect("rmux release barrier lock") = Some(Arc::clone(&barrier));
+        let release_hub = Arc::clone(&hub);
+        let releaser = std::thread::spawn(move || release_hub.release(first_scope));
+        let subscribe_hub = Arc::clone(&hub);
+        let subscribe_barrier = Arc::clone(&barrier);
+        let subscriber = std::thread::spawn(move || {
+            subscribe_barrier.wait();
+            subscribe_hub.subscribe(sibling_scope);
+        });
+        barrier.wait();
+        releaser.join().expect("last rmux release completed");
+        subscriber
+            .join()
+            .expect("concurrent rmux subscribe completed");
+
+        assert!(
+            hub.scopes
+                .lock()
+                .expect("rmux hub scope lock")
+                .contains(&sibling_scope)
+        );
+        assert!(hub.started.load(Ordering::Acquire));
+        hub.release(sibling_scope);
+        assert!(!hub.started.load(Ordering::Acquire));
+        hub.subscribe(first_scope);
+        assert!(hub.started.load(Ordering::Acquire));
+        hub.release(first_scope);
+        assert!(!hub.started.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1260,7 +1863,7 @@ mod tests {
         connection.publish_inventory_rebase(&events, inventory_epoch, true);
         connection.publish_inventory_rebase(&events, inventory_epoch, false);
 
-        let bootstrap = events.drain(scope(), 8);
+        let bootstrap = events.drain_with_initial_rebase(scope(), 8, MuxEventProvenance::RmuxSdk);
         assert_eq!(bootstrap.len(), 1);
         assert_eq!(bootstrap[0].revision, 1);
         assert_eq!(bootstrap[0].topic, MuxEventTopic::SnapshotRebased);
@@ -1320,7 +1923,7 @@ mod tests {
         connection.publish_inventory_rebase(&events, inventory_epoch, true);
         connection.publish_inventory_rebase(&events, inventory_epoch, false);
 
-        let bootstrap = events.drain(scope(), 8);
+        let bootstrap = events.drain_with_initial_rebase(scope(), 8, MuxEventProvenance::RmuxSdk);
         assert_eq!(bootstrap.len(), 1);
         assert_eq!(bootstrap[0].revision, 2);
         assert!(matches!(
@@ -1339,7 +1942,17 @@ mod tests {
         let active_target = pane_target("@active", 2);
         let active = pane_watcher(active_target.clone());
 
-        assert!(retire_watcher(&retired.target));
+        let retired_generation = retired
+            .target
+            .lock()
+            .expect("retired watcher target lock")
+            .snapshot()
+            .expect("active retired watcher")
+            .0;
+        assert!(retire_watcher_for_generation(
+            &retired.target,
+            retired_generation,
+        ));
         assert!(watcher_needs_reconciliation(&retired));
         assert!(!publish_output_observation(
             &events,
@@ -1370,6 +1983,40 @@ mod tests {
                     }
             )
         }));
+    }
+    #[test]
+    fn live_occupant_replacement_retires_both_stream_sources_atomically() {
+        let events = MuxEventQueue::with_backend_limits("rmux:test", 8, 1024);
+        let watcher = pane_watcher(pane_target("@active", 1));
+        let source_generation = watcher
+            .target
+            .lock()
+            .expect("live replacement target lock")
+            .snapshot()
+            .expect("active watcher")
+            .0;
+        let replacement = MuxOccupantIdentity {
+            backend_identity: "rmux:%3:generation:2".to_owned(),
+            pid: Some(11),
+            process: Some("shell".to_owned()),
+        };
+
+        let (_, replacement_target, changed) = watcher
+            .target
+            .lock()
+            .expect("live replacement target lock")
+            .replace_live_occupant(source_generation, Some(replacement))
+            .expect("live replacement applies to source generation");
+        assert!(changed);
+        assert_eq!(replacement_target.occupant.as_ref().unwrap().pid, Some(11));
+        assert!(watcher_needs_reconciliation(&watcher));
+        assert!(!publish_for_watcher_generation(
+            &watcher.target,
+            source_generation,
+            |target| publish_output_for_target(&events, target, 7, b"stale".to_vec()),
+        ));
+        assert!(!publish_state_observation(&events, &watcher.target, 8,));
+        assert!(events.drain(scope(), 8).is_empty());
     }
 
     #[test]
@@ -1450,6 +2097,15 @@ mod tests {
             &watcher,
             target_from_row(&moved_row),
         ));
+        let (source_generation, current_target) = watcher
+            .target
+            .lock()
+            .expect("moved watcher target lock")
+            .snapshot()
+            .expect("active moved watcher");
+        assert_eq!(source_generation, 0);
+        assert_eq!(current_target.window_id.as_deref(), Some("@new"));
+
         assert!(publish_state_observation(&events, &watcher.target, 7));
         assert!(publish_output_observation(
             &events,
@@ -1494,6 +2150,104 @@ mod tests {
                 .iter()
                 .any(|event| event.topic == MuxEventTopic::PaneClosed)
         );
+    }
+    #[test]
+    fn incomplete_authoritative_target_preserves_source_generation() {
+        let events = MuxEventQueue::with_backend_limits("rmux:test", 8, 1024);
+        let watcher = pane_watcher(pane_target("@old", 1));
+        assert!(update_watcher_target(
+            &events,
+            &watcher,
+            MuxEventTarget::pane("$1", "@new", "%3", "t3", None),
+        ));
+
+        let (source_generation, current_target) = watcher
+            .target
+            .lock()
+            .expect("partial target lock")
+            .snapshot()
+            .expect("active partial target");
+        assert_eq!(source_generation, 0);
+        assert!(current_target.occupant.is_some());
+        assert!(publish_state_observation(&events, &watcher.target, 7));
+    }
+
+    #[test]
+    fn state_events_do_not_retarget_a_replacement_occupant() {
+        let events = MuxEventQueue::with_backend_limits("rmux:test", 8, 1024);
+        let old_target = pane_target("@2", 1);
+        let watcher = pane_watcher(old_target);
+        let observed_generation = watcher
+            .target
+            .lock()
+            .expect("active watcher before state poll")
+            .snapshot()
+            .expect("active watcher")
+            .0;
+
+        assert!(update_watcher_target(
+            &events,
+            &watcher,
+            target_from_row(&pane_row("@2", 2)),
+        ));
+        assert!(!publish_state_observation_for_generation(
+            &events,
+            &watcher.target,
+            observed_generation,
+            7,
+        ));
+
+        assert!(!publish_stream_closed_for_generation(
+            &events,
+            &watcher.target,
+            observed_generation,
+            8,
+            "old stream closed".to_owned(),
+        ));
+        let observed = events.drain(scope(), 8);
+        assert!(
+            observed
+                .iter()
+                .any(|event| event.topic == MuxEventTopic::PaneOccupantReplaced)
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|event| event.topic == MuxEventTopic::PaneStateChanged)
+        );
+    }
+    #[test]
+    fn stale_source_exit_cannot_retire_the_replacement_generation() {
+        let watcher = pane_watcher(pane_target("@2", 1));
+        let source_generation = watcher
+            .target
+            .lock()
+            .expect("source watcher target lock")
+            .snapshot()
+            .expect("active source watcher")
+            .0;
+        let events = MuxEventQueue::with_backend_limits("rmux:test", 8, 1024);
+        assert!(update_watcher_target(
+            &events,
+            &watcher,
+            target_from_row(&pane_row("@2", 2)),
+        ));
+
+        let (stop, stop_rx) = watch::channel(false);
+        assert!(abort_stale_watcher_source(
+            &watcher.target,
+            source_generation,
+            &stop,
+        ));
+        assert!(*stop_rx.borrow());
+        assert!(watcher_is_active(&watcher.target));
+        let (replacement_generation, _) = watcher
+            .target
+            .lock()
+            .expect("replacement watcher target lock")
+            .snapshot()
+            .expect("active replacement watcher");
+        assert_ne!(replacement_generation, source_generation);
     }
 
     #[test]
