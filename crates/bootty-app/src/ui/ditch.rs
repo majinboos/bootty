@@ -1,6 +1,7 @@
 use bootty_ui::{Theme, ThemePalette};
 use eframe::egui;
 
+use crate::automation::directory::WorktreeRemovalConfirmation;
 use crate::git::{self, WorktreeStatus};
 use crate::strings::display_path;
 use crate::ui::overlay::{self, ActionItem, ActionMenu, ActionRisk, FloatingWindow, StatusLine};
@@ -32,6 +33,7 @@ pub struct DitchSessionDialog {
     status: WorktreeStatus,
     actions: Vec<DitchAction>,
     selected: usize,
+    pending_worktree_confirmation: Option<(DitchAction, WorktreeRemovalConfirmation)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,7 @@ pub enum DitchSessionEvent {
         session_id: String,
         cwd: Option<String>,
         action: DitchAction,
+        confirmation: Option<Box<WorktreeRemovalConfirmation>>,
     },
 }
 
@@ -58,16 +61,63 @@ impl DitchSessionDialog {
             status,
             actions,
             selected: 0,
+            pending_worktree_confirmation: None,
+        }
+    }
+
+    /// Require a second explicit activation after the exact cross-session
+    /// claimant set has been bound by the locked worktree-removal preflight.
+    pub fn require_worktree_removal_confirmation(
+        &mut self,
+        action: DitchAction,
+        confirmation: WorktreeRemovalConfirmation,
+    ) {
+        self.pending_worktree_confirmation = Some((action, confirmation));
+        self.selected = 0;
+    }
+
+    fn ditch_event(&self, action: DitchAction) -> DitchSessionEvent {
+        let confirmation = self.pending_worktree_confirmation.as_ref().and_then(
+            |(confirmed_action, confirmation)| {
+                (confirmed_action == &action).then(|| Box::new(confirmation.clone()))
+            },
+        );
+        DitchSessionEvent::Ditch {
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            action,
+            confirmation,
         }
     }
 
     pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> DitchSessionEvent {
-        let lines = status_lines(&self.status, self.cwd.as_deref(), theme.palette);
-        let items = action_items(&self.actions);
+        let mut lines = status_lines(&self.status, self.cwd.as_deref(), theme.palette);
+        let (actions, confirmation_pending) =
+            if let Some((action, confirmation)) = &self.pending_worktree_confirmation {
+                let sessions = confirmation
+                    .conflicting_claims
+                    .iter()
+                    .map(|claim| claim.session.session_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(StatusLine {
+                    label: "shared worktree".to_owned(),
+                    value: format!("confirm removal despite active session(s): {sessions}"),
+                    tint: Some(theme.palette.warning),
+                });
+                (vec![action.clone()], true)
+            } else {
+                (self.actions.clone(), false)
+            };
+        let items = action_items(&actions, confirmation_pending);
 
         let result = FloatingWindow::new("ditch-session-dialog", "Ditch Session")
             .icon("trash-2")
-            .hint("Enter confirm   Esc cancel")
+            .hint(if confirmation_pending {
+                "Enter confirms removal shared with the listed sessions   Esc cancel"
+            } else {
+                "Enter confirm   Esc cancel"
+            })
             .width(overlay::panel_width(ctx, 600.0, 420.0))
             .show(ctx, theme, |ui, palette| {
                 let outcome = ActionMenu::new(&lines, &items, self.selected).show(ui, palette);
@@ -76,13 +126,9 @@ impl DitchSessionDialog {
             });
 
         if let Some(index) = result.inner
-            && let Some(action) = self.actions.get(index).cloned()
+            && let Some(action) = actions.get(index).cloned()
         {
-            return DitchSessionEvent::Ditch {
-                session_id: self.session_id.clone(),
-                cwd: self.cwd.clone(),
-                action,
-            };
+            return self.ditch_event(action);
         }
         if result.escaped || result.clicked_outside {
             return DitchSessionEvent::Close;
@@ -129,7 +175,21 @@ fn actions_for(
     actions
 }
 
-fn action_items(actions: &[DitchAction]) -> Vec<ActionItem> {
+fn action_items(actions: &[DitchAction], confirmation_pending: bool) -> Vec<ActionItem> {
+    if confirmation_pending {
+        return actions
+            .iter()
+            .map(|_| ActionItem {
+                icon: Some("alert-triangle".to_owned()),
+                label: "Confirm shared-worktree removal".to_owned(),
+                description: Some(
+                    "Remove this worktree even though the listed sessions still claim it"
+                        .to_owned(),
+                ),
+                risk: ActionRisk::Danger,
+            })
+            .collect();
+    }
     actions
         .iter()
         .map(|action| match action {
@@ -249,6 +309,9 @@ fn status_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    use crate::automation::directory::{RepositoryRef, WorktreeRef};
 
     fn linked(dirty: bool, branch: Option<&str>) -> WorktreeStatus {
         WorktreeStatus {
@@ -267,6 +330,51 @@ mod tests {
             branch: branch.map(str::to_owned),
             ..WorktreeStatus::default()
         }
+    }
+
+    #[test]
+    fn shared_worktree_removal_requires_a_second_explicit_confirmation() {
+        let action = DitchAction::RemoveWorktree { force: true };
+        let mut dialog = DitchSessionDialog::open("session-a".to_owned(), None);
+        let worktree = WorktreeRef {
+            repository: RepositoryRef {
+                common_git_dir: PathBuf::from("/repo/.git"),
+                root: Some(PathBuf::from("/repo")),
+            },
+            git_dir: PathBuf::from("/repo/.git/worktrees/feature"),
+            path: PathBuf::from("/repo-feature"),
+            branch: Some("feature".to_owned()),
+            head: Some("deadbeef".to_owned()),
+            created_by: None,
+            managed_by_bootty: false,
+        };
+        let confirmation = WorktreeRemovalConfirmation {
+            worktree,
+            conflicting_claims: Vec::new(),
+        };
+
+        assert!(matches!(
+            dialog.ditch_event(action.clone()),
+            DitchSessionEvent::Ditch {
+                confirmation: None,
+                ..
+            }
+        ));
+        dialog.require_worktree_removal_confirmation(action.clone(), confirmation.clone());
+        assert!(matches!(
+            dialog.ditch_event(DitchAction::KillOnly),
+            DitchSessionEvent::Ditch {
+                confirmation: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            dialog.ditch_event(action),
+            DitchSessionEvent::Ditch {
+                confirmation: Some(replayed),
+                ..
+            } if *replayed == confirmation
+        ));
     }
 
     #[test]

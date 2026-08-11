@@ -1,0 +1,1080 @@
+{
+  "schema_version": 1,
+  "manifest": "rmux_sdk_0_9_1",
+  "source": "rmux SDK operations",
+  "version": "0.9.1",
+  "source_path": "rmux-sdk/src",
+  "runtime_adapter": "embedded rmux 0.10 SDK/IPC only; never the standalone rmux CLI",
+  "entries": [
+    {
+      "id": "CaptureBuilder::preserve_style",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "NewWindowBuilder::at_index",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::cwd",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::detached",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::env",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::insert",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::name",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::shell",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "NewWindowBuilder::spawn",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "OwnedSession::cleanup",
+      "kind": "descriptor",
+      "command": "session.lease.release"
+    },
+    {
+      "id": "OwnedSession::detach_owned",
+      "kind": "descriptor",
+      "command": "session.lease.release"
+    },
+    {
+      "id": "OwnedSession::install_default_signal_handlers",
+      "kind": "unsupported",
+      "reason": "process-wide signal-handler installation has no Bootty command equivalent"
+    },
+    {
+      "id": "OwnedSession::is_active",
+      "kind": "descriptor",
+      "command": "session.exists"
+    },
+    {
+      "id": "OwnedSession::lease_lost",
+      "kind": "unsupported",
+      "reason": "owner-local lease-loss state is not exposed as a Bootty command"
+    },
+    {
+      "id": "OwnedSession::lease_state",
+      "kind": "unsupported",
+      "reason": "owner-local lease state is not exposed as a Bootty command"
+    },
+    {
+      "id": "OwnedSession::lease_state_receiver",
+      "kind": "unsupported",
+      "reason": "owner-local lease-state watch receiver is not exposed as a Bootty command"
+    },
+    {
+      "id": "OwnedSession::preserve",
+      "kind": "descriptor",
+      "command": "session.lease.renew"
+    },
+    {
+      "id": "OwnedSession::shutdown_now",
+      "kind": "descriptor",
+      "command": "session.kill"
+    },
+    {
+      "id": "OwnedSessionBuilder::cleanup_policy",
+      "kind": "descriptor",
+      "command": "session.lease.create"
+    },
+    {
+      "id": "OwnedSessionBuilder::lease_ttl",
+      "kind": "descriptor",
+      "command": "session.lease.create"
+    },
+    {
+      "id": "OwnedSessionBuilder::replace_existing",
+      "kind": "descriptor",
+      "command": "session.lease.create"
+    },
+    {
+      "id": "OwnedSessionSignalHandlers::abort",
+      "kind": "descriptor",
+      "command": "session.kill"
+    },
+    {
+      "id": "Pane::capture_pane",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "Pane::capture_region",
+      "kind": "descriptor",
+      "command": "terminal.capture_region"
+    },
+    {
+      "id": "Pane::close",
+      "kind": "descriptor",
+      "command": "pane.close"
+    },
+    {
+      "id": "Pane::collect_output_until_exit",
+      "kind": "descriptor",
+      "command": "terminal.output.collect_until_exit"
+    },
+    {
+      "id": "Pane::collect_output_until_exit_starting_at",
+      "kind": "descriptor",
+      "command": "terminal.output.collect_until_exit"
+    },
+    {
+      "id": "Pane::detach",
+      "kind": "unsupported",
+      "reason": "pane detachment has no backend-neutral Bootty command"
+    },
+    {
+      "id": "Pane::exists",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Pane::expect_stable",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "Pane::expect_visible_text",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "Pane::find_text",
+      "kind": "descriptor",
+      "command": "terminal.find_text"
+    },
+    {
+      "id": "Pane::find_text_all",
+      "kind": "descriptor",
+      "command": "terminal.find_text_all"
+    },
+    {
+      "id": "Pane::foreground_state",
+      "kind": "descriptor",
+      "command": "pane.foreground_state"
+    },
+    {
+      "id": "Pane::foreground_state_with_revision",
+      "kind": "descriptor",
+      "command": "pane.foreground_state"
+    },
+    {
+      "id": "Pane::id",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Pane::info",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Pane::line_stream",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_lines"
+    },
+    {
+      "id": "Pane::line_stream_starting_at",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_lines"
+    },
+    {
+      "id": "Pane::option",
+      "kind": "descriptor",
+      "command": "pane.option.get"
+    },
+    {
+      "id": "Pane::output_stream",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_bytes"
+    },
+    {
+      "id": "Pane::output_stream_starting_at",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_bytes"
+    },
+    {
+      "id": "Pane::render_stream",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_rendered"
+    },
+    {
+      "id": "Pane::resize",
+      "kind": "descriptor",
+      "command": "pane.resize"
+    },
+    {
+      "id": "Pane::respawn",
+      "kind": "descriptor",
+      "command": "pane.respawn"
+    },
+    {
+      "id": "Pane::screenshot",
+      "kind": "descriptor",
+      "command": "terminal.screenshot"
+    },
+    {
+      "id": "Pane::send_key",
+      "kind": "descriptor",
+      "command": "terminal.send_key"
+    },
+    {
+      "id": "Pane::send_text",
+      "kind": "descriptor",
+      "command": "terminal.send_text"
+    },
+    {
+      "id": "Pane::set_option",
+      "kind": "descriptor",
+      "command": "pane.option.set"
+    },
+    {
+      "id": "Pane::set_title",
+      "kind": "descriptor",
+      "command": "pane.title.set"
+    },
+    {
+      "id": "Pane::share",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Pane::shell",
+      "kind": "descriptor",
+      "command": "pane.process_info"
+    },
+    {
+      "id": "Pane::spawn",
+      "kind": "descriptor",
+      "command": "pane.spawn"
+    },
+    {
+      "id": "Pane::split",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "Pane::split_with",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "Pane::state_events",
+      "kind": "descriptor",
+      "command": "terminal.observe"
+    },
+    {
+      "id": "Pane::title",
+      "kind": "descriptor",
+      "command": "pane.describe"
+    },
+    {
+      "id": "Pane::unset_option",
+      "kind": "descriptor",
+      "command": "pane.option.unset"
+    },
+    {
+      "id": "Pane::wait_exit",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_exit"
+    },
+    {
+      "id": "Pane::wait_for",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "Pane::wait_for_exit",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_exit"
+    },
+    {
+      "id": "Pane::wait_for_load_state",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "Pane::wait_for_next",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_next_match"
+    },
+    {
+      "id": "Pane::wait_for_text",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "Pane::wait_for_text_next",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_next_match"
+    },
+    {
+      "id": "Pane::wait_until_stable_for",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "PaneCaptureBuilder::alternate",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::buffer",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::do_not_trim_spaces",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::end",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::end_absolute",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::escape_ansi",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::escape_sequences",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::hyperlinks",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::include_format",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::join_wrapped",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::line_numbers",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::pending_input",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::preserve_trailing_spaces",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::quiet",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::start",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::start_absolute",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneCaptureBuilder::use_mode_screen",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "PaneLineStream::next",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_lines"
+    },
+    {
+      "id": "PaneOutputStream::next",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_bytes"
+    },
+    {
+      "id": "PaneOutputStream::poll_once",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_bytes"
+    },
+    {
+      "id": "PaneRenderStream::next",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_rendered"
+    },
+    {
+      "id": "PaneRenderStream::with_debounce",
+      "kind": "descriptor",
+      "command": "terminal.output.stream_rendered"
+    },
+    {
+      "id": "PaneSpawnBuilder::cwd",
+      "kind": "descriptor",
+      "command": "pane.spawn"
+    },
+    {
+      "id": "PaneSpawnBuilder::env",
+      "kind": "descriptor",
+      "command": "pane.spawn"
+    },
+    {
+      "id": "PaneSpawnBuilder::keep_alive_on_exit",
+      "kind": "descriptor",
+      "command": "pane.spawn"
+    },
+    {
+      "id": "PaneSpawnBuilder::kill_existing",
+      "kind": "descriptor",
+      "command": "pane.spawn"
+    },
+    {
+      "id": "PaneSpawnBuilder::title",
+      "kind": "descriptor",
+      "command": "pane.spawn"
+    },
+    {
+      "id": "PaneSplitBuilder::cwd",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "PaneSplitBuilder::env",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "PaneSplitBuilder::keep_alive_on_exit",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "PaneSplitBuilder::shell",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "PaneSplitBuilder::spawn",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "PaneSplitBuilder::title",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "PaneStateEventStream::next",
+      "kind": "descriptor",
+      "command": "terminal.observe"
+    },
+    {
+      "id": "Rmux::broadcast",
+      "kind": "descriptor",
+      "command": "terminal.broadcast_input"
+    },
+    {
+      "id": "Rmux::capabilities",
+      "kind": "descriptor",
+      "command": "backend.capabilities"
+    },
+    {
+      "id": "Rmux::connect",
+      "kind": "descriptor",
+      "command": "backend.connect"
+    },
+    {
+      "id": "Rmux::connect_or_start",
+      "kind": "descriptor",
+      "command": "backend.connect"
+    },
+    {
+      "id": "Rmux::connect_or_start_at",
+      "kind": "descriptor",
+      "command": "backend.connect"
+    },
+    {
+      "id": "Rmux::ensure_session",
+      "kind": "descriptor",
+      "command": "session.create"
+    },
+    {
+      "id": "Rmux::find_panes",
+      "kind": "descriptor",
+      "command": "pane.find"
+    },
+    {
+      "id": "Rmux::get_pane_by_id",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Rmux::get_pane_by_title",
+      "kind": "descriptor",
+      "command": "pane.find"
+    },
+    {
+      "id": "Rmux::has_capability",
+      "kind": "descriptor",
+      "command": "backend.capabilities"
+    },
+    {
+      "id": "Rmux::has_session",
+      "kind": "descriptor",
+      "command": "session.exists"
+    },
+    {
+      "id": "Rmux::list_sessions",
+      "kind": "descriptor",
+      "command": "session.list"
+    },
+    {
+      "id": "Rmux::list_web_shares",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Rmux::owned_session",
+      "kind": "descriptor",
+      "command": "session.lease.create"
+    },
+    {
+      "id": "Rmux::pane",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Rmux::pane_by_id",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Rmux::session",
+      "kind": "descriptor",
+      "command": "session.get"
+    },
+    {
+      "id": "Rmux::set_default_timeout",
+      "kind": "unsupported",
+      "reason": "SDK client timeout configuration is not a Bootty command"
+    },
+    {
+      "id": "Rmux::shutdown",
+      "kind": "descriptor",
+      "command": "instance.kill"
+    },
+    {
+      "id": "Rmux::stop_all_web_shares",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Rmux::stop_web_share",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Rmux::web_config",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Rmux::web_share_by_id",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Rmux::window",
+      "kind": "descriptor",
+      "command": "window.get"
+    },
+    {
+      "id": "RmuxBuilder::connect",
+      "kind": "descriptor",
+      "command": "backend.connect"
+    },
+    {
+      "id": "RmuxBuilder::connect_or_start",
+      "kind": "descriptor",
+      "command": "backend.connect"
+    },
+    {
+      "id": "RmuxBuilder::default_endpoint",
+      "kind": "descriptor",
+      "command": "backend.describe"
+    },
+    {
+      "id": "RmuxBuilder::default_timeout",
+      "kind": "descriptor",
+      "command": "backend.describe"
+    },
+    {
+      "id": "RmuxBuilder::endpoint",
+      "kind": "descriptor",
+      "command": "backend.describe"
+    },
+    {
+      "id": "RmuxBuilder::unix_socket",
+      "kind": "descriptor",
+      "command": "backend.describe"
+    },
+    {
+      "id": "RmuxBuilder::windows_pipe",
+      "kind": "descriptor",
+      "command": "backend.describe"
+    },
+    {
+      "id": "Session::exists",
+      "kind": "descriptor",
+      "command": "session.exists"
+    },
+    {
+      "id": "Session::is_listed",
+      "kind": "descriptor",
+      "command": "session.exists"
+    },
+    {
+      "id": "Session::kill",
+      "kind": "descriptor",
+      "command": "session.kill"
+    },
+    {
+      "id": "Session::list_session_names",
+      "kind": "descriptor",
+      "command": "session.list"
+    },
+    {
+      "id": "Session::new_window",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "Session::new_window_with",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "Session::pane",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Session::pane_by_id",
+      "kind": "descriptor",
+      "command": "pane.get"
+    },
+    {
+      "id": "Session::share",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Session::window",
+      "kind": "descriptor",
+      "command": "window.get"
+    },
+    {
+      "id": "TerminalLoadStateWait::poll_interval",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "TerminalLoadStateWait::stable_for",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "TerminalLoadStateWait::timeout",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "VisibleTextExpectation::not_to_contain",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "VisibleTextExpectation::to_contain",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "VisibleTextExpectation::to_match_all",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "VisibleTextExpectation::to_match_any",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "VisibleTextWait::poll_interval",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "VisibleTextWait::timeout",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_text"
+    },
+    {
+      "id": "WebShareBuilder::dark_theme",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::expires_at",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::frontend_url",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::hide_viewers",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::into_future",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::kill_session_on_expire",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::light_theme",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::max_operators",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::max_spectators",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::no_disclaimer",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::no_navbar",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::no_pin",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::operator_only",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::operator_pin",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::pairing_code",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::pin",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::show_viewer_count",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::show_viewers",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::spectator_only",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::spectator_pin",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::terminal_palette",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::terminal_theme",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::theme",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::ttl",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::tunnel_provider",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::tunnel_url",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareBuilder::user_theme",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::expires_at_unix",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::id",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::kill_session_on_expire",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::max_operators",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::max_spectators",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::operator",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::operator_pairing_code",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::operator_token",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::operator_url",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::operators_active",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::pane_target",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::scope",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::spectator",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::spectator_pairing_code",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::spectator_token",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::spectator_url",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::spectators_active",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::stop",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareHandle::summary",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::cached_summary",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::id",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::operator",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::pane_target",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::scope",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::spectator",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::spectator_url_redacted",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::stop",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "WebShareLookup::summary",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    },
+    {
+      "id": "Window::close",
+      "kind": "descriptor",
+      "command": "window.close"
+    },
+    {
+      "id": "Window::exists",
+      "kind": "descriptor",
+      "command": "window.get"
+    },
+    {
+      "id": "Window::id",
+      "kind": "descriptor",
+      "command": "window.get"
+    },
+    {
+      "id": "Window::info",
+      "kind": "descriptor",
+      "command": "window.get"
+    },
+    {
+      "id": "Window::panes",
+      "kind": "descriptor",
+      "command": "pane.list"
+    },
+    {
+      "id": "Window::rename",
+      "kind": "descriptor",
+      "command": "window.rename"
+    },
+    {
+      "id": "Window::resize",
+      "kind": "descriptor",
+      "command": "window.resize"
+    },
+    {
+      "id": "Window::select",
+      "kind": "descriptor",
+      "command": "window.select"
+    },
+    {
+      "id": "Window::select_layout",
+      "kind": "descriptor",
+      "command": "layout.select"
+    }
+  ]
+}

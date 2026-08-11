@@ -220,13 +220,17 @@ fn bench_session_order(c: &mut Criterion) {
 
     let steady_dir = BenchDir::new("session-order-steady");
     let steady_config_path = steady_dir.path("config.toml");
-    let mut steady_store = SessionOrderStore::for_config_path(&steady_config_path);
-    steady_store.sync_sessions(session_refs.iter().copied());
+    let mut steady_store =
+        SessionOrderStore::for_config_path(&steady_config_path).expect("open steady session order");
+    steady_store
+        .sync_sessions(session_refs.iter().copied())
+        .expect("seed steady session order");
     c.bench_function("session_order_steady_sync_384", |b| {
         b.iter(|| {
             black_box(
                 steady_store
                     .sync_sessions(black_box(session_refs.iter().copied()))
+                    .expect("sync steady session order")
                     .len(),
             )
         })
@@ -234,20 +238,27 @@ fn bench_session_order(c: &mut Criterion) {
 
     let move_dir = BenchDir::new("session-order-move");
     let move_config_path = move_dir.path("config.toml");
-    let mut move_store = SessionOrderStore::for_config_path(&move_config_path);
-    move_store.sync_sessions(session_refs.iter().copied());
+    let mut move_store =
+        SessionOrderStore::for_config_path(&move_config_path).expect("open move session order");
+    move_store
+        .sync_sessions(session_refs.iter().copied())
+        .expect("seed move session order");
     c.bench_function("session_order_move_session_persist_384", |b| {
         b.iter(|| {
-            let moved_up = move_store.move_session_before(
-                black_box("group-5/session-005"),
-                black_box(Some("group-0/session-000")),
-                black_box(session_refs.iter().copied()),
-            );
-            let moved_down = move_store.move_session_before(
-                black_box("group-5/session-005"),
-                black_box(None),
-                black_box(session_refs.iter().copied()),
-            );
+            let moved_up = move_store
+                .move_session_before(
+                    black_box("group-5/session-005"),
+                    black_box(Some("group-0/session-000")),
+                    black_box(session_refs.iter().copied()),
+                )
+                .expect("move session up");
+            let moved_down = move_store
+                .move_session_before(
+                    black_box("group-5/session-005"),
+                    black_box(None),
+                    black_box(session_refs.iter().copied()),
+                )
+                .expect("move session down");
             black_box((moved_up, moved_down))
         })
     });
@@ -258,8 +269,14 @@ fn bench_session_order(c: &mut Criterion) {
             cold_index = cold_index.wrapping_add(1);
             let dir = BenchDir::new(&format!("session-order-cold-{cold_index}"));
             let config_path = dir.path("config.toml");
-            let mut store = SessionOrderStore::for_config_path(&config_path);
-            black_box(store.sync_sessions(session_refs.iter().copied()).len())
+            let mut store =
+                SessionOrderStore::for_config_path(&config_path).expect("open cold session order");
+            black_box(
+                store
+                    .sync_sessions(session_refs.iter().copied())
+                    .expect("sync cold session order")
+                    .len(),
+            )
         })
     });
 }

@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::Result;
 use bootty_runtime::{
-    DrainStats, TerminalSession, TerminalSessionConfig, render_source::TerminalRenderSource,
+    DrainStats, TerminalRuntimeObservations, TerminalSession, TerminalSessionConfig,
+    render_source::TerminalRenderSource,
 };
 use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
 use bootty_terminal::{
@@ -270,6 +271,13 @@ impl TerminalRuntime for StartingNativeTerminal {
         match self.ready_terminal() {
             Ok(Some(terminal)) => terminal.drain_pty(),
             Ok(None) | Err(_) => DrainStats::default(),
+        }
+    }
+
+    fn drain_runtime_observations(&mut self) -> TerminalRuntimeObservations {
+        match self.ready_terminal() {
+            Ok(Some(terminal)) => terminal.drain_runtime_observations(),
+            Ok(None) | Err(_) => TerminalRuntimeObservations::default(),
         }
     }
 

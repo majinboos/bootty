@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::controller::MuxScope;
 
-pub const BINDING_CAPABILITY_DESCRIPTOR_VERSION: u16 = 1;
+pub const BINDING_CAPABILITY_DESCRIPTOR_VERSION: u16 = 2;
 
 /// Backend-neutral operations a binding may expose.
 #[derive(Clone, Copy, Debug, Deserialize, Hash, Ord, PartialOrd, PartialEq, Eq, Serialize)]
@@ -17,6 +17,8 @@ pub enum BindingOperation {
     MoveWindow,
     SplitPane,
     NavigatePane,
+    LastPane,
+    ResizePane,
     ClosePane,
     TogglePaneZoom,
     CreateProjectSession,
@@ -79,10 +81,13 @@ impl BindingCapabilityDescriptor {
         if !self.supports(request.operation) {
             return BindingOperationOutcome::Unsupported;
         }
-        if availability == BindingOperationAvailability::Unavailable {
-            return BindingOperationOutcome::Unavailable;
+        match availability {
+            BindingOperationAvailability::Available => {
+                BindingOperationOutcome::Supported(operation())
+            }
+            BindingOperationAvailability::Unavailable => BindingOperationOutcome::Unavailable,
+            BindingOperationAvailability::Denied => BindingOperationOutcome::Denied,
         }
-        BindingOperationOutcome::Supported(operation())
     }
 }
 
@@ -99,6 +104,7 @@ pub struct BindingOperationRequest {
 pub enum BindingOperationAvailability {
     Available,
     Unavailable,
+    Denied,
 }
 
 /// Typed result of attempting an operation advertised by a binding descriptor.
@@ -108,6 +114,7 @@ pub enum BindingOperationOutcome<T> {
     Supported(T),
     Unsupported,
     Unavailable,
+    Denied,
     Stale,
 }
 

@@ -19,6 +19,12 @@ use std::{sync::atomic::AtomicU64, time::Instant};
 #[cfg(all(unix, not(target_os = "macos")))]
 use std::os::unix::process::CommandExt;
 
+#[cfg(feature = "app")]
+use crate::{
+    backend::{MuxEvent, MuxEventCapability, MuxEventTopic},
+    controller::MuxScope,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOutput {
     pub success: bool,
@@ -31,6 +37,28 @@ pub trait CommandRunner {
 
     fn run_disowned(&self, program: &str, args: &[String]) -> Result<CommandOutput> {
         self.run(program, args)
+    }
+
+    #[cfg(feature = "app")]
+    fn mux_event_capabilities(&self) -> Vec<MuxEventCapability> {
+        MuxEventTopic::ALL
+            .into_iter()
+            .map(|topic| {
+                MuxEventCapability::unsupported(
+                    topic,
+                    "command runner has no persistent backend event transport",
+                )
+            })
+            .collect()
+    }
+
+    /// Starts a long-lived event transport before any cursor is drained. Runners without one keep
+    /// the default no-op and advertise every topic as unsupported.
+    #[cfg(feature = "app")]
+    fn start_mux_event_stream(&self, _program: &str) {}
+    #[cfg(feature = "app")]
+    fn drain_mux_events(&self, _scope: MuxScope, _maximum: usize) -> Vec<MuxEvent> {
+        Vec::new()
     }
 }
 

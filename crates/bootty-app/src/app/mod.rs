@@ -1,7 +1,7 @@
 mod state;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::PathBuf,
     sync::{OnceLock, mpsc},
     time::Instant,
@@ -14,6 +14,7 @@ use eframe::{
     },
     wgpu,
 };
+use serde_json::json;
 
 pub use state::{AppEffect, AppState, FrameInputs, ViewportSnapshot};
 use state::{TerminalProgress, TerminalProgressState};
@@ -344,7 +345,15 @@ impl BoottyApp {
     }
 
     pub fn new_with_config(cc: &eframe::CreationContext<'_>, config: BoottyConfig) -> Result<Self> {
-        Self::new_inner(cc, config, "main".to_owned(), None, None)
+        Self::new_inner(
+            cc,
+            config,
+            "main".to_owned(),
+            None,
+            None,
+            crate::automation::AutomationHub::new(),
+            None,
+        )
     }
 
     pub fn new_with_direct_input(
@@ -360,6 +369,8 @@ impl BoottyApp {
             window_state_key,
             Some(direct_input_rx),
             Some(modifier_side_rx),
+            crate::automation::AutomationHub::new(),
+            None,
         )
     }
 
@@ -370,18 +381,30 @@ impl BoottyApp {
         direct_input_rx: mpsc::Receiver<DirectKeyInput>,
         modifier_side_rx: mpsc::Receiver<ModifierSideState>,
     ) -> Result<Self> {
+        let automation = crate::automation::AutomationHub::new();
+        let descriptor = crate::control::new_instance_descriptor(&window_state_key)?;
+        automation.bind_instance_scope(crate::control::instance_scope(&descriptor))?;
         let mut app = Self::new_inner(
             cc,
             config,
-            window_state_key.clone(),
+            window_state_key,
             Some(direct_input_rx),
             Some(modifier_side_rx),
+            automation.clone(),
+            Some(descriptor.directory_instance()),
         )?;
-        app._control_server = Some(crate::control::ControlServer::spawn(
-            window_state_key,
+        let control_server = crate::control::ControlServer::spawn_with_descriptor(
+            descriptor,
             app.state
                 .app_command_sender(crate::commands::Caller::Socket),
-        )?);
+            automation,
+        )?;
+        debug_assert!(
+            app.state
+                .automation_hub()
+                .shares_state_with(&control_server.automation_hub())
+        );
+        app._control_server = Some(control_server);
         Ok(app)
     }
 
@@ -391,6 +414,8 @@ impl BoottyApp {
         window_state_key: String,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
+        automation: crate::automation::AutomationHub,
+        command_instance: Option<crate::automation::InstanceRef>,
     ) -> Result<Self> {
         if uses_custom_egui_fonts(&config) {
             configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
@@ -427,13 +452,25 @@ impl BoottyApp {
             extension_theme.clone(),
         );
 
-        let state = AppState::new_for_window(
-            config.clone(),
-            window_state_key,
-            repaint,
-            direct_input_rx,
-            modifier_side_rx,
-        )?;
+        let state = match command_instance {
+            Some(instance) => AppState::new_for_window_with_automation_and_instance(
+                config.clone(),
+                window_state_key,
+                repaint,
+                direct_input_rx,
+                modifier_side_rx,
+                automation,
+                instance,
+            )?,
+            None => AppState::new_for_window_with_automation(
+                config.clone(),
+                window_state_key,
+                repaint,
+                direct_input_rx,
+                modifier_side_rx,
+                automation,
+            )?,
+        };
         Ok(Self {
             state,
             terminal_widget,
@@ -2124,6 +2161,103 @@ impl BoottyApp {
             LuaWindowOwner::Status => &self.status_extensions,
         }
     }
+
+    /// Publishes file-backed Luau lifecycle changes through the same hub the
+    /// control server owns. The worker queues initial events until that control
+    /// instance has bound its exact scope.
+    fn drain_extension_reload_events(&mut self) {
+        let Some(scope) = self.state.automation_hub().instance_scope() else {
+            return;
+        };
+        let ExtensionReloadPublication {
+            modules,
+            events,
+            requires_rebase,
+        } = combine_extension_reload_drains([
+            self.status_extensions.take_reload_events(),
+            self.sidebar_extensions.take_reload_events(),
+        ]);
+        if events.is_empty() && !requires_rebase {
+            return;
+        }
+
+        let snapshot = json!({
+            "modules": modules
+                .into_iter()
+                .map(|(extension_id, generation)| json!({
+                    "extension_id": extension_id,
+                    "generation": generation,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let provenance = json!({"source": "extension_host"});
+        if requires_rebase
+            && let Err(error) = self.state.publish_automation_event_with_snapshot(
+                crate::automation::EventPublication::new(
+                    scope.clone(),
+                    "extension.reloaded",
+                    provenance.clone(),
+                    None,
+                    json!({"operation": "reloaded", "rebase": true}),
+                ),
+                snapshot.clone(),
+            )
+        {
+            self.state.record_render_error(error);
+        }
+        for event in events {
+            if let Err(error) = self.state.publish_automation_event_with_snapshot(
+                crate::automation::EventPublication::new(
+                    scope.clone(),
+                    "extension.reloaded",
+                    provenance.clone(),
+                    None,
+                    json!({
+                        "extension_id": event.extension_id,
+                        "generation": event.generation,
+                        "operation": event.operation.as_str(),
+                    }),
+                ),
+                snapshot.clone(),
+            ) {
+                self.state.record_render_error(error);
+            }
+        }
+    }
+}
+
+/// The combined publication from both file-backed extension workers.
+struct ExtensionReloadPublication {
+    modules: BTreeMap<String, u64>,
+    events: Vec<crate::extensions::ExtensionReloadEvent>,
+    requires_rebase: bool,
+}
+
+fn combine_extension_reload_drains(
+    drains: impl IntoIterator<Item = crate::extensions::ExtensionReloadDrain>,
+) -> ExtensionReloadPublication {
+    let mut modules = BTreeMap::new();
+    let mut events = Vec::new();
+    let mut requires_rebase = false;
+    for drain in drains {
+        modules.extend(
+            drain
+                .modules
+                .into_iter()
+                .map(|module| (module.extension_id, module.generation)),
+        );
+        events.extend(drain.events);
+        requires_rebase |= drain.requires_rebase;
+    }
+    if requires_rebase {
+        // The rebase snapshot supersedes every delta collected before it.
+        events.clear();
+    }
+    ExtensionReloadPublication {
+        modules,
+        events,
+        requires_rebase,
+    }
 }
 
 fn effective_session_modules(
@@ -2302,6 +2436,7 @@ impl eframe::App for BoottyApp {
             terminal_view_transform: self.terminal_widget.view_transform(),
         };
         let effects = self.state.update_frame(inputs);
+        self.drain_extension_reload_events();
         self.apply_effects(ctx, effects);
         if animate_indeterminate_progress(
             self.window_focused,
@@ -2587,7 +2722,103 @@ fn egui_font_name(family: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::{ModuleCoord, ModuleItem, ModulePrimitive};
+    use crate::extensions::{
+        ExtensionModuleGeneration, ExtensionReloadDrain, ExtensionReloadEvent,
+        ExtensionReloadOperation, ModuleCoord, ModuleItem, ModulePrimitive,
+    };
+
+    #[test]
+    fn extension_rebase_snapshot_discards_retained_pre_rebase_delta() {
+        let extension_id = "path:/extensions/example.luau".to_owned();
+        let final_generation = 99;
+        let ExtensionReloadPublication {
+            modules,
+            events,
+            requires_rebase,
+        } = combine_extension_reload_drains([
+            ExtensionReloadDrain {
+                events: vec![ExtensionReloadEvent {
+                    extension_id: extension_id.clone(),
+                    generation: 2,
+                    operation: ExtensionReloadOperation::Reloaded,
+                }],
+                modules: vec![ExtensionModuleGeneration {
+                    extension_id: extension_id.clone(),
+                    generation: final_generation,
+                }],
+                requires_rebase: true,
+            },
+            ExtensionReloadDrain::default(),
+        ]);
+
+        let authoritative = modules.clone();
+        assert_eq!(
+            authoritative,
+            BTreeMap::from([(extension_id.clone(), final_generation)])
+        );
+        let mut client_modules = BTreeMap::from([(extension_id, 1)]);
+        if requires_rebase {
+            client_modules.clone_from(&modules);
+        }
+        for event in events {
+            match event.operation {
+                ExtensionReloadOperation::Removed => {
+                    client_modules.remove(&event.extension_id);
+                }
+                ExtensionReloadOperation::Loaded | ExtensionReloadOperation::Reloaded => {
+                    client_modules.insert(event.extension_id, event.generation);
+                }
+            }
+        }
+
+        assert!(requires_rebase);
+        assert_eq!(client_modules, authoritative);
+    }
+
+    #[test]
+    fn extension_reload_publication_preserves_normal_event_order() {
+        let publication = combine_extension_reload_drains([
+            ExtensionReloadDrain {
+                events: vec![
+                    ExtensionReloadEvent {
+                        extension_id: "path:/status/one.luau".to_owned(),
+                        generation: 1,
+                        operation: ExtensionReloadOperation::Loaded,
+                    },
+                    ExtensionReloadEvent {
+                        extension_id: "path:/status/two.luau".to_owned(),
+                        generation: 1,
+                        operation: ExtensionReloadOperation::Loaded,
+                    },
+                ],
+                modules: vec![],
+                requires_rebase: false,
+            },
+            ExtensionReloadDrain {
+                events: vec![ExtensionReloadEvent {
+                    extension_id: "path:/sidebar/one.luau".to_owned(),
+                    generation: 1,
+                    operation: ExtensionReloadOperation::Loaded,
+                }],
+                modules: vec![],
+                requires_rebase: false,
+            },
+        ]);
+
+        assert!(!publication.requires_rebase);
+        assert_eq!(
+            publication
+                .events
+                .into_iter()
+                .map(|event| event.extension_id)
+                .collect::<Vec<_>>(),
+            vec![
+                "path:/status/one.luau".to_owned(),
+                "path:/status/two.luau".to_owned(),
+                "path:/sidebar/one.luau".to_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn legacy_sessions_override_keeps_embedded_details_without_duplicates() {

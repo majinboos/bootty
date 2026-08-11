@@ -1,10 +1,10 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::BTreeSet,
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,24 +15,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-use crate::commands::{
-    AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
-    CommandInvocation, CommandRegistry,
+use crate::{
+    automation::{
+        AutomationError, AutomationHub, InstanceRef, OwnerIdentity,
+        hub::{
+            COMMAND_COMPLETED_TOPIC, EVENT_QUEUE_LIMIT, EVENT_TOPIC_LIMIT, MAX_SUBSCRIPTIONS,
+            MAX_TASKS, MAX_TOPICS_PER_SUBSCRIPTION,
+        },
+    },
+    commands::{
+        AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
+        CommandInvocation, CommandRegistry,
+    },
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-const REQUEST_LIMIT: u64 = 1024 * 1024;
+pub const REQUEST_LIMIT: u64 = 1024 * 1024;
 const RPC_ID_LIMIT: usize = 4096;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONNECTIONS: usize = 32;
-const MAX_TASKS: usize = 64;
-const MAX_SUBSCRIPTIONS: usize = 64;
-const MAX_TOPICS_PER_SUBSCRIPTION: usize = 16;
-const EVENT_QUEUE_LIMIT: usize = 64;
-const EVENT_TOPIC_LIMIT: usize = 128;
 const TASK_WAIT_INTERVAL: Duration = Duration::from_millis(50);
-const COMMAND_COMPLETED_TOPIC: &str = "command.completed";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceDescriptor {
@@ -43,6 +46,17 @@ pub struct InstanceDescriptor {
     pub endpoint: PathBuf,
     pub started_at_ms: u128,
     pub protocol_version: u32,
+}
+
+impl InstanceDescriptor {
+    /// The identity external callers discover and directory claims must share.
+    #[must_use]
+    pub(crate) fn directory_instance(&self) -> InstanceRef {
+        InstanceRef {
+            instance_id: self.instance_id.clone(),
+            generation: self.generation,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -72,25 +86,299 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
+/// A catalog command whose dynamic CLI invocation must call a control-plane
+/// method directly rather than enter the application command dispatcher.
+#[derive(Debug)]
+pub enum DirectControlRequest {
+    Rpc { method: &'static str, params: Value },
+    CommandInvocation(CommandInvocation),
+}
+
+impl DirectControlRequest {
+    #[must_use]
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::Rpc { method, .. } => method,
+            Self::CommandInvocation(_) => "command.invoke",
+        }
+    }
+}
+
+/// Returns whether a catalog command is implemented by an owner-local
+/// control-plane RPC method rather than by `AppState`.
+#[must_use]
+pub fn is_direct_control_command(command: &str) -> bool {
+    crate::commands::is_direct_control_command(command)
+}
+
+/// Converts dynamic CLI argument slots for a catalog direct-control command
+/// into the exact JSON-RPC request shape its owner-local handler accepts.
+///
+/// Slots preserve omitted optional fields, unlike a positional command
+/// invocation. `None` means the command is dispatched through the normal
+/// application command channel.
+pub fn direct_control_request(
+    command: &str,
+    arguments: &[Vec<String>],
+) -> Result<Option<DirectControlRequest>> {
+    let request = match command {
+        "system.ping" => DirectControlRequest::Rpc {
+            method: "system.ping",
+            params: direct_system_ping_params(arguments)?,
+        },
+        "system.describe" | "instance.describe" | "command.list" => {
+            direct_control_slots(command, arguments, 0)?;
+            DirectControlRequest::Rpc {
+                method: match command {
+                    "system.describe" => "system.describe",
+                    "instance.describe" => "instance.describe",
+                    "command.list" => "command.list",
+                    _ => unreachable!("matched direct control command"),
+                },
+                params: Value::Null,
+            }
+        }
+        "command.describe" => {
+            let [command_slot] = direct_control_slots(command, arguments, 1)? else {
+                unreachable!("checked direct-control slot count")
+            };
+            DirectControlRequest::Rpc {
+                method: "command.describe",
+                params: json!({
+                    "command": direct_control_required_argument(
+                        command,
+                        "command",
+                        command_slot,
+                    )?
+                }),
+            }
+        }
+        "command.invoke" => {
+            let [command_slot, argument_batches] = direct_control_slots(command, arguments, 2)?
+            else {
+                unreachable!("checked direct-control slot count")
+            };
+            let command = direct_control_required_argument(command, "command", command_slot)?;
+            let mut invocation_arguments = Vec::new();
+            for batch in argument_batches {
+                invocation_arguments.extend(direct_control_string_array(
+                    "command.invoke",
+                    "arguments",
+                    batch,
+                )?);
+            }
+            DirectControlRequest::CommandInvocation(CommandInvocation {
+                command: command.to_owned(),
+                arguments: invocation_arguments,
+                caller: Caller::Cli,
+                target: None,
+                confirmation: None,
+            })
+        }
+        "event.subscribe" => DirectControlRequest::Rpc {
+            method: "event.subscribe",
+            params: direct_event_subscribe_params(arguments)?,
+        },
+        "event.snapshot" | "event.rebase" | "event.unsubscribe" => {
+            let [subscription] = direct_control_slots(command, arguments, 1)? else {
+                unreachable!("checked direct-control slot count")
+            };
+            DirectControlRequest::Rpc {
+                method: match command {
+                    "event.snapshot" => "event.snapshot",
+                    "event.rebase" => "event.rebase",
+                    "event.unsubscribe" => "event.unsubscribe",
+                    _ => unreachable!("matched direct control command"),
+                },
+                params: json!({
+                    "subscription": direct_control_required_argument(
+                        command,
+                        "subscription",
+                        subscription,
+                    )?
+                }),
+            }
+        }
+        "task.status" | "task.cancel" => {
+            let [task] = direct_control_slots(command, arguments, 1)? else {
+                unreachable!("checked direct-control slot count")
+            };
+            DirectControlRequest::Rpc {
+                method: match command {
+                    "task.status" => "task.status",
+                    "task.cancel" => "task.cancel",
+                    _ => unreachable!("matched direct control command"),
+                },
+                params: json!({
+                    "task": direct_control_required_argument(command, "task", task)?
+                }),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(request))
+}
+
+fn direct_system_ping_params(arguments: &[Vec<String>]) -> Result<Value> {
+    let [minimum, maximum] = direct_control_slots("system.ping", arguments, 2)? else {
+        unreachable!("checked direct-control slot count")
+    };
+    let minimum =
+        direct_control_optional_argument("system.ping", "minimum_protocol_version", minimum)?
+            .map(|value| direct_control_u32("system.ping", "minimum_protocol_version", value))
+            .transpose()?;
+    let maximum =
+        direct_control_optional_argument("system.ping", "maximum_protocol_version", maximum)?
+            .map(|value| direct_control_u32("system.ping", "maximum_protocol_version", value))
+            .transpose()?;
+    Ok(match (minimum, maximum) {
+        (None, None) => json!({}),
+        (Some(minimum), None) => json!({"minimum_protocol_version": minimum}),
+        (None, Some(maximum)) => json!({"maximum_protocol_version": maximum}),
+        (Some(minimum), Some(maximum)) => {
+            json!({
+                "minimum_protocol_version": minimum,
+                "maximum_protocol_version": maximum,
+            })
+        }
+    })
+}
+
+fn direct_event_subscribe_params(arguments: &[Vec<String>]) -> Result<Value> {
+    let [topics, scope, subscription, cursor] =
+        direct_control_slots("event.subscribe", arguments, 4)?
+    else {
+        unreachable!("checked direct-control slot count")
+    };
+    let topics = direct_control_optional_argument("event.subscribe", "topics", topics)?;
+    let scope = direct_control_optional_argument("event.subscribe", "scope", scope)?;
+    let subscription =
+        direct_control_optional_argument("event.subscribe", "subscription", subscription)?;
+    let cursor = direct_control_optional_argument("event.subscribe", "cursor", cursor)?;
+
+    if let Some(subscription) = subscription {
+        if topics.is_some() || scope.is_some() {
+            anyhow::bail!(
+                "command event.subscribe accepts either --topics/--scope or --subscription/--cursor"
+            );
+        }
+        let mut params = json!({"subscription": subscription});
+        if let Some(cursor) = cursor {
+            params["cursor"] = json!(direct_control_u64("event.subscribe", "cursor", cursor)?);
+        }
+        return Ok(params);
+    }
+    if cursor.is_some() {
+        anyhow::bail!("command event.subscribe requires --subscription with --cursor");
+    }
+    let topics = direct_control_string_array(
+        "event.subscribe",
+        "topics",
+        topics.ok_or_else(|| {
+            anyhow::anyhow!("command event.subscribe requires --topics or --subscription")
+        })?,
+    )?;
+    let mut params = json!({"topics": topics});
+    if let Some(scope) = scope {
+        params["scope"] = json!(scope);
+    }
+    Ok(params)
+}
+
+fn direct_control_slots<'a>(
+    command: &str,
+    arguments: &'a [Vec<String>],
+    expected: usize,
+) -> Result<&'a [Vec<String>]> {
+    if arguments.len() == expected {
+        Ok(arguments)
+    } else {
+        anyhow::bail!("command {command} has an unexpected argument schema")
+    }
+}
+
+fn direct_control_required_argument<'a>(
+    command: &str,
+    argument: &str,
+    values: &'a [String],
+) -> Result<&'a str> {
+    direct_control_optional_argument(command, argument, values)?
+        .ok_or_else(|| anyhow::anyhow!("command {command} requires --{argument}"))
+}
+
+fn direct_control_optional_argument<'a>(
+    command: &str,
+    argument: &str,
+    values: &'a [String],
+) -> Result<Option<&'a str>> {
+    match values {
+        [] => Ok(None),
+        [value] => Ok(Some(value)),
+        _ => anyhow::bail!("command {command} accepts exactly one --{argument}"),
+    }
+}
+
+fn direct_control_string_array(command: &str, argument: &str, value: &str) -> Result<Vec<String>> {
+    serde_json::from_str(value).with_context(|| {
+        format!("command {command} requires --{argument} as a JSON array of strings")
+    })
+}
+
+fn direct_control_u32(command: &str, argument: &str, value: &str) -> Result<u32> {
+    value.parse::<u32>().with_context(|| {
+        format!("command {command} requires --{argument} as an unsigned 32-bit integer")
+    })
+}
+
+fn direct_control_u64(command: &str, argument: &str, value: &str) -> Result<u64> {
+    value.parse::<u64>().with_context(|| {
+        format!("command {command} requires --{argument} as an unsigned 64-bit integer")
+    })
+}
+
 pub struct ControlServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
     descriptor_path: PathBuf,
     endpoint_path: PathBuf,
-    state: SharedControlState,
+    automation: AutomationHub,
+    event_owner: OwnerIdentity,
+    instance_scope: String,
 }
 
 impl ControlServer {
     pub fn spawn(window_state_key: String, commands: BoundAppCommandSender) -> Result<Self> {
-        let descriptor = new_instance_descriptor(&window_state_key)?;
+        Self::spawn_with_hub(window_state_key, commands, AutomationHub::new())
+    }
+
+    pub fn spawn_with_hub(
+        window_state_key: String,
+        commands: BoundAppCommandSender,
+        automation: AutomationHub,
+    ) -> Result<Self> {
+        Self::spawn_with_descriptor(
+            new_instance_descriptor(&window_state_key)?,
+            commands,
+            automation,
+        )
+    }
+
+    pub(crate) fn spawn_with_descriptor(
+        descriptor: InstanceDescriptor,
+        commands: BoundAppCommandSender,
+        automation: AutomationHub,
+    ) -> Result<Self> {
+        let instance_scope = instance_scope(&descriptor);
+        automation.bind_instance_scope(instance_scope.clone())?;
+        let event_owner = instance_event_owner(&descriptor);
         prepare_endpoint(&LocalEndpoint::from_path(descriptor.endpoint.clone()))?;
         let endpoint_path = descriptor.endpoint.clone();
         let endpoint = LocalEndpoint::from_path(endpoint_path.clone());
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let state = Arc::new(Mutex::new(ControlState::default()));
-        let server_state = Arc::clone(&state);
+        let server_automation = automation.clone();
         let server_descriptor = descriptor.clone();
+        let server_scope = instance_scope.clone();
         let server_thread = match thread::Builder::new()
             .name("bootty-control".to_owned())
             .spawn(move || {
@@ -115,33 +403,40 @@ impl ControlServer {
                     };
                     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
                     tokio::pin!(shutdown_rx);
+                    let mut owner_reap = tokio::time::interval(Duration::from_secs(1));
+                    owner_reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         tokio::select! {
                             _ = &mut shutdown_rx => break,
+                            _ = owner_reap.tick() => server_automation.reap_dead_owners(),
                             accepted = listener.accept() => {
                                 let Ok((stream, peer)) = accepted else { continue };
                                 if !same_user(&peer) { continue; }
+                                let Some(owner) = OwnerIdentity::for_process(peer.pid) else {
+                                    continue;
+                                };
+                                server_automation.reap_dead_owners();
                                 let Ok(permit) = Arc::clone(&connections).try_acquire_owned() else {
                                     continue;
                                 };
                                 let commands = commands.clone();
                                 let descriptor = server_descriptor.clone();
-                                let state = Arc::clone(&server_state);
+                                let automation = server_automation.clone();
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     let _ = serve_connection(
                                         stream,
                                         descriptor,
                                         commands,
-                                        state,
-                                        peer.pid,
+                                        automation,
+                                        owner,
                                     )
                                     .await;
                                 });
                             }
                         }
                     }
-                    lock_control_state(&server_state).cancel_all_tasks();
+                    server_automation.cancel_tasks_in_scope(&server_scope);
                 });
             }) {
             Ok(thread) => thread,
@@ -157,7 +452,9 @@ impl ControlServer {
                     thread: Some(server_thread),
                     descriptor_path,
                     endpoint_path,
-                    state,
+                    automation,
+                    event_owner,
+                    instance_scope,
                 }),
                 Err(error) => {
                     let _ = shutdown_tx.send(());
@@ -180,17 +477,22 @@ impl ControlServer {
             }
         }
     }
+
+    pub fn automation_hub(&self) -> AutomationHub {
+        self.automation.clone()
+    }
 }
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        lock_control_state(&self.state).cancel_all_tasks();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.automation.cancel_tasks_in_scope(&self.instance_scope);
+        self.automation.disconnect_owner(&self.event_owner);
         let _ = fs::remove_file(&self.descriptor_path);
         let _ = fs::remove_file(&self.endpoint_path);
     }
@@ -200,21 +502,23 @@ async fn serve_connection(
     mut stream: rmux_ipc::LocalStream,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
 ) -> io::Result<()> {
+    let mut reader = tokio::io::BufReader::new(&mut stream);
     let mut line = String::new();
     let read = {
-        let mut reader = tokio::io::BufReader::new(&mut stream).take(REQUEST_LIMIT + 1);
-        tokio::time::timeout(IO_TIMEOUT, reader.read_line(&mut line)).await
+        let mut request = (&mut reader).take(REQUEST_LIMIT + 1);
+        tokio::time::timeout(IO_TIMEOUT, request.read_line(&mut line)).await
     };
+    drop(reader);
     let response = match read {
         Err(_) => RpcResponse::error(Value::Null, -32003, "request read timed out", None),
         Ok(Err(error)) => return Err(error),
         Ok(Ok(_)) if line.len() as u64 > REQUEST_LIMIT => {
             RpcResponse::error(Value::Null, -32600, "request exceeds payload limit", None)
         }
-        Ok(Ok(_)) => match serde_json::from_str::<RpcRequest>(line.trim_end()) {
+        Ok(Ok(_)) => match parse_rpc_request(line.trim_end()) {
             Ok(request)
                 if serde_json::to_vec(&request.id)
                     .is_ok_and(|encoded| encoded.len() > RPC_ID_LIMIT) =>
@@ -226,8 +530,25 @@ async fn serve_connection(
                     None,
                 )
             }
-            Ok(request) => handle_request(request, descriptor, commands, state, owner_pid).await,
-            Err(error) => RpcResponse::error(Value::Null, -32700, error.to_string(), None),
+            Ok(request) => {
+                let connection_cancellation = CommandCancellation::new();
+                tokio::select! {
+                    response = handle_request(
+                        request,
+                        descriptor,
+                        commands,
+                        automation,
+                        owner,
+                        connection_cancellation.clone(),
+                    ) => response,
+                    closed = rmux_ipc::wait_for_peer_close(&stream) => {
+                        connection_cancellation.cancel();
+                        closed?;
+                        return Ok(());
+                    }
+                }
+            }
+            Err(response) => *response,
         },
     };
     let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
@@ -246,16 +567,59 @@ async fn serve_connection(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "response write timed out"))?
 }
 
+fn parse_rpc_request(line: &str) -> Result<RpcRequest, Box<RpcResponse>> {
+    let value = serde_json::from_str::<Value>(line).map_err(|error| {
+        Box::new(RpcResponse::error(
+            Value::Null,
+            -32700,
+            error.to_string(),
+            None,
+        ))
+    })?;
+    let id = value
+        .get("id")
+        .filter(|id| matches!(id, Value::String(_) | Value::Number(_) | Value::Null))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let request = serde_json::from_value::<RpcRequest>(value).map_err(|error| {
+        Box::new(RpcResponse::error(
+            id.clone(),
+            -32600,
+            error.to_string(),
+            None,
+        ))
+    })?;
+    if request.method.is_empty()
+        || !matches!(
+            request.id,
+            Value::String(_) | Value::Number(_) | Value::Null
+        )
+    {
+        return Err(Box::new(RpcResponse::error(
+            id,
+            -32600,
+            "invalid JSON-RPC request",
+            None,
+        )));
+    }
+    Ok(request)
+}
+
 async fn handle_request(
     request: RpcRequest,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
+    connection_cancellation: CommandCancellation,
 ) -> RpcResponse {
     if request.jsonrpc != "2.0" {
         return RpcResponse::error(request.id, -32600, "invalid JSON-RPC version", None);
     }
+    // Event subscriptions belong to the control instance, not to a one-shot CLI process.
+    // The process component keeps liveness OS-backed; the logical generation isolates multiple
+    // owner-local control servers that share one process and AutomationHub.
+    let event_owner = instance_event_owner(&descriptor);
     let result = match request.method.as_str() {
         "system.ping" => negotiate_protocol(&request.params),
         "system.describe" => Ok(json!({
@@ -277,12 +641,10 @@ async fn handle_request(
             },
             "methods": [
                 "system.ping", "system.describe", "instance.describe", "command.list",
-                "command.describe", "command.invoke", "event.subscribe", "event.unsubscribe",
-                "task.status", "task.cancel"
+                "command.describe", "command.invoke", "event.subscribe", "event.snapshot",
+                "event.rebase", "event.unsubscribe", "task.status", "task.cancel"
             ],
-            "event_topics": {
-                "command.completed": {"snapshot": "instance.describe"}
-            }
+            "event_topics": event_topic_descriptions(&automation)
         })),
         "instance.describe" => serde_json::to_value(descriptor).map_err(internal_error),
         "command.list" => serde_json::to_value(CommandRegistry::core().list().collect::<Vec<_>>())
@@ -295,12 +657,25 @@ async fn handle_request(
             }
         }
         "command.invoke" => {
-            invoke_command(request.params, descriptor, commands, state, owner_pid).await
+            invoke_command(
+                request.params,
+                descriptor,
+                commands,
+                automation,
+                owner,
+                event_owner.clone(),
+                connection_cancellation,
+            )
+            .await
         }
-        "event.subscribe" => subscribe_events(request.params, descriptor, state, owner_pid),
-        "event.unsubscribe" => unsubscribe_events(request.params, state, owner_pid),
-        "task.status" => task_status(request.params, state, owner_pid),
-        "task.cancel" => task_cancel(request.params, state, owner_pid),
+        "event.subscribe" => {
+            subscribe_events(request.params, descriptor, automation, event_owner.clone())
+        }
+        "event.snapshot" => event_snapshot(request.params, automation, event_owner.clone()),
+        "event.rebase" => event_rebase(request.params, automation, event_owner.clone()),
+        "event.unsubscribe" => unsubscribe_events(request.params, automation, event_owner),
+        "task.status" => task_status(request.params, automation, owner),
+        "task.cancel" => task_cancel(request.params, automation, owner),
         _ => Err(RpcError::new(-32601, "method not found")),
     };
     match result {
@@ -341,12 +716,29 @@ fn negotiate_protocol(params: &Value) -> Result<Value, RpcError> {
     }))
 }
 
+fn event_topic_descriptions(automation: &AutomationHub) -> serde_json::Map<String, Value> {
+    automation
+        .events()
+        .registered_topics()
+        .into_iter()
+        .map(|topic| {
+            let snapshot = if topic == COMMAND_COMPLETED_TOPIC {
+                "instance.describe"
+            } else {
+                "event.snapshot"
+            };
+            (topic, json!({"snapshot": snapshot}))
+        })
+        .collect()
+}
 async fn invoke_command(
     params: Value,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
+    event_owner: OwnerIdentity,
+    connection_cancellation: CommandCancellation,
 ) -> Result<Value, RpcError> {
     let mut invocation: CommandInvocation = serde_json::from_value(
         params
@@ -357,57 +749,107 @@ async fn invoke_command(
     .map_err(|error| RpcError::new(-32602, error.to_string()))?;
     invocation.caller = Caller::Socket;
     let scope = instance_scope(&descriptor);
+    if let Some(outcome) = invoke_event_command(&invocation, &automation, &event_owner) {
+        publish_command_completion(&automation, scope, &event_owner, &invocation, &outcome);
+        return outcome;
+    }
     if params
         .get("detached")
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        return start_task(invocation, commands, state, owner_pid, scope);
+        return start_task(invocation, commands, automation, owner, scope);
     }
 
     let completion = invocation.clone();
-    let outcome = await_command(invocation, commands, CommandCancellation::new()).await;
-    publish_command_completion(&state, scope, owner_pid, &completion, &outcome);
+    let outcome = await_command(invocation, commands, connection_cancellation).await;
+    publish_command_completion(&automation, scope, &owner, &completion, &outcome);
     outcome
+}
+
+fn invoke_event_command(
+    invocation: &CommandInvocation,
+    automation: &AutomationHub,
+    owner: &OwnerIdentity,
+) -> Option<Result<Value, RpcError>> {
+    let subscription = || event_command_subscription(invocation);
+    match invocation.command.as_str() {
+        "event.snapshot" => Some(subscription().and_then(|subscription| {
+            event_snapshot_for_subscription(subscription, automation, owner)
+        })),
+        "event.rebase" => {
+            Some(subscription().and_then(|subscription| {
+                event_rebase_subscription(subscription, automation, owner)
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn event_command_subscription(invocation: &CommandInvocation) -> Result<&str, RpcError> {
+    match invocation.arguments.as_slice() {
+        [subscription] if !subscription.is_empty() => Ok(subscription),
+        _ => Err(RpcError::new(
+            -32602,
+            "event command requires exactly one subscription argument",
+        )),
+    }
 }
 
 fn start_task(
     invocation: CommandInvocation,
     commands: BoundAppCommandSender,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
     scope: String,
 ) -> Result<Value, RpcError> {
     let cancellation = CommandCancellation::new();
-    let task_id = lock_control_state(&state).start_task(owner_pid, cancellation.clone())?;
+    let task = automation
+        .tasks()
+        .start(owner.clone(), cancellation.clone(), scope.clone())
+        .map_err(automation_error)?;
+    let task_id = task.id.clone();
     let response_rx = match enqueue_command(invocation.clone(), commands, cancellation.clone()) {
         Ok(response_rx) => response_rx,
         Err(error) => {
-            lock_control_state(&state).remove_task(&task_id);
+            automation.tasks().remove(&task_id);
             return Err(error);
         }
     };
-    let worker_state = Arc::clone(&state);
+    let worker_automation = automation.clone();
     let worker_task_id = task_id.clone();
     let worker_cancellation = cancellation.clone();
     let worker_scope = scope.clone();
     let worker_invocation = invocation.clone();
+    let worker_owner = owner.clone();
     let worker = thread::Builder::new()
         .name(format!("bootty-control-{task_id}"))
         .spawn(move || {
             let outcome = wait_for_task(response_rx, &worker_cancellation);
-            let mut state = lock_control_state(&worker_state);
-            state.finish_task(&worker_task_id, outcome.clone());
-            state.publish_command_completion(worker_scope, owner_pid, &worker_invocation, outcome);
+            if let Err(error) = worker_automation.tasks().finish(&worker_task_id, &outcome) {
+                eprintln!("task {worker_task_id} completion publication failed: {error}");
+            }
+            let _ = worker_automation.publish_command_completion(
+                worker_scope,
+                &worker_owner,
+                &worker_invocation,
+                outcome,
+            );
         });
     if let Err(error) = worker {
         cancellation.cancel();
         let outcome = failed_outcome(-32603, format!("start task worker: {error}"));
-        let mut state = lock_control_state(&state);
-        state.finish_task(&task_id, outcome.clone());
-        state.publish_command_completion(scope, owner_pid, &invocation, outcome);
+        if let Err(error) = automation.tasks().finish(&task_id, &outcome) {
+            eprintln!("task {task_id} completion publication failed: {error}");
+        }
+        let _ = automation.publish_command_completion(scope, &owner, &invocation, outcome);
     }
-    lock_control_state(&state).task_value(&task_id, owner_pid)
+    task_value(
+        automation
+            .tasks()
+            .status(&task_id, &owner)
+            .map_err(automation_error)?,
+    )
 }
 
 fn enqueue_command(
@@ -433,14 +875,52 @@ async fn await_command(
     cancellation: CommandCancellation,
 ) -> Result<Value, RpcError> {
     let response_rx = enqueue_command(invocation, commands, cancellation.clone())?;
-    let outcome = tokio::task::spawn_blocking(move || response_rx.recv_timeout(COMMAND_TIMEOUT))
-        .await
-        .map_err(|error| RpcError::new(-32603, error.to_string()))?
-        .map_err(|error| {
+    let worker_cancellation = cancellation.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        wait_for_attached_command(response_rx, &worker_cancellation)
+    })
+    .await
+    .map_err(|error| RpcError::new(-32603, error.to_string()))?;
+    match outcome {
+        Ok(outcome) => serde_json::to_value(outcome).map_err(internal_error),
+        Err(message) => {
             cancellation.cancel();
-            RpcError::new(-32003, error.to_string())
-        })?;
-    serde_json::to_value(outcome).map_err(internal_error)
+            Err(RpcError::new(-32003, message))
+        }
+    }
+}
+
+fn wait_for_attached_command(
+    response_rx: mpsc::Receiver<crate::commands::CommandOutcome>,
+    cancellation: &CommandCancellation,
+) -> Result<crate::commands::CommandOutcome, &'static str> {
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    loop {
+        match response_rx.try_recv() {
+            Ok(outcome) => return Ok(outcome),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("command response channel closed");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if cancellation.is_cancelled() {
+            return match response_rx.try_recv() {
+                Ok(outcome) => Ok(outcome),
+                Err(_) => Err("command was cancelled"),
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("command deadline expired");
+        }
+        match response_rx.recv_timeout(remaining.min(TASK_WAIT_INTERVAL)) {
+            Ok(outcome) => return Ok(outcome),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("command response channel closed");
+            }
+        }
+    }
 }
 
 fn wait_for_task(
@@ -493,9 +973,9 @@ fn failed_outcome(code: impl ToString, message: impl Into<String>) -> Value {
 }
 
 fn publish_command_completion(
-    state: &SharedControlState,
+    automation: &AutomationHub,
     scope: String,
-    owner_pid: u32,
+    owner: &OwnerIdentity,
     invocation: &CommandInvocation,
     outcome: &Result<Value, RpcError>,
 ) {
@@ -503,53 +983,152 @@ fn publish_command_completion(
         .as_ref()
         .cloned()
         .unwrap_or_else(|error| failed_outcome(error.code.to_string(), error.message.clone()));
-    lock_control_state(state).publish_command_completion(scope, owner_pid, invocation, outcome);
+    let _ = automation.publish_command_completion(scope, owner, invocation, outcome);
 }
 
 fn subscribe_events(
     params: Value,
     descriptor: InstanceDescriptor,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
 ) -> Result<Value, RpcError> {
-    let mut state = lock_control_state(&state);
-    if let Some(subscription) = params.get("subscription").and_then(Value::as_str) {
-        let cursor = params
-            .get("cursor")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| RpcError::new(-32602, "missing subscription cursor"))?;
-        return state.poll_subscription(subscription, owner_pid, cursor);
+    let subscription = match params.get("subscription") {
+        Some(subscription) => Some(
+            subscription
+                .as_str()
+                .ok_or_else(|| RpcError::new(-32602, "invalid subscription"))?,
+        ),
+        None => None,
+    };
+    if let Some(subscription) = subscription {
+        if params.get("topics").is_some() || params.get("scope").is_some() {
+            return Err(RpcError::new(
+                -32602,
+                "event subscription request must use either topics/scope or subscription/cursor",
+            ));
+        }
+        let cursor = match params.get("cursor") {
+            Some(cursor) => cursor
+                .as_u64()
+                .ok_or_else(|| RpcError::new(-32602, "invalid subscription cursor"))?,
+            // A fresh subscription begins at zero; later polls must echo the
+            // cursor returned by the preceding delivery.
+            None => 0,
+        };
+        return serde_json::to_value(
+            automation
+                .events()
+                .poll(subscription, &owner, cursor)
+                .map_err(automation_error)?,
+        )
+        .map_err(internal_error);
     }
-    let topics = event_topics(&params)?;
-    let scope = event_scope(&params, &descriptor)?;
-    state.create_subscription(owner_pid, topics, scope)
+    if params.get("cursor").is_some() {
+        return Err(RpcError::new(
+            -32602,
+            "subscription cursor requires subscription",
+        ));
+    }
+    let topics = event_topics(&params, &automation)?;
+    let scope = event_scope(&params, &descriptor, &automation)?;
+    serde_json::to_value(
+        automation
+            .events()
+            .subscribe(owner, topics, scope)
+            .map_err(automation_error)?,
+    )
+    .map_err(internal_error)
+}
+
+fn event_snapshot(
+    params: Value,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
+) -> Result<Value, RpcError> {
+    event_snapshot_for_subscription(subscription_id(&params)?, &automation, &owner)
+}
+
+fn event_snapshot_for_subscription(
+    subscription: &str,
+    automation: &AutomationHub,
+    owner: &OwnerIdentity,
+) -> Result<Value, RpcError> {
+    serde_json::to_value(
+        automation
+            .events()
+            .snapshot_for_subscription(subscription, owner)
+            .map_err(automation_error)?,
+    )
+    .map_err(internal_error)
+}
+
+fn event_rebase(
+    params: Value,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
+) -> Result<Value, RpcError> {
+    event_rebase_subscription(subscription_id(&params)?, &automation, &owner)
+}
+
+fn event_rebase_subscription(
+    subscription: &str,
+    automation: &AutomationHub,
+    owner: &OwnerIdentity,
+) -> Result<Value, RpcError> {
+    serde_json::to_value(
+        automation
+            .events()
+            .rebase(subscription, owner)
+            .map_err(automation_error)?,
+    )
+    .map_err(internal_error)
 }
 
 fn unsubscribe_events(
     params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
 ) -> Result<Value, RpcError> {
     let subscription = subscription_id(&params)?;
-    lock_control_state(&state).unsubscribe(subscription, owner_pid)
+    serde_json::to_value(
+        automation
+            .events()
+            .unsubscribe(subscription, &owner)
+            .map_err(automation_error)?,
+    )
+    .map_err(internal_error)
 }
 
 fn task_status(
     params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
 ) -> Result<Value, RpcError> {
     let task = task_id(&params)?;
-    lock_control_state(&state).task_value(task, owner_pid)
+    task_value(
+        automation
+            .tasks()
+            .status(task, &owner)
+            .map_err(automation_error)?,
+    )
 }
 
 fn task_cancel(
     params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
+    automation: AutomationHub,
+    owner: OwnerIdentity,
 ) -> Result<Value, RpcError> {
     let task = task_id(&params)?;
-    lock_control_state(&state).cancel_task(task, owner_pid)
+    task_value(
+        automation
+            .tasks()
+            .cancel(task, &owner)
+            .map_err(automation_error)?,
+    )
+}
+
+fn task_value(task: crate::automation::TaskStatus) -> Result<Value, RpcError> {
+    Ok(json!({"task": task}))
 }
 
 fn task_id(params: &Value) -> Result<&str, RpcError> {
@@ -567,7 +1146,7 @@ fn subscription_id(params: &Value) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::new(-32602, "missing subscription"))
 }
 
-fn event_topics(params: &Value) -> Result<BTreeSet<String>, RpcError> {
+fn event_topics(params: &Value, automation: &AutomationHub) -> Result<BTreeSet<String>, RpcError> {
     let topics = params
         .get("topics")
         .and_then(Value::as_array)
@@ -583,7 +1162,7 @@ fn event_topics(params: &Value) -> Result<BTreeSet<String>, RpcError> {
             };
             if topic.is_empty()
                 || topic.len() > EVENT_TOPIC_LIMIT
-                || topic != COMMAND_COMPLETED_TOPIC
+                || !automation.events().topic_registered(topic)
             {
                 return Err(RpcError::new(-32602, "unsupported event topic"));
             }
@@ -592,362 +1171,53 @@ fn event_topics(params: &Value) -> Result<BTreeSet<String>, RpcError> {
         .collect()
 }
 
-fn event_scope(params: &Value, descriptor: &InstanceDescriptor) -> Result<String, RpcError> {
-    let expected = instance_scope(descriptor);
+fn event_scope(
+    params: &Value,
+    descriptor: &InstanceDescriptor,
+    automation: &AutomationHub,
+) -> Result<String, RpcError> {
+    let instance = instance_scope(descriptor);
     let scope = params
         .get("scope")
         .and_then(Value::as_str)
-        .unwrap_or(&expected);
-    if scope != expected {
-        return Err(RpcError::new(-32602, "unsupported event scope"));
+        .unwrap_or(&instance);
+    if scope == instance {
+        return Ok(scope.to_owned());
     }
-    Ok(expected)
+    if is_owner_local_binding_scope(scope) {
+        return if automation.events().binding_scope_is_live(scope) {
+            Ok(scope.to_owned())
+        } else {
+            Err(RpcError::new(-32006, "binding event scope is not live"))
+        };
+    }
+    Err(RpcError::new(-32602, "unsupported event scope"))
 }
 
-fn instance_scope(descriptor: &InstanceDescriptor) -> String {
+/// Binding scopes are accepted only by the owner-local server that owns the
+/// hub. A scope cannot cross into another Bootty process because hubs are not
+/// shared between processes.
+fn is_owner_local_binding_scope(scope: &str) -> bool {
+    let mut parts = scope.split(':');
+    matches!(parts.next(), Some("binding"))
+        && parts
+            .next()
+            .is_some_and(|space| space.parse::<i64>().is_ok())
+        && parts
+            .next()
+            .is_some_and(|binding| binding.parse::<i64>().is_ok())
+        && parts.next().is_none()
+}
+
+pub(crate) fn instance_scope(descriptor: &InstanceDescriptor) -> String {
     format!("instance:{}", descriptor.instance_id)
 }
 
-type SharedControlState = Arc<Mutex<ControlState>>;
-
-struct ControlState {
-    next_task: u64,
-    tasks: BTreeMap<String, TaskRecord>,
-    completed_tasks: VecDeque<String>,
-    next_subscription: u64,
-    subscriptions: BTreeMap<String, SubscriptionRecord>,
-    revisions: BTreeMap<String, u64>,
-}
-
-impl Default for ControlState {
-    fn default() -> Self {
-        Self {
-            next_task: 1,
-            tasks: BTreeMap::new(),
-            completed_tasks: VecDeque::new(),
-            next_subscription: 1,
-            subscriptions: BTreeMap::new(),
-            revisions: BTreeMap::new(),
-        }
-    }
-}
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum TaskState {
-    Running,
-    Cancelling,
-    Completed { outcome: Value },
-}
-
-struct TaskRecord {
-    owner_pid: u32,
-    cancellation: CommandCancellation,
-    state: TaskState,
-}
-
-struct SubscriptionRecord {
-    owner_pid: u32,
-    topics: BTreeSet<String>,
-    scope: String,
-    sequence: u64,
-    cursor: u64,
-    events: VecDeque<SubscriptionEvent>,
-    gap: Option<SubscriptionGap>,
-}
-
-#[derive(Clone)]
-struct SubscriptionGap {
-    sequence: u64,
-}
-
-#[derive(Clone, Serialize)]
-struct SubscriptionEvent {
-    sequence: u64,
-    scope: String,
-    revision: u64,
-    topic: String,
-    provenance: Value,
-    target: Value,
-    payload: Value,
-}
-
-impl ControlState {
-    fn start_task(
-        &mut self,
-        owner_pid: u32,
-        cancellation: CommandCancellation,
-    ) -> Result<String, RpcError> {
-        while self.tasks.len() >= MAX_TASKS {
-            let Some(completed) = self.completed_tasks.pop_front() else {
-                return Err(RpcError::new(-32001, "task limit reached"));
-            };
-            self.tasks.remove(&completed);
-        }
-        let id = format!("task-{}", self.next_task);
-        self.next_task += 1;
-        self.tasks.insert(
-            id.clone(),
-            TaskRecord {
-                owner_pid,
-                cancellation,
-                state: TaskState::Running,
-            },
-        );
-        Ok(id)
-    }
-
-    fn remove_task(&mut self, task: &str) {
-        self.tasks.remove(task);
-    }
-
-    fn finish_task(&mut self, task: &str, outcome: Value) {
-        let Some(record) = self.tasks.get_mut(task) else {
-            return;
-        };
-        if !matches!(record.state, TaskState::Completed { .. }) {
-            record.state = TaskState::Completed { outcome };
-            self.completed_tasks.push_back(task.to_owned());
-        }
-    }
-
-    fn task_value(&self, task: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_task(task, owner_pid)?;
-        let record = self.tasks.get(task).expect("owned task exists");
-        Ok(json!({
-            "task": {
-                "id": task,
-                "owner_pid": record.owner_pid,
-                "state": &record.state,
-            }
-        }))
-    }
-
-    fn cancel_task(&mut self, task: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_task(task, owner_pid)?;
-        let record = self.tasks.get_mut(task).expect("owned task exists");
-        if matches!(record.state, TaskState::Running) && record.cancellation.cancel() {
-            record.state = TaskState::Cancelling;
-        }
-        self.task_value(task, owner_pid)
-    }
-
-    fn cancel_all_tasks(&mut self) {
-        for task in self.tasks.values_mut() {
-            if matches!(task.state, TaskState::Running) {
-                task.cancellation.cancel();
-                task.state = TaskState::Cancelling;
-            }
-        }
-    }
-
-    fn owned_task(&self, task: &str, owner_pid: u32) -> Result<(), RpcError> {
-        let Some(record) = self.tasks.get(task) else {
-            return Err(RpcError::new(-32602, "unknown task"));
-        };
-        if record.owner_pid != owner_pid {
-            return Err(RpcError::new(-32006, "task is owned by another process"));
-        }
-        Ok(())
-    }
-
-    fn create_subscription(
-        &mut self,
-        owner_pid: u32,
-        topics: BTreeSet<String>,
-        scope: String,
-    ) -> Result<Value, RpcError> {
-        self.reap_dead_subscriptions();
-        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
-            return Err(RpcError::new(-32001, "subscription limit reached"));
-        }
-        let id = format!("subscription-{}", self.next_subscription);
-        self.next_subscription += 1;
-        let revision = *self.revisions.get(&scope).unwrap_or(&0);
-        self.subscriptions.insert(
-            id.clone(),
-            SubscriptionRecord {
-                owner_pid,
-                topics,
-                scope: scope.clone(),
-                sequence: 0,
-                cursor: 0,
-                events: VecDeque::new(),
-                gap: None,
-            },
-        );
-        Ok(json!({
-            "subscription": id,
-            "scope": scope,
-            "revision": revision,
-            "cursor": 0,
-            "events": [],
-        }))
-    }
-
-    fn poll_subscription(
-        &mut self,
-        subscription: &str,
-        owner_pid: u32,
-        cursor: u64,
-    ) -> Result<Value, RpcError> {
-        let (scope, cursor, events) = {
-            let record = self.owned_subscription(subscription, owner_pid)?;
-            if let Some(gap) = &record.gap {
-                return Err(rebase_error(
-                    subscription,
-                    &record.scope,
-                    record.cursor,
-                    gap.sequence,
-                ));
-            }
-            if cursor != record.cursor {
-                return Err(rebase_error(
-                    subscription,
-                    &record.scope,
-                    record.cursor,
-                    record.sequence,
-                ));
-            }
-            let mut events = VecDeque::new();
-            let mut bytes = 0;
-            while let Some(event) = record.events.front() {
-                let event_bytes = serde_json::to_vec(event).map_err(internal_error)?.len();
-                if bytes + event_bytes > REQUEST_LIMIT as usize / 2 {
-                    break;
-                }
-                bytes += event_bytes;
-                events.push_back(record.events.pop_front().expect("front event"));
-            }
-            if events.is_empty() && !record.events.is_empty() {
-                record.events.clear();
-                record.gap = Some(SubscriptionGap {
-                    sequence: record.sequence,
-                });
-                return Err(rebase_error(
-                    subscription,
-                    &record.scope,
-                    record.cursor,
-                    record.sequence,
-                ));
-            }
-            if let Some(event) = events.back() {
-                record.cursor = event.sequence;
-            }
-            (record.scope.clone(), record.cursor, events)
-        };
-        let revision = *self.revisions.get(&scope).unwrap_or(&0);
-        Ok(json!({
-            "subscription": subscription,
-            "scope": scope,
-            "revision": revision,
-            "cursor": cursor,
-            "events": events,
-        }))
-    }
-
-    fn reap_dead_subscriptions(&mut self) {
-        let system = sysinfo::System::new_all();
-        self.subscriptions.retain(|_, subscription| {
-            system
-                .process(sysinfo::Pid::from_u32(subscription.owner_pid))
-                .is_some()
-        });
-    }
-
-    fn unsubscribe(&mut self, subscription: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_subscription(subscription, owner_pid)?;
-        self.subscriptions.remove(subscription);
-        Ok(json!({"unsubscribed": subscription}))
-    }
-
-    fn owned_subscription(
-        &mut self,
-        subscription: &str,
-        owner_pid: u32,
-    ) -> Result<&mut SubscriptionRecord, RpcError> {
-        let Some(record) = self.subscriptions.get_mut(subscription) else {
-            return Err(RpcError::new(-32602, "unknown subscription"));
-        };
-        if record.owner_pid != owner_pid {
-            return Err(RpcError::new(
-                -32006,
-                "subscription is owned by another process",
-            ));
-        }
-        Ok(record)
-    }
-
-    fn publish_command_completion(
-        &mut self,
-        scope: String,
-        owner_pid: u32,
-        invocation: &CommandInvocation,
-        outcome: Value,
-    ) {
-        let provenance = json!({"caller": invocation.caller, "owner_pid": owner_pid});
-        let target = serde_json::to_value(&invocation.target).unwrap_or(Value::Null);
-        self.publish_event(
-            scope,
-            COMMAND_COMPLETED_TOPIC,
-            provenance,
-            target,
-            json!({"command": invocation.command, "outcome": outcome}),
-        );
-    }
-
-    fn publish_event(
-        &mut self,
-        scope: String,
-        topic: &str,
-        provenance: Value,
-        target: Value,
-        payload: Value,
-    ) {
-        let revision = self.revisions.entry(scope.clone()).or_default();
-        *revision += 1;
-        let revision = *revision;
-        for subscription in self.subscriptions.values_mut() {
-            if subscription.scope != scope || !subscription.topics.contains(topic) {
-                continue;
-            }
-            subscription.sequence += 1;
-            if subscription.gap.is_some() || subscription.events.len() >= EVENT_QUEUE_LIMIT {
-                subscription.events.clear();
-                subscription.gap = Some(SubscriptionGap {
-                    sequence: subscription.sequence,
-                });
-                continue;
-            }
-            subscription.events.push_back(SubscriptionEvent {
-                sequence: subscription.sequence,
-                scope: scope.clone(),
-                revision,
-                topic: topic.to_owned(),
-                provenance: provenance.clone(),
-                target: target.clone(),
-                payload: payload.clone(),
-            });
-        }
-    }
-}
-
-fn rebase_error(subscription: &str, scope: &str, cursor: u64, sequence: u64) -> RpcError {
-    let mut error = RpcError::new(-32005, "event rebase required");
-    error.data = Some(json!({
-        "subscription": subscription,
-        "scope": scope,
-        "cursor": cursor,
-        "sequence": sequence,
-        "rebase": "snapshot",
-    }));
-    error
-}
-
-fn lock_control_state(state: &SharedControlState) -> std::sync::MutexGuard<'_, ControlState> {
-    state
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+fn instance_event_owner(descriptor: &InstanceDescriptor) -> OwnerIdentity {
+    let logical_generation =
+        u64::try_from(descriptor.started_at_ms).expect("instance start time fits in 64 bits");
+    OwnerIdentity::for_process_logical_owner(descriptor.pid, logical_generation)
+        .expect("the running control server has a process identity")
 }
 
 impl RpcResponse {
@@ -981,6 +1251,14 @@ impl RpcError {
             message: message.into(),
             data: None,
         }
+    }
+}
+
+fn automation_error(error: AutomationError) -> RpcError {
+    RpcError {
+        code: error.code,
+        message: error.message,
+        data: error.data,
     }
 }
 
@@ -1032,6 +1310,7 @@ fn start_instance() -> Result<InstanceDescriptor> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .context("start Bootty instance")?;
+    let child_pid = child.id();
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
         if let Some(status) = child
@@ -1042,13 +1321,15 @@ fn start_instance() -> Result<InstanceDescriptor> {
         }
         let started = discover_instances()?
             .into_iter()
-            .filter(|instance| !existing.contains(&instance.instance_id))
+            .filter(|instance| {
+                !existing.contains(&instance.instance_id) && instance.pid == child_pid
+            })
             .collect::<Vec<_>>();
         match started.as_slice() {
             [instance] => return Ok(instance.clone()),
             [] if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             [] => anyhow::bail!("started Bootty instance did not become ready"),
-            _ => anyhow::bail!("multiple Bootty instances started; pass --instance"),
+            _ => anyhow::bail!("started Bootty child registered multiple instances"),
         }
     }
 }
@@ -1058,13 +1339,46 @@ pub fn invoke_instance(
     method: &str,
     params: Value,
 ) -> Result<RpcResponse> {
-    if descriptor.protocol_version != PROTOCOL_VERSION {
+    if descriptor.protocol_version != PROTOCOL_VERSION && method != "system.ping" {
+        negotiate_instance(descriptor)?;
+    }
+    invoke_instance_raw(descriptor, method, params)
+}
+
+fn negotiate_instance(descriptor: &InstanceDescriptor) -> Result<()> {
+    let response = invoke_instance_raw(
+        descriptor,
+        "system.ping",
+        json!({
+            "minimum_protocol_version": PROTOCOL_VERSION,
+            "maximum_protocol_version": PROTOCOL_VERSION,
+        }),
+    )?;
+    let result = response
+        .result
+        .context("protocol negotiation returned no result")?;
+    let minimum = result
+        .get("minimum_protocol_version")
+        .and_then(Value::as_u64)
+        .context("protocol negotiation omitted minimum version")?;
+    let maximum = result
+        .get("maximum_protocol_version")
+        .and_then(Value::as_u64)
+        .context("protocol negotiation omitted maximum version")?;
+    let version = u64::from(PROTOCOL_VERSION);
+    if minimum > version || maximum < version {
         anyhow::bail!(
-            "unsupported Bootty protocol version {}; expected {}",
-            descriptor.protocol_version,
-            PROTOCOL_VERSION
+            "unsupported Bootty protocol range {minimum}..={maximum}; expected {PROTOCOL_VERSION}"
         );
     }
+    Ok(())
+}
+
+fn invoke_instance_raw(
+    descriptor: &InstanceDescriptor,
+    method: &str,
+    params: Value,
+) -> Result<RpcResponse> {
     let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
     let mut stream = connect_blocking(&endpoint, Duration::from_secs(2))?;
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
@@ -1130,19 +1444,22 @@ pub fn discover_instances() -> Result<Vec<InstanceDescriptor>> {
         let Ok(instance) = serde_json::from_slice::<InstanceDescriptor>(&bytes) else {
             continue;
         };
-        let Ok(expected_endpoint) =
+        let expected_endpoint =
             endpoint_for_label(format!("bootty-control-{}", instance.instance_id))
                 .map(LocalEndpoint::into_path)
-        else {
-            let _ = fs::remove_file(path);
-            continue;
-        };
-        if instance.endpoint != expected_endpoint
-            || path.file_stem().and_then(|stem| stem.to_str()) != Some(&instance.instance_id)
-        {
-            let _ = fs::remove_file(path);
+                .ok();
+        let descriptor_path_matches =
+            path.file_stem().and_then(|stem| stem.to_str()) == Some(&instance.instance_id);
+        let endpoint_matches = expected_endpoint
+            .as_ref()
+            .is_some_and(|expected| instance.endpoint.as_path() == expected.as_path());
+        if !descriptor_path_matches || !endpoint_matches {
+            if instance_process_is_dead(&instance) {
+                let _ = fs::remove_file(path);
+            }
             continue;
         }
+        let expected_endpoint = expected_endpoint.expect("a matching endpoint was derived");
         let live = invoke_instance(&instance, "instance.describe", Value::Null)
             .ok()
             .and_then(|response| response.result)
@@ -1166,7 +1483,7 @@ fn instance_process_is_dead(instance: &InstanceDescriptor) -> bool {
         .is_none_or(|process| u128::from(process.start_time()) * 1000 > instance.started_at_ms)
 }
 
-fn new_instance_descriptor(window_state_key: &str) -> Result<InstanceDescriptor> {
+pub(crate) fn new_instance_descriptor(window_state_key: &str) -> Result<InstanceDescriptor> {
     let started_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before epoch")?
@@ -1253,7 +1570,14 @@ fn set_owner_only_file(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{CommandTarget, ResourceKind, app_command_channel};
+    use crate::{
+        automation::{ClaimOwner, EventPublication},
+        commands::{CommandTarget, ResourceKind, app_command_channel},
+    };
+
+    fn owner() -> OwnerIdentity {
+        OwnerIdentity::new(7, 11)
+    }
 
     #[test]
     fn ping_request_uses_json_rpc_envelope() {
@@ -1266,6 +1590,139 @@ mod tests {
         let encoded = serde_json::to_value(request).unwrap();
         assert_eq!(encoded["jsonrpc"], "2.0");
         assert_eq!(encoded["method"], "system.ping");
+    }
+
+    #[test]
+    fn direct_control_requests_cover_each_catalog_control_method() {
+        let cases: &[(&str, &[&[&str]], &str)] = &[
+            ("system.ping", &[&["1"], &["1"]], "system.ping"),
+            ("system.describe", &[], "system.describe"),
+            ("instance.describe", &[], "instance.describe"),
+            ("command.list", &[], "command.list"),
+            ("command.describe", &[&["pane.focus"]], "command.describe"),
+            (
+                "command.invoke",
+                &[&["pane.focus"], &["[]"]],
+                "command.invoke",
+            ),
+            (
+                "event.subscribe",
+                &[&[r#"["extension.reloaded"]"#], &["binding:1:2"], &[], &[]],
+                "event.subscribe",
+            ),
+            ("event.snapshot", &[&["subscription-1"]], "event.snapshot"),
+            ("event.rebase", &[&["subscription-1"]], "event.rebase"),
+            (
+                "event.unsubscribe",
+                &[&["subscription-1"]],
+                "event.unsubscribe",
+            ),
+            ("task.status", &[&["task-1"]], "task.status"),
+            ("task.cancel", &[&["task-1"]], "task.cancel"),
+        ];
+
+        for (command, arguments, method) in cases {
+            let arguments = arguments
+                .iter()
+                .map(|slot| {
+                    slot.iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let request = direct_control_request(command, &arguments)
+                .unwrap()
+                .expect("catalog direct-control request");
+            assert!(is_direct_control_command(command));
+            assert_eq!(request.method(), *method);
+        }
+        assert!(!is_direct_control_command("pane.focus"));
+        assert!(direct_control_request("pane.focus", &[]).unwrap().is_none());
+
+        let subscription = direct_control_request(
+            "event.subscribe",
+            &[
+                vec![r#"["terminal.output"]"#.to_owned()],
+                vec!["binding:1:2".to_owned()],
+                Vec::new(),
+                Vec::new(),
+            ],
+        )
+        .unwrap()
+        .expect("event request");
+        let DirectControlRequest::Rpc { params, .. } = subscription else {
+            panic!("event.subscribe must be a direct RPC");
+        };
+        assert_eq!(
+            params,
+            json!({
+                "topics": ["terminal.output"],
+                "scope": "binding:1:2",
+            })
+        );
+
+        let poll = direct_control_request(
+            "event.subscribe",
+            &[
+                Vec::new(),
+                Vec::new(),
+                vec!["subscription-1".to_owned()],
+                vec!["42".to_owned()],
+            ],
+        )
+        .unwrap()
+        .expect("event poll request");
+        let DirectControlRequest::Rpc { params, .. } = poll else {
+            panic!("event.subscribe polling must be a direct RPC");
+        };
+        assert_eq!(
+            params,
+            json!({"subscription": "subscription-1", "cursor": 42})
+        );
+
+        let task = direct_control_request("task.cancel", &[vec!["task-1".to_owned()]])
+            .unwrap()
+            .expect("task request");
+        let DirectControlRequest::Rpc { params, .. } = task else {
+            panic!("task.cancel must be a direct RPC");
+        };
+        assert_eq!(params, json!({"task": "task-1"}));
+
+        let ping = direct_control_request("system.ping", &[Vec::new(), vec!["7".to_owned()]])
+            .unwrap()
+            .expect("maximum-only ping request");
+        let DirectControlRequest::Rpc { params, .. } = ping else {
+            panic!("system.ping must be a direct RPC");
+        };
+        assert_eq!(params, json!({"maximum_protocol_version": 7}));
+
+        let invocation = direct_control_request(
+            "command.invoke",
+            &[
+                vec!["pane.focus".to_owned()],
+                vec![r#"["argument", "{\"nested\":true}"]"#.to_owned()],
+            ],
+        )
+        .unwrap()
+        .expect("command invocation");
+        let DirectControlRequest::CommandInvocation(invocation) = invocation else {
+            panic!("command.invoke must retain its nested invocation");
+        };
+        assert_eq!(invocation.command, "pane.focus");
+        assert_eq!(
+            invocation.arguments,
+            vec!["argument".to_owned(), r#"{"nested":true}"#.to_owned()]
+        );
+        assert_eq!(invocation.caller, Caller::Cli);
+    }
+
+    #[test]
+    fn valid_json_with_an_invalid_request_is_not_a_parse_error() {
+        let invalid = parse_rpc_request(r#"{"jsonrpc":"2.0","id":7}"#).unwrap_err();
+        assert_eq!(invalid.error.unwrap().code, -32600);
+
+        let malformed = parse_rpc_request("{").unwrap_err();
+        assert_eq!(malformed.error.unwrap().code, -32700);
     }
 
     #[test]
@@ -1282,38 +1739,287 @@ mod tests {
                 },
                 new_instance_descriptor("test").unwrap(),
                 commands.for_caller(Caller::Socket),
-                Arc::new(Mutex::new(ControlState::default())),
-                7,
+                AutomationHub::new(),
+                owner(),
+                CommandCancellation::new(),
             ));
         assert_eq!(response.error.unwrap().code, -32601);
     }
 
     #[test]
-    fn task_cancellation_is_owned_and_shutdown_cancels() {
-        let mut state = ControlState::default();
-        let cancellation = CommandCancellation::new();
-        let task = state.start_task(7, cancellation.clone()).unwrap();
+    fn event_subscription_polling_survives_one_shot_cli_processes() {
+        let descriptor = new_instance_descriptor("event-cli").unwrap();
+        let scope = instance_scope(&descriptor);
+        let automation = AutomationHub::new();
+        automation.bind_instance_scope(scope.clone()).unwrap();
+        let (commands, _receiver) = app_command_channel(1);
+        let commands = commands.for_caller(Caller::Socket);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
 
-        assert_eq!(state.cancel_task(&task, 8).unwrap_err().code, -32006);
-        let value = state.cancel_task(&task, 7).unwrap();
-        assert_eq!(value["task"]["state"]["status"], "cancelling");
+        let subscribed = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(1),
+                method: "event.subscribe".to_owned(),
+                params: json!({"topics": [COMMAND_COMPLETED_TOPIC]}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(41, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(subscribed.error.is_none(), "{:?}", subscribed.error);
+        let subscription_response = subscribed.result.expect("event subscription response");
+        assert_eq!(subscription_response["revision"], json!(0));
+        assert_eq!(subscription_response["cursor"], json!(0));
+        assert_eq!(subscription_response["events"], json!([]));
+        let subscription = subscription_response["subscription"]
+            .as_str()
+            .expect("event subscription id")
+            .to_owned();
+        let cursor = subscription_response["cursor"]
+            .as_u64()
+            .expect("event subscription cursor");
+
+        let initial_poll = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(2),
+                method: "event.subscribe".to_owned(),
+                params: json!({"subscription": subscription.clone()}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(42, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(initial_poll.error.is_none(), "{:?}", initial_poll.error);
+        let initial_poll = initial_poll.result.expect("initial event poll response");
+        assert_eq!(initial_poll["subscription"], json!(subscription));
+        assert_eq!(initial_poll["revision"], json!(0));
+        assert_eq!(initial_poll["cursor"], json!(0));
+        assert_eq!(initial_poll["events"], json!([]));
+
+        automation
+            .publish_event(EventPublication::new(
+                scope.clone(),
+                COMMAND_COMPLETED_TOPIC,
+                Value::Null,
+                None,
+                json!({"ready": true}),
+            ))
+            .unwrap();
+        let polled = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(3),
+                method: "event.subscribe".to_owned(),
+                params: json!({"subscription": subscription.clone(), "cursor": cursor}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(43, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(polled.error.is_none(), "{:?}", polled.error);
+        let polled = polled.result.expect("event poll response");
+        assert_eq!(polled["subscription"], json!(subscription));
+        assert_eq!(polled["revision"], json!(1));
+        assert_eq!(polled["cursor"], json!(1));
+        let events = polled["events"].as_array().expect("event delivery array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["sequence"], json!(1));
+        assert_eq!(events[0]["revision"], json!(1));
+        assert_eq!(events[0]["topic"], json!(COMMAND_COMPLETED_TOPIC));
+        let cursor = polled["cursor"].as_u64().expect("event poll cursor");
+
+        let snapshot = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(4),
+                method: "event.snapshot".to_owned(),
+                params: json!({"subscription": subscription.clone()}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(44, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+        assert_eq!(
+            snapshot.result.expect("event snapshot response")["scope"],
+            json!(scope)
+        );
+
+        let invoked_snapshot = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(5),
+                method: "command.invoke".to_owned(),
+                params: json!({
+                    "invocation": CommandInvocation::from_action(
+                        &format!("event.snapshot:{subscription}"),
+                        Caller::Cli,
+                    )
+                }),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(45, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(
+            invoked_snapshot.error.is_none(),
+            "{:?}",
+            invoked_snapshot.error
+        );
+        assert_eq!(
+            invoked_snapshot
+                .result
+                .expect("invoked event snapshot response")["scope"],
+            json!(scope)
+        );
+
+        let completion_poll = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(6),
+                method: "event.subscribe".to_owned(),
+                params: json!({"subscription": subscription.clone(), "cursor": cursor}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(46, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(
+            completion_poll.error.is_none(),
+            "{:?}",
+            completion_poll.error
+        );
+        let completion_poll = completion_poll
+            .result
+            .expect("command completion poll response");
+        assert_eq!(completion_poll["subscription"], json!(subscription));
+        assert_eq!(completion_poll["revision"], json!(2));
+        assert_eq!(completion_poll["cursor"], json!(2));
+        let events = completion_poll["events"]
+            .as_array()
+            .expect("command completion delivery array");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["sequence"], json!(2));
+        assert_eq!(events[0]["revision"], json!(2));
+        assert_eq!(events[0]["topic"], json!(COMMAND_COMPLETED_TOPIC));
+
+        let rebased = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(7),
+                method: "event.rebase".to_owned(),
+                params: json!({"subscription": subscription.clone()}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(47, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(rebased.error.is_none(), "{:?}", rebased.error);
+        let rebased = rebased.result.expect("event rebase response");
+        assert_eq!(rebased["subscription"], json!(subscription));
+        assert_eq!(rebased["cursor"], json!(2));
+        assert_eq!(rebased["revision"], json!(2));
+        assert_eq!(rebased["snapshot"]["revision"], json!(2));
+
+        let invalid_cursor = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(8),
+                method: "event.subscribe".to_owned(),
+                params: json!({"subscription": subscription.clone(), "cursor": "not-a-cursor"}),
+            },
+            descriptor.clone(),
+            commands.clone(),
+            automation.clone(),
+            OwnerIdentity::new(48, 1),
+            CommandCancellation::new(),
+        ));
+        let invalid_cursor = invalid_cursor.error.expect("invalid cursor error");
+        assert_eq!(invalid_cursor.code, -32602);
+        assert_eq!(invalid_cursor.message, "invalid subscription cursor");
+
+        let unsubscribed = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(9),
+                method: "event.unsubscribe".to_owned(),
+                params: json!({"subscription": subscription.clone()}),
+            },
+            descriptor,
+            commands,
+            automation,
+            OwnerIdentity::new(49, 1),
+            CommandCancellation::new(),
+        ));
+        assert!(unsubscribed.error.is_none(), "{:?}", unsubscribed.error);
+        assert_eq!(
+            unsubscribed.result.expect("event unsubscribe response")["unsubscribed"],
+            json!(subscription)
+        );
+    }
+
+    #[test]
+    fn task_cancellation_is_owned_and_shutdown_cancels() {
+        let automation = AutomationHub::new();
+        let cancellation = CommandCancellation::new();
+        let task = automation
+            .tasks()
+            .start(owner(), cancellation.clone(), "instance:test".to_owned())
+            .unwrap();
+
+        assert_eq!(
+            automation
+                .tasks()
+                .cancel(&task.id, &OwnerIdentity::new(8, 11))
+                .unwrap_err()
+                .code,
+            -32006
+        );
+        let value = automation.tasks().cancel(&task.id, &owner()).unwrap();
+        assert_eq!(
+            serde_json::to_value(value).unwrap()["state"]["status"],
+            "cancelling"
+        );
         assert!(cancellation.is_cancelled());
 
         let other_cancellation = CommandCancellation::new();
-        state.start_task(7, other_cancellation.clone()).unwrap();
-        state.cancel_all_tasks();
+        automation
+            .tasks()
+            .start(
+                owner(),
+                other_cancellation.clone(),
+                "instance:test".to_owned(),
+            )
+            .unwrap();
+        automation.cancel_all_tasks();
         assert!(other_cancellation.is_cancelled());
     }
 
     #[test]
     fn detached_task_reports_completion() {
-        let state = Arc::new(Mutex::new(ControlState::default()));
+        let automation = AutomationHub::new();
         let (commands, receiver) = app_command_channel(1);
         let task = start_task(
             CommandInvocation::from_action("new_tab", Caller::Socket),
             commands.for_caller(Caller::Socket),
-            Arc::clone(&state),
-            7,
+            automation.clone(),
+            owner(),
             "instance:test".to_owned(),
         )
         .unwrap()["task"]["id"]
@@ -1328,7 +2034,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            let status = task_status(json!({"task": task}), Arc::clone(&state), 7).unwrap();
+            let status = task_status(json!({"task": task}), automation.clone(), owner()).unwrap();
             if status["task"]["state"]["status"] == "completed" {
                 assert_eq!(status["task"]["state"]["outcome"]["status"], "success");
                 break;
@@ -1340,18 +2046,17 @@ mod tests {
 
     #[test]
     fn completion_events_include_target_and_provenance() {
-        let mut state = ControlState::default();
+        let automation = AutomationHub::new();
         let scope = "instance:test".to_owned();
-        let subscription = state
-            .create_subscription(
-                7,
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner(),
                 [COMMAND_COMPLETED_TOPIC.to_owned()].into_iter().collect(),
                 scope.clone(),
             )
-            .unwrap()["subscription"]
-            .as_str()
             .unwrap()
-            .to_owned();
+            .subscription;
         let invocation = CommandInvocation {
             command: "new_tab".to_owned(),
             arguments: Vec::new(),
@@ -1364,49 +2069,192 @@ mod tests {
             confirmation: None,
         };
 
-        state.publish_command_completion(
-            scope,
-            7,
-            &invocation,
-            json!({"status": "success", "value": null}),
-        );
-        let events = state.poll_subscription(&subscription, 7, 0).unwrap();
+        automation
+            .publish_command_completion(
+                scope,
+                &owner(),
+                &invocation,
+                json!({"status": "success", "value": null}),
+            )
+            .unwrap();
+        let events = automation
+            .events()
+            .poll(&subscription, &owner(), 0)
+            .unwrap();
 
-        assert_eq!(events["revision"], 1);
-        assert_eq!(events["events"][0]["sequence"], 1);
-        assert_eq!(events["events"][0]["provenance"]["caller"], "socket");
-        assert_eq!(events["events"][0]["provenance"]["owner_pid"], 7);
-        assert_eq!(events["events"][0]["target"]["handle"], "pane-4");
+        assert_eq!(events.revision, 1);
+        assert_eq!(events.events[0].sequence, 1);
+        assert_eq!(events.events[0].provenance["caller"], "socket");
+        assert_eq!(events.events[0].provenance["owner_pid"], 7);
+        assert_eq!(events.events[0].target.as_ref().unwrap().handle, "pane-4");
     }
 
     #[test]
     fn event_overflow_requires_snapshot_rebase() {
-        let mut state = ControlState::default();
+        let automation = AutomationHub::new();
         let scope = "instance:test".to_owned();
-        let subscription = state
-            .create_subscription(
-                7,
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner(),
                 [COMMAND_COMPLETED_TOPIC.to_owned()].into_iter().collect(),
                 scope.clone(),
             )
-            .unwrap()["subscription"]
-            .as_str()
             .unwrap()
-            .to_owned();
+            .subscription;
 
         for _ in 0..=EVENT_QUEUE_LIMIT {
-            state.publish_event(
-                scope.clone(),
-                COMMAND_COMPLETED_TOPIC,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            );
+            automation
+                .publish_event(EventPublication::new(
+                    scope.clone(),
+                    COMMAND_COMPLETED_TOPIC,
+                    Value::Null,
+                    None,
+                    Value::Null,
+                ))
+                .unwrap();
         }
 
-        let error = state.poll_subscription(&subscription, 7, 0).unwrap_err();
+        let error = automation
+            .events()
+            .poll(&subscription, &owner(), 0)
+            .unwrap_err();
         assert_eq!(error.code, -32005);
         assert_eq!(error.data.unwrap()["rebase"], "snapshot");
+    }
+
+    #[test]
+    fn event_snapshot_and_rebase_are_owned_rpc_operations() {
+        let automation = AutomationHub::new();
+        let scope = "binding:1:2".to_owned();
+        automation
+            .events()
+            .set_snapshot(
+                scope.clone(),
+                COMMAND_COMPLETED_TOPIC,
+                json!({"authoritative": true}),
+            )
+            .unwrap();
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner(),
+                [COMMAND_COMPLETED_TOPIC.to_owned()].into_iter().collect(),
+                scope.clone(),
+            )
+            .unwrap()
+            .subscription;
+        automation
+            .publish_event(EventPublication::new(
+                scope,
+                COMMAND_COMPLETED_TOPIC,
+                Value::Null,
+                None,
+                Value::Null,
+            ))
+            .unwrap();
+
+        let snapshot = event_snapshot(
+            json!({"subscription": subscription.clone()}),
+            automation.clone(),
+            owner(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["snapshots"][COMMAND_COMPLETED_TOPIC]["authoritative"],
+            true
+        );
+
+        let rebase = event_rebase(
+            json!({"subscription": subscription.clone()}),
+            automation.clone(),
+            owner(),
+        )
+        .unwrap();
+        assert_eq!(rebase["cursor"], 1);
+        assert_eq!(
+            rebase["snapshot"]["snapshots"][COMMAND_COMPLETED_TOPIC]["authoritative"],
+            true
+        );
+        assert_eq!(
+            event_snapshot(
+                json!({"subscription": subscription}),
+                automation,
+                OwnerIdentity::new(8, 11),
+            )
+            .unwrap_err()
+            .code,
+            -32006
+        );
+    }
+
+    #[test]
+    fn owner_local_binding_event_scope_requires_a_live_registry_entry() {
+        let descriptor = new_instance_descriptor("test").unwrap();
+        let automation = AutomationHub::new();
+        let scope = "binding:1:-2".to_owned();
+        automation
+            .events()
+            .replace_live_binding_scopes([scope.clone()]);
+        automation
+            .events()
+            .set_snapshot(
+                scope.clone(),
+                "topology.changed",
+                json!({"authoritative": true}),
+            )
+            .unwrap();
+        let owner = owner();
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner.clone(),
+                ["topology.changed".to_owned()].into_iter().collect(),
+                scope.clone(),
+            )
+            .unwrap()
+            .subscription;
+
+        assert_eq!(
+            event_scope(&json!({"scope": scope}), &descriptor, &automation,).unwrap(),
+            "binding:1:-2"
+        );
+
+        automation
+            .events()
+            .replace_live_binding_scopes(std::iter::empty());
+
+        assert!(!automation.events().scope_has_snapshot("binding:1:-2"));
+        assert_eq!(
+            event_scope(&json!({"scope": "binding:1:-2"}), &descriptor, &automation,)
+                .unwrap_err()
+                .code,
+            -32006
+        );
+        assert_eq!(
+            automation
+                .events()
+                .poll(&subscription, &owner, 0)
+                .unwrap_err()
+                .code,
+            -32006
+        );
+        assert_eq!(
+            event_scope(&json!({"scope": "binding:1:-3"}), &descriptor, &automation,)
+                .unwrap_err()
+                .code,
+            -32006
+        );
+        assert_eq!(
+            event_scope(
+                &json!({"scope": "binding:not-a-number:2"}),
+                &descriptor,
+                &automation,
+            )
+            .unwrap_err()
+            .code,
+            -32602
+        );
     }
 
     #[test]
@@ -1422,6 +2270,17 @@ mod tests {
             error.data.unwrap()["server_maximum"],
             json!(PROTOCOL_VERSION)
         );
+    }
+
+    #[test]
+    fn descriptor_identity_is_the_directory_claim_identity() {
+        let descriptor = new_instance_descriptor("test").expect("descriptor");
+        let instance = descriptor.directory_instance();
+        let owner = ClaimOwner::current(instance.instance_id.clone()).expect("claim owner");
+
+        assert_eq!(instance.instance_id, descriptor.instance_id);
+        assert_eq!(instance.generation, descriptor.generation);
+        assert_eq!(owner.instance_id, descriptor.instance_id);
     }
 
     #[test]

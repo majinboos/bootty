@@ -4,6 +4,9 @@ use std::sync::Arc;
 #[cfg(feature = "app")]
 pub type RepaintHandle = Arc<dyn Fn() + Send + Sync + 'static>;
 pub use remote_exec::{REMOTE_DAEMON_PROGRAM, REMOTE_DAEMON_PROTOCOL_VERSION, run_remote_command};
+pub use remote_operation_protocol::{
+    write_remote_operation_completion, write_remote_operation_error,
+};
 pub use remote_space_protocol::{
     decode_command as decode_remote_space_command, encode_command as encode_remote_space_command,
 };
@@ -32,6 +35,14 @@ fn bootty_rmux_socket_name(wire_version: u32) -> String {
 
 #[cfg(feature = "app")]
 pub mod backend;
+pub mod operation;
+#[cfg(not(feature = "app"))]
+pub mod backend {
+    pub use crate::operation::{
+        MuxAllocatedResources, MuxAllocatedWindow, MuxBackendCommandCompletion,
+        MuxBackendOperationError, MuxEventTarget, MuxOccupantIdentity,
+    };
+}
 #[cfg(feature = "app")]
 pub mod capability;
 pub mod command;
@@ -46,11 +57,14 @@ pub mod project;
 mod remote_exec;
 #[cfg(feature = "remote-install")]
 mod remote_install;
+mod remote_operation_protocol;
 #[cfg(feature = "app")]
 pub mod remote_space;
 pub mod remote_space_protocol;
 pub mod rmux;
 pub(crate) mod rmux_bridge;
+#[cfg(feature = "app")]
+mod rmux_events;
 pub(crate) mod rmux_remote;
 pub mod snapshot;
 #[cfg(feature = "app")]
@@ -62,6 +76,9 @@ pub mod tmux;
 pub mod tmux_control;
 pub mod tmux_protocol;
 pub mod zellij;
+
+#[cfg(all(test, feature = "app"))]
+mod backend_contract_tests;
 
 #[cfg(test)]
 mod tests {

@@ -239,6 +239,20 @@ mod tests {
                 "-3".to_owned(),
             ]))
         );
+
+        let words =
+            Cli::try_parse_from(["bootty", "--json", "agents", "prompt", "--message", "hello"])
+                .unwrap();
+        assert!(words.json());
+        assert_eq!(
+            words.subcommand(),
+            Some(&Command::Dynamic(vec![
+                "agents".to_owned(),
+                "prompt".to_owned(),
+                "--message".to_owned(),
+                "hello".to_owned(),
+            ]))
+        );
     }
 
     #[test]

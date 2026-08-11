@@ -299,44 +299,38 @@ impl SessionStore {
 #[derive(Debug, Clone)]
 pub struct SessionOrderStore {
     path: PathBuf,
-    binding_id: Option<i64>,
+    binding_id: i64,
     store: SessionStore,
     membership_initialized: bool,
+    #[cfg(test)]
+    next_save_failure: Option<String>,
 }
 
 impl SessionOrderStore {
-    pub fn for_config_path(config_path: &Path) -> Self {
-        let workspace = WorkspaceStore::for_config_path(config_path);
-        let path = workspace.path().to_path_buf();
-        let binding_id = workspace.binding_id();
-        let (store, membership_initialized) = Self::load_store(&path, binding_id);
-        Self {
-            store,
+    pub fn for_config_path(config_path: &Path) -> rusqlite::Result<Self> {
+        let workspace = WorkspaceStore::try_for_config_path(config_path)?;
+        let binding_id = workspace
+            .binding_id()
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        Self::load(workspace.path().to_path_buf(), binding_id)
+    }
+
+    pub fn for_binding(config_path: &Path, binding_id: i64) -> rusqlite::Result<Self> {
+        let workspace = WorkspaceStore::try_for_config_path(config_path)?;
+        Self::load(workspace.path().to_path_buf(), binding_id)
+    }
+
+    fn load(path: PathBuf, binding_id: i64) -> rusqlite::Result<Self> {
+        let store = SessionStore::load_sqlite(&path, binding_id)?;
+        let membership_initialized = Self::membership_initialized(&path, binding_id)?;
+        Ok(Self {
             path,
             binding_id,
-            membership_initialized,
-        }
-    }
-
-    pub fn for_binding(config_path: &Path, binding_id: i64) -> Self {
-        let path = crate::workspace::sqlite_path(config_path);
-        let (store, membership_initialized) = Self::load_store(&path, Some(binding_id));
-        Self {
             store,
-            path,
-            binding_id: Some(binding_id),
             membership_initialized,
-        }
-    }
-
-    fn load_store(path: &Path, binding_id: Option<i64>) -> (SessionStore, bool) {
-        let Some(binding_id) = binding_id else {
-            return (SessionStore::default(), false);
-        };
-        (
-            SessionStore::load_sqlite(path, binding_id).unwrap_or_default(),
-            Self::membership_initialized(path, binding_id).unwrap_or(false),
-        )
+            #[cfg(test)]
+            next_save_failure: None,
+        })
     }
 
     fn membership_initialized(path: &Path, binding_id: i64) -> rusqlite::Result<bool> {
@@ -349,28 +343,41 @@ impl SessionOrderStore {
             |row| row.get(0),
         )
     }
-
-    pub fn add_session(&mut self, name: &str) {
-        if self.store.existing_names().insert(name.to_owned()) {
-            self.store.insert_unique(name);
-            self.save();
-        }
+    fn names_owned_by_other_bindings(&self) -> rusqlite::Result<HashSet<String>> {
+        let conn = open_db(&self.path)?;
+        let mut statement =
+            conn.prepare("SELECT name FROM workspace_sessions WHERE binding_id != ?1")?;
+        statement
+            .query_map([self.binding_id], |row| row.get::<_, String>(0))?
+            .collect()
     }
 
-    pub fn remove_session(&mut self, name: &str) -> bool {
-        let removed = self.store.remove(name);
-        if removed {
-            self.save();
+    pub fn add_session(&mut self, name: &str) -> rusqlite::Result<bool> {
+        if self.store.find_session(name).is_some() {
+            return Ok(false);
         }
-        removed
+        let mut store = self.store.clone();
+        store.insert_unique(name);
+        self.save_store(store)?;
+        Ok(true)
     }
 
-    pub fn rename_session(&mut self, old: &str, new: &str) -> bool {
-        let renamed = self.store.rename_session(old, new);
-        if renamed {
-            self.save();
+    pub fn remove_session(&mut self, name: &str) -> rusqlite::Result<bool> {
+        let mut store = self.store.clone();
+        if !store.remove(name) {
+            return Ok(false);
         }
-        renamed
+        self.save_store(store)?;
+        Ok(true)
+    }
+
+    pub fn rename_session(&mut self, old: &str, new: &str) -> rusqlite::Result<bool> {
+        let mut store = self.store.clone();
+        if !store.rename_session(old, new) {
+            return Ok(false);
+        }
+        self.save_store(store)?;
+        Ok(true)
     }
 
     pub fn session_names(&self) -> Vec<String> {
@@ -380,32 +387,41 @@ impl SessionOrderStore {
     pub fn sync_sessions<'a>(
         &mut self,
         sessions: impl IntoIterator<Item = &'a str>,
-    ) -> Vec<String> {
+    ) -> rusqlite::Result<Vec<String>> {
         let ordered_alive = sessions.into_iter().map(str::to_owned).collect::<Vec<_>>();
         if ordered_alive.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let alive = ordered_alive
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let existing = self.store.existing_names();
-        let mut changed = false;
-        if !self.membership_initialized && existing.is_empty() {
-            for session in &ordered_alive {
-                self.store.insert_unique(session);
-                changed = true;
+        let initialize = !self.membership_initialized && self.store.entries.is_empty();
+        let prune = self
+            .store
+            .entries
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .any(|session| !alive.contains(session.as_str()));
+        if initialize || prune {
+            let mut store = self.store.clone();
+            if initialize {
+                let claimed = self.names_owned_by_other_bindings()?;
+                for session in &ordered_alive {
+                    if !claimed.contains(session) {
+                        store.insert_unique(session);
+                    }
+                }
             }
+            store.prune(&alive);
+            self.save_store(store)?;
         }
-        changed |= self.store.prune(&alive);
-        if changed {
-            self.save();
-        }
-        self.store
+        Ok(self
+            .store
             .ordered_names()
             .into_iter()
             .filter(|session| alive.contains(session.as_str()))
-            .collect()
+            .collect())
     }
 
     pub fn move_session<'a>(
@@ -413,13 +429,14 @@ impl SessionOrderStore {
         name: &str,
         delta: i32,
         sessions: impl IntoIterator<Item = &'a str>,
-    ) -> bool {
-        self.sync_sessions(sessions);
-        let moved = self.store.move_session(name, delta);
-        if moved {
-            self.save();
+    ) -> rusqlite::Result<bool> {
+        self.sync_sessions(sessions)?;
+        let mut store = self.store.clone();
+        if !store.move_session(name, delta) {
+            return Ok(false);
         }
-        moved
+        self.save_store(store)?;
+        Ok(true)
     }
 
     pub fn move_session_before<'a>(
@@ -427,21 +444,33 @@ impl SessionOrderStore {
         source: &str,
         before: Option<&str>,
         sessions: impl IntoIterator<Item = &'a str>,
-    ) -> bool {
-        self.sync_sessions(sessions);
-        let moved = self.store.move_session_before(source, before);
-        if moved {
-            self.save();
+    ) -> rusqlite::Result<bool> {
+        self.sync_sessions(sessions)?;
+        let mut store = self.store.clone();
+        if !store.move_session_before(source, before) {
+            return Ok(false);
         }
-        moved
+        self.save_store(store)?;
+        Ok(true)
     }
 
-    fn save(&mut self) {
-        if let Some(binding_id) = self.binding_id
-            && self.store.save_sqlite(&self.path, binding_id).is_ok()
-        {
-            self.membership_initialized = true;
+    fn save_store(&mut self, store: SessionStore) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if let Some(message) = self.next_save_failure.take() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(message),
+            )));
         }
+
+        store.save_sqlite(&self.path, self.binding_id)?;
+        self.store = store;
+        self.membership_initialized = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_save_for_test(&mut self) {
+        self.next_save_failure = Some("injected session-order persistence failure".to_owned());
     }
 }
 
@@ -464,17 +493,25 @@ mod tests {
     #[test]
     fn sync_sessions_persists_order_in_sqlite_wal_database() {
         let path = temp_config_path("sqlite");
-        let mut store = SessionOrderStore::for_config_path(&path);
-        store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
-        assert!(store.move_session_before(
-            "agents",
-            Some("arc/migrations"),
-            ["arc/migrations", "arc/readiness", "agents", "bootty"],
-        ));
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store
+            .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
+            .expect("sync sessions");
+        assert!(
+            store
+                .move_session_before(
+                    "agents",
+                    Some("arc/migrations"),
+                    ["arc/migrations", "arc/readiness", "agents", "bootty"],
+                )
+                .expect("move session")
+        );
 
-        let mut reloaded = SessionOrderStore::for_config_path(&path);
+        let mut reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
         assert_eq!(
-            reloaded.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]),
+            reloaded
+                .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
+                .expect("sync reloaded sessions"),
             vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
         );
 
@@ -488,19 +525,32 @@ mod tests {
     #[test]
     fn sync_sessions_does_not_overwrite_persisted_order_when_refresh_has_no_sessions() {
         let path = temp_config_path("empty-refresh");
-        let mut store = SessionOrderStore::for_config_path(&path);
-        store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
-        assert!(store.move_session_before(
-            "agents",
-            Some("arc/migrations"),
-            ["arc/migrations", "arc/readiness", "agents", "bootty"],
-        ));
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store
+            .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
+            .expect("sync sessions");
+        assert!(
+            store
+                .move_session_before(
+                    "agents",
+                    Some("arc/migrations"),
+                    ["arc/migrations", "arc/readiness", "agents", "bootty"],
+                )
+                .expect("move session")
+        );
 
-        assert!(store.sync_sessions(std::iter::empty()).is_empty());
+        assert!(
+            store
+                .sync_sessions(std::iter::empty())
+                .expect("sync empty refresh")
+                .is_empty()
+        );
 
-        let mut reloaded = SessionOrderStore::for_config_path(&path);
+        let mut reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
         assert_eq!(
-            reloaded.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]),
+            reloaded
+                .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
+                .expect("sync reloaded sessions"),
             vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
         );
     }
@@ -525,18 +575,26 @@ mod tests {
         .expect("insert second Space binding");
         let second_binding = conn.last_insert_rowid();
 
-        let mut first = SessionOrderStore::for_binding(&path, first_binding);
-        let mut second = SessionOrderStore::for_binding(&path, second_binding);
-        first.add_session("first");
-        second.add_session("second");
+        let mut first =
+            SessionOrderStore::for_binding(&path, first_binding).expect("open first order");
+        let mut second =
+            SessionOrderStore::for_binding(&path, second_binding).expect("open second order");
+        first.add_session("first").expect("persist first session");
+        second
+            .add_session("second")
+            .expect("persist second session");
 
         assert_eq!(
-            first.sync_sessions(["first", "second"]),
+            first
+                .sync_sessions(["first", "second"])
+                .expect("sync first binding"),
             vec!["first"],
             "a binding must expose only its persisted members"
         );
         assert_eq!(
-            second.sync_sessions(["first", "second"]),
+            second
+                .sync_sessions(["first", "second"])
+                .expect("sync second binding"),
             vec!["second"],
             "a second binding on the same backend must remain isolated"
         );
@@ -545,31 +603,47 @@ mod tests {
     #[test]
     fn detached_session_can_be_attached_again() {
         let path = temp_config_path("detach-attach");
-        let mut store = SessionOrderStore::for_config_path(&path);
-        store.add_session("first");
-        store.add_session("second");
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store.add_session("first").expect("persist first session");
+        store.add_session("second").expect("persist second session");
 
-        assert!(store.remove_session("first"));
-        assert_eq!(store.sync_sessions(["first", "second"]), vec!["second"]);
-
-        store.add_session("first");
+        assert!(store.remove_session("first").expect("remove first session"));
         assert_eq!(
-            store.sync_sessions(["first", "second"]),
+            store
+                .sync_sessions(["first", "second"])
+                .expect("sync after detach"),
+            vec!["second"]
+        );
+
+        store
+            .add_session("first")
+            .expect("persist reattached session");
+        assert_eq!(
+            store
+                .sync_sessions(["first", "second"])
+                .expect("sync after attach"),
             vec!["second", "first"]
         );
     }
+
     #[test]
     fn rename_session_preserves_its_persisted_position() {
         let path = temp_config_path("rename-position");
-        let mut store = SessionOrderStore::for_config_path(&path);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
         let sessions = ["first", "project/one", "project/two", "last"];
-        store.sync_sessions(sessions);
+        store.sync_sessions(sessions).expect("sync sessions");
 
-        assert!(store.rename_session("project/one", "renamed"));
+        assert!(
+            store
+                .rename_session("project/one", "renamed")
+                .expect("rename session")
+        );
 
-        let mut reloaded = SessionOrderStore::for_config_path(&path);
+        let mut reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
         assert_eq!(
-            reloaded.sync_sessions(["first", "renamed", "project/two", "last"]),
+            reloaded
+                .sync_sessions(["first", "renamed", "project/two", "last"])
+                .expect("sync reloaded sessions"),
             vec!["first", "renamed", "project/two", "last"]
         );
     }
@@ -577,11 +651,19 @@ mod tests {
     #[test]
     fn move_session_reorders_entries_within_group() {
         let path = temp_config_path("group");
-        let mut store = SessionOrderStore::for_config_path(&path);
-        store.sync_sessions(["a/1", "a/2", "b"]);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store
+            .sync_sessions(["a/1", "a/2", "b"])
+            .expect("sync sessions");
 
-        assert!(store.move_session("a/2", -1, ["a/1", "a/2", "b"]));
-        let ordered = store.sync_sessions(["a/1", "a/2", "b"]);
+        assert!(
+            store
+                .move_session("a/2", -1, ["a/1", "a/2", "b"])
+                .expect("move session")
+        );
+        let ordered = store
+            .sync_sessions(["a/1", "a/2", "b"])
+            .expect("sync reordered sessions");
         let a2_index = ordered
             .iter()
             .position(|name| name == "a/2")
@@ -596,16 +678,24 @@ mod tests {
     #[test]
     fn move_session_moves_single_session_one_block_down_past_group() {
         let path = temp_config_path("step");
-        let mut store = SessionOrderStore::for_config_path(&path);
-        store.sync_sessions(["agents", "arc/migrations", "arc/readiness", "bootty"]);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store
+            .sync_sessions(["agents", "arc/migrations", "arc/readiness", "bootty"])
+            .expect("sync sessions");
 
-        assert!(store.move_session(
-            "agents",
-            1,
-            ["agents", "arc/migrations", "arc/readiness", "bootty"],
-        ));
+        assert!(
+            store
+                .move_session(
+                    "agents",
+                    1,
+                    ["agents", "arc/migrations", "arc/readiness", "bootty"],
+                )
+                .expect("move session")
+        );
         assert_eq!(
-            store.sync_sessions(["agents", "arc/migrations", "arc/readiness", "bootty"]),
+            store
+                .sync_sessions(["agents", "arc/migrations", "arc/readiness", "bootty"])
+                .expect("sync reordered sessions"),
             vec!["arc/migrations", "arc/readiness", "agents", "bootty"]
         );
     }
@@ -613,13 +703,17 @@ mod tests {
     #[test]
     fn move_session_before_reorders_siblings_within_a_group() {
         let path = temp_config_path("within");
-        let mut store = SessionOrderStore::for_config_path(&path);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
         let alive = ["a/1", "a/2", "a/3", "b"];
-        store.sync_sessions(alive);
+        store.sync_sessions(alive).expect("sync sessions");
 
-        assert!(store.move_session_before("a/3", Some("a/1"), alive));
+        assert!(
+            store
+                .move_session_before("a/3", Some("a/1"), alive)
+                .expect("move session")
+        );
         assert_eq!(
-            store.sync_sessions(alive),
+            store.sync_sessions(alive).expect("sync reordered sessions"),
             vec!["a/3", "a/1", "a/2", "b"],
             "a/3 should slot in front of its siblings without disturbing other groups"
         );
@@ -628,30 +722,65 @@ mod tests {
     #[test]
     fn move_session_before_across_groups_moves_the_whole_block() {
         let path = temp_config_path("across");
-        let mut store = SessionOrderStore::for_config_path(&path);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
         let alive = ["a/1", "a/2", "b"];
-        store.sync_sessions(alive);
+        store.sync_sessions(alive).expect("sync sessions");
 
         // Dragging the standalone `b` ahead of an `a` session moves it past the entire group.
-        assert!(store.move_session_before("b", Some("a/1"), alive));
-        assert_eq!(store.sync_sessions(alive), vec!["b", "a/1", "a/2"]);
+        assert!(
+            store
+                .move_session_before("b", Some("a/1"), alive)
+                .expect("move session")
+        );
+        assert_eq!(
+            store.sync_sessions(alive).expect("sync reordered sessions"),
+            vec!["b", "a/1", "a/2"]
+        );
     }
 
     #[test]
     fn move_session_before_reorders_top_level_entries() {
         let path = temp_config_path("block");
-        let mut store = SessionOrderStore::for_config_path(&path);
-        store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store
+            .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
+            .expect("sync sessions");
 
-        assert!(store.move_session_before(
-            "agents",
-            Some("arc/migrations"),
-            ["arc/migrations", "arc/readiness", "agents", "bootty"],
-        ));
+        assert!(
+            store
+                .move_session_before(
+                    "agents",
+                    Some("arc/migrations"),
+                    ["arc/migrations", "arc/readiness", "agents", "bootty"],
+                )
+                .expect("move session")
+        );
         assert_eq!(
-            store.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]),
+            store
+                .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
+                .expect("sync reordered sessions"),
             vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
         );
+    }
+
+    #[test]
+    fn failed_persistence_is_observable_and_does_not_change_membership() {
+        let path = temp_config_path("persistence-failure");
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        store.fail_next_save_for_test();
+
+        let error = store
+            .add_session("lost")
+            .expect_err("injected persistence failure must be returned");
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected session-order persistence failure")
+        );
+        assert!(store.session_names().is_empty());
+        let reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
+        assert!(reloaded.session_names().is_empty());
     }
 
     #[test]
@@ -665,10 +794,12 @@ mod tests {
         )
         .expect("write legacy order");
 
-        let mut store = SessionOrderStore::for_config_path(&path);
+        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
 
         assert_eq!(
-            store.sync_sessions(["first", "second"]),
+            store
+                .sync_sessions(["first", "second"])
+                .expect("sync legacy order"),
             vec!["second", "first"]
         );
     }

@@ -777,7 +777,17 @@ mod tests {
         let executor = CommandRegistry::core().resolve(invocation?).ok()?.executor;
         match executor {
             CoreCommandExecutor::Keybind(action) => Some(action),
-            CoreCommandExecutor::Sidebar(_) | CoreCommandExecutor::ReadTerminal => None,
+            CoreCommandExecutor::Mux(_)
+            | CoreCommandExecutor::Sidebar(_)
+            | CoreCommandExecutor::ReadTerminal
+            | CoreCommandExecutor::SessionSelect { .. }
+            | CoreCommandExecutor::SessionCreate(_)
+            | CoreCommandExecutor::DirectoryResolve { .. }
+            | CoreCommandExecutor::DirectoryUsageList { .. }
+            | CoreCommandExecutor::WorktreeList { .. }
+            | CoreCommandExecutor::WorktreeGet { .. }
+            | CoreCommandExecutor::WorktreeCreate { .. }
+            | CoreCommandExecutor::WorktreeRemove { .. } => None,
         }
     }
 
@@ -1500,18 +1510,18 @@ mod tests {
             action_for_key(&mut bindings, egui::Key::V, cmd),
             Some(KeybindAction::PasteFromClipboard)
         );
-        assert_eq!(
-            action_for_key(
-                &mut bindings,
+        let invocation = bindings
+            .invocation_for_key_with_modifier_sides(
                 egui::Key::N,
                 egui::Modifiers {
                     command: true,
                     alt: true,
                     ..Default::default()
-                }
-            ),
-            Some(KeybindAction::App(AppAction::NewWindow))
-        );
+                },
+                ModifierSideState::default(),
+            )
+            .expect("configured new-window invocation");
+        assert_eq!(invocation.command, "new_window");
         assert_eq!(
             action_for_key(&mut bindings, egui::Key::Q, cmd),
             Some(KeybindAction::App(AppAction::Quit))

@@ -11,7 +11,7 @@
 //! never block the UI.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -42,6 +42,9 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(8);
 /// How often extension dirs are re-scanned for edited/added/removed module files (hot reload).
 const RELOAD_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// Bounded handoff from the worker hot-reload boundary to the UI/control event
+/// publisher. A full queue is coalesced into an explicit rebase publication.
+const RELOAD_EVENT_QUEUE_LIMIT: usize = 64;
 /// Cap on how many descendants `bootty.descendants` reports, so a runaway process tree cannot
 /// stall a render.
 const DESCENDANT_SCAN_LIMIT: usize = 256;
@@ -1059,6 +1062,94 @@ struct ModuleCatalog {
     prefix: &'static str,
 }
 
+/// The file state that determines whether an extension worker must reload a
+/// source. Readability is distinct from mtime because a permission-only
+/// transition must retire an already-active module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ExtensionFileSignature {
+    modified: Option<SystemTime>,
+    readable: bool,
+}
+
+/// A file-backed Luau module lifecycle change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionReloadOperation {
+    Loaded,
+    Reloaded,
+    Removed,
+}
+
+impl ExtensionReloadOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Reloaded => "reloaded",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+/// One lifecycle change emitted at the extension worker's hot-reload boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionReloadEvent {
+    pub extension_id: String,
+    pub generation: u64,
+    pub operation: ExtensionReloadOperation,
+}
+
+/// Atomically drained worker lifecycle events and the source's current state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionReloadDrain {
+    pub events: Vec<ExtensionReloadEvent>,
+    pub modules: Vec<ExtensionModuleGeneration>,
+    pub requires_rebase: bool,
+}
+
+/// A file-backed module in an extension source's authoritative reload snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionModuleGeneration {
+    pub extension_id: String,
+    pub generation: u64,
+}
+
+#[derive(Default)]
+struct ReloadEventQueue {
+    events: VecDeque<ExtensionReloadEvent>,
+    modules: BTreeMap<String, u64>,
+    requires_rebase: bool,
+}
+
+impl ReloadEventQueue {
+    fn publish(&mut self, event: ExtensionReloadEvent) {
+        if self.requires_rebase {
+            return;
+        }
+        if self.events.len() >= RELOAD_EVENT_QUEUE_LIMIT {
+            // The drain's snapshot is authoritative. No older delta may follow it.
+            self.events.clear();
+            self.requires_rebase = true;
+            return;
+        }
+        self.events.push_back(event);
+    }
+
+    fn drain(&mut self) -> ExtensionReloadDrain {
+        ExtensionReloadDrain {
+            events: self.events.drain(..).collect(),
+            modules: self
+                .modules
+                .iter()
+                .map(|(extension_id, generation)| ExtensionModuleGeneration {
+                    extension_id: extension_id.clone(),
+                    generation: *generation,
+                })
+                .collect(),
+            requires_rebase: std::mem::take(&mut self.requires_rebase),
+        }
+    }
+}
+
 /// Owns the Luau worker thread, the shared item map the UI reads, and the mux snapshot the UI feeds.
 pub struct ExtensionHost {
     dir: PathBuf,
@@ -1074,6 +1165,8 @@ pub struct ExtensionHost {
     window_requests: Arc<RwLock<Vec<WindowRequest>>>,
     /// Fates of Luau windows, awaiting their `on_action` handler on the worker.
     pending_window_actions: Arc<RwLock<Vec<WindowOutcome>>>,
+    /// File-backed module lifecycle changes awaiting publication by the control-plane owner.
+    reload_events: Arc<RwLock<ReloadEventQueue>>,
     waker: Arc<Waker>,
     run_jobs: Arc<PlatformRunJobs>,
     shutdown: Arc<AtomicBool>,
@@ -1138,6 +1231,7 @@ impl ExtensionHost {
         let session_reorders: Arc<RwLock<Vec<SessionReorder>>> = Arc::default();
         let window_requests: Arc<RwLock<Vec<WindowRequest>>> = Arc::default();
         let pending_window_actions: Arc<RwLock<Vec<WindowOutcome>>> = Arc::default();
+        let reload_events: Arc<RwLock<ReloadEventQueue>> = Arc::default();
         let next_window_id = Arc::new(AtomicU64::new(1));
         let waker: Arc<Waker> = Arc::default();
         let run_jobs = Arc::new(PlatformRunJobs::default());
@@ -1153,6 +1247,7 @@ impl ExtensionHost {
                 let session_reorders = Arc::clone(&session_reorders);
                 let window_requests = Arc::clone(&window_requests);
                 let pending_window_actions = Arc::clone(&pending_window_actions);
+                let reload_events = Arc::clone(&reload_events);
                 let next_window_id = Arc::clone(&next_window_id);
                 let waker = Arc::clone(&waker);
                 let shutdown = Arc::clone(&shutdown);
@@ -1174,6 +1269,7 @@ impl ExtensionHost {
                         &waker,
                         &shutdown,
                         &run_jobs,
+                        &reload_events,
                     )
                 }
             })
@@ -1188,6 +1284,7 @@ impl ExtensionHost {
             session_reorders,
             window_requests,
             pending_window_actions,
+            reload_events,
             waker,
             shutdown,
             run_jobs,
@@ -1283,6 +1380,16 @@ impl ExtensionHost {
             .unwrap_or_default()
     }
 
+    /// Drains lifecycle changes from the worker with its current authoritative
+    /// file-backed-module snapshot. The UI publishes these through AutomationHub.
+    #[must_use]
+    pub fn take_reload_events(&self) -> ExtensionReloadDrain {
+        self.reload_events
+            .write()
+            .map(|mut queue| queue.drain())
+            .unwrap_or_default()
+    }
+
     /// Drains floating-window open/close requests modules made via `bootty.window`,
     /// for the app to render with the native overlay framework.
     #[must_use]
@@ -1338,6 +1445,7 @@ fn run_loop(
     waker: &Arc<Waker>,
     shutdown: &Arc<AtomicBool>,
     run_jobs: &Arc<PlatformRunJobs>,
+    reload_events: &RwLock<ReloadEventQueue>,
 ) {
     let run_cache = Arc::new(RunCache::with_waker(
         Arc::clone(waker),
@@ -1360,6 +1468,17 @@ fn run_loop(
     });
     let mut modules = load_catalog_modules(&lua, catalogs);
     let mut signature = catalog_signature(catalogs);
+    let mut reload_generations = BTreeMap::new();
+    let mut active_extension_ids = BTreeSet::new();
+    reconcile_extension_reloads(
+        catalogs,
+        &[],
+        &signature,
+        &successful_module_names(&modules),
+        &mut reload_generations,
+        &mut active_extension_ids,
+        reload_events,
+    );
     let mut last_scan = Instant::now();
     let mut system = System::new();
     let battery = BatteryManager::new().ok();
@@ -1374,12 +1493,21 @@ fn run_loop(
             last_scan = now;
             let current = catalog_signature(catalogs);
             if current != signature {
-                signature = current;
+                let previous = std::mem::replace(&mut signature, current);
                 modules = load_catalog_modules(&lua, catalogs);
                 let module_names = modules
                     .iter()
                     .map(|module| module.name.clone())
                     .collect::<BTreeSet<_>>();
+                reconcile_extension_reloads(
+                    catalogs,
+                    &previous,
+                    &signature,
+                    &successful_module_names(&modules),
+                    &mut reload_generations,
+                    &mut active_extension_ids,
+                    reload_events,
+                );
                 prune_removed_items(items, &module_names);
                 ctx.request_repaint();
             }
@@ -1496,13 +1624,138 @@ fn load_catalog_modules(lua: &Lua, catalogs: &[ModuleCatalog]) -> Vec<LoadedModu
         .collect()
 }
 
-fn catalog_signature(catalogs: &[ModuleCatalog]) -> Vec<(PathBuf, Option<SystemTime>)> {
+fn catalog_signature(catalogs: &[ModuleCatalog]) -> Vec<(PathBuf, ExtensionFileSignature)> {
     let mut signature = catalogs
         .iter()
         .flat_map(|catalog| dir_signature(&catalog.dir))
         .collect::<Vec<_>>();
     signature.sort();
     signature
+}
+
+fn successful_module_names(modules: &[LoadedModule]) -> BTreeSet<String> {
+    modules
+        .iter()
+        .filter(|module| !matches!(&module.body, ModuleBody::LoadError(_)))
+        .map(|module| module.name.clone())
+        .collect()
+}
+
+fn extension_id(path: &Path) -> String {
+    format!("path:{}", path.to_string_lossy())
+}
+
+fn extension_signature_entries(
+    signature: &[(PathBuf, ExtensionFileSignature)],
+) -> BTreeMap<String, ExtensionFileSignature> {
+    signature
+        .iter()
+        .map(|(path, modified)| (extension_id(path), *modified))
+        .collect()
+}
+
+fn catalog_module_name(catalogs: &[ModuleCatalog], path: &Path) -> Option<String> {
+    let catalog = catalogs
+        .iter()
+        .find(|catalog| path.parent() == Some(catalog.dir.as_path()))?;
+    let name = path.file_stem()?.to_str()?;
+    Some(format!("{}{}", catalog.prefix, name))
+}
+
+fn successful_extension_ids(
+    catalogs: &[ModuleCatalog],
+    signature: &[(PathBuf, ExtensionFileSignature)],
+    successful_modules: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    signature
+        .iter()
+        .filter_map(|(path, _)| {
+            catalog_module_name(catalogs, path)
+                .filter(|name| successful_modules.contains(name))
+                .map(|_| extension_id(path))
+        })
+        .collect()
+}
+
+fn next_extension_generation(generations: &mut BTreeMap<String, u64>, extension_id: &str) -> u64 {
+    let generation = generations.entry(extension_id.to_owned()).or_insert(0);
+    *generation = generation.saturating_add(1);
+    *generation
+}
+
+fn reconcile_extension_reloads(
+    catalogs: &[ModuleCatalog],
+    previous_signature: &[(PathBuf, ExtensionFileSignature)],
+    current_signature: &[(PathBuf, ExtensionFileSignature)],
+    successful_modules: &BTreeSet<String>,
+    generations: &mut BTreeMap<String, u64>,
+    active_extensions: &mut BTreeSet<String>,
+    reload_events: &RwLock<ReloadEventQueue>,
+) {
+    let previous = extension_signature_entries(previous_signature);
+    let current = extension_signature_entries(current_signature);
+    let successful = successful_extension_ids(catalogs, current_signature, successful_modules);
+    let mut events = Vec::new();
+
+    for (extension_id, modified) in &current {
+        if !successful.contains(extension_id) {
+            // The file still exists, but its new source cannot run. Retire its
+            // prior generation exactly like a removal so lifecycle consumers
+            // clear stale module state before a later successful reload.
+            if active_extensions.remove(extension_id) {
+                events.push(ExtensionReloadEvent {
+                    extension_id: extension_id.clone(),
+                    generation: next_extension_generation(generations, extension_id),
+                    operation: ExtensionReloadOperation::Removed,
+                });
+            }
+            continue;
+        }
+
+        let operation = match previous.get(extension_id) {
+            None => Some(ExtensionReloadOperation::Loaded),
+            Some(_) if !active_extensions.contains(extension_id) => {
+                Some(ExtensionReloadOperation::Loaded)
+            }
+            Some(previous_modified) if previous_modified != modified => {
+                Some(ExtensionReloadOperation::Reloaded)
+            }
+            Some(_) => None,
+        };
+        if let Some(operation) = operation {
+            active_extensions.insert(extension_id.clone());
+            events.push(ExtensionReloadEvent {
+                extension_id: extension_id.clone(),
+                generation: next_extension_generation(generations, extension_id),
+                operation,
+            });
+        }
+    }
+
+    for extension_id in previous.keys() {
+        if !current.contains_key(extension_id) && active_extensions.remove(extension_id) {
+            events.push(ExtensionReloadEvent {
+                extension_id: extension_id.clone(),
+                generation: next_extension_generation(generations, extension_id),
+                operation: ExtensionReloadOperation::Removed,
+            });
+        }
+    }
+
+    if let Ok(mut queue) = reload_events.write() {
+        queue.modules = active_extensions
+            .iter()
+            .filter_map(|extension_id| {
+                generations
+                    .get(extension_id)
+                    .copied()
+                    .map(|generation| (extension_id.clone(), generation))
+            })
+            .collect();
+        for event in events {
+            queue.publish(event);
+        }
+    }
 }
 
 fn prune_removed_items(
@@ -1824,22 +2077,59 @@ fn user_module_path(dir: &Path, name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// Sorted (path, mtime) of module files, so a reload can detect added/edited/removed files cheaply.
-fn dir_signature(dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
+/// Resolve one effective file per module name. `.luau` has the same precedence
+/// as [`user_module_path`], so a lower-priority `.lua` sibling can never
+/// masquerade as a successfully loaded version of a failed `.luau` override.
+fn extension_module_paths(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut signature: Vec<(PathBuf, Option<SystemTime>)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| is_extension_module_file(path))
+    let mut paths: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_extension_module_file(&path) {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let replace = match paths.get(name) {
+            None => true,
+            Some(current) => {
+                extension_module_priority(&path) < extension_module_priority(current)
+                    || (extension_module_priority(&path) == extension_module_priority(current)
+                        && path < *current)
+            }
+        };
+        if replace {
+            paths.insert(name.to_owned(), path);
+        }
+    }
+    paths.into_values().collect()
+}
+
+fn extension_module_priority(path: &Path) -> u8 {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("luau") => 0,
+        Some("lua") => 1,
+        _ => u8::MAX,
+    }
+}
+
+/// Sorted `(path, mtime, readability)` state for effective module files. A
+/// permission-only transition must trigger a reload so active stale state is
+/// retired rather than silently retained.
+fn dir_signature(dir: &Path) -> Vec<(PathBuf, ExtensionFileSignature)> {
+    let mut signature = extension_module_paths(dir)
+        .into_iter()
         .map(|path| {
-            let mtime = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
                 .ok();
-            (path, mtime)
+            let readable = std::fs::File::open(&path).is_ok();
+            (path, ExtensionFileSignature { modified, readable })
         })
-        .collect();
+        .collect::<Vec<_>>();
     signature.sort();
     signature
 }
@@ -2059,9 +2349,18 @@ fn shell_run_output(
     run_jobs: &PlatformRunJobs,
     shutdown: &AtomicBool,
 ) -> std::io::Result<String> {
+    shell_command_output(shell_command(cmd), run_jobs, shutdown)
+}
+
+/// Runs a configured platform-shell command with merged stdout and stderr.
+fn shell_command_output(
+    command: Command,
+    run_jobs: &PlatformRunJobs,
+    shutdown: &AtomicBool,
+) -> std::io::Result<String> {
     // One pipe for both streams: a module's text keeps the interleaved output the old
     // single-file capture produced, and reading a single end cannot deadlock on a full buffer.
-    run_output(shell_command(cmd), true, run_jobs, shutdown)
+    run_output(command, true, run_jobs, shutdown)
 }
 
 /// Run `argv` directly and return its stdout, leaving the platform shell out of it.
@@ -2654,18 +2953,12 @@ fn load_modules(
         .iter()
         .map(|(name, source)| ((*name).to_owned(), Ok((*source).to_owned())))
         .collect::<BTreeMap<_, _>>();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !is_extension_module_file(&path) {
-                continue;
-            }
-            if let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) {
-                let source =
-                    std::fs::read_to_string(&path).map_err(|error| first_line(&error.to_string()));
-                sources.insert(name.to_owned(), source);
-            }
-        }
+    for path in extension_module_paths(dir) {
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let source = std::fs::read_to_string(&path).map_err(|error| first_line(&error.to_string()));
+        sources.insert(name.to_owned(), source);
     }
     sources
         .into_iter()
@@ -3214,31 +3507,6 @@ mod tests {
                 Color32::from_rgb(0xa6, 0xe3, 0xa1),
             ]
         );
-    }
-
-    #[cfg(unix)]
-    struct PathGuard(std::ffi::OsString);
-
-    #[cfg(unix)]
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::set_var("PATH", &self.0);
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn prepend_path(path: &Path) -> PathGuard {
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let next_path = std::env::join_paths(
-            std::iter::once(path.to_path_buf()).chain(std::env::split_paths(&old_path)),
-        )
-        .expect("join PATH");
-        unsafe {
-            std::env::set_var("PATH", next_path);
-        }
-        PathGuard(old_path)
     }
 
     #[test]
@@ -3966,11 +4234,17 @@ mod tests {
         std::fs::write(&program, "#!/bin/sh\nprintf path-ok").expect("write path probe");
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
             .expect("make path probe executable");
-        let _path = prepend_path(dir.path());
+
+        let mut command = shell_command("bootty-path-probe");
+        command.env(
+            "PATH",
+            std::env::join_paths([dir.path(), Path::new("/usr/bin"), Path::new("/bin")])
+                .expect("test PATH"),
+        );
 
         assert_eq!(
-            shell_run_output(
-                "bootty-path-probe",
+            shell_command_output(
+                command,
                 &PlatformRunJobs::default(),
                 &AtomicBool::new(false),
             )
@@ -4981,6 +5255,17 @@ mod tests {
         assert_eq!(loaded.source, edited);
     }
 
+    #[test]
+    fn effective_module_paths_prefer_luau_over_lua_siblings() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let lua = directory.path().join("priority.lua");
+        let luau = directory.path().join("priority.luau");
+        std::fs::write(&lua, "return function() return 'lua' end").expect("write lua");
+        std::fs::write(&luau, "return function() return 'luau' end").expect("write luau");
+
+        assert_eq!(extension_module_paths(directory.path()), vec![luau]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn unreadable_user_module_file_surfaces_load_error() {
@@ -5034,6 +5319,205 @@ mod tests {
 
         assert_eq!(items[0].fg, Some(ERROR_COLOR));
         assert!(items[0].text.starts_with("unreadable:"));
+    }
+
+    #[test]
+    fn reload_events_are_path_stable_and_invalidate_failed_modules() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("example.luau");
+        let catalogs = [ModuleCatalog {
+            dir: directory.path().to_owned(),
+            builtins: &[],
+            prefix: "",
+        }];
+        let initial = vec![(
+            path.clone(),
+            ExtensionFileSignature {
+                modified: Some(SystemTime::UNIX_EPOCH),
+                readable: true,
+            },
+        )];
+        let changed = vec![(
+            path.clone(),
+            ExtensionFileSignature {
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+                readable: true,
+            },
+        )];
+        let failed = vec![(
+            path.clone(),
+            ExtensionFileSignature {
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2)),
+                readable: false,
+            },
+        )];
+        let restored_signature = vec![(
+            path,
+            ExtensionFileSignature {
+                modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(3)),
+                readable: true,
+            },
+        )];
+        let successful_modules = BTreeSet::from(["example".to_owned()]);
+        let reload_events = RwLock::new(ReloadEventQueue::default());
+        let mut generations = BTreeMap::new();
+        let mut active = BTreeSet::new();
+        let take_reload_events = || {
+            reload_events
+                .write()
+                .map(|mut queue| queue.drain())
+                .unwrap_or_default()
+        };
+
+        reconcile_extension_reloads(
+            &catalogs,
+            &[],
+            &initial,
+            &successful_modules,
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        let loaded = take_reload_events();
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(loaded.events[0].operation, ExtensionReloadOperation::Loaded);
+        assert_eq!(loaded.events[0].generation, 1);
+        assert_eq!(loaded.modules.len(), 1);
+        assert_eq!(loaded.modules[0].generation, 1);
+        let extension_id = loaded.events[0].extension_id.clone();
+
+        reconcile_extension_reloads(
+            &catalogs,
+            &initial,
+            &changed,
+            &successful_modules,
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        let reloaded = take_reload_events();
+        assert_eq!(reloaded.events.len(), 1);
+        assert_eq!(reloaded.events[0].extension_id, extension_id);
+        assert_eq!(
+            reloaded.events[0].operation,
+            ExtensionReloadOperation::Reloaded
+        );
+        assert_eq!(reloaded.events[0].generation, 2);
+        assert_eq!(reloaded.modules[0].generation, 2);
+
+        reconcile_extension_reloads(
+            &catalogs,
+            &changed,
+            &failed,
+            &BTreeSet::new(),
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        let invalidated = take_reload_events();
+        assert_eq!(invalidated.events.len(), 1);
+        assert_eq!(invalidated.events[0].extension_id, extension_id);
+        assert_eq!(
+            invalidated.events[0].operation,
+            ExtensionReloadOperation::Removed
+        );
+        assert_eq!(invalidated.events[0].generation, 3);
+        assert!(invalidated.modules.is_empty());
+
+        reconcile_extension_reloads(
+            &catalogs,
+            &failed,
+            &restored_signature,
+            &successful_modules,
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        let restored = take_reload_events();
+        assert_eq!(restored.events.len(), 1);
+        assert_eq!(restored.events[0].extension_id, extension_id);
+        assert_eq!(
+            restored.events[0].operation,
+            ExtensionReloadOperation::Loaded
+        );
+        assert_eq!(restored.events[0].generation, 4);
+        assert_eq!(restored.modules.len(), 1);
+        assert_eq!(restored.modules[0].generation, 4);
+
+        reconcile_extension_reloads(
+            &catalogs,
+            &restored_signature,
+            &[],
+            &BTreeSet::new(),
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        let removed = take_reload_events();
+        assert_eq!(removed.events.len(), 1);
+        assert_eq!(removed.events[0].extension_id, extension_id);
+        assert_eq!(
+            removed.events[0].operation,
+            ExtensionReloadOperation::Removed
+        );
+        assert_eq!(removed.events[0].generation, 5);
+        assert!(removed.modules.is_empty());
+    }
+
+    #[test]
+    fn reload_event_queue_preserves_normal_delta_order() {
+        let mut queue = ReloadEventQueue::default();
+        for generation in [1, 2, 3] {
+            queue.publish(ExtensionReloadEvent {
+                extension_id: "path:/extensions/example.luau".to_owned(),
+                generation,
+                operation: ExtensionReloadOperation::Reloaded,
+            });
+        }
+
+        let drain = queue.drain();
+
+        assert!(!drain.requires_rebase);
+        assert_eq!(
+            drain
+                .events
+                .into_iter()
+                .map(|event| event.generation)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn reload_event_queue_overflow_drops_retained_deltas_for_rebase() {
+        let extension_id = "path:/extensions/example.luau".to_owned();
+        let final_generation = RELOAD_EVENT_QUEUE_LIMIT as u64 + 1;
+        let mut queue = ReloadEventQueue::default();
+        for generation in 1..final_generation {
+            queue.publish(ExtensionReloadEvent {
+                extension_id: extension_id.clone(),
+                generation,
+                operation: ExtensionReloadOperation::Reloaded,
+            });
+        }
+        queue.modules.insert(extension_id.clone(), final_generation);
+        queue.publish(ExtensionReloadEvent {
+            extension_id: extension_id.clone(),
+            generation: final_generation,
+            operation: ExtensionReloadOperation::Reloaded,
+        });
+
+        let drain = queue.drain();
+
+        assert!(drain.requires_rebase);
+        assert!(drain.events.is_empty());
+        assert_eq!(
+            drain.modules,
+            vec![ExtensionModuleGeneration {
+                extension_id,
+                generation: final_generation,
+            }]
+        );
     }
 
     #[test]

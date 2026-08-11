@@ -46,6 +46,7 @@ egui = "0.35"
 egui_code_editor = "0.3.7"
 epaint_default_fonts = "0.35"
 fontdb = "0.23"
+fs4 = "1"
 iconflow = { version = "1", features = [
   "pack-bootstrap",
   "pack-lucide",

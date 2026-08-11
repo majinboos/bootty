@@ -3,7 +3,9 @@ use std::{path::Path, sync::Arc};
 use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
 
 use super::{
-    backend::MuxBackend,
+    backend::{MuxBackend, MuxBackendOperationError},
+    capability::BindingOperationOutcome,
+    command::MuxSessionLaunchPlan,
     native::NativeBackend,
     process::SystemCommandRunner,
     remote_space::RemoteSpaceBackend,
@@ -26,11 +28,25 @@ struct UnavailableBackend {
 
 impl MuxBackend for UnavailableBackend {
     fn snapshot(&self) -> anyhow::Result<crate::snapshot::MuxSnapshot> {
-        anyhow::bail!("{}", self.message)
+        Err(MuxBackendOperationError::Unavailable(self.message.clone()).into())
     }
 
     fn execute(&mut self, _command: crate::command::MuxCommand) -> anyhow::Result<()> {
-        anyhow::bail!("{}", self.message)
+        Err(MuxBackendOperationError::Unavailable(self.message.clone()).into())
+    }
+
+    fn execute_session_launch(
+        &mut self,
+        _plan: MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<anyhow::Result<()>> {
+        BindingOperationOutcome::Unavailable
+    }
+
+    fn session_launch_capability(
+        &self,
+        _plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        BindingOperationOutcome::Unavailable
     }
 }
 
@@ -212,7 +228,11 @@ mod tests {
                     BindingOperation::NavigateWindow,
                     BindingOperation::MoveWindow,
                     BindingOperation::SplitPane,
+                    BindingOperation::NavigatePane,
+                    BindingOperation::LastPane,
+                    BindingOperation::ResizePane,
                     BindingOperation::ClosePane,
+                    BindingOperation::TogglePaneZoom,
                     BindingOperation::CreateProjectSession,
                     BindingOperation::CreateWorktreeSession,
                     BindingOperation::RenameSession,
@@ -226,6 +246,8 @@ mod tests {
                     BindingOperation::MoveWindow,
                     BindingOperation::SplitPane,
                     BindingOperation::NavigatePane,
+                    BindingOperation::LastPane,
+                    BindingOperation::ResizePane,
                     BindingOperation::ClosePane,
                     BindingOperation::TogglePaneZoom,
                     BindingOperation::CreateProjectSession,

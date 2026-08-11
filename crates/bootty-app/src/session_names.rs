@@ -176,6 +176,18 @@ impl SessionNameStore {
         self.save();
     }
 
+    /// Drop a generated name reservation when its authoritative session creation failed.
+    pub fn discard_generated(&mut self, session_id: &str) {
+        if self
+            .records
+            .get(session_id)
+            .is_some_and(|record| !record.explicit)
+        {
+            self.records.remove(session_id);
+            self.save();
+        }
+    }
+
     /// Take a record back as generated under `generated_name`. Used when a name that looked like
     /// someone else's rename turns out to be one bootty asked the backend for.
     pub fn reclaim_generated(&mut self, session_id: &str, generated_name: &str) {

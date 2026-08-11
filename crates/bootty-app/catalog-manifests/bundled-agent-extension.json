@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "manifest": "bundled_extensions",
+  "source": "bundled Luau agent extension declarations",
+  "source_path": "normative bundled agent extension declaration",
+  "entries": [
+    {
+      "id": "agents.abort",
+      "kind": "descriptor",
+      "command": "agents.abort"
+    },
+    {
+      "id": "agents.clear_authority",
+      "kind": "descriptor",
+      "command": "agents.clear_authority"
+    },
+    {
+      "id": "agents.explain",
+      "kind": "descriptor",
+      "command": "agents.explain"
+    },
+    {
+      "id": "agents.focus",
+      "kind": "descriptor",
+      "command": "agents.focus"
+    },
+    {
+      "id": "agents.get",
+      "kind": "descriptor",
+      "command": "agents.get"
+    },
+    {
+      "id": "agents.ingest",
+      "kind": "descriptor",
+      "command": "agents.ingest"
+    },
+    {
+      "id": "agents.integration.doctor",
+      "kind": "descriptor",
+      "command": "agents.integration.doctor"
+    },
+    {
+      "id": "agents.integration.install",
+      "kind": "descriptor",
+      "command": "agents.integration.install"
+    },
+    {
+      "id": "agents.integration.list",
+      "kind": "descriptor",
+      "command": "agents.integration.list"
+    },
+    {
+      "id": "agents.integration.setup",
+      "kind": "descriptor",
+      "command": "agents.integration.setup"
+    },
+    {
+      "id": "agents.integration.uninstall",
+      "kind": "descriptor",
+      "command": "agents.integration.uninstall"
+    },
+    {
+      "id": "agents.list",
+      "kind": "descriptor",
+      "command": "agents.list"
+    },
+    {
+      "id": "agents.manifest.list",
+      "kind": "descriptor",
+      "command": "agents.manifest.list"
+    },
+    {
+      "id": "agents.manifest.reload",
+      "kind": "descriptor",
+      "command": "agents.manifest.reload"
+    },
+    {
+      "id": "agents.pause",
+      "kind": "descriptor",
+      "command": "agents.pause"
+    },
+    {
+      "id": "agents.prompt",
+      "kind": "descriptor",
+      "command": "agents.prompt"
+    },
+    {
+      "id": "agents.read",
+      "kind": "descriptor",
+      "command": "agents.read"
+    },
+    {
+      "id": "agents.release",
+      "kind": "descriptor",
+      "command": "agents.release"
+    },
+    {
+      "id": "agents.rename",
+      "kind": "descriptor",
+      "command": "agents.rename"
+    },
+    {
+      "id": "agents.report",
+      "kind": "descriptor",
+      "command": "agents.report"
+    },
+    {
+      "id": "agents.report_session",
+      "kind": "descriptor",
+      "command": "agents.report_session"
+    },
+    {
+      "id": "agents.resume",
+      "kind": "descriptor",
+      "command": "agents.resume"
+    },
+    {
+      "id": "agents.retry",
+      "kind": "descriptor",
+      "command": "agents.retry"
+    },
+    {
+      "id": "agents.send_keys",
+      "kind": "descriptor",
+      "command": "agents.send_keys"
+    },
+    {
+      "id": "agents.send_text",
+      "kind": "descriptor",
+      "command": "agents.send_text"
+    },
+    {
+      "id": "agents.start",
+      "kind": "descriptor",
+      "command": "agents.start"
+    },
+    {
+      "id": "agents.view.clear",
+      "kind": "descriptor",
+      "command": "agents.view.clear"
+    },
+    {
+      "id": "agents.view.set",
+      "kind": "descriptor",
+      "command": "agents.view.set"
+    },
+    {
+      "id": "agents.wait",
+      "kind": "descriptor",
+      "command": "agents.wait"
+    }
+  ]
+}

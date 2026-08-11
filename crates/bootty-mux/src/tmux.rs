@@ -1,16 +1,24 @@
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 
 #[cfg(not(feature = "app"))]
 use super::process::SystemCommandRunner;
 #[cfg(feature = "app")]
 use super::{
-    backend::MuxBackend,
-    capability::{BindingCapabilityDescriptor, BindingOperation},
+    backend::{MuxBackend, MuxEvent, MuxEventCapability},
+    capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
     controller::MuxScope,
     tmux_control::TmuxControlRunner,
 };
 use super::{
-    command::{MuxCommand, MuxDirection, MuxSplitDirection},
+    command::{
+        MuxCommand, MuxDirection, MuxPaneLaunch, MuxPaneLaunchPlan, MuxPaneResize,
+        MuxSessionLaunchPlan, MuxSplitDirection,
+    },
+    operation::{
+        MuxAllocatedResources, MuxAllocatedWindow, MuxBackendCommandCompletion,
+        MuxBackendOperationError, MuxEventTarget,
+    },
     process::{CommandRunner, require_success},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
 };
@@ -21,6 +29,33 @@ const TMUX_FIELD_SEPARATOR: char = '\x1f';
 const TMUX_SESSION_LINE_TAG: char = 's';
 const TMUX_PANE_LINE_TAG: char = 'p';
 
+#[derive(Debug)]
+struct TmuxLaunchTarget {
+    window_id: String,
+    pane_id: String,
+}
+
+/// Identities tmux returned while creating one session, before the caller observes its next
+/// snapshot. Keeping these facts transaction-local avoids inferring recursive order from tmux's
+/// intentionally flat attach snapshot.
+#[derive(Debug)]
+struct TmuxLaunchAllocation {
+    session_id: String,
+    windows: Vec<TmuxLaunchWindow>,
+}
+
+#[derive(Debug)]
+struct TmuxLaunchWindow {
+    window_id: String,
+    pane_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct TmuxLaunchSessionTarget {
+    session_id: String,
+    target: TmuxLaunchTarget,
+}
+
 #[cfg(feature = "app")]
 pub type DefaultTmuxRunner = TmuxControlRunner;
 #[cfg(not(feature = "app"))]
@@ -30,6 +65,7 @@ pub type DefaultTmuxRunner = SystemCommandRunner;
 pub struct TmuxBackend<R = DefaultTmuxRunner> {
     program: String,
     runner: R,
+    completion: Option<MuxBackendCommandCompletion>,
 }
 
 #[cfg(feature = "app")]
@@ -57,6 +93,7 @@ impl<R> TmuxBackend<R> {
         Self {
             program: program.into(),
             runner,
+            completion: None,
         }
     }
 }
@@ -85,6 +122,22 @@ impl<R: CommandRunner> TmuxBackend<R> {
         require_success(&self.program, &args, output)
     }
 
+    fn run_last_pane(&self, target: String) -> Result<String> {
+        let args = vec!["last-pane".to_owned(), "-t".to_owned(), target];
+        let output = self.runner.run(&self.program, &args)?;
+        if output.success {
+            return Ok(output.stdout);
+        }
+
+        let message = tmux_command_failure_message(&output.stderr);
+        let error = if tmux_target_not_found(&message) {
+            MuxBackendOperationError::Stale(message)
+        } else {
+            MuxBackendOperationError::Failed(message)
+        };
+        Err(error.into())
+    }
+
     fn run_owned_allow_server_exit(&self, args: Vec<String>) -> Result<String> {
         let output = self.runner.run(&self.program, &args)?;
         if !output.success && tmux_server_exited(&output.stderr) {
@@ -111,7 +164,7 @@ impl<R: CommandRunner> TmuxBackend<R> {
             "list-panes",
             "-a",
             "-F",
-            "p\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            "p\x1f#{session_id}\x1f#{window_id}\x1f#{window_index}\x1f#{window_name}\x1f#{window_active}\x1f#{pane_active}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_pb_state}\x1f#{pane_pb_progress}\x1f#{pane_current_path}\x1f#{pane_current_command}",
         ])? else {
             return Ok(MuxSnapshot::default());
         };
@@ -119,7 +172,285 @@ impl<R: CommandRunner> TmuxBackend<R> {
         parse_tmux_snapshot(&sessions, &panes)
     }
 
+    fn execute_session_launch_plan(&mut self, plan: &MuxSessionLaunchPlan) -> Result<()> {
+        self.completion = None;
+        plan.validate()?;
+        if !supports_tmux_session_launch_plan(plan) {
+            return Err(MuxBackendOperationError::unsupported(
+                "tmux cannot preserve this recursive session launch plan's split ratios or shape",
+            )
+            .into());
+        }
+        let first_window = plan
+            .windows
+            .first()
+            .expect("tmux launch support requires at least one window");
+        let first_pane = first_tmux_launch_pane(&first_window.layout);
+        let initial =
+            self.create_tmux_launch_session(plan, first_window.name.as_deref(), first_pane)?;
+        let created_session_id = initial.session_id.clone();
+        let launch: Result<TmuxLaunchAllocation> = (|| {
+            self.restore_tmux_launch_session_environment(
+                &created_session_id,
+                &plan.environment,
+                first_pane,
+            )?;
+            self.set_tmux_launch_pane_title(&initial.target.pane_id, first_pane)?;
+            let initial_pane_ids = self.materialize_tmux_launch_layout(
+                &initial.target.pane_id,
+                &first_window.layout,
+                &plan.environment,
+            )?;
+            let mut windows = vec![TmuxLaunchWindow {
+                window_id: initial.target.window_id.clone(),
+                pane_ids: initial_pane_ids,
+            }];
+            for window in plan.windows.iter().skip(1) {
+                let pane = first_tmux_launch_pane(&window.layout);
+                let target = self.create_tmux_launch_window(
+                    &created_session_id,
+                    window.name.as_deref(),
+                    &plan.environment,
+                    pane,
+                )?;
+                self.set_tmux_launch_pane_title(&target.pane_id, pane)?;
+                let pane_ids = self.materialize_tmux_launch_layout(
+                    &target.pane_id,
+                    &window.layout,
+                    &plan.environment,
+                )?;
+                windows.push(TmuxLaunchWindow {
+                    window_id: target.window_id,
+                    pane_ids,
+                });
+            }
+            let allocation = TmuxLaunchAllocation {
+                session_id: created_session_id.clone(),
+                windows,
+            };
+            validate_tmux_launch_allocation(plan, &allocation)?;
+            let focused_window = allocation
+                .windows
+                .get(plan.focused_window)
+                .expect("tmux launch support requires a focused window");
+            self.run_owned(vec![
+                "select-window".to_owned(),
+                "-t".to_owned(),
+                focused_window.window_id.clone(),
+            ])?;
+            Ok(allocation)
+        })();
+
+        match launch {
+            Ok(allocation) => {
+                let allocated = MuxAllocatedResources {
+                    session_id: allocation.session_id,
+                    windows: allocation
+                        .windows
+                        .into_iter()
+                        .map(|window| MuxAllocatedWindow {
+                            window_id: window.window_id,
+                            pane_ids: window.pane_ids,
+                        })
+                        .collect(),
+                };
+                self.completion = Some(MuxBackendCommandCompletion {
+                    target: Some(MuxEventTarget::session(allocated.session_id.clone())),
+                    allocated: Some(allocated),
+                });
+                Ok(())
+            }
+            Err(error) => match self.run_owned_allow_server_exit(vec![
+                "kill-session".to_owned(),
+                "-t".to_owned(),
+                created_session_id,
+            ]) {
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "also failed to remove partial tmux session {:?}: {cleanup}",
+                    plan.session_id
+                ))),
+            },
+        }
+    }
+
+    fn create_tmux_launch_session(
+        &self,
+        plan: &MuxSessionLaunchPlan,
+        window_name: Option<&str>,
+        pane: &MuxPaneLaunch,
+    ) -> Result<TmuxLaunchSessionTarget> {
+        let mut args = vec![
+            "new-session".to_owned(),
+            "-d".to_owned(),
+            "-P".to_owned(),
+            "-F".to_owned(),
+            format!(
+                "#{{session_id}}{TMUX_FIELD_SEPARATOR}#{{window_id}}{TMUX_FIELD_SEPARATOR}#{{pane_id}}"
+            ),
+            "-s".to_owned(),
+            plan.session_id.clone(),
+        ];
+        if let Some(window_name) = window_name {
+            args.extend(["-n".to_owned(), window_name.to_owned()]);
+        }
+        append_tmux_launch_pane_options(&mut args, &plan.environment, pane);
+        append_tmux_launch_pane_command(&mut args, pane);
+        let output = self.run_owned(args)?;
+        match parse_tmux_launch_session_target(&output) {
+            Ok(target) => Ok(target),
+            Err(error) => match self.run_owned_allow_server_exit(vec![
+                "kill-session".to_owned(),
+                "-t".to_owned(),
+                plan.session_id.clone(),
+            ]) {
+                Ok(_) => Err(error),
+                Err(cleanup) => Err(error.context(format!(
+                    "also failed to remove tmux session {:?} after losing its allocated identity: {cleanup}",
+                    plan.session_id
+                ))),
+            },
+        }
+    }
+
+    /// `new-session -e` writes into the session environment, while a launch pane's values are
+    /// pane-local. Restore the session baseline after its root process has started so later panes
+    /// cannot inherit root-only values.
+    fn restore_tmux_launch_session_environment(
+        &self,
+        session_id: &str,
+        session_environment: &BTreeMap<String, String>,
+        root_pane: &MuxPaneLaunch,
+    ) -> Result<()> {
+        for (name, value) in session_environment {
+            if root_pane
+                .environment
+                .get(name)
+                .is_some_and(|root_value| root_value != value)
+            {
+                self.run_owned(vec![
+                    "set-environment".to_owned(),
+                    "-t".to_owned(),
+                    session_id.to_owned(),
+                    name.clone(),
+                    value.clone(),
+                ])?;
+            }
+        }
+        for name in root_pane.environment.keys() {
+            if !session_environment.contains_key(name) {
+                self.run_owned(vec![
+                    "set-environment".to_owned(),
+                    "-u".to_owned(),
+                    "-t".to_owned(),
+                    session_id.to_owned(),
+                    name.clone(),
+                ])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_tmux_launch_window(
+        &self,
+        session_id: &str,
+        window_name: Option<&str>,
+        session_environment: &BTreeMap<String, String>,
+        pane: &MuxPaneLaunch,
+    ) -> Result<TmuxLaunchTarget> {
+        let mut args = vec![
+            "new-window".to_owned(),
+            "-d".to_owned(),
+            "-P".to_owned(),
+            "-F".to_owned(),
+            format!("#{{window_id}}{TMUX_FIELD_SEPARATOR}#{{pane_id}}"),
+            "-t".to_owned(),
+            session_id.to_owned(),
+        ];
+        if let Some(window_name) = window_name {
+            args.extend(["-n".to_owned(), window_name.to_owned()]);
+        }
+        append_tmux_launch_pane_options(&mut args, session_environment, pane);
+        append_tmux_launch_pane_command(&mut args, pane);
+        parse_tmux_launch_target(&self.run_owned(args)?)
+    }
+
+    fn materialize_tmux_launch_layout(
+        &self,
+        root_pane_id: &str,
+        layout: &MuxPaneLaunchPlan,
+        session_environment: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>> {
+        match layout {
+            MuxPaneLaunchPlan::Pane(_) => Ok(vec![root_pane_id.to_owned()]),
+            MuxPaneLaunchPlan::Split(split) => {
+                let second_pane = self.create_tmux_launch_split(
+                    root_pane_id,
+                    split.direction,
+                    split.ratio_millis,
+                    session_environment,
+                    first_tmux_launch_pane(&split.second),
+                )?;
+                let mut pane_ids = self.materialize_tmux_launch_layout(
+                    root_pane_id,
+                    &split.first,
+                    session_environment,
+                )?;
+                pane_ids.extend(self.materialize_tmux_launch_layout(
+                    &second_pane,
+                    &split.second,
+                    session_environment,
+                )?);
+                Ok(pane_ids)
+            }
+        }
+    }
+
+    fn create_tmux_launch_split(
+        &self,
+        pane_id: &str,
+        direction: MuxSplitDirection,
+        ratio_millis: u16,
+        session_environment: &BTreeMap<String, String>,
+        pane: &MuxPaneLaunch,
+    ) -> Result<String> {
+        let flag = match direction {
+            MuxSplitDirection::Right => "-h",
+            MuxSplitDirection::Down => "-v",
+        };
+        let mut args = vec![
+            "split-window".to_owned(),
+            flag.to_owned(),
+            "-P".to_owned(),
+            "-F".to_owned(),
+            "#{pane_id}".to_owned(),
+            "-t".to_owned(),
+            pane_id.to_owned(),
+            "-p".to_owned(),
+            ((1000 - ratio_millis) / 10).to_string(),
+        ];
+        append_tmux_launch_pane_options(&mut args, session_environment, pane);
+        append_tmux_launch_pane_command(&mut args, pane);
+        let pane_id = parse_tmux_launch_pane_id(&self.run_owned(args)?)?;
+        self.set_tmux_launch_pane_title(&pane_id, pane)?;
+        Ok(pane_id)
+    }
+
+    fn set_tmux_launch_pane_title(&self, pane_id: &str, pane: &MuxPaneLaunch) -> Result<()> {
+        if let Some(title) = &pane.title {
+            self.run_owned(vec![
+                "select-pane".to_owned(),
+                "-t".to_owned(),
+                pane_id.to_owned(),
+                "-T".to_owned(),
+                title.clone(),
+            ])?;
+        }
+        Ok(())
+    }
+
     pub fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        self.completion = None;
         match command {
             MuxCommand::ActivateWindow {
                 session_id: _,
@@ -127,6 +458,7 @@ impl<R: CommandRunner> TmuxBackend<R> {
             } => {
                 self.run_owned(vec!["select-window".into(), "-t".into(), window_id])?;
             }
+            MuxCommand::CreateSession { plan } => self.execute_session_launch_plan(&plan)?,
             MuxCommand::CreateProjectSession { session_id, cwd }
             | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
                 self.run_disowned_owned(vec![
@@ -272,6 +604,12 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 );
                 self.run_owned(vec!["select-pane".into(), "-t".into(), target])?;
             }
+            MuxCommand::SelectLastPane {
+                session_id,
+                window_id,
+            } => {
+                self.run_last_pane(window_id.unwrap_or(session_id))?;
+            }
             MuxCommand::KillPane {
                 session_id,
                 pane_id,
@@ -285,6 +623,13 @@ impl<R: CommandRunner> TmuxBackend<R> {
                     "-t".into(),
                     pane_id.unwrap_or(session_id),
                 ])?;
+            }
+            MuxCommand::ResizePane {
+                session_id,
+                pane_id,
+                adjustment,
+            } => {
+                self.run_owned(tmux_resize_args(pane_id.unwrap_or(session_id), adjustment)?)?;
             }
             MuxCommand::TogglePaneZoom {
                 session_id,
@@ -300,6 +645,219 @@ impl<R: CommandRunner> TmuxBackend<R> {
         }
         Ok(())
     }
+
+    pub fn take_authoritative_completion(&mut self) -> Option<MuxBackendCommandCompletion> {
+        self.completion.take()
+    }
+}
+
+fn append_tmux_launch_pane_options(
+    args: &mut Vec<String>,
+    session_environment: &BTreeMap<String, String>,
+    pane: &MuxPaneLaunch,
+) {
+    if !pane.cwd.is_empty() {
+        args.extend(["-c".to_owned(), pane.cwd.clone()]);
+    }
+    for (name, value) in pane.effective_environment(session_environment) {
+        args.extend(["-e".to_owned(), format!("{name}={value}")]);
+    }
+}
+
+fn append_tmux_launch_pane_command(args: &mut Vec<String>, pane: &MuxPaneLaunch) {
+    match (&pane.command, &pane.argv) {
+        (Some(command), None) => args.push(command.clone()),
+        (None, Some(argv)) => args.push(tmux_shell_command(argv)),
+        (None, None) => {}
+        (Some(_), Some(_)) => unreachable!("validated launch panes cannot have command and argv"),
+    }
+}
+
+fn first_tmux_launch_pane(layout: &MuxPaneLaunchPlan) -> &MuxPaneLaunch {
+    match layout {
+        MuxPaneLaunchPlan::Pane(pane) => pane,
+        MuxPaneLaunchPlan::Split(split) => first_tmux_launch_pane(&split.first),
+    }
+}
+
+fn tmux_shell_command(argv: &[String]) -> String {
+    let mut command = String::from("exec");
+    for argument in argv {
+        command.push(' ');
+        command.push('\'');
+        let mut segments = argument.split('\'');
+        if let Some(first) = segments.next() {
+            command.push_str(first);
+        }
+        for segment in segments {
+            command.push_str("'\"'\"'");
+            command.push_str(segment);
+        }
+        command.push('\'');
+    }
+    command
+}
+
+fn tmux_resize_args(target: String, adjustment: MuxPaneResize) -> Result<Vec<String>> {
+    if !adjustment.is_valid() {
+        return Err(MuxBackendOperationError::Failed(
+            "tmux pane resize requires every supplied dimension to be positive".to_owned(),
+        )
+        .into());
+    }
+    let mut args = vec!["resize-pane".to_owned()];
+    match adjustment {
+        MuxPaneResize::Directional { direction, cells } => {
+            let flag = match direction {
+                MuxDirection::Left => "-L",
+                MuxDirection::Down => "-D",
+                MuxDirection::Up => "-U",
+                MuxDirection::Right => "-R",
+            };
+            args.extend([flag.to_owned(), cells.to_string()]);
+        }
+        MuxPaneResize::Absolute {
+            columns: Some(columns),
+            rows: Some(rows),
+        } => args.extend([
+            "-x".to_owned(),
+            columns.to_string(),
+            "-y".to_owned(),
+            rows.to_string(),
+        ]),
+        MuxPaneResize::Absolute {
+            columns: Some(columns),
+            rows: None,
+        } => args.extend(["-x".to_owned(), columns.to_string()]),
+        MuxPaneResize::Absolute {
+            columns: None,
+            rows: Some(rows),
+        } => args.extend(["-y".to_owned(), rows.to_string()]),
+        MuxPaneResize::Absolute {
+            columns: None,
+            rows: None,
+        } => unreachable!("a valid absolute resize has a supplied dimension"),
+    }
+    args.extend(["-t".to_owned(), target]);
+    Ok(args)
+}
+
+fn parse_tmux_launch_session_target(output: &str) -> Result<TmuxLaunchSessionTarget> {
+    let fields = parse_tmux_launch_fields(output, 3, "session, window, and pane")?;
+    Ok(TmuxLaunchSessionTarget {
+        session_id: parse_tmux_launch_id(fields[0], '$', "session")?,
+        target: TmuxLaunchTarget {
+            window_id: parse_tmux_launch_id(fields[1], '@', "window")?,
+            pane_id: parse_tmux_launch_id(fields[2], '%', "pane")?,
+        },
+    })
+}
+
+fn parse_tmux_launch_target(output: &str) -> Result<TmuxLaunchTarget> {
+    let fields = parse_tmux_launch_fields(output, 2, "window and pane")?;
+    Ok(TmuxLaunchTarget {
+        window_id: parse_tmux_launch_id(fields[0], '@', "window")?,
+        pane_id: parse_tmux_launch_id(fields[1], '%', "pane")?,
+    })
+}
+
+fn parse_tmux_launch_pane_id(output: &str) -> Result<String> {
+    let fields = parse_tmux_launch_fields(output, 1, "pane")?;
+    parse_tmux_launch_id(fields[0], '%', "pane")
+}
+
+fn parse_tmux_launch_fields<'a>(
+    output: &'a str,
+    expected: usize,
+    identities: &str,
+) -> Result<Vec<&'a str>> {
+    let output = output.trim();
+    if output.is_empty() || output.contains(['\r', '\n']) {
+        anyhow::bail!("tmux did not report the {identities} created by launch");
+    }
+    let fields = output.split(TMUX_FIELD_SEPARATOR).collect::<Vec<_>>();
+    if fields.len() != expected || fields.iter().any(|field| field.is_empty()) {
+        anyhow::bail!("tmux did not report the {identities} created by launch");
+    }
+    Ok(fields)
+}
+
+fn parse_tmux_launch_id(value: &str, prefix: char, kind: &str) -> Result<String> {
+    if !value.strip_prefix(prefix).is_some_and(|identity| {
+        !identity.is_empty() && identity.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        anyhow::bail!("tmux reported an invalid {kind} identity during launch");
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_tmux_launch_allocation(
+    plan: &MuxSessionLaunchPlan,
+    allocation: &TmuxLaunchAllocation,
+) -> Result<()> {
+    if allocation.session_id.is_empty() {
+        anyhow::bail!("tmux did not report the session allocated by launch");
+    }
+    if allocation.windows.len() != plan.windows.len() {
+        anyhow::bail!(
+            "tmux allocated {} windows for session {:?}, expected {}",
+            allocation.windows.len(),
+            plan.session_id,
+            plan.windows.len()
+        );
+    }
+    for (window_index, (window, expected)) in
+        allocation.windows.iter().zip(&plan.windows).enumerate()
+    {
+        if window.window_id.is_empty()
+            || allocation.windows[..window_index]
+                .iter()
+                .any(|previous| previous.window_id == window.window_id)
+        {
+            anyhow::bail!("tmux reported a non-unique window identity during launch");
+        }
+        let expected_panes = expected.layout.pane_count();
+        if window.pane_ids.len() != expected_panes {
+            anyhow::bail!(
+                "tmux allocated {} panes for window {:?}, expected {}",
+                window.pane_ids.len(),
+                window.window_id,
+                expected_panes
+            );
+        }
+        for (pane_index, pane_id) in window.pane_ids.iter().enumerate() {
+            if pane_id.is_empty()
+                || window.pane_ids[..pane_index].contains(pane_id)
+                || allocation.windows[..window_index]
+                    .iter()
+                    .any(|previous| previous.pane_ids.contains(pane_id))
+            {
+                anyhow::bail!("tmux reported a non-unique pane identity during launch");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn supports_tmux_session_launch_plan(plan: &MuxSessionLaunchPlan) -> bool {
+    !plan.windows.is_empty()
+        && plan.focused_window < plan.windows.len()
+        && plan
+            .windows
+            .iter()
+            .all(|window| supports_tmux_launch_layout(&window.layout))
+}
+
+fn supports_tmux_launch_layout(layout: &MuxPaneLaunchPlan) -> bool {
+    match layout {
+        MuxPaneLaunchPlan::Pane(_) => true,
+        MuxPaneLaunchPlan::Split(split) => {
+            (50..=950).contains(&split.ratio_millis)
+                && split.ratio_millis % 10 == 0
+                && supports_tmux_launch_layout(&split.first)
+                && supports_tmux_launch_layout(&split.second)
+        }
+    }
 }
 
 #[cfg(feature = "app")]
@@ -312,8 +870,46 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
         TmuxBackend::execute(self, command)
     }
 
+    fn execute_session_launch(
+        &mut self,
+        plan: MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<Result<()>> {
+        self.completion = None;
+        if plan.validate().is_err() || !supports_tmux_session_launch_plan(&plan) {
+            return BindingOperationOutcome::Unsupported;
+        }
+        BindingOperationOutcome::Supported(self.execute_session_launch_plan(&plan))
+    }
+
+    fn session_launch_capability(
+        &self,
+        plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        (plan.validate().is_ok() && supports_tmux_session_launch_plan(plan))
+            .then_some(())
+            .map_or(
+                BindingOperationOutcome::Unsupported,
+                BindingOperationOutcome::Supported,
+            )
+    }
+
+    fn take_authoritative_completion(&mut self) -> Option<MuxBackendCommandCompletion> {
+        TmuxBackend::take_authoritative_completion(self)
+    }
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
         tmux_capabilities(scope)
+    }
+
+    fn event_capabilities(&self) -> Vec<MuxEventCapability> {
+        self.runner.mux_event_capabilities()
+    }
+
+    fn start_event_stream(&mut self) {
+        self.runner.start_mux_event_stream(&self.program);
+    }
+
+    fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
+        self.runner.drain_mux_events(scope, maximum)
     }
 }
 
@@ -329,6 +925,8 @@ pub(crate) fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor 
             BindingOperation::MoveWindow,
             BindingOperation::SplitPane,
             BindingOperation::NavigatePane,
+            BindingOperation::LastPane,
+            BindingOperation::ResizePane,
             BindingOperation::ClosePane,
             BindingOperation::TogglePaneZoom,
             BindingOperation::CreateProjectSession,
@@ -341,6 +939,25 @@ pub(crate) fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor 
 
 fn tmux_server_exited(stderr: &str) -> bool {
     stderr.contains("no server running")
+}
+
+fn tmux_command_failure_message(stderr: &str) -> String {
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        "command failed".to_owned()
+    } else {
+        detail.to_owned()
+    }
+}
+
+fn tmux_target_not_found(message: &str) -> bool {
+    [
+        "can't find session:",
+        "can't find window:",
+        "can't find pane:",
+    ]
+    .into_iter()
+    .any(|prefix| message.starts_with(prefix))
 }
 
 fn tmux_fields(line: &str, fixed_fields_before_tail: usize) -> Vec<String> {
@@ -426,16 +1043,19 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
         let pane_pid = fields.next().and_then(|value| value.parse().ok());
         let cwd = fields.next().filter(|value| !value.is_empty());
         let process = fields.next().filter(|value| !value.is_empty());
+        let occupant_id = tmux_occupant_id(&id, pane_id.as_deref(), pane_pid);
         sessions.push(MuxSession {
             id: id.clone(),
             name: name.clone(),
             active: attached,
             anchor: MuxPaneAnchor {
                 session_id: id,
+                terminal_id: None,
                 pane_id,
                 pane_pid,
                 cwd,
                 process,
+                occupant_id,
             },
             active_window_id: None,
             windows: Vec::new(),
@@ -450,6 +1070,18 @@ fn parse_tmux_snapshot(sessions_output: &str, panes_output: &str) -> Result<MuxS
             .map(|session| session.id.clone()),
         sessions,
     })
+}
+
+/// A pane PID is the strongest occupant identity tmux reports. Pane IDs identify the terminal
+/// across window moves, while cwd and foreground-command changes describe the same occupant.
+fn tmux_occupant_id(
+    session_id: &str,
+    pane_id: Option<&str>,
+    pane_pid: Option<u32>,
+) -> Option<String> {
+    let pane_id = pane_id?;
+    let pane_pid = pane_pid?;
+    Some(format!("tmux:{session_id}:{pane_id}:pid={pane_pid}"))
 }
 
 /// tmux reports `hidden` for a pane with no progress, and an empty state for versions that
@@ -478,31 +1110,59 @@ fn furthest_along(
 
 fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<()> {
     for line in panes_output.lines().filter(|line| !line.trim().is_empty()) {
-        let mut fields = tmux_fields(line, 9).into_iter();
-        let Some(session_id) = fields.next().filter(|value| !value.is_empty()) else {
+        let mut fields = tmux_fields(line, 10);
+        if fields.len() == 1 && line.contains('_') {
+            fields = underscore_joined_tmux_fields(line, 10);
+        }
+        if fields.len() < 9 {
+            continue;
+        }
+        let Some(session_id) = (!fields[0].is_empty()).then(|| fields[0].clone()) else {
             continue;
         };
-        let Some(window_id) = fields.next().filter(|value| !value.is_empty()) else {
+        let Some(window_id) = (!fields[1].is_empty()).then(|| fields[1].clone()) else {
             continue;
         };
-        let Some(window_index) = fields.next().and_then(|value| value.parse().ok()) else {
+        let Some(window_index) = fields[2].parse().ok() else {
             continue;
         };
-        let Some(window_name) = fields.next() else {
-            continue;
+        let window_name = fields[3].clone();
+        let window_active = fields[4] != "0";
+        let pane_active = fields[5] != "0";
+        let pane_id = (!fields[6].is_empty()).then(|| fields[6].clone());
+        let (pane_pid, progress, cwd_index) = if fields.len() >= 12 {
+            (
+                fields[7].parse().ok(),
+                tmux_pane_progress(fields.get(8).cloned(), fields.get(9).cloned()),
+                10,
+            )
+        } else if fields.len() >= 11 {
+            (
+                None,
+                tmux_pane_progress(fields.get(7).cloned(), fields.get(8).cloned()),
+                9,
+            )
+        } else {
+            (None, None, 7)
         };
-        let window_active = fields.next().is_some_and(|value| value != "0");
-        let pane_active = fields.next().is_some_and(|value| value != "0");
-        let pane_id = fields.next().filter(|value| !value.is_empty());
-        let progress = tmux_pane_progress(fields.next(), fields.next());
-        let cwd = fields.next().filter(|value| !value.is_empty());
-        let process = fields.next().filter(|value| !value.is_empty());
-
+        let cwd = fields
+            .get(cwd_index)
+            .filter(|value| !value.is_empty())
+            .cloned();
+        let process = fields
+            .get(cwd_index + 1)
+            .filter(|value| !value.is_empty())
+            .cloned();
         let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) else {
             continue;
         };
         if window_active {
-            session.active_window_id = Some(window_id.to_owned());
+            session.active_window_id = Some(window_id.clone());
+        }
+        if session.anchor.pane_id.as_deref() == pane_id.as_deref() && fields.len() >= 12 {
+            session.anchor.pane_pid = pane_pid;
+            session.anchor.occupant_id =
+                tmux_occupant_id(&session_id, session.anchor.pane_id.as_deref(), pane_pid);
         }
         if let Some(window) = session
             .windows
@@ -513,9 +1173,11 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
                 window.anchor = MuxPaneAnchor {
                     session_id: session_id.clone(),
                     pane_id: pane_id.clone(),
-                    pane_pid: None,
+                    terminal_id: None,
+                    pane_pid,
                     cwd: cwd.clone(),
                     process: process.clone(),
+                    occupant_id: tmux_occupant_id(&session_id, pane_id.as_deref(), pane_pid),
                 };
             }
             // A window's bar stands for every pane in it, so the busiest pane wins.
@@ -523,9 +1185,11 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
             continue;
         }
         let anchor = MuxPaneAnchor {
+            occupant_id: tmux_occupant_id(&session_id, pane_id.as_deref(), pane_pid),
             session_id,
+            terminal_id: None,
             pane_id,
-            pane_pid: None,
+            pane_pid,
             cwd,
             process,
         };
@@ -550,10 +1214,20 @@ fn add_tmux_windows(sessions: &mut [MuxSession], panes_output: &str) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+    use std::{
+        cell::RefCell,
+        collections::{BTreeMap, VecDeque},
+        rc::Rc,
+    };
 
     use super::*;
-    use crate::process::{CommandOutput, CommandRunner};
+    use crate::{
+        command::{
+            MuxPaneLaunch, MuxPaneLaunchPlan, MuxPaneResize, MuxSessionLaunchPlan, MuxSplitLaunch,
+            MuxWindowLaunchPlan,
+        },
+        process::{CommandOutput, CommandRunner},
+    };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedCall {
@@ -658,6 +1332,505 @@ mod tests {
     }
 
     #[test]
+    fn tmux_launch_options_inherit_session_environment_and_prefer_pane_overrides() {
+        let session_environment = BTreeMap::from([
+            ("INHERITED".to_owned(), "session".to_owned()),
+            ("OVERRIDE".to_owned(), "session".to_owned()),
+        ]);
+        let pane = MuxPaneLaunch {
+            cwd: "/repo".to_owned(),
+            command: None,
+            argv: None,
+            environment: BTreeMap::from([
+                ("OVERRIDE".to_owned(), "pane".to_owned()),
+                ("PANE_ONLY".to_owned(), "pane".to_owned()),
+            ]),
+            title: None,
+        };
+        let mut args = Vec::new();
+
+        append_tmux_launch_pane_options(&mut args, &session_environment, &pane);
+
+        assert_eq!(
+            args.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "-c",
+                "/repo",
+                "-e",
+                "INHERITED=session",
+                "-e",
+                "OVERRIDE=pane",
+                "-e",
+                "PANE_ONLY=pane",
+            ]
+        );
+        assert_eq!(session_environment["OVERRIDE"], "session");
+        assert_eq!(pane.environment["OVERRIDE"], "pane");
+    }
+
+    #[test]
+    fn tmux_restores_session_environment_after_root_pane_overrides() {
+        let runner = RecordingRunner::default();
+        let calls = runner.calls.clone();
+        let backend = TmuxBackend::with_runner("tmux", runner);
+        let session_environment = BTreeMap::from([
+            ("OVERRIDDEN".to_owned(), "session".to_owned()),
+            ("SAME".to_owned(), "shared".to_owned()),
+            ("SESSION_ONLY".to_owned(), "shared".to_owned()),
+        ]);
+        let root_pane = MuxPaneLaunch {
+            cwd: "/repo".to_owned(),
+            command: None,
+            argv: None,
+            environment: BTreeMap::from([
+                ("OVERRIDDEN".to_owned(), "root".to_owned()),
+                ("ROOT_ONLY".to_owned(), "root".to_owned()),
+                ("SAME".to_owned(), "shared".to_owned()),
+            ]),
+            title: None,
+        };
+
+        backend
+            .restore_tmux_launch_session_environment("$1", &session_environment, &root_pane)
+            .unwrap();
+
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                RecordedCall::foreground([
+                    "tmux",
+                    "set-environment",
+                    "-t",
+                    "$1",
+                    "OVERRIDDEN",
+                    "session",
+                ]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "set-environment",
+                    "-u",
+                    "-t",
+                    "$1",
+                    "ROOT_ONLY",
+                ]),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
+    fn tmux_session_launch_preserves_recursive_process_and_window_intent() {
+        let runner = RecordingRunner {
+            stdout: Rc::new(RefCell::new(VecDeque::from([
+                "$1\x1f@1\x1f%1\n".to_owned(),
+                String::new(),
+                "%2\n".to_owned(),
+                String::new(),
+                "%3\n".to_owned(),
+                String::new(),
+                "@2\x1f%4\n".to_owned(),
+                String::new(),
+                String::new(),
+            ]))),
+            ..Default::default()
+        };
+        let calls = runner.calls.clone();
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+        let pane = |cwd: &str, argv: Option<&[&str]>, title: Option<&str>| MuxPaneLaunch {
+            cwd: cwd.to_owned(),
+            command: None,
+            argv: argv.map(|argv| argv.iter().map(|argument| (*argument).to_owned()).collect()),
+            environment: BTreeMap::from([("SESSION".to_owned(), "1".to_owned())]),
+            title: title.map(str::to_owned),
+        };
+        let plan = MuxSessionLaunchPlan {
+            session_id: "review".to_owned(),
+            focus: true,
+            default_cwd: "/repo".to_owned(),
+            environment: BTreeMap::from([("SESSION".to_owned(), "1".to_owned())]),
+            windows: vec![
+                MuxWindowLaunchPlan {
+                    name: Some("code".to_owned()),
+                    focus: false,
+                    layout: MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                        direction: MuxSplitDirection::Right,
+                        ratio_millis: 600,
+                        first: Box::new(MuxPaneLaunchPlan::Pane(pane(
+                            "/repo/docs",
+                            Some(&["nvim", "README.md"]),
+                            Some("docs"),
+                        ))),
+                        second: Box::new(MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                            direction: MuxSplitDirection::Down,
+                            ratio_millis: 500,
+                            first: Box::new(MuxPaneLaunchPlan::Pane(pane(
+                                "/repo/tests",
+                                None,
+                                Some("tests"),
+                            ))),
+                            second: Box::new(MuxPaneLaunchPlan::Pane(pane(
+                                "/repo",
+                                Some(&["bash", "-lc", "echo hi"]),
+                                Some("shell"),
+                            ))),
+                        })),
+                    }),
+                },
+                MuxWindowLaunchPlan {
+                    name: Some("logs".to_owned()),
+                    focus: true,
+                    layout: MuxPaneLaunchPlan::Pane(pane(
+                        "/repo/logs",
+                        Some(&["tail", "-f", "app.log"]),
+                        Some("logs"),
+                    )),
+                },
+            ],
+            focused_window: 1,
+        };
+        let mut nonrepresentable = plan.clone();
+        let MuxPaneLaunchPlan::Split(split) = &mut nonrepresentable.windows[0].layout else {
+            unreachable!("test plan starts with a split");
+        };
+        split.ratio_millis = 605;
+        assert!(!supports_tmux_session_launch_plan(&nonrepresentable));
+
+        backend.execute(MuxCommand::CreateSession { plan }).unwrap();
+
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                RecordedCall::foreground([
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{session_id}\x1f#{window_id}\x1f#{pane_id}",
+                    "-s",
+                    "review",
+                    "-n",
+                    "code",
+                    "-c",
+                    "/repo/docs",
+                    "-e",
+                    "SESSION=1",
+                    "exec 'nvim' 'README.md'",
+                ]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "%1", "-T", "docs"]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "split-window",
+                    "-h",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    "%1",
+                    "-p",
+                    "40",
+                    "-c",
+                    "/repo/tests",
+                    "-e",
+                    "SESSION=1",
+                ]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "%2", "-T", "tests"]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "split-window",
+                    "-v",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    "%2",
+                    "-p",
+                    "50",
+                    "-c",
+                    "/repo",
+                    "-e",
+                    "SESSION=1",
+                    "exec 'bash' '-lc' 'echo hi'",
+                ]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "%3", "-T", "shell"]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "new-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{window_id}\x1f#{pane_id}",
+                    "-t",
+                    "$1",
+                    "-n",
+                    "logs",
+                    "-c",
+                    "/repo/logs",
+                    "-e",
+                    "SESSION=1",
+                    "exec 'tail' '-f' 'app.log'",
+                ]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "%4", "-T", "logs"]),
+                RecordedCall::foreground(["tmux", "select-window", "-t", "@2"]),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn tmux_recursive_launch_reports_transaction_authoritative_dfs_ids() {
+        let runner = RecordingRunner {
+            stdout: Rc::new(RefCell::new(VecDeque::from([
+                "$7\x1f@10\x1f%1\n".to_owned(),
+                "%2\n".to_owned(),
+                "%3\n".to_owned(),
+                "@11\x1f%4\n".to_owned(),
+                String::new(),
+            ]))),
+            ..Default::default()
+        };
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+        let pane = |cwd: &str| MuxPaneLaunch {
+            cwd: cwd.to_owned(),
+            command: None,
+            argv: None,
+            environment: BTreeMap::new(),
+            title: None,
+        };
+        let plan = MuxSessionLaunchPlan {
+            session_id: "review".to_owned(),
+            focus: true,
+            default_cwd: "/repo".to_owned(),
+            environment: BTreeMap::new(),
+            windows: vec![
+                MuxWindowLaunchPlan {
+                    name: Some("code".to_owned()),
+                    focus: false,
+                    layout: MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                        direction: MuxSplitDirection::Right,
+                        ratio_millis: 600,
+                        first: Box::new(MuxPaneLaunchPlan::Pane(pane("/repo/first"))),
+                        second: Box::new(MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                            direction: MuxSplitDirection::Down,
+                            ratio_millis: 500,
+                            first: Box::new(MuxPaneLaunchPlan::Pane(pane("/repo/second"))),
+                            second: Box::new(MuxPaneLaunchPlan::Pane(pane("/repo/third"))),
+                        })),
+                    }),
+                },
+                MuxWindowLaunchPlan {
+                    name: Some("logs".to_owned()),
+                    focus: true,
+                    layout: MuxPaneLaunchPlan::Pane(pane("/repo/logs")),
+                },
+            ],
+            focused_window: 1,
+        };
+
+        backend
+            .execute(MuxCommand::CreateSession { plan })
+            .expect("remote daemon tmux launch must retain exact allocated IDs");
+        let completion = backend
+            .take_authoritative_completion()
+            .expect("successful tmux launch must retain its allocated IDs");
+        assert_eq!(
+            completion.target,
+            Some(crate::backend::MuxEventTarget::session("$7"))
+        );
+        assert_eq!(
+            completion.allocated,
+            Some(MuxAllocatedResources {
+                session_id: "$7".to_owned(),
+                windows: vec![
+                    MuxAllocatedWindow {
+                        window_id: "@10".to_owned(),
+                        pane_ids: vec!["%1".to_owned(), "%2".to_owned(), "%3".to_owned()],
+                    },
+                    MuxAllocatedWindow {
+                        window_id: "@11".to_owned(),
+                        pane_ids: vec!["%4".to_owned()],
+                    },
+                ],
+            })
+        );
+        assert!(
+            backend.take_authoritative_completion().is_none(),
+            "completion facts are consumed with one command"
+        );
+    }
+
+    #[test]
+    fn tmux_recursive_launch_rolls_back_when_reported_pane_ids_are_not_unique() {
+        let runner = RecordingRunner {
+            stdout: Rc::new(RefCell::new(VecDeque::from([
+                "$1\x1f@1\x1f%1\n".to_owned(),
+                "%1\n".to_owned(),
+            ]))),
+            ..Default::default()
+        };
+        let calls = runner.calls.clone();
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+        let pane = MuxPaneLaunch {
+            cwd: "/repo".to_owned(),
+            command: None,
+            argv: None,
+            environment: BTreeMap::new(),
+            title: None,
+        };
+        let plan = MuxSessionLaunchPlan {
+            session_id: "review".to_owned(),
+            focus: false,
+            default_cwd: "/repo".to_owned(),
+            environment: BTreeMap::new(),
+            windows: vec![MuxWindowLaunchPlan {
+                name: None,
+                focus: true,
+                layout: MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                    direction: MuxSplitDirection::Right,
+                    ratio_millis: 500,
+                    first: Box::new(MuxPaneLaunchPlan::Pane(pane.clone())),
+                    second: Box::new(MuxPaneLaunchPlan::Pane(pane)),
+                }),
+            }],
+            focused_window: 0,
+        };
+
+        let error = backend
+            .execute(MuxCommand::CreateSession { plan })
+            .expect_err("duplicate allocated pane IDs must fail the launch");
+
+        assert!(error.to_string().contains("non-unique pane identity"));
+        assert_eq!(
+            calls.borrow().last(),
+            Some(&RecordedCall::foreground([
+                "tmux",
+                "kill-session",
+                "-t",
+                "$1"
+            ]))
+        );
+        assert!(
+            backend.take_authoritative_completion().is_none(),
+            "a rolled-back transaction must not report allocated resources"
+        );
+    }
+
+    #[test]
+    fn tmux_launch_identity_parser_requires_canonical_backend_ids() {
+        let parsed = parse_tmux_launch_session_target("$7\x1f@10\x1f%3\n")
+            .expect("tmux numeric IDs are authoritative");
+        assert_eq!(parsed.session_id, "$7");
+        assert_eq!(parsed.target.window_id, "@10");
+        assert_eq!(parsed.target.pane_id, "%3");
+        assert!(parse_tmux_launch_session_target("$session\x1f@10\x1f%3").is_err());
+        assert!(parse_tmux_launch_session_target("$7\x1f@window\x1f%3").is_err());
+        assert!(parse_tmux_launch_session_target("$7\x1f@10\x1f%pane").is_err());
+    }
+
+    #[test]
+    fn tmux_launch_preserves_normative_commands_for_initial_new_and_split_panes() {
+        let runner = RecordingRunner {
+            stdout: Rc::new(RefCell::new(VecDeque::from([
+                "$1\x1f@1\x1f%1\n".to_owned(),
+                "%2\n".to_owned(),
+                "@2\x1f%3\n".to_owned(),
+            ]))),
+            ..Default::default()
+        };
+        let calls = runner.calls.clone();
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+        let root_command = "printf '%s' \"$ROOT\"";
+        let split_command = "printf '%s' \"$SPLIT\"";
+        let new_window_command = "printf '%s' \"$NEW\"";
+        let pane = |cwd: &str, command: &str| MuxPaneLaunch {
+            cwd: cwd.to_owned(),
+            command: Some(command.to_owned()),
+            argv: None,
+            environment: BTreeMap::new(),
+            title: None,
+        };
+        let plan = MuxSessionLaunchPlan {
+            session_id: "commands".to_owned(),
+            focus: false,
+            default_cwd: "/repo".to_owned(),
+            environment: BTreeMap::new(),
+            windows: vec![
+                MuxWindowLaunchPlan {
+                    name: None,
+                    focus: false,
+                    layout: MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                        direction: MuxSplitDirection::Right,
+                        ratio_millis: 500,
+                        first: Box::new(MuxPaneLaunchPlan::Pane(pane("/repo/root", root_command))),
+                        second: Box::new(MuxPaneLaunchPlan::Pane(pane(
+                            "/repo/split",
+                            split_command,
+                        ))),
+                    }),
+                },
+                MuxWindowLaunchPlan {
+                    name: None,
+                    focus: true,
+                    layout: MuxPaneLaunchPlan::Pane(pane("/repo/new", new_window_command)),
+                },
+            ],
+            focused_window: 1,
+        };
+
+        backend.execute(MuxCommand::CreateSession { plan }).unwrap();
+
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                RecordedCall::foreground([
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{session_id}\x1f#{window_id}\x1f#{pane_id}",
+                    "-s",
+                    "commands",
+                    "-c",
+                    "/repo/root",
+                    root_command,
+                ]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "split-window",
+                    "-h",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    "%1",
+                    "-p",
+                    "50",
+                    "-c",
+                    "/repo/split",
+                    split_command,
+                ]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "new-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{window_id}\x1f#{pane_id}",
+                    "-t",
+                    "$1",
+                    "-c",
+                    "/repo/new",
+                    new_window_command,
+                ]),
+                RecordedCall::foreground(["tmux", "select-window", "-t", "@2"]),
+            ]
+            .as_slice()
+        );
+    }
+
+    #[test]
     fn tmux_close_cleanup_tolerates_server_already_exited() {
         let runner = RecordingRunner {
             success: Rc::new(RefCell::new(VecDeque::from([false]))),
@@ -728,6 +1901,26 @@ mod tests {
                 session_id: "$1".to_owned(),
                 window_id: Some("@1".to_owned()),
             },
+            MuxCommand::SelectLastPane {
+                session_id: "$1".to_owned(),
+                window_id: Some("@1".to_owned()),
+            },
+            MuxCommand::ResizePane {
+                session_id: "$1".to_owned(),
+                pane_id: Some("%2".to_owned()),
+                adjustment: MuxPaneResize::Directional {
+                    direction: MuxDirection::Left,
+                    cells: 4,
+                },
+            },
+            MuxCommand::ResizePane {
+                session_id: "$1".to_owned(),
+                pane_id: Some("%2".to_owned()),
+                adjustment: MuxPaneResize::Absolute {
+                    columns: Some(120),
+                    rows: Some(40),
+                },
+            },
             MuxCommand::SplitPane {
                 session_id: "$1".to_owned(),
                 pane_id: Some("%2".to_owned()),
@@ -750,10 +1943,99 @@ mod tests {
                 RecordedCall::foreground(["tmux", "select-pane", "-t", "@1", "-L"]),
                 RecordedCall::foreground(["tmux", "select-pane", "-t", "@1.+"]),
                 RecordedCall::foreground(["tmux", "select-pane", "-t", "@1.-"]),
+                RecordedCall::foreground(["tmux", "last-pane", "-t", "@1"]),
+                RecordedCall::foreground(["tmux", "resize-pane", "-L", "4", "-t", "%2"]),
+                RecordedCall::foreground([
+                    "tmux",
+                    "resize-pane",
+                    "-x",
+                    "120",
+                    "-y",
+                    "40",
+                    "-t",
+                    "%2",
+                ]),
                 RecordedCall::foreground(["tmux", "split-window", "-h", "-t", "%2"]),
                 RecordedCall::foreground(["tmux", "resize-pane", "-Z", "-t", "%2"]),
             ]
             .as_slice()
+        );
+    }
+
+    #[test]
+    fn tmux_rejects_invalid_resize_before_running_a_command() {
+        let runner = RecordingRunner::default();
+        let calls = runner.calls.clone();
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+
+        let error = backend
+            .execute(MuxCommand::ResizePane {
+                session_id: "$1".to_owned(),
+                pane_id: Some("%2".to_owned()),
+                adjustment: MuxPaneResize::Absolute {
+                    columns: Some(0),
+                    rows: Some(24),
+                },
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(MuxBackendOperationError::Failed(message))
+                if message == "tmux pane resize requires every supplied dimension to be positive"
+        ));
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn tmux_select_last_pane_reports_missing_target_as_stale() {
+        let runner = RecordingRunner {
+            success: Rc::new(RefCell::new(VecDeque::from([false]))),
+            stderr: Rc::new(RefCell::new(VecDeque::from([
+                "can't find window: @2".to_owned()
+            ]))),
+            ..Default::default()
+        };
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+
+        let error = backend
+            .execute(MuxCommand::SelectLastPane {
+                session_id: "$1".to_owned(),
+                window_id: Some("@2".to_owned()),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Stale(
+                "can't find window: @2".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn tmux_select_last_pane_reports_other_execution_failures_as_failed() {
+        let runner = RecordingRunner {
+            success: Rc::new(RefCell::new(VecDeque::from([false]))),
+            stderr: Rc::new(RefCell::new(VecDeque::from([
+                "permission denied".to_owned()
+            ]))),
+            ..Default::default()
+        };
+        let mut backend = TmuxBackend::with_runner("tmux", runner);
+
+        let error = backend
+            .execute(MuxCommand::SelectLastPane {
+                session_id: "$1".to_owned(),
+                window_id: Some("@2".to_owned()),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Failed(
+                "permission denied".to_owned()
+            ))
         );
     }
 
@@ -894,10 +2176,42 @@ mod tests {
     }
 
     #[test]
-    fn tmux_snapshot_recovers_underscore_joined_rows() {
+    fn tmux_snapshot_replaces_anchor_pid_from_matching_pane_row() {
+        let snapshot = parse_tmux_snapshot(
+            "$1\x1fboo\x1f1\x1f1\x1f%3\x1f4242\x1f/repo\x1fzsh\n",
+            "$1\x1f@3\x1f0\x1fai\x1f1\x1f1\x1f%3\x1f5252\x1fnormal\x1f42\x1f/repo\x1fzsh\n",
+        )
+        .unwrap();
+
+        let anchor = &snapshot.sessions[0].anchor;
+        assert_eq!(anchor.pane_pid, Some(5252));
+        assert_eq!(anchor.occupant_id.as_deref(), Some("tmux:$1:%3:pid=5252"));
+    }
+
+    #[test]
+    fn tmux_snapshot_recovers_underscore_joined_rows_with_pane_metadata() {
+        let pane_line = "$2_@28_1_ai_1_1_%34_4242_normal_42_/Users/luan/src/agents_node";
+        assert_eq!(
+            underscore_joined_tmux_fields(pane_line, 10),
+            vec![
+                "$2".to_owned(),
+                "@28".to_owned(),
+                "1".to_owned(),
+                "ai".to_owned(),
+                "1".to_owned(),
+                "1".to_owned(),
+                "%34".to_owned(),
+                "4242".to_owned(),
+                "normal".to_owned(),
+                "42".to_owned(),
+                "/Users/luan/src/agents".to_owned(),
+                "node".to_owned(),
+            ]
+        );
+
         let snapshot = parse_tmux_snapshot(
             "$2_agents_0_3_%34_4242_/Users/luan/src/agents_node\n",
-            "$2_@28_1_ai_1_1_%34_normal_42_/Users/luan/src/agents_node\n",
+            &format!("{pane_line}\n"),
         )
         .unwrap();
 
@@ -905,6 +2219,7 @@ mod tests {
         assert_eq!(snapshot.sessions[0].id, "$2");
         assert_eq!(snapshot.sessions[0].name, "agents");
         assert_eq!(snapshot.sessions[0].anchor.pane_id.as_deref(), Some("%34"));
+        assert_eq!(snapshot.sessions[0].anchor.pane_pid, Some(4242));
         assert_eq!(
             snapshot.sessions[0].anchor.cwd.as_deref(),
             Some("/Users/luan/src/agents")
@@ -915,6 +2230,22 @@ mod tests {
             Some("@28")
         );
         assert_eq!(snapshot.sessions[0].windows[0].name, "ai");
+        assert_eq!(snapshot.sessions[0].windows[0].anchor.pane_pid, Some(4242));
+        assert_eq!(
+            snapshot.sessions[0].windows[0].progress,
+            Some(MuxWindowProgress {
+                state: "normal".to_owned(),
+                percent: Some(42),
+            })
+        );
+        assert_eq!(
+            snapshot.sessions[0].windows[0].anchor.cwd.as_deref(),
+            Some("/Users/luan/src/agents")
+        );
+        assert_eq!(
+            snapshot.sessions[0].windows[0].anchor.process.as_deref(),
+            Some("node")
+        );
     }
 
     #[test]

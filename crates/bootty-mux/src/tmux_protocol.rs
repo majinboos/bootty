@@ -122,7 +122,8 @@ pub enum TmuxOutputValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxOutputNotification {
     pub pane_id: usize,
-    pub data: String,
+    /// Encoded tmux control-mode output. This remains bytes because tmux may emit non-UTF-8.
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,17 +167,36 @@ pub enum TmuxControlNotification {
     SessionChanged(TmuxSessionChangedNotification),
     SessionsChanged,
     LayoutChange(TmuxLayoutChangeNotification),
-    WindowAdd { id: usize },
+    WindowAdd {
+        id: usize,
+    },
+    UnlinkedWindowAdd {
+        id: usize,
+    },
+    WindowClose {
+        id: usize,
+    },
+    UnlinkedWindowClose {
+        id: usize,
+    },
     WindowRenamed(TmuxIdNameNotification),
+    UnlinkedWindowRenamed(TmuxIdNameNotification),
     WindowPaneChanged(TmuxWindowPaneChangedNotification),
-    ClientDetached { client: String },
+    /// A tmux pane-mode transition (including copy-mode) changes UI state, not its process.
+    /// Consumers must confirm a new occupant through inventory or daemon lifecycle evidence.
+    PaneModeChanged {
+        pane_id: usize,
+    },
+    ClientDetached {
+        client: String,
+    },
     ClientSessionChanged(TmuxClientSessionChangedNotification),
     Exit,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct TmuxControlParser {
-    line: String,
+    line: Vec<u8>,
     block: Option<String>,
 }
 
@@ -251,21 +271,23 @@ impl TmuxControlParser {
         byte: u8,
     ) -> std::result::Result<Option<TmuxControlNotification>, TmuxParseError> {
         if byte != b'\n' {
-            self.line.push(byte as char);
+            self.line.push(byte);
             return Ok(None);
         }
 
-        let line = self.line.trim_end_matches('\r').to_owned();
-        self.line.clear();
+        let mut line = std::mem::take(&mut self.line);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
         self.parse_line(&line)
     }
 
-    pub fn put_str(
+    pub fn put_bytes(
         &mut self,
-        input: &str,
+        input: &[u8],
     ) -> std::result::Result<Vec<TmuxControlNotification>, TmuxParseError> {
         let mut notifications = Vec::new();
-        for byte in input.bytes() {
+        for &byte in input {
             if let Some(notification) = self.put(byte)? {
                 notifications.push(notification);
             }
@@ -273,10 +295,23 @@ impl TmuxControlParser {
         Ok(notifications)
     }
 
+    pub fn put_str(
+        &mut self,
+        input: &str,
+    ) -> std::result::Result<Vec<TmuxControlNotification>, TmuxParseError> {
+        self.put_bytes(input.as_bytes())
+    }
+
     fn parse_line(
         &mut self,
-        line: &str,
+        line: &[u8],
     ) -> std::result::Result<Option<TmuxControlNotification>, TmuxParseError> {
+        if self.block.is_none()
+            && let Some(notification) = parse_tmux_control_output(line)?
+        {
+            return Ok(Some(notification));
+        }
+        let line = std::str::from_utf8(line).map_err(|_| TmuxParseError::FormatError)?;
         if let Some(block) = &mut self.block {
             if parse_tmux_block_terminator(line, "%end").is_some() {
                 let payload = std::mem::take(block);
@@ -344,14 +379,19 @@ impl TmuxViewerState {
             }
             TmuxControlNotification::Output(output) => {
                 if let Some(pane) = self.panes.get_mut(&output.pane_id) {
-                    pane.output.push_str(&output.data);
+                    pane.output.push_str(&String::from_utf8_lossy(&output.data));
                 }
                 Vec::new()
             }
             TmuxControlNotification::SessionsChanged
             | TmuxControlNotification::BlockError(_)
+            | TmuxControlNotification::UnlinkedWindowAdd { .. }
+            | TmuxControlNotification::WindowClose { .. }
+            | TmuxControlNotification::UnlinkedWindowClose { .. }
             | TmuxControlNotification::WindowRenamed(_)
+            | TmuxControlNotification::UnlinkedWindowRenamed(_)
             | TmuxControlNotification::WindowPaneChanged(_)
+            | TmuxControlNotification::PaneModeChanged { .. }
             | TmuxControlNotification::ClientDetached { .. }
             | TmuxControlNotification::ClientSessionChanged(_) => Vec::new(),
         }
@@ -677,6 +717,27 @@ fn parse_tmux_block_terminator(line: &str, keyword: &str) -> Option<()> {
     parts.next().is_none().then_some(())
 }
 
+fn parse_tmux_control_output(
+    line: &[u8],
+) -> std::result::Result<Option<TmuxControlNotification>, TmuxParseError> {
+    const PREFIX: &[u8] = b"%output ";
+    if !line.starts_with(PREFIX) {
+        return Ok(None);
+    }
+    let rest = &line[PREFIX.len()..];
+    let separator = rest
+        .iter()
+        .position(|byte| *byte == b' ')
+        .ok_or(TmuxParseError::FormatError)?;
+    let pane = std::str::from_utf8(&rest[..separator]).map_err(|_| TmuxParseError::FormatError)?;
+    Ok(Some(TmuxControlNotification::Output(
+        TmuxOutputNotification {
+            pane_id: parse_prefixed_tmux_number(pane, '%')?,
+            data: rest[separator + 1..].to_vec(),
+        },
+    )))
+}
+
 fn parse_tmux_control_notification(
     line: &str,
 ) -> std::result::Result<TmuxControlNotification, TmuxParseError> {
@@ -693,7 +754,7 @@ fn parse_tmux_control_notification(
             let (pane, data) = split_tmux_control_rest(rest)?;
             Ok(TmuxControlNotification::Output(TmuxOutputNotification {
                 pane_id: parse_prefixed_tmux_number(pane, '%')?,
-                data: data.to_owned(),
+                data: data.as_bytes().to_vec(),
             }))
         }
         "%session-changed" => {
@@ -719,9 +780,27 @@ fn parse_tmux_control_notification(
         "%window-add" => Ok(TmuxControlNotification::WindowAdd {
             id: parse_prefixed_tmux_number(rest, '@')?,
         }),
+        "%unlinked-window-add" => Ok(TmuxControlNotification::UnlinkedWindowAdd {
+            id: parse_prefixed_tmux_number(rest, '@')?,
+        }),
+        "%window-close" => Ok(TmuxControlNotification::WindowClose {
+            id: parse_prefixed_tmux_number(rest, '@')?,
+        }),
+        "%unlinked-window-close" => Ok(TmuxControlNotification::UnlinkedWindowClose {
+            id: parse_prefixed_tmux_number(rest, '@')?,
+        }),
         "%window-renamed" => {
             let (id, name) = split_tmux_control_rest(rest)?;
             Ok(TmuxControlNotification::WindowRenamed(
+                TmuxIdNameNotification {
+                    id: parse_prefixed_tmux_number(id, '@')?,
+                    name: name.to_owned(),
+                },
+            ))
+        }
+        "%unlinked-window-renamed" => {
+            let (id, name) = split_tmux_control_rest(rest)?;
+            Ok(TmuxControlNotification::UnlinkedWindowRenamed(
                 TmuxIdNameNotification {
                     id: parse_prefixed_tmux_number(id, '@')?,
                     name: name.to_owned(),
@@ -737,6 +816,9 @@ fn parse_tmux_control_notification(
                 },
             ))
         }
+        "%pane-mode-changed" => Ok(TmuxControlNotification::PaneModeChanged {
+            pane_id: parse_prefixed_tmux_number(rest, '%')?,
+        }),
         "%client-detached" => Ok(TmuxControlNotification::ClientDetached {
             client: rest.to_owned(),
         }),
@@ -1397,8 +1479,27 @@ mod tests {
             feed("%output %42 foo bar baz\n"),
             vec![TmuxControlNotification::Output(TmuxOutputNotification {
                 pane_id: 42,
-                data: "foo bar baz".to_owned(),
+                data: b"foo bar baz".to_vec(),
             })]
+        );
+        let mut raw_output = TmuxControlParser::default();
+        assert_eq!(
+            raw_output.put_bytes(b"%output %42 \xff\xc3\xa9\xf0\x9f\x98\x80\n"),
+            Ok(vec![TmuxControlNotification::Output(
+                TmuxOutputNotification {
+                    pane_id: 42,
+                    data: b"\xff\xc3\xa9\xf0\x9f\x98\x80".to_vec(),
+                }
+            )])
+        );
+        let mut forward_compatible = TmuxControlParser::default();
+        assert_eq!(
+            forward_compatible.put_bytes(b"%future-notification @42\n"),
+            Err(TmuxParseError::FormatError)
+        );
+        assert_eq!(
+            forward_compatible.put_bytes(b"%unlinked-window-add @42\n"),
+            Ok(vec![TmuxControlNotification::UnlinkedWindowAdd { id: 42 }])
         );
         assert_eq!(
             feed("%session-changed $42 foo\n"),
@@ -1431,8 +1532,29 @@ mod tests {
             vec![TmuxControlNotification::WindowAdd { id: 14 }]
         );
         assert_eq!(
+            feed("%unlinked-window-add @14\n"),
+            vec![TmuxControlNotification::UnlinkedWindowAdd { id: 14 }]
+        );
+        assert_eq!(
+            feed("%window-close @14\n"),
+            vec![TmuxControlNotification::WindowClose { id: 14 }]
+        );
+        assert_eq!(
+            feed("%unlinked-window-close @14\n"),
+            vec![TmuxControlNotification::UnlinkedWindowClose { id: 14 }]
+        );
+        assert_eq!(
             feed("%window-renamed @42 bar\n"),
             vec![TmuxControlNotification::WindowRenamed(
+                TmuxIdNameNotification {
+                    id: 42,
+                    name: "bar".to_owned(),
+                }
+            )]
+        );
+        assert_eq!(
+            feed("%unlinked-window-renamed @42 bar\n"),
+            vec![TmuxControlNotification::UnlinkedWindowRenamed(
                 TmuxIdNameNotification {
                     id: 42,
                     name: "bar".to_owned(),
@@ -1447,6 +1569,10 @@ mod tests {
                     pane_id: 2,
                 }
             )]
+        );
+        assert_eq!(
+            feed("%pane-mode-changed %2\n"),
+            vec![TmuxControlNotification::PaneModeChanged { pane_id: 2 }]
         );
         assert_eq!(
             feed("%client-detached /dev/pts/1\n"),
@@ -1518,11 +1644,11 @@ mod tests {
         ));
         viewer.handle(TmuxControlNotification::Output(TmuxOutputNotification {
             pane_id: 0,
-            data: "new output".to_owned(),
+            data: b"new output".to_vec(),
         }));
         viewer.handle(TmuxControlNotification::Output(TmuxOutputNotification {
             pane_id: 999,
-            data: "ignored".to_owned(),
+            data: b"ignored".to_vec(),
         }));
         assert!(viewer.panes.get(&0).unwrap().output.contains("new output"));
         assert!(!viewer.panes.contains_key(&999));

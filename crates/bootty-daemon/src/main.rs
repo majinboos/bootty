@@ -29,7 +29,16 @@ fn main() -> Result<()> {
             reject_extra(args)?;
             std::process::exit(bootty_mux::run_remote_rmux_command(&payload)?);
         }
-        Some("remote-space") => run_remote_space(&args.collect::<Vec<_>>()),
+        Some("remote-space") => {
+            let remote_space_args = args.collect::<Vec<_>>();
+            match run_remote_space(&remote_space_args) {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    bootty_mux::write_remote_operation_error(&error)?;
+                    std::process::exit(1)
+                }
+            }
+        }
         Some("remote-project") => run_remote_project(&args.collect::<Vec<_>>()),
         Some("remote-worktree") => run_remote_worktree(&args.collect::<Vec<_>>()),
         Some(command) => bail!("unknown command {command:?}"),
@@ -70,7 +79,8 @@ fn run_remote_space(args: &[String]) -> Result<()> {
             let backend = Backend::parse(&required_option(arguments, "--backend")?)?;
             let payload = required_option(arguments, "--payload")?;
             let command = bootty_mux::decode_remote_space_command(&payload)?;
-            catalog.execute(&id, backend, command)?;
+            let completion = catalog.execute(&id, backend, command)?;
+            bootty_mux::write_remote_operation_completion(completion)?;
         }
         _ => bail!("unknown remote-space command {command:?}"),
     }

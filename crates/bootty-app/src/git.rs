@@ -3,10 +3,22 @@
 //! dotfiles `mux` tool rather than taking on a libgit dependency.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(unix)]
+use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+use serde::{Deserialize, Serialize};
+
+use crate::automation::directory::{
+    DirectoryClaim, DirectoryClaims, DirectoryClaimsError, DirectoryRef, InstanceRef,
+    RepositoryRef, SessionRef, WorktreeCreator, WorktreeRef, WorktreeRemovalAssessment,
+    WorktreeRemovalConfirmation, WorktreeRemovalRequest,
+};
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -72,12 +84,8 @@ pub fn detach_head(worktree_path: &str) -> Result<(), String> {
 /// tree plus every linked worktree. `0` when `cwd` is not in a git repo. Used to
 /// gate the detach action, which only earns its keep in a multi-worktree repo.
 pub fn worktree_count(cwd: &str) -> usize {
-    read(cwd, &["worktree", "list", "--porcelain"])
-        .map(|out| {
-            out.lines()
-                .filter(|line| line.starts_with("worktree "))
-                .count()
-        })
+    read_bytes(cwd, &["worktree", "list", "--porcelain", "-z"])
+        .map(|output| worktree_path_fields_from_porcelain(&output).count())
         .unwrap_or(0)
 }
 
@@ -97,18 +105,514 @@ pub fn trunk_branch(cwd: &str) -> Option<String> {
     })
 }
 
-/// Remove the linked worktree rooted at `worktree_path`. Runs from the main
-/// working tree so git doesn't refuse to remove the tree you're standing in;
-/// `force` is required when the worktree is dirty.
-pub fn remove_worktree(worktree_path: &str, force: bool) -> Result<(), String> {
-    let main = main_worktree(worktree_path)
-        .ok_or_else(|| "could not locate the main worktree".to_owned())?;
-    let mut args = vec!["worktree", "remove"];
+/// Remove an already verified linked worktree through its pinned common Git
+/// directory. The target is the same [`WorktreeRef`] that passed the final
+/// identity recheck, never a repository rediscovered from its mutable path.
+fn remove_worktree_from_repository(worktree: &WorktreeRef, force: bool) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(&worktree.repository.common_git_dir)
+        .arg("worktree")
+        .arg("remove");
     if force {
-        args.push("--force");
+        command.arg("--force");
     }
-    args.push(worktree_path);
-    run(&main, &args)
+    command.arg("--").arg(&worktree.path);
+    hide_command_window(&mut command);
+    run_git_command(command)
+}
+
+/// Serializable worktree state returned by the independent worktree service.
+/// A worktree lifecycle request never starts, focuses, or closes a session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeDetails {
+    pub worktree: WorktreeRef,
+    pub dirty: bool,
+    pub claims: Vec<DirectoryClaim>,
+}
+
+/// Arguments for an independent linked-worktree creation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCreateRequest {
+    pub repository_path: PathBuf,
+    pub branch: String,
+    #[serde(default = "default_managed_by_bootty")]
+    pub managed_by_bootty: bool,
+    pub caller: String,
+}
+
+fn default_managed_by_bootty() -> bool {
+    true
+}
+
+/// Arguments for a claim-safe worktree removal. `worktree` must be the exact
+/// resolved identity returned by this service, not a display label or an
+/// unchecked path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRemoveRequest {
+    pub worktree: WorktreeRef,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requester_session: Option<SessionRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<WorktreeRemovalConfirmation>,
+}
+
+/// Errors from an independent directory/worktree operation.
+#[derive(Debug)]
+pub enum WorktreeServiceError {
+    Claims(DirectoryClaimsError),
+    NotRepository { path: PathBuf },
+    NotWorktree { path: PathBuf },
+    NotLinkedWorktree { path: PathBuf },
+    IdentityChanged { path: PathBuf },
+    DirtyWorktree { path: PathBuf },
+    Git { message: String },
+}
+
+impl fmt::Display for WorktreeServiceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Claims(error) => write!(formatter, "{error}"),
+            Self::NotRepository { path } => {
+                write!(formatter, "directory {path:?} is not in a Git repository")
+            }
+            Self::NotWorktree { path } => {
+                write!(
+                    formatter,
+                    "directory {path:?} does not identify a Git worktree"
+                )
+            }
+            Self::NotLinkedWorktree { path } => {
+                write!(
+                    formatter,
+                    "directory {path:?} is not a removable linked worktree"
+                )
+            }
+            Self::IdentityChanged { path } => {
+                write!(
+                    formatter,
+                    "worktree identity changed before removal: {path:?}"
+                )
+            }
+            Self::DirtyWorktree { path } => {
+                write!(formatter, "worktree has uncommitted changes: {path:?}")
+            }
+            Self::Git { message } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for WorktreeServiceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Claims(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<DirectoryClaimsError> for WorktreeServiceError {
+    fn from(error: DirectoryClaimsError) -> Self {
+        Self::Claims(error)
+    }
+}
+
+const WORKTREE_METADATA_FILE: &str = "bootty-worktree.json";
+
+/// Durable metadata associated with one exact linked-worktree identity.
+///
+/// Git's per-worktree administrative directory survives process restarts and
+/// is removed with the linked worktree, unlike advisory directory claims.
+#[derive(Serialize, Deserialize)]
+struct PersistedWorktreeMetadata {
+    worktree: WorktreeRef,
+}
+
+fn worktree_metadata_path(worktree: &WorktreeRef) -> PathBuf {
+    worktree.git_dir.join(WORKTREE_METADATA_FILE)
+}
+
+fn persist_worktree_metadata(worktree: &WorktreeRef) -> Result<(), WorktreeServiceError> {
+    let path = worktree_metadata_path(worktree);
+    let bytes = serde_json::to_vec(&PersistedWorktreeMetadata {
+        worktree: worktree.clone(),
+    })
+    .map_err(|error| WorktreeServiceError::Git {
+        message: format!("could not serialize worktree metadata: {error}"),
+    })?;
+    let temporary = worktree.git_dir.join(format!(
+        ".{WORKTREE_METADATA_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    fs::write(&temporary, bytes).map_err(|error| WorktreeServiceError::Git {
+        message: format!("could not persist worktree metadata at {path:?}: {error}"),
+    })?;
+    fs::rename(&temporary, &path).map_err(|error| WorktreeServiceError::Git {
+        message: format!("could not publish worktree metadata at {path:?}: {error}"),
+    })
+}
+
+fn hydrate_worktree_metadata(
+    mut worktree: WorktreeRef,
+) -> Result<WorktreeRef, WorktreeServiceError> {
+    let path = worktree_metadata_path(&worktree);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(worktree),
+        Err(error) => {
+            return Err(WorktreeServiceError::Git {
+                message: format!("could not read worktree metadata at {path:?}: {error}"),
+            });
+        }
+    };
+    let persisted =
+        serde_json::from_slice::<PersistedWorktreeMetadata>(&bytes).map_err(|error| {
+            WorktreeServiceError::Git {
+                message: format!("could not parse worktree metadata at {path:?}: {error}"),
+            }
+        })?;
+    if !persisted.worktree.same_identity(&worktree) {
+        return Err(WorktreeServiceError::IdentityChanged {
+            path: worktree.path,
+        });
+    }
+    worktree.created_by = persisted.worktree.created_by;
+    worktree.managed_by_bootty = persisted.worktree.managed_by_bootty;
+    Ok(worktree)
+}
+
+/// The sole production interface for directory and Git-worktree lifecycle
+/// operations. It shares the cloneable directory-claims store with AppState,
+/// so removal holds the process-wide claims lock through its final reread and
+/// the destructive Git command.
+#[derive(Clone)]
+pub struct WorktreeService {
+    claims: DirectoryClaims,
+    instance: InstanceRef,
+}
+
+impl WorktreeService {
+    pub fn new(claims: DirectoryClaims, instance: InstanceRef) -> Self {
+        Self { claims, instance }
+    }
+
+    pub fn resolve(&self, path: impl AsRef<Path>) -> Result<DirectoryRef, WorktreeServiceError> {
+        DirectoryRef::resolve(path)
+            .map_err(DirectoryClaimsError::from)
+            .map_err(Into::into)
+    }
+
+    pub fn usage(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<DirectoryClaim>, WorktreeServiceError> {
+        let directory = self.resolve(path)?;
+        self.claims.claims_for(&directory).map_err(Into::into)
+    }
+
+    /// List every Git worktree associated with the repository containing
+    /// `path`, including currently discoverable directory claims.
+    pub fn list(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<WorktreeDetails>, WorktreeServiceError> {
+        let directory = self.resolve(path)?;
+        let repository = directory
+            .repository
+            .ok_or(WorktreeServiceError::NotRepository {
+                path: directory.canonical_path,
+            })?;
+        self.list_repository(&repository)
+    }
+
+    /// List the exact worktree inventory for a known repository identity.
+    ///
+    /// This remains usable after one linked worktree has been removed, when
+    /// its old checkout path no longer resolves.
+    pub fn list_repository(
+        &self,
+        repository: &RepositoryRef,
+    ) -> Result<Vec<WorktreeDetails>, WorktreeServiceError> {
+        let output = read_git_dir_bytes(
+            &repository.common_git_dir,
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .ok_or_else(|| WorktreeServiceError::Git {
+            message: format!(
+                "could not list worktrees for repository at {:?}",
+                repository.common_git_dir
+            ),
+        })?;
+        let mut details = Vec::new();
+        for path in worktree_paths_from_porcelain(&output) {
+            match self.get(path) {
+                Ok(detail) if detail.worktree.repository.same_identity(repository) => {
+                    details.push(detail);
+                }
+                // Git retains prunable worktree registrations after their checkout has gone.
+                // They are not inventory items, but must not hide the surviving worktrees.
+                Ok(_) | Err(WorktreeServiceError::NotWorktree { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        details.sort_by(|left, right| left.worktree.path.cmp(&right.worktree.path));
+        Ok(details)
+    }
+
+    /// Return one exact worktree identity and its independently observed state.
+    pub fn get(&self, path: impl AsRef<Path>) -> Result<WorktreeDetails, WorktreeServiceError> {
+        let worktree = hydrate_worktree_metadata(self.resolve_worktree(path)?)?;
+        self.details_for(worktree)
+    }
+
+    /// Preflight the current active claims for one exact worktree. A later
+    /// [`Self::remove`] always repeats this under the global claims lock; this
+    /// assessment exists only to bind an explicit confirmation to what the
+    /// caller reviewed.
+    pub fn assess_removal(
+        &self,
+        path: impl AsRef<Path>,
+        requester_session: Option<&SessionRef>,
+    ) -> Result<WorktreeRemovalAssessment, WorktreeServiceError> {
+        let worktree = self.get(path)?.worktree;
+        self.claims
+            .assess_worktree_removal(&worktree, requester_session)
+            .map_err(Into::into)
+    }
+
+    /// Create a linked worktree without creating or changing any session.
+    pub fn create(
+        &self,
+        request: WorktreeCreateRequest,
+    ) -> Result<WorktreeDetails, WorktreeServiceError> {
+        self.create_after_add(
+            request,
+            add_worktree,
+            |created_path| self.resolve(created_path),
+            persist_worktree_metadata,
+        )
+    }
+
+    fn create_after_add(
+        &self,
+        request: WorktreeCreateRequest,
+        add: impl FnOnce(&str, &str) -> Result<String, String>,
+        resolve_created: impl FnOnce(&str) -> Result<DirectoryRef, WorktreeServiceError>,
+        persist_metadata: impl FnOnce(&WorktreeRef) -> Result<(), WorktreeServiceError>,
+    ) -> Result<WorktreeDetails, WorktreeServiceError> {
+        let repository_directory = self.resolve(&request.repository_path)?;
+        let repository =
+            repository_directory
+                .repository
+                .ok_or_else(|| WorktreeServiceError::NotRepository {
+                    path: repository_directory.canonical_path.clone(),
+                })?;
+        let repository_path = repository_directory
+            .canonical_path
+            .to_string_lossy()
+            .into_owned();
+        let created_path = add(&repository_path, &request.branch)
+            .map_err(|message| WorktreeServiceError::Git { message })?;
+
+        let mut created_worktree = None;
+        let created = (|| {
+            let created_directory = resolve_created(&created_path)?;
+            let mut worktree =
+                created_directory
+                    .worktree
+                    .ok_or_else(|| WorktreeServiceError::NotWorktree {
+                        path: PathBuf::from(&created_path),
+                    })?;
+            if !worktree.repository.same_identity(&repository) {
+                return Err(WorktreeServiceError::IdentityChanged {
+                    path: worktree.path,
+                });
+            }
+            worktree.created_by = Some(WorktreeCreator {
+                instance: self.instance.clone(),
+                caller: request.caller,
+            });
+            worktree.managed_by_bootty = request.managed_by_bootty;
+            created_worktree = Some(worktree.clone());
+            persist_metadata(&worktree)?;
+            self.details_for(worktree)
+        })();
+
+        match created {
+            Ok(details) => Ok(details),
+            Err(error) => {
+                let Some(worktree) = created_worktree.as_ref() else {
+                    return Err(WorktreeServiceError::Git {
+                        message: format!(
+                            "{error}; could not safely roll back newly added worktree at {created_path:?}: could not establish the created worktree identity"
+                        ),
+                    });
+                };
+                match self.rollback_created_worktree(worktree) {
+                    Ok(()) => Err(error),
+                    Err(rollback_error) => Err(WorktreeServiceError::Git {
+                        message: format!(
+                            "{error}; could not safely roll back newly added worktree at {created_path:?}: {rollback_error}"
+                        ),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Roll back a known creation only while claims are globally locked and
+    /// the checkout still resolves to that exact worktree identity.
+    fn rollback_created_worktree(
+        &self,
+        expected: &WorktreeRef,
+    ) -> Result<(), WorktreeServiceError> {
+        let mut final_validation_error = None;
+        let result = self.claims.remove_worktree(
+            expected,
+            &WorktreeRemovalRequest {
+                requester_session: None,
+                confirmation: None,
+            },
+            |expected| {
+                let actual = match self
+                    .resolve_worktree(&expected.path)
+                    .and_then(|resolved| validate_removal_target(expected, resolved, true))
+                {
+                    Ok(actual) => actual,
+                    Err(error) => {
+                        final_validation_error = Some(error);
+                        return Err("worktree identity changed before locked rollback".to_owned());
+                    }
+                };
+                remove_worktree_from_repository(&actual, true)
+            },
+        );
+        if let Some(error) = final_validation_error {
+            return Err(error);
+        }
+        result.map(|_| ()).map_err(Into::into)
+    }
+
+    /// Remove one linked worktree after a final globally locked active-claim
+    /// reread. The requester must re-submit the exact confirmation returned by
+    /// a preceding assessment when another session is using it.
+    pub fn remove(
+        &self,
+        request: WorktreeRemoveRequest,
+    ) -> Result<WorktreeRemovalAssessment, WorktreeServiceError> {
+        self.remove_after_final_recheck(request, remove_worktree_from_repository)
+    }
+
+    fn remove_after_final_recheck(
+        &self,
+        request: WorktreeRemoveRequest,
+        remove_worktree: impl FnOnce(&WorktreeRef, bool) -> Result<(), String>,
+    ) -> Result<WorktreeRemovalAssessment, WorktreeServiceError> {
+        let actual = validate_removal_target(
+            &request.worktree,
+            self.resolve_worktree(&request.worktree.path)?,
+            request.force,
+        )?;
+        let force = request.force;
+        let removal = WorktreeRemovalRequest {
+            requester_session: request.requester_session,
+            confirmation: request.confirmation,
+        };
+        let mut final_validation_error = None;
+        let result = self.claims.remove_worktree(&actual, &removal, |worktree| {
+            let final_actual = match self
+                .resolve_worktree(&worktree.path)
+                .and_then(|resolved| validate_removal_target(worktree, resolved, force))
+            {
+                Ok(actual) => actual,
+                Err(error) => {
+                    final_validation_error = Some(error);
+                    return Err("worktree identity changed before locked removal".to_owned());
+                }
+            };
+            remove_worktree(&final_actual, force)
+        });
+        if let Some(error) = final_validation_error {
+            return Err(error);
+        }
+        result.map_err(Into::into)
+    }
+
+    fn resolve_worktree(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<WorktreeRef, WorktreeServiceError> {
+        let directory = self.resolve(path)?;
+        directory.worktree.ok_or(WorktreeServiceError::NotWorktree {
+            path: directory.canonical_path,
+        })
+    }
+
+    fn details_for(&self, worktree: WorktreeRef) -> Result<WorktreeDetails, WorktreeServiceError> {
+        let claims = self.claims.claims_for_worktree(&worktree)?;
+        let dirty = status(&worktree.path.to_string_lossy()).dirty;
+        Ok(WorktreeDetails {
+            worktree,
+            dirty,
+            claims,
+        })
+    }
+}
+
+fn validate_removal_target(
+    expected: &WorktreeRef,
+    actual: WorktreeRef,
+    force: bool,
+) -> Result<WorktreeRef, WorktreeServiceError> {
+    if !actual.same_identity(expected) {
+        return Err(WorktreeServiceError::IdentityChanged {
+            path: expected.path.clone(),
+        });
+    }
+    if !actual.is_linked() {
+        return Err(WorktreeServiceError::NotLinkedWorktree { path: actual.path });
+    }
+    if status(&actual.path.to_string_lossy()).dirty && !force {
+        return Err(WorktreeServiceError::DirtyWorktree { path: actual.path });
+    }
+    Ok(actual)
+}
+
+fn worktree_paths_from_porcelain(output: &[u8]) -> Vec<PathBuf> {
+    worktree_path_fields_from_porcelain(output)
+        .filter_map(path_from_git_porcelain)
+        .collect()
+}
+
+fn worktree_path_fields_from_porcelain(output: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut first_field_in_record = true;
+    output
+        .split(|byte| *byte == b'\0')
+        .filter_map(move |field| {
+            if field.is_empty() {
+                first_field_in_record = true;
+                return None;
+            }
+            let path = first_field_in_record
+                .then(|| field.strip_prefix(b"worktree "))
+                .flatten();
+            first_field_in_record = false;
+            path
+        })
+}
+
+fn path_from_git_porcelain(path: &[u8]) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        Some(PathBuf::from(OsString::from_vec(path.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(path).ok().map(PathBuf::from)
+    }
 }
 
 /// Create a new linked worktree on a fresh `branch` off the repo containing
@@ -329,11 +833,28 @@ fn read(cwd: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn read_bytes(cwd: &str, args: &[&str]) -> Option<Vec<u8>> {
+    bootty_runtime::perf::record_subprocess("git read");
+    let output = git_command(cwd, args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn read_git_dir_bytes(git_dir: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    bootty_runtime::perf::record_subprocess("git read");
+    let mut command = Command::new("git");
+    command.arg("--git-dir").arg(git_dir).args(args);
+    hide_command_window(&mut command);
+    let output = command.output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
 fn run(cwd: &str, args: &[&str]) -> Result<(), String> {
+    run_git_command(git_command(cwd, args))
+}
+
+fn run_git_command(mut command: Command) -> Result<(), String> {
     bootty_runtime::perf::record_subprocess("git run");
-    let output = git_command(cwd, args)
-        .output()
-        .map_err(|error| error.to_string())?;
+    let output = command.output().map_err(|error| error.to_string())?;
     if output.status.success() {
         Ok(())
     } else {
@@ -361,7 +882,10 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
+    use crate::automation::directory::{ClaimOwner, OwnerLiveness};
     #[test]
     fn worktree_events_under_content_or_git_metadata_move_the_revision() {
         let revision = Arc::new(AtomicU64::new(1));
@@ -385,6 +909,55 @@ mod tests {
         record_worktree_events(&revisions, &[PathBuf::from("/somewhere/else")]);
 
         assert_eq!(revision.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn git_porcelain_round_trips_worktree_path_whitespace() {
+        let porcelain = b"worktree /repo/ leading-and-trailing \0HEAD deadbeef\0\0";
+
+        assert_eq!(
+            worktree_paths_from_porcelain(porcelain),
+            vec![PathBuf::from("/repo/ leading-and-trailing ")]
+        );
+    }
+
+    #[test]
+    fn service_list_preserves_newline_worktree_identity() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let newline_worktree = root.path().join("newline\nworktree");
+        git_ok(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "newline-worktree",
+                newline_worktree.to_str().expect("UTF-8 worktree path"),
+            ],
+        );
+        let expected = DirectoryRef::resolve(&newline_worktree)
+            .expect("resolve newline worktree")
+            .worktree
+            .expect("newline worktree identity");
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("newline-inventory").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "newline-inventory".to_owned(),
+                generation: 1,
+            },
+        );
+
+        let listed = service.list(&main).expect("list worktrees");
+        let matches: Vec<_> = listed
+            .iter()
+            .filter(|details| details.worktree.same_identity(&expected))
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].worktree.path, expected.path);
     }
 
     fn git_ok(cwd: &Path, args: &[&str]) {
@@ -425,6 +998,42 @@ mod tests {
             ],
         );
         (root, main, worktree)
+    }
+
+    struct ReplaceWorktreeDuringLockedRecheck {
+        armed: AtomicBool,
+        worktree: PathBuf,
+    }
+
+    impl OwnerLiveness for ReplaceWorktreeDuringLockedRecheck {
+        fn is_dead(&self, _owner: &ClaimOwner) -> bool {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                let worktree = DirectoryRef::resolve(&self.worktree)
+                    .expect("resolve original worktree")
+                    .worktree
+                    .expect("original worktree");
+                remove_worktree_from_repository(&worktree, true).expect("remove original worktree");
+                fs::create_dir(&self.worktree).expect("replace worktree directory");
+                git_ok(&self.worktree, &["init", "-q"]);
+            }
+            false
+        }
+    }
+
+    fn add_worktree_at(repository: &str, branch: &str, path: &Path) -> Result<String, String> {
+        let path = path.to_string_lossy().into_owned();
+        run(repository, &["worktree", "add", "-b", branch, &path])?;
+        Ok(path)
+    }
+
+    fn resolve_created_worktree(created: &str) -> Result<DirectoryRef, WorktreeServiceError> {
+        Ok(DirectoryRef::resolve(created).map_err(DirectoryClaimsError::from)?)
+    }
+
+    fn injected_post_add_failure(_: &WorktreeRef) -> Result<(), WorktreeServiceError> {
+        Err(WorktreeServiceError::Git {
+            message: "injected post-add failure".to_owned(),
+        })
     }
 
     #[test]
@@ -571,7 +1180,11 @@ mod tests {
     #[test]
     fn remove_worktree_detaches_the_linked_checkout() {
         let (_root, main, worktree) = repo_with_worktree();
-        remove_worktree(worktree.to_str().unwrap(), false).expect("remove worktree");
+        let identity = DirectoryRef::resolve(&worktree)
+            .expect("resolve worktree")
+            .worktree
+            .expect("worktree identity");
+        remove_worktree_from_repository(&identity, false).expect("remove worktree");
         assert!(!worktree.exists());
         let list = read(main.to_str().unwrap(), &["worktree", "list"]).expect("list");
         assert!(!list.contains("wt"), "worktree still listed: {list}");
@@ -585,7 +1198,11 @@ mod tests {
         fs::write(worktree.join("feature.txt"), "work").expect("write");
         git_ok(&worktree, &["add", "."]);
         git_ok(&worktree, &["commit", "-q", "-m", "feature work"]);
-        remove_worktree(worktree.to_str().unwrap(), false).expect("remove worktree");
+        let identity = DirectoryRef::resolve(&worktree)
+            .expect("resolve worktree")
+            .worktree
+            .expect("worktree identity");
+        remove_worktree_from_repository(&identity, false).expect("remove worktree");
 
         delete_branch(main.to_str().unwrap(), "feature", true).expect("force delete");
         let branches =
@@ -667,5 +1284,444 @@ mod tests {
         let added = status(&created);
         assert!(added.is_linked_worktree);
         assert_eq!(added.branch.as_deref(), Some("wip/login"));
+    }
+
+    #[test]
+    fn service_creates_and_removes_a_worktree_without_session_lifecycle() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let claims = DirectoryClaims::at(
+            root.path().join("claims"),
+            ClaimOwner::current("service").expect("owner"),
+        )
+        .expect("claims");
+        let service = WorktreeService::new(
+            claims,
+            InstanceRef {
+                instance_id: "service".to_owned(),
+                generation: 1,
+            },
+        );
+
+        let created = service
+            .create(WorktreeCreateRequest {
+                repository_path: main.clone(),
+                branch: "service-worktree".to_owned(),
+                managed_by_bootty: true,
+                caller: "test".to_owned(),
+            })
+            .expect("create");
+        assert!(created.worktree.is_linked());
+        assert!(created.worktree.managed_by_bootty);
+        assert_eq!(
+            created
+                .worktree
+                .created_by
+                .as_ref()
+                .map(|creator| creator.caller.as_str()),
+            Some("test")
+        );
+
+        service
+            .remove(WorktreeRemoveRequest {
+                worktree: created.worktree.clone(),
+                force: false,
+                requester_session: None,
+                confirmation: None,
+            })
+            .expect("remove");
+        assert!(!created.worktree.path.exists());
+    }
+
+    #[test]
+    fn service_hydrates_persisted_worktree_creator_metadata_by_identity() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("creator").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "creator".to_owned(),
+                generation: 7,
+            },
+        );
+        let created = service
+            .create(WorktreeCreateRequest {
+                repository_path: main.clone(),
+                branch: "persisted-metadata".to_owned(),
+                managed_by_bootty: true,
+                caller: "automation".to_owned(),
+            })
+            .expect("create");
+        let reopened = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("reopened-claims"),
+                ClaimOwner::current("reader").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "reader".to_owned(),
+                generation: 1,
+            },
+        );
+
+        let retrieved = reopened.get(&created.worktree.path).expect("get");
+        let listed = reopened
+            .list(&main)
+            .expect("list")
+            .into_iter()
+            .find(|detail| detail.worktree.same_identity(&created.worktree))
+            .expect("created worktree in inventory");
+
+        for worktree in [&retrieved.worktree, &listed.worktree] {
+            assert!(worktree.managed_by_bootty);
+            let creator = worktree.created_by.as_ref().expect("persisted creator");
+            assert_eq!(creator.instance.instance_id, "creator");
+            assert_eq!(creator.instance.generation, 7);
+            assert_eq!(creator.caller, "automation");
+        }
+    }
+
+    #[test]
+    fn service_list_skips_prunable_worktrees_without_hiding_live_inventory() {
+        let (root, main, stale) = repo_with_worktree();
+        let main_worktree = DirectoryRef::resolve(&main)
+            .expect("resolve main")
+            .worktree
+            .expect("main worktree");
+        let repository = main_worktree.repository.clone();
+        fs::remove_dir_all(&stale).expect("remove stale checkout");
+
+        let porcelain = read_git_dir_bytes(
+            &repository.common_git_dir,
+            &["worktree", "list", "--porcelain", "-z"],
+        )
+        .expect("list worktrees");
+        assert!(
+            worktree_paths_from_porcelain(&porcelain)
+                .iter()
+                .any(|path| !path.exists()),
+            "fixture must expose the prunable registration"
+        );
+
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("inventory").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "inventory".to_owned(),
+                generation: 1,
+            },
+        );
+
+        let inventory = service
+            .list_repository(&repository)
+            .expect("stale entry must not abort inventory");
+        assert_eq!(inventory.len(), 1);
+        assert!(inventory[0].worktree.same_identity(&main_worktree));
+    }
+
+    #[test]
+    fn service_leaves_created_worktree_when_post_add_resolution_has_no_identity() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("rollback").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "rollback".to_owned(),
+                generation: 1,
+            },
+        );
+        let created_path = Arc::new(std::sync::Mutex::new(None));
+        let captured_path = Arc::clone(&created_path);
+
+        let result = service.create_after_add(
+            WorktreeCreateRequest {
+                repository_path: main.clone(),
+                branch: "rollback-on-resolve-failure".to_owned(),
+                managed_by_bootty: true,
+                caller: "test".to_owned(),
+            },
+            move |repository, branch| {
+                let created = add_worktree(repository, branch)?;
+                *captured_path.lock().expect("created path lock") = Some(PathBuf::from(&created));
+                Ok(created)
+            },
+            |created| {
+                Ok(DirectoryRef {
+                    canonical_path: PathBuf::from(created),
+                    repository: None,
+                    worktree: None,
+                })
+            },
+            persist_worktree_metadata,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorktreeServiceError::Git { ref message })
+                if message.contains("could not safely roll back newly added worktree")
+                    && message.contains("could not establish the created worktree identity")
+        ));
+        let created = created_path
+            .lock()
+            .expect("created path lock")
+            .clone()
+            .expect("created path");
+        assert!(
+            created.exists(),
+            "without an exact identity, rollback must leave the created worktree alone"
+        );
+        let inventory =
+            read(main.to_str().expect("main path"), &["worktree", "list"]).expect("worktree list");
+        assert!(
+            inventory.contains("rollback-on-resolve-failure"),
+            "unidentified worktree must remain registered: {inventory}"
+        );
+    }
+
+    #[test]
+    fn service_rolls_back_known_created_worktree_after_post_add_failure() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("rollback-known").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "rollback-known".to_owned(),
+                generation: 1,
+            },
+        );
+        let created_path = root.path().join("rollback-known");
+        let add_path = created_path.clone();
+
+        let result = service.create_after_add(
+            WorktreeCreateRequest {
+                repository_path: main.clone(),
+                branch: "rollback-known".to_owned(),
+                managed_by_bootty: true,
+                caller: "test".to_owned(),
+            },
+            move |repository, branch| add_worktree_at(repository, branch, &add_path),
+            resolve_created_worktree,
+            injected_post_add_failure,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorktreeServiceError::Git { ref message }) if message == "injected post-add failure"
+        ));
+        assert!(
+            !created_path.exists(),
+            "a known created worktree must be removed after the locked recheck"
+        );
+        let inventory =
+            read(main.to_str().expect("main path"), &["worktree", "list"]).expect("worktree list");
+        assert!(
+            !inventory.contains("rollback-known"),
+            "locked rollback must remove the worktree registration: {inventory}"
+        );
+    }
+
+    #[test]
+    fn service_rollback_does_not_remove_replacement_after_locked_recheck() {
+        let (root, main, _worktree) = repo_with_worktree();
+        let created_path = root.path().join("rollback-race");
+        let liveness = Arc::new(ReplaceWorktreeDuringLockedRecheck {
+            armed: AtomicBool::new(false),
+            worktree: created_path.clone(),
+        });
+        let claims = DirectoryClaims::at_with_liveness(
+            root.path().join("claims"),
+            ClaimOwner::current("rollback-race").expect("owner"),
+            liveness.clone(),
+        )
+        .expect("claims");
+        let service = WorktreeService::new(
+            claims,
+            InstanceRef {
+                instance_id: "rollback-race".to_owned(),
+                generation: 1,
+            },
+        );
+        let add_path = created_path.clone();
+        liveness.armed.store(true, Ordering::SeqCst);
+
+        let result = service.create_after_add(
+            WorktreeCreateRequest {
+                repository_path: main.clone(),
+                branch: "rollback-race".to_owned(),
+                managed_by_bootty: true,
+                caller: "test".to_owned(),
+            },
+            move |repository, branch| add_worktree_at(repository, branch, &add_path),
+            resolve_created_worktree,
+            injected_post_add_failure,
+        );
+
+        assert!(matches!(
+            result,
+            Err(WorktreeServiceError::Git { ref message })
+                if message.contains("could not safely roll back newly added worktree")
+        ));
+        assert!(
+            created_path.exists(),
+            "the replacement path must survive a failed identity recheck"
+        );
+        let replacement = DirectoryRef::resolve(&created_path)
+            .expect("resolve replacement")
+            .worktree
+            .expect("replacement worktree");
+        let main_repository = DirectoryRef::resolve(&main)
+            .expect("resolve main")
+            .repository
+            .expect("main repository");
+        assert!(
+            !replacement.repository.same_identity(&main_repository),
+            "the replacement must belong to a different repository"
+        );
+    }
+
+    #[test]
+    fn service_rechecks_identity_inside_claim_lock_before_removal() {
+        let (root, main, worktree) = repo_with_worktree();
+        let liveness = Arc::new(ReplaceWorktreeDuringLockedRecheck {
+            armed: AtomicBool::new(false),
+            worktree: worktree.clone(),
+        });
+        let claims = DirectoryClaims::at_with_liveness(
+            root.path().join("claims"),
+            ClaimOwner::current("race").expect("owner"),
+            liveness.clone(),
+        )
+        .expect("claims");
+        let service = WorktreeService::new(
+            claims,
+            InstanceRef {
+                instance_id: "race".to_owned(),
+                generation: 1,
+            },
+        );
+        let stale = service.get(&worktree).expect("resolve original").worktree;
+        liveness.armed.store(true, Ordering::SeqCst);
+
+        let result = service.remove(WorktreeRemoveRequest {
+            worktree: stale,
+            force: true,
+            requester_session: None,
+            confirmation: None,
+        });
+
+        assert!(matches!(
+            result,
+            Err(WorktreeServiceError::IdentityChanged { .. })
+        ));
+        assert!(
+            worktree.exists(),
+            "the replacement path must not be deleted after the final re-resolve"
+        );
+        let replacement = DirectoryRef::resolve(&worktree)
+            .expect("resolve replacement")
+            .worktree
+            .expect("replacement repository");
+        assert!(
+            !replacement.repository.same_identity(
+                &DirectoryRef::resolve(&main)
+                    .expect("resolve main")
+                    .repository
+                    .expect("main repository")
+            )
+        );
+    }
+
+    #[test]
+    fn service_remove_keeps_a_replacement_from_a_different_repository() {
+        let (root, _, worktree) = repo_with_worktree();
+        let service = WorktreeService::new(
+            DirectoryClaims::at(
+                root.path().join("claims"),
+                ClaimOwner::current("replace-after-recheck").expect("owner"),
+            )
+            .expect("claims"),
+            InstanceRef {
+                instance_id: "replace-after-recheck".to_owned(),
+                generation: 1,
+            },
+        );
+        let stale = service.get(&worktree).expect("resolve original").worktree;
+        let original_repository = stale.repository.clone();
+        let replacement_main = root.path().join("replacement-main");
+        let replacement_path = worktree.clone();
+        let replacement_identity = Arc::new(std::sync::Mutex::new(None));
+        let captured_identity = Arc::clone(&replacement_identity);
+
+        let result = service.remove_after_final_recheck(
+            WorktreeRemoveRequest {
+                worktree: stale,
+                force: true,
+                requester_session: None,
+                confirmation: None,
+            },
+            move |verified, force| {
+                remove_worktree_from_repository(verified, true).expect("remove original worktree");
+                fs::create_dir(&replacement_main).expect("create replacement main");
+                git_ok(&replacement_main, &["init", "-q", "-b", "main"]);
+                git_ok(&replacement_main, &["config", "user.email", "t@t.test"]);
+                git_ok(&replacement_main, &["config", "user.name", "tester"]);
+                fs::write(replacement_main.join("README"), "replacement")
+                    .expect("write replacement");
+                git_ok(&replacement_main, &["add", "."]);
+                git_ok(&replacement_main, &["commit", "-q", "-m", "init"]);
+                git_ok(
+                    &replacement_main,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "replacement",
+                        replacement_path
+                            .to_str()
+                            .expect("UTF-8 replacement worktree path"),
+                    ],
+                );
+                let replacement = DirectoryRef::resolve(&replacement_path)
+                    .expect("resolve replacement")
+                    .worktree
+                    .expect("replacement worktree");
+                *captured_identity.lock().expect("replacement identity lock") = Some(replacement);
+
+                remove_worktree_from_repository(verified, force)
+            },
+        );
+
+        assert!(
+            result.is_err(),
+            "the original repository must reject the no-longer-registered worktree"
+        );
+        let replacement = replacement_identity
+            .lock()
+            .expect("replacement identity lock")
+            .clone()
+            .expect("replacement identity");
+        assert!(
+            !replacement.repository.same_identity(&original_repository),
+            "the replacement must belong to a different repository"
+        );
+        let surviving = DirectoryRef::resolve(&worktree)
+            .expect("resolve surviving replacement")
+            .worktree
+            .expect("surviving replacement worktree");
+        assert!(
+            surviving.same_identity(&replacement),
+            "removal must not switch to and delete the replacement worktree"
+        );
     }
 }

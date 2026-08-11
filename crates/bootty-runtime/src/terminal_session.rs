@@ -25,7 +25,7 @@ use bootty_terminal::{
         TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TERMINAL_TERM, TerminalColorConfig,
         TerminalCopyModeAction, TerminalCopyModeOutcome, TerminalCursorConfig, TerminalEngine,
         TerminalFeatureConfig, TerminalSearchDirection, TerminalSelectionEvent,
-        TerminalSelectionFormat, TerminalSideEffectEvent,
+        TerminalSelectionFormat, TerminalSideEffect, TerminalSideEffectEvent,
     },
     terminal_frame::RenderFrame,
     terminal_input_model::{KeyInput, MacosOptionAsAlt, MouseInput},
@@ -62,6 +62,9 @@ pub(crate) const WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_SETTLED_FRAME_DELAY: Duration = Duration::from_millis(16);
 pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
 
+const MAX_RUNTIME_OUTPUT_OBSERVATIONS: usize = 256;
+const MAX_RUNTIME_OUTPUT_OBSERVATION_BYTES: usize = 1_048_576;
+
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSessionConfig {
     pub launch: SessionLaunchConfig,
@@ -72,10 +75,107 @@ pub struct TerminalSessionConfig {
     pub macos_option_as_alt: MacosOptionAsAlt,
     pub side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     pub side_effect_pane_id: Option<String>,
+    /// Retain raw PTY output and terminal side effects for a backend that can publish authoritative
+    /// lifecycle events. Ordinary rendering sessions pay no observation allocation or copy cost.
+    pub capture_runtime_observations: bool,
     pub benchmark_trace: Option<BenchmarkTrace>,
+}
+
+/// A raw PTY observation with a monotonically increasing runtime-local sequence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TerminalOutputObservation {
+    Bytes {
+        sequence: u64,
+        bytes: Vec<u8>,
+    },
+    Lag {
+        expected_sequence: u64,
+        resume_sequence: u64,
+        missed_events: u64,
+    },
+}
+
+/// Observations a terminal runtime makes available to its authoritative backend bridge.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalRuntimeObservations {
+    pub output: Vec<TerminalOutputObservation>,
+    pub side_effects: Vec<TerminalSideEffect>,
+}
+
+struct TerminalObservationBuffer {
+    next_sequence: u64,
+    output: VecDeque<(u64, Vec<u8>)>,
+    output_bytes: usize,
+    overflow_from: Option<u64>,
+    side_effects: VecDeque<TerminalSideEffect>,
+}
+
+impl TerminalObservationBuffer {
+    fn new() -> Self {
+        Self {
+            next_sequence: 1,
+            output: VecDeque::new(),
+            output_bytes: 0,
+            overflow_from: None,
+            side_effects: VecDeque::new(),
+        }
+    }
+
+    fn record_output(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.output_bytes = self.output_bytes.saturating_add(bytes.len());
+        self.output.push_back((sequence, bytes.to_vec()));
+        while self.output.len() > MAX_RUNTIME_OUTPUT_OBSERVATIONS
+            || self.output_bytes > MAX_RUNTIME_OUTPUT_OBSERVATION_BYTES
+        {
+            let Some((dropped_sequence, dropped)) = self.output.pop_front() else {
+                break;
+            };
+            self.output_bytes = self.output_bytes.saturating_sub(dropped.len());
+            self.overflow_from.get_or_insert(dropped_sequence);
+        }
+    }
+
+    fn record_side_effect(&mut self, effect: TerminalSideEffect) {
+        self.side_effects.push_back(effect);
+    }
+
+    fn drain(&mut self) -> TerminalRuntimeObservations {
+        let mut output =
+            Vec::with_capacity(self.output.len() + usize::from(self.overflow_from.is_some()));
+        if let Some(expected_sequence) = self.overflow_from.take() {
+            let resume_sequence = self
+                .output
+                .front()
+                .map(|(sequence, _)| *sequence)
+                .unwrap_or(self.next_sequence);
+            output.push(TerminalOutputObservation::Lag {
+                expected_sequence,
+                resume_sequence,
+                missed_events: resume_sequence.saturating_sub(expected_sequence),
+            });
+        }
+        output.extend(
+            self.output
+                .drain(..)
+                .map(|(sequence, bytes)| TerminalOutputObservation::Bytes { sequence, bytes }),
+        );
+        self.output_bytes = 0;
+        TerminalRuntimeObservations {
+            output,
+            side_effects: self.side_effects.drain(..).collect(),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionLaunchConfig {
+    /// Process launched directly through the PTY command builder. Unlike `shell`, a relative
+    /// program is resolved through the launch environment's `PATH`.
+    pub program: Option<String>,
     pub shell: Option<String>,
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
@@ -88,6 +188,7 @@ pub struct SessionLaunchConfig {
 impl Default for SessionLaunchConfig {
     fn default() -> Self {
         Self {
+            program: None,
             shell: None,
             args: Vec::new(),
             working_directory: None,
@@ -105,6 +206,7 @@ pub struct TerminalSession {
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
     current_working_directory: Arc<Mutex<Option<String>>>,
+    runtime_observations: Option<Arc<Mutex<TerminalObservationBuffer>>>,
     geometry: TerminalGeometry,
     display_scale: f32,
     render_cell: CellMetrics,
@@ -257,6 +359,9 @@ impl TerminalSession {
         let latest_drain = Arc::new(Mutex::new(DrainStats::default()));
         let pending_pty_len = Arc::new(AtomicUsize::new(0));
         let current_working_directory = Arc::new(Mutex::new(None));
+        let runtime_observations = config
+            .capture_runtime_observations
+            .then(|| Arc::new(Mutex::new(TerminalObservationBuffer::new())));
         let benchmark_trace = match config.benchmark_trace.clone() {
             Some(trace) => Some(trace),
             None => BenchmarkTrace::from_env().context("open benchmark trace")?,
@@ -275,6 +380,7 @@ impl TerminalSession {
             latest_drain: latest_drain.clone(),
             pending_pty_len: pending_pty_len.clone(),
             current_working_directory: current_working_directory.clone(),
+            runtime_observations: runtime_observations.clone(),
             repaint_wakeup,
             side_effect_tx: config.side_effect_tx,
             side_effect_pane_id: config.side_effect_pane_id,
@@ -287,6 +393,7 @@ impl TerminalSession {
             latest_drain,
             pending_pty_len,
             current_working_directory,
+            runtime_observations,
             geometry,
             display_scale: 1.0,
             render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
@@ -357,6 +464,13 @@ impl TerminalSession {
         let drained = *stats;
         *stats = DrainStats::default();
         drained
+    }
+
+    pub fn drain_runtime_observations(&mut self) -> TerminalRuntimeObservations {
+        self.runtime_observations
+            .as_ref()
+            .and_then(|observations| observations.lock().ok().map(|mut queue| queue.drain()))
+            .unwrap_or_default()
     }
 
     pub fn pending_pty_len(&self) -> usize {
@@ -530,6 +644,7 @@ struct TerminalWorkerConfig {
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
     current_working_directory: Arc<Mutex<Option<String>>>,
+    runtime_observations: Option<Arc<Mutex<TerminalObservationBuffer>>>,
     repaint_wakeup: RepaintWakeup,
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     side_effect_pane_id: Option<String>,
@@ -573,6 +688,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             repaint_wakeup: config.repaint_wakeup,
             side_effect_tx: config.side_effect_tx,
             side_effect_pane_id: config.side_effect_pane_id,
+            runtime_observations: config.runtime_observations,
             benchmark_trace: config.benchmark_trace,
             output_buf: Vec::with_capacity(1024),
             pending_pty: PtyBacklog::with_capacity(MAX_COLLECT_CHUNKS_PER_TICK),
@@ -616,6 +732,7 @@ struct TerminalWorker {
     repaint_wakeup: RepaintWakeup,
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     side_effect_pane_id: Option<String>,
+    runtime_observations: Option<Arc<Mutex<TerminalObservationBuffer>>>,
     output_buf: Vec<u8>,
     pending_pty: PtyBacklog,
     last_frame_publish: Instant,
@@ -1013,11 +1130,17 @@ impl TerminalWorker {
             );
         }
         let engine = &mut self.engine;
+        let observations = self.runtime_observations.as_ref();
         let mut observed_sync_output = engine.is_synchronized_output().unwrap_or(false);
         let mut sync_output_escape_prefix_len = self.sync_output_escape_prefix_len;
         let mut write = |bytes: &[u8]| {
             observed_sync_output |=
                 observe_sync_output_start(bytes, &mut sync_output_escape_prefix_len);
+            if let Some(observations) = observations
+                && let Ok(mut observations) = observations.lock()
+            {
+                observations.record_output(bytes);
+            }
             engine.write_vt(bytes);
             observed_sync_output |= engine.is_synchronized_output().unwrap_or(false);
         };
@@ -1069,15 +1192,25 @@ impl TerminalWorker {
     }
 
     fn forward_side_effects(&mut self) {
-        let Some(tx) = self.side_effect_tx.as_ref() else {
+        if self.side_effect_tx.is_none() && self.runtime_observations.is_none() {
             return;
-        };
+        }
         let mut disconnected = false;
         for effect in self.engine.drain_side_effects() {
-            let event = TerminalSideEffectEvent::new(self.side_effect_pane_id.clone(), effect);
-            if tx.send(event).is_err() {
+            if let Some(observations) = &self.runtime_observations
+                && let Ok(mut observations) = observations.lock()
+            {
+                observations.record_side_effect(effect.clone());
+            }
+            if let Some(tx) = self.side_effect_tx.as_ref()
+                && tx
+                    .send(TerminalSideEffectEvent::new(
+                        self.side_effect_pane_id.clone(),
+                        effect,
+                    ))
+                    .is_err()
+            {
                 disconnected = true;
-                break;
             }
         }
         if disconnected {
@@ -1497,9 +1630,11 @@ fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Resu
         pixel_height: geometry.pixel_height(),
     })?;
 
-    let shell = shell_command_path(config.shell.clone());
     let launch_env = resolve_launch_environment(config, crate::terminfo::vendored_terminfo_dir());
-    let mut command = CommandBuilder::new(shell);
+    let mut command = match &config.program {
+        Some(program) => CommandBuilder::new(program),
+        None => CommandBuilder::new(shell_command_path(config.shell.clone())),
+    };
     command.args(&config.args);
     for (name, value) in locale_env_entries() {
         command.env(name, value);
@@ -2159,6 +2294,68 @@ mod tests {
             select_shell_path(None, None, None, None),
             DEFAULT_SHELL.to_owned()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_program_resolves_relative_argv_without_shell_fallback() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = tempfile::tempdir()?;
+        let cwd = tempfile::tempdir()?;
+        let program = bin.path().join("printf");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf '<%s>|<%s>|<%s>|<%s>\\n' \"$PWD\" \"$NATIVE_LAUNCH_ENV\" \"$1\" \"$2\"\n",
+        )?;
+        let mut permissions = std::fs::metadata(&program)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&program, permissions)?;
+
+        let mut session = TerminalSession::new_with_config(
+            TerminalGeometry {
+                cols: 80,
+                rows: 24,
+                cell_width: 10,
+                cell_height: 20,
+            },
+            TerminalSessionConfig {
+                launch: SessionLaunchConfig {
+                    // If direct argv accidentally went through shell selection, this relative
+                    // configured shell would fall back and the fixture output would be absent.
+                    program: Some("printf".to_owned()),
+                    shell: Some("relative-shell".to_owned()),
+                    args: vec!["first value".to_owned(), "second value".to_owned()],
+                    working_directory: Some(cwd.path().to_path_buf()),
+                    env: vec![
+                        ("PATH".to_owned(), bin.path().to_string_lossy().into_owned()),
+                        (
+                            "NATIVE_LAUNCH_ENV".to_owned(),
+                            "environment value".to_owned(),
+                        ),
+                    ],
+                    ..SessionLaunchConfig::default()
+                },
+                ..TerminalSessionConfig::default()
+            },
+            Arc::new(|| {}),
+        )?;
+        let expected = format!(
+            "<{}>|<environment value>|<first value>|<second value>",
+            cwd.path().canonicalize()?.display()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            session.drain_pty();
+            let text = session.extract_frame()?.text.iter().collect::<String>();
+            if text.contains(&expected) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("relative direct program did not preserve launch handoff: {text:?}");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(target_os = "macos")]

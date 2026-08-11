@@ -1,0 +1,650 @@
+{
+  "schema_version": 1,
+  "manifest": "rmux_requests_0_9_1",
+  "source": "rmux protocol requests",
+  "version": "0.9.1",
+  "source_path": "rmux-proto/src/request.rs",
+  "runtime_adapter": "embedded rmux 0.10 SDK/IPC only; never the standalone rmux CLI",
+  "entries": [
+    {
+      "id": "Request::AttachSession",
+      "kind": "descriptor",
+      "command": "session.attach"
+    },
+    {
+      "id": "Request::AttachSessionExt",
+      "kind": "descriptor",
+      "command": "session.attach"
+    },
+    {
+      "id": "Request::AttachSessionExt2",
+      "kind": "descriptor",
+      "command": "session.attach"
+    },
+    {
+      "id": "Request::AttachSessionExt3",
+      "kind": "descriptor",
+      "command": "session.attach"
+    },
+    {
+      "id": "Request::BindKey",
+      "kind": "descriptor",
+      "command": "key.bind"
+    },
+    {
+      "id": "Request::BreakPane",
+      "kind": "descriptor",
+      "command": "pane.break"
+    },
+    {
+      "id": "Request::CancelSdkWait",
+      "kind": "descriptor",
+      "command": "task.cancel"
+    },
+    {
+      "id": "Request::CapturePane",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "Request::CapturePaneTargetAction",
+      "kind": "descriptor",
+      "command": "terminal.capture"
+    },
+    {
+      "id": "Request::ClearHistory",
+      "kind": "descriptor",
+      "command": "terminal.history.clear"
+    },
+    {
+      "id": "Request::ClockMode",
+      "kind": "descriptor",
+      "command": "terminal.clock_mode"
+    },
+    {
+      "id": "Request::ControlMode",
+      "kind": "descriptor",
+      "command": "control_mode.upgrade"
+    },
+    {
+      "id": "Request::CopyMode",
+      "kind": "descriptor",
+      "command": "terminal.copy_mode"
+    },
+    {
+      "id": "Request::CreateSessionLease",
+      "kind": "descriptor",
+      "command": "session.lease.create"
+    },
+    {
+      "id": "Request::DaemonStatus",
+      "kind": "descriptor",
+      "command": "server.status"
+    },
+    {
+      "id": "Request::DeleteBuffer",
+      "kind": "descriptor",
+      "command": "buffer.delete"
+    },
+    {
+      "id": "Request::DetachClient",
+      "kind": "descriptor",
+      "command": "client.detach"
+    },
+    {
+      "id": "Request::DetachClientExt",
+      "kind": "descriptor",
+      "command": "client.detach"
+    },
+    {
+      "id": "Request::DisplayMessage",
+      "kind": "descriptor",
+      "command": "message.display"
+    },
+    {
+      "id": "Request::DisplayMessageExt",
+      "kind": "descriptor",
+      "command": "message.display"
+    },
+    {
+      "id": "Request::DisplayPanes",
+      "kind": "descriptor",
+      "command": "pane.list"
+    },
+    {
+      "id": "Request::Handshake",
+      "kind": "descriptor",
+      "command": "protocol.handshake"
+    },
+    {
+      "id": "Request::HasSession",
+      "kind": "descriptor",
+      "command": "session.exists"
+    },
+    {
+      "id": "Request::IfShell",
+      "kind": "descriptor",
+      "command": "shell.if"
+    },
+    {
+      "id": "Request::JoinPane",
+      "kind": "descriptor",
+      "command": "pane.join"
+    },
+    {
+      "id": "Request::KillPane",
+      "kind": "descriptor",
+      "command": "pane.kill"
+    },
+    {
+      "id": "Request::KillServer",
+      "kind": "descriptor",
+      "command": "instance.kill"
+    },
+    {
+      "id": "Request::KillSession",
+      "kind": "descriptor",
+      "command": "session.kill"
+    },
+    {
+      "id": "Request::KillWindow",
+      "kind": "descriptor",
+      "command": "window.kill"
+    },
+    {
+      "id": "Request::LastPane",
+      "kind": "descriptor",
+      "command": "pane.last"
+    },
+    {
+      "id": "Request::LastWindow",
+      "kind": "descriptor",
+      "command": "window.last"
+    },
+    {
+      "id": "Request::LinkWindow",
+      "kind": "descriptor",
+      "command": "window.link"
+    },
+    {
+      "id": "Request::ListBuffers",
+      "kind": "descriptor",
+      "command": "buffer.list"
+    },
+    {
+      "id": "Request::ListClients",
+      "kind": "descriptor",
+      "command": "client.list"
+    },
+    {
+      "id": "Request::ListKeys",
+      "kind": "descriptor",
+      "command": "key.list"
+    },
+    {
+      "id": "Request::ListPanes",
+      "kind": "descriptor",
+      "command": "pane.list"
+    },
+    {
+      "id": "Request::ListSessions",
+      "kind": "descriptor",
+      "command": "session.list"
+    },
+    {
+      "id": "Request::ListWindows",
+      "kind": "descriptor",
+      "command": "window.list"
+    },
+    {
+      "id": "Request::LoadBuffer",
+      "kind": "descriptor",
+      "command": "buffer.load"
+    },
+    {
+      "id": "Request::LockClient",
+      "kind": "descriptor",
+      "command": "client.lock"
+    },
+    {
+      "id": "Request::LockServer",
+      "kind": "descriptor",
+      "command": "server.lock"
+    },
+    {
+      "id": "Request::LockSession",
+      "kind": "descriptor",
+      "command": "session.lock"
+    },
+    {
+      "id": "Request::MovePane",
+      "kind": "descriptor",
+      "command": "pane.move"
+    },
+    {
+      "id": "Request::MoveWindow",
+      "kind": "descriptor",
+      "command": "window.move"
+    },
+    {
+      "id": "Request::NewSession",
+      "kind": "descriptor",
+      "command": "session.create"
+    },
+    {
+      "id": "Request::NewSessionExt",
+      "kind": "descriptor",
+      "command": "session.create"
+    },
+    {
+      "id": "Request::NewWindow",
+      "kind": "descriptor",
+      "command": "window.create"
+    },
+    {
+      "id": "Request::NextLayout",
+      "kind": "descriptor",
+      "command": "layout.next"
+    },
+    {
+      "id": "Request::NextWindow",
+      "kind": "descriptor",
+      "command": "window.next"
+    },
+    {
+      "id": "Request::PaneBroadcastInput",
+      "kind": "descriptor",
+      "command": "terminal.broadcast_input"
+    },
+    {
+      "id": "Request::PaneForegroundState",
+      "kind": "descriptor",
+      "command": "pane.foreground_state"
+    },
+    {
+      "id": "Request::PaneInput",
+      "kind": "descriptor",
+      "command": "terminal.send_input"
+    },
+    {
+      "id": "Request::PaneKill",
+      "kind": "descriptor",
+      "command": "pane.kill"
+    },
+    {
+      "id": "Request::PaneOptionGet",
+      "kind": "descriptor",
+      "command": "pane.option.get"
+    },
+    {
+      "id": "Request::PaneOptionSet",
+      "kind": "descriptor",
+      "command": "pane.option.set"
+    },
+    {
+      "id": "Request::PaneOutputCursor",
+      "kind": "descriptor",
+      "command": "terminal.output.cursor"
+    },
+    {
+      "id": "Request::PaneResize",
+      "kind": "descriptor",
+      "command": "pane.resize"
+    },
+    {
+      "id": "Request::PaneRespawn",
+      "kind": "descriptor",
+      "command": "pane.respawn"
+    },
+    {
+      "id": "Request::PaneSelect",
+      "kind": "descriptor",
+      "command": "pane.select"
+    },
+    {
+      "id": "Request::PaneSnapshot",
+      "kind": "descriptor",
+      "command": "terminal.snapshot"
+    },
+    {
+      "id": "Request::PaneSnapshotRef",
+      "kind": "descriptor",
+      "command": "terminal.snapshot"
+    },
+    {
+      "id": "Request::PaneStateCursor",
+      "kind": "descriptor",
+      "command": "terminal.observe"
+    },
+    {
+      "id": "Request::PasteBuffer",
+      "kind": "descriptor",
+      "command": "buffer.paste"
+    },
+    {
+      "id": "Request::PipePane",
+      "kind": "descriptor",
+      "command": "pane.pipe"
+    },
+    {
+      "id": "Request::PreviousLayout",
+      "kind": "descriptor",
+      "command": "layout.previous"
+    },
+    {
+      "id": "Request::PreviousWindow",
+      "kind": "descriptor",
+      "command": "window.previous"
+    },
+    {
+      "id": "Request::RefreshClient",
+      "kind": "descriptor",
+      "command": "client.refresh"
+    },
+    {
+      "id": "Request::ReleaseSessionLease",
+      "kind": "descriptor",
+      "command": "session.lease.release"
+    },
+    {
+      "id": "Request::RenameSession",
+      "kind": "descriptor",
+      "command": "session.rename"
+    },
+    {
+      "id": "Request::RenameWindow",
+      "kind": "descriptor",
+      "command": "window.rename"
+    },
+    {
+      "id": "Request::RenewSessionLease",
+      "kind": "descriptor",
+      "command": "session.lease.renew"
+    },
+    {
+      "id": "Request::ResizePane",
+      "kind": "descriptor",
+      "command": "pane.resize"
+    },
+    {
+      "id": "Request::ResizePaneTargetAction",
+      "kind": "descriptor",
+      "command": "pane.resize"
+    },
+    {
+      "id": "Request::ResizeWindow",
+      "kind": "descriptor",
+      "command": "window.resize"
+    },
+    {
+      "id": "Request::ResolveTarget",
+      "kind": "descriptor",
+      "command": "target.resolve"
+    },
+    {
+      "id": "Request::RespawnPane",
+      "kind": "descriptor",
+      "command": "pane.respawn"
+    },
+    {
+      "id": "Request::RespawnWindow",
+      "kind": "descriptor",
+      "command": "window.respawn"
+    },
+    {
+      "id": "Request::RotateWindow",
+      "kind": "descriptor",
+      "command": "window.rotate"
+    },
+    {
+      "id": "Request::RunShell",
+      "kind": "descriptor",
+      "command": "shell.run"
+    },
+    {
+      "id": "Request::SaveBuffer",
+      "kind": "descriptor",
+      "command": "buffer.save"
+    },
+    {
+      "id": "Request::SdkWaitForOutput",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "Request::SdkWaitForOutputRef",
+      "kind": "descriptor",
+      "command": "terminal.wait_for_output"
+    },
+    {
+      "id": "Request::SelectCustomLayout",
+      "kind": "descriptor",
+      "command": "layout.select"
+    },
+    {
+      "id": "Request::SelectLayout",
+      "kind": "descriptor",
+      "command": "layout.select"
+    },
+    {
+      "id": "Request::SelectOldLayout",
+      "kind": "descriptor",
+      "command": "layout.old"
+    },
+    {
+      "id": "Request::SelectPane",
+      "kind": "descriptor",
+      "command": "pane.select"
+    },
+    {
+      "id": "Request::SelectPaneAdjacent",
+      "kind": "descriptor",
+      "command": "pane.focus_direction"
+    },
+    {
+      "id": "Request::SelectPaneMark",
+      "kind": "descriptor",
+      "command": "pane.mark"
+    },
+    {
+      "id": "Request::SelectWindow",
+      "kind": "descriptor",
+      "command": "window.select"
+    },
+    {
+      "id": "Request::SendKeys",
+      "kind": "descriptor",
+      "command": "terminal.send_keys"
+    },
+    {
+      "id": "Request::SendKeysExt",
+      "kind": "descriptor",
+      "command": "terminal.send_keys"
+    },
+    {
+      "id": "Request::SendKeysExt2",
+      "kind": "descriptor",
+      "command": "terminal.send_keys"
+    },
+    {
+      "id": "Request::SendPrefix",
+      "kind": "descriptor",
+      "command": "terminal.send_prefix"
+    },
+    {
+      "id": "Request::ServerAccess",
+      "kind": "descriptor",
+      "command": "server.access"
+    },
+    {
+      "id": "Request::SetBuffer",
+      "kind": "descriptor",
+      "command": "buffer.set"
+    },
+    {
+      "id": "Request::SetEnvironment",
+      "kind": "descriptor",
+      "command": "environment.set"
+    },
+    {
+      "id": "Request::SetHook",
+      "kind": "descriptor",
+      "command": "hook.set"
+    },
+    {
+      "id": "Request::SetHookMutation",
+      "kind": "descriptor",
+      "command": "hook.set"
+    },
+    {
+      "id": "Request::SetOption",
+      "kind": "descriptor",
+      "command": "option.set"
+    },
+    {
+      "id": "Request::SetOptionByName",
+      "kind": "descriptor",
+      "command": "option.set"
+    },
+    {
+      "id": "Request::ShowBuffer",
+      "kind": "descriptor",
+      "command": "buffer.get"
+    },
+    {
+      "id": "Request::ShowEnvironment",
+      "kind": "descriptor",
+      "command": "environment.list"
+    },
+    {
+      "id": "Request::ShowHooks",
+      "kind": "descriptor",
+      "command": "hook.list"
+    },
+    {
+      "id": "Request::ShowMessages",
+      "kind": "descriptor",
+      "command": "server.messages"
+    },
+    {
+      "id": "Request::ShowOptions",
+      "kind": "descriptor",
+      "command": "option.list"
+    },
+    {
+      "id": "Request::ShutdownIfIdle",
+      "kind": "descriptor",
+      "command": "server.shutdown_if_idle"
+    },
+    {
+      "id": "Request::SourceFile",
+      "kind": "descriptor",
+      "command": "config.source_file"
+    },
+    {
+      "id": "Request::SplitWindow",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "Request::SplitWindowExt",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "Request::SplitWindowIdentity",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "Request::SplitWindowTargetAction",
+      "kind": "descriptor",
+      "command": "pane.split"
+    },
+    {
+      "id": "Request::SpreadLayout",
+      "kind": "descriptor",
+      "command": "layout.spread"
+    },
+    {
+      "id": "Request::SubscribePaneOutput",
+      "kind": "descriptor",
+      "command": "terminal.output.subscribe"
+    },
+    {
+      "id": "Request::SubscribePaneOutputRef",
+      "kind": "descriptor",
+      "command": "terminal.output.subscribe"
+    },
+    {
+      "id": "Request::SubscribePaneState",
+      "kind": "descriptor",
+      "command": "terminal.observe"
+    },
+    {
+      "id": "Request::SuspendClient",
+      "kind": "descriptor",
+      "command": "client.suspend"
+    },
+    {
+      "id": "Request::SwapPane",
+      "kind": "descriptor",
+      "command": "pane.swap"
+    },
+    {
+      "id": "Request::SwapWindow",
+      "kind": "descriptor",
+      "command": "window.swap"
+    },
+    {
+      "id": "Request::SwitchClient",
+      "kind": "descriptor",
+      "command": "session.switch"
+    },
+    {
+      "id": "Request::SwitchClientExt",
+      "kind": "descriptor",
+      "command": "session.switch"
+    },
+    {
+      "id": "Request::SwitchClientExt2",
+      "kind": "descriptor",
+      "command": "session.switch"
+    },
+    {
+      "id": "Request::SwitchClientExt3",
+      "kind": "descriptor",
+      "command": "session.switch"
+    },
+    {
+      "id": "Request::UnbindKey",
+      "kind": "descriptor",
+      "command": "key.unbind"
+    },
+    {
+      "id": "Request::UnlinkWindow",
+      "kind": "descriptor",
+      "command": "window.unlink"
+    },
+    {
+      "id": "Request::UnsubscribePaneOutput",
+      "kind": "descriptor",
+      "command": "terminal.output.unsubscribe"
+    },
+    {
+      "id": "Request::UnsubscribePaneState",
+      "kind": "descriptor",
+      "command": "event.unsubscribe"
+    },
+    {
+      "id": "Request::WaitFor",
+      "kind": "descriptor",
+      "command": "synchronization.wait"
+    },
+    {
+      "id": "Request::WebShare",
+      "kind": "service_required",
+      "service": "rmux.web-share"
+    }
+  ]
+}

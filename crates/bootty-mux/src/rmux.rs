@@ -1,19 +1,25 @@
 use anyhow::{Context, Result};
-use rmux_proto::{ListPanesRequest, ListWindowsRequest, Request, Response};
+use rmux_proto::{ListPanesRequest, ListWindowsRequest, Request, Response, RmuxError};
 use rmux_sdk::{Rmux, SessionName};
+
+use crate::operation::{
+    MuxAllocatedResources, MuxBackendCommandCompletion, MuxBackendOperationError, MuxEventTarget,
+};
 
 #[cfg(feature = "app")]
 use crate::rmux_bridge::resize_rmux_window;
-use crate::rmux_bridge::{rmux_execute, rmux_snapshot};
+use crate::rmux_bridge::{
+    rmux_execute, rmux_launch_session, rmux_snapshot, supports_rmux_session_launch_plan,
+};
 
 #[cfg(feature = "app")]
 use super::{
-    backend::MuxBackend,
-    capability::{BindingCapabilityDescriptor, BindingOperation},
+    backend::{MuxBackend, MuxEvent, MuxEventCapability, MuxEventTopic},
+    capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
     controller::MuxScope,
 };
 use super::{
-    command::{MuxCommand, MuxSplitDirection},
+    command::{MuxCommand, MuxDirection, MuxPaneResize, MuxSessionLaunchPlan, MuxSplitDirection},
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxPaneSplitDirection, MuxSession, MuxSnapshot, MuxWindow,
     },
@@ -22,7 +28,7 @@ use super::{
 
 const RMUX_FIELD_SEPARATOR: char = '\u{1f}';
 pub(crate) const RMUX_WINDOW_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{window_name}\u{1f}#{window_layout}";
-pub(crate) const RMUX_PANE_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_current_command}";
+pub(crate) const RMUX_PANE_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{pane_tty}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_current_command}\u{1f}#{pane_lifecycle_generation}";
 
 pub trait RmuxSessionClient {
     fn snapshot(&self) -> Result<MuxSnapshot>;
@@ -46,10 +52,83 @@ pub trait RmuxSessionClient {
         direction: MuxSplitDirection,
     ) -> Result<()>;
     fn close_pane(&self, session_name: &str, pane_id: Option<&str>) -> Result<()>;
+
+    fn select_pane(
+        &self,
+        session_name: &str,
+        window_id: Option<&str>,
+        direction: MuxDirection,
+    ) -> Result<()>;
+    fn select_next_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()>;
+    fn select_previous_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()>;
+    fn select_last_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()>;
+    fn resize_pane(
+        &self,
+        session_name: &str,
+        pane_id: Option<&str>,
+        adjustment: MuxPaneResize,
+    ) -> Result<()>;
+    fn toggle_pane_zoom(&self, session_name: &str, pane_id: Option<&str>) -> Result<()>;
+
+    fn launch_session(&self, plan: MuxSessionLaunchPlan) -> Result<()> {
+        anyhow::bail!(
+            "rmux client does not support recursive session launch {:?}",
+            plan.session_id
+        )
+    }
+
+    fn launch_session_with_allocation(
+        &self,
+        plan: MuxSessionLaunchPlan,
+    ) -> Result<Option<MuxAllocatedResources>> {
+        self.launch_session(plan)?;
+        Ok(None)
+    }
+
+    #[cfg(feature = "app")]
+    fn session_launch_capability(
+        &self,
+        _plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        BindingOperationOutcome::Unsupported
+    }
+
+    #[cfg(feature = "app")]
+    fn launch_session_outcome(
+        &self,
+        _plan: MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<Result<()>> {
+        BindingOperationOutcome::Unsupported
+    }
+
+    #[cfg(feature = "app")]
+    fn event_capabilities(&self) -> Vec<MuxEventCapability> {
+        MuxEventTopic::ALL
+            .into_iter()
+            .map(|topic| {
+                MuxEventCapability::unsupported(
+                    topic,
+                    "rmux client does not expose an embedded SDK event source",
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "app")]
+    fn start_event_stream(&self) {}
+
+    #[cfg(feature = "app")]
+    fn drain_events(&self, _scope: MuxScope, _maximum: usize) -> Vec<MuxEvent> {
+        Vec::new()
+    }
+
+    #[cfg(feature = "app")]
+    fn topology_invalidated(&self) {}
 }
 
 pub struct RmuxBackend<C = SdkRmuxClient> {
     client: C,
+    authoritative_completion: Option<MuxBackendCommandCompletion>,
 }
 
 impl RmuxBackend<SdkRmuxClient> {
@@ -66,7 +145,10 @@ impl Default for RmuxBackend<SdkRmuxClient> {
 
 impl<C> RmuxBackend<C> {
     pub fn with_client(client: C) -> Self {
-        Self { client }
+        Self {
+            client,
+            authoritative_completion: None,
+        }
     }
 }
 
@@ -75,13 +157,74 @@ impl<C: RmuxSessionClient> RmuxBackend<C> {
         self.client.snapshot()
     }
 
+    #[cfg(feature = "app")]
+    fn rmux_session_launch_capability(
+        &self,
+        plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        if plan.validate().is_err() || !supports_rmux_session_launch_plan(plan) {
+            return BindingOperationOutcome::Unsupported;
+        }
+        self.client.session_launch_capability(plan)
+    }
+
+    #[cfg(feature = "app")]
+    fn require_rmux_session_launch(&self, plan: &MuxSessionLaunchPlan) -> Result<()> {
+        match self.rmux_session_launch_capability(plan) {
+            BindingOperationOutcome::Supported(()) => Ok(()),
+            BindingOperationOutcome::Unsupported => Err(MuxBackendOperationError::unsupported(
+                "rmux backend cannot preserve this recursive session launch plan",
+            )
+            .into()),
+            BindingOperationOutcome::Unavailable => Err(MuxBackendOperationError::Unavailable(
+                "rmux session launch is unavailable".to_owned(),
+            )
+            .into()),
+            BindingOperationOutcome::Denied => Err(MuxBackendOperationError::Denied(
+                "rmux session launch was denied".to_owned(),
+            )
+            .into()),
+            BindingOperationOutcome::Stale => Err(MuxBackendOperationError::stale(
+                "rmux session launch capability is stale",
+            )
+            .into()),
+        }
+    }
     pub fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        self.authoritative_completion = None;
         match command {
             MuxCommand::ActivateWindow {
                 session_id,
                 window_id,
             } => {
                 self.client.activate_window(&session_id, &window_id)?;
+            }
+            MuxCommand::CreateSession { plan } => {
+                #[cfg(feature = "app")]
+                self.require_rmux_session_launch(&plan)?;
+                #[cfg(not(feature = "app"))]
+                {
+                    plan.validate()?;
+                    if !supports_rmux_session_launch_plan(&plan) {
+                        return Err(MuxBackendOperationError::unsupported(
+                            "rmux backend cannot preserve this recursive session launch plan",
+                        )
+                        .into());
+                    }
+                }
+                let requested_session_id = plan.session_id.clone();
+                let allocated = self.client.launch_session_with_allocation(plan)?;
+                let target = MuxEventTarget::session(
+                    allocated
+                        .as_ref()
+                        .map_or(requested_session_id, |allocated| {
+                            allocated.session_id.clone()
+                        }),
+                );
+                self.authoritative_completion = Some(MuxBackendCommandCompletion {
+                    allocated,
+                    target: Some(target),
+                });
             }
             MuxCommand::CreateProjectSession { session_id, cwd }
             | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
@@ -142,6 +285,35 @@ impl<C: RmuxSessionClient> RmuxBackend<C> {
                 self.client
                     .split_pane(&session_id, pane_id.as_deref(), direction)?;
             }
+            MuxCommand::SelectPane {
+                session_id,
+                window_id,
+                direction,
+            } => {
+                self.client
+                    .select_pane(&session_id, window_id.as_deref(), direction)?;
+            }
+            MuxCommand::SelectNextPane {
+                session_id,
+                window_id,
+            } => {
+                self.client
+                    .select_next_pane(&session_id, window_id.as_deref())?;
+            }
+            MuxCommand::SelectPreviousPane {
+                session_id,
+                window_id,
+            } => {
+                self.client
+                    .select_previous_pane(&session_id, window_id.as_deref())?;
+            }
+            MuxCommand::SelectLastPane {
+                session_id,
+                window_id,
+            } => {
+                self.client
+                    .select_last_pane(&session_id, window_id.as_deref())?;
+            }
             MuxCommand::KillPane {
                 session_id,
                 pane_id,
@@ -152,14 +324,36 @@ impl<C: RmuxSessionClient> RmuxBackend<C> {
             } => {
                 self.client.close_pane(&session_id, pane_id.as_deref())?;
             }
-            MuxCommand::SelectPane { .. }
-            | MuxCommand::SelectNextPane { .. }
-            | MuxCommand::SelectPreviousPane { .. }
-            | MuxCommand::TogglePaneZoom { .. } => {
-                anyhow::bail!("rmux backend does not support mux command {command:?}");
+            MuxCommand::ResizePane {
+                session_id,
+                pane_id,
+                adjustment,
+            } => {
+                if !adjustment.is_valid() {
+                    return Err(MuxBackendOperationError::Failed(
+                        "rmux pane resize requires every supplied dimension to be positive"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+                self.client
+                    .resize_pane(&session_id, pane_id.as_deref(), adjustment)?;
+            }
+            MuxCommand::TogglePaneZoom {
+                session_id,
+                pane_id,
+            } => {
+                self.client
+                    .toggle_pane_zoom(&session_id, pane_id.as_deref())?;
             }
         }
+        #[cfg(feature = "app")]
+        self.client.topology_invalidated();
         Ok(())
+    }
+
+    pub fn take_authoritative_completion(&mut self) -> Option<MuxBackendCommandCompletion> {
+        self.authoritative_completion.take()
     }
 }
 
@@ -173,8 +367,64 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
         RmuxBackend::execute(self, command)
     }
 
+    fn execute_session_launch(
+        &mut self,
+        plan: MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<Result<()>> {
+        self.authoritative_completion = None;
+        match self.rmux_session_launch_capability(&plan) {
+            BindingOperationOutcome::Supported(()) => {}
+            BindingOperationOutcome::Unsupported => return BindingOperationOutcome::Unsupported,
+            BindingOperationOutcome::Unavailable => return BindingOperationOutcome::Unavailable,
+            BindingOperationOutcome::Denied => return BindingOperationOutcome::Denied,
+            BindingOperationOutcome::Stale => return BindingOperationOutcome::Stale,
+        }
+        let requested_session_id = plan.session_id.clone();
+        match self.client.launch_session_with_allocation(plan) {
+            Ok(allocated) => {
+                let target = MuxEventTarget::session(
+                    allocated
+                        .as_ref()
+                        .map_or(requested_session_id, |allocated| {
+                            allocated.session_id.clone()
+                        }),
+                );
+                self.authoritative_completion = Some(MuxBackendCommandCompletion {
+                    allocated,
+                    target: Some(target),
+                });
+                self.client.topology_invalidated();
+                BindingOperationOutcome::Supported(Ok(()))
+            }
+            Err(error) => BindingOperationOutcome::Supported(Err(error)),
+        }
+    }
+
+    fn session_launch_capability(
+        &self,
+        plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        self.rmux_session_launch_capability(plan)
+    }
+
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
         rmux_capabilities(scope)
+    }
+
+    fn event_capabilities(&self) -> Vec<MuxEventCapability> {
+        self.client.event_capabilities()
+    }
+
+    fn start_event_stream(&mut self) {
+        self.client.start_event_stream();
+    }
+
+    fn drain_events(&mut self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
+        self.client.drain_events(scope, maximum)
+    }
+
+    fn take_authoritative_completion(&mut self) -> Option<MuxBackendCommandCompletion> {
+        RmuxBackend::take_authoritative_completion(self)
     }
 }
 
@@ -192,7 +442,11 @@ pub fn rmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
             BindingOperation::NavigateWindow,
             BindingOperation::MoveWindow,
             BindingOperation::SplitPane,
+            BindingOperation::NavigatePane,
+            BindingOperation::LastPane,
+            BindingOperation::ResizePane,
             BindingOperation::ClosePane,
+            BindingOperation::TogglePaneZoom,
             BindingOperation::CreateProjectSession,
             BindingOperation::CreateWorktreeSession,
             BindingOperation::RenameSession,
@@ -220,6 +474,45 @@ impl RmuxSessionClient for SdkRmuxClient {
         rmux_snapshot()
     }
 
+    fn launch_session(&self, plan: MuxSessionLaunchPlan) -> Result<()> {
+        rmux_execute(MuxCommand::CreateSession { plan })
+    }
+
+    fn launch_session_with_allocation(
+        &self,
+        plan: MuxSessionLaunchPlan,
+    ) -> Result<Option<MuxAllocatedResources>> {
+        rmux_launch_session(plan).map(Some)
+    }
+
+    #[cfg(feature = "app")]
+    fn session_launch_capability(
+        &self,
+        plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        (plan.validate().is_ok() && supports_rmux_session_launch_plan(plan))
+            .then_some(())
+            .map_or(
+                BindingOperationOutcome::Unsupported,
+                BindingOperationOutcome::Supported,
+            )
+    }
+
+    #[cfg(feature = "app")]
+    fn launch_session_outcome(
+        &self,
+        plan: MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<Result<()>> {
+        match self.session_launch_capability(&plan) {
+            BindingOperationOutcome::Supported(()) => {
+                BindingOperationOutcome::Supported(self.launch_session(plan))
+            }
+            BindingOperationOutcome::Unsupported => BindingOperationOutcome::Unsupported,
+            BindingOperationOutcome::Unavailable => BindingOperationOutcome::Unavailable,
+            BindingOperationOutcome::Denied => BindingOperationOutcome::Denied,
+            BindingOperationOutcome::Stale => BindingOperationOutcome::Stale,
+        }
+    }
     fn ensure_session(&self, session_name: &str, cwd: &str) -> Result<()> {
         rmux_execute(MuxCommand::CreateProjectSession {
             session_id: session_name.to_owned(),
@@ -314,6 +607,80 @@ impl RmuxSessionClient for SdkRmuxClient {
             pane_id: pane_id.map(str::to_owned),
         })
     }
+
+    fn select_pane(
+        &self,
+        session_name: &str,
+        window_id: Option<&str>,
+        direction: MuxDirection,
+    ) -> Result<()> {
+        rmux_execute(MuxCommand::SelectPane {
+            session_id: session_name.to_owned(),
+            window_id: window_id.map(str::to_owned),
+            direction,
+        })
+    }
+
+    fn select_next_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+        rmux_execute(MuxCommand::SelectNextPane {
+            session_id: session_name.to_owned(),
+            window_id: window_id.map(str::to_owned),
+        })
+    }
+
+    fn select_previous_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+        rmux_execute(MuxCommand::SelectPreviousPane {
+            session_id: session_name.to_owned(),
+            window_id: window_id.map(str::to_owned),
+        })
+    }
+
+    fn select_last_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+        rmux_execute(MuxCommand::SelectLastPane {
+            session_id: session_name.to_owned(),
+            window_id: window_id.map(str::to_owned),
+        })
+    }
+
+    fn resize_pane(
+        &self,
+        session_name: &str,
+        pane_id: Option<&str>,
+        adjustment: MuxPaneResize,
+    ) -> Result<()> {
+        rmux_execute(MuxCommand::ResizePane {
+            session_id: session_name.to_owned(),
+            pane_id: pane_id.map(str::to_owned),
+            adjustment,
+        })
+    }
+
+    fn toggle_pane_zoom(&self, session_name: &str, pane_id: Option<&str>) -> Result<()> {
+        rmux_execute(MuxCommand::TogglePaneZoom {
+            session_id: session_name.to_owned(),
+            pane_id: pane_id.map(str::to_owned),
+        })
+    }
+
+    #[cfg(feature = "app")]
+    fn event_capabilities(&self) -> Vec<MuxEventCapability> {
+        crate::rmux_events::event_capabilities()
+    }
+
+    #[cfg(feature = "app")]
+    fn start_event_stream(&self) {
+        crate::rmux_events::start();
+    }
+
+    #[cfg(feature = "app")]
+    fn drain_events(&self, scope: MuxScope, maximum: usize) -> Vec<MuxEvent> {
+        crate::rmux_events::drain_events(scope, maximum)
+    }
+
+    #[cfg(feature = "app")]
+    fn topology_invalidated(&self) {
+        crate::rmux_events::topology_invalidated();
+    }
 }
 
 #[cfg(feature = "app")]
@@ -336,10 +703,15 @@ pub(crate) struct RmuxPaneRow {
     pub(crate) session_name: String,
     pub(crate) window_id: String,
     pub(crate) pane_id: String,
+    /// Backend-reported terminal identity hosted by this pane. It is absent when the backend
+    /// cannot report a terminal identity; callers must not infer it from `pane_id`.
+    pub(crate) terminal_id: Option<String>,
     pub(crate) index: u32,
     pub(crate) active: bool,
     pub(crate) cwd: Option<String>,
     pub(crate) process: Option<String>,
+    /// Rmux's lifecycle generation distinguishes process replacements that retain pane identity.
+    pub(crate) occupant_id: Option<String>,
 }
 
 pub(crate) async fn list_window_rows(
@@ -382,16 +754,102 @@ pub(crate) async fn list_pane_rows(_rmux: &Rmux, name: &SessionName) -> Result<V
         .collect()
 }
 
+#[derive(Clone, Copy)]
+enum RmuxResponseOutcome {
+    Unsupported,
+    Unavailable,
+    Denied,
+    Stale,
+    Failed,
+}
+
+fn rmux_daemon_message_outcome(message: &str) -> RmuxResponseOutcome {
+    if message == "no current client" || message.starts_with("server is shutting down") {
+        return RmuxResponseOutcome::Unavailable;
+    }
+    if message == "client is read-only" {
+        return RmuxResponseOutcome::Denied;
+    }
+    if message.contains("target was replaced")
+        || message.contains("target retired")
+        || message.contains("target changed")
+        || message.contains("identity changed")
+        || message.contains("no longer exists")
+    {
+        return RmuxResponseOutcome::Stale;
+    }
+
+    let kind = message
+        .split_once(':')
+        .map_or(message, |(kind, _)| kind)
+        .trim();
+    if kind.eq_ignore_ascii_case("unsupported") {
+        RmuxResponseOutcome::Unsupported
+    } else if kind.eq_ignore_ascii_case("unavailable") {
+        RmuxResponseOutcome::Unavailable
+    } else if kind.eq_ignore_ascii_case("denied") {
+        RmuxResponseOutcome::Denied
+    } else if kind.eq_ignore_ascii_case("stale") {
+        RmuxResponseOutcome::Stale
+    } else {
+        RmuxResponseOutcome::Failed
+    }
+}
+
+fn rmux_response_outcome(error: &RmuxError) -> Option<RmuxResponseOutcome> {
+    match error {
+        RmuxError::UnknownCommand(_) | RmuxError::UnsupportedCapability { .. } => {
+            Some(RmuxResponseOutcome::Unsupported)
+        }
+        RmuxError::SessionNotFound(_)
+        | RmuxError::PaneNotFound { .. }
+        | RmuxError::OwnedSessionLeaseLost { .. } => Some(RmuxResponseOutcome::Stale),
+        RmuxError::ProcessStillRunning => Some(RmuxResponseOutcome::Denied),
+        RmuxError::Server(message) | RmuxError::Message(message) => {
+            Some(rmux_daemon_message_outcome(message))
+        }
+        RmuxError::UnsupportedWireVersion { .. }
+        | RmuxError::FrameTooLarge { .. }
+        | RmuxError::EmptyFrame
+        | RmuxError::BadFrameMagic(_)
+        | RmuxError::IncompleteFrame { .. }
+        | RmuxError::Encode(_)
+        | RmuxError::Decode(_) => None,
+        RmuxError::EmptySessionName
+        | RmuxError::InvalidSessionNameCharacter
+        | RmuxError::InvalidTarget { .. }
+        | RmuxError::DuplicateSession(_)
+        | RmuxError::InvalidSetOption(_)
+        | RmuxError::SpawnFailed { .. } => Some(RmuxResponseOutcome::Failed),
+    }
+}
+
+pub(crate) fn rmux_response_checked(response: Response) -> Result<Response> {
+    let Response::Error(error) = response else {
+        return Ok(response);
+    };
+    let message = error.error.to_string();
+    let Some(outcome) = rmux_response_outcome(&error.error) else {
+        return Err(anyhow::Error::msg(format!(
+            "rmux request failed: {message}"
+        )));
+    };
+    Err(match outcome {
+        RmuxResponseOutcome::Unsupported => MuxBackendOperationError::Unsupported(message).into(),
+        RmuxResponseOutcome::Unavailable => MuxBackendOperationError::Unavailable(message).into(),
+        RmuxResponseOutcome::Denied => MuxBackendOperationError::Denied(message).into(),
+        RmuxResponseOutcome::Stale => MuxBackendOperationError::Stale(message).into(),
+        RmuxResponseOutcome::Failed => MuxBackendOperationError::Failed(message).into(),
+    })
+}
+
 pub(crate) async fn rmux_request(request: Request) -> Result<Response> {
     let endpoint = crate::bootty_rmux_endpoint_path().context("resolve Bootty rmux endpoint")?;
     let response =
         tokio::task::spawn_blocking(move || rmux_client::connect(&endpoint)?.roundtrip(&request))
             .await
             .context("join rmux request")??;
-    if let Response::Error(error) = response {
-        anyhow::bail!("rmux request failed: {}", error.error);
-    }
-    Ok(response)
+    rmux_response_checked(response)
 }
 
 pub(crate) async fn rmux_request_checked(request: Request) -> Result<()> {
@@ -419,24 +877,31 @@ fn parse_window_row(line: &str) -> Result<RmuxWindowRow> {
 }
 
 fn parse_pane_row(line: &str) -> Result<RmuxPaneRow> {
-    let mut fields = line.splitn(7, RMUX_FIELD_SEPARATOR);
+    let mut fields = line.splitn(9, RMUX_FIELD_SEPARATOR);
     let session_name = next_rmux_field(&mut fields, "pane session")?.to_owned();
     let window_id = next_rmux_field(&mut fields, "pane window id")?.to_owned();
     let pane_id = next_rmux_field(&mut fields, "pane id")?.to_owned();
+    let terminal_id = non_empty_rmux_field(next_rmux_field(&mut fields, "pane terminal id")?);
     let index = next_rmux_field(&mut fields, "pane index")?
         .parse::<u32>()
         .with_context(|| format!("invalid rmux pane index in {line:?}"))?;
     let active = parse_rmux_bool(next_rmux_field(&mut fields, "pane active")?);
     let cwd = non_empty_rmux_field(next_rmux_field(&mut fields, "pane cwd")?);
     let process = non_empty_rmux_field(next_rmux_field(&mut fields, "pane process")?);
+    let occupant_id = fields
+        .next()
+        .and_then(non_empty_rmux_field)
+        .map(|generation| format!("rmux:{pane_id}:generation:{generation}"));
     Ok(RmuxPaneRow {
         session_name,
         window_id,
+        terminal_id,
         pane_id,
         index,
         active,
         cwd,
         process,
+        occupant_id,
     })
 }
 
@@ -536,9 +1001,11 @@ pub(crate) fn session_from_rows(
                 .unwrap_or_else(|| MuxPaneAnchor {
                     session_id: name.to_owned(),
                     pane_id: None,
+                    terminal_id: None,
                     pane_pid: None,
                     cwd: None,
                     process: None,
+                    occupant_id: None,
                 });
             MuxWindow {
                 id: window.id.clone(),
@@ -574,9 +1041,11 @@ pub(crate) fn session_from_rows(
         .unwrap_or_else(|| MuxPaneAnchor {
             session_id: name.to_owned(),
             pane_id: None,
+            terminal_id: None,
             pane_pid: None,
             cwd: None,
             process: None,
+            occupant_id: None,
         });
 
     MuxSession {
@@ -593,9 +1062,11 @@ fn anchor_for_pane_row(session_name: &str, pane: &RmuxPaneRow) -> MuxPaneAnchor 
     MuxPaneAnchor {
         session_id: session_name.to_owned(),
         pane_id: Some(pane.pane_id.clone()),
+        terminal_id: pane.terminal_id.clone(),
         pane_pid: None,
         cwd: pane.cwd.clone(),
         process: pane.process.clone(),
+        occupant_id: pane.occupant_id.clone(),
     }
 }
 
@@ -604,7 +1075,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::command::MuxCommand;
+    use crate::command::{MuxCommand, MuxDirection, MuxPaneResize};
     #[cfg(feature = "app")]
     use rmux_sdk::{PaneId, TerminalSizeSpec};
 
@@ -613,6 +1084,136 @@ mod tests {
             .enable_all()
             .build()?
             .block_on(rmux_request(request))
+    }
+
+    fn rmux_response_error(error: rmux_proto::RmuxError) -> anyhow::Error {
+        rmux_response_checked(Response::Error(rmux_proto::ErrorResponse { error }))
+            .expect_err("rmux error response must fail")
+    }
+
+    #[test]
+    fn rmux_protocol_response_errors_keep_backend_outcome_types() {
+        let cases = [
+            (
+                rmux_proto::RmuxError::UnknownCommand("future-command".to_owned()),
+                MuxBackendOperationError::Unsupported("unknown command: future-command".to_owned()),
+            ),
+            (
+                rmux_proto::RmuxError::Server(
+                    "server is shutting down; mutation was not started".to_owned(),
+                ),
+                MuxBackendOperationError::Unavailable(
+                    "server error: server is shutting down; mutation was not started".to_owned(),
+                ),
+            ),
+            (
+                rmux_proto::RmuxError::Server("client is read-only".to_owned()),
+                MuxBackendOperationError::Denied("server error: client is read-only".to_owned()),
+            ),
+            (
+                rmux_proto::RmuxError::SessionNotFound("project".to_owned()),
+                MuxBackendOperationError::Stale("session not found: project".to_owned()),
+            ),
+            (
+                rmux_proto::RmuxError::InvalidSetOption(
+                    "resize dimensions must be positive".to_owned(),
+                ),
+                MuxBackendOperationError::Failed(
+                    "invalid set-option request: resize dimensions must be positive".to_owned(),
+                ),
+            ),
+        ];
+
+        for (protocol_error, expected) in cases {
+            let error = rmux_response_error(protocol_error);
+            assert_eq!(
+                error.downcast_ref::<MuxBackendOperationError>(),
+                Some(&expected),
+                "rmux protocol error should retain its backend outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn rmux_pane_rows_preserve_terminal_identity_independently() {
+        let row = parse_pane_row("$1\x1f@1\x1f%p\x1ft1\x1f0\x1f1\x1f/repo\x1fzsh\x1f7")
+            .expect("parse pane row");
+        assert_eq!(row.pane_id, "%p");
+        assert_eq!(row.terminal_id.as_deref(), Some("t1"));
+
+        let anchor = anchor_for_pane_row("$1", &row);
+        assert_eq!(anchor.pane_id.as_deref(), Some("%p"));
+        assert_eq!(anchor.terminal_id.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn rmux_protocol_stale_errors_preserve_the_exact_target() {
+        let error = rmux_response_error(rmux_proto::RmuxError::PaneNotFound {
+            session_name: rmux_proto::SessionName::new("project").expect("valid session"),
+            pane_id: rmux_proto::PaneId::new(7),
+        });
+
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Stale(
+                "invalid target 'project:%7': pane id does not exist in session".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn rmux_protocol_invalid_targets_are_failed_and_preserve_the_exact_target() {
+        let error = rmux_response_error(rmux_proto::RmuxError::InvalidTarget {
+            value: "project:not-a-pane".to_owned(),
+            reason: "pane index must be numeric".to_owned(),
+        });
+
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Failed(
+                "invalid target 'project:not-a-pane': pane index must be numeric".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn rmux_protocol_unknown_response_errors_fall_back_to_typed_failure() {
+        let error = rmux_response_error(rmux_proto::RmuxError::Server(
+            "unrecognized daemon rejection".to_owned(),
+        ));
+
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Failed(
+                "server error: unrecognized daemon rejection".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
+    fn rmux_protocol_serialization_response_errors_remain_generic() {
+        let error = rmux_response_error(rmux_proto::RmuxError::Decode(
+            "truncated payload".to_owned(),
+        ));
+
+        assert!(
+            error.downcast_ref::<MuxBackendOperationError>().is_none(),
+            "serialization failures must remain generic"
+        );
+        assert_eq!(
+            error.to_string(),
+            "rmux request failed: failed to decode frame payload: truncated payload"
+        );
+
+        let error = rmux_response_error(rmux_proto::RmuxError::UnsupportedWireVersion {
+            got: 2,
+            minimum: 1,
+            maximum: 1,
+        });
+        assert!(
+            error.downcast_ref::<MuxBackendOperationError>().is_none(),
+            "wire compatibility failures must remain generic"
+        );
     }
 
     #[derive(Clone, Default)]
@@ -751,6 +1352,72 @@ mod tests {
             ]);
             Ok(())
         }
+
+        fn select_pane(
+            &self,
+            session_name: &str,
+            window_id: Option<&str>,
+            direction: MuxDirection,
+        ) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+                format!("{direction:?}"),
+            ]);
+            Ok(())
+        }
+
+        fn select_next_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_next_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn select_previous_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_previous_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn select_last_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_last_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn resize_pane(
+            &self,
+            session_name: &str,
+            pane_id: Option<&str>,
+            adjustment: MuxPaneResize,
+        ) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "resize_pane".to_owned(),
+                session_name.to_owned(),
+                pane_id.unwrap_or_default().to_owned(),
+                format!("{adjustment:?}"),
+            ]);
+            Ok(())
+        }
+
+        fn toggle_pane_zoom(&self, session_name: &str, pane_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "toggle_pane_zoom".to_owned(),
+                session_name.to_owned(),
+                pane_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
     }
 
     #[derive(Clone, Default)]
@@ -879,6 +1546,72 @@ mod tests {
             ]);
             Ok(())
         }
+
+        fn select_pane(
+            &self,
+            session_name: &str,
+            window_id: Option<&str>,
+            direction: MuxDirection,
+        ) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+                format!("{direction:?}"),
+            ]);
+            Ok(())
+        }
+
+        fn select_next_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_next_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn select_previous_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_previous_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn select_last_pane(&self, session_name: &str, window_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "select_last_pane".to_owned(),
+                session_name.to_owned(),
+                window_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
+
+        fn resize_pane(
+            &self,
+            session_name: &str,
+            pane_id: Option<&str>,
+            adjustment: MuxPaneResize,
+        ) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "resize_pane".to_owned(),
+                session_name.to_owned(),
+                pane_id.unwrap_or_default().to_owned(),
+                format!("{adjustment:?}"),
+            ]);
+            Ok(())
+        }
+
+        fn toggle_pane_zoom(&self, session_name: &str, pane_id: Option<&str>) -> Result<()> {
+            self.calls.borrow_mut().push(vec![
+                "toggle_pane_zoom".to_owned(),
+                session_name.to_owned(),
+                pane_id.unwrap_or_default().to_owned(),
+            ]);
+            Ok(())
+        }
     }
 
     #[test]
@@ -983,6 +1716,39 @@ mod tests {
                 delta: -1,
             })
             .unwrap();
+        for command in [
+            MuxCommand::SelectPane {
+                session_id: "project".to_owned(),
+                window_id: Some("@2".to_owned()),
+                direction: MuxDirection::Right,
+            },
+            MuxCommand::SelectNextPane {
+                session_id: "project".to_owned(),
+                window_id: Some("@2".to_owned()),
+            },
+            MuxCommand::SelectPreviousPane {
+                session_id: "project".to_owned(),
+                window_id: Some("@2".to_owned()),
+            },
+            MuxCommand::SelectLastPane {
+                session_id: "project".to_owned(),
+                window_id: Some("@2".to_owned()),
+            },
+            MuxCommand::ResizePane {
+                session_id: "project".to_owned(),
+                pane_id: Some("%4".to_owned()),
+                adjustment: MuxPaneResize::Directional {
+                    direction: MuxDirection::Down,
+                    cells: 3,
+                },
+            },
+            MuxCommand::TogglePaneZoom {
+                session_id: "project".to_owned(),
+                pane_id: Some("%4".to_owned()),
+            },
+        ] {
+            backend.execute(command).unwrap();
+        }
 
         assert_eq!(
             calls.borrow().as_slice(),
@@ -1023,7 +1789,68 @@ mod tests {
                     "@2".to_owned(),
                     "-1".to_owned()
                 ],
+                vec![
+                    "select_pane".to_owned(),
+                    "project".to_owned(),
+                    "@2".to_owned(),
+                    "Right".to_owned(),
+                ],
+                vec![
+                    "select_next_pane".to_owned(),
+                    "project".to_owned(),
+                    "@2".to_owned(),
+                ],
+                vec![
+                    "select_previous_pane".to_owned(),
+                    "project".to_owned(),
+                    "@2".to_owned(),
+                ],
+                vec![
+                    "select_last_pane".to_owned(),
+                    "project".to_owned(),
+                    "@2".to_owned(),
+                ],
+                vec![
+                    "resize_pane".to_owned(),
+                    "project".to_owned(),
+                    "%4".to_owned(),
+                    "Directional { direction: Down, cells: 3 }".to_owned(),
+                ],
+                vec![
+                    "toggle_pane_zoom".to_owned(),
+                    "project".to_owned(),
+                    "%4".to_owned(),
+                ],
             ]
+        );
+    }
+
+    #[test]
+    fn rmux_adapter_rejects_invalid_resize_as_a_typed_failure() {
+        let client = RecordingClient::default();
+        let calls = client.calls.clone();
+        let mut backend = RmuxBackend::with_client(client);
+
+        let error = backend
+            .execute(MuxCommand::ResizePane {
+                session_id: "project".to_owned(),
+                pane_id: Some("%4".to_owned()),
+                adjustment: MuxPaneResize::Directional {
+                    direction: MuxDirection::Right,
+                    cells: 0,
+                },
+            })
+            .expect_err("invalid resize must fail");
+
+        assert_eq!(
+            error.downcast_ref::<MuxBackendOperationError>(),
+            Some(&MuxBackendOperationError::Failed(
+                "rmux pane resize requires every supplied dimension to be positive".to_owned(),
+            ))
+        );
+        assert!(
+            calls.borrow().is_empty(),
+            "invalid resize must not reach the rmux client"
         );
     }
 
@@ -1458,19 +2285,23 @@ mod tests {
                 session_name: "alpha".to_owned(),
                 window_id: "@10".to_owned(),
                 pane_id: "%1".to_owned(),
+                terminal_id: Some("t1".to_owned()),
                 index: 0,
                 active: true,
                 cwd: None,
                 process: None,
+                occupant_id: Some("rmux:%1:generation:1".to_owned()),
             },
             RmuxPaneRow {
                 session_name: "alpha".to_owned(),
                 window_id: "@10".to_owned(),
                 pane_id: "%2".to_owned(),
+                terminal_id: Some("t2".to_owned()),
                 index: 1,
                 active: false,
                 cwd: None,
                 process: None,
+                occupant_id: Some("rmux:%2:generation:1".to_owned()),
             },
         ];
 
@@ -1509,28 +2340,34 @@ mod tests {
                 session_name: "alpha".to_owned(),
                 window_id: "@10".to_owned(),
                 pane_id: "%1".to_owned(),
+                terminal_id: Some("t1".to_owned()),
                 index: 1,
                 active: false,
                 cwd: Some("/repo".to_owned()),
                 process: Some("fish".to_owned()),
+                occupant_id: Some("rmux:%1:generation:1".to_owned()),
             },
             RmuxPaneRow {
                 session_name: "alpha".to_owned(),
                 window_id: "@10".to_owned(),
                 pane_id: "%2".to_owned(),
+                terminal_id: Some("t2".to_owned()),
                 index: 0,
                 active: true,
                 cwd: Some("/repo".to_owned()),
                 process: Some("vim".to_owned()),
+                occupant_id: Some("rmux:%2:generation:1".to_owned()),
             },
             RmuxPaneRow {
                 session_name: "alpha".to_owned(),
                 window_id: "@11".to_owned(),
                 pane_id: "%3".to_owned(),
+                terminal_id: Some("t3".to_owned()),
                 index: 0,
                 active: true,
                 cwd: Some("/build".to_owned()),
                 process: Some("cargo".to_owned()),
+                occupant_id: Some("rmux:%3:generation:1".to_owned()),
             },
         ];
 
@@ -1602,9 +2439,11 @@ mod tests {
                     anchor: MuxPaneAnchor {
                         session_id: "alpha".to_owned(),
                         pane_id: Some("%1".to_owned()),
+                        terminal_id: Some("t1".to_owned()),
                         pane_pid: None,
                         cwd: Some("/repo".to_owned()),
                         process: Some("vim".to_owned()),
+                        occupant_id: None,
                     },
                     active_window_id: None,
                     windows: Vec::new(),

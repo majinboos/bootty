@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "records": [
+    {
+      "id": "rmux.web-share",
+      "reason": "rmux web sharing requires a service that Bootty will not operate or depend on"
+    }
+  ]
+}

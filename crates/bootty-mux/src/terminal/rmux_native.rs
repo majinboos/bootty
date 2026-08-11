@@ -986,7 +986,7 @@ impl RmuxWorker {
     fn drain_input_results(&mut self) {
         while let Ok(result) = self.pane_io.result_rx.try_recv() {
             if let Err(error) = result {
-                self.send_error(anyhow::anyhow!(error));
+                self.send_error(error);
             }
         }
     }
@@ -1261,6 +1261,7 @@ mod tests {
             macos_option_as_alt: Default::default(),
             side_effect_tx: None,
             side_effect_pane_id: None,
+            capture_runtime_observations: false,
             benchmark_trace: None,
         }
     }
@@ -1430,6 +1431,7 @@ mod tests {
             .context("input smoke pane should exist")?;
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
+            terminal_id: Some(pane_id.clone()),
             pane_id: pane_id.clone(),
             cwd: None,
         };
@@ -1486,6 +1488,7 @@ mod tests {
             .context("image pane should exist")?;
         let target = MuxPaneTarget::Pane {
             session_id: session,
+            terminal_id: Some(pane_id.clone()),
             pane_id,
             cwd: None,
         };
@@ -1684,6 +1687,7 @@ mod tests {
         let first_marker = std::env::var("BOOTTY_SHARED_FIRST_MARKER")?;
         let target = MuxPaneTarget::Pane {
             session_id: session,
+            terminal_id: Some(pane_id.clone()),
             pane_id,
             cwd: None,
         };
@@ -1741,6 +1745,7 @@ mod tests {
             .context("ctrl-c smoke pane should exist")?;
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
+            terminal_id: Some(pane_id.clone()),
             pane_id: pane_id.clone(),
             cwd: None,
         };
@@ -1792,6 +1797,7 @@ mod tests {
             .context("latency smoke pane should exist")?;
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
+            terminal_id: Some(pane_id.clone()),
             pane_id: pane_id.clone(),
             cwd: None,
         };
@@ -1873,6 +1879,7 @@ mod tests {
 
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
+            terminal_id: Some(pane_id.clone()),
             pane_id: pane_id.clone(),
             cwd: None,
         };
@@ -1950,6 +1957,7 @@ mod tests {
             .context("persist smoke pane should exist")?;
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
+            terminal_id: Some(pane_id.clone()),
             pane_id: pane_id.clone(),
             cwd: None,
         };
@@ -2010,6 +2018,7 @@ mod tests {
             .context("cursor smoke pane should exist")?;
         let target = MuxPaneTarget::Pane {
             session_id: session.clone(),
+            terminal_id: Some(pane_id.clone()),
             pane_id: pane_id.clone(),
             cwd: None,
         };

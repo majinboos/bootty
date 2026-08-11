@@ -8,8 +8,8 @@ pub mod terminfo;
 
 pub use benchmark_trace::{BenchmarkTrace, TraceValue};
 pub use terminal_session::{
-    DrainStats, PtyBacklog, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
-    drain_pty_backlog,
+    DrainStats, PtyBacklog, SessionLaunchConfig, TerminalOutputObservation,
+    TerminalRuntimeObservations, TerminalSession, TerminalSessionConfig, drain_pty_backlog,
 };
 
 pub mod geometry {

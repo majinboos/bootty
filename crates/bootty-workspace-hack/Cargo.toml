@@ -120,7 +120,6 @@ naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
-smallvec = { version = "1", default-features = false, features = ["union"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
@@ -145,7 +144,6 @@ zbus_macros = { version = "5", features = ["blocking-api"] }
 
 [target.wasm32-unknown-unknown.dependencies]
 crossbeam-utils = { version = "0.8" }
-js-sys = { version = "0.3" }
 time = { version = "0.3", features = ["formatting", "parsing", "wasm-bindgen"] }
 wasm-bindgen = { version = "0.2" }
 web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "AddEventListenerOptions", "BinaryType", "BlobPropertyBag", "CanvasRenderingContext2d", "Clipboard", "ClipboardEvent", "ClipboardItem", "CompositionEvent", "CssStyleDeclaration", "DataTransfer", "DataTransferItem", "DataTransferItemList", "Document", "DomException", "DomRect", "DragEvent", "EventListener", "ExtSRgb", "File", "FileList", "FocusEvent", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "ImageBitmap", "ImageBitmapOptions", "ImageBitmapRenderingContext", "ImageData", "InputEvent", "IntersectionObserver", "IntersectionObserverEntry", "KeyboardEvent", "Location", "MediaQueryList", "MediaQueryListEvent", "MessageChannel", "MessagePort", "Navigator", "NodeList", "OrientationLockType", "OrientationType", "PageTransitionEvent", "Performance", "PermissionState", "PermissionStatus", "Permissions", "PointerEvent", "PremultiplyAlpha", "ResizeObserver", "ResizeObserverBoxOptions", "ResizeObserverEntry", "ResizeObserverOptions", "ResizeObserverSize", "Screen", "ScreenOrientation", "ShadowRoot", "Storage", "Touch", "TouchEvent", "TouchList", "Url", "VisibilityState", "WebGl2RenderingContext", "WebGlRenderingContext", "WebglDebugRendererInfo", "WheelEvent", "Window", "Worker", "console"] }
@@ -238,7 +236,6 @@ naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
-smallvec = { version = "1", default-features = false, features = ["union"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }

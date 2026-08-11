@@ -61,11 +61,19 @@ pub struct MuxWindowProgress {
 pub struct MuxPaneAnchor {
     pub session_id: String,
     pub pane_id: Option<String>,
+    /// Opaque backend-issued identity of the terminal hosted by this pane. This can differ from
+    /// the pane ID and is the identity used for terminal generations and command targets.
+    #[serde(default)]
+    pub terminal_id: Option<String>,
     /// The pane's process id, when the backend reports one. Lets a module walk the pane's process
     /// tree without asking the backend again for what a snapshot already knows.
     pub pane_pid: Option<u32>,
     pub cwd: Option<String>,
     pub process: Option<String>,
+    /// Opaque backend-issued identity for the process occupying this pane. It changes on a
+    /// replacement even if the pane id, PID, and process label are reused.
+    #[serde(default)]
+    pub occupant_id: Option<String>,
 }
 
 pub fn session_matches(session: &MuxSession, session_id: &str) -> bool {

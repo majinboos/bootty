@@ -992,6 +992,7 @@ impl Default for SessionConfig {
 impl SessionConfig {
     pub fn launch_config(&self) -> SessionLaunchConfig {
         SessionLaunchConfig {
+            program: None,
             shell: self.shell.clone(),
             args: Vec::new(),
             working_directory: self
@@ -1017,6 +1018,7 @@ impl BoottyConfig {
             macos_option_as_alt: self.input.macos_option_as_alt.into(),
             side_effect_tx: None,
             side_effect_pane_id: None,
+            capture_runtime_observations: false,
             benchmark_trace: None,
         }
     }

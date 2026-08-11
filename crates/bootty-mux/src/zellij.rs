@@ -2,8 +2,9 @@ use anyhow::Result;
 
 #[cfg(feature = "app")]
 use super::{
-    backend::MuxBackend,
-    capability::{BindingCapabilityDescriptor, BindingOperation},
+    backend::{MuxBackend, MuxBackendOperationError},
+    capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
+    command::MuxSessionLaunchPlan,
     controller::MuxScope,
 };
 use super::{
@@ -59,6 +60,15 @@ impl<R: CommandRunner> ZellijBackend<R> {
             MuxCommand::ActivateWindow { .. } => {
                 anyhow::bail!("zellij native window activation is not implemented");
             }
+            MuxCommand::CreateSession { .. } => {
+                #[cfg(feature = "app")]
+                return Err(MuxBackendOperationError::unsupported(
+                    "zellij does not support recursive session launch plans",
+                )
+                .into());
+                #[cfg(not(feature = "app"))]
+                anyhow::bail!("zellij does not support recursive session launch plans");
+            }
             MuxCommand::CreateProjectSession { session_id, cwd }
             | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
                 self.run_owned(vec![
@@ -99,8 +109,10 @@ impl<R: CommandRunner> ZellijBackend<R> {
             | MuxCommand::SelectPane { .. }
             | MuxCommand::SelectNextPane { .. }
             | MuxCommand::SelectPreviousPane { .. }
+            | MuxCommand::SelectLastPane { .. }
             | MuxCommand::KillPane { .. }
             | MuxCommand::ClosePane { .. }
+            | MuxCommand::ResizePane { .. }
             | MuxCommand::TogglePaneZoom { .. } => {
                 anyhow::bail!("zellij backend does not support mux command {command:?}");
             }
@@ -117,6 +129,20 @@ impl<R: CommandRunner> MuxBackend for ZellijBackend<R> {
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
         ZellijBackend::execute(self, command)
+    }
+
+    fn execute_session_launch(
+        &mut self,
+        _plan: MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<Result<()>> {
+        BindingOperationOutcome::Unsupported
+    }
+
+    fn session_launch_capability(
+        &self,
+        _plan: &MuxSessionLaunchPlan,
+    ) -> BindingOperationOutcome<()> {
+        BindingOperationOutcome::Unsupported
     }
 
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
@@ -152,9 +178,11 @@ fn parse_zellij_snapshot(output: &str) -> MuxSnapshot {
                 anchor: MuxPaneAnchor {
                     session_id: name.to_owned(),
                     pane_id: None,
+                    terminal_id: None,
                     pane_pid: None,
                     cwd: None,
                     process: None,
+                    occupant_id: None,
                 },
                 active_window_id: None,
                 windows: Vec::new(),

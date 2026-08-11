@@ -5,11 +5,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
 pub const REMOTE_DAEMON_PROGRAM: &str = "bootty-daemon";
-pub const REMOTE_DAEMON_PROTOCOL_VERSION: &str = "2";
+pub const REMOTE_DAEMON_PROTOCOL_VERSION: &str = "4";
 #[cfg(feature = "app")]
 pub const REMOTE_EXEC_PROGRAM: &str = concat!(
     "./.bootty/bin/bootty-daemon-",
-    "2",
+    "4",
     "-",
     env!("CARGO_PKG_VERSION"),
     ".exe"

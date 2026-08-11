@@ -69,6 +69,17 @@ impl SshRemote {
         }
     }
 
+    /// An opaque transport identity for event producers. It distinguishes the executable,
+    /// destination, port, and configured flags without exposing those flag values in event
+    /// metadata.
+    pub fn transport_identity(&self) -> String {
+        format!(
+            "{}:{:016x}",
+            self.destination(),
+            self.transport_fingerprint()
+        )
+    }
+
     pub fn ensure_daemon(&self) -> Result<()> {
         self.ensure_daemon_with(&SystemCommandRunner)
     }
@@ -172,6 +183,15 @@ impl SshRemote {
         (self.config.program.clone(), ssh_args)
     }
 
+    fn transport_fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.config.program.hash(&mut hasher);
+        self.destination().hash(&mut hasher);
+        self.config.port.hash(&mut hasher);
+        self.config.args.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Turn a lost connection into a failure instead of a wait. A black-holed link answers nothing
     /// and closes nothing: without these, dialing blocks for the operating system's TCP timeout and
     /// an established connection never ends at all, which strands the mutation worker and leaves the
@@ -193,12 +213,8 @@ impl SshRemote {
     /// shipped with Windows does not implement.
     #[cfg(unix)]
     fn multiplexing_args(&self) -> Vec<String> {
-        let mut hasher = DefaultHasher::new();
-        self.config.program.hash(&mut hasher);
-        self.destination().hash(&mut hasher);
-        self.config.port.hash(&mut hasher);
-        self.config.args.hash(&mut hasher);
-        let path = std::env::temp_dir().join(format!("bootty-ssh-{:016x}", hasher.finish()));
+        let path =
+            std::env::temp_dir().join(format!("bootty-ssh-{:016x}", self.transport_fingerprint()));
         vec![
             "-o".to_owned(),
             "ControlMaster=auto".to_owned(),

@@ -1538,8 +1538,14 @@ mod tests {
             .expect("imported session");
         assert_eq!(imported_name, "project/main");
         let mut order =
-            crate::session_order::SessionOrderStore::for_binding(&config_path, binding_id);
-        assert_eq!(order.sync_sessions(["project/main"]), vec!["project/main"]);
+            crate::session_order::SessionOrderStore::for_binding(&config_path, binding_id)
+                .expect("open imported session order");
+        assert_eq!(
+            order
+                .sync_sessions(["project/main"])
+                .expect("sync imported session order"),
+            vec!["project/main"]
+        );
         let mut names =
             crate::session_names::SessionNameStore::for_binding(&config_path, binding_id);
         let name = names
