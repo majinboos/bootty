@@ -1,7 +1,7 @@
 mod state;
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{OnceLock, mpsc},
     time::Instant,
@@ -398,6 +398,7 @@ impl BoottyApp {
             app.state
                 .app_command_sender(crate::commands::Caller::Socket),
             automation,
+            app.state.extension_command_registry(),
         )?;
         debug_assert!(
             app.state
@@ -2169,83 +2170,106 @@ impl BoottyApp {
         let Some(scope) = self.state.automation_hub().instance_scope() else {
             return;
         };
-        let ExtensionReloadPublication {
-            modules,
-            events,
-            requires_rebase,
-        } = combine_extension_reload_drains([
+        let drains = [
             self.status_extensions.take_reload_events(),
             self.sidebar_extensions.take_reload_events(),
-        ]);
+        ];
+        let ExtensionReloadPublication {
+            events,
+            requires_rebase,
+            ..
+        } = combine_extension_reload_drains(drains.iter().cloned());
         if events.is_empty() && !requires_rebase {
             return;
         }
-
-        let snapshot = json!({
-            "modules": modules
-                .into_iter()
-                .map(|(extension_id, generation)| json!({
-                    "extension_id": extension_id,
-                    "generation": generation,
-                }))
-                .collect::<Vec<_>>(),
-        });
-        let provenance = json!({"source": "extension_host"});
-        if requires_rebase
-            && let Err(error) = self.state.publish_automation_event_with_snapshot(
-                crate::automation::EventPublication::new(
-                    scope.clone(),
-                    "extension.reloaded",
-                    provenance.clone(),
-                    None,
-                    json!({"operation": "reloaded", "rebase": true}),
-                ),
-                snapshot.clone(),
-            )
+        let source_snapshots = [
+            ("status".to_owned(), extension_host_snapshot(&drains[0])),
+            ("sidebar".to_owned(), extension_host_snapshot(&drains[1])),
+        ];
+        let mut publications = Vec::new();
+        if requires_rebase {
+            for (source, snapshot) in source_snapshots {
+                publications.push((
+                    crate::automation::EventPublication::new(
+                        scope.clone(),
+                        "extension.reloaded",
+                        json!({"source": source.clone()}),
+                        None,
+                        json!({
+                            "operation": "reloaded",
+                            "rebase": true,
+                            "source": source.clone(),
+                        }),
+                    ),
+                    vec![("extension.reloaded".to_owned(), source, snapshot)],
+                ));
+            }
+        } else {
+            for ((source, snapshot), drain) in source_snapshots.into_iter().zip(drains.iter()) {
+                for event in &drain.events {
+                    publications.push((
+                        crate::automation::EventPublication::new(
+                            scope.clone(),
+                            "extension.reloaded",
+                            json!({"source": source.clone()}),
+                            None,
+                            json!({
+                                "extension_id": event.extension_id.clone(),
+                                "generation": event.generation,
+                                "operation": event.operation.as_str(),
+                                "source": source.clone(),
+                            }),
+                        ),
+                        vec![(
+                            "extension.reloaded".to_owned(),
+                            source.clone(),
+                            snapshot.clone(),
+                        )],
+                    ));
+                }
+            }
+        }
+        if publications.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .state
+            .automation_hub()
+            .publish_events_with_snapshot_sources(publications)
         {
             self.state.record_render_error(error);
-        }
-        for event in events {
-            if let Err(error) = self.state.publish_automation_event_with_snapshot(
-                crate::automation::EventPublication::new(
-                    scope.clone(),
-                    "extension.reloaded",
-                    provenance.clone(),
-                    None,
-                    json!({
-                        "extension_id": event.extension_id,
-                        "generation": event.generation,
-                        "operation": event.operation.as_str(),
-                    }),
-                ),
-                snapshot.clone(),
-            ) {
-                self.state.record_render_error(error);
-            }
+            self.status_extensions
+                .requeue_reload_events(drains[0].clone());
+            self.sidebar_extensions
+                .requeue_reload_events(drains[1].clone());
         }
     }
 }
 
-/// The combined publication from both file-backed extension workers.
 struct ExtensionReloadPublication {
-    modules: BTreeMap<String, u64>,
     events: Vec<crate::extensions::ExtensionReloadEvent>,
     requires_rebase: bool,
+}
+
+fn extension_host_snapshot(drain: &crate::extensions::ExtensionReloadDrain) -> serde_json::Value {
+    json!({
+        "modules": drain
+            .modules
+            .iter()
+            .map(|module| json!({
+                "extension_id": module.extension_id,
+                "generation": module.generation,
+            }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn combine_extension_reload_drains(
     drains: impl IntoIterator<Item = crate::extensions::ExtensionReloadDrain>,
 ) -> ExtensionReloadPublication {
-    let mut modules = BTreeMap::new();
     let mut events = Vec::new();
     let mut requires_rebase = false;
     for drain in drains {
-        modules.extend(
-            drain
-                .modules
-                .into_iter()
-                .map(|module| (module.extension_id, module.generation)),
-        );
         events.extend(drain.events);
         requires_rebase |= drain.requires_rebase;
     }
@@ -2254,7 +2278,6 @@ fn combine_extension_reload_drains(
         events.clear();
     }
     ExtensionReloadPublication {
-        modules,
         events,
         requires_rebase,
     }
@@ -2731,48 +2754,34 @@ mod tests {
     fn extension_rebase_snapshot_discards_retained_pre_rebase_delta() {
         let extension_id = "path:/extensions/example.luau".to_owned();
         let final_generation = 99;
+        let drain = ExtensionReloadDrain {
+            events: vec![ExtensionReloadEvent {
+                extension_id: extension_id.clone(),
+                generation: 2,
+                operation: ExtensionReloadOperation::Reloaded,
+            }],
+            modules: vec![ExtensionModuleGeneration {
+                extension_id: extension_id.clone(),
+                generation: final_generation,
+            }],
+            inventory_revision: 0,
+            requires_rebase: true,
+        };
+        let snapshot = extension_host_snapshot(&drain);
         let ExtensionReloadPublication {
-            modules,
             events,
             requires_rebase,
-        } = combine_extension_reload_drains([
-            ExtensionReloadDrain {
-                events: vec![ExtensionReloadEvent {
-                    extension_id: extension_id.clone(),
-                    generation: 2,
-                    operation: ExtensionReloadOperation::Reloaded,
-                }],
-                modules: vec![ExtensionModuleGeneration {
-                    extension_id: extension_id.clone(),
-                    generation: final_generation,
-                }],
-                requires_rebase: true,
-            },
-            ExtensionReloadDrain::default(),
-        ]);
-
-        let authoritative = modules.clone();
-        assert_eq!(
-            authoritative,
-            BTreeMap::from([(extension_id.clone(), final_generation)])
-        );
-        let mut client_modules = BTreeMap::from([(extension_id, 1)]);
-        if requires_rebase {
-            client_modules.clone_from(&modules);
-        }
-        for event in events {
-            match event.operation {
-                ExtensionReloadOperation::Removed => {
-                    client_modules.remove(&event.extension_id);
-                }
-                ExtensionReloadOperation::Loaded | ExtensionReloadOperation::Reloaded => {
-                    client_modules.insert(event.extension_id, event.generation);
-                }
-            }
-        }
+        } = combine_extension_reload_drains([drain, ExtensionReloadDrain::default()]);
 
         assert!(requires_rebase);
-        assert_eq!(client_modules, authoritative);
+        assert!(events.is_empty());
+        let modules = snapshot["modules"].as_array().expect("module snapshot");
+        assert_eq!(modules.len(), 1);
+        assert_eq!(
+            modules[0]["extension_id"].as_str(),
+            Some(extension_id.as_str())
+        );
+        assert_eq!(modules[0]["generation"].as_u64(), Some(final_generation));
     }
 
     #[test]
@@ -2791,6 +2800,7 @@ mod tests {
                         operation: ExtensionReloadOperation::Loaded,
                     },
                 ],
+                inventory_revision: 0,
                 modules: vec![],
                 requires_rebase: false,
             },
@@ -2801,6 +2811,7 @@ mod tests {
                     operation: ExtensionReloadOperation::Loaded,
                 }],
                 modules: vec![],
+                inventory_revision: 0,
                 requires_rebase: false,
             },
         ]);
@@ -2818,6 +2829,35 @@ mod tests {
                 "path:/sidebar/one.luau".to_owned(),
             ]
         );
+    }
+    #[test]
+    fn extension_reload_publication_keeps_both_complete_host_inventories() {
+        let host_drain = |prefix: &str| ExtensionReloadDrain {
+            modules: (0..256)
+                .map(|index| ExtensionModuleGeneration {
+                    extension_id: format!("path:/{prefix}/{index:03}.luau"),
+                    generation: index,
+                })
+                .collect(),
+            ..ExtensionReloadDrain::default()
+        };
+        let status = host_drain("status");
+        let sidebar = host_drain("sidebar");
+        let publication = combine_extension_reload_drains([status.clone(), sidebar.clone()]);
+        assert!(!publication.requires_rebase);
+        assert!(publication.events.is_empty());
+        for drain in [status, sidebar] {
+            let snapshot = extension_host_snapshot(&drain);
+            let modules = snapshot["modules"].as_array().expect("module snapshot");
+            assert_eq!(modules.len(), 256);
+            assert_eq!(
+                modules
+                    .iter()
+                    .filter(|module| module["generation"].as_u64() == Some(255))
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]

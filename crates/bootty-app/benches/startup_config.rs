@@ -6,7 +6,7 @@ use bootty_app::{
         resolve_theme, write_font_size_preference,
     },
     input_binding_set::BindingSet,
-    session_order::SessionOrderStore,
+    session_order::{BackendConnectionNamespace, SessionOrderStore},
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -220,8 +220,11 @@ fn bench_session_order(c: &mut Criterion) {
 
     let steady_dir = BenchDir::new("session-order-steady");
     let steady_config_path = steady_dir.path("config.toml");
-    let mut steady_store =
-        SessionOrderStore::for_config_path(&steady_config_path).expect("open steady session order");
+    let mut steady_store = SessionOrderStore::for_config_path(
+        &steady_config_path,
+        BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None),
+    )
+    .expect("open steady session order");
     steady_store
         .sync_sessions(session_refs.iter().copied())
         .expect("seed steady session order");
@@ -238,8 +241,11 @@ fn bench_session_order(c: &mut Criterion) {
 
     let move_dir = BenchDir::new("session-order-move");
     let move_config_path = move_dir.path("config.toml");
-    let mut move_store =
-        SessionOrderStore::for_config_path(&move_config_path).expect("open move session order");
+    let mut move_store = SessionOrderStore::for_config_path(
+        &move_config_path,
+        BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None),
+    )
+    .expect("open move session order");
     move_store
         .sync_sessions(session_refs.iter().copied())
         .expect("seed move session order");
@@ -269,8 +275,11 @@ fn bench_session_order(c: &mut Criterion) {
             cold_index = cold_index.wrapping_add(1);
             let dir = BenchDir::new(&format!("session-order-cold-{cold_index}"));
             let config_path = dir.path("config.toml");
-            let mut store =
-                SessionOrderStore::for_config_path(&config_path).expect("open cold session order");
+            let mut store = SessionOrderStore::for_config_path(
+                &config_path,
+                BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None),
+            )
+            .expect("open cold session order");
             black_box(
                 store
                     .sync_sessions(session_refs.iter().copied())

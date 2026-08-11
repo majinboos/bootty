@@ -1,11 +1,164 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
-use rusqlite::params;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
 
-use crate::workspace::{WorkspaceStore, open_db};
+use crate::{
+    config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig},
+    mux::{config::selected_backend, controller::MuxScope},
+    workspace::{WorkspaceStore, open_db},
+};
+
+/// Returns the persistence namespace used by a binding's session membership.
+///
+/// Native sessions are shared by every binding in a workspace, but each Space owns its
+/// membership view. Qualifying native namespaces by Space lets two Spaces refer to the same
+/// backend session identity without allowing unrelated bindings in one Space to claim it twice.
+pub(crate) fn namespace_for_binding(
+    scope: MuxScope,
+    config: &MultiplexerConfig,
+) -> BackendConnectionNamespace {
+    let mut namespace = BackendConnectionNamespace::from_multiplexer(config);
+    if selected_backend(config) == MultiplexerBackendConfig::Native {
+        namespace.remote_space_id = Some(format!(
+            "native-space:{}",
+            scope.space_id().persistence_value()
+        ));
+    }
+    namespace
+}
+
+/// The durable namespace of one backend connection.
+///
+/// Binding IDs identify persisted UI state, not the multiplexer endpoint. Initial
+/// membership claims are isolated by this value so equal backend-local names can
+/// be claimed independently by different connections.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BackendConnectionNamespace {
+    pub backend: MultiplexerBackendConfig,
+    pub remote: Option<SshRemoteConfig>,
+    pub remote_space_id: Option<String>,
+}
+
+impl BackendConnectionNamespace {
+    pub fn new(backend: MultiplexerBackendConfig, remote: Option<SshRemoteConfig>) -> Self {
+        Self {
+            backend,
+            remote,
+            remote_space_id: None,
+        }
+    }
+
+    pub fn from_multiplexer(config: &MultiplexerConfig) -> Self {
+        Self {
+            backend: selected_backend(config),
+            remote: config.remote.clone(),
+            remote_space_id: config.remote_space_id.clone(),
+        }
+    }
+
+    pub(crate) fn persistence_key(&self) -> String {
+        serde_json::to_string(self).expect("backend connection namespace is serializable")
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionMembershipConflict {
+    pub name: String,
+    pub namespace: String,
+}
+
+impl std::fmt::Display for SessionMembershipConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "session '{}' is already owned by another binding on backend connection {}",
+            self.name, self.namespace
+        )
+    }
+}
+
+impl std::error::Error for SessionMembershipConflict {}
+
+fn membership_conflict(name: &str, namespace: &str) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(SessionMembershipConflict {
+        name: name.to_owned(),
+        namespace: namespace.to_owned(),
+    }))
+}
+
+fn ensure_namespace_table(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "CREATE TABLE IF NOT EXISTS workspace_session_namespaces (
+             binding_id INTEGER PRIMARY KEY
+                 REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+             namespace TEXT NOT NULL
+         )",
+        [],
+    )?;
+    Ok(())
+}
+
+fn namespace_conflict(
+    tx: &Transaction<'_>,
+    binding_id: i64,
+    namespace_key: &str,
+) -> rusqlite::Result<Option<String>> {
+    tx.query_row(
+        "SELECT s.name
+         FROM workspace_sessions s
+         JOIN workspace_session_namespaces n
+           ON n.namespace = ?2 AND n.binding_id != ?1
+         JOIN workspace_sessions other
+           ON other.binding_id = n.binding_id AND other.name = s.name
+         WHERE s.binding_id = ?1
+         LIMIT 1",
+        params![binding_id, namespace_key],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}
+
+fn validate_namespace(
+    path: &Path,
+    binding_id: i64,
+    namespace: &BackendConnectionNamespace,
+) -> rusqlite::Result<()> {
+    let mut conn = open_db(path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_namespace_table(&tx)?;
+    let namespace_key = namespace.persistence_key();
+    if let Some(name) = namespace_conflict(&tx, binding_id, &namespace_key)? {
+        return Err(membership_conflict(&name, &namespace_key));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn register_namespace(
+    path: &Path,
+    binding_id: i64,
+    namespace: &BackendConnectionNamespace,
+) -> rusqlite::Result<()> {
+    let mut conn = open_db(path)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_namespace_table(&tx)?;
+    let namespace_key = namespace.persistence_key();
+    if let Some(name) = namespace_conflict(&tx, binding_id, &namespace_key)? {
+        return Err(membership_conflict(&name, &namespace_key));
+    }
+    tx.execute(
+        "INSERT INTO workspace_session_namespaces (binding_id, namespace)
+         VALUES (?1, ?2)
+         ON CONFLICT(binding_id) DO UPDATE SET namespace = excluded.namespace",
+        params![binding_id, namespace_key],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
 
 fn session_group(name: &str) -> &str {
     name.split_once('/').map_or("", |(group, _)| group)
@@ -25,6 +178,14 @@ struct SessionStore {
 impl SessionStore {
     fn load_sqlite(path: &Path, binding_id: i64) -> rusqlite::Result<Self> {
         let conn = open_db(path)?;
+        Self::load_connection(&conn, binding_id)
+    }
+
+    fn load_transaction(tx: &Transaction<'_>, binding_id: i64) -> rusqlite::Result<Self> {
+        Self::load_connection(tx, binding_id)
+    }
+
+    fn load_connection(conn: &Connection, binding_id: i64) -> rusqlite::Result<Self> {
         let mut stmt = conn.prepare(
             "SELECT g.id, g.name, s.name
              FROM workspace_session_groups g
@@ -252,9 +413,7 @@ impl SessionStore {
             })
     }
 
-    fn save_sqlite(&self, path: &Path, binding_id: i64) -> rusqlite::Result<()> {
-        let mut conn = open_db(path)?;
-        let tx = conn.transaction()?;
+    fn save_transaction(&self, tx: &Transaction<'_>, binding_id: i64) -> rusqlite::Result<()> {
         tx.execute(
             "DELETE FROM workspace_sessions WHERE binding_id = ?1",
             [binding_id],
@@ -292,7 +451,7 @@ impl SessionStore {
                 [binding_id],
             )?;
         }
-        tx.commit()
+        Ok(())
     }
 }
 
@@ -300,6 +459,7 @@ impl SessionStore {
 pub struct SessionOrderStore {
     path: PathBuf,
     binding_id: i64,
+    namespace: BackendConnectionNamespace,
     store: SessionStore,
     membership_initialized: bool,
     #[cfg(test)]
@@ -307,25 +467,112 @@ pub struct SessionOrderStore {
 }
 
 impl SessionOrderStore {
-    pub fn for_config_path(config_path: &Path) -> rusqlite::Result<Self> {
+    pub fn for_config_path(
+        config_path: &Path,
+        namespace: BackendConnectionNamespace,
+    ) -> rusqlite::Result<Self> {
         let workspace = WorkspaceStore::try_for_config_path(config_path)?;
         let binding_id = workspace
             .binding_id()
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        Self::load(workspace.path().to_path_buf(), binding_id)
+        Self::load(workspace.path().to_path_buf(), binding_id, namespace, true)
     }
 
-    pub fn for_binding(config_path: &Path, binding_id: i64) -> rusqlite::Result<Self> {
+    pub fn for_binding(
+        config_path: &Path,
+        binding_id: i64,
+        namespace: BackendConnectionNamespace,
+    ) -> rusqlite::Result<Self> {
         let workspace = WorkspaceStore::try_for_config_path(config_path)?;
-        Self::load(workspace.path().to_path_buf(), binding_id)
+        Self::load(workspace.path().to_path_buf(), binding_id, namespace, true)
     }
 
-    fn load(path: PathBuf, binding_id: i64) -> rusqlite::Result<Self> {
+    pub(crate) fn for_binding_preflight(
+        config_path: &Path,
+        binding_id: i64,
+        namespace: BackendConnectionNamespace,
+    ) -> rusqlite::Result<Self> {
+        let workspace = WorkspaceStore::try_for_config_path(config_path)?;
+        Self::load(workspace.path().to_path_buf(), binding_id, namespace, false)
+    }
+
+    /// Register a batch of binding namespaces in one database transaction. Callers use this
+    /// after every replacement has passed preflight so a later conflict or I/O error cannot leave
+    /// a partially applied namespace set behind.
+    pub(crate) fn register_namespaces(
+        config_path: &Path,
+        namespaces: impl IntoIterator<Item = (i64, BackendConnectionNamespace)>,
+    ) -> rusqlite::Result<()> {
+        let workspace = WorkspaceStore::try_for_config_path(config_path)?;
+        let mut conn = open_db(workspace.path())?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        ensure_namespace_table(&tx)?;
+        let mut final_namespaces = HashMap::new();
+        {
+            let mut statement =
+                tx.prepare("SELECT binding_id, namespace FROM workspace_session_namespaces")?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (binding_id, namespace) = row?;
+                final_namespaces.insert(binding_id, namespace);
+            }
+        }
+        let updates = namespaces
+            .into_iter()
+            .map(|(binding_id, namespace)| (binding_id, namespace.persistence_key()))
+            .collect::<Vec<_>>();
+        for (binding_id, namespace) in &updates {
+            final_namespaces.insert(*binding_id, namespace.clone());
+        }
+
+        let mut claimed = HashMap::<(String, String), i64>::new();
+        {
+            let mut statement = tx.prepare("SELECT binding_id, name FROM workspace_sessions")?;
+            for row in statement.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (binding_id, name) = row?;
+                let Some(namespace) = final_namespaces.get(&binding_id) else {
+                    continue;
+                };
+                let key = (namespace.clone(), name.clone());
+                if let Some(previous_binding) = claimed.insert(key, binding_id)
+                    && previous_binding != binding_id
+                {
+                    return Err(membership_conflict(&name, namespace));
+                }
+            }
+        }
+        for (binding_id, namespace) in updates {
+            tx.execute(
+                "INSERT INTO workspace_session_namespaces (binding_id, namespace)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(binding_id) DO UPDATE SET namespace = excluded.namespace",
+                params![binding_id, namespace],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn load(
+        path: PathBuf,
+        binding_id: i64,
+        namespace: BackendConnectionNamespace,
+        register: bool,
+    ) -> rusqlite::Result<Self> {
+        if register {
+            register_namespace(&path, binding_id, &namespace)?;
+        } else {
+            validate_namespace(&path, binding_id, &namespace)?;
+        }
         let store = SessionStore::load_sqlite(&path, binding_id)?;
         let membership_initialized = Self::membership_initialized(&path, binding_id)?;
         Ok(Self {
             path,
             binding_id,
+            namespace,
             store,
             membership_initialized,
             #[cfg(test)]
@@ -343,41 +590,169 @@ impl SessionOrderStore {
             |row| row.get(0),
         )
     }
-    fn names_owned_by_other_bindings(&self) -> rusqlite::Result<HashSet<String>> {
-        let conn = open_db(&self.path)?;
-        let mut statement =
-            conn.prepare("SELECT name FROM workspace_sessions WHERE binding_id != ?1")?;
+
+    fn membership_initialized_transaction(
+        tx: &Transaction<'_>,
+        binding_id: i64,
+    ) -> rusqlite::Result<bool> {
+        tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM workspace_session_groups WHERE binding_id = ?1
+             )",
+            [binding_id],
+            |row| row.get(0),
+        )
+    }
+
+    fn claimed_names(
+        tx: &Transaction<'_>,
+        binding_id: i64,
+        namespace: &BackendConnectionNamespace,
+    ) -> rusqlite::Result<HashSet<String>> {
+        let mut statement = tx.prepare(
+            "SELECT s.name
+             FROM workspace_sessions s
+             JOIN workspace_session_namespaces n ON n.binding_id = s.binding_id
+             WHERE n.namespace = ?1 AND s.binding_id != ?2",
+        )?;
         statement
-            .query_map([self.binding_id], |row| row.get::<_, String>(0))?
-            .collect()
+            .query_map(params![namespace.persistence_key(), binding_id], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<HashSet<_>>>()
+    }
+
+    fn check_save_failure(&mut self) -> rusqlite::Result<()> {
+        #[cfg(test)]
+        if let Some(message) = self.next_save_failure.take() {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(message),
+            )));
+        }
+        Ok(())
+    }
+    /// Rebuild the persisted order after a stale concurrent writer adds a session.
+    ///
+    /// The transaction already contains additions committed by another writer. Keep the
+    /// order owned by this store, retain names from that snapshot that are still present,
+    /// and merge all names introduced since that snapshot in canonical order.
+    fn merge_stale_additions(&self, store: &mut SessionStore) {
+        let known = self.store.existing_names();
+        let mut current = Vec::new();
+        let mut additions = Vec::new();
+        for name in store.ordered_names() {
+            if known.contains(&name) {
+                current.push(name);
+            } else {
+                additions.push(name);
+            }
+        }
+        additions.sort();
+        current.append(&mut additions);
+
+        let mut merged = SessionStore::default();
+        for name in current {
+            merged.insert_unique(&name);
+        }
+        *store = merged;
+    }
+
+    fn mutate_store(
+        &mut self,
+        deterministic_stale_add: bool,
+        mutate: impl FnOnce(&mut SessionStore, &HashSet<String>) -> rusqlite::Result<bool>,
+    ) -> rusqlite::Result<bool> {
+        let mut conn = open_db(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut store = SessionStore::load_transaction(&tx, self.binding_id)?;
+        let stale = deterministic_stale_add && self.store != store;
+        let initialized = Self::membership_initialized_transaction(&tx, self.binding_id)?;
+        let claimed = Self::claimed_names(&tx, self.binding_id, &self.namespace)?;
+        let changed = mutate(&mut store, &claimed)?;
+        if !changed {
+            tx.commit()?;
+            self.store = store;
+            self.membership_initialized = initialized;
+            return Ok(false);
+        }
+        if stale {
+            self.merge_stale_additions(&mut store);
+        }
+        self.check_save_failure()?;
+        store.save_transaction(&tx, self.binding_id)?;
+        tx.commit()?;
+        self.store = store;
+        self.membership_initialized = true;
+        Ok(true)
+    }
+
+    fn sync_store(
+        &self,
+        tx: &Transaction<'_>,
+        store: &mut SessionStore,
+        ordered_alive: &[String],
+    ) -> rusqlite::Result<bool> {
+        let initialized = Self::membership_initialized_transaction(tx, self.binding_id)?;
+        if !initialized && store.entries.is_empty() {
+            let claimed = Self::claimed_names(tx, self.binding_id, &self.namespace)?;
+            for session in ordered_alive {
+                if !claimed.contains(session) {
+                    store.insert_unique(session);
+                }
+            }
+            return Ok(true);
+        }
+        let alive = ordered_alive
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let prune = store
+            .entries
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .any(|session| !alive.contains(session.as_str()));
+        Ok(prune && store.prune(&alive))
     }
 
     pub fn add_session(&mut self, name: &str) -> rusqlite::Result<bool> {
-        if self.store.find_session(name).is_some() {
-            return Ok(false);
-        }
-        let mut store = self.store.clone();
-        store.insert_unique(name);
-        self.save_store(store)?;
-        Ok(true)
+        let namespace = self.namespace.persistence_key();
+        self.mutate_store(true, move |store, claimed| {
+            if claimed.contains(name) {
+                return Err(membership_conflict(name, &namespace));
+            }
+            if store.find_session(name).is_some() {
+                return Ok(false);
+            }
+            store.insert_unique(name);
+            Ok(true)
+        })
     }
 
     pub fn remove_session(&mut self, name: &str) -> rusqlite::Result<bool> {
-        let mut store = self.store.clone();
-        if !store.remove(name) {
-            return Ok(false);
-        }
-        self.save_store(store)?;
-        Ok(true)
+        self.mutate_store(false, |store, _claimed| Ok(store.remove(name)))
+    }
+    /// Forget a membership after another owner has committed its durable removal transaction.
+    /// This only updates the in-memory order; it intentionally performs no I/O or fallible work.
+    pub(crate) fn forget_session_cache(&mut self, name: &str) {
+        self.store.remove(name);
+    }
+    /// Rename a membership after another owner has committed the durable transaction.
+    /// This only updates the in-memory order and intentionally cannot fail.
+    pub(crate) fn rename_session_cache(&mut self, old: &str, new: &str) -> bool {
+        self.store.rename_session(old, new)
     }
 
     pub fn rename_session(&mut self, old: &str, new: &str) -> rusqlite::Result<bool> {
-        let mut store = self.store.clone();
-        if !store.rename_session(old, new) {
-            return Ok(false);
-        }
-        self.save_store(store)?;
-        Ok(true)
+        let namespace = self.namespace.persistence_key();
+        self.mutate_store(false, move |store, claimed| {
+            if store.find_session(old).is_none() {
+                return Ok(false);
+            }
+            if claimed.contains(new) {
+                return Err(membership_conflict(new, &namespace));
+            }
+            Ok(store.rename_session(old, new))
+        })
     }
 
     pub fn session_names(&self) -> Vec<String> {
@@ -389,33 +764,26 @@ impl SessionOrderStore {
         sessions: impl IntoIterator<Item = &'a str>,
     ) -> rusqlite::Result<Vec<String>> {
         let ordered_alive = sessions.into_iter().map(str::to_owned).collect::<Vec<_>>();
-        if ordered_alive.is_empty() {
-            return Ok(Vec::new());
+        let mut conn = open_db(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut store = SessionStore::load_transaction(&tx, self.binding_id)?;
+        let changed = if ordered_alive.is_empty() {
+            false
+        } else {
+            self.sync_store(&tx, &mut store, &ordered_alive)?
+        };
+        let initialized = Self::membership_initialized_transaction(&tx, self.binding_id)?;
+        if changed {
+            self.check_save_failure()?;
+            store.save_transaction(&tx, self.binding_id)?;
         }
+        tx.commit()?;
+        self.store = store;
+        self.membership_initialized = changed || initialized;
         let alive = ordered_alive
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let initialize = !self.membership_initialized && self.store.entries.is_empty();
-        let prune = self
-            .store
-            .entries
-            .iter()
-            .flat_map(|group| &group.sessions)
-            .any(|session| !alive.contains(session.as_str()));
-        if initialize || prune {
-            let mut store = self.store.clone();
-            if initialize {
-                let claimed = self.names_owned_by_other_bindings()?;
-                for session in &ordered_alive {
-                    if !claimed.contains(session) {
-                        store.insert_unique(session);
-                    }
-                }
-            }
-            store.prune(&alive);
-            self.save_store(store)?;
-        }
         Ok(self
             .store
             .ordered_names()
@@ -430,13 +798,25 @@ impl SessionOrderStore {
         delta: i32,
         sessions: impl IntoIterator<Item = &'a str>,
     ) -> rusqlite::Result<bool> {
-        self.sync_sessions(sessions)?;
-        let mut store = self.store.clone();
-        if !store.move_session(name, delta) {
-            return Ok(false);
+        let ordered_alive = sessions.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let mut conn = open_db(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut store = SessionStore::load_transaction(&tx, self.binding_id)?;
+        let sync_changed = if ordered_alive.is_empty() {
+            false
+        } else {
+            self.sync_store(&tx, &mut store, &ordered_alive)?
+        };
+        let moved = store.move_session(name, delta);
+        let initialized = Self::membership_initialized_transaction(&tx, self.binding_id)?;
+        if sync_changed || moved {
+            self.check_save_failure()?;
+            store.save_transaction(&tx, self.binding_id)?;
         }
-        self.save_store(store)?;
-        Ok(true)
+        tx.commit()?;
+        self.store = store;
+        self.membership_initialized = sync_changed || initialized;
+        Ok(moved)
     }
 
     pub fn move_session_before<'a>(
@@ -445,32 +825,35 @@ impl SessionOrderStore {
         before: Option<&str>,
         sessions: impl IntoIterator<Item = &'a str>,
     ) -> rusqlite::Result<bool> {
-        self.sync_sessions(sessions)?;
-        let mut store = self.store.clone();
-        if !store.move_session_before(source, before) {
-            return Ok(false);
+        let ordered_alive = sessions.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let mut conn = open_db(&self.path)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut store = SessionStore::load_transaction(&tx, self.binding_id)?;
+        let sync_changed = if ordered_alive.is_empty() {
+            false
+        } else {
+            self.sync_store(&tx, &mut store, &ordered_alive)?
+        };
+        let moved = store.move_session_before(source, before);
+        let initialized = Self::membership_initialized_transaction(&tx, self.binding_id)?;
+        if sync_changed || moved {
+            self.check_save_failure()?;
+            store.save_transaction(&tx, self.binding_id)?;
         }
-        self.save_store(store)?;
-        Ok(true)
-    }
-
-    fn save_store(&mut self, store: SessionStore) -> rusqlite::Result<()> {
-        #[cfg(test)]
-        if let Some(message) = self.next_save_failure.take() {
-            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::other(message),
-            )));
-        }
-
-        store.save_sqlite(&self.path, self.binding_id)?;
+        tx.commit()?;
         self.store = store;
-        self.membership_initialized = true;
-        Ok(())
+        self.membership_initialized = sync_changed || initialized;
+        Ok(moved)
     }
 
     #[cfg(test)]
     pub(crate) fn fail_next_save_for_test(&mut self) {
         self.next_save_failure = Some("injected session-order persistence failure".to_owned());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_save_failure_for_test(&mut self) {
+        self.next_save_failure = None;
     }
 }
 
@@ -489,11 +872,22 @@ mod tests {
         fs::write(dir.join("session-order"), "").expect("write empty legacy order");
         dir.join("config.toml")
     }
+    fn namespace(
+        backend: MultiplexerBackendConfig,
+        host: Option<&str>,
+    ) -> BackendConnectionNamespace {
+        BackendConnectionNamespace::new(backend, host.map(SshRemoteConfig::for_host))
+    }
+
+    fn local_namespace() -> BackendConnectionNamespace {
+        namespace(MultiplexerBackendConfig::Native, None)
+    }
 
     #[test]
     fn sync_sessions_persists_order_in_sqlite_wal_database() {
         let path = temp_config_path("sqlite");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store
             .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
             .expect("sync sessions");
@@ -507,7 +901,8 @@ mod tests {
                 .expect("move session")
         );
 
-        let mut reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
+        let mut reloaded = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("reload session order");
         assert_eq!(
             reloaded
                 .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
@@ -525,7 +920,8 @@ mod tests {
     #[test]
     fn sync_sessions_does_not_overwrite_persisted_order_when_refresh_has_no_sessions() {
         let path = temp_config_path("empty-refresh");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store
             .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
             .expect("sync sessions");
@@ -546,7 +942,8 @@ mod tests {
                 .is_empty()
         );
 
-        let mut reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
+        let mut reloaded = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("reload session order");
         assert_eq!(
             reloaded
                 .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
@@ -575,10 +972,10 @@ mod tests {
         .expect("insert second Space binding");
         let second_binding = conn.last_insert_rowid();
 
-        let mut first =
-            SessionOrderStore::for_binding(&path, first_binding).expect("open first order");
-        let mut second =
-            SessionOrderStore::for_binding(&path, second_binding).expect("open second order");
+        let mut first = SessionOrderStore::for_binding(&path, first_binding, local_namespace())
+            .expect("open first order");
+        let mut second = SessionOrderStore::for_binding(&path, second_binding, local_namespace())
+            .expect("open second order");
         first.add_session("first").expect("persist first session");
         second
             .add_session("second")
@@ -601,9 +998,233 @@ mod tests {
     }
 
     #[test]
+    fn initial_sync_allows_same_name_for_distinct_backend_connections() {
+        let path = temp_config_path("distinct-backend-connections");
+        let workspace = WorkspaceStore::for_config_path(&path);
+        let first_binding = workspace.binding_id().expect("default binding");
+        let conn = open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Second Space"],
+        )
+        .expect("insert second Space");
+        let second_space = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![second_space, "Second Space Binding", "tmux", 0_i64],
+        )
+        .expect("insert second Space binding");
+        let second_binding = conn.last_insert_rowid();
+        drop(conn);
+
+        let mut first = SessionOrderStore::for_binding(
+            &path,
+            first_binding,
+            namespace(MultiplexerBackendConfig::Tmux, Some("devbox-a")),
+        )
+        .expect("open first order");
+        let mut second = SessionOrderStore::for_binding(
+            &path,
+            second_binding,
+            namespace(MultiplexerBackendConfig::Tmux, Some("devbox-b")),
+        )
+        .expect("open second order");
+
+        assert_eq!(
+            first.sync_sessions(["dev"]).expect("sync first backend"),
+            vec!["dev"]
+        );
+        assert_eq!(
+            second.sync_sessions(["dev"]).expect("sync second backend"),
+            vec!["dev"]
+        );
+    }
+    #[test]
+    fn concurrent_initial_sync_claims_each_session_once() {
+        let path = temp_config_path("concurrent-binding-membership");
+        let workspace = WorkspaceStore::for_config_path(&path);
+        let first_binding = workspace.binding_id().expect("default binding");
+        let conn = open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Second Space"],
+        )
+        .expect("insert second Space");
+        let second_space = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![second_space, "Second Space Binding", "native", 0_i64],
+        )
+        .expect("insert second Space binding");
+        let second_binding = conn.last_insert_rowid();
+        drop(conn);
+
+        let first = SessionOrderStore::for_binding(&path, first_binding, local_namespace())
+            .expect("open first order");
+        let second = SessionOrderStore::for_binding(&path, second_binding, local_namespace())
+            .expect("open second order");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let owners = std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            let first = scope.spawn(move || {
+                let mut first = first;
+                first_barrier.wait();
+                first.sync_sessions(["shared"]).expect("sync first binding")
+            });
+            let second_barrier = barrier.clone();
+            let second = scope.spawn(move || {
+                let mut second = second;
+                second_barrier.wait();
+                second
+                    .sync_sessions(["shared"])
+                    .expect("sync second binding")
+            });
+            [
+                first.join().expect("first thread"),
+                second.join().expect("second thread"),
+            ]
+        });
+
+        assert_eq!(
+            owners
+                .iter()
+                .filter(|sessions| !sessions.is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn concurrent_same_binding_additions_preserve_both_sessions() {
+        let path = temp_config_path("same-binding-lost-update");
+        let first = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open first session order");
+        let second = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open second session order");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let added = std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            let first = scope.spawn(move || {
+                let mut first = first;
+                first_barrier.wait();
+                first.add_session("first").expect("add first session")
+            });
+            let second_barrier = barrier.clone();
+            let second = scope.spawn(move || {
+                let mut second = second;
+                second_barrier.wait();
+                second.add_session("second").expect("add second session")
+            });
+            [
+                first.join().expect("first thread"),
+                second.join().expect("second thread"),
+            ]
+        });
+
+        assert_eq!(added, [true, true]);
+        let reloaded = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("reload session order");
+        assert_eq!(reloaded.session_names(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn add_session_rejects_name_owned_by_another_binding_on_same_connection() {
+        let path = temp_config_path("cross-binding-conflict");
+        let workspace = WorkspaceStore::for_config_path(&path);
+        let first_binding = workspace.binding_id().expect("default binding");
+        let conn = open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Second Space"],
+        )
+        .expect("insert second Space");
+        let second_space = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![second_space, "Second Space Binding", "native", 0_i64],
+        )
+        .expect("insert second Space binding");
+        let second_binding = conn.last_insert_rowid();
+        drop(conn);
+
+        let mut first = SessionOrderStore::for_binding(&path, first_binding, local_namespace())
+            .expect("open first binding");
+        let mut second = SessionOrderStore::for_binding(&path, second_binding, local_namespace())
+            .expect("open second binding");
+
+        assert!(first.add_session("shared").expect("add shared session"));
+        let error = second
+            .add_session("shared")
+            .expect_err("reject conflicting shared session");
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another binding")
+        );
+        assert!(second.session_names().is_empty());
+        assert!(first.add_session("first").expect("add first session"));
+        assert!(second.add_session("second").expect("add second session"));
+        let error = first
+            .rename_session("first", "second")
+            .expect_err("reject conflicting rename");
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another binding")
+        );
+    }
+
+    #[test]
+    fn namespace_rebind_rejects_destination_collision_and_preserves_source() {
+        let path = temp_config_path("namespace-rebind-collision");
+        let workspace = WorkspaceStore::for_config_path(&path);
+        let first_binding = workspace.binding_id().expect("default binding");
+        let conn = open_db(workspace.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_spaces (name, position) VALUES (?1, 1)",
+            ["Second Space"],
+        )
+        .expect("insert second Space");
+        let second_space = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![second_space, "Second Space Binding", "native", 0_i64],
+        )
+        .expect("insert second Space binding");
+        let second_binding = conn.last_insert_rowid();
+        drop(conn);
+
+        let tmux = namespace(MultiplexerBackendConfig::Tmux, Some("devbox"));
+        let native = local_namespace();
+        let mut first = SessionOrderStore::for_binding(&path, first_binding, tmux.clone())
+            .expect("open tmux binding");
+        let mut second = SessionOrderStore::for_binding(&path, second_binding, native.clone())
+            .expect("open native binding");
+        first.add_session("dev").expect("persist tmux session");
+        second.add_session("dev").expect("persist native session");
+
+        let error = SessionOrderStore::for_binding(&path, first_binding, native)
+            .expect_err("reject namespace rebind collision");
+        assert!(
+            error
+                .to_string()
+                .contains("already owned by another binding")
+        );
+        let preserved = SessionOrderStore::for_binding(&path, first_binding, tmux)
+            .expect("reopen original namespace");
+        assert_eq!(preserved.session_names(), vec!["dev"]);
+    }
+
+    #[test]
     fn detached_session_can_be_attached_again() {
         let path = temp_config_path("detach-attach");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store.add_session("first").expect("persist first session");
         store.add_session("second").expect("persist second session");
 
@@ -629,7 +1250,8 @@ mod tests {
     #[test]
     fn rename_session_preserves_its_persisted_position() {
         let path = temp_config_path("rename-position");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         let sessions = ["first", "project/one", "project/two", "last"];
         store.sync_sessions(sessions).expect("sync sessions");
 
@@ -639,7 +1261,8 @@ mod tests {
                 .expect("rename session")
         );
 
-        let mut reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
+        let mut reloaded = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("reload session order");
         assert_eq!(
             reloaded
                 .sync_sessions(["first", "renamed", "project/two", "last"])
@@ -651,7 +1274,8 @@ mod tests {
     #[test]
     fn move_session_reorders_entries_within_group() {
         let path = temp_config_path("group");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store
             .sync_sessions(["a/1", "a/2", "b"])
             .expect("sync sessions");
@@ -678,7 +1302,8 @@ mod tests {
     #[test]
     fn move_session_moves_single_session_one_block_down_past_group() {
         let path = temp_config_path("step");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store
             .sync_sessions(["agents", "arc/migrations", "arc/readiness", "bootty"])
             .expect("sync sessions");
@@ -703,7 +1328,8 @@ mod tests {
     #[test]
     fn move_session_before_reorders_siblings_within_a_group() {
         let path = temp_config_path("within");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         let alive = ["a/1", "a/2", "a/3", "b"];
         store.sync_sessions(alive).expect("sync sessions");
 
@@ -722,7 +1348,8 @@ mod tests {
     #[test]
     fn move_session_before_across_groups_moves_the_whole_block() {
         let path = temp_config_path("across");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         let alive = ["a/1", "a/2", "b"];
         store.sync_sessions(alive).expect("sync sessions");
 
@@ -741,7 +1368,8 @@ mod tests {
     #[test]
     fn move_session_before_reorders_top_level_entries() {
         let path = temp_config_path("block");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store
             .sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"])
             .expect("sync sessions");
@@ -766,7 +1394,8 @@ mod tests {
     #[test]
     fn failed_persistence_is_observable_and_does_not_change_membership() {
         let path = temp_config_path("persistence-failure");
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
         store.fail_next_save_for_test();
 
         let error = store
@@ -779,7 +1408,8 @@ mod tests {
                 .contains("injected session-order persistence failure")
         );
         assert!(store.session_names().is_empty());
-        let reloaded = SessionOrderStore::for_config_path(&path).expect("reload session order");
+        let reloaded = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("reload session order");
         assert!(reloaded.session_names().is_empty());
     }
 
@@ -794,7 +1424,8 @@ mod tests {
         )
         .expect("write legacy order");
 
-        let mut store = SessionOrderStore::for_config_path(&path).expect("open session order");
+        let mut store = SessionOrderStore::for_config_path(&path, local_namespace())
+            .expect("open session order");
 
         assert_eq!(
             store

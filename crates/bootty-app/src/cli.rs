@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process,
@@ -123,6 +124,30 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Parse command-line arguments while keeping confirmation separate from
+    /// the dynamic trailing argument list.
+    ///
+    /// Clap intentionally gives a trailing var arg everything after the first
+    /// positional value. Consequently `--yes` after a dynamic argument is
+    /// present in `arguments` rather than in the generated boolean field. The
+    /// raw tokens are the only place where an explicit `--` delimiter remains
+    /// observable, so normalize from them after Clap has validated the rest of
+    /// the command line.
+    pub fn parse() -> Self {
+        Self::try_parse_from(std::env::args_os()).unwrap_or_else(|error| error.exit())
+    }
+
+    pub fn try_parse_from<I, T>(itr: I) -> std::result::Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let raw: Vec<OsString> = itr.into_iter().map(Into::into).collect();
+        let mut cli = <Self as Parser>::try_parse_from(raw.clone())?;
+        normalize_invoke_confirmation(&mut cli, &raw)?;
+        Ok(cli)
+    }
+
     pub fn load_config(&self) -> Result<BoottyConfig> {
         let path = self.selected_config_path();
         if self.defaults {
@@ -161,6 +186,148 @@ impl Cli {
     }
 }
 
+fn normalize_invoke_confirmation(
+    cli: &mut Cli,
+    raw: &[OsString],
+) -> std::result::Result<(), clap::Error> {
+    let Some(Command::Invoke {
+        name: _,
+        arguments,
+        yes,
+    }) = cli.command.as_mut()
+    else {
+        return Ok(());
+    };
+    let Some(command_index) = invoke_subcommand_index(raw) else {
+        return Ok(());
+    };
+
+    let mut saw_name = false;
+    let mut delimiter = false;
+    let mut confirmation_count = 0;
+    let mut normalized_arguments = Vec::new();
+    for token in &raw[command_index + 1..] {
+        let token = token.to_string_lossy();
+        if !saw_name {
+            if token == "--yes" {
+                confirmation_count += 1;
+                continue;
+            }
+            if token.starts_with("--yes=") {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::InvalidValue,
+                    "--yes does not accept a value",
+                ));
+            }
+            saw_name = true;
+            continue;
+        }
+        if !delimiter && token == "--" {
+            delimiter = true;
+            continue;
+        }
+        if !delimiter && token == "--yes" {
+            confirmation_count += 1;
+            continue;
+        }
+        if !delimiter && token.starts_with("--yes=") {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::InvalidValue,
+                "--yes does not accept a value",
+            ));
+        }
+        normalized_arguments.push(token.into_owned());
+    }
+    if confirmation_count > 1 {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--yes may only be specified once",
+        ));
+    }
+    *arguments = normalized_arguments;
+    *yes |= confirmation_count == 1;
+    Ok(())
+}
+
+fn invoke_subcommand_index(raw: &[OsString]) -> Option<usize> {
+    let mut index = 1;
+    while index < raw.len() {
+        let token = raw[index].to_string_lossy();
+        if token == "command" {
+            return Some(index);
+        }
+        if token == "--" {
+            return None;
+        }
+        if let Some(option) = token
+            .strip_prefix("--")
+            .and_then(|token| token.split('=').next())
+            && option_takes_value(option)
+            && !token.contains('=')
+        {
+            index += 1;
+        }
+        index += 1;
+    }
+    None
+}
+
+fn option_takes_value(option: &str) -> bool {
+    matches!(
+        option,
+        "config"
+            | "window-state-key"
+            | "instance"
+            | "backend"
+            | "ssh-remote"
+            | "fullscreen-top-offset"
+            | "window-decoration"
+            | "titlebar"
+            | "macos-titlebar-style"
+            | "title"
+            | "width"
+            | "height"
+            | "theme"
+            | "background"
+            | "foreground"
+            | "cursor-color"
+            | "cursor-text"
+            | "selection-background"
+            | "selection-foreground"
+            | "palette"
+            | "font-size"
+            | "font-family"
+            | "font-feature"
+            | "font-cell-width"
+            | "font-cell-height"
+            | "font-baseline-adjustment"
+            | "font-underline-position"
+            | "font-underline-thickness"
+            | "cursor-style"
+            | "shell"
+            | "working-directory"
+            | "env"
+            | "term"
+            | "colorterm"
+            | "max-scrollback"
+            | "macos-option-as-alt"
+            | "modifier-remap"
+            | "sidebar-position"
+            | "sidebar-width"
+            | "sidebar-background"
+            | "sidebar-foreground"
+            | "sidebar-selected"
+            | "sidebar-hover"
+            | "sidebar-border"
+            | "status-height"
+            | "chrome-gap"
+            | "gap"
+            | "unfocused-sidebar-dim"
+            | "unfocused-terminal-dim"
+            | "stability-trace"
+    )
+}
+
 fn isolated_defaults_config_path() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -194,7 +361,7 @@ mod tests {
         },
     };
     use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
-    use clap::{CommandFactory, Parser};
+    use clap::CommandFactory;
     use indoc::indoc;
 
     use super::{Cli, Command};
@@ -253,6 +420,122 @@ mod tests {
                 "hello".to_owned(),
             ]))
         );
+    }
+
+    #[test]
+    fn invoke_confirmation_after_arguments_is_extracted() {
+        let cli = Cli::try_parse_from([
+            "bootty",
+            "command",
+            "worktree.remove",
+            "/tmp/worktree",
+            "--yes",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.subcommand(),
+            Some(&Command::Invoke {
+                name: "worktree.remove".to_owned(),
+                arguments: vec!["/tmp/worktree".to_owned()],
+                yes: true,
+            })
+        );
+    }
+
+    #[test]
+    fn invoke_subcommand_scan_skips_global_option_values() {
+        let cli = Cli::try_parse_from([
+            "bootty",
+            "--instance",
+            "command",
+            "command",
+            "command",
+            "/tmp/worktree",
+            "--yes",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.subcommand(),
+            Some(&Command::Invoke {
+                name: "command".to_owned(),
+                arguments: vec!["/tmp/worktree".to_owned()],
+                yes: true,
+            })
+        );
+    }
+
+    #[test]
+    fn invoke_confirmation_before_name_is_preserved() {
+        let cli = Cli::try_parse_from([
+            "bootty",
+            "command",
+            "--yes",
+            "worktree.remove",
+            "/tmp/worktree",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.subcommand(),
+            Some(&Command::Invoke {
+                name: "worktree.remove".to_owned(),
+                arguments: vec!["/tmp/worktree".to_owned()],
+                yes: true,
+            })
+        );
+    }
+
+    #[test]
+    fn invoke_confirmation_after_delimiter_is_literal() {
+        let cli = Cli::try_parse_from([
+            "bootty",
+            "command",
+            "worktree.remove",
+            "/tmp/worktree",
+            "--",
+            "--yes",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.subcommand(),
+            Some(&Command::Invoke {
+                name: "worktree.remove".to_owned(),
+                arguments: vec!["/tmp/worktree".to_owned(), "--yes".to_owned()],
+                yes: false,
+            })
+        );
+    }
+
+    #[test]
+    fn invoke_without_confirmation_remains_unconfirmed() {
+        let cli =
+            Cli::try_parse_from(["bootty", "command", "worktree.remove", "/tmp/worktree"]).unwrap();
+
+        assert_eq!(
+            cli.subcommand(),
+            Some(&Command::Invoke {
+                name: "worktree.remove".to_owned(),
+                arguments: vec!["/tmp/worktree".to_owned()],
+                yes: false,
+            })
+        );
+    }
+
+    #[test]
+    fn invoke_confirmation_cannot_be_repeated() {
+        let result = Cli::try_parse_from([
+            "bootty",
+            "command",
+            "worktree.remove",
+            "/tmp/worktree",
+            "--yes",
+            "--yes",
+        ]);
+
+        assert!(result.is_err());
     }
 
     #[test]

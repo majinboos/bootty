@@ -12,7 +12,6 @@ use bootty_app::{
     control, remote_catalog,
     update::{self, UpdateResult},
 };
-use clap::Parser;
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_TRANSPORT: u8 = 4;
@@ -91,8 +90,7 @@ fn run() -> Result<()> {
             arguments,
             yes,
         }) => {
-            let mut invocation = CommandInvocation::from_action(name, Caller::Cli);
-            invocation.arguments = arguments.clone();
+            let invocation = command_invocation_from_cli(name, arguments);
             print_command_response(invoke_control_command(&cli, invocation, *yes)?, cli.json())?;
             return Ok(());
         }
@@ -187,13 +185,11 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
                 .ok_or_else(|| usage_failure(format!("unknown command {}", raw[0])))?
         };
     let raw_arguments = &raw[path_len..];
-    if raw_arguments
-        .iter()
-        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
-    {
+    if dynamic_help_requested(raw_arguments) {
         print_dynamic_help(&raw[..path_len].join(" "), &descriptor);
         return Ok(());
     }
+
     let (mut values, target, confirmed) =
         parse_dynamic_argument_values(&descriptor, raw_arguments)?;
     complete_dynamic_argument_values(&descriptor, &mut values)?;
@@ -238,6 +234,11 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
             )
         }
     }
+}
+fn dynamic_help_requested(raw: &[String]) -> bool {
+    raw.iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
 }
 
 fn dynamic_command_descriptors(
@@ -367,6 +368,12 @@ fn normalized_dynamic_name(name: &str) -> String {
         .map(|part| part.replace('-', "_"))
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn command_invocation_from_cli(name: &str, arguments: &[String]) -> CommandInvocation {
+    let mut invocation = CommandInvocation::from_action(name, Caller::Cli);
+    invocation.arguments.extend(arguments.iter().cloned());
+    invocation
 }
 
 fn invoke_control_command(
@@ -503,6 +510,9 @@ fn parse_dynamic_argument_values(
         }
         if options {
             if option == "--yes" {
+                if confirmed {
+                    return Err(usage_failure("--yes may only be specified once"));
+                }
                 confirmed = true;
                 continue;
             }
@@ -1238,9 +1248,43 @@ mod control_cli_tests {
             .expect("complete dynamic arguments");
         assert!(target.is_none());
         assert!(!confirmed);
+
         control::direct_control_request(&descriptor.id, &values)
             .expect("valid direct-control request")
             .expect("catalog direct-control request")
+    }
+    #[test]
+    fn terminal_send_text_help_after_delimiter_is_literal() {
+        let descriptor = CommandRegistry::core()
+            .describe("terminal.send_text")
+            .expect("terminal.send_text descriptor");
+        let raw = ["--".to_owned(), "--help".to_owned()];
+
+        assert!(!dynamic_help_requested(&raw));
+        let (arguments, target, confirmed) =
+            parse_dynamic_arguments(&descriptor, &raw).expect("literal send-text argument");
+
+        assert_eq!(arguments, ["--help"]);
+        assert!(target.is_none());
+        assert!(!confirmed);
+    }
+
+    #[test]
+    fn cli_invocation_keeps_embedded_move_tab_argument() {
+        let explicit = vec!["from-cli".to_owned()];
+        let invocation = command_invocation_from_cli("move_tab:-1", &explicit);
+
+        assert_eq!(invocation.command, "move_tab");
+        assert_eq!(invocation.arguments, ["-1", "from-cli"]);
+    }
+
+    #[test]
+    fn cli_invocation_keeps_embedded_navigate_search_argument() {
+        let explicit = vec!["from-cli".to_owned()];
+        let invocation = command_invocation_from_cli("navigate_search:next", &explicit);
+
+        assert_eq!(invocation.command, "navigate_search");
+        assert_eq!(invocation.arguments, ["next", "from-cli"]);
     }
 
     #[test]

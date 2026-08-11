@@ -1,5 +1,6 @@
 --!strict
--- Adds detected coding-agent activity below each session.
+-- Render only adapter-authoritative agent records published by the bundled extension.
+-- Process names, terminal text, descendants, and transcript output are never agent state.
 local ui = bootty.ui
 local facts = bootty.sidebar.session_facts()
 
@@ -12,17 +13,19 @@ return {
 			sessions = sessions,
 			facts = facts.get,
 			render = function(_, enriched)
+				if not enriched or not enriched.authoritative or not enriched.agent_name then
+					return nil
+				end
 				local activity, activity_color = facts.activity(enriched)
+				local style = enriched.agent_style or {}
 				return {
 					details = {
 						{
 							key = "agent",
-							icon = if enriched.agent_style then enriched.agent_style.icon else nil,
+							icon = style.icon,
 							label = enriched.agent_name,
-							color = if enriched.agent_style then enriched.agent_style.color else nil,
+							color = style.color,
 							right = activity,
-							-- The provider pulses this colour off `bootty.time()`, which is what
-							-- animates an agent's activity line. A fixed colour holds it still.
 							right_color = activity_color,
 						},
 					},

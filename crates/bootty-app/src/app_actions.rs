@@ -787,7 +787,8 @@ mod tests {
             | CoreCommandExecutor::WorktreeList { .. }
             | CoreCommandExecutor::WorktreeGet { .. }
             | CoreCommandExecutor::WorktreeCreate { .. }
-            | CoreCommandExecutor::WorktreeRemove { .. } => None,
+            | CoreCommandExecutor::WorktreeRemove { .. }
+            | CoreCommandExecutor::Extension { .. } => None,
         }
     }
 

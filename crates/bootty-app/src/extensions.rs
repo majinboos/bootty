@@ -12,6 +12,9 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -25,18 +28,23 @@ use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, Sys
 
 mod codexbar;
 mod http;
+pub mod runtime;
+pub use runtime::*;
 
+use crate::commands::CommandCancellation;
 #[cfg(test)]
 use codexbar::command_invokes_usage as command_invokes_codexbar_usage;
 use codexbar::{
     reject_reserved_shell_command, resolve_program as resolve_codexbar_program,
     validate_provider as validate_codexbar_provider,
 };
-use http::get_local as http_get_local;
 #[cfg(test)]
 use http::response_body as http_response_body;
+use http::{get_local as http_get_local, get_local_cancellable};
 
 /// Default refresh cadence for a module that doesn't declare its own `interval`.
+const EXTENSION_LUA_LOAD_TIMEOUT: Duration = Duration::from_millis(250);
+const EXTENSION_LUA_RENDER_TIMEOUT: Duration = Duration::from_millis(100);
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 /// Background poll granularity; a module fires on the first tick at or after its interval elapses.
 const TICK: Duration = Duration::from_millis(8);
@@ -45,6 +53,10 @@ const RELOAD_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 /// Bounded handoff from the worker hot-reload boundary to the UI/control event
 /// publisher. A full queue is coalesced into an explicit rebase publication.
 const RELOAD_EVENT_QUEUE_LIMIT: usize = 64;
+/// Bounds the authoritative module inventory carried by a reload rebase.
+const RELOAD_MODULE_LIMIT: usize = 256;
+const RELOAD_MODULE_ID_BYTES: usize = 256;
+const RELOAD_MODULE_SNAPSHOT_BYTES: usize = 64 * 1024;
 /// Cap on how many descendants `bootty.descendants` reports, so a runaway process tree cannot
 /// stall a render.
 const DESCENDANT_SCAN_LIMIT: usize = 256;
@@ -90,7 +102,6 @@ const BUILTIN_SESSION_EXTENSIONS: &[(&str, &str)] = &[
 pub fn session_module_key(name: &str) -> String {
     format!("{SESSION_MODULE_PREFIX}{name}")
 }
-
 /// One renderable element a Lua/Luau module produced.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModuleItem {
@@ -686,24 +697,49 @@ impl RunCommand {
 
 /// Caches `bootty.run` query output across renders and refreshes shell-outs off the extension
 /// worker so one slow provider/command cannot block unrelated modules.
+///
+/// The cache and its refresh workers are deliberately bounded. User-provided modules can choose
+/// arbitrary command strings, so an unbounded map or one thread per key would otherwise turn a
+/// render loop into a resource leak.
+const RUN_CACHE_ENTRY_LIMIT: usize = 256;
+const RUN_CACHE_REFRESH_LIMIT: usize = EXTENSION_PROCESS_LIMIT;
+const RUN_CACHE_QUOTA_ERROR: &str = "extension refresh quota exhausted";
+
 #[derive(Default)]
 struct RunCache {
     entries: Mutex<HashMap<String, RunEntry>>,
-    /// Current behavior, a `RunMode` discriminant; defaults to `Live`.
+    /// Refresh handles are retained until they are reaped, so a completed worker is joined
+    /// rather than silently detached. A reserved `None` handle is an active spawn slot.
+    refresh_jobs: Arc<Mutex<BTreeMap<u64, RefreshJob>>>,
+    next_refresh_job: AtomicU64,
+    next_access: AtomicU64,
     mode: AtomicU8,
     waker: Option<Arc<Waker>>,
     run_jobs: Arc<PlatformRunJobs>,
     shutdown: Arc<AtomicBool>,
-    codexbar: CodexBarClient,
+    codexbar: Arc<CodexBarClient>,
     /// Branch a settings preview should show. Previews render against example sessions whose paths
     /// do not exist, so a real `HEAD` read has nothing to find.
     preview_branch: Option<String>,
+}
+
+struct RefreshJob {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RefreshJob {
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+    }
 }
 
 #[derive(Default)]
 struct RunEntry {
     output: String,
     refreshing: bool,
+    last_used: u64,
 }
 
 #[derive(Default)]
@@ -711,6 +747,7 @@ struct CodexBarEntry {
     output: String,
     refreshing: bool,
     last_refresh: Option<Instant>,
+    last_used: u64,
 }
 
 impl RunCache {
@@ -719,12 +756,11 @@ impl RunCache {
         run_jobs: Arc<PlatformRunJobs>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
-        Self {
-            waker: Some(waker),
-            run_jobs,
-            shutdown,
-            ..Self::default()
-        }
+        let mut cache = Self::default();
+        cache.waker = Some(waker);
+        cache.run_jobs = run_jobs;
+        cache.shutdown = shutdown;
+        cache
     }
 
     fn set_mode(&self, mode: RunMode) {
@@ -771,7 +807,7 @@ impl RunCache {
             }
             RunMode::Refresh => {
                 let cached = self.cached(&command.cache_key());
-                self.refresh(command);
+                self.refresh(command)?;
                 Ok((cached.clone().unwrap_or_default(), cached.is_some()))
             }
         }
@@ -792,71 +828,253 @@ impl RunCache {
     }
 
     fn cached(&self, key: &str) -> Option<String> {
-        self.entries
-            .lock()
-            .ok()
-            .and_then(|entries| entries.get(key).map(|entry| entry.output.clone()))
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.get_mut(key)?;
+        entry.last_used = self.next_access.fetch_add(1, Ordering::Relaxed);
+        Some(entry.output.clone())
     }
 
-    fn refresh(self: &Arc<Self>, command: RunCommand) {
+    fn refresh(self: &Arc<Self>, command: RunCommand) -> std::io::Result<()> {
+        self.reap_finished_jobs();
         let key = command.cache_key().into_owned();
+        let job_id = self.next_refresh_job.fetch_add(1, Ordering::Relaxed);
+
         {
-            let Ok(mut entries) = self.entries.lock() else {
-                return;
-            };
-            let entry = entries.entry(key.clone()).or_default();
-            if entry.refreshing {
-                return;
+            let mut jobs = self
+                .refresh_jobs
+                .lock()
+                .map_err(|_| std::io::Error::other("extension refresh jobs poisoned"))?;
+
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| std::io::Error::other("extension run cache poisoned"))?;
+            if let Some(entry) = entries.get_mut(&key) {
+                if entry.refreshing {
+                    return Ok(());
+                }
+                if jobs.len() >= RUN_CACHE_REFRESH_LIMIT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        RUN_CACHE_QUOTA_ERROR,
+                    ));
+                }
+                entry.refreshing = true;
+                entry.last_used = self.next_access.fetch_add(1, Ordering::Relaxed);
+            } else {
+                if jobs.len() >= RUN_CACHE_REFRESH_LIMIT {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        RUN_CACHE_QUOTA_ERROR,
+                    ));
+                }
+                if entries.len() >= RUN_CACHE_ENTRY_LIMIT {
+                    let Some(eviction_key) = entries
+                        .iter()
+                        .filter(|(_, entry)| !entry.refreshing)
+                        .min_by_key(|(_, entry)| entry.last_used)
+                        .map(|(key, _)| key.clone())
+                    else {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            RUN_CACHE_QUOTA_ERROR,
+                        ));
+                    };
+                    entries.remove(&eviction_key);
+                }
+                entries.insert(
+                    key.clone(),
+                    RunEntry {
+                        refreshing: true,
+                        last_used: self.next_access.fetch_add(1, Ordering::Relaxed),
+                        ..RunEntry::default()
+                    },
+                );
             }
-            entry.refreshing = true;
+            jobs.insert(job_id, RefreshJob { handle: None });
         }
 
-        let cache = Arc::clone(self);
-        std::thread::spawn(move || {
-            let output = command
-                .output(&cache.run_jobs, &cache.shutdown)
-                .map(|output| output.trim().to_owned())
-                .unwrap_or_else(|error| format!("bootty.run: {error}"));
-            if let Ok(mut entries) = cache.entries.lock() {
-                let entry = entries.entry(key).or_default();
-                entry.output = output;
-                entry.refreshing = false;
+        let run_jobs = Arc::clone(&self.run_jobs);
+        let shutdown = Arc::clone(&self.shutdown);
+        let cache = Arc::downgrade(self);
+        let thread_key = key.clone();
+        let handle = match std::thread::Builder::new()
+            .name("bootty-run-refresh".to_owned())
+            .spawn(move || {
+                let output = command
+                    .output(&run_jobs, &shutdown)
+                    .map(|output| output.trim().to_owned())
+                    .unwrap_or_else(|error| format!("bootty.run: {error}"));
+                let Some(cache) = cache.upgrade() else {
+                    return;
+                };
+                if let Ok(mut entries) = cache.entries.lock()
+                    && let Some(entry) = entries.get_mut(&thread_key)
+                {
+                    entry.output = output;
+                    entry.refreshing = false;
+                    entry.last_used = cache.next_access.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(waker) = &cache.waker {
+                    waker.force();
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Ok(mut entries) = self.entries.lock()
+                    && let Some(entry) = entries.get_mut(&key)
+                {
+                    if entry.output.is_empty() {
+                        entries.remove(&key);
+                    } else {
+                        entry.refreshing = false;
+                    }
+                }
+                if let Ok(mut jobs) = self.refresh_jobs.lock() {
+                    jobs.remove(&job_id);
+                }
+                return Err(error);
             }
-            if let Some(waker) = &cache.waker {
-                waker.force();
-            }
-        });
+        };
+        if let Ok(mut jobs) = self.refresh_jobs.lock()
+            && let Some(job) = jobs.get_mut(&job_id)
+        {
+            job.handle = Some(handle);
+        } else {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+
+    fn reap_finished_jobs(&self) {
+        let finished = {
+            let Ok(mut jobs) = self.refresh_jobs.lock() else {
+                return;
+            };
+            let ids: Vec<_> = jobs
+                .iter()
+                .filter(|(_, job)| job.is_finished())
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| jobs.remove(&id).and_then(|job| job.handle))
+                .collect::<Vec<_>>()
+        };
+        for handle in finished {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn cache_state(&self) -> (usize, usize) {
+        self.reap_finished_jobs();
+        let entries = self
+            .entries
+            .lock()
+            .map(|entries| entries.len())
+            .unwrap_or(0);
+        let active = self.refresh_jobs.lock().map(|jobs| jobs.len()).unwrap_or(0);
+        (entries, active)
     }
 
     fn refresh_codexbar_usage(self: &Arc<Self>, provider: String) {
+        self.reap_finished_jobs();
+        let job_id = self.next_refresh_job.fetch_add(1, Ordering::Relaxed);
+        let Ok(mut jobs) = self.refresh_jobs.lock() else {
+            return;
+        };
+        if jobs.len() >= RUN_CACHE_REFRESH_LIMIT {
+            return;
+        }
+        jobs.insert(job_id, RefreshJob { handle: None });
+        drop(jobs);
+
         if !self
             .codexbar
             .mark_refreshing(&provider, CODEXBAR_REFRESH_INTERVAL)
         {
+            if let Ok(mut jobs) = self.refresh_jobs.lock() {
+                jobs.remove(&job_id);
+            }
             return;
         }
 
-        let cache = Arc::clone(self);
-        std::thread::spawn(move || {
-            let output = cache
-                .codexbar
-                .fetch_usage(&provider)
-                .map(|output| output.trim().to_owned())
-                .ok();
-            let changed = cache.codexbar.finish_refresh(&provider, output);
-            if changed && let Some(waker) = &cache.waker {
-                waker.force();
+        let cache = Arc::downgrade(self);
+        let codexbar = Arc::clone(&self.codexbar);
+        let shutdown = Arc::clone(&self.shutdown);
+        let thread_provider = provider.clone();
+        let handle = match std::thread::Builder::new()
+            .name("bootty-codexbar-refresh".to_owned())
+            .spawn(move || {
+                let output = codexbar
+                    .fetch_usage(&thread_provider, &shutdown)
+                    .map(|output| output.trim().to_owned())
+                    .ok();
+                let Some(cache) = cache.upgrade() else {
+                    return;
+                };
+                let changed = cache.codexbar.finish_refresh(&thread_provider, output);
+                if changed && let Some(waker) = &cache.waker {
+                    waker.force();
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.codexbar.cancel_refresh(&provider);
+                if let Ok(mut jobs) = self.refresh_jobs.lock() {
+                    jobs.remove(&job_id);
+                }
+                let _ = error;
+                return;
             }
-        });
+        };
+        if let Ok(mut jobs) = self.refresh_jobs.lock()
+            && let Some(job) = jobs.get_mut(&job_id)
+        {
+            job.handle = Some(handle);
+        } else {
+            let _ = handle.join();
+        }
     }
 }
+
+impl Drop for RunCache {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        self.run_jobs.cleanup();
+        self.codexbar.stop_server();
+        let jobs = self
+            .refresh_jobs
+            .lock()
+            .map(|mut jobs| std::mem::take(&mut *jobs))
+            .unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        for (_, job) in jobs {
+            let Some(handle) = job.handle else {
+                continue;
+            };
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+type CodexBarFetch = Arc<dyn Fn(&str) -> std::io::Result<String> + Send + Sync + 'static>;
 
 #[derive(Default)]
 struct CodexBarClient {
     server: Mutex<CodexBarServerState>,
     entries: Mutex<HashMap<String, CodexBarEntry>>,
+    next_access: AtomicU64,
     #[cfg(test)]
     mock_usage: Mutex<HashMap<String, String>>,
+    #[cfg(test)]
+    fetch_override: Mutex<Option<CodexBarFetch>>,
 }
 
 #[derive(Default)]
@@ -867,16 +1085,20 @@ struct CodexBarServerState {
 
 impl Drop for CodexBarClient {
     fn drop(&mut self) {
-        if let Ok(mut server) = self.server.lock()
-            && let Some(mut child) = server.child.take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.stop_server();
     }
 }
-
 impl CodexBarClient {
+    fn stop_server(&self) {
+        if let Ok(mut server) = self.server.lock() {
+            if let Some(mut child) = server.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            server.port = None;
+        }
+    }
+
     #[cfg(test)]
     fn mock_usage(&self, provider: &str) -> Option<String> {
         self.mock_usage
@@ -885,18 +1107,40 @@ impl CodexBarClient {
             .and_then(|entries| entries.get(provider).cloned())
     }
 
-    fn cached(&self, provider: &str) -> Option<String> {
-        self.entries
+    #[cfg(test)]
+    fn set_mock_usage(&self, provider: &str, output: &str) {
+        self.mock_usage
             .lock()
-            .ok()
-            .and_then(|entries| entries.get(provider).map(|entry| entry.output.clone()))
+            .expect("codexbar mock usage")
+            .insert(provider.to_owned(), output.to_owned());
+    }
+
+    fn cached(&self, provider: &str) -> Option<String> {
+        let mut entries = self.entries.lock().ok()?;
+        let entry = entries.get_mut(provider)?;
+        entry.last_used = self.next_access.fetch_add(1, Ordering::Relaxed);
+        Some(entry.output.clone())
     }
 
     fn mark_refreshing(&self, provider: &str, refresh_interval: Duration) -> bool {
         let Ok(mut entries) = self.entries.lock() else {
             return false;
         };
-        let entry = entries.entry(provider.to_owned()).or_default();
+        if !entries.contains_key(provider) {
+            if entries.len() >= RUN_CACHE_ENTRY_LIMIT {
+                let Some(eviction_key) = entries
+                    .iter()
+                    .filter(|(_, entry)| !entry.refreshing)
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| key.clone())
+                else {
+                    return false;
+                };
+                entries.remove(&eviction_key);
+            }
+            entries.insert(provider.to_owned(), CodexBarEntry::default());
+        }
+        let entry = entries.get_mut(provider).expect("codexbar entry inserted");
         if entry.refreshing {
             return false;
         }
@@ -909,14 +1153,30 @@ impl CodexBarClient {
         }
         entry.refreshing = true;
         entry.last_refresh = Some(now);
+        entry.last_used = self.next_access.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    fn cancel_refresh(&self, provider: &str) {
+        if let Ok(mut entries) = self.entries.lock() {
+            let remove = entries
+                .get(provider)
+                .is_some_and(|entry| entry.output.is_empty());
+            if remove {
+                entries.remove(provider);
+            } else if let Some(entry) = entries.get_mut(provider) {
+                entry.refreshing = false;
+            }
+        }
     }
 
     fn finish_refresh(&self, provider: &str, output: Option<String>) -> bool {
         let Ok(mut entries) = self.entries.lock() else {
             return false;
         };
-        let entry = entries.entry(provider.to_owned()).or_default();
+        let Some(entry) = entries.get_mut(provider) else {
+            return false;
+        };
         entry.refreshing = false;
         let Some(output) = output else {
             return false;
@@ -925,24 +1185,32 @@ impl CodexBarClient {
             return false;
         }
         entry.output = output;
+        entry.last_used = self.next_access.fetch_add(1, Ordering::Relaxed);
         true
     }
 
-    fn fetch_usage(&self, provider: &str) -> std::io::Result<String> {
+    fn fetch_usage(&self, provider: &str, shutdown: &AtomicBool) -> std::io::Result<String> {
+        #[cfg(test)]
+        if let Some(fetch) = self
+            .fetch_override
+            .lock()
+            .ok()
+            .and_then(|fetch| fetch.clone())
+        {
+            return fetch(provider);
+        }
         let port = self.ensure_server()?;
-        http_get_local(
+        get_local_cancellable(
             port,
             &format!("/usage?provider={provider}"),
             Duration::from_secs(35),
+            shutdown,
         )
     }
 
     #[cfg(test)]
-    fn set_mock_usage(&self, provider: &str, output: &str) {
-        self.mock_usage
-            .lock()
-            .expect("codexbar mock usage")
-            .insert(provider.to_owned(), output.to_owned());
+    fn set_fetch_override(&self, fetch: CodexBarFetch) {
+        *self.fetch_override.lock().expect("codexbar fetch override") = Some(fetch);
     }
 
     fn ensure_server(&self) -> std::io::Result<u16> {
@@ -1103,6 +1371,7 @@ pub struct ExtensionReloadEvent {
 pub struct ExtensionReloadDrain {
     pub events: Vec<ExtensionReloadEvent>,
     pub modules: Vec<ExtensionModuleGeneration>,
+    pub inventory_revision: u64,
     pub requires_rebase: bool,
 }
 
@@ -1117,6 +1386,7 @@ pub struct ExtensionModuleGeneration {
 struct ReloadEventQueue {
     events: VecDeque<ExtensionReloadEvent>,
     modules: BTreeMap<String, u64>,
+    inventory_revision: u64,
     requires_rebase: bool,
 }
 
@@ -1126,12 +1396,75 @@ impl ReloadEventQueue {
             return;
         }
         if self.events.len() >= RELOAD_EVENT_QUEUE_LIMIT {
-            // The drain's snapshot is authoritative. No older delta may follow it.
             self.events.clear();
             self.requires_rebase = true;
             return;
         }
         self.events.push_back(event);
+    }
+    fn mark_rebase(&mut self) {
+        self.events.clear();
+        self.requires_rebase = true;
+    }
+
+    fn set_modules(&mut self, modules: impl IntoIterator<Item = (String, u64)>) -> bool {
+        let candidate = modules.into_iter().collect::<BTreeMap<_, _>>();
+        if candidate.len() > RELOAD_MODULE_LIMIT
+            || candidate
+                .keys()
+                .any(|extension_id| extension_id.len() > RELOAD_MODULE_ID_BYTES)
+        {
+            return false;
+        }
+        let encoded_bytes = candidate
+            .keys()
+            .map(|id| id.len() + std::mem::size_of::<u64>() + 32)
+            .sum::<usize>();
+        if encoded_bytes > RELOAD_MODULE_SNAPSHOT_BYTES {
+            return false;
+        }
+        if candidate != self.modules {
+            self.modules = candidate;
+            self.inventory_revision = self.inventory_revision.saturating_add(1);
+        }
+        true
+    }
+
+    fn requeue(&mut self, drain: ExtensionReloadDrain) {
+        let current_events = std::mem::take(&mut self.events);
+        let mut merged_events = VecDeque::new();
+        let mut seen_events = BTreeSet::new();
+        let mut newest_generation = BTreeMap::new();
+        for event in drain.events.into_iter().chain(current_events) {
+            if newest_generation
+                .get(&event.extension_id)
+                .is_some_and(|generation| event.generation < *generation)
+            {
+                continue;
+            }
+            newest_generation
+                .entry(event.extension_id.clone())
+                .and_modify(|generation| *generation = (*generation).max(event.generation))
+                .or_insert(event.generation);
+            let key = (
+                event.extension_id.clone(),
+                event.generation,
+                event.operation.as_str().to_owned(),
+            );
+            if seen_events.insert(key) {
+                merged_events.push_back(event);
+            }
+        }
+        self.events = merged_events;
+        while self.events.len() > RELOAD_EVENT_QUEUE_LIMIT {
+            self.events.pop_front();
+            self.requires_rebase = true;
+        }
+
+        // `drain` snapshots the authoritative module inventory without removing it from
+        // the worker queue. A newer scan may already have replaced that inventory (including
+        // with an empty set), so never merge or restore the drained modules here.
+        self.requires_rebase |= drain.requires_rebase;
     }
 
     fn drain(&mut self) -> ExtensionReloadDrain {
@@ -1145,11 +1478,11 @@ impl ReloadEventQueue {
                     generation: *generation,
                 })
                 .collect(),
+            inventory_revision: self.inventory_revision,
             requires_rebase: std::mem::take(&mut self.requires_rebase),
         }
     }
 }
-
 /// Owns the Luau worker thread, the shared item map the UI reads, and the mux snapshot the UI feeds.
 pub struct ExtensionHost {
     dir: PathBuf,
@@ -1170,6 +1503,8 @@ pub struct ExtensionHost {
     waker: Arc<Waker>,
     run_jobs: Arc<PlatformRunJobs>,
     shutdown: Arc<AtomicBool>,
+    worker_cancellation: CommandCancellation,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ExtensionHost {
@@ -1236,7 +1571,9 @@ impl ExtensionHost {
         let waker: Arc<Waker> = Arc::default();
         let run_jobs = Arc::new(PlatformRunJobs::default());
         let shutdown = Arc::new(AtomicBool::new(false));
-        let _handle = std::thread::Builder::new()
+        let worker_cancellation = CommandCancellation::new();
+        let thread_cancellation = worker_cancellation.clone();
+        let worker_handle = std::thread::Builder::new()
             .name(thread_name.to_owned())
             .spawn({
                 let items = Arc::clone(&items);
@@ -1253,6 +1590,9 @@ impl ExtensionHost {
                 let shutdown = Arc::clone(&shutdown);
                 let run_jobs = Arc::clone(&run_jobs);
                 move || {
+                    if !thread_cancellation.try_start() {
+                        return;
+                    }
                     run_loop(
                         &catalogs,
                         &ctx,
@@ -1268,6 +1608,7 @@ impl ExtensionHost {
                         &next_window_id,
                         &waker,
                         &shutdown,
+                        &thread_cancellation,
                         &run_jobs,
                         &reload_events,
                     )
@@ -1288,6 +1629,8 @@ impl ExtensionHost {
             waker,
             shutdown,
             run_jobs,
+            worker_cancellation,
+            worker: Mutex::new(worker_handle),
         }
     }
 
@@ -1389,6 +1732,13 @@ impl ExtensionHost {
             .map(|mut queue| queue.drain())
             .unwrap_or_default()
     }
+    /// Returns a failed publication to the worker queue so transient control-plane
+    /// failures cannot lose lifecycle state.
+    pub fn requeue_reload_events(&self, drain: ExtensionReloadDrain) {
+        if let Ok(mut queue) = self.reload_events.write() {
+            queue.requeue(drain);
+        }
+    }
 
     /// Drains floating-window open/close requests modules made via `bootty.window`,
     /// for the app to render with the native overlay framework.
@@ -1422,9 +1772,34 @@ impl ExtensionHost {
 
 impl Drop for ExtensionHost {
     fn drop(&mut self) {
+        self.worker_cancellation.request_cancel();
         self.shutdown.store(true, Ordering::Release);
         self.waker.wake();
         self.run_jobs.cleanup();
+        join_extension_worker(&self.worker, Duration::from_millis(300));
+    }
+}
+
+fn join_extension_worker(handle: &Mutex<Option<std::thread::JoinHandle<()>>>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let finished = handle
+            .lock()
+            .ok()
+            .and_then(|handle| handle.as_ref().map(std::thread::JoinHandle::is_finished))
+            .unwrap_or(true);
+        if finished || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    if let Ok(mut handle) = handle.lock()
+        && handle
+            .as_ref()
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        && let Some(handle) = handle.take()
+    {
+        let _ = handle.join();
     }
 }
 
@@ -1444,6 +1819,7 @@ fn run_loop(
     next_window_id: &Arc<AtomicU64>,
     waker: &Arc<Waker>,
     shutdown: &Arc<AtomicBool>,
+    cancellation: &CommandCancellation,
     run_jobs: &Arc<PlatformRunJobs>,
     reload_events: &RwLock<ReloadEventQueue>,
 ) {
@@ -1466,24 +1842,34 @@ fn run_loop(
     WINDOW_QUEUE.with(|queue| {
         *queue.borrow_mut() = Some((Arc::clone(window_requests), Arc::clone(next_window_id)));
     });
-    let mut modules = load_catalog_modules(&lua, catalogs);
+    let mut modules = load_catalog_modules(&lua, catalogs, cancellation, shutdown);
     let mut signature = catalog_signature(catalogs);
+    let initial_signature = signature.clone();
     let mut reload_generations = BTreeMap::new();
     let mut active_extension_ids = BTreeSet::new();
-    reconcile_extension_reloads(
+    let rejected = reconcile_extension_reloads(
         catalogs,
         &[],
-        &signature,
+        &initial_signature,
         &successful_module_names(&modules),
         &mut reload_generations,
         &mut active_extension_ids,
         reload_events,
     );
+    if !rejected.is_empty() {
+        signature.retain(|(path, _)| !rejected.contains(&extension_id(path)));
+    }
+    retain_accepted_modules(
+        &mut modules,
+        catalogs,
+        &initial_signature,
+        &active_extension_ids,
+    );
     let mut last_scan = Instant::now();
     let mut system = System::new();
     let battery = BatteryManager::new().ok();
     let mut last_metrics: Option<Instant> = None;
-    while !shutdown.load(Ordering::Relaxed) {
+    while !shutdown.load(Ordering::Relaxed) && !cancellation.is_cancel_requested() {
         let now = Instant::now();
         // A structural mux change (reorder, session/window added or removed) forces a re-render
         // this tick, so the new layout shows immediately instead of after the poll interval.
@@ -1493,21 +1879,27 @@ fn run_loop(
             last_scan = now;
             let current = catalog_signature(catalogs);
             if current != signature {
-                let previous = std::mem::replace(&mut signature, current);
-                modules = load_catalog_modules(&lua, catalogs);
-                let module_names = modules
-                    .iter()
-                    .map(|module| module.name.clone())
-                    .collect::<BTreeSet<_>>();
-                reconcile_extension_reloads(
+                let previous = signature.clone();
+                modules = load_catalog_modules(&lua, catalogs, cancellation, shutdown);
+                let rejected = reconcile_extension_reloads(
                     catalogs,
                     &previous,
-                    &signature,
+                    &current,
                     &successful_module_names(&modules),
                     &mut reload_generations,
                     &mut active_extension_ids,
                     reload_events,
                 );
+                signature = current
+                    .iter()
+                    .filter(|(path, _)| !rejected.contains(&extension_id(path)))
+                    .cloned()
+                    .collect();
+                retain_accepted_modules(&mut modules, catalogs, &current, &active_extension_ids);
+                let module_names = modules
+                    .iter()
+                    .map(|module| module.name.clone())
+                    .collect::<BTreeSet<_>>();
                 prune_removed_items(items, &module_names);
                 ctx.request_repaint();
             }
@@ -1537,7 +1929,15 @@ fn run_loop(
             let Some(handler) = module.on_reorder.clone() else {
                 continue;
             };
-            if let Err(error) = handler.call::<()>((request.source, request.before))
+            install_lua_interrupt(
+                &lua,
+                cancellation,
+                shutdown,
+                Instant::now() + EXTENSION_LUA_RENDER_TIMEOUT,
+            );
+            let reorder_result = handler.call::<()>((request.source, request.before));
+            lua.remove_interrupt();
+            if let Err(error) = reorder_result
                 && let Ok(mut map) = items.write()
             {
                 map.insert(module.name.clone(), vec![error_item(&error.to_string())]);
@@ -1556,7 +1956,15 @@ fn run_loop(
             let handler =
                 WINDOW_HANDLERS.with(|handlers| handlers.borrow_mut().remove(&outcome.id()));
             if let (Some(handler), WindowOutcome::Chosen { key, value, .. }) = (handler, outcome) {
-                let _ = handler.call::<()>((key, value));
+                install_lua_interrupt(
+                    &lua,
+                    cancellation,
+                    shutdown,
+                    Instant::now() + EXTENSION_LUA_RENDER_TIMEOUT,
+                );
+                let result = handler.call::<()>((key, value));
+                lua.remove_interrupt();
+                let _ = result;
                 ctx.request_repaint();
             }
         }
@@ -1589,7 +1997,7 @@ fn run_loop(
                 })
             {
                 record_module_interval_run(force, &mut module.last_run, now);
-                let produced = run_module(&module.body);
+                let produced = run_module_bounded(&lua, &module.body, cancellation, shutdown);
                 if let Ok(mut map) = items.write()
                     && map.get(&module.name) != Some(&produced)
                 {
@@ -1610,11 +2018,16 @@ fn record_module_interval_run(force: bool, last_run: &mut Option<Instant>, now: 
     }
 }
 
-fn load_catalog_modules(lua: &Lua, catalogs: &[ModuleCatalog]) -> Vec<LoadedModule> {
+fn load_catalog_modules(
+    lua: &Lua,
+    catalogs: &[ModuleCatalog],
+    cancellation: &CommandCancellation,
+    shutdown: &Arc<AtomicBool>,
+) -> Vec<LoadedModule> {
     catalogs
         .iter()
         .flat_map(|catalog| {
-            load_modules(lua, &catalog.dir, catalog.builtins)
+            load_modules_bounded(lua, &catalog.dir, catalog.builtins, cancellation, shutdown)
                 .into_iter()
                 .map(|mut module| {
                     module.name.insert_str(0, catalog.prefix);
@@ -1677,6 +2090,18 @@ fn successful_extension_ids(
         .collect()
 }
 
+fn module_inventory_within_limits(active: &BTreeSet<String>) -> bool {
+    active.len() <= RELOAD_MODULE_LIMIT
+        && active
+            .iter()
+            .all(|extension_id| extension_id.len() <= RELOAD_MODULE_ID_BYTES)
+        && active
+            .iter()
+            .map(|extension_id| extension_id.len() + std::mem::size_of::<u64>() + 32)
+            .sum::<usize>()
+            <= RELOAD_MODULE_SNAPSHOT_BYTES
+}
+
 fn next_extension_generation(generations: &mut BTreeMap<String, u64>, extension_id: &str) -> u64 {
     let generation = generations.entry(extension_id.to_owned()).or_insert(0);
     *generation = generation.saturating_add(1);
@@ -1691,27 +2116,53 @@ fn reconcile_extension_reloads(
     generations: &mut BTreeMap<String, u64>,
     active_extensions: &mut BTreeSet<String>,
     reload_events: &RwLock<ReloadEventQueue>,
-) {
+) -> BTreeSet<String> {
     let previous = extension_signature_entries(previous_signature);
     let current = extension_signature_entries(current_signature);
     let successful = successful_extension_ids(catalogs, current_signature, successful_modules);
-    let mut events = Vec::new();
+    let mut retained = BTreeSet::new();
+    let mut removed = Vec::new();
 
-    for (extension_id, modified) in &current {
-        if !successful.contains(extension_id) {
-            // The file still exists, but its new source cannot run. Retire its
-            // prior generation exactly like a removal so lifecycle consumers
-            // clear stale module state before a later successful reload.
-            if active_extensions.remove(extension_id) {
-                events.push(ExtensionReloadEvent {
-                    extension_id: extension_id.clone(),
-                    generation: next_extension_generation(generations, extension_id),
-                    operation: ExtensionReloadOperation::Removed,
-                });
-            }
+    // Remove failed and vanished modules before considering additions. This makes a
+    // same-scan replacement fit at the limit instead of rejecting the replacement
+    // because its predecessor still occupies a slot.
+    for extension_id in active_extensions.iter() {
+        if current.contains_key(extension_id) && successful.contains(extension_id) {
+            retained.insert(extension_id.clone());
+        } else {
+            removed.push(extension_id.clone());
+        }
+    }
+
+    let mut accepted = retained.clone();
+    let mut rejected = BTreeSet::new();
+    for extension_id in successful.iter() {
+        if accepted.contains(extension_id) {
             continue;
         }
+        let mut candidate = accepted.clone();
+        candidate.insert(extension_id.clone());
+        if module_inventory_within_limits(&candidate) {
+            accepted.insert(extension_id.clone());
+        } else {
+            rejected.insert(extension_id.clone());
+        }
+    }
 
+    let mut events = Vec::new();
+    for extension_id in removed {
+        active_extensions.remove(&extension_id);
+        events.push(ExtensionReloadEvent {
+            extension_id: extension_id.clone(),
+            generation: next_extension_generation(generations, &extension_id),
+            operation: ExtensionReloadOperation::Removed,
+        });
+    }
+
+    for (extension_id, modified) in &current {
+        if !successful.contains(extension_id) || !accepted.contains(extension_id) {
+            continue;
+        }
         let operation = match previous.get(extension_id) {
             None => Some(ExtensionReloadOperation::Loaded),
             Some(_) if !active_extensions.contains(extension_id) => {
@@ -1732,30 +2183,61 @@ fn reconcile_extension_reloads(
         }
     }
 
-    for extension_id in previous.keys() {
-        if !current.contains_key(extension_id) && active_extensions.remove(extension_id) {
-            events.push(ExtensionReloadEvent {
-                extension_id: extension_id.clone(),
-                generation: next_extension_generation(generations, extension_id),
-                operation: ExtensionReloadOperation::Removed,
-            });
-        }
-    }
-
+    // Keep the accepted set authoritative even if a caller supplied stale state.
+    *active_extensions = accepted;
     if let Ok(mut queue) = reload_events.write() {
-        queue.modules = active_extensions
-            .iter()
-            .filter_map(|extension_id| {
-                generations
-                    .get(extension_id)
-                    .copied()
-                    .map(|generation| (extension_id.clone(), generation))
-            })
-            .collect();
+        if !queue.set_modules(active_extensions.iter().filter_map(|extension_id| {
+            generations
+                .get(extension_id)
+                .copied()
+                .map(|generation| (extension_id.clone(), generation))
+        })) {
+            queue.mark_rebase();
+        }
+        if !rejected.is_empty() {
+            // An over-limit source is deliberately not acknowledged in the accepted
+            // signature by the worker. Force a bounded rebase publication so consumers
+            // receive a diagnostic lifecycle boundary instead of a partial inventory.
+            queue.mark_rebase();
+        }
         for event in events {
             queue.publish(event);
         }
     }
+    rejected
+}
+
+fn accepted_user_module_names(
+    catalogs: &[ModuleCatalog],
+    current_signature: &[(PathBuf, ExtensionFileSignature)],
+    active_extensions: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    current_signature
+        .iter()
+        .filter_map(|(path, _)| {
+            let id = extension_id(path);
+            active_extensions
+                .contains(&id)
+                .then(|| catalog_module_name(catalogs, path))
+                .flatten()
+        })
+        .collect()
+}
+
+fn retain_accepted_modules(
+    modules: &mut Vec<LoadedModule>,
+    catalogs: &[ModuleCatalog],
+    current_signature: &[(PathBuf, ExtensionFileSignature)],
+    active_extensions: &BTreeSet<String>,
+) {
+    let user_module_names = current_signature
+        .iter()
+        .filter_map(|(path, _)| catalog_module_name(catalogs, path))
+        .collect::<BTreeSet<_>>();
+    let accepted_names = accepted_user_module_names(catalogs, current_signature, active_extensions);
+    modules.retain(|module| {
+        !user_module_names.contains(&module.name) || accepted_names.contains(&module.name)
+    });
 }
 
 fn prune_removed_items(
@@ -1785,10 +2267,9 @@ impl ModuleKind {
     }
 }
 fn preview_run_cache() -> Arc<RunCache> {
-    let cache = Arc::new(RunCache {
-        preview_branch: Some("feature/module-previews".to_owned()),
-        ..RunCache::default()
-    });
+    let mut cache = RunCache::default();
+    cache.preview_branch = Some("feature/module-previews".to_owned());
+    let cache = Arc::new(cache);
     cache.set_mode(RunMode::Cached);
     let commands = [
         (
@@ -1822,6 +2303,7 @@ fn preview_run_cache() -> Arc<RunCache> {
                 RunEntry {
                     output: output.to_owned(),
                     refreshing: false,
+                    last_used: cache.next_access.fetch_add(1, Ordering::Relaxed),
                 },
             );
         }
@@ -1865,6 +2347,24 @@ pub fn preview_module_source(
     }));
     let run_cache = preview_run_cache();
     let result = setup_lua(theme, mux, metrics, Arc::default(), run_cache).and_then(|lua| {
+        let provider: Table = lua.load("return bootty.sidebar.session_facts()").eval()?;
+        let records: Table = lua
+            .load(
+                r#"return {
+                    {
+                        agent_id = "preview/codex",
+                        provider = "codex",
+                        session_key = "preview:binding:$1",
+                        display_name = "Codex",
+                        lifecycle = "running",
+                        activity = "working",
+                    },
+                }"#,
+            )
+            .eval()?;
+        provider
+            .get::<Function>("set_records")?
+            .call::<()>(records)?;
         let deadline = Instant::now() + Duration::from_millis(50);
         lua.set_interrupt(move |_| {
             if Instant::now() >= deadline {
@@ -2300,6 +2800,7 @@ static RUN_JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 struct PlatformRunJobs {
     children: Mutex<BTreeMap<u64, Child>>,
+    cancelled: AtomicBool,
 }
 
 impl PlatformRunJobs {
@@ -2309,34 +2810,65 @@ impl PlatformRunJobs {
             .lock()
             .map_err(|_| std::io::Error::other("extension run jobs poisoned"))?;
         children.insert(id, child);
-        // Drop can set shutdown and clean the registry between spawn and registration. Rechecking
-        // while the registry is locked closes that gap: either cleanup sees this child, or this
-        // path removes it itself.
-        if shutdown.load(Ordering::Acquire) {
-            let mut child = children.remove(&id).expect("registered child");
-            let _ = child.kill();
-            let _ = child.wait();
+        if shutdown.load(Ordering::Acquire) || self.cancelled.load(Ordering::Acquire) {
+            if let Some(mut child) = children.remove(&id) {
+                terminate_platform_child(&mut child);
+            }
             return Err(std::io::Error::other("extension host stopped"));
         }
         Ok(())
     }
 
-    /// Reclaim a finished job. `None` means [`Self::cleanup`] already killed it.
     fn take(&self, id: u64) -> Option<Child> {
         self.children.lock().ok()?.remove(&id)
     }
 
+    fn terminate(&self, id: u64) {
+        if let Ok(mut children) = self.children.lock()
+            && let Some(mut child) = children.remove(&id)
+        {
+            terminate_platform_child(&mut child);
+        }
+    }
+
     fn cleanup(&self) {
+        self.cancelled.store(true, Ordering::Release);
         let Ok(mut children) = self.children.lock() else {
             return;
         };
-        // ponytail: killing the shell orphans any grandchild it started; a process-group kill
-        // needs `libc::killpg`, which the workspace's `unsafe_code = "deny"` rules out.
         for (_, mut child) in std::mem::take(&mut *children) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_platform_child(&mut child);
         }
     }
+}
+
+fn terminate_platform_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id().to_string();
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .status();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < deadline {
+            if child.try_wait().ok().flatten().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
+    }
+    let _ = child.kill();
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    let _ = child.try_wait();
 }
 
 /// Run `cmd` through the platform shell and return its merged stdout/stderr.
@@ -2391,7 +2923,7 @@ fn run_output(
     if shutdown.load(Ordering::Acquire) {
         return Err(std::io::Error::other("extension host stopped"));
     }
-    let (mut reader, writer) = std::io::pipe()?;
+    let (reader, writer) = std::io::pipe()?;
     command.stdin(Stdio::null());
     if capture_stderr {
         command.stderr(writer.try_clone()?);
@@ -2399,24 +2931,107 @@ fn run_output(
         command.stderr(Stdio::null());
     }
     command.stdout(writer);
+    #[cfg(unix)]
+    command.process_group(0);
 
     let id = RUN_JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let child = command.spawn()?;
-    // `command` holds the pipe's write end until it is dropped, and the read below ends only
-    // once every writer is closed.
     drop(command);
     run_jobs.register(id, child, shutdown)?;
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel(8);
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => {
+                    let _ = output_tx.send(Ok(None));
+                    break;
+                }
+                Ok(size) => {
+                    if output_tx.send(Ok(Some(chunk[..size].to_vec()))).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = output_tx.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
 
-    let mut output = String::new();
-    let read = std::io::Read::read_to_string(&mut reader, &mut output);
-    let mut child = run_jobs
-        .take(id)
-        .ok_or_else(|| std::io::Error::other("extension host stopped"))?;
-    let _ = child.wait();
-    read?;
-    Ok(output)
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut output = Vec::new();
+    let result = loop {
+        if shutdown.load(Ordering::Acquire) {
+            run_jobs.terminate(id);
+            break Err(std::io::Error::other("extension host stopped"));
+        }
+        if Instant::now() >= deadline {
+            run_jobs.terminate(id);
+            break Err(std::io::Error::other("extension command deadline expired"));
+        }
+        match output_rx.recv_timeout(Duration::from_millis(8)) {
+            Ok(Ok(None)) => break Ok(()),
+            Ok(Ok(Some(chunk))) => {
+                if output.len().saturating_add(chunk.len()) > EXTENSION_PROCESS_BYTES {
+                    run_jobs.terminate(id);
+                    break Err(std::io::Error::other("extension output limit exceeded"));
+                }
+                output.extend_from_slice(&chunk);
+            }
+            Ok(Err(error)) => {
+                run_jobs.terminate(id);
+                break Err(error);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break Err(std::io::Error::other("extension output reader stopped"));
+            }
+        }
+    };
+    drop(output_rx);
+    if result.is_err() {
+        run_jobs.terminate(id);
+    }
+    let mut output_closed_with_live_child = false;
+    let mut cancelled_by_cleanup = false;
+    if let Some(mut child) = run_jobs.take(id) {
+        let wait_deadline = Instant::now() + Duration::from_millis(100);
+        let mut exited = child.try_wait().ok().flatten().is_some();
+        while !exited && Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(4));
+            exited = child.try_wait().ok().flatten().is_some();
+        }
+        if !exited {
+            output_closed_with_live_child = true;
+            terminate_platform_child(&mut child);
+        }
+    } else if result.is_ok() {
+        // `cleanup` removes a child from the registry before killing it. If its pipe happens to
+        // close cleanly first, treating the partial bytes as success would leak cancelled output
+        // into the module cache.
+        cancelled_by_cleanup = true;
+    }
+    let join_deadline = Instant::now() + Duration::from_millis(150);
+    while !reader_handle.is_finished() && Instant::now() < join_deadline {
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    if reader_handle.is_finished() {
+        let _ = reader_handle.join();
+    }
+    result?;
+    if cancelled_by_cleanup {
+        return Err(std::io::Error::other("extension command cancelled"));
+    }
+    if output_closed_with_live_child {
+        return Err(std::io::Error::other(
+            "process_still_running_after_output_closed",
+        ));
+    }
+    String::from_utf8(output).map_err(|error| std::io::Error::other(error.to_string()))
 }
-
 /// One process below a session's pane, as a module sees it.
 struct DescendantProcess {
     /// Executable path when known, otherwise the process name.
@@ -2540,6 +3155,51 @@ fn platform_shell_quote(value: &str) -> String {
 #[cfg(windows)]
 const fn windows_no_window_flag() -> u32 {
     0x0800_0000
+}
+
+fn preview_diff_counts(run_cache: &RunCache) -> Option<(u64, u64)> {
+    let command = RunCommand::Exec(
+        [
+            "git",
+            "-C",
+            "/Users/demo/src/bootty",
+            "diff",
+            "HEAD",
+            "--numstat",
+        ]
+        .map(str::to_owned)
+        .to_vec(),
+    );
+    let output = run_cache.cached(&command.cache_key())?;
+    let mut totals: Option<(u64, u64)> = None;
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        let added = fields.next()?.parse::<u64>().ok()?;
+        let removed = fields.next()?.parse::<u64>().ok()?;
+        let (total_added, total_removed) = totals.get_or_insert((0, 0));
+        *total_added = (*total_added).saturating_add(added);
+        *total_removed = (*total_removed).saturating_add(removed);
+    }
+    totals
+}
+
+fn enrich_session_facts(facts: &Table, session: &Table, run_cache: &RunCache) -> mlua::Result<()> {
+    let cwd = session.get::<Option<String>>("cwd")?;
+    let branch = run_cache
+        .preview_branch
+        .clone()
+        .or_else(|| cwd.as_deref().and_then(crate::git::head_branch));
+    facts.set("branch", branch.clone())?;
+    facts.set("branch_status", branch.as_ref().map(|_| "current"))?;
+    if run_cache.preview_branch.is_some() {
+        let (added, removed) = preview_diff_counts(run_cache).unwrap_or((0, 0));
+        facts.set("diff_added", added)?;
+        facts.set("diff_removed", removed)?;
+    } else {
+        facts.set("diff_added", Option::<u64>::None)?;
+        facts.set("diff_removed", Option::<u64>::None)?;
+    }
+    Ok(())
 }
 
 fn setup_lua(
@@ -2908,6 +3568,18 @@ fn setup_lua(
         .load(SIDEBAR_FACTS_PRELUDE)
         .set_name("bootty.sidebar")
         .eval()?;
+    let session_facts: Function = sidebar_table.get("session_facts")?;
+    let session_facts_provider: Table = session_facts.call(())?;
+    let original_get: Function = session_facts_provider.get("get")?;
+    let facts_run_cache = Arc::clone(&run_cache);
+    session_facts_provider.set(
+        "get",
+        lua.create_function(move |_, session: Table| {
+            let facts: Table = original_get.call(session.clone())?;
+            enrich_session_facts(&facts, &session, &facts_run_cache)?;
+            Ok(facts)
+        })?,
+    )?;
     let sidebar_mux = Arc::clone(&mux);
     sidebar_table.set(
         "visible",
@@ -2934,7 +3606,6 @@ fn setup_lua(
     lua.sandbox(true)?;
     Ok(lua)
 }
-
 fn module_environment(lua: &Lua) -> mlua::Result<Table> {
     let env = lua.create_table()?;
     let metatable = lua.create_table()?;
@@ -2944,10 +3615,12 @@ fn module_environment(lua: &Lua) -> mlua::Result<Table> {
     Ok(env)
 }
 
-fn load_modules(
+fn load_modules_bounded(
     lua: &Lua,
     dir: &Path,
     builtins: &'static [(&'static str, &'static str)],
+    cancellation: &CommandCancellation,
+    shutdown: &Arc<AtomicBool>,
 ) -> Vec<LoadedModule> {
     let mut sources = builtins
         .iter()
@@ -2963,20 +3636,32 @@ fn load_modules(
     sources
         .into_iter()
         .map(|(name, source)| match source {
-            Ok(code) => match module_environment(lua).and_then(|env| {
-                lua.load(&code)
-                    .set_name(&name)
-                    .set_environment(env)
-                    .eval::<Value>()
-            }) {
-                Ok(value) => loaded_module_from_value(name.clone(), value).unwrap_or_else(|| {
-                    load_error(
-                        name,
-                        "must return a function or { render = ... }".to_owned(),
-                    )
-                }),
-                Err(error) => load_error(name, first_line(&error.to_string())),
-            },
+            Ok(code) => {
+                install_lua_interrupt(
+                    lua,
+                    cancellation,
+                    shutdown,
+                    Instant::now() + EXTENSION_LUA_LOAD_TIMEOUT,
+                );
+                let result = module_environment(lua).and_then(|env| {
+                    lua.load(&code)
+                        .set_name(&name)
+                        .set_environment(env)
+                        .eval::<Value>()
+                });
+                lua.remove_interrupt();
+                match result {
+                    Ok(value) => {
+                        loaded_module_from_value(name.clone(), value).unwrap_or_else(|| {
+                            load_error(
+                                name,
+                                "must return a function or { render = ... }".to_owned(),
+                            )
+                        })
+                    }
+                    Err(error) => load_error(name, first_line(&error.to_string())),
+                }
+            }
             Err(error) => load_error(name, error),
         })
         .collect()
@@ -3019,6 +3704,48 @@ fn loaded_module_from_value(name: String, value: Value) -> Option<LoadedModule> 
         }
         _ => None,
     }
+}
+
+fn install_lua_interrupt(
+    lua: &Lua,
+    cancellation: &CommandCancellation,
+    shutdown: &Arc<AtomicBool>,
+    deadline: Instant,
+) {
+    let cancellation = cancellation.clone();
+    let shutdown = Arc::clone(shutdown);
+    lua.set_interrupt(move |_| {
+        if shutdown.load(Ordering::Acquire) || cancellation.is_cancel_requested() {
+            return Err(mlua::Error::external("cancelled"));
+        }
+        if Instant::now() >= deadline {
+            return Err(mlua::Error::external("deadline_exceeded"));
+        }
+        Ok(VmState::Continue)
+    });
+}
+
+fn run_module_bounded(
+    lua: &Lua,
+    body: &ModuleBody,
+    cancellation: &CommandCancellation,
+    shutdown: &Arc<AtomicBool>,
+) -> Vec<ModuleItem> {
+    install_lua_interrupt(
+        lua,
+        cancellation,
+        shutdown,
+        Instant::now() + EXTENSION_LUA_RENDER_TIMEOUT,
+    );
+    let produced = match body {
+        ModuleBody::Render(render) => match render.call::<Value>(()) {
+            Ok(value) => items_from_value(value),
+            Err(error) => vec![error_item(&error.to_string())],
+        },
+        ModuleBody::LoadError(message) => vec![error_item(message)],
+    };
+    lua.remove_interrupt();
+    produced
 }
 
 fn run_module(body: &ModuleBody) -> Vec<ModuleItem> {
@@ -3308,6 +4035,16 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn load_modules(
+        lua: &Lua,
+        dir: &Path,
+        builtins: &'static [(&'static str, &'static str)],
+    ) -> Vec<LoadedModule> {
+        let cancellation = CommandCancellation::new();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::load_modules_bounded(lua, dir, builtins, &cancellation, &shutdown)
+    }
+
     #[test]
     fn parse_window_spec_defaults_kind_and_reads_rows() {
         let lua = Lua::new();
@@ -3550,7 +4287,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_facts_isolate_scopes_and_reset_when_the_pane_changes() {
+    fn sidebar_facts_use_explicit_authority_and_scoped_correlation() {
         let run_cache = Arc::new(RunCache::default());
         run_cache.set_mode(RunMode::Cached);
         let lua = setup_lua(
@@ -3565,6 +4302,29 @@ mod tests {
             .load("return bootty.sidebar.session_facts()")
             .eval()
             .expect("facts provider");
+        let records: Table = lua
+            .load(
+                r#"return {
+					{
+						agent_id = "opaque-native",
+						session_key = "1:1:$1",
+						terminal = { terminal_id = "%1" },
+						lifecycle = "running",
+					},
+					{
+						agent_id = "terminal-native",
+						terminal = { terminal_id = "%2" },
+						lifecycle = "waiting",
+					},
+				}"#,
+            )
+            .eval()
+            .expect("authoritative agent records");
+        provider
+            .get::<Function>("set_records")
+            .expect("set records")
+            .call::<()>(records)
+            .expect("authoritative agent provider");
         let refresh: Function = provider.get("refresh").expect("refresh");
         let get: Function = provider.get("get").expect("get");
         let session = |scope: &str, pane: &str, process: &str| {
@@ -3584,43 +4344,56 @@ mod tests {
 
         let first = session("1:1:$1", "%1", "codex");
         refresh_one(first.clone());
-        let first_facts: Table = get.call(first.clone()).expect("first facts");
-        assert_eq!(first_facts.get::<String>("agent_name").unwrap(), "codex");
-
-        let other_scope = session("2:2:$1", "%1", "zsh");
-        refresh_one(other_scope.clone());
-        let other_facts: Table = get.call(other_scope.clone()).expect("other facts");
-        assert_eq!(other_facts.get::<String>("display_process").unwrap(), "zsh");
+        let first_facts: Table = get.call(first).expect("first facts");
+        assert!(first_facts.get::<bool>("authoritative").unwrap());
+        assert_eq!(
+            first_facts.get::<String>("agent_id").unwrap(),
+            "opaque-native"
+        );
+        assert_eq!(first_facts.get::<String>("lifecycle").unwrap(), "running");
         assert!(
-            other_facts
-                .get::<Option<String>>("agent_name")
+            first_facts
+                .get::<Option<String>>("provider")
                 .unwrap()
                 .is_none()
         );
-        let retained_first: Table = get.call(first).expect("retained first scope");
-        assert_eq!(retained_first.get::<String>("agent_name").unwrap(), "codex");
+        assert!(
+            first_facts
+                .get::<Option<String>>("activity")
+                .unwrap()
+                .is_none()
+        );
+
+        let other_scope = session("2:2:$1", "%1", "codex");
+        refresh_one(other_scope.clone());
+        let other_facts: Table = get.call(other_scope).expect("other facts");
+        assert!(!other_facts.get::<bool>("authoritative").unwrap());
+        assert!(
+            other_facts
+                .get::<Option<String>>("agent_id")
+                .unwrap()
+                .is_none()
+        );
 
         let replacement_pane = session("2:2:$1", "%2", "cargo");
         refresh_one(replacement_pane.clone());
         let replacement_facts: Table = get.call(replacement_pane).expect("replacement facts");
+        assert!(replacement_facts.get::<bool>("authoritative").unwrap());
         assert_eq!(
-            replacement_facts.get::<String>("display_process").unwrap(),
-            "cargo"
+            replacement_facts.get::<String>("agent_id").unwrap(),
+            "terminal-native"
         );
-        assert!(
-            replacement_facts
-                .get::<Option<String>>("agent_name")
-                .unwrap()
-                .is_none()
+        assert_eq!(
+            replacement_facts.get::<String>("lifecycle").unwrap(),
+            "waiting"
         );
     }
 
     #[test]
-    fn sidebar_facts_starts_one_cold_session_per_frame() {
-        let run_cache = Arc::new(RunCache {
-            shutdown: Arc::new(AtomicBool::new(true)),
-            ..RunCache::default()
-        });
+    fn sidebar_facts_never_shell_for_process_or_terminal_inference() {
+        let mut cache = RunCache::default();
+        cache.shutdown = Arc::new(AtomicBool::new(true));
+        let run_cache = Arc::new(cache);
         run_cache.set_mode(RunMode::Refresh);
         let lua = setup_lua(
             &[],
@@ -3645,24 +4418,19 @@ mod tests {
             session.set("process", "codex").expect("process");
             sessions.set(index, session).expect("session entry");
         }
-
         let refresh: Function = provider.get("refresh").expect("refresh");
         refresh
             .call::<()>(sessions.clone())
             .expect("first module refresh");
-        refresh
-            .call::<()>(sessions)
-            .expect("second module in the same frame");
-
-        assert_eq!(
-            run_cache.entries.lock().expect("entries").len(),
-            1,
-            "shared provider calls in one UI frame must start only one cold command"
+        refresh.call::<()>(sessions).expect("second module refresh");
+        assert!(
+            run_cache.entries.lock().expect("entries").is_empty(),
+            "agent facts must not shell out to classify processes or scrape panes"
         );
     }
 
     #[test]
-    fn sidebar_facts_consumes_a_completed_diff_on_the_next_frame() {
+    fn sidebar_facts_preserve_only_host_session_context() {
         let run_cache = Arc::new(RunCache::default());
         run_cache.set_mode(RunMode::Cached);
         let lua = setup_lua(
@@ -3685,31 +4453,18 @@ mod tests {
         let sessions = lua.create_table().expect("sessions");
         sessions.set(1, session.clone()).expect("session entry");
         let refresh: Function = provider.get("refresh").expect("refresh");
-        refresh
-            .call::<()>(sessions.clone())
-            .expect("initial refresh");
-        let command = RunCommand::Exec(
-            ["git", "-C", "/missing/repo", "diff", "HEAD", "--numstat"]
-                .map(str::to_owned)
-                .to_vec(),
-        );
-        run_cache.entries.lock().expect("entries").insert(
-            command.cache_key().into_owned(),
-            RunEntry {
-                output: "12\t3\tsrc/main.rs".to_owned(),
-                refreshing: false,
-            },
-        );
-
-        refresh.call::<()>(sessions).expect("next frame");
-
+        refresh.call::<()>(sessions).expect("refresh");
         let facts: Table = provider
             .get::<Function>("get")
             .expect("get")
             .call(session)
             .expect("facts");
-        assert_eq!(facts.get::<u32>("diff_added").unwrap(), 12);
-        assert_eq!(facts.get::<u32>("diff_removed").unwrap(), 3);
+        assert_eq!(facts.get::<String>("display_process").unwrap(), "zsh");
+        assert!(facts.get::<Option<u32>>("diff_added").unwrap().is_none());
+        assert!(
+            run_cache.entries.lock().expect("entries").is_empty(),
+            "agent fact providers must not derive repository facts as agent state"
+        );
     }
 
     #[test]
@@ -3844,6 +4599,32 @@ mod tests {
             "cleanup should stop the command before it reaches its gate"
         );
     }
+    #[cfg(unix)]
+    #[test]
+    fn shell_run_output_terminates_background_pipe_holders() {
+        let run_jobs = PlatformRunJobs::default();
+        let shutdown = AtomicBool::new(false);
+        let started = Instant::now();
+        let result = shell_run_output("printf ready; sleep 30 &", &run_jobs, &shutdown);
+        assert!(
+            result.is_err(),
+            "a background pipe holder must hit the bounded deadline"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(run_jobs.children.lock().is_ok_and(|jobs| jobs.is_empty()));
+        let stress_started = Instant::now();
+        assert!(shell_run_output("yes", &run_jobs, &shutdown).is_err());
+        assert!(stress_started.elapsed() < Duration::from_secs(1));
+        assert!(run_jobs.children.lock().is_ok_and(|jobs| jobs.is_empty()));
+        let closed_started = Instant::now();
+        let error = shell_run_output("exec 1>&- 2>&-; sleep 30", &run_jobs, &shutdown).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "process_still_running_after_output_closed"
+        );
+        assert!(closed_started.elapsed() < Duration::from_secs(1));
+        assert!(run_jobs.children.lock().is_ok_and(|jobs| jobs.is_empty()));
+    }
 
     #[test]
     fn keep_awake_mux_change_forces_status_module_rerender() {
@@ -3921,6 +4702,92 @@ mod tests {
             !wait_for_path(&done, Duration::from_millis(200)),
             "dropping the host should cancel its in-flight shell commands"
         );
+    }
+    #[test]
+    fn window_action_deadline_keeps_worker_usable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("window_loop.luau"),
+            r#"
+                local opened = false
+                local renders = 0
+                return {
+                    interval = 60,
+                    render = function()
+                        renders = renders + 1
+                        if not opened then
+                            opened = true
+                            bootty.window.open({
+                                title = "loop",
+                                rows = {{ key = "go", text = "go" }},
+                                on_action = function()
+                                    while true do end
+                                end
+                            })
+                        end
+                        return tostring(renders)
+                    end
+                }
+            "#,
+        )
+        .expect("write window module");
+        let host = ExtensionHost::spawn_status(
+            dir.path().to_path_buf(),
+            egui::Context::default(),
+            Vec::new(),
+        );
+        host.set_active(["window_loop".to_owned()]);
+        let initial_deadline = Instant::now() + Duration::from_secs(2);
+        let initial = loop {
+            if let Some(item) = host.items("window_loop").into_iter().next() {
+                break item.text;
+            }
+            assert!(
+                Instant::now() < initial_deadline,
+                "window module did not render"
+            );
+            std::thread::sleep(Duration::from_millis(8));
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let window = loop {
+            if let Some(spec) =
+                host.take_window_requests()
+                    .into_iter()
+                    .find_map(|request| match request {
+                        WindowRequest::Open(spec) => Some(spec),
+                        WindowRequest::Close => None,
+                    })
+            {
+                break spec;
+            }
+            assert!(Instant::now() < deadline, "window request was not produced");
+            std::thread::sleep(Duration::from_millis(8));
+        };
+        host.push_window_action(window.id, "go".to_owned(), None);
+        std::thread::sleep(Duration::from_millis(150));
+        host.update_mux(MuxView {
+            keep_awake: true,
+            ..MuxView::default()
+        });
+        let rerender_deadline = Instant::now() + Duration::from_millis(500);
+        let rerendered = loop {
+            if host
+                .items("window_loop")
+                .iter()
+                .any(|item| item.text != initial)
+            {
+                break true;
+            }
+            if Instant::now() >= rerender_deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        };
+        assert!(
+            rerendered,
+            "timed-out window callback must not strand the worker"
+        );
+        drop(host);
     }
 
     #[cfg(unix)]
@@ -4078,6 +4945,7 @@ mod tests {
                     output: "cached".to_owned(),
                     refreshing: true,
                     last_refresh: None,
+                    ..CodexBarEntry::default()
                 },
             );
 
@@ -4098,6 +4966,7 @@ mod tests {
                     output: "cached".to_owned(),
                     refreshing: false,
                     last_refresh: None,
+                    ..CodexBarEntry::default()
                 },
             );
         run_cache.set_mode(RunMode::Cached);
@@ -4122,6 +4991,91 @@ mod tests {
         assert!(client.mark_refreshing("claude", CODEXBAR_REFRESH_INTERVAL));
         assert!(!client.mark_refreshing("claude", CODEXBAR_REFRESH_INTERVAL));
         assert!(client.mark_refreshing("codex", CODEXBAR_REFRESH_INTERVAL));
+    }
+    #[test]
+    fn codexbar_cache_bounds_unique_providers_with_lru_eviction() {
+        let client = CodexBarClient::default();
+        let mut providers = Vec::with_capacity(RUN_CACHE_ENTRY_LIMIT + 1);
+        for index in 0..=RUN_CACHE_ENTRY_LIMIT {
+            let provider = format!("provider-{index}");
+            assert!(client.mark_refreshing(&provider, Duration::ZERO));
+            assert!(client.finish_refresh(&provider, Some(format!("usage-{index}"))));
+            providers.push(provider);
+        }
+        let entries = client.entries.lock().expect("codexbar entries");
+        assert_eq!(entries.len(), RUN_CACHE_ENTRY_LIMIT);
+        assert_eq!(
+            entries
+                .get(providers.last().expect("last provider"))
+                .map(|entry| entry.output.as_str()),
+            Some("usage-256")
+        );
+    }
+
+    #[test]
+    fn codexbar_refresh_rejects_new_provider_when_active_quota_is_full() {
+        let run_cache = Arc::new(RunCache::default());
+        for index in 0..RUN_CACHE_REFRESH_LIMIT {
+            let provider = format!("active-{index}");
+            assert!(
+                run_cache
+                    .codexbar
+                    .mark_refreshing(&provider, Duration::ZERO)
+            );
+            run_cache
+                .refresh_jobs
+                .lock()
+                .expect("refresh jobs")
+                .insert(index as u64, RefreshJob { handle: None });
+        }
+
+        run_cache.refresh_codexbar_usage("overflow".to_owned());
+
+        assert!(
+            !run_cache
+                .codexbar
+                .entries
+                .lock()
+                .expect("codexbar entries")
+                .contains_key("overflow")
+        );
+        assert_eq!(
+            run_cache.refresh_jobs.lock().expect("refresh jobs").len(),
+            RUN_CACHE_REFRESH_LIMIT
+        );
+    }
+
+    #[test]
+    fn dropping_codexbar_refresh_cancels_and_joins_injected_fetch() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let mut cache = RunCache::default();
+        cache.shutdown = Arc::clone(&shutdown);
+        let run_cache = Arc::new(cache);
+        let jobs = Arc::clone(&run_cache.refresh_jobs);
+        let fetch_shutdown = Arc::clone(&shutdown);
+        let fetch_started = Arc::clone(&started);
+        run_cache.codexbar.set_fetch_override(Arc::new(move |_| {
+            fetch_started.store(true, Ordering::Release);
+            while !fetch_shutdown.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(std::io::Error::other("cancelled"))
+        }));
+        run_cache.refresh_codexbar_usage("codex".to_owned());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(started.load(Ordering::Acquire));
+
+        drop(run_cache);
+
+        assert!(
+            jobs.lock().expect("refresh jobs").is_empty(),
+            "drop must remove every tracked CodexBar refresh job"
+        );
+        assert!(shutdown.load(Ordering::Acquire));
     }
 
     #[test]
@@ -4886,14 +5840,103 @@ mod tests {
         assert_eq!(run(), "4", "live never serves a cached result");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_cache_bounds_unique_keys_and_evicts_least_recent_completed_entry() {
+        let run_cache = Arc::new(RunCache::default());
+        let mut commands = Vec::with_capacity(RUN_CACHE_ENTRY_LIMIT + 1);
+        for index in 0..=RUN_CACHE_ENTRY_LIMIT {
+            let command = format!("printf key{index}");
+            run_cache
+                .refresh(RunCommand::Shell(command.clone()))
+                .expect("refresh should reserve a bounded slot");
+            assert!(wait_for_cached_output(
+                &run_cache,
+                &command,
+                &format!("key{index}"),
+                Duration::from_secs(2)
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while run_cache.cache_state().1 != 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            commands.push(command);
+        }
+
+        let (entries, active) = run_cache.cache_state();
+        assert_eq!(entries, RUN_CACHE_ENTRY_LIMIT);
+        assert_eq!(active, 0);
+        assert!(
+            run_cache.cached(&commands[0]).is_none(),
+            "the least-recent completed entry should be evicted"
+        );
+        assert_eq!(
+            run_cache.cached(commands.last().expect("last command")),
+            Some(format!("key{RUN_CACHE_ENTRY_LIMIT}"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cache_rejects_new_refresh_when_all_workers_are_active() {
+        let run_cache = Arc::new(RunCache::default());
+        for index in 0..RUN_CACHE_REFRESH_LIMIT {
+            run_cache
+                .refresh(RunCommand::Shell(format!(
+                    "while true; do sleep 1; done # {index}"
+                )))
+                .expect("each active refresh should consume one quota slot");
+        }
+        assert_eq!(run_cache.cache_state().1, RUN_CACHE_REFRESH_LIMIT);
+
+        let error = run_cache
+            .refresh(RunCommand::Shell("printf extra".to_owned()))
+            .expect_err("an extra active refresh must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), RUN_CACHE_QUOTA_ERROR);
+        assert_eq!(run_cache.cache_state().1, RUN_CACHE_REFRESH_LIMIT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_run_cache_cancels_and_joins_refresh_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let started = dir.path().join("started");
+        let gate = dir.path().join("gate");
+        let done = dir.path().join("done");
+        let command = blocking_file_command(&started, &gate, &done);
+        let run_jobs = Arc::new(PlatformRunJobs::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut cache = RunCache::default();
+        cache.run_jobs = Arc::clone(&run_jobs);
+        cache.shutdown = Arc::clone(&shutdown);
+        let run_cache = Arc::new(cache);
+        let weak_cache = Arc::downgrade(&run_cache);
+        run_cache
+            .refresh(RunCommand::Shell(command))
+            .expect("blocking refresh should start");
+        assert!(wait_for_path(&started, Duration::from_secs(2)));
+
+        drop(run_cache);
+
+        assert!(
+            weak_cache.upgrade().is_none(),
+            "drop must release the cache"
+        );
+        assert!(
+            run_jobs.children.lock().is_ok_and(|jobs| jobs.is_empty()),
+            "drop must cancel every process group"
+        );
+        assert!(!wait_for_path(&done, Duration::from_millis(200)));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn run_cache_refresh_keeps_shell_out_errors_visible() {
         let cmd = "printf ignored".to_owned();
-        let run_cache = Arc::new(RunCache {
-            shutdown: Arc::new(AtomicBool::new(true)),
-            ..RunCache::default()
-        });
+        let mut cache = RunCache::default();
+        cache.shutdown = Arc::new(AtomicBool::new(true));
+        let run_cache = Arc::new(cache);
 
         run_cache.set_mode(RunMode::Refresh);
         // Empty and not an answer yet: a module told only "empty" cannot tell this from a command
@@ -5518,6 +6561,158 @@ mod tests {
                 generation: final_generation,
             }]
         );
+    }
+    #[test]
+    fn requeue_keeps_newer_generation_after_failed_older_publication() {
+        let mut queue = ReloadEventQueue::default();
+        let extension_id = "path:/extensions/interleaved.luau".to_owned();
+        assert!(queue.set_modules([(extension_id.clone(), 1)]));
+        queue.publish(ExtensionReloadEvent {
+            extension_id: extension_id.clone(),
+            generation: 1,
+            operation: ExtensionReloadOperation::Loaded,
+        });
+        let failed = queue.drain();
+        assert_eq!(failed.inventory_revision, 1);
+        assert!(queue.set_modules([(extension_id.clone(), 2)]));
+        queue.publish(ExtensionReloadEvent {
+            extension_id: extension_id.clone(),
+            generation: 2,
+            operation: ExtensionReloadOperation::Reloaded,
+        });
+        queue.requeue(failed);
+        let merged = queue.drain();
+        assert_eq!(merged.inventory_revision, 2);
+        assert_eq!(merged.modules[0].generation, 2);
+        assert_eq!(
+            merged
+                .events
+                .iter()
+                .map(|event| event.generation)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn requeue_does_not_resurrect_authoritative_empty_inventory() {
+        let mut queue = ReloadEventQueue::default();
+        let extension_id = "path:/extensions/removed.luau".to_owned();
+        assert!(queue.set_modules([(extension_id.clone(), 1)]));
+        let failed = queue.drain();
+        assert_eq!(failed.inventory_revision, 1);
+        assert!(queue.set_modules(std::iter::empty::<(String, u64)>()));
+        queue.publish(ExtensionReloadEvent {
+            extension_id,
+            generation: 2,
+            operation: ExtensionReloadOperation::Removed,
+        });
+        queue.requeue(failed);
+        let drained = queue.drain();
+        assert!(drained.modules.is_empty());
+        assert_eq!(drained.inventory_revision, 2);
+        assert_eq!(drained.events.len(), 1);
+        assert_eq!(
+            drained.events[0].operation,
+            ExtensionReloadOperation::Removed
+        );
+    }
+    #[test]
+    fn reload_module_inventory_rejects_overflow_and_publishes_complete_admitted_set() {
+        let mut queue = ReloadEventQueue::default();
+        assert!(
+            !queue.set_modules(
+                (0..(RELOAD_MODULE_LIMIT + 1))
+                    .map(|index| { (format!("path:/extensions/{index:04}.luau"), index as u64) })
+            )
+        );
+        assert!(queue.drain().modules.is_empty());
+        assert!(
+            queue.set_modules(
+                (0..RELOAD_MODULE_LIMIT)
+                    .map(|index| { (format!("path:/extensions/{index:04}.luau"), index as u64) })
+            )
+        );
+        let drain = queue.drain();
+        assert!(!drain.requires_rebase);
+        assert_eq!(drain.modules.len(), RELOAD_MODULE_LIMIT);
+        assert_eq!(drain.modules[0].generation, 0);
+        assert_eq!(
+            drain.modules.last().map(|module| module.generation),
+            Some((RELOAD_MODULE_LIMIT - 1) as u64)
+        );
+    }
+
+    #[test]
+    fn reload_reconciliation_replaces_removed_module_at_inventory_limit() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let catalogs = [ModuleCatalog {
+            dir: directory.path().to_owned(),
+            builtins: &[],
+            prefix: "",
+        }];
+        let paths = (0..=RELOAD_MODULE_LIMIT)
+            .map(|index| directory.path().join(format!("module-{index:03}.luau")))
+            .collect::<Vec<_>>();
+        let signature = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    ExtensionFileSignature {
+                        modified: Some(SystemTime::UNIX_EPOCH),
+                        readable: true,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let successful = paths
+            .iter()
+            .map(|path| catalog_module_name(&catalogs, path).expect("module name"))
+            .collect::<BTreeSet<_>>();
+        let reload_events = RwLock::new(ReloadEventQueue::default());
+        let mut generations = BTreeMap::new();
+        let mut active = BTreeSet::new();
+
+        let rejected = reconcile_extension_reloads(
+            &catalogs,
+            &[],
+            &signature,
+            &successful,
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        assert_eq!(active.len(), RELOAD_MODULE_LIMIT);
+        assert_eq!(rejected.len(), 1);
+        let rejected_id = rejected.iter().next().expect("overflow module").clone();
+        assert!(!active.contains(&rejected_id));
+        let _ = reload_events.write().map(|mut queue| queue.drain());
+
+        let accepted_signature = signature
+            .iter()
+            .filter(|(path, _)| extension_id(path) != rejected_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let replacement_signature = signature.iter().skip(1).cloned().collect::<Vec<_>>();
+        let replacement_successful = paths
+            .iter()
+            .skip(1)
+            .map(|path| catalog_module_name(&catalogs, path).expect("module name"))
+            .collect::<BTreeSet<_>>();
+        let rejected = reconcile_extension_reloads(
+            &catalogs,
+            &accepted_signature,
+            &replacement_signature,
+            &replacement_successful,
+            &mut generations,
+            &mut active,
+            &reload_events,
+        );
+        assert!(rejected.is_empty());
+        assert_eq!(active.len(), RELOAD_MODULE_LIMIT);
+        assert!(active.contains(&rejected_id));
+        assert!(!active.contains(&extension_id(&paths[0])));
     }
 
     #[test]

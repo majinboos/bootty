@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, LazyLock, Mutex, RwLock,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     time::Instant,
@@ -216,6 +216,9 @@ impl CommandInvocation {
     }
 }
 
+pub const COMMAND_OUTCOME_BYTE_LIMIT: usize = 256 * 1024;
+pub const COMMAND_RESULT_TOO_LARGE_CODE: &str = "result_too_large";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandWarning {
     pub code: String,
@@ -281,6 +284,34 @@ impl CommandOutcome {
     pub fn pending(target: Option<CommandTarget>) -> Self {
         Self::Pending { target }
     }
+
+    pub fn completion_indeterminate() -> Self {
+        Self::Failed {
+            code: "completion_indeterminate".to_owned(),
+            message: "command started before its deadline; completion is being reconciled"
+                .to_owned(),
+        }
+    }
+}
+
+pub fn bounded_command_outcome(outcome: CommandOutcome) -> CommandOutcome {
+    let Ok(bytes) = serde_json::to_vec(&outcome) else {
+        return CommandOutcome::Failed {
+            code: COMMAND_RESULT_TOO_LARGE_CODE.to_owned(),
+            message: "command result could not be serialized within the result limit".to_owned(),
+        };
+    };
+    if bytes.len() <= COMMAND_OUTCOME_BYTE_LIMIT {
+        return outcome;
+    }
+    CommandOutcome::Failed {
+        code: COMMAND_RESULT_TOO_LARGE_CODE.to_owned(),
+        message: format!(
+            "serialized command result is {} bytes; limit is {} bytes",
+            bytes.len(),
+            COMMAND_OUTCOME_BYTE_LIMIT
+        ),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -322,6 +353,42 @@ pub enum CoreCommandExecutor {
         force: bool,
         confirmation: Option<WorktreeRemovalConfirmation>,
     },
+    /// A command owned by a live Luau extension generation. The handler is
+    /// resolved by `ExtensionRuntime` after the common registry has validated
+    /// its descriptor and arguments.
+    Extension {
+        command_id: String,
+        extension_id: String,
+        generation: u64,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ExtensionRegisteredCommand {
+    descriptor: CommandDescriptor,
+    extension_id: String,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExtensionRegistryState {
+    commands: BTreeMap<String, ExtensionRegisteredCommand>,
+    aliases: BTreeMap<String, String>,
+}
+
+/// Mutable extension overlay owned by one app/control instance. It is
+/// intentionally not global: two Bootty instances must not see one another's
+/// commands or generation lifetimes.
+#[derive(Clone, Debug, Default)]
+pub struct ExtensionCommandRegistry {
+    state: Arc<RwLock<ExtensionRegistryState>>,
+}
+
+impl ExtensionCommandRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -373,7 +440,7 @@ enum CommandExecutorResolver {
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 enum PaneResizeArgument {
     Directional {
-        direction: PaneResizeDirection,
+        direction: String,
         cells: u16,
     },
     Absolute {
@@ -382,16 +449,7 @@ enum PaneResizeArgument {
     },
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PaneResizeDirection {
-    Left,
-    Down,
-    Up,
-    Right,
-}
-
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CommandRegistry {
     /// Canonical descriptors only. Keeping aliases separately makes `list`
     /// truthful while still allowing every established action spelling through
@@ -399,6 +457,7 @@ pub struct CommandRegistry {
     commands: BTreeMap<String, RegisteredCommand>,
     aliases: BTreeMap<String, RegisteredAlias>,
     parameterized_aliases: BTreeMap<String, BTreeMap<Vec<String>, String>>,
+    extensions: Option<ExtensionCommandRegistry>,
 }
 
 impl CommandRegistry {
@@ -407,9 +466,44 @@ impl CommandRegistry {
             LazyLock::new(CommandRegistry::from_core_commands);
         &REGISTRY
     }
+    /// Returns a registry view sharing the immutable core descriptors while
+    /// reading/writing the supplied instance-local extension overlay.
+    #[must_use]
+    pub fn with_extension_registry(&self, extensions: ExtensionCommandRegistry) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            aliases: self.aliases.clone(),
+            parameterized_aliases: self.parameterized_aliases.clone(),
+            extensions: Some(extensions),
+        }
+    }
 
-    pub fn list(&self) -> impl Iterator<Item = &CommandDescriptor> {
-        self.commands.values().map(|command| &command.descriptor)
+    /// Returns canonical core and live extension descriptors. Values are
+    /// cloned so a reload can atomically replace its generation while a
+    /// caller is enumerating the snapshot.
+    pub fn list(&self) -> impl Iterator<Item = CommandDescriptor> {
+        let extensions = self
+            .extensions
+            .as_ref()
+            .and_then(|overlay| overlay.state.read().ok())
+            .map(|registry| {
+                let ids = registry.commands.keys().cloned().collect::<BTreeSet<_>>();
+                let commands = registry
+                    .commands
+                    .values()
+                    .map(|command| command.descriptor.clone())
+                    .collect::<Vec<_>>();
+                (ids, commands)
+            })
+            .unwrap_or_default();
+        let (extension_ids, extension_commands) = extensions;
+        let core = self
+            .commands
+            .values()
+            .filter(|command| !extension_ids.contains(&command.descriptor.id))
+            .map(|command| command.descriptor.clone())
+            .collect::<Vec<_>>();
+        core.into_iter().chain(extension_commands)
     }
 
     /// Returns the effective descriptor for the supplied spelling.
@@ -419,10 +513,21 @@ impl CommandRegistry {
     /// caller that will invoke an alias must parse against this result rather
     /// than the canonical descriptor alone.
     pub fn describe(&self, id: &str) -> Option<CommandDescriptor> {
+        if let Some(overlay) = &self.extensions
+            && let Ok(registry) = overlay.state.read()
+        {
+            if let Some(command) = registry.commands.get(id) {
+                return Some(command.descriptor.clone());
+            }
+            if let Some(canonical) = registry.aliases.get(id)
+                && let Some(command) = registry.commands.get(canonical)
+            {
+                return Some(command.descriptor.clone());
+            }
+        }
         if let Some(command) = self.commands.get(id) {
             return Some(command.descriptor.clone());
         }
-
         let alias = self.aliases.get(id)?;
         let command = self.commands.get(&alias.canonical)?;
         Some(effective_alias_descriptor(command, alias))
@@ -440,11 +545,148 @@ impl CommandRegistry {
                     .is_some_and(|descriptor| descriptor.palette)
         })
     }
+    /// Registers one descriptor in the same live registry used by the core
+    /// dispatcher. An extension may replace any catalog-only unavailable
+    /// placeholder; every runnable core spelling remains reserved.
+    pub fn register_extension_command(
+        &self,
+        mut descriptor: CommandDescriptor,
+        extension_id: impl Into<String>,
+        generation: u64,
+    ) -> Result<(), CommandOutcome> {
+        let extension_id = extension_id.into();
+        if !valid_extension_command_name(&descriptor.id) {
+            return Err(CommandOutcome::Failed {
+                code: "invalid_extension_command".to_owned(),
+                message: format!("extension command name {} is invalid", descriptor.id),
+            });
+        }
+        if extension_id.is_empty() || generation == 0 {
+            return Err(CommandOutcome::Failed {
+                code: "invalid_extension_generation".to_owned(),
+                message: "extension id and generation are required".to_owned(),
+            });
+        }
+        descriptor.origin = Some(CatalogOrigin::Extension {
+            extension_id: extension_id.clone(),
+            generation,
+        });
+        let Some(overlay) = &self.extensions else {
+            return Err(CommandOutcome::Failed {
+                code: "extension_registry_unbound".to_owned(),
+                message: "extension commands require an instance registry".to_owned(),
+            });
+        };
+        let mut registry = overlay.state.write().map_err(|_| CommandOutcome::Failed {
+            code: "registry_poisoned".to_owned(),
+            message: "extension command registry is unavailable".to_owned(),
+        })?;
+        if (self.commands.contains_key(&descriptor.id) || self.aliases.contains_key(&descriptor.id))
+            && !core_placeholder_matches(
+                &self.commands,
+                &self.aliases,
+                &descriptor.id,
+                &descriptor.id,
+            )
+            || registry.commands.contains_key(&descriptor.id)
+            || registry.aliases.contains_key(&descriptor.id)
+        {
+            return Err(CommandOutcome::Failed {
+                code: "command_collision".to_owned(),
+                message: format!("command {} is already registered", descriptor.id),
+            });
+        }
+        if descriptor.aliases.iter().any(|alias| {
+            !valid_extension_command_name(alias)
+                || ((self.commands.contains_key(alias) || self.aliases.contains_key(alias))
+                    && !core_placeholder_matches(
+                        &self.commands,
+                        &self.aliases,
+                        alias,
+                        &descriptor.id,
+                    ))
+                || registry.commands.contains_key(alias)
+                || registry.aliases.contains_key(alias)
+        }) {
+            return Err(CommandOutcome::Failed {
+                code: "command_collision".to_owned(),
+                message: format!("command alias collides for {}", descriptor.id),
+            });
+        }
+        let id = descriptor.id.clone();
+        for alias in &descriptor.aliases {
+            registry.aliases.insert(alias.clone(), id.clone());
+        }
+        registry.commands.insert(
+            id,
+            ExtensionRegisteredCommand {
+                descriptor,
+                extension_id,
+                generation,
+            },
+        );
+        Ok(())
+    }
 
+    /// Removes only the exact generation's commands and aliases. This makes a
+    /// stale reload unable to unregister a replacement generation.
+    pub fn unregister_extension_commands(&self, extension_id: &str, generation: u64) -> usize {
+        let Some(overlay) = &self.extensions else {
+            return 0;
+        };
+        let Ok(mut registry) = overlay.state.write() else {
+            return 0;
+        };
+        let ids = registry
+            .commands
+            .iter()
+            .filter(|(_, command)| {
+                command.extension_id == extension_id && command.generation == generation
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in &ids {
+            registry.commands.remove(id);
+        }
+        registry
+            .aliases
+            .retain(|_, canonical| !ids.contains(canonical));
+        ids.len()
+    }
+
+    pub fn extension_commands(&self) -> Vec<CommandDescriptor> {
+        self.extensions
+            .as_ref()
+            .and_then(|overlay| overlay.state.read().ok())
+            .map(|registry| {
+                registry
+                    .commands
+                    .values()
+                    .map(|command| command.descriptor.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     pub fn resolve(
         &self,
         mut invocation: CommandInvocation,
     ) -> Result<ResolvedCommandInvocation, CommandOutcome> {
+        if let Some((descriptor, extension_id, generation)) =
+            extension_command_for(self.extensions.as_ref(), &invocation.command)
+        {
+            normalize_arguments(&descriptor, &mut invocation.arguments)?;
+            validate_arguments(&descriptor, &invocation.arguments)?;
+            return Ok(ResolvedCommandInvocation {
+                descriptor: descriptor.clone(),
+                executor: CoreCommandExecutor::Extension {
+                    command_id: descriptor.id,
+                    extension_id,
+                    generation,
+                },
+                invocation,
+            });
+        }
+
         let (descriptor, resolver) = if let Some(registered) =
             self.commands.get(&invocation.command)
         {
@@ -475,6 +717,12 @@ impl CommandRegistry {
             });
         };
 
+        if matches!(
+            &resolver,
+            CommandExecutorResolver::Catalog(CatalogAvailability::Unavailable)
+        ) {
+            return Err(unavailable_command_outcome(&invocation.command));
+        }
         normalize_arguments(&descriptor, &mut invocation.arguments)?;
         validate_arguments(&descriptor, &invocation.arguments)?;
         let executor = resolve_executor(&resolver, &invocation)?;
@@ -615,8 +863,59 @@ impl CommandRegistry {
             commands,
             aliases,
             parameterized_aliases,
+            extensions: None,
         }
     }
+}
+
+fn valid_extension_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+}
+fn core_placeholder_matches(
+    commands: &BTreeMap<String, RegisteredCommand>,
+    aliases: &BTreeMap<String, RegisteredAlias>,
+    spelling: &str,
+    canonical: &str,
+) -> bool {
+    let command = commands.get(spelling).or_else(|| {
+        aliases
+            .get(spelling)
+            .and_then(|alias| commands.get(&alias.canonical))
+    });
+    command.is_some_and(|command| {
+        command.descriptor.id == canonical
+            && matches!(
+                command.descriptor.origin.as_ref(),
+                Some(CatalogOrigin::Extension { .. })
+            )
+            && command
+                .descriptor
+                .availability
+                .as_ref()
+                .is_some_and(|availability| availability.core == CatalogAvailability::Unavailable)
+    })
+}
+
+fn extension_command_for(
+    overlay: Option<&ExtensionCommandRegistry>,
+    id: &str,
+) -> Option<(CommandDescriptor, String, u64)> {
+    let registry = overlay?.state.read().ok()?;
+    let canonical = registry.aliases.get(id).map_or(id, String::as_str);
+    registry.commands.get(canonical).map(|command| {
+        (
+            command.descriptor.clone(),
+            command.extension_id.clone(),
+            command.generation,
+        )
+    })
 }
 
 fn effective_alias_descriptor(
@@ -836,6 +1135,12 @@ fn canonical_executor(descriptor: &CanonicalDescriptor) -> CommandExecutorResolv
     }
 }
 
+fn unavailable_command_outcome(command: &str) -> CommandOutcome {
+    CommandOutcome::Unavailable {
+        message: format!("command {command} is currently unavailable"),
+    }
+}
+
 fn resolve_executor(
     resolver: &CommandExecutorResolver,
     invocation: &CommandInvocation,
@@ -951,18 +1256,18 @@ fn resolve_executor(
                 invocation.command
             ),
         }),
-        CommandExecutorResolver::Catalog(availability) => Err(match availability {
-            CatalogAvailability::Unavailable => CommandOutcome::Unavailable {
-                message: format!("command {} is currently unavailable", invocation.command),
-            },
+        CommandExecutorResolver::Catalog(CatalogAvailability::Unavailable) => {
+            Err(unavailable_command_outcome(&invocation.command))
+        }
+        CommandExecutorResolver::Catalog(
             CatalogAvailability::Available
             | CatalogAvailability::Conditional
-            | CatalogAvailability::Unsupported => CommandOutcome::Unsupported {
-                message: format!(
-                    "command {} is not implemented by this core dispatcher",
-                    invocation.command
-                ),
-            },
+            | CatalogAvailability::Unsupported,
+        ) => Err(CommandOutcome::Unsupported {
+            message: format!(
+                "command {} is not implemented by this core dispatcher",
+                invocation.command
+            ),
         }),
     }
 }
@@ -995,15 +1300,16 @@ fn parse_pane_resize_argument(value: &str) -> Result<MuxPaneResize, CommandOutco
     let argument = serde_json::from_str::<PaneResizeArgument>(value)
         .map_err(|_| invalid_pane_resize_argument())?;
     let adjustment = match argument {
-        PaneResizeArgument::Directional { direction, cells } => MuxPaneResize::Directional {
-            direction: match direction {
-                PaneResizeDirection::Left => MuxDirection::Left,
-                PaneResizeDirection::Down => MuxDirection::Down,
-                PaneResizeDirection::Up => MuxDirection::Up,
-                PaneResizeDirection::Right => MuxDirection::Right,
-            },
-            cells,
-        },
+        PaneResizeArgument::Directional { direction, cells } => {
+            let direction = match direction.as_str() {
+                "left" => MuxDirection::Left,
+                "down" => MuxDirection::Down,
+                "up" => MuxDirection::Up,
+                "right" => MuxDirection::Right,
+                _ => return Err(invalid_pane_resize_argument()),
+            };
+            MuxPaneResize::Directional { direction, cells }
+        }
         PaneResizeArgument::Absolute { columns, rows } => MuxPaneResize::Absolute { columns, rows },
     };
     adjustment
@@ -1254,9 +1560,8 @@ fn legacy_target_for(id: &str) -> Option<ResourceKind> {
         }
         "new_tab" | "rename_session" | "ditch_session" | "move_session" | "next_tab"
         | "previous_tab" | "last_tab" | "select_tab" => Some(ResourceKind::Session),
-        "move_tab" | "rename_tab" | "select_pane" | "next_pane" | "previous_pane" => {
-            Some(ResourceKind::MuxWindow)
-        }
+        "move_tab" | "rename_tab" => Some(ResourceKind::MuxWindow),
+        "select_pane" | "next_pane" | "previous_pane" => Some(ResourceKind::Pane),
         "split_right" | "split_down" | "kill_pane" | "close_surface" | "toggle_pane_zoom" => {
             Some(ResourceKind::Pane)
         }
@@ -1287,6 +1592,17 @@ pub struct AppCommandRequest {
     pub deadline: Instant,
     pub cancellation: CommandCancellation,
     pub response: mpsc::Sender<CommandOutcome>,
+    /// Optional event provenance for requests that cross the control socket. Requests
+    /// produced by in-process callers leave this unset and do not publish a completion event.
+    pub completion: Option<CommandCompletionContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandCompletionContext {
+    pub caller: Caller,
+    pub owner_pid: u32,
+    pub owner_generation: u64,
+    pub target: Option<CommandTarget>,
 }
 
 #[derive(Clone)]
@@ -1370,6 +1686,11 @@ impl BoundAppCommandSender {
 impl AppCommandReceiver {
     pub fn try_recv(&self) -> Result<AppCommandRequest, mpsc::TryRecvError> {
         self.receiver.try_recv()
+    }
+    /// Stop accepting new requests while the owner performs bounded teardown.
+    pub fn close(&self) {
+        let mut open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+        *open = false;
     }
 }
 
@@ -1542,7 +1863,7 @@ mod tests {
                 "pane.select",
                 vec!["right".to_owned()],
                 "pane.select",
-                ResourceKind::MuxWindow,
+                ResourceKind::Pane,
                 CoreCommandExecutor::Mux(MuxCommandSpec::SelectPane {
                     direction: MuxDirection::Right,
                 }),
@@ -1551,7 +1872,7 @@ mod tests {
                 "select-pane",
                 vec!["left".to_owned()],
                 "pane.select",
-                ResourceKind::MuxWindow,
+                ResourceKind::Pane,
                 CoreCommandExecutor::Mux(MuxCommandSpec::SelectPane {
                     direction: MuxDirection::Left,
                 }),
@@ -1599,7 +1920,7 @@ mod tests {
                 .resolve(CommandInvocation {
                     command: command.to_owned(),
                     arguments,
-                    caller: Caller::Socket,
+                    caller: Caller::Cli,
                     target: None,
                     confirmation: None,
                 })
@@ -1617,23 +1938,23 @@ mod tests {
         for (command, target, native, rmux, tmux) in [
             (
                 "pane.select",
-                ResourceKind::MuxWindow,
+                ResourceKind::Pane,
                 CatalogAvailability::Conditional,
-                CatalogAvailability::Conditional,
+                CatalogAvailability::Unavailable,
                 CatalogAvailability::Conditional,
             ),
             (
                 "pane.last",
                 ResourceKind::MuxWindow,
                 CatalogAvailability::Unsupported,
-                CatalogAvailability::Conditional,
+                CatalogAvailability::Unavailable,
                 CatalogAvailability::Conditional,
             ),
             (
                 "pane.resize",
                 ResourceKind::Pane,
                 CatalogAvailability::Unsupported,
-                CatalogAvailability::Conditional,
+                CatalogAvailability::Unavailable,
                 CatalogAvailability::Conditional,
             ),
         ] {
@@ -2000,19 +2321,23 @@ mod tests {
                 .target,
             Some(ResourceKind::Session)
         );
-        for (command, target) in [
+        for (action, target) in [
             ("new_tab", ResourceKind::Session),
             ("rename_tab", ResourceKind::MuxWindow),
+            ("move_session:1", ResourceKind::Session),
+            ("select_pane:right", ResourceKind::Pane),
+            ("next_pane", ResourceKind::Pane),
+            ("previous_pane", ResourceKind::Pane),
             ("copy_mode", ResourceKind::Terminal),
         ] {
             assert_eq!(
                 CommandRegistry::core()
-                    .resolve(CommandInvocation::from_action(command, Caller::Internal))
+                    .resolve(CommandInvocation::from_action(action, Caller::Internal))
                     .unwrap()
                     .descriptor
                     .target,
                 Some(target),
-                "{command}"
+                "{action}"
             );
         }
         assert!(matches!(
@@ -2083,6 +2408,7 @@ mod tests {
                 deadline: Instant::now(),
                 cancellation: CommandCancellation::new(),
                 response,
+                completion: None,
             }
         };
 
@@ -2105,6 +2431,7 @@ mod tests {
             deadline: Instant::now(),
             cancellation: CommandCancellation::new(),
             response,
+            completion: None,
         })
         .unwrap();
 
@@ -2122,6 +2449,7 @@ mod tests {
             deadline: Instant::now(),
             cancellation: CommandCancellation::new(),
             response,
+            completion: None,
         })
         .unwrap();
 
@@ -2141,6 +2469,7 @@ mod tests {
                 deadline: Instant::now(),
                 cancellation: CommandCancellation::new(),
                 response,
+                completion: None,
             }),
             Err(AppCommandSendError::Shutdown)
         );
@@ -2156,6 +2485,7 @@ mod tests {
             deadline: Instant::now(),
             cancellation: CommandCancellation::new(),
             response,
+            completion: None,
         })
         .unwrap();
 

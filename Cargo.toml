@@ -89,6 +89,7 @@ rmux-proto = "0.10"
 rmux-server = { version = "0.10", default-features = false }
 rstest = "0.26"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+rustix = { version = "=1.1.4", features = ["fs"] }
 sha2 = "0.10"
 rustybuzz = "0.20"
 serde = { version = "1", features = ["derive"] }

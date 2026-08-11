@@ -1,5 +1,6 @@
 use bootty_ui::{Theme, ThemePalette};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::automation::directory::WorktreeRemovalConfirmation;
 use crate::git::{self, WorktreeStatus};
@@ -7,7 +8,7 @@ use crate::strings::display_path;
 use crate::ui::overlay::{self, ActionItem, ActionMenu, ActionRisk, FloatingWindow, StatusLine};
 
 /// A cleanup action chosen in the ditch window, executed by the app layer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DitchAction {
     /// Close the session after detaching HEAD in the worktree, freeing its
     /// branch while keeping the worktree, branch, and every commit.

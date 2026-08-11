@@ -1,10 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
-    sync::{Arc, mpsc},
+    process::{Child, Command as ProcessCommand},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,7 +29,7 @@ use crate::{
     },
     commands::{
         AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
-        CommandInvocation, CommandRegistry,
+        CommandCompletionContext, CommandInvocation, CommandRegistry,
     },
 };
 
@@ -336,6 +340,66 @@ fn direct_control_u64(command: &str, argument: &str, value: &str) -> Result<u64>
     })
 }
 
+#[derive(Clone, Default)]
+struct ConnectionCancellationRegistry {
+    next_id: Arc<AtomicU64>,
+    tokens: Arc<Mutex<BTreeMap<u64, CommandCancellation>>>,
+}
+
+struct ConnectionCancellationRegistration {
+    id: u64,
+    token: CommandCancellation,
+    registry: ConnectionCancellationRegistry,
+}
+
+impl ConnectionCancellationRegistry {
+    fn register(&self) -> ConnectionCancellationRegistration {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let token = CommandCancellation::new();
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, token.clone());
+        ConnectionCancellationRegistration {
+            id,
+            token,
+            registry: self.clone(),
+        }
+    }
+
+    fn cancel_all(&self) {
+        let tokens = self
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for token in tokens {
+            let _ = token.cancel();
+        }
+    }
+
+    fn unregister(&self, id: u64) {
+        self.tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+    }
+}
+
+impl ConnectionCancellationRegistration {
+    fn token(&self) -> CommandCancellation {
+        self.token.clone()
+    }
+}
+
+impl Drop for ConnectionCancellationRegistration {
+    fn drop(&mut self) {
+        self.registry.unregister(self.id);
+    }
+}
+
 pub struct ControlServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -344,6 +408,7 @@ pub struct ControlServer {
     automation: AutomationHub,
     event_owner: OwnerIdentity,
     instance_scope: String,
+    connection_cancellations: ConnectionCancellationRegistry,
 }
 
 impl ControlServer {
@@ -360,6 +425,7 @@ impl ControlServer {
             new_instance_descriptor(&window_state_key)?,
             commands,
             automation,
+            CommandRegistry::core().clone(),
         )
     }
 
@@ -367,6 +433,7 @@ impl ControlServer {
         descriptor: InstanceDescriptor,
         commands: BoundAppCommandSender,
         automation: AutomationHub,
+        registry: CommandRegistry,
     ) -> Result<Self> {
         let instance_scope = instance_scope(&descriptor);
         automation.bind_instance_scope(instance_scope.clone())?;
@@ -377,8 +444,10 @@ impl ControlServer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let server_automation = automation.clone();
+        let connection_cancellations = ConnectionCancellationRegistry::default();
+        let server_connection_cancellations = connection_cancellations.clone();
         let server_descriptor = descriptor.clone();
-        let server_scope = instance_scope.clone();
+        let server_registry = registry.clone();
         let server_thread = match thread::Builder::new()
             .name("bootty-control".to_owned())
             .spawn(move || {
@@ -422,21 +491,27 @@ impl ControlServer {
                                 let commands = commands.clone();
                                 let descriptor = server_descriptor.clone();
                                 let automation = server_automation.clone();
+                                let registry = server_registry.clone();
+                                let registration = server_connection_cancellations.register();
+                                let connection_cancellation = registration.token();
                                 tokio::spawn(async move {
                                     let _permit = permit;
+                                    let _registration = registration;
                                     let _ = serve_connection(
                                         stream,
                                         descriptor,
                                         commands,
+                                        registry,
                                         automation,
                                         owner,
+                                        connection_cancellation,
                                     )
                                     .await;
                                 });
                             }
                         }
                     }
-                    server_automation.cancel_tasks_in_scope(&server_scope);
+                    server_connection_cancellations.cancel_all();
                 });
             }) {
             Ok(thread) => thread,
@@ -455,6 +530,7 @@ impl ControlServer {
                     automation,
                     event_owner,
                     instance_scope,
+                    connection_cancellations,
                 }),
                 Err(error) => {
                     let _ = shutdown_tx.send(());
@@ -485,6 +561,7 @@ impl ControlServer {
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
+        self.connection_cancellations.cancel_all();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -502,8 +579,10 @@ async fn serve_connection(
     mut stream: rmux_ipc::LocalStream,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
+    registry: CommandRegistry,
     automation: AutomationHub,
     owner: OwnerIdentity,
+    connection_cancellation: CommandCancellation,
 ) -> io::Result<()> {
     let mut reader = tokio::io::BufReader::new(&mut stream);
     let mut line = String::new();
@@ -531,12 +610,12 @@ async fn serve_connection(
                 )
             }
             Ok(request) => {
-                let connection_cancellation = CommandCancellation::new();
                 tokio::select! {
                     response = handle_request(
                         request,
                         descriptor,
                         commands,
+                        registry,
                         automation,
                         owner,
                         connection_cancellation.clone(),
@@ -604,11 +683,11 @@ fn parse_rpc_request(line: &str) -> Result<RpcRequest, Box<RpcResponse>> {
     }
     Ok(request)
 }
-
 async fn handle_request(
     request: RpcRequest,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
+    registry: CommandRegistry,
     automation: AutomationHub,
     owner: OwnerIdentity,
     connection_cancellation: CommandCancellation,
@@ -647,11 +726,12 @@ async fn handle_request(
             "event_topics": event_topic_descriptions(&automation)
         })),
         "instance.describe" => serde_json::to_value(descriptor).map_err(internal_error),
-        "command.list" => serde_json::to_value(CommandRegistry::core().list().collect::<Vec<_>>())
-            .map_err(internal_error),
+        "command.list" => {
+            serde_json::to_value(registry.list().collect::<Vec<_>>()).map_err(internal_error)
+        }
         "command.describe" => {
             let name = request.params.get("command").and_then(Value::as_str);
-            match name.and_then(|name| CommandRegistry::core().describe(name)) {
+            match name.and_then(|name| registry.describe(name)) {
                 Some(command) => serde_json::to_value(command).map_err(internal_error),
                 None => Err(RpcError::new(-32602, "unknown command")),
             }
@@ -761,10 +841,19 @@ async fn invoke_command(
         return start_task(invocation, commands, automation, owner, scope);
     }
 
-    let completion = invocation.clone();
-    let outcome = await_command(invocation, commands, connection_cancellation).await;
-    publish_command_completion(&automation, scope, &owner, &completion, &outcome);
-    outcome
+    let completion_context = CommandCompletionContext {
+        caller: Caller::Socket,
+        owner_pid: owner.pid(),
+        owner_generation: owner.generation(),
+        target: invocation.target.clone(),
+    };
+    await_command(
+        invocation,
+        commands,
+        connection_cancellation,
+        completion_context,
+    )
+    .await
 }
 
 fn invoke_event_command(
@@ -809,7 +898,18 @@ fn start_task(
         .start(owner.clone(), cancellation.clone(), scope.clone())
         .map_err(automation_error)?;
     let task_id = task.id.clone();
-    let response_rx = match enqueue_command(invocation.clone(), commands, cancellation.clone()) {
+    let completion_context = CommandCompletionContext {
+        caller: Caller::Socket,
+        owner_pid: owner.pid(),
+        owner_generation: owner.generation(),
+        target: invocation.target.clone(),
+    };
+    let response_rx = match enqueue_command(
+        invocation.clone(),
+        commands,
+        cancellation.clone(),
+        completion_context,
+    ) {
         Ok(response_rx) => response_rx,
         Err(error) => {
             automation.tasks().remove(&task_id);
@@ -819,22 +919,25 @@ fn start_task(
     let worker_automation = automation.clone();
     let worker_task_id = task_id.clone();
     let worker_cancellation = cancellation.clone();
-    let worker_scope = scope.clone();
-    let worker_invocation = invocation.clone();
-    let worker_owner = owner.clone();
     let worker = thread::Builder::new()
         .name(format!("bootty-control-{task_id}"))
         .spawn(move || {
-            let outcome = wait_for_task(response_rx, &worker_cancellation);
+            let outcome = match wait_for_task(response_rx, &worker_cancellation) {
+                CommandWaitResult::Completed(outcome) => {
+                    serde_json::to_value(outcome).unwrap_or_else(internal_outcome)
+                }
+                CommandWaitResult::Cancelled => failed_outcome("-32003", "command was cancelled"),
+                CommandWaitResult::DeadlineExceeded => {
+                    failed_outcome("-32003", "command deadline expired")
+                }
+                CommandWaitResult::Indeterminate => completion_indeterminate_value(),
+                CommandWaitResult::ChannelClosed => {
+                    failed_outcome("-32003", "command response channel closed")
+                }
+            };
             if let Err(error) = worker_automation.tasks().finish(&worker_task_id, &outcome) {
                 eprintln!("task {worker_task_id} completion publication failed: {error}");
             }
-            let _ = worker_automation.publish_command_completion(
-                worker_scope,
-                &worker_owner,
-                &worker_invocation,
-                outcome,
-            );
         });
     if let Err(error) = worker {
         cancellation.cancel();
@@ -842,7 +945,6 @@ fn start_task(
         if let Err(error) = automation.tasks().finish(&task_id, &outcome) {
             eprintln!("task {task_id} completion publication failed: {error}");
         }
-        let _ = automation.publish_command_completion(scope, &owner, &invocation, outcome);
     }
     task_value(
         automation
@@ -856,6 +958,7 @@ fn enqueue_command(
     invocation: CommandInvocation,
     commands: BoundAppCommandSender,
     cancellation: CommandCancellation,
+    completion: CommandCompletionContext,
 ) -> Result<mpsc::Receiver<crate::commands::CommandOutcome>, RpcError> {
     let (response_tx, response_rx) = mpsc::channel();
     commands
@@ -864,94 +967,129 @@ fn enqueue_command(
             deadline: Instant::now() + COMMAND_TIMEOUT,
             cancellation,
             response: response_tx,
+            completion: Some(completion),
         })
         .map_err(command_send_error)?;
     Ok(response_rx)
+}
+
+enum CommandWaitResult {
+    Completed(crate::commands::CommandOutcome),
+    Cancelled,
+    DeadlineExceeded,
+    Indeterminate,
+    ChannelClosed,
+}
+
+fn completion_indeterminate_outcome() -> crate::commands::CommandOutcome {
+    crate::commands::CommandOutcome::completion_indeterminate()
+}
+
+fn completion_indeterminate_value() -> Value {
+    serde_json::to_value(completion_indeterminate_outcome()).unwrap_or_else(internal_outcome)
 }
 
 async fn await_command(
     invocation: CommandInvocation,
     commands: BoundAppCommandSender,
     cancellation: CommandCancellation,
+    completion: CommandCompletionContext,
 ) -> Result<Value, RpcError> {
-    let response_rx = enqueue_command(invocation, commands, cancellation.clone())?;
-    let worker_cancellation = cancellation.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        wait_for_attached_command(response_rx, &worker_cancellation)
-    })
-    .await
-    .map_err(|error| RpcError::new(-32603, error.to_string()))?;
+    let response_rx = enqueue_command(invocation, commands, cancellation.clone(), completion)?;
+    let outcome = wait_for_attached_command_async(
+        response_rx,
+        &cancellation,
+        Instant::now() + COMMAND_TIMEOUT,
+    )
+    .await;
     match outcome {
-        Ok(outcome) => serde_json::to_value(outcome).map_err(internal_error),
-        Err(message) => {
+        CommandWaitResult::Completed(outcome) => {
+            serde_json::to_value(outcome).map_err(internal_error)
+        }
+        CommandWaitResult::Cancelled => {
             cancellation.cancel();
-            Err(RpcError::new(-32003, message))
+            Err(RpcError::new(-32003, "command was cancelled"))
+        }
+        CommandWaitResult::DeadlineExceeded => {
+            cancellation.cancel();
+            Err(RpcError::new(-32003, "command deadline expired"))
+        }
+        CommandWaitResult::Indeterminate => Ok(completion_indeterminate_value()),
+        CommandWaitResult::ChannelClosed => {
+            cancellation.cancel();
+            Err(RpcError::new(-32003, "command response channel closed"))
         }
     }
 }
 
-fn wait_for_attached_command(
+async fn wait_for_attached_command_async(
     response_rx: mpsc::Receiver<crate::commands::CommandOutcome>,
     cancellation: &CommandCancellation,
-) -> Result<crate::commands::CommandOutcome, &'static str> {
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    deadline: Instant,
+) -> CommandWaitResult {
     loop {
         match response_rx.try_recv() {
-            Ok(outcome) => return Ok(outcome),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err("command response channel closed");
-            }
+            Ok(outcome) => return CommandWaitResult::Completed(outcome),
+            Err(mpsc::TryRecvError::Disconnected) => return CommandWaitResult::ChannelClosed,
             Err(mpsc::TryRecvError::Empty) => {}
         }
         if cancellation.is_cancelled() {
             return match response_rx.try_recv() {
-                Ok(outcome) => Ok(outcome),
-                Err(_) => Err("command was cancelled"),
+                Ok(outcome) => CommandWaitResult::Completed(outcome),
+                Err(mpsc::TryRecvError::Disconnected) => CommandWaitResult::ChannelClosed,
+                Err(mpsc::TryRecvError::Empty) => CommandWaitResult::Cancelled,
             };
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("command deadline expired");
+            return if cancellation.cancel() {
+                CommandWaitResult::DeadlineExceeded
+            } else {
+                CommandWaitResult::Indeterminate
+            };
         }
-        match response_rx.recv_timeout(remaining.min(TASK_WAIT_INTERVAL)) {
-            Ok(outcome) => return Ok(outcome),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("command response channel closed");
-            }
-        }
+        tokio::time::sleep(remaining.min(TASK_WAIT_INTERVAL)).await;
     }
 }
 
 fn wait_for_task(
     response_rx: mpsc::Receiver<crate::commands::CommandOutcome>,
     cancellation: &CommandCancellation,
-) -> Value {
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
+) -> CommandWaitResult {
+    wait_for_task_until(response_rx, cancellation, Instant::now() + COMMAND_TIMEOUT)
+}
+
+fn wait_for_task_until(
+    response_rx: mpsc::Receiver<crate::commands::CommandOutcome>,
+    cancellation: &CommandCancellation,
+    deadline: Instant,
+) -> CommandWaitResult {
     loop {
         match response_rx.try_recv() {
-            Ok(outcome) => return serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return failed_outcome("-32003", "command response channel closed");
-            }
+            Ok(outcome) => return CommandWaitResult::Completed(outcome),
+            Err(mpsc::TryRecvError::Disconnected) => return CommandWaitResult::ChannelClosed,
             Err(mpsc::TryRecvError::Empty) => {}
         }
         if cancellation.is_cancelled() {
             return match response_rx.try_recv() {
-                Ok(outcome) => serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
-                Err(_) => failed_outcome("-32003", "command was cancelled"),
+                Ok(outcome) => CommandWaitResult::Completed(outcome),
+                Err(mpsc::TryRecvError::Disconnected) => CommandWaitResult::ChannelClosed,
+                Err(mpsc::TryRecvError::Empty) => CommandWaitResult::Cancelled,
             };
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            cancellation.cancel();
-            return failed_outcome("-32003", "command deadline expired");
+            return if cancellation.cancel() {
+                CommandWaitResult::DeadlineExceeded
+            } else {
+                CommandWaitResult::Indeterminate
+            };
         }
         match response_rx.recv_timeout(remaining.min(TASK_WAIT_INTERVAL)) {
-            Ok(outcome) => return serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
+            Ok(outcome) => return CommandWaitResult::Completed(outcome),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return failed_outcome("-32003", "command response channel closed");
+                return CommandWaitResult::ChannelClosed;
             }
         }
     }
@@ -1298,20 +1436,56 @@ pub fn select_or_start(instance: Option<&str>, start: bool) -> Result<InstanceDe
     }
 }
 
-fn start_instance() -> Result<InstanceDescriptor> {
-    let existing = discover_instances()?
-        .into_iter()
-        .map(|instance| instance.instance_id)
-        .collect::<BTreeSet<_>>();
-    let executable = std::env::current_exe().context("find Bootty executable")?;
-    let mut child = ProcessCommand::new(executable)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("start Bootty instance")?;
+struct SpawnedChildGuard {
+    child: Option<Child>,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn id(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("spawned child guard must be armed")
+            .id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child
+            .as_mut()
+            .expect("spawned child guard must be armed")
+            .try_wait()
+    }
+
+    fn disarm(&mut self) -> Option<Child> {
+        self.child.take()
+    }
+
+    fn terminate(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+fn wait_for_started_instance(
+    mut child: SpawnedChildGuard,
+    existing: &BTreeSet<String>,
+    deadline: Instant,
+    mut discover: impl FnMut() -> Result<Vec<InstanceDescriptor>>,
+) -> Result<InstanceDescriptor> {
     let child_pid = child.id();
-    let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
         if let Some(status) = child
             .try_wait()
@@ -1319,19 +1493,42 @@ fn start_instance() -> Result<InstanceDescriptor> {
         {
             anyhow::bail!("started Bootty instance exited with {status}");
         }
-        let started = discover_instances()?
+        let started = discover()?
             .into_iter()
             .filter(|instance| {
                 !existing.contains(&instance.instance_id) && instance.pid == child_pid
             })
             .collect::<Vec<_>>();
         match started.as_slice() {
-            [instance] => return Ok(instance.clone()),
+            [instance] => {
+                let _ = child.disarm();
+                return Ok(instance.clone());
+            }
             [] if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
             [] => anyhow::bail!("started Bootty instance did not become ready"),
             _ => anyhow::bail!("started Bootty child registered multiple instances"),
         }
     }
+}
+
+fn start_instance() -> Result<InstanceDescriptor> {
+    let existing = discover_instances()?
+        .into_iter()
+        .map(|instance| instance.instance_id)
+        .collect::<BTreeSet<_>>();
+    let executable = std::env::current_exe().context("find Bootty executable")?;
+    let child = ProcessCommand::new(executable)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("start Bootty instance")?;
+    wait_for_started_instance(
+        SpawnedChildGuard::new(child),
+        &existing,
+        Instant::now() + COMMAND_TIMEOUT,
+        discover_instances,
+    )
 }
 
 pub fn invoke_instance(
@@ -1379,17 +1576,20 @@ fn invoke_instance_raw(
     method: &str,
     params: Value,
 ) -> Result<RpcResponse> {
-    let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
-    let mut stream = connect_blocking(&endpoint, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
     let request = RpcRequest {
         jsonrpc: "2.0".to_owned(),
         id: json!(1),
         method: method.to_owned(),
         params,
     };
-    serde_json::to_writer(&mut stream, &request)?;
+    let encoded_request = serde_json::to_vec(&request)?;
+    validate_request_size(&encoded_request)?;
+
+    let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
+    let mut stream = connect_blocking(&endpoint, Duration::from_secs(2))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    stream.write_all(&encoded_request)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     let mut response = String::new();
@@ -1400,6 +1600,13 @@ fn invoke_instance_raw(
         anyhow::bail!("control response exceeds payload limit");
     }
     serde_json::from_str(&response).context("decode control response")
+}
+
+fn validate_request_size(encoded_request: &[u8]) -> Result<()> {
+    if encoded_request.len() as u64 + 1 > REQUEST_LIMIT {
+        anyhow::bail!("control request exceeds the {REQUEST_LIMIT} byte payload limit");
+    }
+    Ok(())
 }
 
 pub fn select_instance(explicit: Option<&str>) -> Result<InstanceDescriptor> {
@@ -1572,7 +1779,7 @@ mod tests {
     use super::*;
     use crate::{
         automation::{ClaimOwner, EventPublication},
-        commands::{CommandTarget, ResourceKind, app_command_channel},
+        commands::{CommandTarget, ExtensionCommandRegistry, ResourceKind, app_command_channel},
     };
 
     fn owner() -> OwnerIdentity {
@@ -1590,6 +1797,94 @@ mod tests {
         let encoded = serde_json::to_value(request).unwrap();
         assert_eq!(encoded["jsonrpc"], "2.0");
         assert_eq!(encoded["method"], "system.ping");
+    }
+
+    #[test]
+    fn request_limit_includes_json_rpc_envelope() {
+        let mut payload = "x".repeat(REQUEST_LIMIT as usize);
+        let encoded = loop {
+            let request = RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(1),
+                method: "command.invoke".to_owned(),
+                params: json!({"payload": &payload}),
+            };
+            let encoded = serde_json::to_vec(&request).unwrap();
+            if (encoded.len() as u64) < REQUEST_LIMIT {
+                break encoded;
+            }
+            payload.pop();
+        };
+
+        assert_eq!(encoded.len() as u64 + 1, REQUEST_LIMIT);
+        validate_request_size(&encoded).unwrap();
+
+        payload.push('x');
+        let request = RpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: json!(1),
+            method: "command.invoke".to_owned(),
+            params: json!({"payload": &payload}),
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let error = validate_request_size(&encoded).unwrap_err();
+        assert!(error.to_string().contains("control request exceeds"));
+    }
+
+    #[test]
+    fn control_server_holds_connection_permits_until_requests_finish() {
+        let (commands, receiver) = app_command_channel(MAX_CONNECTIONS + 1);
+        let descriptor = new_instance_descriptor("connection-limit").unwrap();
+        let server = ControlServer::spawn_with_descriptor(
+            descriptor.clone(),
+            commands.for_caller(Caller::Socket),
+            AutomationHub::new(),
+            CommandRegistry::core().clone(),
+        )
+        .unwrap();
+        let request = serde_json::to_vec(&RpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: json!(1),
+            method: "command.invoke".to_owned(),
+            params: json!({
+                "invocation": {
+                    "command": "pane.focus",
+                    "arguments": [],
+                    "caller": "socket"
+                }
+            }),
+        })
+        .unwrap();
+        let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
+        let mut streams = Vec::new();
+        for _ in 0..=MAX_CONNECTIONS {
+            let mut stream = connect_blocking(&endpoint, Duration::from_secs(2)).unwrap();
+            stream.write_all(&request).unwrap();
+            stream.write_all(b"\n").unwrap();
+            stream.flush().unwrap();
+            streams.push(stream);
+        }
+
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && requests.len() < MAX_CONNECTIONS {
+            while let Ok(request) = receiver.try_recv() {
+                requests.push(request);
+            }
+            if requests.len() < MAX_CONNECTIONS {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert_eq!(requests.len(), MAX_CONNECTIONS);
+        thread::sleep(Duration::from_millis(50));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        drop(requests);
+        drop(streams);
+        drop(server);
     }
 
     #[test]
@@ -1739,11 +2034,105 @@ mod tests {
                 },
                 new_instance_descriptor("test").unwrap(),
                 commands.for_caller(Caller::Socket),
+                CommandRegistry::core().clone(),
                 AutomationHub::new(),
                 owner(),
                 CommandCancellation::new(),
             ));
         assert_eq!(response.error.unwrap().code, -32601);
+    }
+    #[test]
+    fn command_list_and_describe_use_the_instance_extension_registry() {
+        let overlay = ExtensionCommandRegistry::new();
+        let registry = CommandRegistry::core().with_extension_registry(overlay);
+        let mut descriptor = registry.describe("pane.focus").expect("core descriptor");
+        descriptor.id = "sample.extension.echo".to_owned();
+        descriptor.aliases = vec!["sample.extension.e".to_owned()];
+        descriptor.arguments = Default::default();
+        registry
+            .register_extension_command(descriptor.clone(), "sample.extension", 1)
+            .unwrap();
+        let resolved = registry
+            .resolve(CommandInvocation {
+                command: "sample.extension.e".to_owned(),
+                arguments: Vec::new(),
+                caller: Caller::Cli,
+                target: None,
+                confirmation: None,
+            })
+            .unwrap();
+        assert_eq!(resolved.descriptor.id, "sample.extension.echo");
+        let (commands, _receiver) = app_command_channel(1);
+        let commands = commands.for_caller(Caller::Socket);
+        let instance = new_instance_descriptor("extension-registry").unwrap();
+        let automation = AutomationHub::new();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let listed = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(1),
+                method: "command.list".to_owned(),
+                params: Value::Null,
+            },
+            instance.clone(),
+            commands.clone(),
+            registry.clone(),
+            automation.clone(),
+            owner(),
+            CommandCancellation::new(),
+        ));
+        let listed = listed.result.expect("command list result");
+        assert!(
+            listed
+                .as_array()
+                .expect("command list array")
+                .iter()
+                .any(|command| command["id"] == "sample.extension.echo")
+        );
+
+        let described = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(2),
+                method: "command.describe".to_owned(),
+                params: json!({"command": "sample.extension.e"}),
+            },
+            instance.clone(),
+            commands.clone(),
+            registry.clone(),
+            automation.clone(),
+            owner(),
+            CommandCancellation::new(),
+        ));
+        let described = described.result.expect("command describe result");
+        assert_eq!(described["id"], "sample.extension.echo");
+        assert_eq!(described["origin"]["extension_id"], "sample.extension");
+        assert_eq!(described["origin"]["generation"], 1);
+
+        assert_eq!(
+            registry.unregister_extension_commands("sample.extension", 1),
+            1
+        );
+        registry
+            .register_extension_command(descriptor, "sample.extension", 2)
+            .unwrap();
+        let replaced = runtime.block_on(handle_request(
+            RpcRequest {
+                jsonrpc: "2.0".to_owned(),
+                id: json!(3),
+                method: "command.describe".to_owned(),
+                params: json!({"command": "sample.extension.echo"}),
+            },
+            instance,
+            commands,
+            registry,
+            automation,
+            owner(),
+            CommandCancellation::new(),
+        ));
+        let replaced = replaced.result.expect("replacement command result");
+        assert_eq!(replaced["origin"]["generation"], 2);
     }
 
     #[test]
@@ -1755,6 +2144,7 @@ mod tests {
         let (commands, _receiver) = app_command_channel(1);
         let commands = commands.for_caller(Caller::Socket);
         let runtime = tokio::runtime::Runtime::new().unwrap();
+        let registry = CommandRegistry::core().clone();
 
         let subscribed = runtime.block_on(handle_request(
             RpcRequest {
@@ -1765,6 +2155,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(41, 1),
             CommandCancellation::new(),
@@ -1791,6 +2182,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(42, 1),
             CommandCancellation::new(),
@@ -1820,6 +2212,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(43, 1),
             CommandCancellation::new(),
@@ -1845,6 +2238,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(44, 1),
             CommandCancellation::new(),
@@ -1869,6 +2263,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(45, 1),
             CommandCancellation::new(),
@@ -1894,6 +2289,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(46, 1),
             CommandCancellation::new(),
@@ -1926,6 +2322,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(47, 1),
             CommandCancellation::new(),
@@ -1946,6 +2343,7 @@ mod tests {
             },
             descriptor.clone(),
             commands.clone(),
+            registry.clone(),
             automation.clone(),
             OwnerIdentity::new(48, 1),
             CommandCancellation::new(),
@@ -1963,7 +2361,8 @@ mod tests {
             },
             descriptor,
             commands,
-            automation,
+            registry,
+            automation.clone(),
             OwnerIdentity::new(49, 1),
             CommandCancellation::new(),
         ));
@@ -2009,6 +2408,97 @@ mod tests {
             .unwrap();
         automation.cancel_all_tasks();
         assert!(other_cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn control_runtime_cancels_registered_connection_requests() {
+        let registry = ConnectionCancellationRegistry::default();
+        let first = registry.register();
+        let second = registry.register();
+        let first_token = first.token();
+        let second_token = second.token();
+
+        assert!(!first_token.is_cancelled());
+        assert!(!second_token.is_cancelled());
+        registry.cancel_all();
+        assert!(first_token.is_cancelled());
+        assert!(second_token.is_cancelled());
+    }
+
+    #[test]
+    fn attached_command_drop_releases_response_after_started() {
+        let (commands, receiver) = app_command_channel(1);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let cancellation = CommandCancellation::new();
+            let waiter = tokio::spawn(await_command(
+                CommandInvocation::from_action("new_tab", Caller::Socket),
+                commands.for_caller(Caller::Socket),
+                cancellation,
+                CommandCompletionContext {
+                    caller: Caller::Socket,
+                    owner_pid: owner().pid(),
+                    owner_generation: owner().generation(),
+                    target: None,
+                },
+            ));
+            let request = loop {
+                match receiver.try_recv() {
+                    Ok(request) => break request,
+                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("command receiver disconnected")
+                    }
+                }
+            };
+            assert!(request.cancellation.try_start());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            assert!(
+                request
+                    .response
+                    .send(crate::commands::CommandOutcome::success())
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn command_waiters_return_indeterminate_after_started_deadline() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let cancellation = CommandCancellation::new();
+            assert!(cancellation.try_start());
+            let (response_tx, response_rx) = mpsc::channel();
+            let outcome = wait_for_attached_command_async(
+                response_rx,
+                &cancellation,
+                Instant::now() - Duration::from_millis(1),
+            )
+            .await;
+            assert!(matches!(outcome, CommandWaitResult::Indeterminate));
+            assert!(
+                response_tx
+                    .send(crate::commands::CommandOutcome::success())
+                    .is_err()
+            );
+
+            let cancellation = CommandCancellation::new();
+            assert!(cancellation.try_start());
+            let (response_tx, response_rx) = mpsc::channel();
+            let outcome = wait_for_task_until(
+                response_rx,
+                &cancellation,
+                Instant::now() - Duration::from_millis(1),
+            );
+            assert!(matches!(outcome, CommandWaitResult::Indeterminate));
+            assert!(
+                response_tx
+                    .send(crate::commands::CommandOutcome::success())
+                    .is_err()
+            );
+        });
     }
 
     #[test]
@@ -2127,6 +2617,9 @@ mod tests {
     fn event_snapshot_and_rebase_are_owned_rpc_operations() {
         let automation = AutomationHub::new();
         let scope = "binding:1:2".to_owned();
+        automation
+            .events()
+            .replace_live_binding_scopes([scope.clone()]);
         automation
             .events()
             .set_snapshot(
@@ -2270,6 +2763,118 @@ mod tests {
             error.data.unwrap()["server_maximum"],
             json!(PROTOCOL_VERSION)
         );
+    }
+
+    #[cfg(unix)]
+    fn assert_startup_failure_reaps(
+        deadline: Instant,
+        expected: &str,
+        mut discover: impl FnMut(u32) -> Result<Vec<InstanceDescriptor>>,
+    ) {
+        let child = ProcessCommand::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn hanging child");
+        let pid = child.id();
+        let error = wait_for_started_instance(
+            SpawnedChildGuard::new(child),
+            &BTreeSet::new(),
+            deadline,
+            || discover(pid),
+        )
+        .expect_err("startup should fail");
+
+        assert_eq!(error.to_string(), expected);
+        assert!(
+            sysinfo::System::new_all()
+                .process(sysinfo::Pid::from_u32(pid))
+                .is_none(),
+            "startup child {pid} was not reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    fn descriptor_for_pid(pid: u32, instance_id: &str) -> InstanceDescriptor {
+        InstanceDescriptor {
+            instance_id: instance_id.to_owned(),
+            generation: 1,
+            pid,
+            window_state_key: "test".to_owned(),
+            endpoint: PathBuf::new(),
+            started_at_ms: 1,
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_startup_child_is_reaped() {
+        let child = ProcessCommand::new("true")
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let error = wait_for_started_instance(
+            SpawnedChildGuard::new(child),
+            &BTreeSet::new(),
+            Instant::now() + Duration::from_secs(1),
+            || Ok(Vec::new()),
+        )
+        .expect_err("exited startup child should fail selection");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("started Bootty instance exited")
+        );
+        assert!(
+            sysinfo::System::new_all()
+                .process(sysinfo::Pid::from_u32(pid))
+                .is_none(),
+            "short-lived startup child {pid} was not reaped"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_errors_reap_spawned_child_and_preserve_error() {
+        assert_startup_failure_reaps(
+            Instant::now() + Duration::from_secs(1),
+            "malformed descriptor",
+            |_| Err(anyhow::anyhow!("malformed descriptor")),
+        );
+        assert_startup_failure_reaps(
+            Instant::now() + Duration::from_secs(1),
+            "started Bootty child registered multiple instances",
+            |pid| {
+                Ok(vec![
+                    descriptor_for_pid(pid, "first"),
+                    descriptor_for_pid(pid, "second"),
+                ])
+            },
+        );
+        assert_startup_failure_reaps(
+            Instant::now(),
+            "started Bootty instance did not become ready",
+            |_| Ok(Vec::new()),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_success_disarms_child_guard() {
+        let child = ProcessCommand::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn hanging child");
+        let mut guard = SpawnedChildGuard::new(child);
+        let mut child = guard.disarm().expect("armed child");
+
+        assert!(
+            child.try_wait().expect("inspect disarmed child").is_none(),
+            "disarming must leave the child running"
+        );
+        child.kill().expect("stop test child");
+        child.wait().expect("reap test child");
     }
 
     #[test]

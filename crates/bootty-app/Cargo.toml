@@ -17,6 +17,7 @@ egui_code_editor.workspace = true
 iconflow.workspace = true
 fontdb.workspace = true
 fs4.workspace = true
+rustix = { workspace = true, features = ["net", "event"] }
 libghostty-vt.workspace = true
 bootty-winit = { path = "../bootty-winit", default-features = false }
 bootty-config = { path = "../bootty-config" }

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -9,20 +9,57 @@ use std::{
 
 use crate::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig, default_config_path},
-    mux::controller::{BindingId, MuxScope, SpaceId},
+    mux::{
+        command::{MuxPaneLaunch, MuxPaneLaunchPlan, MuxSessionLaunchPlan, MuxWindowLaunchPlan},
+        controller::{BindingId, MuxScope, SpaceId},
+    },
+    session_order::SessionMembershipConflict,
 };
 
 const WORKSPACE_SNAPSHOT_REVISION: i64 = 1;
+const LEGACY_SESSION_LAUNCH_PLAN_MIGRATION: &str = "legacy-session-launch-plans-v1";
 const DEFAULT_SPACE_NAME: &str = "Default Space";
 pub(crate) const DEFAULT_SPACE_ICON: &str = "folder";
 pub(crate) const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
 const DEFAULT_TINT_SIDEBAR: bool = false;
 const DEFAULT_BINDING_NAME: &str = "Default Binding";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingSessionRename {
+    pub(crate) session_id: String,
+    pub(crate) old_name: String,
+    pub(crate) new_name: String,
+    pub(crate) display_name: String,
+    pub(crate) cwd: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionRenamePersistenceState {
+    NotCommitted,
+    AlreadyCommitted,
+    Conflict,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpaceMuxOverride {
     pub backend: Option<MultiplexerBackendConfig>,
     pub remote: SpaceRemoteOverride,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceSpaceUpdate<'a> {
+    pub(crate) id: SpaceId,
+    pub(crate) name: &'a str,
+    pub(crate) icon: &'a str,
+    pub(crate) color: [u8; 3],
+    pub(crate) tint_sidebar: bool,
+    pub(crate) mux: SpaceMuxOverride,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WorkspaceNamespaceUpdateContext<'a> {
+    pub(crate) binding_id: i64,
+    pub(crate) namespace: &'a str,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,7 +239,7 @@ impl WorkspaceStore {
             return Ok(None);
         }
         let mut conn = open_db(&self.path)?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut names = tx.prepare("SELECT name FROM workspace_spaces")?;
         let existing_names = names
             .query_map([], |row| row.get::<_, String>(0))?
@@ -287,8 +324,9 @@ impl WorkspaceStore {
         let Some(icon) = nonempty_trimmed(icon) else {
             return Ok(false);
         };
-        let conn = open_db(&self.path)?;
-        if conn.execute(
+        let mut conn = open_db(&self.path)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if tx.execute(
             "UPDATE workspace_spaces
              SET name = ?1, icon = ?2, color = ?3, tint_sidebar = ?4
              WHERE id = ?5",
@@ -303,7 +341,7 @@ impl WorkspaceStore {
         {
             return Ok(false);
         }
-        conn.execute(
+        tx.execute(
             "UPDATE workspace_bindings
              SET backend = ?1, remote = ?2
              WHERE id = (
@@ -318,12 +356,121 @@ impl WorkspaceStore {
                 id.persistence_value()
             ],
         )?;
+        tx.commit()?;
         if let Some(space) = self.spaces.iter_mut().find(|space| space.id == id) {
             space.name = name;
             space.icon = icon;
             space.color = color;
             space.tint_sidebar = tint_sidebar;
             if let Some(binding) = space.bindings.first_mut() {
+                binding.backend_override = mux.backend;
+                binding.remote_override = mux.remote;
+            }
+        }
+        Ok(true)
+    }
+    pub(crate) fn update_space_with_namespace(
+        &mut self,
+        update: WorkspaceSpaceUpdate<'_>,
+        context: WorkspaceNamespaceUpdateContext<'_>,
+    ) -> rusqlite::Result<bool> {
+        let WorkspaceSpaceUpdate {
+            id,
+            name,
+            icon,
+            color,
+            tint_sidebar,
+            mux,
+        } = update;
+        let WorkspaceNamespaceUpdateContext {
+            binding_id,
+            namespace,
+        } = context;
+
+        let Some(name) = nonempty_trimmed(name) else {
+            return Ok(false);
+        };
+        let Some(icon) = nonempty_trimmed(icon) else {
+            return Ok(false);
+        };
+        let mut conn = open_db(&self.path)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if tx.execute(
+            "UPDATE workspace_spaces
+             SET name = ?1, icon = ?2, color = ?3, tint_sidebar = ?4
+             WHERE id = ?5",
+            params![
+                name,
+                icon,
+                color_to_hex(color),
+                i64::from(tint_sidebar),
+                id.persistence_value()
+            ],
+        )? == 0
+        {
+            return Ok(false);
+        }
+        if tx.execute(
+            "UPDATE workspace_bindings
+             SET backend = ?1, remote = ?2
+             WHERE id = ?3 AND space_id = ?4",
+            params![
+                backend_to_storage(mux.backend),
+                remote_to_storage(&mux.remote),
+                binding_id,
+                id.persistence_value()
+            ],
+        )? == 0
+        {
+            return Ok(false);
+        }
+        tx.execute(
+            "CREATE TABLE IF NOT EXISTS workspace_session_namespaces (
+                 binding_id INTEGER PRIMARY KEY
+                     REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+                 namespace TEXT NOT NULL
+             )",
+            [],
+        )?;
+        let conflict = tx
+            .query_row(
+                "SELECT s.name
+                 FROM workspace_sessions s
+                 JOIN workspace_session_namespaces n
+                   ON n.namespace = ?2 AND n.binding_id != ?1
+                 JOIN workspace_sessions other
+                   ON other.binding_id = n.binding_id AND other.name = s.name
+                 WHERE s.binding_id = ?1
+                 LIMIT 1",
+                params![binding_id, namespace],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(name) = conflict {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                SessionMembershipConflict {
+                    name,
+                    namespace: namespace.to_owned(),
+                },
+            )));
+        }
+        tx.execute(
+            "INSERT INTO workspace_session_namespaces (binding_id, namespace)
+             VALUES (?1, ?2)
+             ON CONFLICT(binding_id) DO UPDATE SET namespace = excluded.namespace",
+            params![binding_id, namespace],
+        )?;
+        tx.commit()?;
+        if let Some(space) = self.spaces.iter_mut().find(|space| space.id == id) {
+            space.name = name;
+            space.icon = icon;
+            space.color = color;
+            space.tint_sidebar = tint_sidebar;
+            if let Some(binding) = space
+                .bindings
+                .iter_mut()
+                .find(|binding| binding.scope.binding_id().persistence_value() == binding_id)
+            {
                 binding.backend_override = mux.backend;
                 binding.remote_override = mux.remote;
             }
@@ -444,6 +591,12 @@ impl WorkspaceStore {
         if revision > WORKSPACE_SNAPSHOT_REVISION {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        {
+            let tx = conn.transaction()?;
+            create_workspace_schema(&tx)?;
+            migrate_workspace_snapshot_state(&tx)?;
+            tx.commit()?;
+        }
         migrate_workspace_binding_cardinality(&conn)?;
         let tx = conn.transaction()?;
         create_workspace_schema(&tx)?;
@@ -460,6 +613,7 @@ impl WorkspaceStore {
         } else {
             create_missing_space_bindings(&tx)?;
         }
+        migrate_workspace_session_launch_plans(&tx)?;
         let spaces = load_spaces(&tx)?;
         tx.pragma_update(None, "user_version", WORKSPACE_SNAPSHOT_REVISION)?;
         tx.commit()?;
@@ -481,6 +635,689 @@ pub(crate) fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     Ok(conn)
+}
+fn ensure_session_launch_plan_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_session_launch_plans (
+            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            PRIMARY KEY(binding_id, session_id)
+        )",
+    )
+}
+fn ensure_pending_ditch_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_pending_ditch (
+            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            cwd TEXT,
+            action TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(binding_id, session_id)
+        )",
+    )?;
+    let mut statement = conn.prepare("PRAGMA table_info(workspace_pending_ditch)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    if !columns.iter().any(|column| column == "cwd") {
+        conn.execute(
+            "ALTER TABLE workspace_pending_ditch ADD COLUMN cwd TEXT",
+            [],
+        )?;
+    }
+    if !columns.iter().any(|column| column == "action") {
+        conn.execute(
+            "ALTER TABLE workspace_pending_ditch ADD COLUMN action TEXT NOT NULL DEFAULT '{}'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_pending_ditch(
+    config_path: &Path,
+    binding_id: i64,
+    session_id: &str,
+    cwd: Option<&str>,
+    action: &str,
+) -> rusqlite::Result<()> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_pending_ditch_table(&conn)?;
+    conn.execute(
+        "INSERT INTO workspace_pending_ditch(binding_id, session_id, cwd, action)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(binding_id, session_id) DO UPDATE SET cwd = excluded.cwd, action = excluded.action",
+        params![binding_id, session_id, cwd, action],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_pending_ditch(
+    config_path: &Path,
+    binding_id: i64,
+    session_id: &str,
+) -> rusqlite::Result<()> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_pending_ditch_table(&conn)?;
+    conn.execute(
+        "DELETE FROM workspace_pending_ditch WHERE binding_id = ?1 AND session_id = ?2",
+        params![binding_id, session_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn load_pending_ditches(
+    config_path: &Path,
+    binding_id: i64,
+) -> rusqlite::Result<Vec<String>> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_pending_ditch_table(&conn)?;
+    let mut statement = conn.prepare(
+        "SELECT session_id FROM workspace_pending_ditch
+         WHERE binding_id = ?1 ORDER BY session_id",
+    )?;
+    statement
+        .query_map(params![binding_id], |row| row.get(0))?
+        .collect()
+}
+
+fn ensure_pending_session_rename_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_pending_session_rename (
+            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            command_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            old_name TEXT NOT NULL,
+            new_name TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            cwd TEXT NOT NULL,
+            PRIMARY KEY(binding_id, command_id)
+        )",
+    )
+}
+
+pub(crate) fn persist_pending_session_rename(
+    config_path: &Path,
+    binding_id: i64,
+    command_id: &str,
+    rename: &PendingSessionRename,
+) -> rusqlite::Result<()> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_pending_session_rename_table(&conn)?;
+    conn.execute(
+        "INSERT INTO workspace_pending_session_rename
+            (binding_id, command_id, session_id, old_name, new_name, display_name, cwd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(binding_id, command_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            old_name = excluded.old_name,
+            new_name = excluded.new_name,
+            display_name = excluded.display_name,
+            cwd = excluded.cwd",
+        params![
+            binding_id,
+            command_id,
+            rename.session_id,
+            rename.old_name,
+            rename.new_name,
+            rename.display_name,
+            rename.cwd,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn clear_pending_session_rename(
+    config_path: &Path,
+    binding_id: i64,
+    command_id: &str,
+) -> rusqlite::Result<()> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_pending_session_rename_table(&conn)?;
+    conn.execute(
+        "DELETE FROM workspace_pending_session_rename
+         WHERE binding_id = ?1 AND command_id = ?2",
+        params![binding_id, command_id],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn load_pending_session_renames(
+    config_path: &Path,
+    binding_id: i64,
+) -> rusqlite::Result<Vec<(String, PendingSessionRename)>> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_pending_session_rename_table(&conn)?;
+    let mut statement = conn.prepare(
+        "SELECT command_id, session_id, old_name, new_name, display_name, cwd
+         FROM workspace_pending_session_rename
+         WHERE binding_id = ?1 ORDER BY command_id",
+    )?;
+    statement
+        .query_map([binding_id], |row| {
+            Ok((
+                row.get(0)?,
+                PendingSessionRename {
+                    session_id: row.get(1)?,
+                    old_name: row.get(2)?,
+                    new_name: row.get(3)?,
+                    display_name: row.get(4)?,
+                    cwd: row.get(5)?,
+                },
+            ))
+        })?
+        .collect()
+}
+
+pub(crate) fn persist_session_launch_plan(
+    config_path: &Path,
+    binding_id: i64,
+    plan: &MuxSessionLaunchPlan,
+) -> rusqlite::Result<()> {
+    plan.validate()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let encoded = serde_json::to_string(plan)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    let existing = conn
+        .query_row(
+            "SELECT plan FROM workspace_session_launch_plans
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, plan.session_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing == encoded {
+            return Ok(());
+        }
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "immutable launch plan already exists for binding {binding_id} session {:?}",
+                    plan.session_id
+                ),
+            ),
+        )));
+    }
+    conn.execute(
+        "INSERT INTO workspace_session_launch_plans (binding_id, session_id, plan)
+         VALUES (?1, ?2, ?3)",
+        params![binding_id, plan.session_id.as_str(), encoded],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn load_session_launch_plans(
+    config_path: &Path,
+    binding_id: i64,
+) -> rusqlite::Result<Vec<(String, MuxSessionLaunchPlan)>> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    let mut statement = conn.prepare(
+        "SELECT session_id, plan
+         FROM workspace_session_launch_plans
+         WHERE binding_id = ?1
+         ORDER BY session_id",
+    )?;
+    statement
+        .query_map([binding_id], |row| {
+            let session_id = row.get::<_, String>(0)?;
+            let encoded = row.get::<_, String>(1)?;
+            let plan = serde_json::from_str::<MuxSessionLaunchPlan>(&encoded).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok((session_id, plan))
+        })?
+        .collect()
+}
+
+pub(crate) fn delete_session_launch_plan(
+    config_path: &Path,
+    binding_id: i64,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    Ok(conn.execute(
+        "DELETE FROM workspace_session_launch_plans
+         WHERE binding_id = ?1 AND session_id = ?2",
+        params![binding_id, session_id],
+    )? != 0)
+}
+
+pub(crate) fn rekey_session_launch_plan(
+    config_path: &Path,
+    binding_id: i64,
+    old_session_id: &str,
+    new_session_id: &str,
+) -> rusqlite::Result<bool> {
+    if old_session_id == new_session_id {
+        return Ok(false);
+    }
+    let mut conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    let tx = conn.transaction()?;
+    let old_plan = tx
+        .query_row(
+            "SELECT plan FROM workspace_session_launch_plans
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, old_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(old_plan) = old_plan else {
+        return Ok(false);
+    };
+    let target_plan = tx
+        .query_row(
+            "SELECT plan FROM workspace_session_launch_plans
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, new_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    match target_plan {
+        None => {
+            tx.execute(
+                "UPDATE workspace_session_launch_plans
+                 SET session_id = ?1
+                 WHERE binding_id = ?2 AND session_id = ?3",
+                params![new_session_id, binding_id, old_session_id],
+            )?;
+        }
+        Some(target_plan) if target_plan == old_plan => {
+            tx.execute(
+                "DELETE FROM workspace_session_launch_plans
+                 WHERE binding_id = ?1 AND session_id = ?2",
+                params![binding_id, old_session_id],
+            )?;
+        }
+        Some(_) => {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "immutable launch plan already exists for binding {binding_id} session \
+                         {new_session_id:?}"
+                    ),
+                ),
+            )));
+        }
+    }
+    tx.commit()?;
+    Ok(true)
+}
+pub(crate) fn session_rename_persistence_state(
+    config_path: &Path,
+    binding_id: i64,
+    command_id: &str,
+    rename: &PendingSessionRename,
+) -> rusqlite::Result<SessionRenamePersistenceState> {
+    let conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    ensure_pending_session_rename_table(&conn)?;
+
+    let pending = conn
+        .query_row(
+            "SELECT session_id, old_name, new_name, display_name, cwd
+             FROM workspace_pending_session_rename
+             WHERE binding_id = ?1 AND command_id = ?2",
+            params![binding_id, command_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let pending_matches =
+        pending.is_some_and(|(session_id, old_name, new_name, display_name, cwd)| {
+            session_id == rename.session_id
+                && old_name == rename.old_name
+                && new_name == rename.new_name
+                && display_name == rename.display_name
+                && cwd == rename.cwd
+        });
+    if !pending_matches {
+        return Ok(SessionRenamePersistenceState::NotCommitted);
+    }
+
+    let (source_membership, destination_membership) = {
+        let membership_exists = |name: &str| {
+            conn.query_row(
+                "SELECT 1 FROM workspace_sessions
+                 WHERE binding_id = ?1 AND name = ?2",
+                params![binding_id, name],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())
+        };
+        (
+            membership_exists(&rename.old_name)?,
+            membership_exists(&rename.new_name)?,
+        )
+    };
+
+    let mut statement = conn.prepare(
+        "SELECT session_id, plan
+         FROM workspace_session_launch_plans
+         WHERE binding_id = ?1",
+    )?;
+    let plans = statement
+        .query_map([binding_id], |row| {
+            let key = row.get::<_, String>(0)?;
+            let encoded = row.get::<_, String>(1)?;
+            let plan = serde_json::from_str::<MuxSessionLaunchPlan>(&encoded).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok((key, plan))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+    let source_plan = plans.iter().any(|(key, plan)| {
+        key == &rename.old_name
+            || key == &rename.session_id
+            || plan.session_id == rename.old_name
+            || plan.session_id == rename.session_id
+    });
+    let destination_plan = plans
+        .iter()
+        .find(|(key, _)| key == &rename.new_name)
+        .map(|(_, plan)| plan);
+    let destination_exists = destination_membership || destination_plan.is_some();
+    if source_membership || source_plan || !destination_exists {
+        return Ok(SessionRenamePersistenceState::NotCommitted);
+    }
+
+    let metadata = conn
+        .query_row(
+            "SELECT session_id, session_name, cwd
+             FROM workspace_session_name_metadata
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, rename.session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let metadata_matches = metadata.is_some_and(|(session_id, session_name, cwd)| {
+        session_id == rename.session_id
+            && cwd == rename.cwd
+            && (session_name == rename.old_name || session_name == rename.new_name)
+    });
+    let plan_matches = destination_membership
+        && destination_plan.is_some_and(|plan| {
+            plan.session_id == rename.new_name && plan.default_cwd == rename.cwd
+        });
+    if metadata_matches && plan_matches {
+        Ok(SessionRenamePersistenceState::AlreadyCommitted)
+    } else {
+        Ok(SessionRenamePersistenceState::Conflict)
+    }
+}
+
+/// validates destination collisions before changing either membership or launch-plan JSON.
+pub(crate) fn rename_session_membership_and_launch_plans(
+    config_path: &Path,
+    binding_id: i64,
+    old_name: &str,
+    new_name: &str,
+    plan_ids: &[&str],
+) -> rusqlite::Result<bool> {
+    if old_name == new_name {
+        return Ok(false);
+    }
+    let mut conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    ensure_pending_ditch_table(&conn)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+    let old_membership = tx
+        .query_row(
+            "SELECT 1 FROM workspace_sessions
+             WHERE binding_id = ?1 AND name = ?2",
+            params![binding_id, old_name],
+            |_| Ok(()),
+        )
+        .optional()?;
+    let destination_membership = tx
+        .query_row(
+            "SELECT 1 FROM workspace_sessions
+             WHERE binding_id = ?1 AND name = ?2",
+            params![binding_id, new_name],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if destination_membership.is_some() {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("session membership already exists for {new_name:?}"),
+            ),
+        )));
+    }
+
+    let mut statement = tx.prepare(
+        "SELECT session_id, plan
+         FROM workspace_session_launch_plans
+         WHERE binding_id = ?1",
+    )?;
+    let rows = statement
+        .query_map([binding_id], |row| {
+            let key = row.get::<_, String>(0)?;
+            let encoded = row.get::<_, String>(1)?;
+            let plan = serde_json::from_str::<MuxSessionLaunchPlan>(&encoded).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok((key, plan))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    let mut matching = rows
+        .into_iter()
+        .filter(|(key, plan)| {
+            key == old_name
+                || plan.session_id == old_name
+                || plan_ids
+                    .iter()
+                    .any(|id| *id == key || *id == plan.session_id)
+        })
+        .collect::<Vec<_>>();
+    let pending = tx
+        .query_row(
+            "SELECT 1 FROM workspace_pending_ditch
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, old_name],
+            |_| Ok(()),
+        )
+        .optional()?;
+
+    if old_membership.is_none() && matching.is_empty() && pending.is_none() {
+        tx.commit()?;
+        return Ok(false);
+    }
+
+    let existing_target = tx
+        .query_row(
+            "SELECT plan FROM workspace_session_launch_plans
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, new_name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if existing_target.is_some() && matching.iter().any(|(key, _)| key != new_name) {
+        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("launch plan already exists for {new_name:?}"),
+            ),
+        )));
+    }
+
+    let mut renamed_plan: Option<String> = existing_target;
+    for (key, mut plan) in matching.drain(..) {
+        plan.session_id = new_name.to_owned();
+        plan.validate()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let encoded = serde_json::to_string(&plan)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        if renamed_plan
+            .as_deref()
+            .is_some_and(|existing| existing != encoded)
+        {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("conflicting launch plans for {new_name:?}"),
+                ),
+            )));
+        }
+        tx.execute(
+            "DELETE FROM workspace_session_launch_plans
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, key],
+        )?;
+        renamed_plan = Some(encoded);
+    }
+    if let Some(encoded) = renamed_plan {
+        tx.execute(
+            "INSERT INTO workspace_session_launch_plans(binding_id, session_id, plan)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(binding_id, session_id) DO UPDATE SET plan = excluded.plan",
+            params![binding_id, new_name, encoded],
+        )?;
+    }
+    if old_membership.is_some() {
+        tx.execute(
+            "UPDATE workspace_sessions SET name = ?1
+             WHERE binding_id = ?2 AND name = ?3",
+            params![new_name, binding_id, old_name],
+        )?;
+    }
+    if pending.is_some() {
+        tx.execute(
+            "UPDATE workspace_pending_ditch SET session_id = ?1
+             WHERE binding_id = ?2 AND session_id = ?3",
+            params![new_name, binding_id, old_name],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Atomically retire a backend session's workspace membership and every immutable launch plan
+/// identifying it. The transaction intentionally parses all candidate plans before commit: a
+/// malformed or otherwise unwritable plan rolls back membership removal rather than leaving a
+/// successfully ditched backend session restorable on the next reopen.
+pub(crate) fn remove_session_membership_and_launch_plan(
+    config_path: &Path,
+    binding_id: i64,
+    membership_name: &str,
+    plan_ids: &[&str],
+) -> rusqlite::Result<()> {
+    let mut conn = open_db(&sqlite_path(config_path))?;
+    ensure_session_launch_plan_table(&conn)?;
+    ensure_pending_ditch_table(&conn)?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM workspace_sessions
+         WHERE binding_id = ?1 AND name = ?2",
+        params![binding_id, membership_name],
+    )?;
+    tx.execute(
+        "DELETE FROM workspace_session_groups
+         WHERE binding_id = ?1
+           AND NOT EXISTS (
+               SELECT 1 FROM workspace_sessions
+               WHERE workspace_sessions.binding_id = workspace_session_groups.binding_id
+                 AND workspace_sessions.group_id = workspace_session_groups.id
+           )",
+        [binding_id],
+    )?;
+    tx.execute(
+        "INSERT INTO workspace_session_groups (binding_id, name, position)
+         SELECT ?1, '', 0
+         WHERE NOT EXISTS (
+             SELECT 1 FROM workspace_session_groups WHERE binding_id = ?1
+         )",
+        [binding_id],
+    )?;
+
+    let mut statement = tx.prepare(
+        "SELECT session_id, plan
+         FROM workspace_session_launch_plans
+         WHERE binding_id = ?1",
+    )?;
+    let mut plan_keys = Vec::new();
+    let rows = statement.query_map([binding_id], |row| {
+        let key = row.get::<_, String>(0)?;
+        let encoded = row.get::<_, String>(1)?;
+        let plan = serde_json::from_str::<MuxSessionLaunchPlan>(&encoded).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        Ok((key, plan))
+    })?;
+    for row in rows {
+        let (key, plan) = row?;
+        if plan_ids
+            .iter()
+            .any(|plan_id| *plan_id == key || *plan_id == plan.session_id)
+        {
+            plan_keys.push(key);
+        }
+    }
+    drop(statement);
+    for key in plan_keys {
+        tx.execute(
+            "DELETE FROM workspace_session_launch_plans
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, key],
+        )?;
+    }
+    for plan_id in plan_ids {
+        tx.execute(
+            "DELETE FROM workspace_pending_ditch
+             WHERE binding_id = ?1 AND session_id = ?2",
+            params![binding_id, plan_id],
+        )?;
+    }
+    tx.execute(
+        "DELETE FROM workspace_pending_ditch
+         WHERE binding_id = ?1 AND session_id = ?2",
+        params![binding_id, membership_name],
+    )?;
+    tx.commit()
 }
 
 fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqlite::Result<()> {
@@ -510,11 +1347,17 @@ fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqlite::Result<
              space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
              name TEXT NOT NULL,
              backend TEXT NOT NULL,
-             hide_tmux_status INTEGER NOT NULL
+             hide_tmux_status INTEGER NOT NULL,
+             remote TEXT,
+             unavailable INTEGER NOT NULL DEFAULT 0,
+             selected_session_id TEXT,
+             selected_window_id TEXT
          );
          INSERT INTO workspace_bindings_multiple
-             (id, space_id, name, backend, hide_tmux_status)
-         SELECT id, space_id, name, backend, hide_tmux_status
+             (id, space_id, name, backend, hide_tmux_status, remote, unavailable,
+              selected_session_id, selected_window_id)
+         SELECT id, space_id, name, backend, hide_tmux_status, remote, unavailable,
+                selected_session_id, selected_window_id
          FROM workspace_bindings;
          DROP TABLE workspace_bindings;
          ALTER TABLE workspace_bindings_multiple RENAME TO workspace_bindings;
@@ -573,6 +1416,22 @@ fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
             session_name TEXT NOT NULL DEFAULT '',
             display_name TEXT NOT NULL DEFAULT '',
             explicit INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(binding_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS workspace_session_launch_plans (
+            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            plan TEXT NOT NULL,
+            PRIMARY KEY(binding_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS workspace_migrations (
+            name TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS workspace_pending_ditch (
+            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            cwd TEXT,
+            action TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY(binding_id, session_id)
         );
         CREATE TABLE IF NOT EXISTS workspace_window_state (
@@ -682,6 +1541,73 @@ fn migrate_workspace_session_name_metadata(tx: &Transaction<'_>) -> rusqlite::Re
         )?;
     }
     Ok(())
+}
+fn migrate_workspace_session_launch_plans(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let migrated = tx
+        .query_row(
+            "SELECT 1 FROM workspace_migrations WHERE name = ?1",
+            [LEGACY_SESSION_LAUNCH_PLAN_MIGRATION],
+            |_| Ok(()),
+        )
+        .optional()?;
+    if migrated.is_some() {
+        return Ok(());
+    }
+
+    let mut statement = tx.prepare(
+        "SELECT binding_id, session_id, cwd
+         FROM workspace_session_name_metadata",
+    )?;
+    let legacy = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    for (binding_id, session_id, cwd) in legacy {
+        let plan = simple_session_launch_plan(&session_id, &cwd);
+        let encoded = serde_json::to_string(&plan)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO workspace_session_launch_plans
+                (binding_id, session_id, plan)
+             VALUES (?1, ?2, ?3)",
+            params![binding_id, session_id, encoded],
+        )?;
+    }
+    // The marker is written in the same transaction, after every legacy row has been inserted.
+    // A failed insert rolls back both the plans and this marker, so migration can safely retry.
+    tx.execute(
+        "INSERT INTO workspace_migrations(name) VALUES (?1)",
+        [LEGACY_SESSION_LAUNCH_PLAN_MIGRATION],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn simple_session_launch_plan(session_id: &str, cwd: &str) -> MuxSessionLaunchPlan {
+    MuxSessionLaunchPlan {
+        session_id: session_id.to_owned(),
+        focus: true,
+        default_cwd: cwd.to_owned(),
+        environment: std::collections::BTreeMap::new(),
+        windows: vec![MuxWindowLaunchPlan {
+            name: None,
+            focus: true,
+            layout: MuxPaneLaunchPlan::Pane(MuxPaneLaunch {
+                cwd: cwd.to_owned(),
+                command: None,
+                argv: None,
+                environment: std::collections::BTreeMap::new(),
+                title: None,
+            }),
+        }],
+        focused_window: 0,
+    }
 }
 
 fn migrate_workspace_snapshot_state(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -1117,6 +2043,62 @@ mod tests {
     }
 
     #[test]
+    fn update_space_rolls_back_space_when_binding_update_fails() {
+        let config_path = temp_config_path("atomic-space-update");
+        let mut store = WorkspaceStore::for_config_path(&config_path);
+        let space = store
+            .create_space(
+                "Atomic",
+                "terminal",
+                [1, 2, 3],
+                false,
+                SpaceMuxOverride::default(),
+                &MultiplexerConfig::default(),
+            )
+            .expect("create space")
+            .expect("created space");
+
+        let conn = open_db(store.path()).expect("open workspace database");
+        conn.execute_batch(
+            "CREATE TRIGGER fail_space_binding_update
+             BEFORE UPDATE OF backend ON workspace_bindings
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected binding update failure');
+             END;",
+        )
+        .expect("install binding update failure");
+
+        let result = store.update_space(
+            space.id(),
+            "Changed",
+            "calendar",
+            [4, 5, 6],
+            true,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Tmux),
+                remote: SpaceRemoteOverride::Local,
+            },
+        );
+        assert!(result.is_err(), "the injected second update must fail");
+
+        let reopened = WorkspaceStore::for_config_path(&config_path);
+        let persisted = reopened
+            .spaces()
+            .iter()
+            .find(|candidate| candidate.id() == space.id())
+            .expect("persisted space");
+        assert_eq!(persisted.name(), "Atomic");
+        assert_eq!(persisted.icon(), "terminal");
+        assert_eq!(persisted.color(), [1, 2, 3]);
+        assert!(!persisted.tint_sidebar());
+        assert_eq!(persisted.bindings()[0].backend_override(), None);
+        assert_eq!(
+            persisted.bindings()[0].remote_override(),
+            &SpaceRemoteOverride::Inherit
+        );
+    }
+
+    #[test]
     fn a_space_remembers_its_remote_space_reference() {
         let config_path = temp_config_path("remote-space-reference");
         let mut store = WorkspaceStore::for_config_path(&config_path);
@@ -1335,6 +2317,65 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_space_creation_chooses_distinct_unique_names() {
+        let config_path = temp_config_path("concurrent-create-space");
+        let config = MultiplexerConfig::default();
+        let first = WorkspaceStore::for_config_path(&config_path);
+        let second = WorkspaceStore::for_config_path(&config_path);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_config = config.clone();
+        let second_config = config.clone();
+
+        let results = std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            let first = scope.spawn(move || {
+                let mut store = first;
+                first_barrier.wait();
+                store.create_space(
+                    "Review",
+                    DEFAULT_SPACE_ICON,
+                    DEFAULT_SPACE_COLOR,
+                    false,
+                    SpaceMuxOverride::default(),
+                    &first_config,
+                )
+            });
+            let second_barrier = barrier.clone();
+            let second = scope.spawn(move || {
+                let mut store = second;
+                second_barrier.wait();
+                store.create_space(
+                    "Review",
+                    DEFAULT_SPACE_ICON,
+                    DEFAULT_SPACE_COLOR,
+                    false,
+                    SpaceMuxOverride::default(),
+                    &second_config,
+                )
+            });
+            [
+                first.join().expect("first create thread"),
+                second.join().expect("second create thread"),
+            ]
+        });
+
+        assert!(results.iter().all(|result| result.is_ok()));
+        assert!(
+            results
+                .iter()
+                .all(|result| result.as_ref().unwrap().is_some())
+        );
+        let reopened = WorkspaceStore::for_config_path(&config_path);
+        let names = reopened
+            .spaces()
+            .iter()
+            .map(WorkspaceSpace::name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"Review"));
+        assert!(names.contains(&"Review 2"));
+    }
+
+    #[test]
     fn icon_migration_round_trips_edits_and_cascades_deleted_space_bindings() {
         let config_path = temp_config_path("space-icon-migration");
         let db_path = sqlite_path(&config_path);
@@ -1434,7 +2475,11 @@ mod tests {
                 space_id INTEGER NOT NULL UNIQUE REFERENCES workspace_spaces(id) ON DELETE CASCADE,
                 name TEXT NOT NULL,
                 backend TEXT NOT NULL,
-                hide_tmux_status INTEGER NOT NULL
+                hide_tmux_status INTEGER NOT NULL,
+                remote TEXT,
+                unavailable INTEGER NOT NULL DEFAULT 0,
+                selected_session_id TEXT,
+                selected_window_id TEXT
             );
             CREATE TABLE workspace_session_name_metadata (
                 binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
@@ -1447,8 +2492,9 @@ mod tests {
             INSERT INTO workspace_spaces (id, name, position)
             VALUES (1, 'Default Space', 0);
             INSERT INTO workspace_bindings
-                (id, space_id, name, backend, hide_tmux_status)
-            VALUES (1, 1, 'Default Binding', 'native', 0);
+                (id, space_id, name, backend, hide_tmux_status, remote, unavailable,
+                 selected_session_id, selected_window_id)
+            VALUES (1, 1, 'Default Binding', 'native', 0, 'devbox', 1, '$1', '@2');
             INSERT INTO workspace_session_name_metadata
                 (binding_id, session_id, cwd, generated_name, explicit)
             VALUES (1, '$1', '/repo', 'repo', 0);",
@@ -1471,9 +2517,346 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("preserved metadata count");
+        let migrated_plans =
+            load_session_launch_plans(&config_path, 1).expect("migrated launch plan");
+        let preserved_binding: (Option<String>, bool, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT remote, unavailable, selected_session_id, selected_window_id
+                 FROM workspace_bindings WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get(2)?,
+                        row.get(3)?,
+                    ))
+                },
+            )
+            .expect("preserved binding state");
 
         assert_eq!(store.bindings().len(), 1);
         assert_eq!(metadata_count, 1);
+        assert_eq!(
+            preserved_binding,
+            (
+                Some("devbox".to_owned()),
+                true,
+                Some("$1".to_owned()),
+                Some("@2".to_owned())
+            )
+        );
+        assert_eq!(
+            migrated_plans,
+            vec![("$1".to_owned(), simple_session_launch_plan("$1", "/repo"))]
+        );
+    }
+    #[test]
+    fn migrated_launch_plan_is_not_recreated_after_rename_and_reopen() {
+        let config_path = temp_config_path("migration-rename-reopen");
+        let db_path = sqlite_path(&config_path);
+        let conn = open_db(&db_path).expect("open old workspace database");
+        conn.execute_batch(
+            "CREATE TABLE workspace_spaces (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL UNIQUE
+            );
+            CREATE TABLE workspace_bindings (
+                id INTEGER PRIMARY KEY,
+                space_id INTEGER NOT NULL UNIQUE REFERENCES workspace_spaces(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                hide_tmux_status INTEGER NOT NULL,
+                remote TEXT,
+                unavailable INTEGER NOT NULL DEFAULT 0,
+                selected_session_id TEXT,
+                selected_window_id TEXT
+            );
+            CREATE TABLE workspace_session_name_metadata (
+                binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                generated_name TEXT NOT NULL,
+                explicit INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(binding_id, session_id)
+            );
+            INSERT INTO workspace_spaces (id, name, position)
+            VALUES (1, 'Default Space', 0);
+            INSERT INTO workspace_bindings
+                (id, space_id, name, backend, hide_tmux_status)
+            VALUES (1, 1, 'Default Binding', 'native', 0);
+            INSERT INTO workspace_session_name_metadata
+                (binding_id, session_id, cwd, generated_name, explicit)
+            VALUES (1, '$7', '/repo', 'repo', 0);",
+        )
+        .expect("create old workspace schema");
+        drop(conn);
+
+        let store = WorkspaceStore::for_config_path(&config_path);
+        assert_eq!(
+            load_session_launch_plans(&config_path, 1).expect("load migrated plan"),
+            vec![("$7".to_owned(), simple_session_launch_plan("$7", "/repo"))]
+        );
+        let conn = open_db(store.path()).expect("open migrated workspace database");
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_migrations
+                 WHERE name = 'legacy-session-launch-plans-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read launch-plan migration marker");
+        assert_eq!(migration_count, 1);
+        conn.execute(
+            "UPDATE workspace_session_name_metadata
+             SET session_name = 'release', display_name = 'release', explicit = 1
+             WHERE binding_id = 1 AND session_id = '$7'",
+            [],
+        )
+        .expect("record explicit rename metadata");
+        drop(conn);
+
+        assert!(
+            rename_session_membership_and_launch_plans(&config_path, 1, "$7", "release", &["$7"],)
+                .expect("rename migrated plan")
+        );
+
+        let reopened = WorkspaceStore::for_config_path(&config_path);
+        let plans = load_session_launch_plans(&config_path, 1).expect("reload renamed plan");
+        assert_eq!(
+            plans,
+            vec![(
+                "release".to_owned(),
+                simple_session_launch_plan("release", "/repo")
+            )]
+        );
+        assert!(!plans.iter().any(|(session_id, _)| session_id == "$7"));
+        assert_eq!(reopened.bindings().len(), 1);
+        let conn = open_db(reopened.path()).expect("reopen migrated database");
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_migrations
+                 WHERE name = 'legacy-session-launch-plans-v1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read retained launch-plan migration marker");
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn committed_session_rename_is_idempotently_recognized() {
+        let config_path = temp_config_path("rename-recovery");
+        let store = WorkspaceStore::for_config_path(&config_path);
+        let binding_id = store
+            .binding()
+            .expect("default binding")
+            .mux_scope()
+            .binding_id()
+            .persistence_value();
+        let conn = open_db(store.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_session_groups (binding_id, name, position)
+             VALUES (?1, '', 0)",
+            [binding_id],
+        )
+        .expect("insert session group");
+        let group_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
+             VALUES (?1, 'alpha', ?2, 0)",
+            params![binding_id, group_id],
+        )
+        .expect("insert source membership");
+        conn.execute(
+            "INSERT INTO workspace_session_name_metadata
+                (binding_id, session_id, cwd, generated_name, session_name, display_name, explicit)
+             VALUES (?1, 's1', '/repo/alpha', 'alpha', 'alpha', 'alpha', 0)",
+            [binding_id],
+        )
+        .expect("insert session metadata");
+        persist_session_launch_plan(
+            &config_path,
+            binding_id,
+            &simple_session_launch_plan("alpha", "/repo/alpha"),
+        )
+        .expect("persist source plan");
+        let rename = PendingSessionRename {
+            session_id: "s1".to_owned(),
+            old_name: "alpha".to_owned(),
+            new_name: "release".to_owned(),
+            display_name: "release".to_owned(),
+            cwd: "/repo/alpha".to_owned(),
+        };
+        persist_pending_session_rename(&config_path, binding_id, "rename-token", &rename)
+            .expect("persist pending rename");
+        drop(conn);
+
+        assert!(
+            rename_session_membership_and_launch_plans(
+                &config_path,
+                binding_id,
+                &rename.old_name,
+                &rename.new_name,
+                &[rename.session_id.as_str()],
+            )
+            .expect("commit rename before simulated crash")
+        );
+        let conn = open_db(store.path()).expect("reopen after committed rename");
+        conn.execute(
+            "UPDATE workspace_session_name_metadata
+             SET session_name = 'release', display_name = 'release', explicit = 1
+             WHERE binding_id = ?1 AND session_id = 's1'",
+            [binding_id],
+        )
+        .expect("persist post-rename metadata");
+        drop(conn);
+
+        assert_eq!(
+            session_rename_persistence_state(&config_path, binding_id, "rename-token", &rename,)
+                .expect("inspect committed rename"),
+            SessionRenamePersistenceState::AlreadyCommitted
+        );
+        clear_pending_session_rename(&config_path, binding_id, "rename-token")
+            .expect("clear recovered rename");
+        assert!(
+            load_pending_session_renames(&config_path, binding_id)
+                .expect("load pending renames")
+                .is_empty()
+        );
+        assert_eq!(
+            load_session_launch_plans(&config_path, binding_id).expect("load committed plan"),
+            vec![(
+                "release".to_owned(),
+                simple_session_launch_plan("release", "/repo/alpha")
+            )]
+        );
+    }
+
+    #[test]
+    fn ditch_cleanup_rolls_back_membership_when_plan_cleanup_fails() {
+        let config_path = temp_config_path("ditch-atomicity");
+        let store = WorkspaceStore::for_config_path(&config_path);
+        let binding_id = store
+            .binding()
+            .expect("default binding")
+            .mux_scope()
+            .binding_id()
+            .persistence_value();
+        let db_path = sqlite_path(&config_path);
+        let conn = open_db(&db_path).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_session_groups (binding_id, name, position)
+             VALUES (?1, '', 0)",
+            [binding_id],
+        )
+        .expect("insert session group");
+        let group_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
+             VALUES (?1, '$1', ?2, 0)",
+            params![binding_id, group_id],
+        )
+        .expect("insert session membership");
+        persist_session_launch_plan(
+            &config_path,
+            binding_id,
+            &simple_session_launch_plan("$1", "/repo"),
+        )
+        .expect("persist launch plan");
+        conn.execute(
+            "INSERT INTO workspace_session_launch_plans (binding_id, session_id, plan)
+             VALUES (?1, 'malformed', '{')",
+            [binding_id],
+        )
+        .expect("inject second-step failure");
+
+        assert!(
+            remove_session_membership_and_launch_plan(&config_path, binding_id, "$1", &["$1"])
+                .is_err()
+        );
+
+        let reopened = open_db(&db_path).expect("reopen workspace database");
+        let membership_count: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_sessions
+                 WHERE binding_id = ?1 AND name = '$1'",
+                [binding_id],
+                |row| row.get(0),
+            )
+            .expect("read membership");
+        let plan_count: i64 = reopened
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_session_launch_plans
+                 WHERE binding_id = ?1 AND session_id = '$1'",
+                [binding_id],
+                |row| row.get(0),
+            )
+            .expect("read launch plan");
+        assert_eq!(membership_count, 1);
+        assert_eq!(plan_count, 1);
+    }
+
+    #[test]
+    fn renaming_membership_rekeys_launch_plan_atomically() {
+        let config_path = temp_config_path("rename-launch-plan");
+        let store = WorkspaceStore::for_config_path(&config_path);
+        let binding_id = store
+            .binding()
+            .expect("default binding")
+            .mux_scope()
+            .binding_id()
+            .persistence_value();
+        let conn = open_db(store.path()).expect("open workspace database");
+        conn.execute(
+            "INSERT INTO workspace_session_groups (binding_id, name, position)
+             VALUES (?1, '', 0)",
+            [binding_id],
+        )
+        .expect("insert session group");
+        let group_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
+             VALUES (?1, '$1', ?2, 0)",
+            params![binding_id, group_id],
+        )
+        .expect("insert session membership");
+        persist_session_launch_plan(
+            &config_path,
+            binding_id,
+            &simple_session_launch_plan("$1", "/repo"),
+        )
+        .expect("persist launch plan");
+
+        assert!(
+            rename_session_membership_and_launch_plans(
+                &config_path,
+                binding_id,
+                "$1",
+                "release",
+                &["$1"],
+            )
+            .expect("rename membership and plan")
+        );
+
+        let reopened = open_db(store.path()).expect("reopen workspace database");
+        let membership: String = reopened
+            .query_row(
+                "SELECT name FROM workspace_sessions
+                 WHERE binding_id = ?1",
+                [binding_id],
+                |row| row.get(0),
+            )
+            .expect("read renamed membership");
+        assert_eq!(membership, "release");
+        assert_eq!(
+            load_session_launch_plans(&config_path, binding_id).expect("load renamed plan"),
+            vec![(
+                "release".to_owned(),
+                simple_session_launch_plan("release", "/repo")
+            )]
+        );
     }
 
     #[test]
@@ -1537,9 +2920,15 @@ mod tests {
             )
             .expect("imported session");
         assert_eq!(imported_name, "project/main");
-        let mut order =
-            crate::session_order::SessionOrderStore::for_binding(&config_path, binding_id)
-                .expect("open imported session order");
+        let mut order = crate::session_order::SessionOrderStore::for_binding(
+            &config_path,
+            binding_id,
+            crate::session_order::BackendConnectionNamespace::new(
+                MultiplexerBackendConfig::Native,
+                None,
+            ),
+        )
+        .expect("open imported session order");
         assert_eq!(
             order
                 .sync_sessions(["project/main"])
@@ -1723,5 +3112,99 @@ mod tests {
             .unwrap();
 
         assert_ne!(second.remote_id(), first_remote_id);
+    }
+    #[test]
+    fn update_space_with_namespace_rolls_back_on_destination_conflict() {
+        let config_path = temp_config_path("atomic-namespace-update");
+        let mut store = WorkspaceStore::for_config_path(&config_path);
+        let first_space = store.spaces()[0].clone();
+        let first_binding = store.binding_id().expect("default binding");
+        let second_space = store
+            .create_space(
+                "Second",
+                "folder",
+                DEFAULT_SPACE_COLOR,
+                false,
+                SpaceMuxOverride {
+                    backend: Some(MultiplexerBackendConfig::Tmux),
+                    remote: SpaceRemoteOverride::Local,
+                },
+                &MultiplexerConfig::default(),
+            )
+            .expect("create second space")
+            .expect("second space");
+        let second_binding = second_space.bindings()[0]
+            .scope
+            .binding_id()
+            .persistence_value();
+        let source_namespace = crate::session_order::BackendConnectionNamespace::new(
+            MultiplexerBackendConfig::Native,
+            None,
+        );
+        let destination_namespace = crate::session_order::BackendConnectionNamespace::new(
+            MultiplexerBackendConfig::Tmux,
+            None,
+        );
+        crate::session_order::SessionOrderStore::for_binding(
+            &config_path,
+            first_binding,
+            source_namespace.clone(),
+        )
+        .expect("open source session order")
+        .add_session("dev")
+        .expect("add source session");
+        crate::session_order::SessionOrderStore::for_binding(
+            &config_path,
+            second_binding,
+            destination_namespace.clone(),
+        )
+        .expect("open destination session order")
+        .add_session("dev")
+        .expect("add destination session");
+
+        let result = store.update_space_with_namespace(
+            WorkspaceSpaceUpdate {
+                id: first_space.id(),
+                name: "Changed",
+                icon: "changed",
+                color: [0xFF, 0x00, 0x00],
+                tint_sidebar: true,
+                mux: SpaceMuxOverride {
+                    backend: Some(MultiplexerBackendConfig::Tmux),
+                    remote: SpaceRemoteOverride::Local,
+                },
+            },
+            WorkspaceNamespaceUpdateContext {
+                binding_id: first_binding,
+                namespace: &destination_namespace.persistence_key(),
+            },
+        );
+        assert!(
+            result
+                .expect_err("destination namespace conflict must fail")
+                .to_string()
+                .contains("already owned by another binding")
+        );
+
+        let reopened = WorkspaceStore::for_config_path(&config_path);
+        let unchanged = reopened
+            .spaces()
+            .iter()
+            .find(|space| space.id() == first_space.id())
+            .expect("source space");
+        assert_eq!(unchanged.name(), first_space.name());
+        assert_eq!(unchanged.icon(), first_space.icon());
+        assert_eq!(unchanged.color(), first_space.color());
+        assert_eq!(unchanged.tint_sidebar(), first_space.tint_sidebar());
+        assert_eq!(unchanged.bindings()[0].backend_override(), None);
+        let conn = open_db(&sqlite_path(&config_path)).expect("open workspace database");
+        let namespace: String = conn
+            .query_row(
+                "SELECT namespace FROM workspace_session_namespaces WHERE binding_id = ?1",
+                [first_binding],
+                |row| row.get(0),
+            )
+            .expect("source namespace");
+        assert_eq!(namespace, source_namespace.persistence_key());
     }
 }

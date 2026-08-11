@@ -1,10 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     hash::Hasher,
     net::{IpAddr, UdpSocket},
     path::PathBuf,
     sync::{
-        Arc, OnceLock,
+        Arc, LazyLock, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -56,9 +56,9 @@ use crate::{
     },
     commands::{
         AppCommandReceiver, AppCommandSender, BoundAppCommandSender, Caller, CommandCancellation,
-        CommandInvocation, CommandOutcome, CommandRegistry, CommandTarget, CommandWarning,
+        CommandCompletionContext, CommandInvocation, CommandOutcome, CommandTarget, CommandWarning,
         Confirmation, CoreCommandExecutor, MutationClass, MuxCommandSpec, ResourceKind,
-        app_command_channel_with_repaint,
+        app_command_channel_with_repaint, bounded_command_outcome,
     },
     config::{
         AppearanceMode, AppearanceVariant, BoottyConfig, ConfigState, WindowConfig,
@@ -82,13 +82,16 @@ use crate::{
     modifier_remap::ModifierRemapSet,
     mux::{
         RepaintHandle,
-        backend::{MuxEvent, MuxEventPayload, MuxEventTarget, MuxEventTopic},
+        backend::{
+            MuxAllocatedResources, MuxEvent, MuxEventPayload, MuxEventTarget, MuxEventTopic,
+            MuxForegroundState, MuxOccupantIdentity, MuxPaneOption, MuxPaneState, MuxRebaseReason,
+        },
         capability::{BindingOperation, BindingOperationOutcome},
         command::{MuxCommand, MuxPaneLaunchPlan, MuxSessionLaunchPlan, MuxSplitDirection},
         config::selected_backend,
         controller::{
             BindingId, BindingMuxController, MuxCommandCompletion, MuxCommandError,
-            MuxCommandResult, MuxController, MuxEventObservation, MuxScope, NewMuxSessionRequest,
+            MuxCommandResult, MuxController, MuxEventObservation, MuxScope,
             SessionSelectorResolution, SpaceId, mux_session_refresh_interval,
         },
         native::NativeBackend,
@@ -103,7 +106,7 @@ use crate::{
     renderer::{RendererMetrics, TerminalRenderSource, TerminalWidget},
     scheduler::{RepaintScheduler, RepaintSignal},
     session_names::SessionNameStore,
-    session_order::SessionOrderStore,
+    session_order::{BackendConnectionNamespace, SessionOrderStore, namespace_for_binding},
     terminal::{DrainStats, MouseButton, TerminalSearchDirection, TerminalSessionConfig},
     terminal_text::TerminalTextConfig,
     theme::theme_from_config,
@@ -119,7 +122,16 @@ use crate::{
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::{SpaceMuxOverride, SpaceRemoteOverride, WorkspaceSpace, WorkspaceStore},
+    workspace::{
+        PendingSessionRename, SessionRenamePersistenceState, SpaceMuxOverride, SpaceRemoteOverride,
+        WorkspaceNamespaceUpdateContext, WorkspaceSpace, WorkspaceSpaceUpdate, WorkspaceStore,
+        clear_pending_ditch, clear_pending_session_rename, delete_session_launch_plan,
+        load_pending_ditches, load_pending_session_renames, load_session_launch_plans,
+        persist_pending_ditch, persist_pending_session_rename, persist_session_launch_plan,
+        rekey_session_launch_plan, remove_session_membership_and_launch_plan,
+        rename_session_membership_and_launch_plans, session_rename_persistence_state,
+        simple_session_launch_plan,
+    },
 };
 use bootty_terminal::terminal_engine::{
     TerminalColorConfig, TerminalCopyModeAction, TerminalCursorConfig, TerminalFeatureConfig,
@@ -138,6 +150,11 @@ use bootty_terminal::terminal_engine::TerminalCopyModeMotion;
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
 static NEXT_WINDOW_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_APP_COMMAND_RECONCILIATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_app_command_reconciliation_id() -> u64 {
+    NEXT_APP_COMMAND_RECONCILIATION_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 fn process_command_handle() -> String {
     static HANDLE: OnceLock<String> = OnceLock::new();
@@ -153,17 +170,249 @@ fn process_command_handle() -> String {
 }
 
 fn process_directory_claims(instance_id: &str) -> Result<DirectoryClaims> {
-    static CLAIMS: OnceLock<std::result::Result<DirectoryClaims, String>> = OnceLock::new();
-    match CLAIMS.get_or_init(|| {
-        ClaimOwner::current(instance_id)
-            .map_err(|error| error.to_string())
-            .and_then(|owner| DirectoryClaims::open(owner).map_err(|error| error.to_string()))
-    }) {
+    static CLAIMS: OnceLock<Mutex<HashMap<String, std::result::Result<DirectoryClaims, String>>>> =
+        OnceLock::new();
+    let claims_by_instance = CLAIMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut claims_by_instance = claims_by_instance
+        .lock()
+        .map_err(|_| anyhow::anyhow!("directory claims cache is poisoned"))?;
+    match claims_by_instance
+        .entry(instance_id.to_owned())
+        .or_insert_with(|| {
+            ClaimOwner::current(instance_id)
+                .map_err(|error| error.to_string())
+                .and_then(|owner| DirectoryClaims::open(owner).map_err(|error| error.to_string()))
+        }) {
         Ok(claims) => Ok(claims.clone()),
         Err(error) => Err(anyhow::anyhow!(
             "could not initialize directory claims: {error}"
         )),
     }
+}
+#[derive(Clone)]
+enum ClaimReleaseTarget {
+    Window(WindowRef),
+    Binding(BindingRef),
+}
+
+struct PendingWindowClaimRelease {
+    claims: DirectoryClaims,
+    target: ClaimReleaseTarget,
+    automation: AutomationHub,
+    scopes: Vec<String>,
+    attempts: u32,
+    next_attempt: Instant,
+}
+
+struct WindowClaimReleaseQueue {
+    sender: mpsc::Sender<PendingWindowClaimRelease>,
+}
+
+static WINDOW_CLAIM_RELEASE_QUEUE: OnceLock<Arc<WindowClaimReleaseQueue>> = OnceLock::new();
+
+fn window_claim_release_queue() -> Arc<WindowClaimReleaseQueue> {
+    WINDOW_CLAIM_RELEASE_QUEUE
+        .get_or_init(|| {
+            let (sender, receiver) = mpsc::channel();
+            if let Err(error) = std::thread::Builder::new()
+                .name("bootty-claim-release".to_owned())
+                .spawn(move || window_claim_release_worker(receiver))
+            {
+                eprintln!("could not start window claim release worker: {error}");
+            }
+            Arc::new(WindowClaimReleaseQueue { sender })
+        })
+        .clone()
+}
+
+fn window_claim_release_backoff(attempts: u32) -> Duration {
+    let seconds = 1_u64.checked_shl(attempts.min(5)).unwrap_or(32).min(30);
+    Duration::from_secs(seconds)
+}
+
+fn publish_window_claim_release(item: &PendingWindowClaimRelease, revision: u64) {
+    let mut payload = match &item.target {
+        ClaimReleaseTarget::Window(window) => json!({
+            "reason": "window_closed",
+            "window_id": window.window_id.clone(),
+        }),
+        ClaimReleaseTarget::Binding(binding) => {
+            let space_id = binding
+                .space_id
+                .parse::<u64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| Value::String(binding.space_id.clone()));
+            json!({
+                "reason": "space_closed",
+                "space_id": space_id,
+            })
+        }
+    };
+    payload["revision"] = Value::from(revision);
+    for scope in &item.scopes {
+        if let Err(error) = publish_directory_usage_changed_for_scope(
+            &item.automation,
+            &item.claims,
+            scope.clone(),
+            None,
+            payload.clone(),
+        ) {
+            eprintln!("claim release succeeded but usage publication failed: {error}");
+        }
+    }
+}
+
+fn release_claims(item: &PendingWindowClaimRelease) -> std::result::Result<Option<u64>, String> {
+    match &item.target {
+        ClaimReleaseTarget::Window(window) => item
+            .claims
+            .release_window_claims(window)
+            .map_err(|error| error.to_string()),
+        ClaimReleaseTarget::Binding(binding) => item
+            .claims
+            .reconcile_live_claimants(binding, Vec::new())
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn claim_release_label(target: &ClaimReleaseTarget) -> String {
+    match target {
+        ClaimReleaseTarget::Window(window) => format!("window {}", window.window_id),
+        ClaimReleaseTarget::Binding(binding) => format!("space {}", binding.space_id),
+    }
+}
+
+fn fallback_window_claim_release(item: PendingWindowClaimRelease) {
+    match release_claims(&item) {
+        Ok(Some(revision)) => publish_window_claim_release(&item, revision),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "claim release worker unavailable for {}; synchronous fallback failed: {error}; \
+             durable owner snapshot remains for authoritative reconciliation",
+            claim_release_label(&item.target)
+        ),
+    }
+}
+
+fn coalesce_window_claim_release(
+    pending: &mut Vec<PendingWindowClaimRelease>,
+    item: PendingWindowClaimRelease,
+) {
+    if let Some(existing) = pending.iter_mut().find(|existing| {
+        std::mem::discriminant(&existing.target) == std::mem::discriminant(&item.target)
+            && match (&existing.target, &item.target) {
+                (ClaimReleaseTarget::Window(left), ClaimReleaseTarget::Window(right)) => {
+                    left == right
+                }
+                (ClaimReleaseTarget::Binding(left), ClaimReleaseTarget::Binding(right)) => {
+                    left == right
+                }
+                _ => false,
+            }
+    }) {
+        existing.next_attempt = existing.next_attempt.min(item.next_attempt);
+        existing.attempts = existing.attempts.max(item.attempts);
+    } else {
+        pending.push(item);
+    }
+}
+
+fn window_claim_release_worker(receiver: mpsc::Receiver<PendingWindowClaimRelease>) {
+    let mut pending: Vec<PendingWindowClaimRelease> = Vec::new();
+    loop {
+        let now = Instant::now();
+        if let Some(index) = pending.iter().position(|item| item.next_attempt <= now) {
+            let mut item = pending.swap_remove(index);
+            match release_claims(&item) {
+                Ok(Some(revision)) => publish_window_claim_release(&item, revision),
+                Ok(None) => {}
+                Err(error) => {
+                    item.attempts = item.attempts.saturating_add(1);
+                    let attempts = item.attempts;
+                    if attempts == 1 || attempts == 3 || attempts.is_multiple_of(8) {
+                        eprintln!(
+                            "claim release attempt {attempts} failed for {}: {error}; \
+                             retrying with durable claims retained",
+                            claim_release_label(&item.target)
+                        );
+                    }
+                    item.next_attempt = Instant::now() + window_claim_release_backoff(attempts);
+                    coalesce_window_claim_release(&mut pending, item);
+                }
+            }
+            continue;
+        }
+
+        let wait = pending
+            .iter()
+            .map(|item| item.next_attempt.saturating_duration_since(now))
+            .min();
+        match wait {
+            Some(wait) => match receiver.recv_timeout(wait) {
+                Ok(item) => coalesce_window_claim_release(&mut pending, item),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    for item in pending.drain(..) {
+                        fallback_window_claim_release(item);
+                    }
+                    return;
+                }
+            },
+            None => match receiver.recv() {
+                Ok(item) => coalesce_window_claim_release(&mut pending, item),
+                Err(_) => return,
+            },
+        }
+    }
+}
+
+fn enqueue_claim_release(item: PendingWindowClaimRelease) {
+    match release_claims(&item) {
+        Ok(Some(revision)) => publish_window_claim_release(&item, revision),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!(
+                "claim release failed for {}; retaining durable claims for retry: {error}",
+                claim_release_label(&item.target)
+            );
+            let queue = window_claim_release_queue();
+            if let Err(error) = queue.sender.send(item) {
+                fallback_window_claim_release(error.0);
+            }
+        }
+    }
+}
+
+fn enqueue_window_claim_release(
+    claims: DirectoryClaims,
+    window: WindowRef,
+    automation: AutomationHub,
+    scopes: Vec<String>,
+) {
+    enqueue_claim_release(PendingWindowClaimRelease {
+        claims,
+        target: ClaimReleaseTarget::Window(window),
+        automation,
+        scopes,
+        attempts: 0,
+        next_attempt: Instant::now(),
+    });
+}
+
+fn enqueue_binding_claim_release(
+    claims: DirectoryClaims,
+    binding: BindingRef,
+    automation: AutomationHub,
+    scopes: Vec<String>,
+) {
+    enqueue_claim_release(PendingWindowClaimRelease {
+        claims,
+        target: ClaimReleaseTarget::Binding(binding),
+        automation,
+        scopes,
+        attempts: 0,
+        next_attempt: Instant::now(),
+    });
 }
 
 fn next_window_command_generation() -> u64 {
@@ -377,6 +626,7 @@ struct ResolvedCommandContext<'a> {
     caller: Caller,
     viewport: ViewportSnapshot,
     execution: Option<(Instant, CommandCancellation)>,
+    invocation: CommandInvocation,
 }
 
 pub(crate) enum CommandDispatch {
@@ -385,22 +635,674 @@ pub(crate) enum CommandDispatch {
         command: MuxCommand,
         command_id: String,
         origin: MuxScope,
+        binding_identity: BindingRef,
+        binding_generation: u64,
+        namespace: BackendConnectionNamespace,
         target: Option<CommandTarget>,
         deadline: Instant,
         cancellation: CommandCancellation,
         result: mpsc::Receiver<MuxCommandResult>,
     },
+    ExtensionPending {
+        invocation: CommandInvocation,
+        extension_id: String,
+        generation: u64,
+        target: Option<CommandTarget>,
+        deadline: Instant,
+        cancellation: CommandCancellation,
+        result: mpsc::Receiver<CommandOutcome>,
+    },
+}
+
+struct MuxCompletionContext<'a> {
+    command_id: &'a str,
+    origin: MuxScope,
+    binding_identity: &'a BindingRef,
+    binding_generation: u64,
+    namespace: &'a BackendConnectionNamespace,
+    command: &'a MuxCommand,
+    rename: Option<&'a PendingSessionRename>,
 }
 
 struct PendingAppCommand {
+    request_id: u64,
     command: MuxCommand,
     command_id: String,
     origin: MuxScope,
+    binding_identity: BindingRef,
+    binding_generation: u64,
+    namespace: BackendConnectionNamespace,
     target: Option<CommandTarget>,
     deadline: Instant,
     cancellation: CommandCancellation,
     response: Option<mpsc::Sender<CommandOutcome>>,
+    completion: Option<CommandCompletionContext>,
+    rename: Option<PendingSessionRename>,
     result: mpsc::Receiver<MuxCommandResult>,
+}
+
+struct PendingExtensionCommand {
+    request_id: u64,
+    invocation: CommandInvocation,
+    extension_id: String,
+    generation: u64,
+    target: Option<CommandTarget>,
+    deadline: Instant,
+    cancellation: CommandCancellation,
+    response: Option<mpsc::Sender<CommandOutcome>>,
+    completion: Option<CommandCompletionContext>,
+    result: mpsc::Receiver<CommandOutcome>,
+}
+
+const COMPLETION_PUBLICATION_QUEUE_LIMIT: usize = 64;
+const COMPLETION_PUBLICATION_RETRY_LIMIT: usize = 64;
+const SHUTDOWN_RECONCILIATION_GRACE: Duration = Duration::from_secs(30);
+const COMPLETION_PUBLICATION_RETRY_BASE: Duration = Duration::from_millis(25);
+const COMPLETION_PUBLICATION_RETRY_MAX: Duration = Duration::from_secs(30);
+
+struct PendingCompletionPublication {
+    request_id: u64,
+    publication: EventPublication,
+    automation: AutomationHub,
+    fallback_scope: String,
+    attempts: u32,
+    next_attempt_at: Instant,
+}
+
+enum ShutdownReconciliationJob {
+    Mux(ShutdownMuxReconciliation),
+    Extension(ShutdownExtensionReconciliation),
+    Publication(PendingCompletionPublication),
+}
+
+struct ShutdownMuxReconciliation {
+    request_id: u64,
+    command_id: String,
+    command: MuxCommand,
+    origin: MuxScope,
+    binding_identity: BindingRef,
+    binding_generation: u64,
+    namespace: BackendConnectionNamespace,
+    result: mpsc::Receiver<MuxCommandResult>,
+    deadline: Instant,
+    cancellation: CommandCancellation,
+    target: Option<CommandTarget>,
+    completion: Option<CommandCompletionContext>,
+    reconciliation: mpsc::Sender<ShutdownReconciliationCompletion>,
+    automation: AutomationHub,
+    scope: String,
+    fallback_scope: String,
+}
+
+struct ShutdownExtensionReconciliation {
+    request_id: u64,
+    command_id: String,
+    invocation: CommandInvocation,
+    extension_id: String,
+    generation: u64,
+    result: mpsc::Receiver<CommandOutcome>,
+    deadline: Instant,
+    cancellation: CommandCancellation,
+    target: Option<CommandTarget>,
+    completion: Option<CommandCompletionContext>,
+    reconciliation: mpsc::Sender<ShutdownReconciliationCompletion>,
+    automation: AutomationHub,
+    scope: String,
+    fallback_scope: String,
+}
+
+enum ShutdownReconciliationCompletion {
+    Mux {
+        request_id: u64,
+        command_id: String,
+        command: MuxCommand,
+        origin: MuxScope,
+        binding_identity: BindingRef,
+        binding_generation: u64,
+        namespace: BackendConnectionNamespace,
+        target: Option<CommandTarget>,
+        completion: Option<CommandCompletionContext>,
+        result: Box<MuxCommandResult>,
+    },
+    Extension {
+        request_id: u64,
+        command_id: String,
+        invocation: CommandInvocation,
+        extension_id: String,
+        generation: u64,
+        target: Option<CommandTarget>,
+        completion: Option<CommandCompletionContext>,
+        result: CommandOutcome,
+    },
+}
+
+static SHUTDOWN_RECONCILIATION_WORKER: LazyLock<mpsc::Sender<ShutdownReconciliationJob>> =
+    LazyLock::new(|| {
+        let (sender, receiver) = mpsc::channel::<ShutdownReconciliationJob>();
+        std::thread::Builder::new()
+            .name("bootty-command-reconciliation".to_owned())
+            .spawn(move || run_shutdown_reconciliation_worker(receiver))
+            .expect("command reconciliation worker must start");
+        sender
+    });
+
+fn enqueue_shutdown_reconciliation(job: ShutdownReconciliationJob) {
+    if let Err(error) = SHUTDOWN_RECONCILIATION_WORKER.send(job) {
+        eprintln!("command reconciliation worker stopped; reconciling inline");
+        run_shutdown_reconciliation_inline(error.0);
+    }
+}
+
+fn run_shutdown_reconciliation_worker(receiver: mpsc::Receiver<ShutdownReconciliationJob>) {
+    let mut jobs = VecDeque::new();
+    loop {
+        while let Ok(job) = receiver.try_recv() {
+            jobs.push_back(job);
+        }
+        if jobs.is_empty() {
+            match receiver.recv() {
+                Ok(job) => jobs.push_back(job),
+                Err(_) => return,
+            }
+            continue;
+        }
+
+        let round = jobs.len();
+        for _ in 0..round {
+            let Some(job) = jobs.pop_front() else {
+                break;
+            };
+            match poll_shutdown_reconciliation_job(job) {
+                ShutdownReconciliationPoll::Pending(job) => jobs.push_back(*job),
+                ShutdownReconciliationPoll::Complete => {}
+            }
+        }
+        if !jobs.is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+fn run_shutdown_reconciliation_inline(mut job: ShutdownReconciliationJob) {
+    loop {
+        match poll_shutdown_reconciliation_job(job) {
+            ShutdownReconciliationPoll::Pending(next) => {
+                job = *next;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            ShutdownReconciliationPoll::Complete => return,
+        }
+    }
+}
+enum ShutdownReconciliationPoll {
+    Pending(Box<ShutdownReconciliationJob>),
+    Complete,
+}
+
+fn pending_shutdown_reconciliation(job: ShutdownReconciliationJob) -> ShutdownReconciliationPoll {
+    ShutdownReconciliationPoll::Pending(Box::new(job))
+}
+
+fn poll_shutdown_reconciliation_job(job: ShutdownReconciliationJob) -> ShutdownReconciliationPoll {
+    match job {
+        ShutdownReconciliationJob::Mux(job) => {
+            if Instant::now() >= job.deadline {
+                publish_shutdown_completion(
+                    ShutdownCompletionContext {
+                        automation: &job.automation,
+                        scope: job.scope,
+                        fallback_scope: job.fallback_scope,
+                        request_id: job.request_id,
+                        command_id: job.command_id,
+                        target: job.target,
+                        completion: job.completion,
+                    },
+                    shutdown_unknown_outcome(),
+                    true,
+                    durable_intent_for_mux_command(&job.command),
+                );
+                return ShutdownReconciliationPoll::Complete;
+            }
+            let _ = job.cancellation.is_cancelled();
+            match job.result.try_recv() {
+                Ok(result) => {
+                    let completion = ShutdownReconciliationCompletion::Mux {
+                        request_id: job.request_id,
+                        command_id: job.command_id,
+                        command: job.command,
+                        origin: job.origin,
+                        binding_identity: job.binding_identity,
+                        binding_generation: job.binding_generation,
+                        namespace: job.namespace,
+                        target: job.target,
+                        completion: job.completion,
+                        result: Box::new(result),
+                    };
+                    match job.reconciliation.send(completion) {
+                        Ok(()) => ShutdownReconciliationPoll::Complete,
+                        Err(error) => {
+                            let ShutdownReconciliationCompletion::Mux {
+                                request_id,
+                                command_id,
+                                command,
+                                target,
+                                completion,
+                                result,
+                                ..
+                            } = error.0
+                            else {
+                                unreachable!(
+                                    "mux reconciliation sender returned an extension result"
+                                );
+                            };
+                            publish_shutdown_completion(
+                                ShutdownCompletionContext {
+                                    automation: &job.automation,
+                                    scope: job.scope,
+                                    fallback_scope: job.fallback_scope,
+                                    request_id,
+                                    command_id,
+                                    target,
+                                    completion,
+                                },
+                                shutdown_mux_outcome(&command, *result),
+                                false,
+                                durable_intent_for_mux_command(&command),
+                            );
+                            ShutdownReconciliationPoll::Complete
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    publish_shutdown_completion(
+                        ShutdownCompletionContext {
+                            automation: &job.automation,
+                            scope: job.scope,
+                            fallback_scope: job.fallback_scope,
+                            request_id: job.request_id,
+                            command_id: job.command_id,
+                            target: job.target,
+                            completion: job.completion,
+                        },
+                        shutdown_unknown_outcome(),
+                        true,
+                        durable_intent_for_mux_command(&job.command),
+                    );
+                    ShutdownReconciliationPoll::Complete
+                }
+                Err(mpsc::TryRecvError::Empty) if Instant::now() >= job.deadline => {
+                    publish_shutdown_completion(
+                        ShutdownCompletionContext {
+                            automation: &job.automation,
+                            scope: job.scope,
+                            fallback_scope: job.fallback_scope,
+                            request_id: job.request_id,
+                            command_id: job.command_id,
+                            target: job.target,
+                            completion: job.completion,
+                        },
+                        shutdown_unknown_outcome(),
+                        true,
+                        durable_intent_for_mux_command(&job.command),
+                    );
+                    ShutdownReconciliationPoll::Complete
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    pending_shutdown_reconciliation(ShutdownReconciliationJob::Mux(job))
+                }
+            }
+        }
+        ShutdownReconciliationJob::Extension(job) => {
+            if Instant::now() >= job.deadline {
+                publish_shutdown_completion(
+                    ShutdownCompletionContext {
+                        automation: &job.automation,
+                        scope: job.scope,
+                        fallback_scope: job.fallback_scope,
+                        request_id: job.request_id,
+                        command_id: job.command_id,
+                        target: job.target,
+                        completion: job.completion,
+                    },
+                    shutdown_unknown_outcome(),
+                    true,
+                    None,
+                );
+                return ShutdownReconciliationPoll::Complete;
+            }
+            let _ = job.cancellation.is_cancelled();
+            match job.result.try_recv() {
+                Ok(result) => {
+                    let completion = ShutdownReconciliationCompletion::Extension {
+                        request_id: job.request_id,
+                        command_id: job.command_id,
+                        invocation: job.invocation,
+                        extension_id: job.extension_id,
+                        generation: job.generation,
+                        target: job.target,
+                        completion: job.completion,
+                        result,
+                    };
+                    match job.reconciliation.send(completion) {
+                        Ok(()) => ShutdownReconciliationPoll::Complete,
+                        Err(error) => {
+                            let ShutdownReconciliationCompletion::Extension {
+                                request_id,
+                                command_id,
+                                target,
+                                completion,
+                                result,
+                                ..
+                            } = error.0
+                            else {
+                                unreachable!(
+                                    "extension reconciliation sender returned a mux result"
+                                );
+                            };
+                            publish_shutdown_completion(
+                                ShutdownCompletionContext {
+                                    automation: &job.automation,
+                                    scope: job.scope,
+                                    fallback_scope: job.fallback_scope,
+                                    request_id,
+                                    command_id,
+                                    target,
+                                    completion,
+                                },
+                                result,
+                                false,
+                                None,
+                            );
+                            ShutdownReconciliationPoll::Complete
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    publish_shutdown_completion(
+                        ShutdownCompletionContext {
+                            automation: &job.automation,
+                            scope: job.scope,
+                            fallback_scope: job.fallback_scope,
+                            request_id: job.request_id,
+                            command_id: job.command_id,
+                            target: job.target,
+                            completion: job.completion,
+                        },
+                        shutdown_unknown_outcome(),
+                        true,
+                        None,
+                    );
+                    ShutdownReconciliationPoll::Complete
+                }
+                Err(mpsc::TryRecvError::Empty) if Instant::now() >= job.deadline => {
+                    publish_shutdown_completion(
+                        ShutdownCompletionContext {
+                            automation: &job.automation,
+                            scope: job.scope,
+                            fallback_scope: job.fallback_scope,
+                            request_id: job.request_id,
+                            command_id: job.command_id,
+                            target: job.target,
+                            completion: job.completion,
+                        },
+                        shutdown_unknown_outcome(),
+                        true,
+                        None,
+                    );
+                    ShutdownReconciliationPoll::Complete
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    pending_shutdown_reconciliation(ShutdownReconciliationJob::Extension(job))
+                }
+            }
+        }
+        ShutdownReconciliationJob::Publication(mut pending) => {
+            if Instant::now() < pending.next_attempt_at {
+                return pending_shutdown_reconciliation(ShutdownReconciliationJob::Publication(
+                    pending,
+                ));
+            }
+            match pending
+                .automation
+                .publish_event(pending.publication.clone())
+            {
+                Ok(_) => ShutdownReconciliationPoll::Complete,
+                Err(error) if publication_error_is_oversized(&error) => {
+                    pending.publication = bounded_completion_publication(&pending, &error);
+                    pending.attempts = 0;
+                    pending.next_attempt_at = Instant::now();
+                    pending_shutdown_reconciliation(ShutdownReconciliationJob::Publication(pending))
+                }
+                Err(error)
+                    if publication_error_is_retired_scope(&error)
+                        && pending.publication.scope != pending.fallback_scope =>
+                {
+                    pending.publication.scope = pending.fallback_scope.clone();
+                    pending.attempts = 0;
+                    pending.next_attempt_at = Instant::now();
+                    pending_shutdown_reconciliation(ShutdownReconciliationJob::Publication(pending))
+                }
+                Err(error) => {
+                    pending.attempts = pending.attempts.saturating_add(1);
+                    pending.next_attempt_at =
+                        Instant::now() + completion_publication_retry_delay(pending.attempts);
+                    eprintln!(
+                        "completion publication retry {} failed for request {}: {error}",
+                        pending.attempts, pending.request_id
+                    );
+                    pending_shutdown_reconciliation(ShutdownReconciliationJob::Publication(pending))
+                }
+            }
+        }
+    }
+}
+
+fn publication_error_is_oversized(error: &AutomationError) -> bool {
+    error.code == -32003
+        && (error.message.contains("payload")
+            || error.message.contains("size")
+            || error.message.contains("serial"))
+}
+
+fn publication_error_is_retired_scope(error: &AutomationError) -> bool {
+    error.code == -32006 && error.message.contains("scope")
+}
+
+fn completion_publication_retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.min(10);
+    let multiplier = 1u64 << shift;
+    let millis = (COMPLETION_PUBLICATION_RETRY_BASE.as_millis() as u64)
+        .saturating_mul(multiplier)
+        .min(COMPLETION_PUBLICATION_RETRY_MAX.as_millis() as u64);
+    Duration::from_millis(millis)
+}
+
+fn bounded_completion_publication(
+    pending: &PendingCompletionPublication,
+    _error: &AutomationError,
+) -> EventPublication {
+    let command = pending
+        .publication
+        .payload
+        .get("command")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let request_id = pending
+        .publication
+        .payload
+        .get("request_id")
+        .cloned()
+        .unwrap_or(Value::Null);
+    EventPublication::new(
+        pending.fallback_scope.clone(),
+        "command.completed",
+        json!({
+            "source": "completion_publication_fallback",
+            "reconciled": true,
+        }),
+        None,
+        json!({
+            "command": command,
+            "request_id": request_id,
+            "reconciled": true,
+            "actual_outcome_unknown": true,
+            "outcome": {
+                "status": "failed",
+                "code": "result_too_large",
+                "message": "completion publication exceeded the event payload limit",
+            },
+        }),
+    )
+}
+
+fn shutdown_unknown_outcome() -> CommandOutcome {
+    CommandOutcome::Failed {
+        code: "completion_indeterminate".to_owned(),
+        message: "command completion is unknown; durable intent was retained for reconciliation"
+            .to_owned(),
+    }
+}
+
+fn durable_intent_for_mux_command(command: &MuxCommand) -> Option<Value> {
+    match command {
+        MuxCommand::CreateSession { plan } => serde_json::to_value(plan).ok(),
+        MuxCommand::CreateProjectSession { session_id, .. }
+        | MuxCommand::CreateWorktreeSession { session_id, .. } => {
+            Some(json!({"session_id": session_id}))
+        }
+        MuxCommand::DitchSession { session_id } => {
+            Some(json!({"operation": "ditch_session", "session_id": session_id}))
+        }
+        _ => None,
+    }
+}
+
+fn shutdown_mux_outcome(command: &MuxCommand, result: MuxCommandResult) -> CommandOutcome {
+    match result {
+        Ok(completion) => {
+            let mut value = serde_json::Map::new();
+            if let MuxCommand::CreateSession { plan } = command {
+                value.insert(
+                    "launch".to_owned(),
+                    serde_json::to_value(plan).unwrap_or(Value::Null),
+                );
+            }
+            if let Some(allocated) = completion.allocated() {
+                value.insert(
+                    "allocated".to_owned(),
+                    serde_json::to_value(allocated).unwrap_or(Value::Null),
+                );
+            }
+            if let Some(target) = completion.resolved_target() {
+                value.insert(
+                    "resolved_target".to_owned(),
+                    serde_json::to_value(target).unwrap_or(Value::Null),
+                );
+            }
+            CommandOutcome::Success {
+                value: Value::Object(value),
+                warnings: Vec::new(),
+            }
+        }
+        Err(error) => {
+            let (code, message) = match error {
+                MuxCommandError::Cancelled => ("cancelled", "mux command was cancelled".to_owned()),
+                MuxCommandError::DeadlineExceeded => (
+                    "deadline_exceeded",
+                    "mux command deadline expired".to_owned(),
+                ),
+                MuxCommandError::Unsupported => {
+                    ("unsupported", "mux operation is unsupported".to_owned())
+                }
+                MuxCommandError::Unavailable => {
+                    ("unavailable", "mux operation is unavailable".to_owned())
+                }
+                MuxCommandError::Denied => ("denied", "mux operation was denied".to_owned()),
+                MuxCommandError::Stale => {
+                    ("stale_target", "mux operation target is stale".to_owned())
+                }
+                MuxCommandError::Failed(message) => ("execution_failed", message),
+            };
+            CommandOutcome::Failed {
+                code: code.to_owned(),
+                message,
+            }
+        }
+    }
+}
+struct ShutdownCompletionContext<'a> {
+    automation: &'a AutomationHub,
+    scope: String,
+    fallback_scope: String,
+    request_id: u64,
+    command_id: String,
+    target: Option<CommandTarget>,
+    completion: Option<CommandCompletionContext>,
+}
+
+fn publish_shutdown_completion(
+    context: ShutdownCompletionContext<'_>,
+    outcome: CommandOutcome,
+    actual_outcome_unknown: bool,
+    durable_intent: Option<Value>,
+) {
+    let ShutdownCompletionContext {
+        automation,
+        scope,
+        fallback_scope,
+        request_id,
+        command_id,
+        target: requested_target,
+        completion,
+    } = context;
+    let target = completion
+        .as_ref()
+        .and_then(|completion| completion.target.as_ref())
+        .or(requested_target.as_ref())
+        .cloned();
+    let outcome = bounded_command_outcome(outcome);
+    let publication = EventPublication::new(
+        scope,
+        "command.completed",
+        json!({
+            "source": "shutdown_reconciliation",
+            "reconciled": true,
+            "request_id": request_id,
+            "caller": completion.as_ref().map(|completion| completion.caller),
+            "owner_pid": completion.as_ref().map(|completion| completion.owner_pid),
+            "owner_generation": completion.as_ref().map(|completion| completion.owner_generation),
+        }),
+        target.clone(),
+        json!({
+            "command": command_id,
+            "request_id": request_id,
+            "reconciled": true,
+            "actual_outcome_unknown": actual_outcome_unknown,
+            "durable_intent": durable_intent,
+            "target": target,
+            "outcome": serde_json::to_value(outcome).unwrap_or_else(|_| json!({
+                "status": "failed",
+                "code": "result_too_large",
+            })),
+        }),
+    );
+    if let Err(error) = automation.publish_event(publication.clone()) {
+        let mut pending = PendingCompletionPublication {
+            request_id,
+            publication,
+            automation: automation.clone(),
+            fallback_scope,
+            attempts: 0,
+            next_attempt_at: Instant::now(),
+        };
+        if !publication_error_is_oversized(&error) && !publication_error_is_retired_scope(&error) {
+            pending.attempts = 1;
+            pending.next_attempt_at =
+                Instant::now() + completion_publication_retry_delay(pending.attempts);
+        }
+        eprintln!("shutdown completion publication queued after failure: {error}");
+        enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Publication(pending));
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,6 +1354,8 @@ struct PendingGeneratedName {
     name: String,
     /// What bootty calls it, which drops any uniqueness suffix `name` had to carry.
     display_name: String,
+    /// The display name to restore if an in-flight rename fails.
+    previous_display_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -539,43 +1443,80 @@ impl NativeTerminalOwner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersistedSessionRestoreDecision {
     Wait,
-    Skip,
     Restore,
 }
 
 fn persisted_session_restore_decision(
     backend: MultiplexerBackendConfig,
     refresh_completed: bool,
-    daemon_has_sessions: bool,
 ) -> PersistedSessionRestoreDecision {
     match backend {
         MultiplexerBackendConfig::Native => PersistedSessionRestoreDecision::Restore,
-        MultiplexerBackendConfig::Rmux if !refresh_completed => {
+        MultiplexerBackendConfig::Rmux
+        | MultiplexerBackendConfig::Tmux
+        | MultiplexerBackendConfig::Zellij
+            if !refresh_completed =>
+        {
             PersistedSessionRestoreDecision::Wait
         }
-        MultiplexerBackendConfig::Rmux if daemon_has_sessions => {
-            PersistedSessionRestoreDecision::Skip
-        }
-        MultiplexerBackendConfig::Rmux => PersistedSessionRestoreDecision::Restore,
-        MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => {
-            PersistedSessionRestoreDecision::Skip
-        }
+        MultiplexerBackendConfig::Rmux
+        | MultiplexerBackendConfig::Tmux
+        | MultiplexerBackendConfig::Zellij => PersistedSessionRestoreDecision::Restore,
     }
 }
 
-/// A persisted session is restored through the idempotent project-session
-/// path. Keep its immutable cwd until the backend exposes the exact pane and
-/// occupant generation that can safely own its launch claim.
+/// One immutable leaf in a recursive persisted launch. Pane order is the normalized DFS order
+/// exposed by authoritative backend allocations.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingPersistedSessionLaunch {
-    session_id: String,
+struct PersistedLaunchLeaf {
+    window_index: usize,
+    pane_index: usize,
     cwd: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPersistedSessionLaunch {
+    /// The current backend/session-order identity used to resolve the claim.
+    session_id: String,
+    plan: Arc<MuxSessionLaunchPlan>,
+    leaves: Vec<PersistedLaunchLeaf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedPersistedSessionLaunchClaim {
     launch: PendingPersistedSessionLaunch,
     claimant: ClaimantRef,
     directory: DirectoryRef,
+}
+fn persisted_launch_leaves(plan: &MuxSessionLaunchPlan) -> Vec<PersistedLaunchLeaf> {
+    let mut leaves = Vec::with_capacity(plan.pane_count());
+    for (window_index, window) in plan.windows.iter().enumerate() {
+        let mut pane_index = 0;
+        collect_persisted_launch_leaves(&window.layout, window_index, &mut pane_index, &mut leaves);
+    }
+    leaves
+}
+
+fn collect_persisted_launch_leaves(
+    layout: &MuxPaneLaunchPlan,
+    window_index: usize,
+    pane_index: &mut usize,
+    leaves: &mut Vec<PersistedLaunchLeaf>,
+) {
+    match layout {
+        MuxPaneLaunchPlan::Pane(pane) => {
+            leaves.push(PersistedLaunchLeaf {
+                window_index,
+                pane_index: *pane_index,
+                cwd: pane.cwd.clone(),
+            });
+            *pane_index += 1;
+        }
+        MuxPaneLaunchPlan::Split(split) => {
+            collect_persisted_launch_leaves(&split.first, window_index, pane_index, leaves);
+            collect_persisted_launch_leaves(&split.second, window_index, pane_index, leaves);
+        }
+    }
 }
 
 struct BindingRuntime {
@@ -590,6 +1531,7 @@ struct BindingRuntime {
     /// When this binding's current remote attach client was asked for, so an outage that keeps
     /// ending clients can be told from one connection that lasted and then dropped much later.
     remote_attach_started: Option<Instant>,
+    workspace_config_path: PathBuf,
     multiplexer: crate::config::MultiplexerConfig,
     terminal: Box<ActiveTerminal>,
     mux: BindingMuxController,
@@ -612,6 +1554,13 @@ struct BindingRuntime {
     /// Drained backend observations remain here until their claim and event
     /// publication succeeds, so one failure cannot discard later observations.
     pending_automation_events: VecDeque<MuxEventObservation>,
+    /// Per-terminal authoritative state for each terminal lifecycle topic. The
+    /// cache is rebuilt from the live backend inventory at every authoritative
+    /// snapshot rebase and is updated before publishing each delta.
+    automation_terminal_states: BTreeMap<AutomationTerminalStateKey, AutomationTerminalState>,
+    /// Binding-level backend status retained independently for each backend
+    /// lifecycle topic, so a status rebase never masquerades as topology.
+    automation_backend_states: HashMap<&'static str, AutomationTerminalTopicState>,
     /// Generation whose lifecycle sources are currently installed in the
     /// automation hub. `None` makes a newly constructed binding purge any
     /// recoverable claim/output state from a prior runtime before bootstrap.
@@ -638,8 +1587,18 @@ impl BindingRuntime {
             SpaceRemoteOverride::Inherit,
             variant,
             repaint.clone(),
+            true,
         )?;
-        binding.restore_persisted_sessions(false, &repaint)?;
+        let refresh_completed =
+            if selected_backend(&binding.multiplexer) == MultiplexerBackendConfig::Native {
+                binding
+                    .mux
+                    .refresh_sessions(&repaint, &binding.multiplexer)
+                    .is_none()
+            } else {
+                false
+            };
+        binding.restore_persisted_sessions(refresh_completed, &repaint)?;
         Ok(binding)
     }
 
@@ -650,6 +1609,7 @@ impl BindingRuntime {
         remote_override: SpaceRemoteOverride,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
+        register_namespace: bool,
     ) -> Result<Self> {
         let mut config = config.clone();
         let backend_override = match &remote_override {
@@ -704,22 +1664,34 @@ impl BindingRuntime {
             }
             bootty_mux::config::build_backend_for_workspace(multiplexer, Some(&workspace))
         }));
+        let namespace = namespace_for_binding(scope, &config.multiplexer);
+        let session_order = if register_namespace {
+            SessionOrderStore::for_binding(
+                &config.config_path,
+                scope.binding_id().persistence_value(),
+                namespace,
+            )?
+        } else {
+            SessionOrderStore::for_binding_preflight(
+                &config.config_path,
+                scope.binding_id().persistence_value(),
+                namespace,
+            )?
+        };
         let mut binding = Self {
             label: binding_label(scope, &config.multiplexer),
             backend_override,
             remote_override,
             reattach: None,
             remote_attach_started: None,
+            workspace_config_path: config.config_path.clone(),
             multiplexer: config.multiplexer.clone(),
             scope,
             terminal,
             terminal_side_effect_tx,
             terminal_side_effect_rx,
             mux,
-            session_order: SessionOrderStore::for_binding(
-                &config.config_path,
-                scope.binding_id().persistence_value(),
-            )?,
+            session_order,
             session_names: SessionNameStore::for_binding(
                 &config.config_path,
                 scope.binding_id().persistence_value(),
@@ -737,6 +1709,8 @@ impl BindingRuntime {
             persisted_sessions_restored: false,
             pending_persisted_session_launches: Vec::new(),
             pending_automation_events: VecDeque::new(),
+            automation_terminal_states: BTreeMap::new(),
+            automation_backend_states: unknown_automation_backend_states(),
             automation_generation: None,
             automation_sources_installed: false,
             automation_event_refresh_pending: false,
@@ -752,6 +1726,178 @@ impl BindingRuntime {
         Ok(binding)
     }
 
+    fn register_native_persisted_launch(&mut self, plan: &MuxSessionLaunchPlan) -> Result<bool> {
+        if selected_backend(&self.multiplexer) != MultiplexerBackendConfig::Native {
+            return Ok(true);
+        }
+        let Some(session) = self
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| session.id == plan.session_id || session.name == plan.session_id)
+        else {
+            return Ok(false);
+        };
+        if session.id != plan.session_id || session.windows.len() != plan.windows.len() {
+            return Ok(false);
+        }
+        let allocated = MuxAllocatedResources {
+            session_id: session.id.clone(),
+            windows: session
+                .windows
+                .iter()
+                .map(|window| crate::mux::backend::MuxAllocatedWindow {
+                    window_id: window.id.clone(),
+                    pane_ids: window
+                        .panes
+                        .iter()
+                        .filter_map(|pane| pane.pane_id.clone())
+                        .collect(),
+                })
+                .collect(),
+        };
+        let terminal_ids = allocated
+            .windows
+            .iter()
+            .map(|window| {
+                window
+                    .pane_ids
+                    .iter()
+                    .map(|pane_id| {
+                        self.mux
+                            .terminal_id_for_pane(&allocated.session_id, &window.window_id, pane_id)
+                            .map(|terminal_id| (pane_id.clone(), terminal_id.to_owned()))
+                    })
+                    .collect::<Option<HashMap<_, _>>>()
+                    .map(|pane_terminal_ids| (window.window_id.clone(), pane_terminal_ids))
+            })
+            .collect::<Option<HashMap<_, _>>>();
+        let Some(terminal_ids) = terminal_ids else {
+            return Ok(false);
+        };
+        self.terminal.register_native_session_launch(
+            self.scope,
+            plan,
+            &allocated,
+            &terminal_ids,
+        )?;
+        Ok(true)
+    }
+    fn reconcile_pending_ditches(&mut self) -> Result<()> {
+        let pending = load_pending_ditches(
+            &self.workspace_config_path,
+            self.scope.binding_id().persistence_value(),
+        )?;
+        for session_id in pending {
+            let live = self
+                .mux
+                .sessions()
+                .iter()
+                .any(|session| session.id == session_id || session.name == session_id);
+            if live {
+                clear_pending_ditch(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    &session_id,
+                )?;
+            } else {
+                remove_session_membership_and_launch_plan(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    &session_id,
+                    &[session_id.as_str()],
+                )?;
+                self.session_order.forget_session_cache(&session_id);
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_pending_session_renames(&mut self) -> Result<()> {
+        let pending = load_pending_session_renames(
+            &self.workspace_config_path,
+            self.scope.binding_id().persistence_value(),
+        )?;
+        for (command_id, rename) in pending {
+            let target = self
+                .mux
+                .sessions()
+                .iter()
+                .filter(|session| session.id == rename.session_id)
+                .collect::<Vec<_>>();
+            let new_live = target.iter().any(|session| session.name == rename.new_name);
+            let old_live = target.iter().any(|session| session.name == rename.old_name);
+            if new_live && old_live {
+                return Err(anyhow::anyhow!(
+                    "pending session rename {:?} has conflicting authoritative names",
+                    rename.session_id
+                ));
+            }
+            if new_live && !old_live {
+                match session_rename_persistence_state(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    &command_id,
+                    &rename,
+                )? {
+                    SessionRenamePersistenceState::AlreadyCommitted => {
+                        self.session_order
+                            .rename_session_cache(&rename.old_name, &rename.new_name);
+                        self.session_names.mark_explicit(
+                            &rename.session_id,
+                            &rename.new_name,
+                            &rename.display_name,
+                            &rename.cwd,
+                        );
+                        clear_pending_session_rename(
+                            &self.workspace_config_path,
+                            self.scope.binding_id().persistence_value(),
+                            &command_id,
+                        )?;
+                        continue;
+                    }
+                    SessionRenamePersistenceState::Conflict => {
+                        return Err(anyhow::anyhow!(
+                            "pending session rename {:?} conflicts with committed destination",
+                            rename.session_id
+                        ));
+                    }
+                    SessionRenamePersistenceState::NotCommitted => {}
+                }
+            }
+            if new_live {
+                let plan_ids = [rename.old_name.as_str(), rename.session_id.as_str()];
+                rename_session_membership_and_launch_plans(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    &rename.old_name,
+                    &rename.new_name,
+                    &plan_ids,
+                )?;
+                self.session_order
+                    .rename_session_cache(&rename.old_name, &rename.new_name);
+                self.session_names.mark_explicit(
+                    &rename.session_id,
+                    &rename.new_name,
+                    &rename.display_name,
+                    &rename.cwd,
+                );
+                clear_pending_session_rename(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    &command_id,
+                )?;
+            } else if old_live || target.is_empty() {
+                clear_pending_session_rename(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    &command_id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn restore_persisted_sessions(
         &mut self,
         refresh_completed: bool,
@@ -763,60 +1909,156 @@ impl BindingRuntime {
         let decision = persisted_session_restore_decision(
             selected_backend(&self.multiplexer),
             refresh_completed,
-            !self.mux.sessions().is_empty(),
         );
         match decision {
             PersistedSessionRestoreDecision::Wait => return Ok(false),
-            PersistedSessionRestoreDecision::Skip => {
-                self.persisted_sessions_restored = true;
-                return Ok(true);
-            }
-            PersistedSessionRestoreDecision::Restore => {
-                self.persisted_sessions_restored = true;
-            }
+            PersistedSessionRestoreDecision::Restore => {}
+        }
+        if refresh_completed {
+            self.reconcile_pending_session_renames()?;
+            self.reconcile_pending_ditches()?;
+        }
+        let persisted = self
+            .session_names
+            .persisted_sessions(&self.session_order.session_names());
+        let stored_plans = load_session_launch_plans(
+            &self.workspace_config_path,
+            self.scope.binding_id().persistence_value(),
+        )?;
+        let mut plans_by_key = stored_plans.into_iter().collect::<HashMap<_, _>>();
+        let mut restores = Vec::with_capacity(persisted.len());
+        for (session_id, name, cwd) in persisted {
+            let plan = plans_by_key
+                .remove(&session_id)
+                .or_else(|| plans_by_key.remove(&name))
+                .or_else(|| {
+                    plans_by_key
+                        .iter()
+                        .find(|(_, plan)| plan.session_id == session_id || plan.session_id == name)
+                        .map(|(key, _)| key.clone())
+                        .and_then(|key| plans_by_key.remove(&key))
+                })
+                .or_else(|| {
+                    let cwd_keys = plans_by_key
+                        .iter()
+                        .filter(|(_, plan)| plan.default_cwd.as_str() == cwd.as_str())
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>();
+                    (cwd_keys.len() == 1).then(|| plans_by_key.remove(&cwd_keys[0]))?
+                });
+            let (plan, missing) = plan.map_or_else(
+                || (simple_session_launch_plan(&session_id, &cwd), true),
+                |plan| (plan, false),
+            );
+            plan.validate().map_err(|error| {
+                anyhow::anyhow!(
+                    "persisted session launch plan for {session_id:?} is invalid: {error}"
+                )
+            })?;
+            restores.push((session_id, name, plan, missing));
+        }
+        // A launch is durable as soon as it is queued, before session membership is updated by
+        // completion. Include such plans even when a crash interrupted that completion boundary.
+        for (session_id, plan) in plans_by_key {
+            plan.validate().map_err(|error| {
+                anyhow::anyhow!(
+                    "pending session launch plan for {session_id:?} is invalid: {error}"
+                )
+            })?;
+            restores.push((session_id.clone(), session_id, plan, false));
         }
 
-        // Native mux state can outlive an AppState in this process. Persisted restoration is
-        // therefore an idempotent ensure, not the create-only `session.create` contract used by
-        // callers submitting immutable launch intent.
-        for (session_id, name, cwd) in self
-            .session_names
-            .persisted_sessions(&self.session_order.session_names())
-        {
-            let launch = PendingPersistedSessionLaunch {
-                session_id: session_id.clone(),
-                cwd: cwd.clone(),
+        // Persist synthesized legacy plans before issuing any backend mutation. A malformed or
+        // otherwise unwritable record therefore cannot leave a partially restored topology.
+        for (session_id, _, plan, missing) in &restores {
+            if *missing {
+                persist_session_launch_plan(
+                    &self.workspace_config_path,
+                    self.scope.binding_id().persistence_value(),
+                    plan,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "persisting legacy session launch plan for {session_id:?} failed: {error}"
+                    )
+                })?;
+            }
+        }
+        // Establish durable membership before asking a backend to create anything. This makes
+        // an interrupted startup recoverable even when the backend has already committed.
+        for (_, name, _, _) in &restores {
+            self.session_order.add_session(name).map_err(|error| {
+                anyhow::anyhow!("persisting restored session membership failed: {error}")
+            })?;
+        }
+        let mut native_restore_ready = true;
+        // Backend mux state can outlive an AppState or be rediscovered after refresh. Recursive
+        // restoration is therefore an idempotent ensure: an already observed session is
+        // rediscovered, while an absent one receives the exact immutable plan persisted for it.
+        for (session_id, name, plan, _) in &restores {
+            let (already_exists, rename_target) = {
+                let existing = self.mux.sessions().iter().find(|session| {
+                    session.id == *session_id
+                        || session.name == *session_id
+                        || session.id == *name
+                        || session.name == *name
+                        || session.id == plan.session_id
+                        || session.name == plan.session_id
+                });
+                (
+                    existing.is_some(),
+                    existing
+                        .map(|session| session.id.clone())
+                        .unwrap_or_else(|| plan.session_id.clone()),
+                )
             };
-            self.mux.create_project_session(
-                NewMuxSessionRequest {
-                    session_id: session_id.clone(),
-                    cwd,
-                },
-                repaint,
-                &self.multiplexer,
-            );
-            if !self
+            let already_pending = self
                 .pending_persisted_session_launches
                 .iter()
-                .any(|pending| pending.session_id == session_id)
-            {
+                .any(|pending| pending.session_id == *session_id);
+            if !already_exists && !already_pending {
+                self.mux
+                    .create_session(plan.clone(), repaint, &self.multiplexer);
+            }
+            if !already_pending && !self.register_native_persisted_launch(plan)? {
+                native_restore_ready = false;
+                continue;
+            }
+            let launch = PendingPersistedSessionLaunch {
+                session_id: session_id.clone(),
+                plan: Arc::new(plan.clone()),
+                leaves: persisted_launch_leaves(plan),
+            };
+            if !already_pending {
                 self.pending_persisted_session_launches.push(launch);
             }
-            if name != session_id {
+            if name != session_id && !already_pending {
                 self.mux
-                    .rename_session(&session_id, name, repaint, &self.multiplexer);
+                    .rename_session(&rename_target, name.clone(), repaint, &self.multiplexer);
             }
         }
         if let Err(error) = self.sync_session_order() {
             self.persisted_sessions_restored = false;
             return Err(error);
         }
-        Ok(true)
+        let complete = native_restore_ready
+            && restores.iter().all(|(session_id, name, plan, _)| {
+                self.mux.sessions().iter().any(|session| {
+                    session.id == *session_id
+                        || session.name == *session_id
+                        || session.id == *name
+                        || session.name == *name
+                        || session.id == plan.session_id
+                        || session.name == plan.session_id
+                })
+            });
+        self.persisted_sessions_restored = complete;
+        Ok(complete)
     }
 
     /// Yields only claims whose persisted launch has an unambiguous, currently
-    /// authoritative one-pane allocation. Any not-yet-observed allocation stays
-    /// queued rather than guessing a pane identity.
+    /// authoritative allocation. Any not-yet-observed allocation stays queued
+    /// rather than guessing a pane identity.
     fn take_resolved_persisted_session_launch_claims(
         &mut self,
         context: &DirectoryClaimsContext,
@@ -829,47 +2071,68 @@ impl BindingRuntime {
         let mut resolved = Vec::new();
         let mut pending = Vec::new();
         for launch in std::mem::take(&mut self.pending_persisted_session_launches) {
-            let Some(directory) = DirectoryRef::resolve(&launch.cwd).ok() else {
-                pending.push(launch);
-                continue;
-            };
             let Some(session) = self.mux.sessions().iter().find(|session| {
-                session.id == launch.session_id || session.name == launch.session_id
+                session.id == launch.session_id
+                    || session.name == launch.session_id
+                    || session.id == launch.plan.session_id
+                    || session.name == launch.plan.session_id
             }) else {
                 pending.push(launch);
                 continue;
             };
-            let mut panes = HashSet::new();
-            for window in &session.windows {
-                for pane in window.panes.iter().chain(std::iter::once(&window.anchor)) {
-                    if let (Some(pane_id), Some(terminal_id)) = (&pane.pane_id, &pane.terminal_id) {
-                        panes.insert((window.id.clone(), pane_id.clone(), terminal_id.clone()));
-                    }
-                }
+            let mut unresolved = Vec::new();
+            for leaf in &launch.leaves {
+                let Some(directory) = DirectoryRef::resolve(&leaf.cwd).ok() else {
+                    unresolved.push(leaf.clone());
+                    continue;
+                };
+                let Some(window) = session.windows.get(leaf.window_index) else {
+                    unresolved.push(leaf.clone());
+                    continue;
+                };
+                let pane = if window.panes.is_empty() {
+                    (leaf.pane_index == 0).then_some(&window.anchor)
+                } else {
+                    window.panes.get(leaf.pane_index)
+                };
+                let Some(pane) = pane else {
+                    unresolved.push(leaf.clone());
+                    continue;
+                };
+                let (Some(pane_id), Some(terminal_id)) =
+                    (pane.pane_id.as_deref(), pane.terminal_id.as_deref())
+                else {
+                    unresolved.push(leaf.clone());
+                    continue;
+                };
+                let Some(claimant) = directory_claimant_for_pane(
+                    context,
+                    self,
+                    &session.id,
+                    &window.id,
+                    pane_id,
+                    terminal_id,
+                ) else {
+                    unresolved.push(leaf.clone());
+                    continue;
+                };
+                resolved.push(ResolvedPersistedSessionLaunchClaim {
+                    launch: PendingPersistedSessionLaunch {
+                        session_id: launch.session_id.clone(),
+                        plan: Arc::clone(&launch.plan),
+                        leaves: vec![leaf.clone()],
+                    },
+                    claimant,
+                    directory,
+                });
             }
-            let Some((window_id, pane_id, terminal_id)) = (panes.len() == 1)
-                .then(|| panes.into_iter().next())
-                .flatten()
-            else {
-                pending.push(launch);
-                continue;
-            };
-            let Some(claimant) = directory_claimant_for_pane(
-                context,
-                self,
-                &session.id,
-                &window_id,
-                &pane_id,
-                &terminal_id,
-            ) else {
-                pending.push(launch);
-                continue;
-            };
-            resolved.push(ResolvedPersistedSessionLaunchClaim {
-                launch,
-                claimant,
-                directory,
-            });
+            if !unresolved.is_empty() {
+                pending.push(PendingPersistedSessionLaunch {
+                    session_id: launch.session_id,
+                    plan: launch.plan,
+                    leaves: unresolved,
+                });
+            }
         }
         self.pending_persisted_session_launches = pending;
         resolved
@@ -930,26 +2193,42 @@ impl BindingRuntime {
     }
 
     fn sync_session_order(&mut self) -> Result<()> {
+        let initial_membership = self.session_order.session_names();
+        if !initial_membership.is_empty() {
+            self.mux.apply_session_order(&initial_membership);
+        }
         self.carry_renamed_members()?;
         if self.multiplexer.remote_space_id.is_some() {
             for session in self.mux.all_sessions() {
                 self.session_order.add_session(&session.name)?;
             }
         }
-        // Prune against the whole backend list, never `sessions()`: that one is already narrowed to
-        // membership, so a session this binding just attached would count as dead and be dropped
-        // again before it ever showed up in the sidebar.
-        let ordered_names = self.session_order.sync_sessions(
-            self.mux
-                .all_sessions()
-                .iter()
-                .map(|session| session.name.as_str())
-                .chain(
-                    self.pending_generated_names
-                        .values()
-                        .map(|pending| pending.name.as_str()),
-                ),
-        )?;
+        // A binding with no persisted membership may adopt live backend sessions on its first
+        // authoritative view. Once membership exists, keep refreshes scoped to that durable view:
+        // another Space can own a same-server session, and an all-sessions snapshot must not
+        // silently adopt it here. Pending generated names remain live until their command settles.
+        let persisted_names = self.session_order.session_names();
+        let pending_names = self
+            .pending_generated_names
+            .values()
+            .map(|pending| pending.name.clone())
+            .collect::<Vec<_>>();
+        let include_all_sessions = persisted_names.is_empty();
+        let alive_names = self
+            .mux
+            .all_sessions()
+            .iter()
+            .filter(|session| {
+                include_all_sessions
+                    || persisted_names.iter().any(|name| name == &session.name)
+                    || pending_names.iter().any(|name| name == &session.name)
+            })
+            .map(|session| session.name.clone())
+            .chain(pending_names.iter().cloned())
+            .collect::<Vec<_>>();
+        let ordered_names = self
+            .session_order
+            .sync_sessions(alive_names.iter().map(String::as_str))?;
         self.mux.apply_session_order(&ordered_names);
         Ok(())
     }
@@ -970,6 +2249,12 @@ impl BindingRuntime {
             .collect::<Vec<_>>();
         for (previous, current) in renames {
             self.session_order.rename_session(&previous, &current)?;
+            rekey_session_launch_plan(
+                &self.workspace_config_path,
+                self.scope.binding_id().persistence_value(),
+                &previous,
+                &current,
+            )?;
         }
         Ok(())
     }
@@ -1014,6 +2299,52 @@ const AUTOMATION_BINDING_SNAPSHOT_TOPICS: &[&str] = &[
     "backend.lagged",
     "backend.rebased",
 ];
+
+const AUTOMATION_TERMINAL_STATE_TOPICS: &[&str] = &[
+    "terminal.process_changed",
+    "terminal.title_changed",
+    "terminal.options_changed",
+    "terminal.foreground_changed",
+    "terminal.cwd_changed",
+];
+const AUTOMATION_UNKNOWN_STATE_REASON: &str = "backend_snapshot_field_unavailable";
+const AUTOMATION_BACKEND_STATE_TOPICS: &[&str] = &[
+    "backend.connection_changed",
+    "backend.lagged",
+    "backend.rebased",
+];
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct AutomationTerminalStateKey {
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+    terminal_id: Option<String>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AutomationTerminalTopicState {
+    available: bool,
+    value: Value,
+    reason: Option<&'static str>,
+}
+fn unknown_automation_backend_states() -> HashMap<&'static str, AutomationTerminalTopicState> {
+    AUTOMATION_BACKEND_STATE_TOPICS
+        .iter()
+        .map(|&topic| (topic, unknown_automation_terminal_topic_state()))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct AutomationTerminalState {
+    target: MuxEventTarget,
+    generation: u64,
+    topics: HashMap<&'static str, AutomationTerminalTopicState>,
+    latest_pane_state: Option<MuxPaneState>,
+    options: BTreeMap<String, String>,
+    options_known: bool,
+}
 
 struct AutomationTargetContext {
     process: String,
@@ -1245,6 +2576,696 @@ fn publish_worktree_changed(
     Ok(())
 }
 
+fn automation_terminal_state_topic(topic: MuxEventTopic) -> Option<&'static str> {
+    match topic {
+        MuxEventTopic::PaneStateChanged => Some("terminal.process_changed"),
+        MuxEventTopic::PaneTitleChanged => Some("terminal.title_changed"),
+        MuxEventTopic::PaneOptionsChanged => Some("terminal.options_changed"),
+        MuxEventTopic::PaneForegroundChanged => Some("terminal.foreground_changed"),
+        MuxEventTopic::PaneCwdChanged => Some("terminal.cwd_changed"),
+        _ => None,
+    }
+}
+
+fn unknown_automation_terminal_topic_state() -> AutomationTerminalTopicState {
+    AutomationTerminalTopicState {
+        available: false,
+        value: Value::Null,
+        reason: Some(AUTOMATION_UNKNOWN_STATE_REASON),
+    }
+}
+
+fn unknown_automation_terminal_topics() -> HashMap<&'static str, AutomationTerminalTopicState> {
+    AUTOMATION_TERMINAL_STATE_TOPICS
+        .iter()
+        .map(|&topic| (topic, unknown_automation_terminal_topic_state()))
+        .collect()
+}
+
+fn available_automation_terminal_topic_state(
+    payload: &MuxEventPayload,
+) -> AutomationTerminalTopicState {
+    AutomationTerminalTopicState {
+        available: true,
+        value: serde_json::to_value(payload).expect("serialize automation terminal event payload"),
+        reason: None,
+    }
+}
+
+fn automation_terminal_state_key(
+    target: &MuxEventTarget,
+    generation: u64,
+) -> Option<AutomationTerminalStateKey> {
+    Some(AutomationTerminalStateKey {
+        session_id: target.session_id.clone()?,
+        window_id: target.window_id.clone()?,
+        pane_id: target.pane_id.clone()?,
+        terminal_id: target.terminal_id.clone(),
+        generation,
+    })
+}
+
+fn automation_terminal_target_from_anchor(
+    binding: &BindingRuntime,
+    session_id: &str,
+    window_id: &str,
+    anchor: &MuxPaneAnchor,
+) -> Option<(AutomationTerminalStateKey, MuxEventTarget, u64)> {
+    let pane_id = anchor.pane_id.clone()?;
+    let (terminal_id, generation) = match anchor.terminal_id.as_deref() {
+        Some(terminal_id) => (
+            Some(terminal_id.to_owned()),
+            binding
+                .mux
+                .terminal_generation(session_id, window_id, terminal_id)?,
+        ),
+        None => (
+            None,
+            binding
+                .mux
+                .pane_generation(session_id, window_id, &pane_id)?,
+        ),
+    };
+    let occupant = anchor
+        .occupant_id
+        .clone()
+        .map(|backend_identity| MuxOccupantIdentity {
+            backend_identity,
+            pid: anchor.pane_pid,
+            process: anchor.process.clone(),
+        });
+    let target = MuxEventTarget {
+        session_id: Some(session_id.to_owned()),
+        window_id: Some(window_id.to_owned()),
+        pane_id: Some(pane_id),
+        terminal_id,
+        occupant,
+    };
+    let key = automation_terminal_state_key(&target, generation)?;
+    Some((key, target, generation))
+}
+
+fn seeded_automation_terminal_topics(
+    anchor: &MuxPaneAnchor,
+) -> HashMap<&'static str, AutomationTerminalTopicState> {
+    let mut topics = unknown_automation_terminal_topics();
+    let foreground = MuxForegroundState {
+        pid: anchor.pane_pid,
+        command: anchor.process.clone(),
+        cwd: anchor.cwd.clone(),
+        executable: None,
+    };
+    let foreground_available = foreground.pid.is_some()
+        || foreground.command.is_some()
+        || foreground.cwd.is_some()
+        || foreground.executable.is_some();
+    if foreground_available {
+        topics.insert(
+            "terminal.foreground_changed",
+            available_automation_terminal_topic_state(&MuxEventPayload::Foreground {
+                old_state: None,
+                new_state: Some(foreground.clone()),
+            }),
+        );
+    }
+    if anchor.cwd.is_some() {
+        topics.insert(
+            "terminal.cwd_changed",
+            available_automation_terminal_topic_state(&MuxEventPayload::Cwd {
+                old_cwd: None,
+                new_cwd: anchor.cwd.clone(),
+            }),
+        );
+    }
+    if anchor.process.is_some() || anchor.pane_pid.is_some() {
+        topics.insert(
+            "terminal.process_changed",
+            available_automation_terminal_topic_state(&MuxEventPayload::PaneState {
+                state: MuxPaneState {
+                    title: None,
+                    options: Vec::new(),
+                    foreground: foreground_available.then_some(foreground),
+                },
+            }),
+        );
+    }
+    topics
+}
+
+fn merge_rebased_automation_terminal_state(
+    mut fresh: AutomationTerminalState,
+    previous: AutomationTerminalState,
+) -> AutomationTerminalState {
+    for topic in AUTOMATION_TERMINAL_STATE_TOPICS {
+        let fresh_state = fresh.topics.get(topic).is_some_and(|state| state.available);
+        if !fresh_state
+            && let Some(previous_state) = previous.topics.get(topic)
+            && previous_state.available
+        {
+            fresh.topics.insert(topic, previous_state.clone());
+        }
+    }
+    if !fresh.options_known && previous.options_known {
+        let mut pane_state = previous.latest_pane_state.unwrap_or_default();
+        if let Some(fresh_foreground) = fresh
+            .latest_pane_state
+            .as_ref()
+            .and_then(|pane_state| pane_state.foreground.clone())
+        {
+            pane_state.foreground = Some(fresh_foreground);
+        }
+        fresh.latest_pane_state = Some(pane_state);
+        fresh.options = previous.options;
+        fresh.options_known = true;
+    }
+    fresh
+}
+
+fn rebase_automation_terminal_states(binding: &mut BindingRuntime) {
+    let previous = std::mem::take(&mut binding.automation_terminal_states);
+    let mut states = BTreeMap::new();
+    for session in binding.mux.sessions() {
+        for window in &session.windows {
+            for anchor in std::iter::once(&window.anchor).chain(&window.panes) {
+                let Some((key, target, generation)) = automation_terminal_target_from_anchor(
+                    binding,
+                    &session.id,
+                    &window.id,
+                    anchor,
+                ) else {
+                    continue;
+                };
+                let foreground = MuxForegroundState {
+                    pid: anchor.pane_pid,
+                    command: anchor.process.clone(),
+                    cwd: anchor.cwd.clone(),
+                    executable: None,
+                };
+                let foreground_available = foreground.pid.is_some()
+                    || foreground.command.is_some()
+                    || foreground.cwd.is_some()
+                    || foreground.executable.is_some();
+                let fresh_pane_state = foreground_available.then(|| MuxPaneState {
+                    title: None,
+                    options: Vec::new(),
+                    foreground: Some(foreground),
+                });
+                let fresh = AutomationTerminalState {
+                    target,
+                    generation,
+                    topics: seeded_automation_terminal_topics(anchor),
+                    latest_pane_state: fresh_pane_state,
+                    options: BTreeMap::new(),
+                    options_known: false,
+                };
+                let state = previous
+                    .get(&key)
+                    .cloned()
+                    .map_or(fresh.clone(), |previous| {
+                        merge_rebased_automation_terminal_state(fresh, previous)
+                    });
+                states.entry(key).or_insert(state);
+            }
+        }
+    }
+    binding.automation_terminal_states = states;
+}
+
+fn ensure_automation_terminal_state<'a>(
+    binding: &'a mut BindingRuntime,
+    target: &MuxEventTarget,
+    generation: u64,
+) -> Option<&'a mut AutomationTerminalState> {
+    let key = automation_terminal_state_key(target, generation)?;
+    Some(
+        binding
+            .automation_terminal_states
+            .entry(key)
+            .or_insert_with(|| AutomationTerminalState {
+                target: target.clone(),
+                generation,
+                topics: unknown_automation_terminal_topics(),
+                latest_pane_state: None,
+                options: BTreeMap::new(),
+                options_known: false,
+            }),
+    )
+}
+
+fn retire_automation_terminal_state(
+    binding: &mut BindingRuntime,
+    target: &MuxEventTarget,
+    generation: Option<u64>,
+) {
+    let Some(generation) = generation else {
+        return;
+    };
+    let Some(key) = automation_terminal_state_key(target, generation) else {
+        return;
+    };
+    if binding.automation_terminal_states.remove(&key).is_some() {
+        return;
+    }
+    // Replacement events carry the new terminal identity while their
+    // retired generation belongs to the old identity. The pane IDs and exact
+    // generation still identify one cache entry, so retire that old identity
+    // without broadening the generation match.
+    binding.automation_terminal_states.retain(|candidate, _| {
+        !(candidate.session_id == key.session_id
+            && candidate.window_id == key.window_id
+            && candidate.pane_id == key.pane_id
+            && candidate.generation == key.generation)
+    });
+}
+
+fn automation_pane_state_payload(state: &MuxPaneState) -> MuxEventPayload {
+    MuxEventPayload::PaneState {
+        state: state.clone(),
+    }
+}
+
+fn refresh_automation_process_state(state: &mut AutomationTerminalState) {
+    let Some(pane_state) = state.latest_pane_state.as_ref() else {
+        state.topics.insert(
+            "terminal.process_changed",
+            unknown_automation_terminal_topic_state(),
+        );
+        return;
+    };
+    if pane_state.foreground.as_ref().is_some_and(|foreground| {
+        foreground.pid.is_some() || foreground.command.is_some() || foreground.executable.is_some()
+    }) {
+        state.topics.insert(
+            "terminal.process_changed",
+            available_automation_terminal_topic_state(&automation_pane_state_payload(pane_state)),
+        );
+    } else {
+        state.topics.insert(
+            "terminal.process_changed",
+            unknown_automation_terminal_topic_state(),
+        );
+    }
+}
+
+/// Apply the backend delta to the source cache before the corresponding event
+/// reaches the automation hub. Replacements and closes only retire the exact
+/// target generation they name.
+fn apply_automation_terminal_event_state(
+    binding: &mut BindingRuntime,
+    observation: &MuxEventObservation,
+) {
+    if observation.binding_generation != binding.mux.binding_generation() {
+        return;
+    }
+    let event = &observation.event;
+    if matches!(
+        event.topic,
+        MuxEventTopic::PaneOccupantReplaced | MuxEventTopic::PaneClosed
+    ) {
+        if let Some(target) = event.target.as_ref() {
+            retire_automation_terminal_state(
+                binding,
+                target,
+                match event.topic {
+                    MuxEventTopic::PaneClosed => observation
+                        .retired_target_generation
+                        .or(observation.target_generation),
+                    MuxEventTopic::PaneOccupantReplaced => observation.retired_target_generation,
+                    _ => None,
+                },
+            );
+        }
+        if event.topic == MuxEventTopic::PaneClosed {
+            return;
+        }
+    }
+    let (Some(target), Some(generation)) = (event.target.as_ref(), observation.target_generation)
+    else {
+        return;
+    };
+    let Some(state) = ensure_automation_terminal_state(binding, target, generation) else {
+        return;
+    };
+    state.target = target.clone();
+    state.generation = generation;
+    if let MuxEventPayload::PaneState { state: pane_state } = &event.payload {
+        state.latest_pane_state = Some(pane_state.clone());
+        state.options = pane_state
+            .options
+            .iter()
+            .map(|option| (option.name.clone(), option.value.clone()))
+            .collect();
+        state.options_known = true;
+        state.topics.insert(
+            "terminal.options_changed",
+            available_automation_terminal_topic_state(&event.payload),
+        );
+        if pane_state.title.is_some() {
+            state.topics.insert(
+                "terminal.title_changed",
+                available_automation_terminal_topic_state(&MuxEventPayload::Title {
+                    old_title: None,
+                    new_title: pane_state.title.clone(),
+                }),
+            );
+        } else {
+            state.topics.insert(
+                "terminal.title_changed",
+                unknown_automation_terminal_topic_state(),
+            );
+        }
+        if pane_state.foreground.is_some() {
+            state.topics.insert(
+                "terminal.foreground_changed",
+                available_automation_terminal_topic_state(&MuxEventPayload::Foreground {
+                    old_state: None,
+                    new_state: pane_state.foreground.clone(),
+                }),
+            );
+            if pane_state
+                .foreground
+                .as_ref()
+                .and_then(|foreground| foreground.cwd.as_ref())
+                .is_some()
+            {
+                state.topics.insert(
+                    "terminal.cwd_changed",
+                    available_automation_terminal_topic_state(&MuxEventPayload::Cwd {
+                        old_cwd: None,
+                        new_cwd: pane_state
+                            .foreground
+                            .as_ref()
+                            .and_then(|foreground| foreground.cwd.clone()),
+                    }),
+                );
+            } else {
+                state.topics.insert(
+                    "terminal.cwd_changed",
+                    unknown_automation_terminal_topic_state(),
+                );
+            }
+            if pane_state.foreground.as_ref().is_some_and(|foreground| {
+                foreground.pid.is_some()
+                    || foreground.command.is_some()
+                    || foreground.executable.is_some()
+            }) {
+                state.topics.insert(
+                    "terminal.process_changed",
+                    available_automation_terminal_topic_state(&event.payload),
+                );
+            } else {
+                state.topics.insert(
+                    "terminal.process_changed",
+                    unknown_automation_terminal_topic_state(),
+                );
+            }
+        } else {
+            state.topics.insert(
+                "terminal.foreground_changed",
+                unknown_automation_terminal_topic_state(),
+            );
+            state.topics.insert(
+                "terminal.cwd_changed",
+                unknown_automation_terminal_topic_state(),
+            );
+            state.topics.insert(
+                "terminal.process_changed",
+                unknown_automation_terminal_topic_state(),
+            );
+        }
+        return;
+    }
+    let Some(topic) = automation_terminal_state_topic(event.topic) else {
+        if event.topic == MuxEventTopic::PaneOccupantReplaced {
+            let _ = ensure_automation_terminal_state(binding, target, generation);
+        }
+        return;
+    };
+    match &event.payload {
+        MuxEventPayload::Option {
+            name, new_value, ..
+        } => {
+            if let Some(value) = new_value {
+                state.options.insert(name.clone(), value.clone());
+            } else {
+                state.options.remove(name);
+            }
+            if state.options_known {
+                let mut pane_state = state.latest_pane_state.clone().unwrap_or_default();
+                pane_state.options = state
+                    .options
+                    .iter()
+                    .map(|(name, value)| MuxPaneOption {
+                        name: name.clone(),
+                        value: value.clone(),
+                    })
+                    .collect();
+                state.latest_pane_state = Some(pane_state.clone());
+                refresh_automation_process_state(state);
+                state.topics.insert(
+                    "terminal.options_changed",
+                    available_automation_terminal_topic_state(&automation_pane_state_payload(
+                        &pane_state,
+                    )),
+                );
+            } else {
+                state.topics.insert(
+                    "terminal.options_changed",
+                    unknown_automation_terminal_topic_state(),
+                );
+            }
+        }
+        MuxEventPayload::Title { new_title, .. } => {
+            let mut pane_state = state.latest_pane_state.take().unwrap_or_default();
+            pane_state.title = new_title.clone();
+            state.latest_pane_state = Some(pane_state);
+            refresh_automation_process_state(state);
+            state.topics.insert(
+                topic,
+                available_automation_terminal_topic_state(&event.payload),
+            );
+        }
+        MuxEventPayload::Cwd { new_cwd, .. } => {
+            let mut pane_state = state.latest_pane_state.take().unwrap_or_default();
+            let had_foreground = pane_state.foreground.is_some();
+            let mut foreground = pane_state.foreground.take().unwrap_or_default();
+            foreground.cwd = new_cwd.clone();
+            let foreground_state = foreground.clone();
+            pane_state.foreground = Some(foreground);
+            state.latest_pane_state = Some(pane_state);
+            refresh_automation_process_state(state);
+            state.topics.insert(
+                topic,
+                available_automation_terminal_topic_state(&event.payload),
+            );
+            if had_foreground {
+                state.topics.insert(
+                    "terminal.foreground_changed",
+                    available_automation_terminal_topic_state(&MuxEventPayload::Foreground {
+                        old_state: None,
+                        new_state: Some(foreground_state),
+                    }),
+                );
+            }
+        }
+        MuxEventPayload::Foreground { new_state, .. } => {
+            let mut pane_state = state.latest_pane_state.take().unwrap_or_default();
+            pane_state.foreground = new_state.clone();
+            state.latest_pane_state = Some(pane_state);
+            refresh_automation_process_state(state);
+            state.topics.insert(
+                topic,
+                available_automation_terminal_topic_state(&event.payload),
+            );
+            if let Some(foreground) = new_state {
+                if foreground.cwd.is_some() {
+                    state.topics.insert(
+                        "terminal.cwd_changed",
+                        available_automation_terminal_topic_state(&MuxEventPayload::Cwd {
+                            old_cwd: None,
+                            new_cwd: foreground.cwd.clone(),
+                        }),
+                    );
+                } else {
+                    state.topics.insert(
+                        "terminal.cwd_changed",
+                        unknown_automation_terminal_topic_state(),
+                    );
+                }
+            } else {
+                state.topics.insert(
+                    "terminal.cwd_changed",
+                    unknown_automation_terminal_topic_state(),
+                );
+            }
+        }
+        _ => {
+            state.topics.insert(
+                topic,
+                available_automation_terminal_topic_state(&event.payload),
+            );
+        }
+    }
+}
+
+fn backend_topic_state(value: Value) -> AutomationTerminalTopicState {
+    AutomationTerminalTopicState {
+        available: true,
+        value,
+        reason: None,
+    }
+}
+
+fn apply_automation_backend_event_state(
+    binding: &mut BindingRuntime,
+    observation: &MuxEventObservation,
+) {
+    if observation.binding_generation != binding.mux.binding_generation() {
+        return;
+    }
+    let event = &observation.event;
+    match event.topic {
+        MuxEventTopic::BackendDisconnected => {
+            binding.automation_backend_states.insert(
+                "backend.connection_changed",
+                backend_topic_state(
+                    serde_json::to_value(&event.payload)
+                        .expect("serialize backend connection payload"),
+                ),
+            );
+        }
+        MuxEventTopic::BackendLagged => {
+            binding.automation_backend_states.insert(
+                "backend.lagged",
+                backend_topic_state(json!({
+                    "lagged": true,
+                    "last_event": serde_json::to_value(&event.payload)
+                        .expect("serialize backend lag payload"),
+                })),
+            );
+        }
+        MuxEventTopic::SnapshotRebased => {
+            binding.automation_backend_states.insert(
+                "backend.rebased",
+                backend_topic_state(
+                    serde_json::to_value(&event.payload).expect("serialize backend rebase payload"),
+                ),
+            );
+            binding.automation_backend_states.insert(
+                "backend.lagged",
+                backend_topic_state(json!({"lagged": false, "last_event": null})),
+            );
+            binding.automation_backend_states.insert(
+                "backend.connection_changed",
+                unknown_automation_terminal_topic_state(),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn rebase_automation_backend_states(binding: &mut BindingRuntime) {
+    binding.automation_backend_states.insert(
+        "backend.rebased",
+        backend_topic_state(
+            serde_json::to_value(MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Bootstrap,
+            })
+            .expect("serialize bootstrap rebase payload"),
+        ),
+    );
+    binding.automation_backend_states.insert(
+        "backend.lagged",
+        backend_topic_state(json!({"lagged": false, "last_event": null})),
+    );
+    binding.automation_backend_states.insert(
+        "backend.connection_changed",
+        unknown_automation_terminal_topic_state(),
+    );
+}
+
+fn automation_binding_backend_snapshot(
+    binding: &BindingRuntime,
+    context: &AutomationTargetContext,
+    topic: &str,
+) -> Value {
+    let topic_state = binding
+        .automation_backend_states
+        .get(topic)
+        .cloned()
+        .unwrap_or_else(unknown_automation_terminal_topic_state);
+    let mut target = serde_json::Map::new();
+    target.insert(
+        "target".to_owned(),
+        serde_json::to_value(MuxEventTarget::default()).expect("serialize binding status target"),
+    );
+    target.insert(
+        "generation".to_owned(),
+        json!(binding.mux.binding_generation()),
+    );
+    target.insert(
+        "availability".to_owned(),
+        Value::String(if topic_state.available {
+            "available".to_owned()
+        } else {
+            "unknown".to_owned()
+        }),
+    );
+    target.insert("value".to_owned(), topic_state.value);
+    if let Some(reason) = topic_state.reason {
+        target.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    }
+    json!({
+        "topic": topic,
+        "scope": automation_event_scope(binding.scope),
+        "binding": automation_binding_target(binding, context),
+        "targets": [Value::Object(target)],
+    })
+}
+
+fn automation_binding_state_snapshot(
+    binding: &BindingRuntime,
+    context: &AutomationTargetContext,
+    topic: &str,
+) -> Value {
+    let targets = binding
+        .automation_terminal_states
+        .values()
+        .map(|state| {
+            let topic_state = state
+                .topics
+                .get(topic)
+                .cloned()
+                .unwrap_or_else(unknown_automation_terminal_topic_state);
+            let mut target = serde_json::Map::new();
+            target.insert(
+                "target".to_owned(),
+                serde_json::to_value(&state.target).expect("serialize automation target"),
+            );
+            target.insert("generation".to_owned(), json!(state.generation));
+            target.insert(
+                "availability".to_owned(),
+                Value::String(if topic_state.available {
+                    "available".to_owned()
+                } else {
+                    "unknown".to_owned()
+                }),
+            );
+            target.insert("value".to_owned(), topic_state.value);
+            if let Some(reason) = topic_state.reason {
+                target.insert("reason".to_owned(), Value::String(reason.to_owned()));
+            }
+            Value::Object(target)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "topic": topic,
+        "scope": automation_event_scope(binding.scope),
+        "binding": automation_binding_target(binding, context),
+        "targets": targets,
+    })
+}
+
 fn event_cwd(event: &MuxEvent) -> Option<&str> {
     match &event.payload {
         MuxEventPayload::Cwd {
@@ -1286,6 +3307,40 @@ fn directory_claimant_from_observation(
         observation.binding_generation,
         occupant_generation,
     ))
+}
+
+fn directory_claim_observation_is_current(
+    context: &DirectoryClaimsContext,
+    binding: &BindingRuntime,
+    observation: &MuxEventObservation,
+    generation: u64,
+) -> bool {
+    let observed_binding =
+        directory_binding_ref_for_generation(context, binding, observation.binding_generation);
+    if observed_binding != directory_binding_ref(context, binding) {
+        return false;
+    }
+
+    let Some(target) = observation.event.target.as_ref() else {
+        return false;
+    };
+    let (Some(session_id), Some(window_id), Some(pane_id), Some(terminal_id)) = (
+        target.session_id.as_deref(),
+        target.window_id.as_deref(),
+        target.pane_id.as_deref(),
+        target.terminal_id.as_deref(),
+    ) else {
+        return false;
+    };
+
+    binding
+        .mux
+        .terminal_id_for_pane(session_id, window_id, pane_id)
+        == Some(terminal_id)
+        && binding
+            .mux
+            .terminal_generation(session_id, window_id, terminal_id)
+            == Some(generation)
 }
 
 fn consume_directory_claim_event(
@@ -1371,18 +3426,47 @@ fn consume_directory_claim_event(
         MuxEventTopic::PaneCwdChanged
         | MuxEventTopic::PaneForegroundChanged
         | MuxEventTopic::PaneStateChanged => {
-            let Some(cwd) = event_cwd(event) else {
-                return Ok(());
-            };
             let Some(generation) = observation.target_generation else {
                 return Ok(());
             };
+            if !directory_claim_observation_is_current(
+                claims_context,
+                binding,
+                observation,
+                generation,
+            ) {
+                return Ok(());
+            }
             let Some(claimant) = directory_claimant_from_observation(
                 claims_context,
                 binding,
                 observation,
                 generation,
             ) else {
+                return Ok(());
+            };
+            let target = automation_terminal_target_from_observation(
+                binding,
+                target_context,
+                observation,
+                generation,
+            );
+            let Some(cwd) = event_cwd(event) else {
+                if let Some(revision) = claims
+                    .release_observed_claimant(&claimant)
+                    .map_err(directory_claims_automation_error)?
+                {
+                    publish_directory_usage_changed(
+                        automation,
+                        claims,
+                        binding,
+                        target,
+                        json!({
+                            "reason": "cwd_cleared",
+                            "revision": revision,
+                        }),
+                    )?;
+                }
                 return Ok(());
             };
             let directory =
@@ -1394,12 +3478,7 @@ fn consume_directory_claim_event(
                 automation,
                 claims,
                 binding,
-                automation_terminal_target_from_observation(
-                    binding,
-                    target_context,
-                    observation,
-                    generation,
-                ),
+                target,
                 json!({
                     "reason": "cwd_changed",
                     "update": update,
@@ -1474,6 +3553,72 @@ fn append_directory_claim_outcome(
     warnings.extend(outcome_warnings);
 }
 
+const AUTOMATION_PENDING_EVENT_LIMIT: usize = 256;
+
+fn automation_event_is_replaceable(observation: &MuxEventObservation) -> bool {
+    matches!(
+        observation.event.topic,
+        MuxEventTopic::PaneStateChanged
+            | MuxEventTopic::PaneTitleChanged
+            | MuxEventTopic::PaneOptionsChanged
+            | MuxEventTopic::PaneForegroundChanged
+            | MuxEventTopic::PaneCwdChanged
+    )
+}
+
+fn enqueue_automation_event(binding: &mut BindingRuntime, observation: MuxEventObservation) {
+    let replaceable = automation_event_is_replaceable(&observation);
+    if replaceable
+        && let Some(existing) = binding
+            .pending_automation_events
+            .iter_mut()
+            .find(|existing| {
+                existing.event.topic == observation.event.topic
+                    && existing.event.target == observation.event.target
+                    && existing.target_generation == observation.target_generation
+                    && existing.binding_generation == observation.binding_generation
+            })
+    {
+        *existing = observation;
+        return;
+    }
+    if binding.pending_automation_events.len() < AUTOMATION_PENDING_EVENT_LIMIT {
+        binding.pending_automation_events.push_back(observation);
+        return;
+    }
+    if let Some(index) = binding
+        .pending_automation_events
+        .iter()
+        .position(automation_event_is_replaceable)
+    {
+        binding.pending_automation_events.remove(index);
+        binding.pending_automation_events.push_back(observation);
+        binding.automation_event_refresh_pending = true;
+    } else {
+        // Rebase observations make an older refresh marker redundant. Keep
+        // every newer lifecycle observation within the bound by evicting an
+        // older refresh or non-close event; never evict an authoritative
+        // close in favor of another status event.
+        if let Some(index) = binding
+            .pending_automation_events
+            .iter()
+            .position(automation_event_requires_refresh)
+            .or_else(|| {
+                binding
+                    .pending_automation_events
+                    .iter()
+                    .position(|event| event.event.topic != MuxEventTopic::PaneClosed)
+            })
+        {
+            binding.pending_automation_events.remove(index);
+            binding.pending_automation_events.push_back(observation);
+            binding.automation_event_refresh_pending = true;
+        } else {
+            binding.automation_event_refresh_pending = true;
+        }
+    }
+}
+
 fn automation_event_requires_refresh(observation: &MuxEventObservation) -> bool {
     observation.event.topic == MuxEventTopic::TopologyChanged || observation.event.requires_rebase()
 }
@@ -1483,9 +3628,10 @@ fn collect_binding_automation_events(binding: &mut BindingRuntime) -> usize {
         .mux
         .drain_events(&binding.multiplexer, AUTOMATION_BACKEND_EVENT_DRAIN_LIMIT);
     let drained = observations.len();
-    binding.automation_event_refresh_pending |=
-        observations.iter().any(automation_event_requires_refresh);
-    binding.pending_automation_events.extend(observations);
+    for observation in observations {
+        binding.automation_event_refresh_pending |= automation_event_requires_refresh(&observation);
+        enqueue_automation_event(binding, observation);
+    }
     drained
 }
 
@@ -1559,13 +3705,90 @@ fn publish_pending_binding_automation_events(
     result
 }
 
+fn automation_event_mutates_terminal_cache(observation: &MuxEventObservation) -> bool {
+    matches!(
+        observation.event.topic,
+        MuxEventTopic::PaneStateChanged
+            | MuxEventTopic::PaneTitleChanged
+            | MuxEventTopic::PaneOptionsChanged
+            | MuxEventTopic::PaneForegroundChanged
+            | MuxEventTopic::PaneCwdChanged
+            | MuxEventTopic::PaneOccupantReplaced
+            | MuxEventTopic::PaneClosed
+    )
+}
+
+fn automation_observation_target_is_live(
+    binding: &BindingRuntime,
+    observation: &MuxEventObservation,
+) -> bool {
+    let Some(target) = observation.event.target.as_ref() else {
+        return false;
+    };
+    let generation = if observation.event.topic == MuxEventTopic::PaneClosed {
+        observation
+            .retired_target_generation
+            .or(observation.target_generation)
+    } else {
+        observation.target_generation
+    };
+    let Some(generation) = generation else {
+        return false;
+    };
+    if let Some(key) = automation_terminal_state_key(target, generation)
+        && binding.automation_terminal_states.contains_key(&key)
+    {
+        return true;
+    }
+    // Unit callers can apply events before any authoritative inventory exists.
+    // Once the controller has a live inventory, require an exact generation
+    // match so historical events cannot repopulate a rebased cache.
+    if binding.mux.sessions().is_empty() {
+        return true;
+    }
+    let Some(session_id) = target.session_id.as_deref() else {
+        return false;
+    };
+    let Some(window_id) = target.window_id.as_deref() else {
+        return false;
+    };
+    match (target.terminal_id.as_deref(), target.pane_id.as_deref()) {
+        (Some(terminal_id), Some(pane_id)) => {
+            binding
+                .mux
+                .terminal_id_for_pane(session_id, window_id, pane_id)
+                == Some(terminal_id)
+                && binding
+                    .mux
+                    .terminal_generation(session_id, window_id, terminal_id)
+                    == Some(generation)
+        }
+        (Some(terminal_id), None) => {
+            binding
+                .mux
+                .terminal_generation(session_id, window_id, terminal_id)
+                == Some(generation)
+        }
+        (None, Some(pane_id)) => {
+            binding.mux.pane_generation(session_id, window_id, pane_id) == Some(generation)
+        }
+        (None, None) => false,
+    }
+}
+
 fn publish_mux_event(
     automation: &AutomationHub,
-    binding: &BindingRuntime,
+    binding: &mut BindingRuntime,
     target_context: &AutomationTargetContext,
     observation: &MuxEventObservation,
 ) -> Result<(), AutomationError> {
     let event = &observation.event;
+    apply_automation_backend_event_state(binding, observation);
+    if !automation_event_mutates_terminal_cache(observation)
+        || automation_observation_target_is_live(binding, observation)
+    {
+        apply_automation_terminal_event_state(binding, observation);
+    }
     let target = automation_target_from_mux_event(binding, target_context, observation);
     let scope = automation_event_scope(event.scope);
     let provenance = json!({
@@ -1594,12 +3817,18 @@ fn publish_mux_event(
         target,
         payload,
     );
-    let topology = automation_binding_snapshot(binding, target_context);
     automation.events().publish_with_snapshots(
         publication,
-        AUTOMATION_BINDING_SNAPSHOT_TOPICS
-            .iter()
-            .map(|topic| ((*topic).to_owned(), topology.clone())),
+        AUTOMATION_BINDING_SNAPSHOT_TOPICS.iter().map(|topic| {
+            let snapshot = if AUTOMATION_TERMINAL_STATE_TOPICS.contains(topic) {
+                automation_binding_state_snapshot(binding, target_context, topic)
+            } else if AUTOMATION_BACKEND_STATE_TOPICS.contains(topic) {
+                automation_binding_backend_snapshot(binding, target_context, topic)
+            } else {
+                automation_binding_snapshot(binding, target_context)
+            };
+            ((*topic).to_owned(), snapshot)
+        }),
     )?;
     Ok(())
 }
@@ -1617,7 +3846,13 @@ fn automation_target_from_mux_event(
         ));
     };
     let session = target.session_id.as_deref()?;
-    let generation = observation.target_generation?;
+    let generation = if observation.event.topic == MuxEventTopic::PaneClosed {
+        observation
+            .retired_target_generation
+            .or(observation.target_generation)?
+    } else {
+        observation.target_generation?
+    };
     let binding_handle =
         automation_binding_handle_for_generation(binding, context, observation.binding_generation);
     match (
@@ -1850,8 +4085,8 @@ fn reconcile_binding_automation_generation(
 }
 
 /// The controller's cached topology is the UI's authoritative binding state.
-/// Backend events may be deltas, so snapshots deliberately carry this complete
-/// source view rather than re-labeling a delta as bootstrap state.
+/// Backend events may be deltas, so topology snapshots deliberately carry this
+/// complete source view rather than re-labeling a delta as bootstrap state.
 fn automation_binding_snapshot(
     binding: &BindingRuntime,
     context: &AutomationTargetContext,
@@ -1876,16 +4111,28 @@ fn install_binding_automation_sources(
     if !first_install && !force {
         return Ok(());
     }
+    rebase_automation_terminal_states(binding);
+    rebase_automation_backend_states(binding);
     let scope = automation_event_scope(binding.scope);
     let topology = automation_binding_snapshot(binding, context);
+    let terminal_snapshots = AUTOMATION_BINDING_SNAPSHOT_TOPICS
+        .iter()
+        .map(|topic| {
+            let snapshot = if AUTOMATION_TERMINAL_STATE_TOPICS.contains(topic) {
+                automation_binding_state_snapshot(binding, context, topic)
+            } else if AUTOMATION_BACKEND_STATE_TOPICS.contains(topic) {
+                automation_binding_backend_snapshot(binding, context, topic)
+            } else {
+                topology.clone()
+            };
+            ((*topic).to_owned(), snapshot)
+        })
+        .collect::<Vec<_>>();
     let result = claims
         .with_live_snapshots(|directory_snapshots| {
             let directory_snapshot = serde_json::to_value(directory_snapshots)
                 .map_err(directory_claims_automation_error)?;
-            let mut snapshots = AUTOMATION_BINDING_SNAPSHOT_TOPICS
-                .iter()
-                .map(|topic| ((*topic).to_owned(), topology.clone()))
-                .collect::<Vec<_>>();
+            let mut snapshots = terminal_snapshots.clone();
             snapshots.push(("directory.usage_changed".to_owned(), directory_snapshot));
             if first_install {
                 // A binding has no repository-wide worktree inventory until a
@@ -1928,16 +4175,30 @@ fn automation_event_topic(topic: MuxEventTopic) -> &'static str {
         MuxEventTopic::SnapshotRebased => "backend.rebased",
     }
 }
-
-fn binding_runtime_for_multiplexer(
-    config: &BoottyConfig,
+struct BindingRuntimeSpec<'a> {
+    config: &'a BoottyConfig,
     scope: MuxScope,
     label: String,
     backend_override: Option<MultiplexerBackendConfig>,
     remote_override: SpaceRemoteOverride,
     variant: AppearanceVariant,
     repaint: RepaintHandle,
-) -> Result<BindingRuntime> {
+    register_namespace: bool,
+    restore_sessions: bool,
+}
+
+fn binding_runtime_for_multiplexer(spec: BindingRuntimeSpec<'_>) -> Result<BindingRuntime> {
+    let BindingRuntimeSpec {
+        config,
+        scope,
+        label,
+        backend_override,
+        remote_override,
+        variant,
+        repaint,
+        register_namespace,
+        restore_sessions,
+    } = spec;
     let mut binding = BindingRuntime::new_with_backend_override(
         scope,
         config,
@@ -1945,9 +4206,12 @@ fn binding_runtime_for_multiplexer(
         remote_override,
         variant,
         repaint.clone(),
+        register_namespace,
     )?;
     binding.label = label;
-    binding.restore_persisted_sessions(false, &repaint)?;
+    if restore_sessions {
+        binding.restore_persisted_sessions(false, &repaint)?;
+    }
     Ok(binding)
 }
 
@@ -1973,15 +4237,17 @@ impl SpaceRuntime {
             .bindings()
             .iter()
             .map(|workspace_binding| {
-                let mut runtime = binding_runtime_for_multiplexer(
+                let mut runtime = binding_runtime_for_multiplexer(BindingRuntimeSpec {
                     config,
-                    workspace_binding.mux_scope(),
-                    workspace_binding.name().to_owned(),
-                    workspace_binding.backend_override(),
-                    workspace_binding.remote_override().clone(),
+                    scope: workspace_binding.mux_scope(),
+                    label: workspace_binding.name().to_owned(),
+                    backend_override: workspace_binding.backend_override(),
+                    remote_override: workspace_binding.remote_override().clone(),
                     variant,
-                    repaint.clone(),
-                )?;
+                    repaint: repaint.clone(),
+                    register_namespace: true,
+                    restore_sessions: true,
+                })?;
                 if workspace_binding.unavailable() {
                     runtime.mux.set_availability_error(Some(
                         "binding unavailable; reconnect to restore it".to_owned(),
@@ -2132,6 +4398,9 @@ fn network_signature() -> Option<IpAddr> {
 pub struct AppState {
     window_state_key: String,
     automation: AutomationHub,
+    /// Instance-scoped generic Luau runtime. Its command overlay is shared by
+    /// CLI/socket/palette/keybinding/Luau callers without process-global state.
+    extension_runtime: crate::extensions::ExtensionRuntime,
     directory_claims: DirectoryClaims,
     command_instance_handle: String,
     command_instance_generation: u64,
@@ -2205,19 +4474,107 @@ pub struct AppState {
     last_terminal_search: String,
     last_terminal_search_direction: TerminalSearchDirection,
     theme_picker_restore_config: Option<BoottyConfig>,
-    /// A command-palette choice waiting for the next frame's viewport and effect sink.
     pending_command: Option<CommandInvocation>,
+    pending_app_commands: Vec<PendingAppCommand>,
+    pending_extension_commands: Vec<PendingExtensionCommand>,
+    pending_completion_publications: VecDeque<PendingCompletionPublication>,
     app_command_tx: AppCommandSender,
     app_command_rx: AppCommandReceiver,
-    pending_app_commands: Vec<PendingAppCommand>,
+    reconciliation_tx: mpsc::Sender<ShutdownReconciliationCompletion>,
+    reconciliation_rx: mpsc::Receiver<ShutdownReconciliationCompletion>,
+    macos_non_native_fullscreen_active: bool,
     #[cfg(debug_assertions)]
     diagnostic_action_driver: Option<DiagnosticActionDriver>,
-    macos_non_native_fullscreen_active: bool,
     macos_non_native_fullscreen_pending_apply: bool,
 }
-
 impl Drop for AppState {
     fn drop(&mut self) {
+        self.app_command_rx.close();
+        self.pending_command = None;
+
+        for mut pending in std::mem::take(&mut self.pending_app_commands) {
+            if pending.cancellation.is_started() {
+                pending.cancellation.cancel();
+                if let Some(response) = pending.response.take() {
+                    let _ = response.send(CommandOutcome::completion_indeterminate());
+                }
+                enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Mux(
+                    ShutdownMuxReconciliation {
+                        request_id: pending.request_id,
+                        command_id: pending.command_id,
+                        command: pending.command,
+                        origin: pending.origin,
+                        binding_identity: pending.binding_identity,
+                        binding_generation: pending.binding_generation,
+                        namespace: pending.namespace,
+                        result: pending.result,
+                        deadline: pending
+                            .deadline
+                            .checked_add(SHUTDOWN_RECONCILIATION_GRACE)
+                            .unwrap_or_else(Instant::now),
+                        cancellation: pending.cancellation,
+                        target: pending.target,
+                        completion: pending.completion,
+                        reconciliation: self.reconciliation_tx.clone(),
+                        automation: self.automation.clone(),
+                        scope: automation_event_scope(pending.origin),
+                        fallback_scope: format!("instance:{}", self.command_instance_handle),
+                    },
+                ));
+            } else {
+                pending.cancellation.cancel();
+                if let Some(response) = pending.response.take() {
+                    let _ = response.send(CommandOutcome::Failed {
+                        code: "cancelled".to_owned(),
+                        message: "application command service is shutting down".to_owned(),
+                    });
+                }
+            }
+        }
+
+        for mut pending in std::mem::take(&mut self.pending_extension_commands) {
+            if pending.cancellation.is_started() {
+                pending.cancellation.cancel();
+                if let Some(response) = pending.response.take() {
+                    let _ = response.send(CommandOutcome::completion_indeterminate());
+                }
+                enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Extension(
+                    ShutdownExtensionReconciliation {
+                        request_id: pending.request_id,
+                        command_id: pending.invocation.command.clone(),
+                        invocation: pending.invocation,
+                        extension_id: pending.extension_id,
+                        generation: pending.generation,
+                        result: pending.result,
+                        deadline: pending
+                            .deadline
+                            .checked_add(SHUTDOWN_RECONCILIATION_GRACE)
+                            .unwrap_or_else(Instant::now),
+                        cancellation: pending.cancellation,
+                        target: pending.target,
+                        completion: pending.completion,
+                        reconciliation: self.reconciliation_tx.clone(),
+                        automation: self.automation.clone(),
+                        scope: format!("instance:{}", self.command_instance_handle),
+                        fallback_scope: format!("instance:{}", self.command_instance_handle),
+                    },
+                ));
+            } else {
+                pending.cancellation.cancel();
+                if let Some(response) = pending.response.take() {
+                    let _ = response.send(CommandOutcome::Failed {
+                        code: "cancelled".to_owned(),
+                        message: "application command service is shutting down".to_owned(),
+                    });
+                }
+            }
+        }
+
+        for pending in std::mem::take(&mut self.pending_completion_publications) {
+            enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Publication(pending));
+        }
+        self.automation.cancel_all_tasks();
+
         let window = WindowRef {
             instance: InstanceRef {
                 instance_id: self.command_instance_handle.clone(),
@@ -2225,24 +4582,16 @@ impl Drop for AppState {
             },
             window_id: self.window_state_key.clone(),
         };
-        let Ok(Some(revision)) = self.directory_claims.release_window_claims(&window) else {
-            return;
-        };
-
-        let payload = json!({
-            "reason": "window_closed",
-            "window_id": window.window_id,
-            "revision": revision,
-        });
-        for binding in self.binding_runtimes() {
-            let _ = publish_directory_usage_changed(
-                &self.automation,
-                &self.directory_claims,
-                binding,
-                None,
-                payload.clone(),
-            );
-        }
+        let scopes = self
+            .binding_runtimes()
+            .map(|binding| automation_event_scope(binding.scope))
+            .collect();
+        enqueue_window_claim_release(
+            self.directory_claims.clone(),
+            window,
+            self.automation.clone(),
+            scopes,
+        );
     }
 }
 
@@ -2620,16 +4969,23 @@ impl AppState {
             macos_non_native_fullscreen_active && !macos_non_native_fullscreen_applied;
         #[cfg(debug_assertions)]
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
+        let (reconciliation_tx, reconciliation_rx) =
+            mpsc::channel::<ShutdownReconciliationCompletion>();
         let (app_command_tx, app_command_rx) =
             app_command_channel_with_repaint(64, repaint.clone());
         let command_instance_handle = command_instance.instance_id;
         let command_instance_generation = command_instance.generation;
         let command_window_generation = next_window_command_generation();
         let directory_claims = process_directory_claims(&command_instance_handle)?;
+        let extension_runtime = crate::extensions::ExtensionRuntime::new(automation.clone());
+        if let Some(config_dir) = config.config_path.parent() {
+            let _ = extension_runtime.set_storage_root(config_dir.join("extensions"));
+        }
 
         let mut state = Self {
             window_state_key,
             automation,
+            extension_runtime,
             directory_claims,
             command_instance_handle,
             command_instance_generation,
@@ -2677,6 +5033,7 @@ impl AppState {
             mouse_pointer_hidden_while_typing: false,
             last_mouse_hover_pos: None,
             macos_option_as_alt,
+            macos_non_native_fullscreen_active,
             stability_trace,
             config_hot_reload,
             new_mux_session_dialog: None,
@@ -2694,15 +5051,32 @@ impl AppState {
             theme_picker_restore_config: None,
             pending_command: None,
             pending_app_commands: Vec::new(),
+            pending_extension_commands: Vec::new(),
+            pending_completion_publications: VecDeque::new(),
             app_command_tx,
             app_command_rx,
+            reconciliation_tx,
+            reconciliation_rx,
             ditch_session_dialog: None,
             keybind_help_dialog: None,
             #[cfg(debug_assertions)]
             diagnostic_action_driver,
-            macos_non_native_fullscreen_active,
             macos_non_native_fullscreen_pending_apply,
         };
+        let bundled_extensions = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extensions");
+        if let Err(error) = state
+            .extension_runtime
+            .discover_and_load(&bundled_extensions)
+        {
+            state.last_error = Some(format!("bundled extension startup failed: {error}"));
+        }
+        if let Some(config_dir) = state.config().config_path.parent()
+            && let Err(error) = state
+                .extension_runtime
+                .discover_and_load(&config_dir.join("extensions"))
+        {
+            state.last_error = Some(format!("extension startup failed: {error}"));
+        }
         state.initialize_automation_event_sources()?;
         state.record_restored_persisted_launch_claims();
         Ok(state)
@@ -2795,6 +5169,181 @@ impl AppState {
 
     pub fn automation_hub(&self) -> AutomationHub {
         self.automation.clone()
+    }
+    pub fn extension_command_registry(&self) -> crate::commands::CommandRegistry {
+        self.extension_runtime.command_registry()
+    }
+
+    fn publish_reconciled_command_completion(
+        &mut self,
+        request_id: u64,
+        command_id: &str,
+        target: Option<&CommandTarget>,
+        completion: Option<&CommandCompletionContext>,
+        outcome: &CommandOutcome,
+    ) {
+        self.publish_command_completion_event(
+            request_id, command_id, target, completion, outcome, true,
+        );
+    }
+
+    fn queue_completion_publication(&mut self, request_id: u64, publication: EventPublication) {
+        if let Some(existing) = self
+            .pending_completion_publications
+            .iter_mut()
+            .find(|pending| pending.request_id == request_id)
+        {
+            existing.publication = publication;
+            existing.fallback_scope = format!("instance:{}", self.command_instance_handle);
+            existing.attempts = 0;
+            existing.next_attempt_at = Instant::now();
+            return;
+        }
+        if self.pending_completion_publications.len() >= COMPLETION_PUBLICATION_QUEUE_LIMIT {
+            eprintln!(
+                "completion publication queue exhausted for request {request_id}; \
+                 handing publication to the reconciliation worker"
+            );
+            enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Publication(
+                PendingCompletionPublication {
+                    request_id,
+                    publication,
+                    automation: self.automation.clone(),
+                    fallback_scope: format!("instance:{}", self.command_instance_handle),
+                    attempts: COMPLETION_PUBLICATION_RETRY_LIMIT as u32,
+                    next_attempt_at: Instant::now(),
+                },
+            ));
+            return;
+        }
+        self.pending_completion_publications
+            .push_back(PendingCompletionPublication {
+                request_id,
+                publication,
+                automation: self.automation.clone(),
+                fallback_scope: format!("instance:{}", self.command_instance_handle),
+                attempts: 0,
+                next_attempt_at: Instant::now(),
+            });
+    }
+
+    fn retry_pending_completion_publications(&mut self) {
+        let attempts = self.pending_completion_publications.len();
+        for _ in 0..attempts {
+            let Some(mut pending) = self.pending_completion_publications.pop_front() else {
+                break;
+            };
+            if Instant::now() < pending.next_attempt_at {
+                self.pending_completion_publications.push_back(pending);
+                continue;
+            }
+            match pending
+                .automation
+                .publish_event(pending.publication.clone())
+            {
+                Ok(_) => {}
+                Err(error) if publication_error_is_oversized(&error) => {
+                    pending.publication = bounded_completion_publication(&pending, &error);
+                    pending.attempts = 0;
+                    pending.next_attempt_at = Instant::now();
+                    self.pending_completion_publications.push_back(pending);
+                }
+                Err(error)
+                    if publication_error_is_retired_scope(&error)
+                        && pending.publication.scope != pending.fallback_scope =>
+                {
+                    pending.publication.scope = pending.fallback_scope.clone();
+                    pending.attempts = 0;
+                    pending.next_attempt_at = Instant::now();
+                    self.pending_completion_publications.push_back(pending);
+                }
+                Err(error) => {
+                    pending.attempts = pending.attempts.saturating_add(1);
+                    pending.next_attempt_at =
+                        Instant::now() + completion_publication_retry_delay(pending.attempts);
+                    eprintln!(
+                        "completion publication retry {} failed for request {}: {error}",
+                        pending.attempts, pending.request_id
+                    );
+                    if pending.attempts >= COMPLETION_PUBLICATION_RETRY_LIMIT as u32 {
+                        eprintln!(
+                            "completion publication retry limit reached for request {}; \
+                             handing publication to the reconciliation worker",
+                            pending.request_id
+                        );
+                        enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Publication(
+                            pending,
+                        ));
+                    } else {
+                        self.pending_completion_publications.push_back(pending);
+                    }
+                }
+            }
+        }
+    }
+
+    fn publish_command_completion_event(
+        &mut self,
+        request_id: u64,
+        command_id: &str,
+        target: Option<&CommandTarget>,
+        completion: Option<&CommandCompletionContext>,
+        outcome: &CommandOutcome,
+        reconciled: bool,
+    ) {
+        let target = completion
+            .and_then(|completion| completion.target.as_ref())
+            .or(target);
+        let outcome = bounded_command_outcome(outcome.clone());
+        let outcome = serde_json::to_value(&outcome).unwrap_or_else(|error| {
+            json!({
+                "status": "failed",
+                "code": "result_too_large",
+                "message": error.to_string(),
+            })
+        });
+        let publication = EventPublication::new(
+            format!("instance:{}", self.command_instance_handle),
+            "command.completed",
+            json!({
+                "source": "app_state",
+                "reconciled": reconciled,
+                "request_id": request_id,
+                "caller": completion.map(|completion| completion.caller),
+                "owner_pid": completion.map(|completion| completion.owner_pid),
+                "owner_generation": completion.map(|completion| completion.owner_generation),
+            }),
+            target.cloned(),
+            json!({
+                "command": command_id,
+                "request_id": request_id,
+                "reconciled": reconciled,
+                "target": target,
+                "outcome": outcome,
+            }),
+        );
+        if let Err(error) = self.automation.publish_event(publication.clone()) {
+            eprintln!("command completion publication failed for request {request_id}: {error}");
+            self.queue_completion_publication(request_id, publication);
+        }
+    }
+    fn completion_target_for_invocation(
+        &self,
+        invocation: &CommandInvocation,
+    ) -> Option<CommandTarget> {
+        let resolved = self
+            .extension_runtime
+            .command_registry()
+            .resolve(invocation.clone())
+            .ok()?;
+        self.resolve_command_target(
+            resolved.descriptor.id.as_str(),
+            resolved.descriptor.target,
+            resolved.invocation.target.as_ref(),
+        )
+        .ok()
+        .flatten()
+        .map(|target| target.target)
     }
 
     pub fn publish_automation_event(
@@ -3301,6 +5850,9 @@ impl AppState {
     /// so the hot-reload baseline is refreshed to skip the redundant reload the write would trigger.
     pub fn persist_sidebar_width(&mut self, width: f32) {
         let path = self.config().config_path.clone();
+        let previous_width = load_config_from_path(&path)
+            .ok()
+            .map(|config| config.chrome.sidebar_width);
         let result = (|| {
             let mut document = load_or_create_config_document(&path)?;
             document.set_item(
@@ -3311,7 +5863,12 @@ impl AppState {
         })();
         match result {
             Ok(()) => self.config_hot_reload.refresh_after_reload(&path),
-            Err(error) => self.last_error = Some(error.to_string()),
+            Err(error) => {
+                if let Some(previous_width) = previous_width {
+                    self.config_state.current_mut().chrome.sidebar_width = previous_width;
+                }
+                self.last_error = Some(error.to_string());
+            }
         }
     }
 
@@ -3332,8 +5889,9 @@ impl AppState {
         })();
         match result {
             Ok(()) => {
-                self.config_hot_reload.refresh_after_reload(&path);
-                self.reload_config(effects);
+                if self.reload_config(effects) {
+                    self.config_hot_reload.refresh_after_reload(&path);
+                }
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -3355,8 +5913,9 @@ impl AppState {
         })();
         match result {
             Ok(()) => {
-                self.config_hot_reload.refresh_after_reload(&path);
-                self.reload_config(effects);
+                if self.reload_config(effects) {
+                    self.config_hot_reload.refresh_after_reload(&path);
+                }
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -3593,6 +6152,23 @@ impl AppState {
         self.activate_space_from_ui(id)
     }
 
+    fn reject_space_transition_with_pending_commands(&mut self, space_id: SpaceId) -> bool {
+        let mut commands_in_flight = false;
+        for pending in &self.pending_app_commands {
+            if pending.origin.space_id() == space_id {
+                pending.cancellation.request_cancel();
+                commands_in_flight = true;
+            }
+        }
+        if commands_in_flight {
+            self.last_error = Some(
+                "commands_in_flight: wait for command reconciliation before changing this Space"
+                    .to_owned(),
+            );
+        }
+        commands_in_flight
+    }
+
     pub fn close_space_from_ui(&mut self, space_id: SpaceId) -> bool {
         let spaces = self.space_summaries();
         if spaces.len() <= 1 {
@@ -3601,6 +6177,9 @@ impl AppState {
         let Some(index) = spaces.iter().position(|space| space.id == space_id) else {
             return false;
         };
+        if self.reject_space_transition_with_pending_commands(space_id) {
+            return false;
+        }
         if space_id == self.active_space_id {
             let neighbor = spaces
                 .get(index + 1)
@@ -3613,8 +6192,60 @@ impl AppState {
         let mut workspace = WorkspaceStore::for_config_path(&config_path);
         match workspace.delete_space(space_id) {
             Ok(true) => {
+                let claims_context = DirectoryClaimsContext {
+                    instance: InstanceRef {
+                        instance_id: self.command_instance_handle.clone(),
+                        generation: self.command_instance_generation,
+                    },
+                    window_id: self.window_state_key.clone(),
+                };
+                let mut release_error = None;
+                if let Some(space) = self
+                    .inactive_spaces
+                    .iter()
+                    .find(|space| space.id == space_id)
+                {
+                    for binding in space.bindings() {
+                        let binding_ref = directory_binding_ref(&claims_context, binding);
+                        match self
+                            .directory_claims
+                            .reconcile_live_claimants(&binding_ref, Vec::new())
+                        {
+                            Ok(Some(revision)) => {
+                                if let Err(error) = publish_directory_usage_changed(
+                                    &self.automation,
+                                    &self.directory_claims,
+                                    binding,
+                                    None,
+                                    json!({
+                                        "reason": "space_closed",
+                                        "space_id": space_id.persistence_value(),
+                                        "revision": revision,
+                                    }),
+                                ) {
+                                    release_error = Some(error.to_string());
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                enqueue_binding_claim_release(
+                                    self.directory_claims.clone(),
+                                    binding_ref.clone(),
+                                    self.automation.clone(),
+                                    vec![automation_event_scope(binding.scope)],
+                                );
+                                release_error = Some(format!(
+                                    "{error}; durable space claim cleanup queued for retry"
+                                ));
+                            }
+                        }
+                    }
+                }
                 self.inactive_spaces.retain(|space| space.id != space_id);
                 self.synchronize_live_binding_event_scopes();
+                if let Some(error) = release_error {
+                    self.last_error = Some(error);
+                }
                 true
             }
             Ok(false) => false,
@@ -3643,6 +6274,13 @@ impl AppState {
         };
         let previous_remote = self.space_remote_override(space_id);
         let resolved_backend = backend_override.unwrap_or(self.config().multiplexer.backend);
+        // Name/icon/color edits retain the binding runtime and are safe while a command is
+        // completing. Backend, remote, or binding-identity changes must wait for reconciliation.
+        let backend_changed = previous_override != backend_override
+            || previous_remote.as_ref() != Some(&remote_override);
+        if backend_changed && self.reject_space_transition_with_pending_commands(space_id) {
+            return false;
+        }
         let app_key_bindings = if space_id == self.active_space_id {
             let keybinds = self.config().input.keybinds_for_backend(resolved_backend);
             match AppKeyBindings::from_keybinds(&keybinds) {
@@ -3657,13 +6295,13 @@ impl AppState {
         };
         // The remote decides which machine the binding's sessions live on, so a change to it needs
         // the same rebuild a backend change does.
-        let backend_changed = previous_override != backend_override
-            || previous_remote.as_ref() != Some(&remote_override);
         let config_path = self.config().config_path.clone();
         let mut workspace = WorkspaceStore::for_config_path(&config_path);
         let runtime_config = self.config().clone();
         let active_appearance_variant = self.active_appearance_variant;
         let repaint = self.repaint.clone();
+        let mut replacement_namespace = None;
+        let mut replacement_binding_id = None;
         let mut replacement = if backend_changed {
             let binding = if space_id == self.active_space_id {
                 Some(&self.binding)
@@ -3676,16 +6314,25 @@ impl AppState {
             let Some(binding) = binding else {
                 return false;
             };
-            match binding_runtime_for_multiplexer(
-                &runtime_config,
-                binding.scope,
-                binding.label.clone(),
+            match binding_runtime_for_multiplexer(BindingRuntimeSpec {
+                config: &runtime_config,
+                scope: binding.scope,
+                label: binding.label.clone(),
                 backend_override,
-                remote_override.clone(),
-                active_appearance_variant,
-                repaint.clone(),
-            ) {
-                Ok(binding) => Some(binding),
+                remote_override: remote_override.clone(),
+                variant: active_appearance_variant,
+                repaint: repaint.clone(),
+                register_namespace: false,
+                restore_sessions: false,
+            }) {
+                Ok(binding) => {
+                    replacement_binding_id = Some(binding.scope.binding_id().persistence_value());
+                    replacement_namespace = Some(
+                        namespace_for_binding(binding.scope, &binding.multiplexer)
+                            .persistence_key(),
+                    );
+                    Some(binding)
+                }
                 Err(error) => {
                     self.last_error = Some(error.to_string());
                     return false;
@@ -3694,7 +6341,27 @@ impl AppState {
         } else {
             None
         };
-        match workspace.update_space(space_id, name, icon, color, tint_sidebar, mux) {
+        let update = if backend_changed {
+            workspace.update_space_with_namespace(
+                WorkspaceSpaceUpdate {
+                    id: space_id,
+                    name,
+                    icon,
+                    color,
+                    tint_sidebar,
+                    mux,
+                },
+                WorkspaceNamespaceUpdateContext {
+                    binding_id: replacement_binding_id.expect("changed backend has a binding"),
+                    namespace: replacement_namespace
+                        .as_deref()
+                        .expect("changed backend has a namespace"),
+                },
+            )
+        } else {
+            workspace.update_space(space_id, name, icon, color, tint_sidebar, mux)
+        };
+        match update {
             Ok(true) => {
                 if space_id == self.active_space_id {
                     self.active_space_name = name.trim().to_owned();
@@ -3705,6 +6372,10 @@ impl AppState {
                         self.binding = replacement
                             .take()
                             .expect("changed backend has a prepared binding");
+                        if let Err(error) = self.binding.restore_persisted_sessions(false, &repaint)
+                        {
+                            self.last_error = Some(error.to_string());
+                        }
                         self.app_key_bindings =
                             app_key_bindings.expect("active backend bindings were validated");
                         self.terminal_surface = None;
@@ -3726,6 +6397,11 @@ impl AppState {
                         space.binding = replacement
                             .take()
                             .expect("changed backend has a prepared binding");
+                        if let Err(error) =
+                            space.binding.restore_persisted_sessions(false, &repaint)
+                        {
+                            self.last_error = Some(error.to_string());
+                        }
                     }
                 }
                 true
@@ -3809,6 +6485,20 @@ impl AppState {
             }
         };
         let switch_started = crate::diagnostics::latency_start();
+        let phase = crate::diagnostics::latency_start();
+        let config_path = self.config().config_path.clone();
+        let workspace = match WorkspaceStore::try_for_config_path(&config_path) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return false;
+            }
+        };
+        if let Err(error) = workspace.set_selected_space(&self.window_state_key, space_id) {
+            self.last_error = Some(error.to_string());
+            return false;
+        }
+        crate::diagnostics::trace_phase("space.persist_selected_space", phase);
         self.persist_active_binding_restore_state();
         crate::diagnostics::trace_phase("space.persist_restore_state", switch_started);
         // Leave the outgoing space's tmux overrides in place. It keeps a live runtime, so its
@@ -3909,14 +6599,6 @@ impl AppState {
             to: self.active_space_id,
             started: Instant::now(),
         });
-        let phase = crate::diagnostics::latency_start();
-        let workspace = WorkspaceStore::for_config_path(&self.config().config_path);
-        if let Err(error) =
-            workspace.set_selected_space(&self.window_state_key, self.active_space_id)
-        {
-            self.last_error = Some(error.to_string());
-        }
-        crate::diagnostics::trace_phase("space.persist_selected_space", phase);
         self.app_key_bindings = app_key_bindings;
         self.terminal_surface = None;
         self.last_pane_area = None;
@@ -4089,6 +6771,20 @@ impl AppState {
         self.binding_runtimes_mut()
             .find(|binding| binding.scope == scope)
     }
+    fn binding_identity(&self, binding: &BindingRuntime) -> BindingRef {
+        BindingRef {
+            window: WindowRef {
+                instance: InstanceRef {
+                    instance_id: self.command_instance_handle.clone(),
+                    generation: self.command_instance_generation,
+                },
+                window_id: self.window_state_key.clone(),
+            },
+            space_id: binding.scope.space_id().persistence_value().to_string(),
+            binding_id: binding.scope.binding_id().persistence_value().to_string(),
+            generation: 0,
+        }
+    }
 
     fn binding_runtimes_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
         std::iter::once(&mut self.binding)
@@ -4126,6 +6822,49 @@ impl AppState {
         }
         for binding in self.binding_runtimes_mut() {
             binding.terminal.set_feature_config(features)?;
+        }
+        Ok(())
+    }
+
+    fn apply_terminal_reload(
+        &mut self,
+        previous: &BoottyConfig,
+        next: &BoottyConfig,
+    ) -> Result<()> {
+        let colors_changed = previous.colors_for_appearance(self.active_appearance_variant)
+            != next.colors_for_appearance(self.active_appearance_variant);
+        let cursor_changed = previous.cursor != next.cursor;
+        let features_changed = previous.session.glyph_protocol != next.session.glyph_protocol;
+        let result = (|| {
+            if colors_changed {
+                self.set_binding_terminal_colors(
+                    next.colors_for_appearance(self.active_appearance_variant)
+                        .terminal_color_config(),
+                )?;
+            }
+            if cursor_changed {
+                self.set_binding_cursor_config(next.cursor.terminal_cursor_config())?;
+            }
+            if features_changed {
+                self.set_binding_feature_config(next.session.terminal_feature_config())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if features_changed {
+                let _ = self.set_binding_feature_config(previous.session.terminal_feature_config());
+            }
+            if cursor_changed {
+                let _ = self.set_binding_cursor_config(previous.cursor.terminal_cursor_config());
+            }
+            if colors_changed {
+                let _ = self.set_binding_terminal_colors(
+                    previous
+                        .colors_for_appearance(self.active_appearance_variant)
+                        .terminal_color_config(),
+                );
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -5453,6 +8192,7 @@ impl AppState {
                     cwd,
                     name: desired.clone(),
                     display_name,
+                    previous_display_name: None,
                 },
             );
             renames.push((session.id.clone(), desired));
@@ -5516,6 +8256,15 @@ impl AppState {
             self.last_error = command_outcome_message(&outcome);
             return;
         }
+        if let Err(error) = persist_session_launch_plan(
+            &self.config().config_path,
+            self.binding.scope.binding_id().persistence_value(),
+            &plan,
+        ) {
+            self.last_error = Some(format!("persisting session launch plan failed: {error}"));
+            return;
+        }
+        let plan_id = plan.session_id.clone();
         let origin = self.binding.scope;
         let pending = match self.enqueue_authoritative_mux_command(
             "session.create",
@@ -5528,22 +8277,59 @@ impl AppState {
                 command,
                 command_id,
                 origin,
+                binding_identity,
+                binding_generation,
+                namespace,
                 target,
                 deadline,
                 cancellation,
                 result,
             } => PendingAppCommand {
+                request_id: next_app_command_reconciliation_id(),
                 command,
                 command_id,
                 origin,
+                binding_identity,
+                binding_generation,
+                namespace,
                 target,
                 deadline,
                 cancellation,
                 response: None,
+                completion: None,
+                rename: None,
                 result,
             },
             CommandDispatch::Complete(outcome) => {
-                self.last_error = command_outcome_message(&outcome);
+                let cleanup_error = delete_session_launch_plan(
+                    &self.config().config_path,
+                    self.binding.scope.binding_id().persistence_value(),
+                    &plan_id,
+                )
+                .err()
+                .map(|error| error.to_string());
+                self.binding.session_order.forget_session_cache(&plan_id);
+                self.last_error = cleanup_error
+                    .map(|error| format!("session launch cleanup failed: {error}"))
+                    .or_else(|| command_outcome_message(&outcome));
+                return;
+            }
+            CommandDispatch::ExtensionPending { .. } => {
+                let outcome = CommandOutcome::Failed {
+                    code: "execution_failed".to_owned(),
+                    message: "authoritative mux enqueue returned extension pending".to_owned(),
+                };
+                let cleanup_error = delete_session_launch_plan(
+                    &self.config().config_path,
+                    self.binding.scope.binding_id().persistence_value(),
+                    &plan_id,
+                )
+                .err()
+                .map(|error| error.to_string());
+                self.binding.session_order.forget_session_cache(&plan_id);
+                self.last_error = cleanup_error
+                    .map(|error| format!("session launch cleanup failed: {error}"))
+                    .or_else(|| command_outcome_message(&outcome));
                 return;
             }
         };
@@ -5553,6 +8339,7 @@ impl AppState {
                 cwd: cwd.clone(),
                 name: session_id.clone(),
                 display_name: display_name.clone(),
+                previous_display_name: None,
             },
         );
         self.binding.session_names.remember_generated(
@@ -5741,9 +8528,14 @@ impl AppState {
             else {
                 return Ok(false);
             };
-            if !binding.session_order.remove_session(&name)? {
-                return Ok(false);
-            }
+            let plan_ids = [target.session_id.as_str(), name.as_str()];
+            remove_session_membership_and_launch_plan(
+                &binding.workspace_config_path,
+                target.scope.binding_id().persistence_value(),
+                &name,
+                &plan_ids,
+            )?;
+            binding.session_order.forget_session_cache(&name);
             binding.sync_session_order()?;
             Ok(true)
         })();
@@ -5796,10 +8588,13 @@ impl AppState {
                     }
                     Ok(())
                 })();
+                let activation_succeeded = result.is_ok();
                 if let Err(error) = result {
                     self.record_session_order_error(error);
                 }
-                self.activate_scoped_session_from_ui(&target);
+                if activation_succeeded {
+                    self.activate_scoped_session_from_ui(&target);
+                }
             }
         }
     }
@@ -5836,6 +8631,13 @@ impl AppState {
                         .as_deref()
                         .map(Self::session_root)
                         .unwrap_or_default();
+                    let previous_display_name = self
+                        .binding
+                        .session_names
+                        .display_name(&session.id)
+                        .map(str::to_owned)
+                        .or_else(|| Some(session.name.clone()));
+
                     // The typed name is what bootty shows. The backend still needs a name no other
                     // session on the server holds, so it may carry a suffix the sidebar never shows.
                     let taken = self.taken_session_names(Some(session.name.as_str()));
@@ -5843,35 +8645,105 @@ impl AppState {
                         &name,
                         taken.iter().map(String::as_str),
                     );
-                    match self
-                        .binding
-                        .session_order
-                        .rename_session(&session.name, &backend_name)
-                    {
-                        Ok(_) => {
-                            self.binding.pending_generated_names.insert(
-                                backend_name.clone(),
-                                PendingGeneratedName {
-                                    cwd: cwd.clone(),
-                                    name: backend_name.clone(),
-                                    display_name: name.clone(),
-                                },
-                            );
-                            self.binding.session_names.mark_explicit(
-                                &session.id,
-                                &backend_name,
-                                &name,
-                                &cwd,
-                            );
-                            let mux_config = self.active_multiplexer().clone();
-                            self.binding.mux.rename_session(
-                                &session.id,
-                                backend_name,
-                                &self.repaint,
-                                &mux_config,
-                            );
+                    let command_id =
+                        format!("session.rename.{}", next_app_command_reconciliation_id());
+                    let rename = PendingSessionRename {
+                        session_id: session.id.clone(),
+                        old_name: session.name.clone(),
+                        new_name: backend_name.clone(),
+                        display_name: name.clone(),
+                        cwd: cwd.clone(),
+                    };
+                    let binding_id = self.binding.scope.binding_id().persistence_value();
+                    if let Err(error) = persist_pending_session_rename(
+                        &self.binding.workspace_config_path,
+                        binding_id,
+                        &command_id,
+                        &rename,
+                    ) {
+                        self.record_session_order_error(error);
+                    } else {
+                        let command = MuxCommand::RenameSession {
+                            session_id: session.id.clone(),
+                            name: backend_name.clone(),
+                        };
+                        match self.enqueue_authoritative_mux_command(
+                            command_id.clone(),
+                            command,
+                            self.binding.scope,
+                            None,
+                            None,
+                        ) {
+                            CommandDispatch::Pending {
+                                command,
+                                command_id,
+                                origin,
+                                binding_identity,
+                                binding_generation,
+                                namespace,
+                                target,
+                                deadline,
+                                cancellation,
+                                result,
+                            } => {
+                                self.binding.pending_generated_names.insert(
+                                    backend_name.clone(),
+                                    PendingGeneratedName {
+                                        cwd: cwd.clone(),
+                                        name: backend_name.clone(),
+                                        display_name: name.clone(),
+                                        previous_display_name,
+                                    },
+                                );
+                                self.binding
+                                    .session_names
+                                    .set_display_name(&session.id, &name);
+                                self.pending_app_commands.push(PendingAppCommand {
+                                    request_id: next_app_command_reconciliation_id(),
+                                    command,
+                                    command_id,
+                                    origin,
+                                    binding_identity,
+                                    binding_generation,
+                                    namespace,
+                                    target,
+                                    deadline,
+                                    cancellation,
+                                    response: None,
+                                    completion: None,
+                                    rename: Some(rename),
+                                    result,
+                                });
+                                self.persist_rmux_restore_state();
+                            }
+                            CommandDispatch::Complete(outcome) => {
+                                let cleanup = clear_pending_session_rename(
+                                    &self.binding.workspace_config_path,
+                                    binding_id,
+                                    &command_id,
+                                );
+                                self.last_error = cleanup
+                                    .err()
+                                    .map(|error| format!("session rename cleanup failed: {error}"))
+                                    .or_else(|| command_outcome_message(&outcome));
+                            }
+                            CommandDispatch::ExtensionPending { .. } => {
+                                let outcome = CommandOutcome::Failed {
+                                    code: "execution_failed".to_owned(),
+                                    message: "authoritative mux enqueue returned extension pending"
+                                        .to_owned(),
+                                };
+                                let cleanup = clear_pending_session_rename(
+                                    &self.binding.workspace_config_path,
+                                    binding_id,
+                                    &command_id,
+                                );
+                                self.last_error = cleanup
+                                    .err()
+                                    .map(|error| format!("session rename cleanup failed: {error}"))
+                                    .or_else(|| command_outcome_message(&outcome));
+                            }
                         }
-                        Err(error) => self.record_session_order_error(error),
                     }
                 }
                 self.input_focus = InputFocus::Terminal;
@@ -5929,7 +8801,6 @@ impl AppState {
             }
             TerminalFindEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
-                self.clear_terminal_search();
                 self.terminal_find_return_focus_after_search = false;
             }
             TerminalFindEvent::FocusFind => {
@@ -5974,36 +8845,137 @@ impl AppState {
                 cwd,
                 action,
                 confirmation,
-            } => match run_ditch_cleanup(
-                self,
-                &session_id,
-                cwd.as_deref(),
-                &action,
-                confirmation.as_deref(),
-            ) {
-                Ok(()) => {
-                    let mux_config = self.active_multiplexer().clone();
-                    self.binding
-                        .mux
-                        .ditch_session(&session_id, &self.repaint, &mux_config);
-                    if self.is_native() {
-                        self.prune_native_terminal_snapshot();
-                        self.sync_native_layout_terminal_now();
+            } => {
+                let command_session_id = self
+                    .binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .find(|session| session.id == session_id || session.name == session_id)
+                    .map(|session| session.name.clone())
+                    .unwrap_or_else(|| session_id.clone());
+                let action_json = match serde_json::to_string(&action) {
+                    Ok(action_json) => action_json,
+                    Err(error) => {
+                        self.last_error =
+                            Some(format!("serializing pending ditch intent failed: {error}"));
+                        self.ditch_session_dialog = Some(dialog);
+                        return;
                     }
-                    self.input_focus = InputFocus::Terminal;
-                }
-                Err(DitchCleanupError::ConfirmationRequired(confirmation)) => {
-                    dialog.require_worktree_removal_confirmation(action, *confirmation);
+                };
+                if let Err(error) = persist_pending_ditch(
+                    &self.binding.workspace_config_path,
+                    self.binding.scope.binding_id().persistence_value(),
+                    &command_session_id,
+                    cwd.as_deref(),
+                    &action_json,
+                ) {
+                    self.last_error =
+                        Some(format!("persisting pending ditch intent failed: {error}"));
                     self.ditch_session_dialog = Some(dialog);
+                    return;
                 }
-                Err(error) => {
-                    // The git cleanup failed; keep the session alive and re-show the
-                    // dialog so the user sees the error instead of losing the session
-                    // on top of an orphaned worktree.
-                    self.last_error = Some(format!("ditch: {error}"));
-                    self.ditch_session_dialog = Some(dialog);
+                match run_ditch_cleanup(
+                    self,
+                    &session_id,
+                    cwd.as_deref(),
+                    &action,
+                    confirmation.as_deref(),
+                ) {
+                    Ok(()) => {
+                        let pending_ditch_session_id = command_session_id.clone();
+                        let command = MuxCommand::DitchSession {
+                            session_id: command_session_id,
+                        };
+                        match self.enqueue_authoritative_mux_command(
+                            "session.ditch",
+                            command,
+                            self.binding.scope,
+                            None,
+                            None,
+                        ) {
+                            CommandDispatch::Pending {
+                                command,
+                                command_id,
+                                origin,
+                                binding_identity,
+                                binding_generation,
+                                namespace,
+                                target,
+                                deadline,
+                                cancellation,
+                                result,
+                            } => {
+                                self.pending_app_commands.push(PendingAppCommand {
+                                    request_id: next_app_command_reconciliation_id(),
+                                    command,
+                                    command_id,
+                                    origin,
+                                    binding_identity,
+                                    binding_generation,
+                                    namespace,
+                                    target,
+                                    deadline,
+                                    cancellation,
+                                    response: None,
+                                    completion: None,
+                                    rename: None,
+                                    result,
+                                });
+                                let _ = self.drain_pending_app_commands(Instant::now());
+                                self.input_focus = InputFocus::Terminal;
+                            }
+                            CommandDispatch::Complete(outcome) => {
+                                let _ = clear_pending_ditch(
+                                    &self.binding.workspace_config_path,
+                                    self.binding.scope.binding_id().persistence_value(),
+                                    &pending_ditch_session_id,
+                                );
+                                self.last_error = command_outcome_message(&outcome);
+                                self.ditch_session_dialog = Some(dialog);
+                            }
+                            CommandDispatch::ExtensionPending { .. } => {
+                                let _ = clear_pending_ditch(
+                                    &self.binding.workspace_config_path,
+                                    self.binding.scope.binding_id().persistence_value(),
+                                    &pending_ditch_session_id,
+                                );
+                                let outcome = CommandOutcome::Failed {
+                                    code: "execution_failed".to_owned(),
+                                    message: "authoritative mux enqueue returned extension pending"
+                                        .to_owned(),
+                                };
+                                self.last_error = command_outcome_message(&outcome);
+                                self.ditch_session_dialog = Some(dialog);
+                            }
+                        }
+                    }
+                    Err(DitchCleanupError::ConfirmationRequired(confirmation)) => {
+                        dialog.require_worktree_removal_confirmation(action, *confirmation);
+                        self.ditch_session_dialog = Some(dialog);
+                    }
+                    Err(DitchCleanupError::StaleTarget(message)) => {
+                        let _ = clear_pending_ditch(
+                            &self.binding.workspace_config_path,
+                            self.binding.scope.binding_id().persistence_value(),
+                            &command_session_id,
+                        );
+                        self.last_error = Some(format!("ditch: {message}"));
+                        self.ditch_session_dialog = Some(DitchSessionDialog::open(session_id, cwd));
+                    }
+                    Err(error) => {
+                        // The git cleanup failed; clear the one-shot intent so a partial/CAS
+                        // failure is retried only after the user confirms a fresh action.
+                        let _ = clear_pending_ditch(
+                            &self.binding.workspace_config_path,
+                            self.binding.scope.binding_id().persistence_value(),
+                            &command_session_id,
+                        );
+                        self.last_error = Some(format!("ditch: {error}"));
+                        self.ditch_session_dialog = Some(dialog);
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -6051,7 +9023,9 @@ impl AppState {
                 else {
                     return;
                 };
-                if let Some(kind) = CommandRegistry::core()
+                if let Some(kind) = self
+                    .extension_runtime
+                    .command_registry()
                     .describe(&invocation.command)
                     .and_then(|descriptor| descriptor.target)
                 {
@@ -7079,7 +10053,10 @@ impl AppState {
             && !self.settings_open
     }
 
-    fn rebuild_profile_bindings(&mut self, config: &BoottyConfig) -> Result<()> {
+    fn prepare_profile_bindings(
+        &self,
+        config: &BoottyConfig,
+    ) -> Result<Vec<(MuxScope, BindingRuntime)>> {
         let repaint = self.repaint.clone();
         let variant = self.active_appearance_variant;
         let specs = self
@@ -7094,27 +10071,47 @@ impl AppState {
                 )
             })
             .collect::<Vec<_>>();
-        let replacements = specs
+        specs
             .into_iter()
             .map(|(scope, label, backend_override, remote_override)| {
-                binding_runtime_for_multiplexer(
+                binding_runtime_for_multiplexer(BindingRuntimeSpec {
                     config,
                     scope,
                     label,
                     backend_override,
                     remote_override,
                     variant,
-                    repaint.clone(),
-                )
+                    repaint: repaint.clone(),
+                    register_namespace: false,
+                    restore_sessions: false,
+                })
+                .map(|binding| (scope, binding))
             })
-            .collect::<Result<Vec<_>>>()?;
-        for (binding, replacement) in self
-            .binding_runtimes_mut()
-            .filter(|binding| matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)))
-            .zip(replacements)
-        {
-            *binding = replacement;
+            .collect()
+    }
+
+    fn commit_profile_bindings(&mut self, replacements: Vec<(MuxScope, BindingRuntime)>) {
+        for (scope, replacement) in replacements {
+            if let Some(binding) = self.binding_runtime_mut(scope) {
+                *binding = replacement;
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn rebuild_profile_bindings(&mut self, config: &BoottyConfig) -> Result<()> {
+        let replacements = self.prepare_profile_bindings(config)?;
+        if !replacements.is_empty() {
+            let path = self.config().config_path.clone();
+            let namespaces = replacements.iter().map(|(scope, binding)| {
+                (
+                    scope.binding_id().persistence_value(),
+                    namespace_for_binding(*scope, &binding.multiplexer),
+                )
+            });
+            SessionOrderStore::register_namespaces(&path, namespaces)?;
+        }
+        self.commit_profile_bindings(replacements);
         Ok(())
     }
 
@@ -7129,6 +10126,13 @@ impl AppState {
                 return false;
             }
         };
+        if next.multiplexer != previous.multiplexer {
+            let error =
+                "live multiplexer changes are unsupported; restart to apply the new backend";
+            self.config_state.reject(error);
+            self.last_error = self.config_state.last_error().map(str::to_owned);
+            return false;
+        }
         let compatibility_warning = (!next.compatibility_warnings.is_empty())
             .then(|| next.compatibility_warnings.join("; "));
         let modifier_remaps = match next.input.modifier_remaps() {
@@ -7160,58 +10164,84 @@ impl AppState {
                 }
             };
 
-        let previous_colors = previous.colors_for_appearance(self.active_appearance_variant);
-        let next_colors = next.colors_for_appearance(self.active_appearance_variant);
-        if previous_colors != next_colors
-            && let Err(error) =
-                self.set_binding_terminal_colors(next_colors.terminal_color_config())
-        {
+        let mut profile_replacements = if previous.ssh_profiles != next.ssh_profiles {
+            match self.prepare_profile_bindings(&next) {
+                Ok(replacements) => replacements,
+                Err(error) => {
+                    self.config_state.reject(error.to_string());
+                    self.last_error = self.config_state.last_error().map(str::to_owned);
+                    return false;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        // A profile replacement may still fail at the namespace commit. Defer all active order
+        // writes in that case so a rejected profile reload cannot alter unrelated session state.
+        let active_order = if !profile_replacements.is_empty() {
+            None
+        } else {
+            let binding_id = self.binding.scope.binding_id().persistence_value();
+            let namespace = namespace_for_binding(self.binding.scope, &self.binding.multiplexer);
+            if let Err(error) =
+                SessionOrderStore::for_binding_preflight(&path, binding_id, namespace)
+            {
+                self.config_state.reject(error.to_string());
+                self.last_error = self.config_state.last_error().map(str::to_owned);
+                return false;
+            }
+            let session_order = self.binding.session_order.clone();
+            let ordered_alive = self
+                .binding
+                .mux
+                .all_sessions()
+                .iter()
+                .map(|session| session.name.clone())
+                .collect::<Vec<_>>();
+            Some((session_order, ordered_alive))
+        };
+
+        if let Err(error) = self.apply_terminal_reload(&previous, &next) {
             self.config_state.reject(error.to_string());
             self.last_error = self.config_state.last_error().map(str::to_owned);
             return false;
         }
-        if previous.cursor != next.cursor
-            && let Err(error) = self.set_binding_cursor_config(next.cursor.terminal_cursor_config())
-        {
-            self.config_state.reject(error.to_string());
-            self.last_error = self.config_state.last_error().map(str::to_owned);
-            return false;
-        }
-        if previous.session.glyph_protocol != next.session.glyph_protocol
-            && let Err(error) =
-                self.set_binding_feature_config(next.session.terminal_feature_config())
-        {
-            self.config_state.reject(error.to_string());
-            self.last_error = self.config_state.last_error().map(str::to_owned);
-            return false;
-        }
-        if previous.font != next.font {
-            effects.push(AppEffect::SetTerminalTextConfig(
-                next.font.terminal_text_config(),
-            ));
-            if previous.font.ui_families() != next.font.ui_families() {
-                effects.push(AppEffect::SetUiFonts(next.font.ui_families().to_vec()));
+        let active_order = match active_order {
+            Some((mut session_order, ordered_alive)) => {
+                match session_order
+                    .sync_sessions(ordered_alive.iter().map(|session| session.as_str()))
+                {
+                    Ok(ordered_names) => Some((session_order, ordered_names)),
+                    Err(error) => {
+                        #[cfg(test)]
+                        self.binding.session_order.clear_save_failure_for_test();
+                        let _ = self.apply_terminal_reload(&next, &previous);
+                        self.config_state.reject(error.to_string());
+                        self.last_error = self.config_state.last_error().map(str::to_owned);
+                        return false;
+                    }
+                }
+            }
+            None => None,
+        };
+
+        if !profile_replacements.is_empty() {
+            let namespaces = profile_replacements.iter().map(|(scope, binding)| {
+                (
+                    scope.binding_id().persistence_value(),
+                    namespace_for_binding(*scope, &binding.multiplexer),
+                )
+            });
+            if let Err(error) = SessionOrderStore::register_namespaces(&path, namespaces) {
+                let _ = self.apply_terminal_reload(&next, &previous);
+                self.config_state.reject(error.to_string());
+                self.last_error = self.config_state.last_error().map(str::to_owned);
+                return false;
             }
         }
-        if previous.window.title != next.window.title {
-            effects.push(AppEffect::SetWindowTitle(next.window.title.clone()));
-        }
-        if previous.diagnostics != next.diagnostics {
-            self.stability_trace = StabilityTrace::from_config(&next);
-        }
 
-        self.modifier_remaps = modifier_remaps;
-        self.macos_option_as_alt = next.input.macos_option_as_alt.into();
-        self.app_key_bindings = app_key_bindings;
-        self.sidebar_key_bindings = sidebar_key_bindings;
+        self.commit_profile_bindings(std::mem::take(&mut profile_replacements));
         let active_appearance_variant = self.active_appearance_variant;
-        if previous.ssh_profiles != next.ssh_profiles
-            && let Err(error) = self.rebuild_profile_bindings(&next)
-        {
-            self.config_state.reject(error.to_string());
-            self.last_error = self.config_state.last_error().map(str::to_owned);
-            return false;
-        }
         for binding in self.binding_runtimes_mut() {
             let mut binding_config = next.clone();
             binding_config.multiplexer = binding.multiplexer.clone();
@@ -7232,28 +10262,42 @@ impl AppState {
             );
             owner.terminal.set_terminal_config(session_config);
         }
-        self.has_new_session_config_changes = new_session_only_config_changed(&previous, &next)
-            || self.has_new_session_config_changes;
-        self.config_state.accept(next);
-        self.set_mouse_pointer_hidden_while_typing(self.mouse_pointer_hidden_while_typing, effects);
-        let config_path = self.config().config_path.clone();
-        let binding_id = self.binding.scope.binding_id().persistence_value();
-        let session_order = match SessionOrderStore::for_binding(&config_path, binding_id) {
-            Ok(session_order) => session_order,
-            Err(error) => {
-                self.record_session_order_error(error);
-                effects.push(AppEffect::RequestRepaint);
-                return true;
-            }
-        };
-        self.binding.session_names = SessionNameStore::for_binding(&config_path, binding_id);
-        self.binding.pending_generated_names.clear();
-        self.binding.session_order = session_order;
-        if let Err(error) = self.binding.sync_session_order() {
-            self.record_session_order_error(error);
-            effects.push(AppEffect::RequestRepaint);
-            return true;
+
+        if let Some((session_order, ordered_names)) = active_order {
+            let config_path = next.config_path.clone();
+            let binding_id = self.binding.scope.binding_id().persistence_value();
+            self.binding.session_names = SessionNameStore::for_binding(&config_path, binding_id);
+            self.binding.pending_generated_names.clear();
+            self.binding.session_order = session_order;
+            self.binding.mux.apply_session_order(&ordered_names);
         }
+        let new_session_changes = new_session_only_config_changed(&previous, &next);
+        self.config_state.accept(next);
+        self.modifier_remaps = modifier_remaps;
+        self.macos_option_as_alt = self.config().input.macos_option_as_alt.into();
+        self.app_key_bindings = app_key_bindings;
+        self.sidebar_key_bindings = sidebar_key_bindings;
+        self.has_new_session_config_changes =
+            new_session_changes || self.has_new_session_config_changes;
+        if previous.font != self.config().font {
+            effects.push(AppEffect::SetTerminalTextConfig(
+                self.config().font.terminal_text_config(),
+            ));
+            if previous.font.ui_families() != self.config().font.ui_families() {
+                effects.push(AppEffect::SetUiFonts(
+                    self.config().font.ui_families().to_vec(),
+                ));
+            }
+        }
+        if previous.window.title != self.config().window.title {
+            effects.push(AppEffect::SetWindowTitle(
+                self.config().window.title.clone(),
+            ));
+        }
+        if previous.diagnostics != self.config().diagnostics {
+            self.stability_trace = StabilityTrace::from_config(self.config());
+        }
+        self.set_mouse_pointer_hidden_while_typing(self.mouse_pointer_hidden_while_typing, effects);
         self.last_error = match (self.has_new_session_config_changes, compatibility_warning) {
             (true, Some(warning)) => Some(format!(
                 "config reloaded; session/window settings require a new window or restart; {warning}"
@@ -7781,8 +10825,94 @@ impl AppState {
         self.app_command_tx.for_caller(caller)
     }
 
+    fn drain_reconciliation_completions(&mut self) -> bool {
+        let mut completed = false;
+        while let Ok(reconciliation) = self.reconciliation_rx.try_recv() {
+            completed = true;
+            match reconciliation {
+                ShutdownReconciliationCompletion::Mux {
+                    request_id,
+                    command_id,
+                    command,
+                    origin,
+                    binding_identity,
+                    binding_generation,
+                    namespace,
+                    target,
+                    completion,
+                    result,
+                } => {
+                    let outcome = self.command_outcome_for_mux_result(
+                        MuxCompletionContext {
+                            command_id: &command_id,
+                            origin,
+                            binding_identity: &binding_identity,
+                            binding_generation,
+                            namespace: &namespace,
+                            command: &command,
+                            rename: None,
+                        },
+                        *result,
+                    );
+                    let outcome = bounded_command_outcome(outcome);
+                    if let Some(message) = command_outcome_message(&outcome) {
+                        self.last_error = Some(message);
+                    }
+                    self.publish_reconciled_command_completion(
+                        request_id,
+                        &command_id,
+                        target.as_ref(),
+                        completion.as_ref(),
+                        &outcome,
+                    );
+                }
+                ShutdownReconciliationCompletion::Extension {
+                    request_id,
+                    command_id,
+                    invocation,
+                    extension_id,
+                    generation,
+                    target,
+                    completion,
+                    result,
+                } => {
+                    let outcome = if self
+                        .extension_runtime
+                        .generation_is_active(&extension_id, generation)
+                    {
+                        result
+                    } else {
+                        CommandOutcome::Failed {
+                            code: "stale_generation".to_owned(),
+                            message: format!(
+                                "extension command generation was reloaded while reconciling {}",
+                                invocation.command
+                            ),
+                        }
+                    };
+                    let outcome = bounded_command_outcome(outcome);
+                    if let Some(message) = command_outcome_message(&outcome) {
+                        self.last_error = Some(message);
+                    }
+                    self.publish_reconciled_command_completion(
+                        request_id,
+                        &command_id,
+                        target.as_ref(),
+                        completion.as_ref(),
+                        &outcome,
+                    );
+                }
+            }
+        }
+        completed
+    }
+
     fn drain_app_commands(&mut self, viewport: ViewportSnapshot, effects: &mut Vec<AppEffect>) {
-        if self.drain_pending_app_commands(Instant::now()) {
+        self.retry_pending_completion_publications();
+        let reconciled = self.drain_reconciliation_completions();
+        let mux_completed = self.drain_pending_app_commands(Instant::now());
+        let extension_completed = self.drain_pending_extension_commands(Instant::now());
+        if reconciled || mux_completed || extension_completed {
             effects.push(AppEffect::RequestRepaint);
         }
         let mut drained = 0;
@@ -7793,13 +10923,39 @@ impl AppState {
             };
             drained += 1;
             let now = Instant::now();
+            let request_id = next_app_command_reconciliation_id();
+            let request_command_id = request.invocation.command.clone();
+            let completion_target = self.completion_target_for_invocation(&request.invocation);
+            let mut completion = request.completion;
+            if let Some(context) = completion.as_mut()
+                && completion_target.is_some()
+            {
+                context.target = completion_target.clone();
+            }
+            let started_deadline = now >= request.deadline && request.cancellation.is_started();
+            if started_deadline {
+                let indeterminate = CommandOutcome::completion_indeterminate();
+                if request.response.clone().send(indeterminate.clone()).is_ok() {
+                    if let Some(completion) = completion.as_ref() {
+                        self.publish_command_completion_event(
+                            request_id,
+                            &request_command_id,
+                            completion_target.as_ref(),
+                            Some(completion),
+                            &indeterminate,
+                            false,
+                        );
+                    }
+                    continue;
+                }
+            }
             let dispatch = if request.cancellation.is_cancelled() {
                 CommandDispatch::Complete(CommandOutcome::Failed {
                     code: "cancelled".to_owned(),
                     message: "command was cancelled".to_owned(),
                 })
-            } else if now >= request.deadline {
-                request.cancellation.cancel();
+            // The cancellation CAS is the commit gate: only a still-pending request may time out.
+            } else if now >= request.deadline && request.cancellation.cancel() {
                 CommandDispatch::Complete(CommandOutcome::Failed {
                     code: "deadline_exceeded".to_owned(),
                     message: "command deadline expired".to_owned(),
@@ -7814,27 +10970,81 @@ impl AppState {
             };
             match dispatch {
                 CommandDispatch::Complete(outcome) => {
-                    let _ = request.response.send(outcome);
+                    let outcome = bounded_command_outcome(outcome);
+                    let disconnected = request.response.send(outcome.clone()).is_err();
+                    if (!disconnected || request.cancellation.is_started()) && completion.is_some()
+                    {
+                        if disconnected {
+                            self.publish_reconciled_command_completion(
+                                request_id,
+                                &request_command_id,
+                                completion_target.as_ref(),
+                                completion.as_ref(),
+                                &outcome,
+                            );
+                        } else {
+                            self.publish_command_completion_event(
+                                request_id,
+                                &request_command_id,
+                                completion_target.as_ref(),
+                                completion.as_ref(),
+                                &outcome,
+                                false,
+                            );
+                        }
+                    }
                 }
                 CommandDispatch::Pending {
                     command,
                     command_id,
                     origin,
+                    binding_identity,
+                    binding_generation,
+                    namespace,
                     target,
                     deadline,
                     cancellation,
                     result,
                 } => {
                     self.pending_app_commands.push(PendingAppCommand {
+                        request_id,
                         command,
                         command_id,
                         origin,
+                        binding_identity,
+                        binding_generation,
+                        namespace,
                         target,
                         deadline,
                         cancellation,
                         response: Some(request.response),
+                        completion,
+                        rename: None,
                         result,
                     });
+                }
+                CommandDispatch::ExtensionPending {
+                    invocation,
+                    extension_id,
+                    generation,
+                    target,
+                    deadline,
+                    cancellation,
+                    result,
+                } => {
+                    self.pending_extension_commands
+                        .push(PendingExtensionCommand {
+                            request_id,
+                            invocation,
+                            extension_id,
+                            generation,
+                            target,
+                            deadline,
+                            cancellation,
+                            response: Some(request.response),
+                            completion,
+                            result,
+                        });
                 }
             }
         }
@@ -7845,48 +11055,108 @@ impl AppState {
 
     fn drain_pending_app_commands(&mut self, now: Instant) -> bool {
         let mut completed = false;
-        for pending in std::mem::take(&mut self.pending_app_commands) {
+        for mut pending in std::mem::take(&mut self.pending_app_commands) {
+            if now >= pending.deadline && pending.cancellation.is_started() {
+                pending.cancellation.request_cancel();
+                if let Some(response) = pending.response.take() {
+                    let _ = response.send(CommandOutcome::completion_indeterminate());
+                }
+                enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Mux(
+                    ShutdownMuxReconciliation {
+                        request_id: pending.request_id,
+                        command_id: pending.command_id,
+                        command: pending.command,
+                        origin: pending.origin,
+                        binding_identity: pending.binding_identity,
+                        binding_generation: pending.binding_generation,
+                        namespace: pending.namespace,
+                        result: pending.result,
+                        deadline: pending
+                            .deadline
+                            .checked_add(SHUTDOWN_RECONCILIATION_GRACE)
+                            .unwrap_or_else(Instant::now),
+                        cancellation: pending.cancellation,
+                        target: pending.target,
+                        completion: pending.completion,
+                        reconciliation: self.reconciliation_tx.clone(),
+                        automation: self.automation.clone(),
+                        scope: automation_event_scope(pending.origin),
+                        fallback_scope: format!("instance:{}", self.command_instance_handle),
+                    },
+                ));
+                completed = true;
+                continue;
+            }
             let outcome = if pending.cancellation.is_cancelled() {
-                self.finalize_failed_session_launch(
+                let outcome = self.finalize_failed_session_launch(
                     pending.origin,
+                    &pending.namespace,
                     &pending.command,
                     CommandOutcome::Failed {
                         code: "cancelled".to_owned(),
                         message: "command was cancelled".to_owned(),
                     },
-                )
-            } else if now >= pending.deadline && pending.cancellation.cancel() {
-                self.finalize_failed_session_launch(
+                );
+                self.clear_failed_session_rename(
                     pending.origin,
+                    &pending.command_id,
+                    pending.rename.as_ref(),
+                )
+                .unwrap_or(outcome)
+            } else if now >= pending.deadline && pending.cancellation.cancel() {
+                let outcome = self.finalize_failed_session_launch(
+                    pending.origin,
+                    &pending.namespace,
                     &pending.command,
                     CommandOutcome::Failed {
                         code: "deadline_exceeded".to_owned(),
                         message: "command deadline expired".to_owned(),
                     },
+                );
+                self.clear_failed_session_rename(
+                    pending.origin,
+                    &pending.command_id,
+                    pending.rename.as_ref(),
                 )
+                .unwrap_or(outcome)
             } else {
                 match pending.result.try_recv() {
                     Ok(result) => self.command_outcome_for_mux_result(
-                        &pending.command_id,
-                        pending.origin,
-                        pending.target.as_ref(),
-                        &pending.command,
+                        MuxCompletionContext {
+                            command_id: &pending.command_id,
+                            origin: pending.origin,
+                            binding_identity: &pending.binding_identity,
+                            binding_generation: pending.binding_generation,
+                            namespace: &pending.namespace,
+                            command: &pending.command,
+                            rename: pending.rename.as_ref(),
+                        },
                         result,
                     ),
                     Err(mpsc::TryRecvError::Empty) => {
                         self.pending_app_commands.push(pending);
                         continue;
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => self.finalize_failed_session_launch(
-                        pending.origin,
-                        &pending.command,
-                        CommandOutcome::Failed {
-                            code: "backend_worker_stopped".to_owned(),
-                            message: "mux command worker stopped".to_owned(),
-                        },
-                    ),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        let outcome = self.finalize_failed_session_launch(
+                            pending.origin,
+                            &pending.namespace,
+                            &pending.command,
+                            CommandOutcome::Failed {
+                                code: "backend_worker_stopped".to_owned(),
+                                message: "mux command worker stopped".to_owned(),
+                            },
+                        );
+                        self.clear_failed_session_rename(
+                            pending.origin,
+                            &pending.command_id,
+                            pending.rename.as_ref(),
+                        )
+                        .unwrap_or(outcome)
+                    }
                 }
             };
+            let outcome = bounded_command_outcome(outcome);
             completed = true;
             if pending.response.is_none()
                 && let Some(message) = command_outcome_message(&outcome)
@@ -7894,7 +11164,164 @@ impl AppState {
                 self.last_error = Some(message);
             }
             if let Some(response) = pending.response {
-                let _ = response.send(outcome);
+                let disconnected = response.send(outcome.clone()).is_err();
+                if (!disconnected || pending.cancellation.is_started())
+                    && pending.completion.is_some()
+                {
+                    if disconnected {
+                        self.publish_reconciled_command_completion(
+                            pending.request_id,
+                            &pending.command_id,
+                            pending.target.as_ref(),
+                            pending.completion.as_ref(),
+                            &outcome,
+                        );
+                    } else {
+                        self.publish_command_completion_event(
+                            pending.request_id,
+                            &pending.command_id,
+                            pending.target.as_ref(),
+                            pending.completion.as_ref(),
+                            &outcome,
+                            false,
+                        );
+                    }
+                }
+            } else if pending.completion.is_some() {
+                self.publish_reconciled_command_completion(
+                    pending.request_id,
+                    &pending.command_id,
+                    pending.target.as_ref(),
+                    pending.completion.as_ref(),
+                    &outcome,
+                );
+            }
+        }
+        completed
+    }
+    fn drain_pending_extension_commands(&mut self, now: Instant) -> bool {
+        let mut completed = false;
+        for mut pending in std::mem::take(&mut self.pending_extension_commands) {
+            let generation_active = self
+                .extension_runtime
+                .generation_is_active(&pending.extension_id, pending.generation);
+            if now >= pending.deadline && pending.cancellation.is_started() {
+                pending.cancellation.request_cancel();
+                if let Some(response) = pending.response.take() {
+                    let _ = response.send(CommandOutcome::completion_indeterminate());
+                }
+                enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Extension(
+                    ShutdownExtensionReconciliation {
+                        request_id: pending.request_id,
+                        command_id: pending.invocation.command.clone(),
+                        invocation: pending.invocation,
+                        extension_id: pending.extension_id,
+                        generation: pending.generation,
+                        result: pending.result,
+                        deadline: pending
+                            .deadline
+                            .checked_add(SHUTDOWN_RECONCILIATION_GRACE)
+                            .unwrap_or_else(Instant::now),
+                        cancellation: pending.cancellation,
+                        target: pending.target,
+                        completion: pending.completion,
+                        reconciliation: self.reconciliation_tx.clone(),
+                        automation: self.automation.clone(),
+                        scope: format!("instance:{}", self.command_instance_handle),
+                        fallback_scope: format!("instance:{}", self.command_instance_handle),
+                    },
+                ));
+                completed = true;
+                continue;
+            }
+            let outcome = if !generation_active {
+                CommandOutcome::Failed {
+                    code: "stale_generation".to_owned(),
+                    message: "extension command generation was reloaded".to_owned(),
+                }
+            } else if pending.cancellation.is_cancelled() {
+                CommandOutcome::Failed {
+                    code: "cancelled".to_owned(),
+                    message: "extension command was cancelled".to_owned(),
+                }
+            } else if now >= pending.deadline && pending.cancellation.cancel() {
+                CommandOutcome::Failed {
+                    code: "deadline_exceeded".to_owned(),
+                    message: "extension command deadline expired".to_owned(),
+                }
+            } else {
+                match pending.result.try_recv() {
+                    Ok(outcome) => outcome,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        if !self
+                            .extension_runtime
+                            .generation_is_active(&pending.extension_id, pending.generation)
+                        {
+                            CommandOutcome::Failed {
+                                code: "stale_generation".to_owned(),
+                                message: "extension command generation was reloaded".to_owned(),
+                            }
+                        } else {
+                            self.pending_extension_commands.push(pending);
+                            continue;
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => CommandOutcome::Failed {
+                        code: "extension_worker_stopped".to_owned(),
+                        message: "extension command worker stopped".to_owned(),
+                    },
+                }
+            };
+            let outcome = if self
+                .extension_runtime
+                .generation_is_active(&pending.extension_id, pending.generation)
+            {
+                outcome
+            } else {
+                CommandOutcome::Failed {
+                    code: "stale_generation".to_owned(),
+                    message: "extension command generation was reloaded".to_owned(),
+                }
+            };
+            let outcome = bounded_command_outcome(outcome);
+            completed = true;
+            if pending.response.is_none()
+                && let Some(message) = command_outcome_message(&outcome)
+            {
+                self.last_error = Some(message);
+            }
+            if let Some(response) = pending.response {
+                let disconnected = response.send(outcome.clone()).is_err();
+                if (!disconnected || pending.cancellation.is_started())
+                    && pending.completion.is_some()
+                {
+                    if disconnected {
+                        self.publish_reconciled_command_completion(
+                            pending.request_id,
+                            &pending.invocation.command,
+                            pending.target.as_ref(),
+                            pending.completion.as_ref(),
+                            &outcome,
+                        );
+                    } else {
+                        self.publish_command_completion_event(
+                            pending.request_id,
+                            &pending.invocation.command,
+                            pending.target.as_ref(),
+                            pending.completion.as_ref(),
+                            &outcome,
+                            false,
+                        );
+                    }
+                }
+            } else if pending.completion.is_some() {
+                self.publish_reconciled_command_completion(
+                    pending.request_id,
+                    &pending.invocation.command,
+                    pending.target.as_ref(),
+                    pending.completion.as_ref(),
+                    &outcome,
+                );
             }
         }
         completed
@@ -7931,6 +11358,9 @@ impl AppState {
         ) {
             return CommandDispatch::Complete(outcome);
         }
+        let binding_identity = self.binding_identity(binding);
+        let binding_generation = binding.mux.binding_generation();
+        let namespace = namespace_for_binding(binding.scope, &binding.multiplexer);
         let repaint = self.repaint.clone();
         let Some(binding) = self.binding_runtime_mut(origin) else {
             return CommandDispatch::Complete(CommandOutcome::Unavailable {
@@ -7938,6 +11368,9 @@ impl AppState {
             });
         };
         let config = binding.multiplexer.clone();
+        let selected_session_before = matches!(command, MuxCommand::RenameSession { .. })
+            .then(|| binding.mux.selected_session().map(str::to_owned))
+            .flatten();
         let result = binding.mux.execute_command_authoritatively(
             &repaint,
             &config,
@@ -7945,10 +11378,16 @@ impl AppState {
             deadline,
             cancellation.clone(),
         );
+        if let Some(selected_session) = selected_session_before {
+            binding.mux.activate_session(&selected_session);
+        }
         CommandDispatch::Pending {
             command,
             command_id: command_id.into(),
             origin,
+            binding_identity,
+            binding_generation,
+            namespace,
             target,
             deadline,
             cancellation,
@@ -7968,6 +11407,9 @@ impl AppState {
                 command,
                 command_id,
                 origin,
+                binding_identity,
+                binding_generation,
+                namespace,
                 target,
                 deadline,
                 cancellation,
@@ -7975,16 +11417,47 @@ impl AppState {
             } => {
                 let outcome = CommandOutcome::pending(target.clone());
                 self.pending_app_commands.push(PendingAppCommand {
+                    request_id: next_app_command_reconciliation_id(),
                     command,
                     command_id,
                     origin,
+                    binding_identity,
+                    binding_generation,
+                    namespace,
                     target,
                     deadline,
                     cancellation,
                     response: None,
+                    completion: None,
+                    rename: None,
                     result,
                 });
                 effects.push(AppEffect::RequestRepaint);
+                outcome
+            }
+            CommandDispatch::ExtensionPending {
+                invocation,
+                extension_id,
+                generation,
+                target,
+                deadline,
+                cancellation,
+                result,
+            } => {
+                let outcome = CommandOutcome::pending(target.clone());
+                self.pending_extension_commands
+                    .push(PendingExtensionCommand {
+                        request_id: next_app_command_reconciliation_id(),
+                        invocation,
+                        extension_id,
+                        generation,
+                        target,
+                        deadline,
+                        cancellation,
+                        response: None,
+                        completion: None,
+                        result,
+                    });
                 outcome
             }
         }
@@ -8018,7 +11491,11 @@ impl AppState {
             return CommandDispatch::Complete(CommandOutcome::success());
         }
 
-        let mut resolved = match CommandRegistry::core().resolve(invocation) {
+        let mut resolved = match self
+            .extension_runtime
+            .command_registry()
+            .resolve(invocation)
+        {
             Ok(resolved) => resolved,
             Err(outcome) => {
                 self.last_error = command_outcome_message(&outcome);
@@ -8058,13 +11535,15 @@ impl AppState {
                 confirmation: Box::new(resolved.invocation.confirmation()),
             });
         }
+        let invocation = resolved.invocation.clone();
         let target = resolved.invocation.target;
         let context = ResolvedCommandContext {
             target: target.as_ref(),
             mux_scope,
-            caller: resolved.invocation.caller,
+            caller: invocation.caller,
             viewport,
             execution,
+            invocation,
         };
         self.dispatch_resolved_command(resolved.descriptor.id, resolved.executor, context, effects)
     }
@@ -8903,6 +12382,37 @@ impl AppState {
                 confirmation,
                 context.execution,
             ),
+            CoreCommandExecutor::Extension {
+                command_id,
+                extension_id,
+                generation,
+            } => {
+                let (deadline, cancellation) = context.execution.unwrap_or_else(|| {
+                    (
+                        Instant::now() + Duration::from_secs(10),
+                        CommandCancellation::new(),
+                    )
+                });
+                let mut invocation = context.invocation;
+                invocation.command.clone_from(&command_id);
+                let target = invocation.target.clone();
+                let result = self.extension_runtime.invoke_async_exact(
+                    invocation.clone(),
+                    &extension_id,
+                    generation,
+                    deadline,
+                    cancellation.clone(),
+                );
+                CommandDispatch::ExtensionPending {
+                    invocation,
+                    extension_id,
+                    generation,
+                    target,
+                    deadline,
+                    cancellation,
+                    result,
+                }
+            }
             CoreCommandExecutor::ReadTerminal => {
                 if let Err(outcome) = Self::begin_synchronous_command(context.execution) {
                     return CommandDispatch::Complete(outcome);
@@ -9066,8 +12576,8 @@ impl AppState {
         match (specification, target.kind, path.as_slice()) {
             (
                 MuxCommandSpec::SelectPane { direction },
-                ResourceKind::MuxWindow,
-                [_, session_id, window_id],
+                ResourceKind::Pane,
+                [_, session_id, window_id, _pane_id],
             ) => Ok(MuxCommand::SelectPane {
                 session_id: session_id.clone(),
                 window_id: Some(window_id.clone()),
@@ -9157,6 +12667,17 @@ impl AppState {
         {
             return CommandDispatch::Complete(outcome);
         }
+        if let Err(error) = persist_session_launch_plan(
+            &self.config().config_path,
+            origin.binding_id().persistence_value(),
+            &plan,
+        ) {
+            return CommandDispatch::Complete(CommandOutcome::Failed {
+                code: "session_launch_persistence_failed".to_owned(),
+                message: format!("persisting session launch plan failed: {error}"),
+            });
+        }
+        let plan_id = plan.session_id.clone();
         let dispatch = self.enqueue_authoritative_mux_command(
             command_id,
             MuxCommand::CreateSession { plan },
@@ -9164,6 +12685,38 @@ impl AppState {
             target,
             execution,
         );
+        if matches!(&dispatch, CommandDispatch::Complete(_)) {
+            let cleanup_error = delete_session_launch_plan(
+                &self.config().config_path,
+                origin.binding_id().persistence_value(),
+                &plan_id,
+            )
+            .err()
+            .map(|error| error.to_string());
+            if generated_name {
+                SessionNameStore::for_binding(
+                    &self.config().config_path,
+                    origin.binding_id().persistence_value(),
+                )
+                .discard_generated(&plan_id);
+            }
+            if let Some(binding) = self.binding_runtime_mut(origin) {
+                binding.session_order.forget_session_cache(&plan_id);
+            }
+            if let Some(error) = cleanup_error {
+                let original = match &dispatch {
+                    CommandDispatch::Complete(outcome) => command_outcome_message(outcome),
+                    CommandDispatch::Pending { .. } | CommandDispatch::ExtensionPending { .. } => {
+                        None
+                    }
+                }
+                .unwrap_or_else(|| "session launch failed".to_owned());
+                return CommandDispatch::Complete(CommandOutcome::Failed {
+                    code: "session_launch_cleanup_failed".to_owned(),
+                    message: format!("{original}; session launch cleanup failed: {error}"),
+                });
+            }
+        }
         if matches!(&dispatch, CommandDispatch::Pending { .. }) && generated_name {
             let Some(binding) = self.binding_runtime_mut(origin) else {
                 return CommandDispatch::Complete(CommandOutcome::Unavailable {
@@ -9176,6 +12729,7 @@ impl AppState {
                     cwd: cwd.clone(),
                     name: session_id.clone(),
                     display_name: display_name.clone(),
+                    previous_display_name: None,
                 },
             );
             binding
@@ -9219,19 +12773,32 @@ impl AppState {
             caller: _,
             viewport,
             execution,
+            invocation: _,
         } = context;
+        if let Err(outcome) = self.validate_local_keybind_target(&action, target) {
+            return CommandDispatch::Complete(outcome);
+        }
         let mut return_native_mux_focus = false;
         if let KeybindAction::Mux(mux_action) = action {
             let origin = mux_scope.unwrap_or(self.binding.scope);
+            if let Some(kind) = Self::mux_action_target_kind(mux_action)
+                && let Err(outcome) = self.validate_current_command_target(kind, target)
+            {
+                return CommandDispatch::Complete(outcome);
+            }
             let native_local_action = self.binding_runtime(origin).is_some_and(|binding| {
                 selected_backend(&binding.multiplexer) == MultiplexerBackendConfig::Native
             }) && Self::native_mux_action_uses_local_layout(mux_action);
             if native_local_action {
                 if origin != self.binding.scope {
-                    return CommandDispatch::Complete(CommandOutcome::Unsupported {
-                        message: "native local-layout commands require the active binding"
-                            .to_owned(),
+                    return CommandDispatch::Complete(CommandOutcome::StaleTarget {
+                        message: "local mux actions require the active binding target".to_owned(),
                     });
+                }
+                if let Some(kind) = Self::native_local_mux_target_kind(mux_action)
+                    && let Err(outcome) = self.validate_current_command_target(kind, target)
+                {
+                    return CommandDispatch::Complete(outcome);
                 }
                 return_native_mux_focus = true;
             } else {
@@ -9282,6 +12849,77 @@ impl AppState {
         };
         CommandDispatch::Complete(outcome)
     }
+
+    fn validate_local_keybind_target(
+        &self,
+        action: &KeybindAction,
+        target: Option<&CommandTarget>,
+    ) -> Result<(), CommandOutcome> {
+        if Self::keybind_action_uses_active_terminal(action) {
+            return self.validate_current_command_target(ResourceKind::Terminal, target);
+        }
+        Ok(())
+    }
+
+    fn keybind_action_uses_active_terminal(action: &KeybindAction) -> bool {
+        matches!(
+            action,
+            KeybindAction::Scroll(_)
+                | KeybindAction::Write(_)
+                | KeybindAction::Find(_)
+                | KeybindAction::CopyToClipboard(_)
+                | KeybindAction::CopyMode
+                | KeybindAction::PasteFromClipboard
+        )
+    }
+
+    fn mux_action_target_kind(action: MuxKeyAction) -> Option<ResourceKind> {
+        match action {
+            MuxKeyAction::NextSession
+            | MuxKeyAction::PreviousSession
+            | MuxKeyAction::LastSession
+            | MuxKeyAction::SelectSession(_) => Some(ResourceKind::Binding),
+            MuxKeyAction::MoveSession(_) => Some(ResourceKind::Session),
+            _ => None,
+        }
+    }
+
+    fn native_local_mux_target_kind(action: MuxKeyAction) -> Option<ResourceKind> {
+        match action {
+            MuxKeyAction::SplitPane(_)
+            | MuxKeyAction::KillPane
+            | MuxKeyAction::ClosePane
+            | MuxKeyAction::TogglePaneZoom => Some(ResourceKind::Pane),
+            MuxKeyAction::SelectPane(_) | MuxKeyAction::NextPane | MuxKeyAction::PreviousPane => {
+                Some(ResourceKind::Pane)
+            }
+            _ => None,
+        }
+    }
+
+    fn validate_current_command_target(
+        &self,
+        kind: ResourceKind,
+        target: Option<&CommandTarget>,
+    ) -> Result<(), CommandOutcome> {
+        let Some(target) = target else {
+            return Err(CommandOutcome::Unavailable {
+                message: format!("no current {kind:?} target is available"),
+            });
+        };
+        let Some(current) = self.current_command_target(kind) else {
+            return Err(CommandOutcome::Unavailable {
+                message: format!("no current {kind:?} target is available"),
+            });
+        };
+        if target.kind != kind || target != &current {
+            return Err(CommandOutcome::StaleTarget {
+                message: format!("the {kind:?} target is not current"),
+            });
+        }
+        Ok(())
+    }
+
     fn validate_app_action_target(
         &self,
         action: AppAction,
@@ -9498,37 +13136,143 @@ impl AppState {
         Ok(Some(command))
     }
 
+    fn reconcile_stale_mux_completion(
+        &mut self,
+        origin: MuxScope,
+        namespace: &BackendConnectionNamespace,
+        command: &MuxCommand,
+        result: &MuxCommandResult,
+        outcome: CommandOutcome,
+    ) -> CommandOutcome {
+        let MuxCommand::CreateSession { .. } = command else {
+            return self.finalize_failed_session_launch(origin, namespace, command, outcome);
+        };
+        let Some(allocated) = result
+            .as_ref()
+            .ok()
+            .and_then(MuxCommandCompletion::allocated)
+        else {
+            return self.finalize_failed_session_launch(origin, namespace, command, outcome);
+        };
+
+        let allocation_error = if let Some(binding) = self.binding_runtime_mut(origin) {
+            let current_namespace = namespace_for_binding(binding.scope, &binding.multiplexer);
+            if current_namespace != *namespace {
+                Some("the target backend connection changed before cleanup".to_owned())
+            } else {
+                let config = binding.multiplexer.clone();
+                binding
+                    .mux
+                    .compensate_created_session(&allocated.session_id, &config)
+                    .err()
+                    .map(|error| error.to_string())
+            }
+        } else {
+            Some("the target binding is unavailable".to_owned())
+        };
+        if let Some(error) = allocation_error {
+            let original = command_outcome_message(&outcome).unwrap_or_else(|| {
+                "the target binding changed before command completion".to_owned()
+            });
+            let message = format!(
+                "{original}; session allocation {} could not be reconciled: {error}; \
+                 durable launch intent was retained for authoritative recovery",
+                allocated.session_id
+            );
+            self.last_error = Some(message.clone());
+            return CommandOutcome::Failed {
+                code: "completion_indeterminate".to_owned(),
+                message,
+            };
+        }
+
+        if let Err(error) = self.discard_failed_session_launch(origin, namespace, command) {
+            let original = command_outcome_message(&outcome).unwrap_or_else(|| {
+                "the target binding changed before command completion".to_owned()
+            });
+            let message = format!(
+                "{original}; session allocation {} was compensated, but durable launch intent \
+                 cleanup failed: {error}",
+                allocated.session_id
+            );
+            self.last_error = Some(message.clone());
+            return CommandOutcome::Failed {
+                code: "session_launch_cleanup_failed".to_owned(),
+                message,
+            };
+        }
+        self.last_error = command_outcome_message(&outcome);
+        outcome
+    }
+
     fn command_outcome_for_mux_result(
         &mut self,
-        _command_id: &str,
-        origin: MuxScope,
-        _target: Option<&CommandTarget>,
-        command: &MuxCommand,
+        context: MuxCompletionContext<'_>,
         result: MuxCommandResult,
     ) -> CommandOutcome {
-        let Some(config) = self
-            .binding_runtime(origin)
-            .map(|binding| binding.multiplexer.clone())
+        let MuxCompletionContext {
+            command_id,
+            origin,
+            binding_identity,
+            binding_generation,
+            namespace,
+            command,
+            rename,
+        } = context;
+        let Some((config, current_identity, current_generation, current_namespace)) =
+            self.binding_runtime(origin).map(|binding| {
+                (
+                    binding.multiplexer.clone(),
+                    self.binding_identity(binding),
+                    binding.mux.binding_generation(),
+                    namespace_for_binding(binding.scope, &binding.multiplexer),
+                )
+            })
         else {
-            return self.finalize_failed_session_launch(
+            return self.reconcile_stale_mux_completion(
                 origin,
+                namespace,
                 command,
+                &result,
                 CommandOutcome::Unavailable {
                     message: "the target binding is unavailable".to_owned(),
                 },
             );
         };
+        if current_identity != *binding_identity
+            || current_generation != binding_generation
+            || current_namespace != *namespace
+        {
+            return self.reconcile_stale_mux_completion(
+                origin,
+                namespace,
+                command,
+                &result,
+                CommandOutcome::StaleTarget {
+                    message: "the target binding changed before command completion".to_owned(),
+                },
+            );
+        }
         let completed = {
             let Some(binding) = self.binding_runtime_mut(origin) else {
-                return self.finalize_failed_session_launch(
+                return self.reconcile_stale_mux_completion(
                     origin,
+                    namespace,
                     command,
+                    &result,
                     CommandOutcome::Unavailable {
                         message: "the target binding is unavailable".to_owned(),
                     },
                 );
             };
-            binding.mux.complete_authoritative_command(result, &config)
+            let selected_session_before = binding.mux.selected_session().map(str::to_owned);
+            let completed = binding.mux.complete_authoritative_command(result, &config);
+            if rename.is_some()
+                && let Some(selected_session) = selected_session_before
+            {
+                binding.mux.activate_session(&selected_session);
+            }
+            completed
         };
         match completed {
             Ok(completion) => {
@@ -9537,15 +13281,21 @@ impl AppState {
                     warnings: Vec::new(),
                 };
                 if let Err(outcome) =
-                    self.record_completed_session_launch(origin, command, &completion)
+                    self.record_completed_session_launch(origin, namespace, command, &completion)
                 {
                     let outcome = self.compensate_completed_session_launch(
                         origin,
+                        namespace,
                         command,
                         &completion,
                         outcome,
                     );
-                    self.last_error = command_outcome_message(&outcome);
+                    return outcome;
+                }
+                if let Some(rename) = rename
+                    && let Err(outcome) =
+                        self.record_completed_session_rename(origin, command_id, rename)
+                {
                     return outcome;
                 }
                 self.sync_native_focus_from_completion(origin, &completion);
@@ -9587,19 +13337,138 @@ impl AppState {
                         message,
                     },
                 };
-                let outcome = self.finalize_failed_session_launch(origin, command, outcome);
+                let outcome =
+                    self.finalize_failed_session_launch(origin, namespace, command, outcome);
+                let outcome = self
+                    .clear_failed_session_rename(origin, command_id, rename)
+                    .unwrap_or(outcome);
                 self.last_error = command_outcome_message(&outcome);
+
                 outcome
             }
+        }
+    }
+    fn record_completed_session_rename(
+        &mut self,
+        origin: MuxScope,
+        command_id: &str,
+        rename: &PendingSessionRename,
+    ) -> std::result::Result<(), CommandOutcome> {
+        let Some(binding) = self.binding_runtime_mut(origin) else {
+            return Err(CommandOutcome::Unavailable {
+                message: "the target binding is unavailable".to_owned(),
+            });
+        };
+        let plan_ids = [rename.old_name.as_str(), rename.session_id.as_str()];
+        rename_session_membership_and_launch_plans(
+            &binding.workspace_config_path,
+            origin.binding_id().persistence_value(),
+            &rename.old_name,
+            &rename.new_name,
+            &plan_ids,
+        )
+        .map_err(|error| CommandOutcome::Failed {
+            code: "session_rename_persistence_failed".to_owned(),
+            message: format!(
+                "session rename completed in the backend, but workspace persistence failed: \
+                 {error}"
+            ),
+        })?;
+        binding
+            .session_order
+            .rename_session_cache(&rename.old_name, &rename.new_name);
+        binding.session_names.mark_explicit(
+            &rename.session_id,
+            &rename.new_name,
+            &rename.display_name,
+            &rename.cwd,
+        );
+        binding.pending_generated_names.remove(&rename.new_name);
+        clear_pending_session_rename(
+            &binding.workspace_config_path,
+            origin.binding_id().persistence_value(),
+            command_id,
+        )
+        .map_err(|error| CommandOutcome::Failed {
+            code: "session_rename_persistence_failed".to_owned(),
+            message: format!(
+                "session rename completed and workspace state changed, but pending intent \
+                 cleanup failed: {error}"
+            ),
+        })?;
+        Ok(())
+    }
+    fn clear_failed_session_rename(
+        &mut self,
+        origin: MuxScope,
+        command_id: &str,
+        rename: Option<&PendingSessionRename>,
+    ) -> Option<CommandOutcome> {
+        let rename = rename?;
+        let binding = self.binding_runtime_mut(origin)?;
+        match clear_pending_session_rename(
+            &binding.workspace_config_path,
+            origin.binding_id().persistence_value(),
+            command_id,
+        ) {
+            Ok(()) => {
+                let previous_display_name = binding
+                    .pending_generated_names
+                    .get(&rename.new_name)
+                    .and_then(|pending| pending.previous_display_name.clone());
+                if let Some(previous_display_name) = previous_display_name {
+                    binding
+                        .session_names
+                        .set_display_name(&rename.session_id, &previous_display_name);
+                }
+                binding.pending_generated_names.remove(&rename.new_name);
+                None
+            }
+            Err(error) => Some(CommandOutcome::Failed {
+                code: "session_rename_cleanup_failed".to_owned(),
+                message: format!(
+                    "backend session rename failed and pending intent cleanup failed: {error}"
+                ),
+            }),
         }
     }
 
     fn record_completed_session_launch(
         &mut self,
         origin: MuxScope,
+        _namespace: &BackendConnectionNamespace,
         command: &MuxCommand,
         completion: &MuxCommandCompletion,
     ) -> std::result::Result<(), CommandOutcome> {
+        if let MuxCommand::DitchSession { session_id } = command {
+            if let Some(binding) = self.binding_runtime_mut(origin) {
+                let observed_name = binding
+                    .session_names
+                    .last_observed_name(session_id)
+                    .unwrap_or(session_id)
+                    .to_owned();
+                let plan_ids = [session_id.as_str(), observed_name.as_str()];
+                remove_session_membership_and_launch_plan(
+                    &binding.workspace_config_path,
+                    origin.binding_id().persistence_value(),
+                    &observed_name,
+                    &plan_ids,
+                )
+                .map_err(|error| CommandOutcome::Failed {
+                    code: "session_ditch_persistence_failed".to_owned(),
+                    message: format!(
+                        "session ditch completed, but membership/launch-plan cleanup failed: \
+                         {error}"
+                    ),
+                })?;
+                binding.session_order.forget_session_cache(&observed_name);
+                if observed_name != session_id.as_str() {
+                    binding.session_order.forget_session_cache(session_id);
+                }
+            }
+            self.persist_rmux_restore_state();
+            return Ok(());
+        }
         let (requested_session_id, focus, launch_plan) = match command {
             MuxCommand::CreateSession { plan } => {
                 (plan.session_id.as_str(), plan.focus, Some(plan))
@@ -9610,14 +13479,23 @@ impl AppState {
             }
             _ => return Ok(()),
         };
-        let session_id = completion
-            .allocated()
-            .map(|resources| resources.session_id.as_str())
-            .unwrap_or(requested_session_id);
         if let Some(binding) = self.binding_runtime_mut(origin) {
+            if let Some(plan) = launch_plan {
+                persist_session_launch_plan(
+                    &binding.workspace_config_path,
+                    origin.binding_id().persistence_value(),
+                    plan,
+                )
+                .map_err(|error| CommandOutcome::Failed {
+                    code: "session_launch_persistence_failed".to_owned(),
+                    message: format!(
+                        "session creation completed, but launch-plan persistence failed: {error}"
+                    ),
+                })?;
+            }
             binding
                 .session_order
-                .add_session(session_id)
+                .add_session(requested_session_id)
                 .map_err(|error| CommandOutcome::Failed {
                     code: "session_membership_persistence_failed".to_owned(),
                     message: format!(
@@ -9645,7 +13523,11 @@ impl AppState {
                             .map(|pane_id| {
                                 binding
                                     .mux
-                                    .terminal_id_for_pane(session_id, &window.window_id, pane_id)
+                                    .terminal_id_for_pane(
+                                        &allocated.session_id,
+                                        &window.window_id,
+                                        pane_id,
+                                    )
                                     .map(|terminal_id| (pane_id.clone(), terminal_id.to_owned()))
                             })
                             .collect::<Option<HashMap<_, _>>>()
@@ -9665,6 +13547,24 @@ impl AppState {
                         message: error.to_string(),
                     })?;
             }
+            if launch_plan.is_some()
+                && let Some(allocated) = completion.allocated()
+                && allocated.session_id != requested_session_id
+            {
+                rekey_session_launch_plan(
+                    &binding.workspace_config_path,
+                    origin.binding_id().persistence_value(),
+                    requested_session_id,
+                    &allocated.session_id,
+                )
+                .map_err(|error| CommandOutcome::Failed {
+                    code: "session_launch_persistence_failed".to_owned(),
+                    message: format!(
+                        "session creation completed, but launch-plan identity persistence failed: \
+                         {error}"
+                    ),
+                })?;
+            }
         }
         if focus && origin == self.binding.scope {
             self.input_focus = InputFocus::Terminal;
@@ -9676,33 +13576,73 @@ impl AppState {
     fn discard_failed_session_launch(
         &mut self,
         origin: MuxScope,
+        namespace: &BackendConnectionNamespace,
         command: &MuxCommand,
     ) -> Result<()> {
         let MuxCommand::CreateSession { plan } = command else {
             return Ok(());
         };
-        if let Some(binding) = self.binding_runtime_mut(origin) {
-            binding.pending_generated_names.remove(&plan.session_id);
-            binding.session_names.discard_generated(&plan.session_id);
-            binding.session_order.remove_session(&plan.session_id)?;
-            return Ok(());
-        }
-
         let config_path = self.config().config_path.clone();
         let binding_id = origin.binding_id().persistence_value();
-        SessionNameStore::for_binding(&config_path, binding_id).discard_generated(&plan.session_id);
-        let mut session_order = SessionOrderStore::for_binding(&config_path, binding_id)?;
-        session_order.remove_session(&plan.session_id)?;
-        Ok(())
+        let mut cleanup_error = None;
+        let mut membership_removed = false;
+        if let Some(binding) = self.binding_runtime_mut(origin) {
+            match binding.session_order.remove_session(&plan.session_id) {
+                Ok(_) => membership_removed = true,
+                Err(error) => cleanup_error = Some(error),
+            }
+        }
+        if let Err(error) = remove_session_membership_and_launch_plan(
+            &config_path,
+            binding_id,
+            &plan.session_id,
+            &[plan.session_id.as_str()],
+        ) && cleanup_error.is_none()
+        {
+            cleanup_error = Some(error);
+        }
+
+        let same_namespace = self.binding_runtime(origin).is_some_and(|binding| {
+            namespace_for_binding(binding.scope, &binding.multiplexer) == *namespace
+        });
+        if same_namespace {
+            SessionNameStore::for_binding(&config_path, binding_id)
+                .discard_generated(&plan.session_id);
+            if let Some(binding) = self.binding_runtime_mut(origin) {
+                binding.pending_generated_names.remove(&plan.session_id);
+                binding.session_names.discard_generated(&plan.session_id);
+                if membership_removed {
+                    binding.session_order.forget_session_cache(&plan.session_id);
+                }
+            }
+        } else if self.binding_runtime(origin).is_none() {
+            SessionNameStore::for_binding(&config_path, binding_id)
+                .discard_generated(&plan.session_id);
+        }
+        if let Some(error) = cleanup_error {
+            Err(error.into())
+        } else {
+            Ok(())
+        }
     }
 
     fn finalize_failed_session_launch(
         &mut self,
         origin: MuxScope,
+        namespace: &BackendConnectionNamespace,
         command: &MuxCommand,
         outcome: CommandOutcome,
     ) -> CommandOutcome {
-        let Err(error) = self.discard_failed_session_launch(origin, command) else {
+        if let MuxCommand::DitchSession { session_id } = command
+            && let Some(binding) = self.binding_runtime(origin)
+        {
+            let _ = clear_pending_ditch(
+                &binding.workspace_config_path,
+                origin.binding_id().persistence_value(),
+                session_id,
+            );
+        }
+        let Err(error) = self.discard_failed_session_launch(origin, namespace, command) else {
             return outcome;
         };
         let original = command_outcome_message(&outcome)
@@ -9717,52 +13657,62 @@ impl AppState {
     fn compensate_completed_session_launch(
         &mut self,
         origin: MuxScope,
+        namespace: &BackendConnectionNamespace,
         command: &MuxCommand,
         completion: &MuxCommandCompletion,
         outcome: CommandOutcome,
     ) -> CommandOutcome {
-        let mut outcome = self.finalize_failed_session_launch(origin, command, outcome);
         let Some(allocated) = completion.allocated() else {
-            return outcome;
+            if matches!(command, MuxCommand::DitchSession { .. }) {
+                // Backend ditch succeeded; the durable cleanup failure is retriable from the
+                // pending intent and must not be treated as an unstarted command.
+                return outcome;
+            }
+            return self.finalize_failed_session_launch(origin, namespace, command, outcome);
         };
+        let membership_error = self
+            .discard_failed_session_launch(origin, namespace, command)
+            .err()
+            .map(|error| error.to_string());
         let original = command_outcome_message(&outcome)
             .unwrap_or_else(|| "session launch finalization failed".to_owned());
-        let Some(binding) = self.binding_runtime_mut(origin) else {
-            let message = format!(
-                "{original}; authoritative session {} could not be cleaned up because its binding \
-                 vanished",
-                allocated.session_id
-            );
-            return CommandOutcome::Failed {
-                code: "session_allocation_cleanup_failed".to_owned(),
-                message,
-            };
+        let allocation_error = match self.binding_runtime_mut(origin) {
+            Some(binding) => {
+                let config = binding.multiplexer.clone();
+                binding
+                    .mux
+                    .compensate_created_session(&allocated.session_id, &config)
+                    .err()
+                    .map(|error| error.to_string())
+            }
+            None => Some("its binding vanished".to_owned()),
         };
-        if let Err(error) = binding.session_order.remove_session(&allocated.session_id) {
-            let message = format!(
-                "{original}; session membership cleanup failed for {}: {error}",
-                allocated.session_id
-            );
-            return CommandOutcome::Failed {
+
+        match (membership_error, allocation_error) {
+            (None, None) => outcome,
+            (Some(error), None) => CommandOutcome::Failed {
                 code: "session_membership_cleanup_failed".to_owned(),
-                message,
-            };
-        }
-        let config = binding.multiplexer.clone();
-        if let Err(error) = binding
-            .mux
-            .compensate_created_session(&allocated.session_id, &config)
-        {
-            let message = format!(
-                "{original}; authoritative session cleanup failed for {}: {error}",
-                allocated.session_id
-            );
-            outcome = CommandOutcome::Failed {
+                message: format!(
+                    "{original}; session membership cleanup failed for {}: {error}",
+                    allocated.session_id
+                ),
+            },
+            (None, Some(error)) => CommandOutcome::Failed {
                 code: "session_allocation_cleanup_failed".to_owned(),
-                message,
-            };
+                message: format!(
+                    "{original}; authoritative session cleanup failed for {}: {error}",
+                    allocated.session_id
+                ),
+            },
+            (Some(membership_error), Some(allocation_error)) => CommandOutcome::Failed {
+                code: "session_membership_cleanup_failed".to_owned(),
+                message: format!(
+                    "{original}; session membership cleanup failed for {}: {membership_error}; \
+                     authoritative session cleanup also failed: {allocation_error}",
+                    allocated.session_id
+                ),
+            },
         }
-        outcome
     }
 
     fn mux_command_completion_value(
@@ -9808,11 +13758,17 @@ impl AppState {
                     serde_json::to_value(&session).expect("serialize command target"),
                 );
             }
+            // A flat tmux snapshot reports only its attach anchor. The authoritative recursive
+            // allocation is one result, so descendants use the created session's allocation
+            // generation rather than a per-pane generation assigned while bookkeeping that
+            // snapshot.
+            let allocation_generation =
+                matches!(command, MuxCommand::CreateSession { .. }).then_some(session.generation);
             let windows = allocated
                 .windows
                 .iter()
                 .map(|window| {
-                    let target = self
+                    let mut target = self
                         .mux_resource_target_for_scope(
                             origin,
                             ResourceKind::MuxWindow,
@@ -9820,17 +13776,25 @@ impl AppState {
                             Some(&window.window_id),
                         )
                         .expect("authoritative allocation window generation");
+                    if let Some(generation) = allocation_generation {
+                        target.generation = generation;
+                    }
                     let panes = window
                         .pane_ids
                         .iter()
                         .map(|pane_id| {
-                            self.mux_pane_resource_target_for_scope(
-                                origin,
-                                &allocated.session_id,
-                                &window.window_id,
-                                pane_id,
-                            )
-                            .expect("authoritative allocation pane generation")
+                            let mut target = self
+                                .mux_pane_resource_target_for_scope(
+                                    origin,
+                                    &allocated.session_id,
+                                    &window.window_id,
+                                    pane_id,
+                                )
+                                .expect("authoritative allocation pane generation");
+                            if let Some(generation) = allocation_generation {
+                                target.generation = generation;
+                            }
+                            target
                         })
                         .collect::<Vec<_>>();
                     serde_json::json!({
@@ -11192,6 +15156,8 @@ fn next_non_native_fullscreen_state(
 enum DitchCleanupError {
     ConfirmationRequired(Box<WorktreeRemovalConfirmation>),
     Failed(String),
+    PartialCleanup(String),
+    StaleTarget(String),
 }
 
 impl std::fmt::Display for DitchCleanupError {
@@ -11200,7 +15166,9 @@ impl std::fmt::Display for DitchCleanupError {
             Self::ConfirmationRequired(_) => formatter.write_str(
                 "worktree removal is shared with active sessions and needs explicit confirmation",
             ),
-            Self::Failed(message) => formatter.write_str(message),
+            Self::Failed(message) | Self::PartialCleanup(message) | Self::StaleTarget(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -11231,12 +15199,15 @@ fn run_ditch_cleanup(
             branch,
             repo,
         } => {
+            let branch_target = crate::git::capture_branch_removal_target(repo, branch)
+                .map_err(DitchCleanupError::Failed)?;
             // A retry may only need the branch deletion when the worktree was
             // removed by a prior claim-safe invocation.
             if std::path::Path::new(cwd).exists() {
                 remove_ditch_worktree(state, session_id, cwd, *force, confirmation.cloned())?;
             }
-            crate::git::delete_branch(repo, branch, *force).map_err(DitchCleanupError::Failed)
+            crate::git::delete_branch_if_unchanged(repo, &branch_target)
+                .map_err(DitchCleanupError::PartialCleanup)
         }
     }
 }
@@ -11260,6 +15231,17 @@ fn remove_ditch_worktree(
         confirmation,
     }) {
         Ok(assessment) => assessment,
+        Err(WorktreeServiceError::Claims(
+            crate::automation::directory::DirectoryClaimsError::StaleRemovalTarget {
+                expected, ..
+            },
+        )) => {
+            return Err(DitchCleanupError::StaleTarget(format!(
+                "worktree removal target changed before deletion at {:?}; no cleanup was applied; \
+                 fresh confirmation is required",
+                expected.path
+            )));
+        }
         Err(WorktreeServiceError::Claims(
             crate::automation::directory::DirectoryClaimsError::ConfirmationRequired { assessment }
             | crate::automation::directory::DirectoryClaimsError::StaleConfirmation { assessment },
@@ -11347,6 +15329,69 @@ mod tests {
             .as_nanos();
         let sequence = TEST_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         format!("{nanos}-{sequence}")
+    }
+    fn ensure_test_binding(
+        config_path: &std::path::Path,
+        scope: MuxScope,
+        backend: MultiplexerBackendConfig,
+    ) {
+        let workspace = WorkspaceStore::for_config_path(config_path);
+        let conn =
+            crate::workspace::open_db(workspace.path()).expect("open test workspace database");
+        let space_id = scope.space_id().persistence_value();
+        let binding_id = scope.binding_id().persistence_value();
+        let space_exists = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workspace_spaces WHERE id = ?1)",
+                [space_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("check test workspace space");
+        if !space_exists {
+            let position = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(position) + 1, 0) FROM workspace_spaces",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("allocate test workspace space position");
+            conn.execute(
+                "INSERT INTO workspace_spaces
+                    (id, remote_id, name, icon, color, tint_sidebar, position)
+                 VALUES (?1, ?2, ?3, 'folder', '#7AA2F7', 0, ?4)",
+                rusqlite::params![
+                    space_id,
+                    format!("test-space-{space_id}"),
+                    format!("Test Space {space_id}"),
+                    position
+                ],
+            )
+            .expect("insert test workspace space");
+        }
+        let backend = match backend {
+            MultiplexerBackendConfig::Native => "native",
+            MultiplexerBackendConfig::Rmux => "rmux",
+            MultiplexerBackendConfig::Tmux => "tmux",
+            MultiplexerBackendConfig::Zellij => "zellij",
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_bindings
+                (id, space_id, name, backend, hide_tmux_status)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![
+                binding_id,
+                space_id,
+                format!("Test Binding {binding_id}"),
+                backend
+            ],
+        )
+        .expect("insert test workspace binding");
+        conn.execute(
+            "INSERT OR IGNORE INTO workspace_session_groups (binding_id, name, position)
+             VALUES (?1, '', 0)",
+            [binding_id],
+        )
+        .expect("insert test workspace session group");
     }
 
     fn route_selection_test_events(
@@ -12671,21 +16716,29 @@ mod tests {
     }
 
     #[test]
-    fn persisted_session_restore_waits_for_an_empty_completed_rmux_refresh() {
+    fn persisted_session_restore_waits_for_incomplete_refresh_then_reconciles_each_plan() {
         assert_eq!(
-            persisted_session_restore_decision(MultiplexerBackendConfig::Native, false, true),
+            persisted_session_restore_decision(MultiplexerBackendConfig::Native, false),
             PersistedSessionRestoreDecision::Restore
         );
         assert_eq!(
-            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, false, false),
+            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, false),
             PersistedSessionRestoreDecision::Wait
         );
         assert_eq!(
-            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, true, true),
-            PersistedSessionRestoreDecision::Skip
+            persisted_session_restore_decision(MultiplexerBackendConfig::Zellij, false),
+            PersistedSessionRestoreDecision::Wait
         );
         assert_eq!(
-            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, true, false),
+            persisted_session_restore_decision(MultiplexerBackendConfig::Rmux, true),
+            PersistedSessionRestoreDecision::Restore
+        );
+        assert_eq!(
+            persisted_session_restore_decision(MultiplexerBackendConfig::Tmux, true),
+            PersistedSessionRestoreDecision::Restore
+        );
+        assert_eq!(
+            persisted_session_restore_decision(MultiplexerBackendConfig::Zellij, true),
             PersistedSessionRestoreDecision::Restore
         );
     }
@@ -13750,11 +17803,32 @@ mod tests {
         claims
             .observe_cwd(sibling_claimant.clone(), directory)
             .expect("record sibling cwd");
+        let closing_scope = automation_event_scope(closing.binding.scope);
+        let closing_window = WindowRef {
+            instance: closing_context.instance.clone(),
+            window_id: closing_context.window_id.clone(),
+        };
+        let closing_claims = claims.clone();
         let before = claims.snapshot().expect("claims before teardown");
 
         drop(closing);
+        for _ in 0..512 {
+            enqueue_window_claim_release(
+                closing_claims.clone(),
+                closing_window.clone(),
+                automation.clone(),
+                vec![closing_scope.clone()],
+            );
+        }
 
-        let snapshot = claims.snapshot().expect("claims after teardown");
+        let mut snapshot = claims.snapshot().expect("claims after teardown");
+        for _ in 0..100 {
+            if snapshot.revision > before.revision {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            snapshot = claims.snapshot().expect("claims after teardown");
+        }
         assert_eq!(snapshot.revision, before.revision + 1);
         assert!(
             snapshot
@@ -13779,10 +17853,354 @@ mod tests {
     }
 
     fn test_binding_runtime(scope: MuxScope) -> BindingRuntime {
-        let config = BoottyConfig::default();
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-binding-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create binding test config directory");
+        let config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        ensure_test_binding(
+            &config.config_path,
+            scope,
+            selected_backend(&config.multiplexer),
+        );
         let repaint: RepaintHandle = std::sync::Arc::new(|| {});
         BindingRuntime::new(scope, &config, AppearanceVariant::Dark, repaint)
             .expect("create test binding")
+    }
+
+    #[test]
+    fn persisted_recursive_launch_restores_exact_plan_and_topology() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-recursive-restore-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create recursive restore config directory");
+        let mut config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        config.multiplexer.backend = MultiplexerBackendConfig::Native;
+
+        let root_path = config_dir.join("root");
+        let first_path = root_path.join("first");
+        let second_path = root_path.join("second");
+        let logs_path = root_path.join("logs");
+        for path in [&first_path, &second_path, &logs_path] {
+            std::fs::create_dir_all(path).expect("create launch pane directory");
+        }
+        let root = root_path.to_string_lossy().into_owned();
+        let first_cwd = first_path.to_string_lossy().into_owned();
+        let second_cwd = second_path.to_string_lossy().into_owned();
+        let logs_cwd = logs_path.to_string_lossy().into_owned();
+        let session_id = format!("recursive-restore-{unique}");
+
+        let mut session_environment = std::collections::BTreeMap::new();
+        session_environment.insert("SESSION".to_owned(), "persisted".to_owned());
+        let mut first_environment = std::collections::BTreeMap::new();
+        first_environment.insert("PANE".to_owned(), "first".to_owned());
+        let first = MuxPaneLaunch {
+            cwd: first_cwd.clone(),
+            command: Some("printf first".to_owned()),
+            argv: None,
+            environment: first_environment,
+            title: Some("First pane".to_owned()),
+        };
+        let second = MuxPaneLaunch {
+            cwd: second_cwd.clone(),
+            command: None,
+            argv: Some(vec!["printf".to_owned(), "second".to_owned()]),
+            environment: std::collections::BTreeMap::new(),
+            title: Some("Second pane".to_owned()),
+        };
+        let logs = MuxPaneLaunch {
+            cwd: logs_cwd.clone(),
+            command: Some("printf logs".to_owned()),
+            argv: None,
+            environment: std::collections::BTreeMap::new(),
+            title: Some("Logs".to_owned()),
+        };
+        let plan = MuxSessionLaunchPlan {
+            session_id: session_id.clone(),
+            focus: true,
+            default_cwd: root.clone(),
+            environment: session_environment,
+            windows: vec![
+                MuxWindowLaunchPlan {
+                    name: Some("work".to_owned()),
+                    focus: true,
+                    layout: MuxPaneLaunchPlan::Split(MuxSplitLaunch {
+                        direction: MuxSplitDirection::Right,
+                        ratio_millis: 620,
+                        first: Box::new(MuxPaneLaunchPlan::Pane(first)),
+                        second: Box::new(MuxPaneLaunchPlan::Pane(second)),
+                    }),
+                },
+                MuxWindowLaunchPlan {
+                    name: Some("logs".to_owned()),
+                    focus: false,
+                    layout: MuxPaneLaunchPlan::Pane(logs),
+                },
+            ],
+            focused_window: 0,
+        };
+
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let scope = workspace.binding().expect("default binding").mux_scope();
+        let binding_id = scope.binding_id().persistence_value();
+        let mut names = SessionNameStore::for_binding(&config.config_path, binding_id);
+        names.remember_generated(&session_id, &root, &session_id, &session_id);
+        let mut order = SessionOrderStore::for_binding(
+            &config.config_path,
+            binding_id,
+            namespace_for_binding(scope, &config.multiplexer),
+        )
+        .expect("open recursive restore order");
+        order
+            .add_session(&session_id)
+            .expect("persist recursive session");
+        persist_session_launch_plan(&config.config_path, binding_id, &plan)
+            .expect("persist recursive plan");
+
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let binding = BindingRuntime::new(scope, &config, AppearanceVariant::Dark, repaint)
+            .expect("restore recursive binding");
+        let restored = binding
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("restored recursive session");
+        assert_eq!(restored.windows.len(), 2);
+        assert_eq!(restored.windows[0].name, "work");
+        assert_eq!(restored.windows[0].panes.len(), 2);
+        assert_eq!(
+            restored.windows[0].panes[0].cwd.as_deref(),
+            Some(first_cwd.as_str())
+        );
+        assert_eq!(
+            restored.windows[0].panes[1].cwd.as_deref(),
+            Some(second_cwd.as_str())
+        );
+        assert_eq!(restored.windows[1].name, "logs");
+        assert_eq!(restored.windows[1].panes.len(), 1);
+        assert_eq!(
+            restored.windows[1].panes[0].cwd.as_deref(),
+            Some(logs_cwd.as_str())
+        );
+        assert_eq!(
+            load_session_launch_plans(&config.config_path, binding_id)
+                .expect("reload recursive plan"),
+            vec![(session_id, plan)]
+        );
+    }
+
+    #[test]
+    fn persisted_restore_reconciles_two_plans_when_one_session_is_already_live() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-partial-restore-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create partial restore config directory");
+        let mut config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        config.multiplexer.backend = MultiplexerBackendConfig::Native;
+
+        let cwd = config_dir.join("cwd").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&cwd).expect("create partial restore cwd");
+        let live_id = format!("partial-live-{unique}");
+        let missing_id = format!("partial-missing-{unique}");
+        let live_plan = simple_session_launch_plan(&live_id, &cwd);
+        let missing_plan = simple_session_launch_plan(&missing_id, &cwd);
+
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let scope = workspace.binding().expect("default binding").mux_scope();
+        let binding_id = scope.binding_id().persistence_value();
+        {
+            let mut names = SessionNameStore::for_binding(&config.config_path, binding_id);
+            names.remember_generated(&live_id, &cwd, &live_id, &live_id);
+            names.remember_generated(&missing_id, &cwd, &missing_id, &missing_id);
+            let mut order = SessionOrderStore::for_binding(
+                &config.config_path,
+                binding_id,
+                namespace_for_binding(scope, &config.multiplexer),
+            )
+            .expect("open partial restore order");
+            order.add_session(&live_id).expect("persist live session");
+            order
+                .add_session(&missing_id)
+                .expect("persist missing session");
+            persist_session_launch_plan(&config.config_path, binding_id, &live_plan)
+                .expect("persist live plan");
+            persist_session_launch_plan(&config.config_path, binding_id, &missing_plan)
+                .expect("persist missing plan");
+        }
+
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        {
+            let mut live_binding = BindingRuntime::new_with_backend_override(
+                scope,
+                &config,
+                None,
+                SpaceRemoteOverride::Inherit,
+                AppearanceVariant::Dark,
+                repaint.clone(),
+                true,
+            )
+            .expect("create pre-existing binding");
+            live_binding
+                .mux
+                .create_session(live_plan.clone(), &repaint, &live_binding.multiplexer);
+            assert!(
+                live_binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .any(|session| session.id == live_id)
+            );
+        }
+
+        let binding = BindingRuntime::new(scope, &config, AppearanceVariant::Dark, repaint)
+            .expect("restore partial binding");
+        let sessions = binding.mux.sessions();
+        assert!(sessions.iter().any(|session| session.id == live_id));
+        assert!(sessions.iter().any(|session| session.id == missing_id));
+        assert_eq!(
+            load_session_launch_plans(&config.config_path, binding_id)
+                .expect("reload partial plans"),
+            vec![(live_id, live_plan), (missing_id, missing_plan)]
+        );
+    }
+
+    #[test]
+    fn reopened_binding_reconciles_committed_rename_without_duplicate_plan() {
+        let unique = unique_test_id();
+        let config_dir = std::env::temp_dir().join(format!("bootty-rename-recovery-{unique}"));
+        std::fs::create_dir_all(&config_dir).expect("create rename recovery config directory");
+        let mut config = BoottyConfig {
+            config_path: config_dir.join("config.toml"),
+            ..BoottyConfig::default()
+        };
+        config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        let cwd = config_dir.join("cwd").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&cwd).expect("create rename recovery cwd");
+        let plan = simple_session_launch_plan("alpha", &cwd);
+        let rename = PendingSessionRename {
+            session_id: "alpha".to_owned(),
+            old_name: "alpha".to_owned(),
+            new_name: "release".to_owned(),
+            display_name: "release".to_owned(),
+            cwd: cwd.clone(),
+        };
+
+        let workspace = WorkspaceStore::for_config_path(&config.config_path);
+        let scope = workspace.binding().expect("default binding").mux_scope();
+        let binding_id = scope.binding_id().persistence_value();
+        {
+            let mut names = SessionNameStore::for_binding(&config.config_path, binding_id);
+            names.remember_generated("alpha", &cwd, "alpha", "alpha");
+            let mut order = SessionOrderStore::for_binding(
+                &config.config_path,
+                binding_id,
+                namespace_for_binding(scope, &config.multiplexer),
+            )
+            .expect("open rename recovery order");
+            order
+                .add_session("alpha")
+                .expect("persist source membership");
+            persist_session_launch_plan(&config.config_path, binding_id, &plan)
+                .expect("persist source launch plan");
+            persist_pending_session_rename(
+                &config.config_path,
+                binding_id,
+                "rename-recovery-token",
+                &rename,
+            )
+            .expect("persist pending rename");
+        }
+
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        {
+            let mut live_binding = BindingRuntime::new_with_backend_override(
+                scope,
+                &config,
+                None,
+                SpaceRemoteOverride::Inherit,
+                AppearanceVariant::Dark,
+                repaint.clone(),
+                true,
+            )
+            .expect("create live rename binding");
+            live_binding
+                .mux
+                .create_session(plan.clone(), &repaint, &live_binding.multiplexer);
+            assert!(
+                live_binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .any(|session| session.id == "alpha")
+            );
+
+            assert!(
+                rename_session_membership_and_launch_plans(
+                    &config.config_path,
+                    binding_id,
+                    &rename.old_name,
+                    &rename.new_name,
+                    &[rename.session_id.as_str()],
+                )
+                .expect("commit durable rename before simulated crash")
+            );
+            let conn =
+                crate::workspace::open_db(workspace.path()).expect("open rename recovery database");
+            conn.execute(
+                "UPDATE workspace_session_name_metadata
+                 SET session_name = 'release', display_name = 'release', explicit = 1
+                 WHERE binding_id = ?1 AND session_id = 'alpha'",
+                [binding_id],
+            )
+            .expect("persist renamed metadata before simulated crash");
+            drop(conn);
+
+            live_binding.mux.rename_session(
+                "alpha",
+                "release".to_owned(),
+                &repaint,
+                &live_binding.multiplexer,
+            );
+            assert!(
+                live_binding
+                    .mux
+                    .sessions()
+                    .iter()
+                    .any(|session| session.id == "alpha" && session.name == "release")
+            );
+        }
+
+        let binding = BindingRuntime::new(scope, &config, AppearanceVariant::Dark, repaint)
+            .expect("reopen rename recovery binding");
+        assert!(
+            load_pending_session_renames(&config.config_path, binding_id)
+                .expect("load recovered pending renames")
+                .is_empty()
+        );
+        assert_eq!(
+            load_session_launch_plans(&config.config_path, binding_id)
+                .expect("load recovered launch plan"),
+            vec![(
+                "release".to_owned(),
+                simple_session_launch_plan("release", &cwd)
+            )]
+        );
+        assert_eq!(
+            binding
+                .mux
+                .sessions()
+                .iter()
+                .filter(|session| session.id == "alpha" && session.name == "release")
+                .count(),
+            1
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -13873,6 +18291,240 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_cwd_clear_releases_the_observed_directory_claim() {
+        let state = test_state_with_config(|_| {});
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(98),
+            BindingId::from_persistence(98),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let unique = unique_test_id();
+        let directory = std::env::temp_dir().join(format!("bootty-cwd-clear-{unique}"));
+        std::fs::create_dir_all(&directory).expect("claim directory");
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let _backend = ScriptedBackend::with(vec![session_with_window_and_pane(
+            "live",
+            "live",
+            &directory.to_string_lossy(),
+        )])
+        .install(&mut binding);
+        refresh_selector_test_sessions(&mut binding, &repaint, 1);
+        let binding_generation = binding.mux.binding_generation();
+        let window_id = "live-window";
+        let pane_id = "live-pane";
+        let terminal_id = "live-terminal";
+        let target_generation = binding
+            .mux
+            .terminal_generation("live", window_id, terminal_id)
+            .expect("live test generation");
+        let claims = DirectoryClaims::at(
+            directory.join("claims"),
+            ClaimOwner::current(format!("cwd-clear-{unique}")).expect("claim owner"),
+        )
+        .expect("isolated claims");
+        let claims_context = DirectoryClaimsContext {
+            instance: InstanceRef {
+                instance_id: format!("cwd-clear-{unique}"),
+                generation: 1,
+            },
+            window_id: state.window_state_key.clone(),
+        };
+        let claimant = directory_claimant_for_pane_at_generation(
+            &claims_context,
+            &binding,
+            "live",
+            pane_id,
+            terminal_id,
+            binding_generation,
+            target_generation,
+        );
+        claims
+            .observe_cwd(
+                claimant,
+                DirectoryRef::resolve(&directory).expect("resolve claim directory"),
+            )
+            .expect("record observed cwd");
+        let observation = observed_mux_event(
+            scope,
+            1,
+            MuxEventTopic::PaneCwdChanged,
+            Some(MuxEventTarget::pane(
+                "live",
+                window_id,
+                pane_id,
+                terminal_id,
+                None,
+            )),
+            MuxEventPayload::Cwd {
+                old_cwd: Some(directory.to_string_lossy().into_owned()),
+                new_cwd: None,
+            },
+            ObservationGenerations {
+                binding: binding_generation,
+                target: Some(target_generation),
+                retired_target: None,
+            },
+        );
+        consume_directory_claim_event(
+            &claims,
+            &claims_context,
+            &state.automation,
+            &binding,
+            &AutomationTargetContext {
+                process: state.command_instance_handle.clone(),
+                window_state_key: state.window_state_key.clone(),
+                window_generation: state.command_window_generation,
+            },
+            &observation,
+        )
+        .expect("consume cwd clear");
+
+        assert!(claims.snapshot().expect("claims").claims.is_empty());
+    }
+    #[test]
+    fn stale_cwd_after_binding_rebase_does_not_recreate_retired_claim() {
+        let state = test_state_with_config(|_| {});
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(100),
+            BindingId::from_persistence(100),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let repaint: RepaintHandle = std::sync::Arc::new(|| {});
+        let unique = unique_test_id();
+        let root = std::env::temp_dir().join(format!("bootty-stale-cwd-{unique}"));
+        std::fs::create_dir_all(&root).expect("stale cwd directory");
+        let cwd = root.to_string_lossy().into_owned();
+        let backend =
+            ScriptedBackend::with(vec![session_with_window_and_pane("live", "live", &cwd)])
+                .install(&mut binding);
+        refresh_selector_test_sessions(&mut binding, &repaint, 1);
+        let old_binding_generation = binding.mux.binding_generation();
+        let window_id = "live-window";
+        let pane_id = "live-pane";
+        let terminal_id = "live-terminal";
+        let target_generation = binding
+            .mux
+            .terminal_generation("live", window_id, terminal_id)
+            .expect("live stale-cwd generation");
+        let automation = state.automation_hub();
+        let claims = DirectoryClaims::at(
+            root.join("claims"),
+            ClaimOwner::current(format!("stale-cwd-{unique}")).expect("claim owner"),
+        )
+        .expect("stale cwd claims");
+        let claims_context = DirectoryClaimsContext {
+            instance: InstanceRef {
+                instance_id: format!("stale-cwd-{unique}"),
+                generation: 1,
+            },
+            window_id: state.window_state_key.clone(),
+        };
+        let old_claimant = directory_claimant_for_pane_at_generation(
+            &claims_context,
+            &binding,
+            "live",
+            pane_id,
+            terminal_id,
+            old_binding_generation,
+            target_generation,
+        );
+        claims
+            .observe_cwd(
+                old_claimant.clone(),
+                DirectoryRef::resolve(&root).expect("resolve stale cwd"),
+            )
+            .expect("record stale cwd claim");
+        let old_observation = observed_mux_event(
+            scope,
+            1,
+            MuxEventTopic::PaneCwdChanged,
+            Some(MuxEventTarget::pane(
+                "live",
+                window_id,
+                pane_id,
+                terminal_id,
+                None,
+            )),
+            MuxEventPayload::Cwd {
+                old_cwd: None,
+                new_cwd: Some(root.to_string_lossy().into_owned()),
+            },
+            ObservationGenerations {
+                binding: old_binding_generation,
+                target: Some(target_generation),
+                retired_target: None,
+            },
+        );
+
+        assert!(
+            binding
+                .mux
+                .drain_events(&binding.multiplexer, 16)
+                .is_empty()
+        );
+        backend.publish_event(crate::mux::backend::MuxEventDraft::rebase(
+            crate::mux::backend::MuxEventProvenance::Queue,
+            crate::mux::backend::MuxRebaseReason::Reconnect,
+        ));
+        let rebased = binding.mux.drain_events(&binding.multiplexer, 16);
+        assert_eq!(rebased.len(), 1);
+        assert_ne!(binding.mux.binding_generation(), old_binding_generation);
+        claims
+            .release_observed_claimant(&old_claimant)
+            .expect("retire old cwd claim");
+        assert!(claims.snapshot().expect("retired claims").claims.is_empty());
+
+        let target_context = AutomationTargetContext {
+            process: state.command_instance_handle.clone(),
+            window_state_key: state.window_state_key.clone(),
+            window_generation: state.command_window_generation,
+        };
+        let owner = crate::automation::OwnerIdentity::new(1, 1);
+        automation
+            .events()
+            .replace_live_binding_scopes([automation_event_scope(scope)]);
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner.clone(),
+                [automation_event_topic(MuxEventTopic::PaneCwdChanged).to_owned()]
+                    .into_iter()
+                    .collect(),
+                automation_event_scope(scope),
+            )
+            .expect("subscribe stale cwd event")
+            .subscription;
+        binding.pending_automation_events.push_back(old_observation);
+        assert_eq!(
+            publish_pending_binding_automation_events(
+                &mut binding,
+                &automation,
+                &target_context,
+                &claims,
+                &claims_context,
+            )
+            .expect("publish stale cwd event"),
+            1
+        );
+        assert!(
+            claims
+                .snapshot()
+                .expect("post-event claims")
+                .claims
+                .is_empty()
+        );
+        let delivery = automation
+            .events()
+            .poll(&subscription, &owner, 0)
+            .expect("poll stale cwd event");
+        assert_eq!(delivery.events.len(), 1);
+        assert_eq!(
+            delivery.events[0].topic,
+            automation_event_topic(MuxEventTopic::PaneCwdChanged)
+        );
+    }
+
+    #[test]
     fn batched_occupant_replacements_publish_their_own_target_generations() {
         let state = test_state_with_config(|_| {});
         let scope = MuxScope::new(
@@ -13900,6 +18552,9 @@ mod tests {
             window_id: state.window_state_key.clone(),
         };
         let event_scope = automation_event_scope(scope);
+        automation
+            .events()
+            .replace_live_binding_scopes([event_scope.clone()]);
         let owner = crate::automation::OwnerIdentity::new(1, 1);
         let subscription = automation
             .events()
@@ -14060,6 +18715,9 @@ mod tests {
             window_id: state.window_state_key.clone(),
         };
         let event_scope = automation_event_scope(scope);
+        automation
+            .events()
+            .replace_live_binding_scopes([event_scope.clone()]);
         let owner = crate::automation::OwnerIdentity::new(1, 1);
         let subscription = automation
             .events()
@@ -14186,6 +18844,12 @@ mod tests {
 
         let scope = MuxScope::new(state.active_space_id(), BindingId::from_persistence(99));
         let config = state.config().clone();
+        ensure_test_binding(
+            &config.config_path,
+            scope,
+            selected_backend(&config.multiplexer),
+        );
+
         let mut binding = BindingRuntime::new(
             scope,
             &config,
@@ -14242,6 +18906,7 @@ mod tests {
             .expect("record closed launch");
 
         state.inactive_bindings.push(binding);
+        state.synchronize_live_binding_event_scopes();
         let automation = state.automation_hub();
         let event_scope = automation_event_scope(scope);
         let owner = crate::automation::OwnerIdentity::new(1, 1);
@@ -14692,8 +19357,12 @@ mod tests {
         .expect("insert vanished completion binding");
         let mut names = SessionNameStore::for_binding(&config_path, binding_id);
         names.remember_generated(&session_id, &cwd, &session_id, &session_id);
-        let mut order =
-            SessionOrderStore::for_binding(&config_path, binding_id).expect("open session order");
+        let mut order = SessionOrderStore::for_binding(
+            &config_path,
+            binding_id,
+            BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None),
+        )
+        .expect("open session order");
         order
             .add_session(&session_id)
             .expect("persist generated session");
@@ -14708,11 +19377,29 @@ mod tests {
                 focused_window: 0,
             },
         };
+        let namespace = BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None);
+        let binding_identity = BindingRef {
+            window: WindowRef {
+                instance: InstanceRef {
+                    instance_id: "vanished-completion-test".to_owned(),
+                    generation: 0,
+                },
+                window_id: "vanished-completion-test".to_owned(),
+            },
+            space_id: origin.space_id().persistence_value().to_string(),
+            binding_id: binding_id.to_string(),
+            generation: 0,
+        };
         let outcome = state.command_outcome_for_mux_result(
-            "late-completion",
-            origin,
-            None,
-            &command,
+            MuxCompletionContext {
+                command_id: "late-completion",
+                origin,
+                binding_identity: &binding_identity,
+                binding_generation: 0,
+                namespace: &namespace,
+                command: &command,
+                rename: None,
+            },
             Ok(MuxCommandCompletion::default()),
         );
 
@@ -14722,15 +19409,19 @@ mod tests {
             None
         );
         assert!(
-            SessionOrderStore::for_binding(&config_path, binding_id)
-                .expect("reload session order")
-                .session_names()
-                .is_empty()
+            SessionOrderStore::for_binding(
+                &config_path,
+                binding_id,
+                BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None),
+            )
+            .expect("reload session order")
+            .session_names()
+            .is_empty()
         );
     }
 
-    #[test]
-    fn completed_native_launch_persistence_failure_cleans_allocation_and_reservations() {
+    fn completed_native_launch_fixture()
+    -> (AppState, MuxScope, MuxCommand, MuxCommandCompletion, String) {
         let mut state = test_state_with_config(|config| {
             config.multiplexer.backend = MultiplexerBackendConfig::Native;
         });
@@ -14747,13 +19438,14 @@ mod tests {
         let plan = AppState::normalize_session_launch_descriptor(&descriptor, false)
             .expect("normalize native launch")
             .mux_plan(session_id.clone());
-        let command = MuxCommand::CreateSession { plan: plan.clone() };
+        let command = MuxCommand::CreateSession { plan };
         state.binding.pending_generated_names.insert(
             session_id.clone(),
             PendingGeneratedName {
                 cwd: cwd.clone(),
                 name: session_id.clone(),
                 display_name: session_id.clone(),
+                previous_display_name: None,
             },
         );
         state
@@ -14761,7 +19453,7 @@ mod tests {
             .session_names
             .remember_generated(&session_id, &cwd, &session_id, &session_id);
         let config = state.binding.multiplexer.clone();
-        let result = state
+        let completion = state
             .binding
             .mux
             .execute_command_authoritatively(
@@ -14772,10 +19464,177 @@ mod tests {
                 CommandCancellation::new(),
             )
             .recv_timeout(Duration::from_secs(1))
-            .expect("native launch completion");
-        state.binding.session_order.fail_next_save_for_test();
+            .expect("native launch completion")
+            .expect("native launch succeeds");
+        (state, origin, command, completion, session_id)
+    }
 
-        let outcome = state.command_outcome_for_mux_result("test", origin, None, &command, result);
+    fn persist_fixture_launch_plan(state: &AppState, command: &MuxCommand) {
+        let MuxCommand::CreateSession { plan } = command else {
+            panic!("launch fixture must be a CreateSession command");
+        };
+        persist_session_launch_plan(
+            &state.config().config_path,
+            state.binding.scope.binding_id().persistence_value(),
+            plan,
+        )
+        .expect("persist launch plan");
+    }
+
+    #[test]
+    fn stale_allocated_create_compensates_before_discarding_plan() {
+        let (mut state, origin, command, completion, session_id) =
+            completed_native_launch_fixture();
+        persist_fixture_launch_plan(&state, &command);
+        let binding_identity = state.binding_identity(&state.binding);
+        let binding_generation = state.binding.mux.binding_generation();
+        let namespace = namespace_for_binding(state.binding.scope, &state.binding.multiplexer);
+
+        let outcome = state.command_outcome_for_mux_result(
+            MuxCompletionContext {
+                command_id: "stale-create",
+                origin,
+                binding_identity: &binding_identity,
+                binding_generation: binding_generation + 1,
+                namespace: &namespace,
+                command: &command,
+                rename: None,
+            },
+            Ok(completion),
+        );
+
+        assert!(matches!(outcome, CommandOutcome::StaleTarget { .. }));
+        assert!(
+            load_session_launch_plans(
+                &state.config().config_path,
+                origin.binding_id().persistence_value()
+            )
+            .expect("reload launch plans")
+            .is_empty(),
+            "the plan is removed only after authoritative compensation"
+        );
+        assert!(
+            state
+                .binding
+                .mux
+                .all_sessions()
+                .iter()
+                .all(|session| session.id != session_id),
+            "stale completion compensation must remove the backend allocation"
+        );
+    }
+
+    #[test]
+    fn stale_allocated_create_retains_plan_when_backend_namespace_changed() {
+        let (mut state, origin, command, completion, session_id) =
+            completed_native_launch_fixture();
+        persist_fixture_launch_plan(&state, &command);
+        let binding_identity = state.binding_identity(&state.binding);
+        let namespace = BackendConnectionNamespace::new(MultiplexerBackendConfig::Tmux, None);
+
+        let outcome = state.command_outcome_for_mux_result(
+            MuxCompletionContext {
+                command_id: "stale-create-namespace",
+                origin,
+                binding_identity: &binding_identity,
+                binding_generation: state.binding.mux.binding_generation(),
+                namespace: &namespace,
+                command: &command,
+                rename: None,
+            },
+            Ok(completion),
+        );
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Failed { ref code, .. } if code == "completion_indeterminate"
+        ));
+        assert_eq!(
+            load_session_launch_plans(
+                &state.config().config_path,
+                origin.binding_id().persistence_value()
+            )
+            .expect("reload launch plans")
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+            vec![session_id.as_str()],
+            "the plan remains durable when cleanup cannot target the original backend"
+        );
+        assert!(
+            state
+                .binding
+                .mux
+                .all_sessions()
+                .iter()
+                .any(|session| session.id == session_id),
+            "the allocation remains for authoritative recovery"
+        );
+    }
+
+    #[test]
+    fn stale_allocated_create_retains_plan_when_compensation_fails() {
+        let (mut state, origin, command, completion, session_id) =
+            completed_native_launch_fixture();
+        persist_fixture_launch_plan(&state, &command);
+        ScriptedBackend::failing(Vec::new(), "injected stale compensation failure")
+            .install(&mut state.binding);
+        let binding_identity = state.binding_identity(&state.binding);
+        let binding_generation = state.binding.mux.binding_generation();
+        let namespace = namespace_for_binding(state.binding.scope, &state.binding.multiplexer);
+
+        let outcome = state.command_outcome_for_mux_result(
+            MuxCompletionContext {
+                command_id: "stale-create-compensation-failure",
+                origin,
+                binding_identity: &binding_identity,
+                binding_generation: binding_generation + 1,
+                namespace: &namespace,
+                command: &command,
+                rename: None,
+            },
+            Ok(completion),
+        );
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Failed { ref code, .. } if code == "completion_indeterminate"
+        ));
+        assert_eq!(
+            load_session_launch_plans(
+                &state.config().config_path,
+                origin.binding_id().persistence_value()
+            )
+            .expect("reload launch plans")
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+            vec![session_id.as_str()],
+            "a failed compensation must not discard durable recovery intent"
+        );
+    }
+
+    #[test]
+    fn completed_native_launch_persistence_failure_cleans_allocation_and_reservations() {
+        let (mut state, origin, command, completion, session_id) =
+            completed_native_launch_fixture();
+        state.binding.session_order.fail_next_save_for_test();
+        let binding_identity = state.binding_identity(&state.binding);
+        let binding_generation = state.binding.mux.binding_generation();
+        let namespace = namespace_for_binding(state.binding.scope, &state.binding.multiplexer);
+
+        let outcome = state.command_outcome_for_mux_result(
+            MuxCompletionContext {
+                command_id: "test",
+                origin,
+                binding_identity: &binding_identity,
+                binding_generation,
+                namespace: &namespace,
+                command: &command,
+                rename: None,
+            },
+            Ok(completion),
+        );
 
         assert!(matches!(
             outcome,
@@ -14803,6 +19662,60 @@ mod tests {
                 .all_sessions()
                 .iter()
                 .all(|session| session.id != session_id)
+        );
+    }
+
+    #[test]
+    fn membership_cleanup_failure_does_not_skip_native_allocation_compensation() {
+        let (mut state, origin, command, completion, session_id) =
+            completed_native_launch_fixture();
+        state
+            .binding
+            .session_order
+            .add_session(&session_id)
+            .expect("persist allocated session membership");
+        state.binding.session_order.fail_next_save_for_test();
+
+        let namespace = namespace_for_binding(state.binding.scope, &state.binding.multiplexer);
+        let outcome = state.compensate_completed_session_launch(
+            origin,
+            &namespace,
+            &command,
+            &completion,
+            CommandOutcome::Failed {
+                code: "session_membership_persistence_failed".to_owned(),
+                message: "injected launch finalization failure".to_owned(),
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Failed { ref code, .. }
+                if code == "session_membership_cleanup_failed"
+        ));
+        assert!(
+            state
+                .binding
+                .session_order
+                .session_names()
+                .contains(&session_id),
+            "the injected failure must reach membership cleanup"
+        );
+        assert!(
+            !state
+                .binding
+                .pending_generated_names
+                .contains_key(&session_id)
+        );
+        assert_eq!(state.binding.session_names.display_name(&session_id), None);
+        assert!(
+            state
+                .binding
+                .mux
+                .all_sessions()
+                .iter()
+                .all(|session| session.id != session_id),
+            "backend compensation must run despite the persistence failure"
         );
     }
 
@@ -14863,8 +19776,21 @@ mod tests {
                 .allocated()
                 .cloned()
                 .expect("new native session has authoritative allocation");
-            let outcome =
-                state.command_outcome_for_mux_result("test", origin, None, &command, result);
+            let binding_identity = state.binding_identity(&state.binding);
+            let binding_generation = state.binding.mux.binding_generation();
+            let namespace = namespace_for_binding(state.binding.scope, &state.binding.multiplexer);
+            let outcome = state.command_outcome_for_mux_result(
+                MuxCompletionContext {
+                    command_id: "test",
+                    origin,
+                    binding_identity: &binding_identity,
+                    binding_generation,
+                    namespace: &namespace,
+                    command: &command,
+                    rename: None,
+                },
+                result,
+            );
             assert!(matches!(outcome, CommandOutcome::Success { .. }));
 
             let session = state
@@ -15136,6 +20062,12 @@ mod tests {
                     .saturating_add(1000),
             ),
         );
+        ensure_test_binding(
+            &state.config().config_path,
+            remote_scope,
+            selected_backend(&state.config().multiplexer),
+        );
+
         let mut remote = BindingRuntime::new(
             remote_scope,
             state.config(),
@@ -15235,6 +20167,7 @@ mod tests {
                 .move_session(&second, -1, [first.as_str(), second.as_str()])
                 .expect("persist remote session order")
         );
+        let remote_namespace = namespace_for_binding(remote.scope, &remote.multiplexer);
         state.inactive_bindings.push(remote);
 
         state.update_frame(test_frame_inputs(Vec::new(), None));
@@ -15258,6 +20191,7 @@ mod tests {
             SessionOrderStore::for_binding(
                 &config_path,
                 remote_scope.binding_id().persistence_value(),
+                remote_namespace,
             )
             .expect("reload remote session order")
             .session_names(),
@@ -15267,6 +20201,7 @@ mod tests {
             SessionOrderStore::for_binding(
                 &config_path,
                 state.binding.scope.binding_id().persistence_value(),
+                namespace_for_binding(state.binding.scope, &state.binding.multiplexer,),
             )
             .expect("reload active session order")
             .session_names(),
@@ -15289,6 +20224,12 @@ mod tests {
                     .saturating_add(1000),
             ),
         );
+        ensure_test_binding(
+            &state.config().config_path,
+            remote_scope,
+            selected_backend(&state.config().multiplexer),
+        );
+
         let mut remote = BindingRuntime::new(
             remote_scope,
             state.config(),
@@ -15553,9 +20494,177 @@ mod tests {
             reopened.multiplexer_backend(),
             MultiplexerBackendConfig::Zellij
         );
+        let claims = DirectoryClaims::at(
+            config_dir.join("close-space-claims"),
+            ClaimOwner::current(format!("close-space-{unique}")).expect("claim owner"),
+        )
+        .expect("isolated claims");
+        reopened.directory_claims = claims.clone();
+        let claims_context = DirectoryClaimsContext {
+            instance: InstanceRef {
+                instance_id: reopened.command_instance_handle.clone(),
+                generation: reopened.command_instance_generation,
+            },
+            window_id: reopened.window_state_key.clone(),
+        };
+        let claimant = directory_claimant_for_pane_at_generation(
+            &claims_context,
+            &reopened.binding,
+            "review-session",
+            "review-pane",
+            "review-terminal",
+            reopened.binding.mux.binding_generation(),
+            1,
+        );
+        claims
+            .record_launch(
+                claimant,
+                DirectoryRef::resolve(&config_dir).expect("claim directory"),
+            )
+            .expect("record Space claim");
         assert!(reopened.close_space_from_ui(review_space));
+        assert!(
+            claims
+                .snapshot()
+                .expect("claims after Space close")
+                .claims
+                .is_empty(),
+            "closing a Space must release its binding claims"
+        );
         assert_eq!(reopened.active_space_id(), default_space);
         assert!(!reopened.close_space_from_ui(default_space));
+    }
+
+    #[test]
+    fn space_lifecycle_refuses_started_command_transition() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Native;
+        });
+        assert!(state.create_space_from_ui(
+            "Second",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+        ));
+        let target = state.active_space_id();
+        let origin = state.binding.scope;
+        let binding_identity = state.binding_identity(&state.binding);
+        let binding_generation = state.binding.mux.binding_generation();
+        let namespace = namespace_for_binding(state.binding.scope, &state.binding.multiplexer);
+        let command = MuxCommand::CreateSession {
+            plan: MuxSessionLaunchPlan {
+                session_id: "in-flight".to_owned(),
+                focus: false,
+                default_cwd: "/tmp".to_owned(),
+                environment: BTreeMap::new(),
+                windows: Vec::new(),
+                focused_window: 0,
+            },
+        };
+        let cancellation = CommandCancellation::new();
+        assert!(cancellation.try_start());
+        let (result_sender, result) = mpsc::channel();
+        state.pending_app_commands.push(PendingAppCommand {
+            request_id: 1,
+            command,
+            command_id: "in-flight".to_owned(),
+            origin,
+            binding_identity,
+            binding_generation,
+            namespace,
+            target: None,
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation: cancellation.clone(),
+            response: None,
+            completion: None,
+            rename: None,
+            result,
+        });
+        let before = state.space_summaries();
+
+        assert!(!state.close_space_from_ui(target));
+        assert_eq!(state.active_space_id(), target);
+        assert_eq!(state.space_summaries(), before);
+        assert!(cancellation.is_cancel_requested());
+        assert!(
+            state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("commands_in_flight"))
+        );
+
+        assert!(state.update_space_from_ui(
+            target,
+            "Changed",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride::default(),
+        ));
+        let after_rename = state.space_summaries();
+        assert_eq!(
+            after_rename
+                .iter()
+                .find(|space| space.id == target)
+                .map(|space| space.name.as_str()),
+            Some("Changed")
+        );
+        assert_eq!(state.pending_app_commands.len(), 1);
+        assert!(!state.update_space_from_ui(
+            target,
+            "Backend Attempt",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Tmux),
+                remote: SpaceRemoteOverride::Inherit,
+            },
+        ));
+        assert_eq!(state.space_summaries(), after_rename);
+        result_sender
+            .send(Err(MuxCommandError::Cancelled))
+            .expect("deliver old-backend cancellation");
+        assert!(state.drain_pending_app_commands(Instant::now()));
+        assert!(
+            state.pending_app_commands.is_empty(),
+            "the transition may retry only after terminal reconciliation"
+        );
+        assert!(state.update_space_from_ui(
+            target,
+            "Changed",
+            "folder",
+            crate::workspace::DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Tmux),
+                remote: SpaceRemoteOverride::Inherit,
+            },
+        ));
+        assert_eq!(
+            state
+                .space_summaries()
+                .iter()
+                .find(|space| space.id == target)
+                .map(|space| space.name.as_str()),
+            Some("Changed")
+        );
+        assert!(
+            state.close_space_from_ui(target),
+            "a reconciled binding must be closable"
+        );
+        assert!(
+            state
+                .space_summaries()
+                .iter()
+                .all(|space| space.id != target),
+            "close must remove the reconciled Space"
+        );
+        assert_ne!(
+            state.active_space_id(),
+            target,
+            "close must leave the surviving Space active"
+        );
     }
 
     /// A dropped connection has to reconnect, not close: the sessions are on the other host, and
@@ -16295,7 +21404,19 @@ mod tests {
 
         drop(state);
         let mut reopened = AppState::new(config, repaint, None, None).expect("reopened state");
-        reopened.update_frame(test_frame_inputs(Vec::new(), None));
+        for _ in 0..100 {
+            reopened.update_frame(test_frame_inputs(Vec::new(), None));
+            let visible_names = reopened
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .map(|session| session.name.clone())
+                .collect::<Vec<_>>();
+            if visible_names == second_names {
+                break;
+            }
+        }
         assert_eq!(
             reopened
                 .binding
@@ -17326,6 +22447,12 @@ mod tests {
             &state.repaint,
             &mux_config,
         );
+        persist_session_launch_plan(
+            &state.config().config_path,
+            state.binding.scope.binding_id().persistence_value(),
+            &simple_session_launch_plan(&first, "/tmp"),
+        )
+        .expect("persist launch plan");
 
         state.apply_ditch_session_event(
             DitchSessionDialog::open(first.clone(), None),
@@ -17344,6 +22471,57 @@ mod tests {
                 .sessions()
                 .iter()
                 .all(|session| session.id != first)
+        );
+        let plans = load_session_launch_plans(
+            &state.config().config_path,
+            state.binding.scope.binding_id().persistence_value(),
+        )
+        .expect("load launch plans");
+        assert!(
+            plans.iter().all(|(_, plan)| plan.session_id != first),
+            "successful ditch must not resurrect persisted launch intent"
+        );
+    }
+
+    #[test]
+    fn failed_ditch_preserves_persisted_launch_plan() {
+        let mut state = test_state();
+        let session_id = format!("failed-ditch-{}", unique_test_id());
+        let mux_config = state.config().multiplexer.clone();
+        state.binding.mux.create_project_session(
+            crate::mux::controller::NewMuxSessionRequest {
+                session_id: session_id.clone(),
+                cwd: "/tmp".to_owned(),
+            },
+            &state.repaint,
+            &mux_config,
+        );
+        persist_session_launch_plan(
+            &state.config().config_path,
+            state.binding.scope.binding_id().persistence_value(),
+            &simple_session_launch_plan(&session_id, "/tmp"),
+        )
+        .expect("persist launch plan");
+
+        state.apply_ditch_session_event(
+            DitchSessionDialog::open(session_id.clone(), Some("/not/a/worktree".to_owned())),
+            DitchSessionEvent::Ditch {
+                session_id: session_id.clone(),
+                cwd: Some("/not/a/worktree".to_owned()),
+                action: DitchAction::DetachWorktree,
+                confirmation: None,
+            },
+        );
+
+        assert!(state.ditch_session_dialog.is_some());
+        let plans = load_session_launch_plans(
+            &state.config().config_path,
+            state.binding.scope.binding_id().persistence_value(),
+        )
+        .expect("load launch plans");
+        assert!(
+            plans.iter().any(|(_, plan)| plan.session_id == session_id),
+            "failed ditch must retain restore intent"
         );
     }
 
@@ -18460,6 +23638,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: crate::commands::CommandCancellation::new(),
                 response,
+                completion: None,
             })
             .unwrap();
 
@@ -18499,6 +23678,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: crate::commands::CommandCancellation::new(),
                 response,
+                completion: None,
             })
             .unwrap();
 
@@ -18548,6 +23728,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: crate::commands::CommandCancellation::new(),
                 response,
+                completion: None,
             })
             .unwrap();
         state.update_frame(test_frame_inputs(Vec::new(), None));
@@ -18570,7 +23751,7 @@ mod tests {
     #[test]
     fn pane_mux_commands_reach_typed_commands_and_preflight_backend_gaps() {
         fn invoke(state: &mut AppState, invocation: CommandInvocation) -> CommandOutcome {
-            let sender = state.app_command_sender(Caller::Socket);
+            let sender = state.app_command_sender(Caller::Cli);
             let (response, response_rx) = mpsc::channel();
             sender
                 .try_send(crate::commands::AppCommandRequest {
@@ -18578,6 +23759,7 @@ mod tests {
                     deadline: Instant::now() + Duration::from_secs(1),
                     cancellation: crate::commands::CommandCancellation::new(),
                     response,
+                    completion: None,
                 })
                 .expect("queue command");
             for _ in 0..100 {
@@ -18642,7 +23824,7 @@ mod tests {
             (
                 "pane.select",
                 vec!["right".to_owned()],
-                ResourceKind::MuxWindow,
+                ResourceKind::Pane,
                 MuxCommand::SelectPane {
                     session_id: "s1".to_owned(),
                     window_id: Some("s1-window".to_owned()),
@@ -18680,15 +23862,12 @@ mod tests {
                 CommandInvocation {
                     command: command.to_owned(),
                     arguments,
-                    caller: Caller::Socket,
+                    caller: Caller::Cli,
                     target: Some(target),
                     confirmation: None,
                 },
             );
-            assert!(
-                matches!(outcome, CommandOutcome::Success { .. }),
-                "{command} did not complete: {outcome:?}"
-            );
+            assert!(matches!(outcome, CommandOutcome::Success { .. }),);
             expected_commands.push(expected);
         }
         assert_eq!(backend.executed_commands(), expected_commands);
@@ -18733,7 +23912,7 @@ mod tests {
                 CommandInvocation {
                     command: command.to_owned(),
                     arguments,
-                    caller: Caller::Socket,
+                    caller: Caller::Cli,
                     target: Some(target),
                     confirmation: None,
                 },
@@ -18778,6 +23957,7 @@ mod tests {
                     deadline,
                     cancellation,
                     response,
+                    completion: None,
                 })
                 .unwrap();
             state.update_frame(test_frame_inputs(Vec::new(), None));
@@ -18790,6 +23970,270 @@ mod tests {
         assert_eq!(state.config().chrome.sidebar, before);
     }
 
+    #[test]
+    fn expired_started_request_reports_indeterminate_completion() {
+        let mut state = test_state();
+        let before = state.config().chrome.sidebar;
+        let sender = state.app_command_sender(Caller::Socket);
+        let cancellation = crate::commands::CommandCancellation::new();
+        assert!(cancellation.try_start());
+        let (response, response_rx) = mpsc::channel();
+        sender
+            .try_send(crate::commands::AppCommandRequest {
+                invocation: CommandInvocation::from_action(
+                    "toggle_sidebar_visibility",
+                    Caller::Socket,
+                ),
+                deadline: Instant::now() - Duration::from_secs(1),
+                cancellation,
+                response,
+                completion: None,
+            })
+            .unwrap();
+
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+
+        assert!(matches!(
+            response_rx.recv().unwrap(),
+            CommandOutcome::Failed { code, .. } if code == "completion_indeterminate"
+        ));
+        assert_eq!(state.config().chrome.sidebar, before);
+    }
+
+    #[test]
+    fn started_completion_is_reconciled_when_caller_drops_response() {
+        let automation = AutomationHub::new();
+        let mut state = test_state_with_config_and_automation(|_| {}, automation.clone());
+        let scope = format!("instance:{}", state.command_instance_handle);
+        let owner = crate::automation::OwnerIdentity::new(1, 1);
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner.clone(),
+                ["command.completed".to_owned()].into_iter().collect(),
+                scope,
+            )
+            .unwrap()
+            .subscription;
+        let sender = state.app_command_sender(Caller::Socket);
+        let cancellation = crate::commands::CommandCancellation::new();
+        assert!(cancellation.try_start());
+        let (response, response_rx) = mpsc::channel();
+        drop(response_rx);
+        sender
+            .try_send(crate::commands::AppCommandRequest {
+                invocation: CommandInvocation::from_action(
+                    "toggle_sidebar_visibility",
+                    Caller::Socket,
+                ),
+                deadline: Instant::now() - Duration::from_secs(1),
+                cancellation,
+                response,
+                completion: Some(CommandCompletionContext {
+                    caller: Caller::Socket,
+                    owner_pid: owner.pid(),
+                    owner_generation: owner.generation(),
+                    target: None,
+                }),
+            })
+            .unwrap();
+
+        state.update_frame(test_frame_inputs(Vec::new(), None));
+
+        let events = (0..100)
+            .find_map(|_| {
+                let delivery = automation
+                    .events()
+                    .poll(&subscription, &owner, 0)
+                    .expect("reconciled completion event");
+                if delivery.events.is_empty() {
+                    std::thread::sleep(Duration::from_millis(1));
+                    None
+                } else {
+                    Some(delivery)
+                }
+            })
+            .expect("reconciled completion event");
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].provenance["caller"], "socket");
+        assert_eq!(
+            events.events[0].provenance["owner_pid"],
+            serde_json::json!(owner.pid())
+        );
+        assert_eq!(
+            events.events[0].provenance["owner_generation"],
+            serde_json::json!(owner.generation())
+        );
+        assert_eq!(events.events[0].payload["reconciled"], true);
+        assert!(events.events[0].payload["request_id"].is_u64());
+        assert_eq!(events.events[0].payload["outcome"]["status"], "failed");
+    }
+
+    #[test]
+    fn reconciliation_worker_fairly_publishes_over_capacity_started_completions() {
+        const TOTAL: usize = 80;
+        let automation = AutomationHub::new();
+        let owner = crate::automation::OwnerIdentity::new(91, 7);
+        let scope = "instance:reconciliation-worker-test".to_owned();
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner.clone(),
+                ["command.completed".to_owned()].into_iter().collect(),
+                scope.clone(),
+            )
+            .expect("subscribe to completion events")
+            .subscription;
+        let mut cursor = 0;
+        let mut events = Vec::new();
+        let mut stalled_sender: Option<mpsc::Sender<MuxCommandResult>> = None;
+        let (reconciliation_tx, reconciliation_rx) =
+            mpsc::channel::<ShutdownReconciliationCompletion>();
+        drop(reconciliation_rx);
+        let origin = MuxScope::new(
+            SpaceId::from_persistence(91),
+            BindingId::from_persistence(91),
+        );
+        let binding_identity = BindingRef {
+            window: WindowRef {
+                instance: InstanceRef {
+                    instance_id: "reconciliation-worker-test".to_owned(),
+                    generation: owner.generation(),
+                },
+                window_id: "reconciliation-worker-test".to_owned(),
+            },
+            space_id: origin.space_id().persistence_value().to_string(),
+            binding_id: origin.binding_id().persistence_value().to_string(),
+            generation: 1,
+        };
+        let namespace = BackendConnectionNamespace::new(MultiplexerBackendConfig::Native, None);
+
+        for index in 0..TOTAL {
+            let (result_tx, result_rx) = mpsc::channel::<MuxCommandResult>();
+            let cancellation = CommandCancellation::new();
+            assert!(cancellation.try_start());
+            let completion = Some(CommandCompletionContext {
+                caller: Caller::Socket,
+                owner_pid: owner.pid(),
+                owner_generation: owner.generation(),
+                target: None,
+            });
+            enqueue_shutdown_reconciliation(ShutdownReconciliationJob::Mux(
+                ShutdownMuxReconciliation {
+                    request_id: index as u64 + 1,
+                    command_id: "test.reconcile".to_owned(),
+                    command: MuxCommand::ActivateNextWindow {
+                        session_id: "session".to_owned(),
+                    },
+                    result: result_rx,
+                    origin,
+                    binding_identity: binding_identity.clone(),
+                    binding_generation: 1,
+                    namespace: namespace.clone(),
+                    deadline: Instant::now() + SHUTDOWN_RECONCILIATION_GRACE,
+                    reconciliation: reconciliation_tx.clone(),
+                    cancellation,
+                    target: None,
+                    completion,
+                    automation: automation.clone(),
+                    scope: scope.clone(),
+                    fallback_scope: scope.clone(),
+                },
+            ));
+            if index == 0 {
+                stalled_sender = Some(result_tx);
+            } else {
+                result_tx
+                    .send(Ok(MuxCommandCompletion::default()))
+                    .expect("send actual completion");
+            }
+            let delivery = automation
+                .events()
+                .poll(&subscription, &owner, cursor)
+                .expect("poll completion events");
+            cursor = delivery.cursor;
+            events.extend(delivery.events);
+        }
+
+        for _ in 0..1000 {
+            if events.len() == TOTAL - 1 {
+                break;
+            }
+            let delivery = automation
+                .events()
+                .poll(&subscription, &owner, cursor)
+                .expect("poll completion events");
+            cursor = delivery.cursor;
+            events.extend(delivery.events);
+            if events.len() != TOTAL - 1 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        assert_eq!(events.len(), TOTAL - 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.payload["outcome"]["status"] == "success")
+        );
+        drop(stalled_sender);
+    }
+
+    #[test]
+    fn reconciled_completion_preserves_target_and_owner_provenance() {
+        let automation = AutomationHub::new();
+        let mut state = test_state_with_config_and_automation(|_| {}, automation.clone());
+        let scope = format!("instance:{}", state.command_instance_handle);
+        let owner = crate::automation::OwnerIdentity::new(2, 3);
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner.clone(),
+                ["command.completed".to_owned()].into_iter().collect(),
+                scope,
+            )
+            .unwrap()
+            .subscription;
+        let target = CommandTarget {
+            kind: ResourceKind::Pane,
+            handle: "resolved-pane".to_owned(),
+            generation: 7,
+        };
+        let completion = CommandCompletionContext {
+            caller: Caller::Socket,
+            owner_pid: owner.pid(),
+            owner_generation: owner.generation(),
+            target: Some(target.clone()),
+        };
+
+        state.publish_reconciled_command_completion(
+            17,
+            "pane.select",
+            None,
+            Some(&completion),
+            &CommandOutcome::success(),
+        );
+
+        let events = automation
+            .events()
+            .poll(&subscription, &owner, 0)
+            .expect("reconciled completion event");
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].target.as_ref(), Some(&target));
+        assert_eq!(
+            events.events[0].payload["target"],
+            serde_json::to_value(&target).unwrap()
+        );
+        assert_eq!(events.events[0].provenance["caller"], "socket");
+        assert_eq!(
+            events.events[0].provenance["owner_pid"],
+            serde_json::json!(owner.pid())
+        );
+        assert_eq!(
+            events.events[0].provenance["owner_generation"],
+            serde_json::json!(owner.generation())
+        );
+    }
     #[test]
     fn synchronous_command_rechecks_deadline_before_starting() {
         let mut state = test_state();
@@ -18829,6 +24273,9 @@ mod tests {
                 *confirmation
             }
             CommandDispatch::Pending { .. } => panic!("expected confirmation"),
+            CommandDispatch::ExtensionPending { .. } => {
+                panic!("expected confirmation, got extension pending")
+            }
             CommandDispatch::Complete(outcome) => {
                 panic!("expected confirmation, got {outcome:?}")
             }
@@ -19131,6 +24578,12 @@ mod tests {
                     .saturating_add(1_000),
             ),
         );
+        ensure_test_binding(
+            &state.config().config_path,
+            remote_scope,
+            selected_backend(&state.config().multiplexer),
+        );
+
         let mut remote = BindingRuntime::new(
             remote_scope,
             state.config(),
@@ -19375,6 +24828,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: crate::commands::CommandCancellation::new(),
                 response,
+                completion: None,
             })
             .unwrap();
 
@@ -19551,6 +25005,389 @@ mod tests {
             state
                 .last_error()
                 .is_some_and(|error| error.contains("background-opacity"))
+        );
+    }
+
+    #[test]
+    fn automation_state_rebase_keeps_latest_state_per_target_after_gap() {
+        let state = test_state_with_config(|_| {});
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(201),
+            BindingId::from_persistence(201),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let context = AutomationTargetContext {
+            process: state.command_instance_handle.clone(),
+            window_state_key: state.window_state_key.clone(),
+            window_generation: state.command_window_generation,
+        };
+        let automation = AutomationHub::new();
+        let owner = crate::automation::OwnerIdentity::new(1, 1);
+        let event_scope = automation_event_scope(scope);
+        automation
+            .events()
+            .replace_live_binding_scopes([event_scope.clone()]);
+        let topics = ["terminal.title_changed".to_owned()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let subscription = automation
+            .events()
+            .subscribe(owner.clone(), topics, event_scope)
+            .expect("subscribe to title changes")
+            .subscription;
+        let targets = [
+            MuxEventTarget::pane("$1", "@1", "%1", "t1", None),
+            MuxEventTarget::pane("$2", "@2", "%2", "t2", None),
+        ];
+        for revision in 0..70 {
+            let target = targets[revision % targets.len()].clone();
+            let observation = observed_mux_event(
+                scope,
+                revision as u64 + 1,
+                MuxEventTopic::PaneTitleChanged,
+                Some(target),
+                MuxEventPayload::Title {
+                    old_title: None,
+                    new_title: Some(format!("title-{revision}")),
+                },
+                ObservationGenerations {
+                    binding: binding.mux.binding_generation(),
+                    target: Some(1),
+                    retired_target: None,
+                },
+            );
+            publish_mux_event(&automation, &mut binding, &context, &observation)
+                .expect("publish title change");
+        }
+        assert!(
+            automation.events().poll(&subscription, &owner, 0).is_err(),
+            "the bounded subscription must report a gap"
+        );
+        let rebase = automation
+            .events()
+            .rebase(&subscription, &owner)
+            .expect("rebase title subscription");
+        let targets = rebase.snapshot.snapshots["terminal.title_changed"]["targets"]
+            .as_array()
+            .expect("title targets");
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0]["target"]["terminal_id"], json!("t1"));
+        assert_eq!(targets[0]["value"]["new_title"], json!("title-68"));
+        assert_eq!(targets[1]["target"]["terminal_id"], json!("t2"));
+        assert_eq!(targets[1]["value"]["new_title"], json!("title-69"));
+    }
+
+    #[test]
+    fn automation_state_close_retires_only_the_exact_generation() {
+        let state = test_state_with_config(|_| {});
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(202),
+            BindingId::from_persistence(202),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let target = MuxEventTarget::pane("$1", "@1", "%1", "t1", None);
+        for generation in [1, 2] {
+            let binding_generation = binding.mux.binding_generation();
+            let observation = observed_mux_event(
+                scope,
+                generation,
+                MuxEventTopic::PaneTitleChanged,
+                Some(target.clone()),
+                MuxEventPayload::Title {
+                    old_title: None,
+                    new_title: Some(format!("title-{generation}")),
+                },
+                ObservationGenerations {
+                    binding: binding_generation,
+                    target: Some(generation),
+                    retired_target: None,
+                },
+            );
+            apply_automation_terminal_event_state(&mut binding, &observation);
+        }
+        let binding_generation = binding.mux.binding_generation();
+        let observation = observed_mux_event(
+            scope,
+            3,
+            MuxEventTopic::PaneClosed,
+            Some(target),
+            MuxEventPayload::Closed {
+                reason: "test".to_owned(),
+            },
+            ObservationGenerations {
+                binding: binding_generation,
+                target: Some(2),
+                retired_target: Some(1),
+            },
+        );
+        apply_automation_terminal_event_state(&mut binding, &observation);
+        let snapshot = automation_binding_state_snapshot(
+            &binding,
+            &AutomationTargetContext {
+                process: state.command_instance_handle.clone(),
+                window_state_key: state.window_state_key.clone(),
+                window_generation: state.command_window_generation,
+            },
+            "terminal.title_changed",
+        );
+        let targets = snapshot["targets"].as_array().expect("title targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["generation"], json!(2));
+        assert_eq!(targets[0]["value"]["new_title"], json!("title-2"));
+    }
+
+    #[test]
+    fn automation_state_rebase_marks_unavailable_backend_fields_explicitly() {
+        let mut state = test_state_with_config(|config| {
+            config.multiplexer.backend = MultiplexerBackendConfig::Tmux;
+        });
+        ScriptedBackend::with(vec![session_with_window_and_pane("s1", "session", "/repo")])
+            .install(&mut state.binding);
+        refresh_selector_test_sessions(&mut state.binding, &state.repaint, 1);
+        let _ = state.binding.mux.take_refresh_completed();
+        rebase_automation_terminal_states(&mut state.binding);
+        let context = AutomationTargetContext {
+            process: state.command_instance_handle.clone(),
+            window_state_key: state.window_state_key.clone(),
+            window_generation: state.command_window_generation,
+        };
+        let title =
+            automation_binding_state_snapshot(&state.binding, &context, "terminal.title_changed");
+        let title_target = &title["targets"][0];
+        assert_eq!(title_target["availability"], json!("unknown"));
+        assert_eq!(title_target["value"], Value::Null);
+        assert_eq!(
+            title_target["reason"],
+            json!(AUTOMATION_UNKNOWN_STATE_REASON)
+        );
+        let cwd =
+            automation_binding_state_snapshot(&state.binding, &context, "terminal.cwd_changed");
+        assert_eq!(cwd["targets"][0]["availability"], json!("available"));
+        assert_eq!(cwd["targets"][0]["value"]["new_cwd"], json!("/repo"));
+    }
+
+    #[test]
+    fn automation_state_topics_never_reuse_another_topic_snapshot() {
+        let state = test_state_with_config(|_| {});
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(203),
+            BindingId::from_persistence(203),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let context = AutomationTargetContext {
+            process: state.command_instance_handle.clone(),
+            window_state_key: state.window_state_key.clone(),
+            window_generation: state.command_window_generation,
+        };
+        let target = MuxEventTarget::pane("$1", "@1", "%1", "t1", None);
+        let observation = observed_mux_event(
+            scope,
+            1,
+            MuxEventTopic::PaneTitleChanged,
+            Some(target),
+            MuxEventPayload::Title {
+                old_title: None,
+                new_title: Some("title".to_owned()),
+            },
+            ObservationGenerations {
+                binding: binding.mux.binding_generation(),
+                target: Some(1),
+                retired_target: None,
+            },
+        );
+        apply_automation_terminal_event_state(&mut binding, &observation);
+        let title = automation_binding_state_snapshot(&binding, &context, "terminal.title_changed");
+        let options =
+            automation_binding_state_snapshot(&binding, &context, "terminal.options_changed");
+        assert_eq!(title["targets"][0]["value"]["kind"], json!("title"));
+        assert_eq!(options["targets"][0]["availability"], json!("unknown"));
+        assert_eq!(options["targets"][0]["value"], Value::Null);
+    }
+    #[test]
+    fn automation_event_queue_rebases_after_lifecycle_overflow() {
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(204),
+            BindingId::from_persistence(204),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let binding_generation = binding.mux.binding_generation();
+        let target = MuxEventTarget::pane("$1", "@1", "%1", "t1", None);
+        for revision in 1..=257 {
+            enqueue_automation_event(
+                &mut binding,
+                observed_mux_event(
+                    scope,
+                    revision,
+                    MuxEventTopic::PaneClosed,
+                    Some(target.clone()),
+                    MuxEventPayload::Closed {
+                        reason: "overflow".to_owned(),
+                    },
+                    ObservationGenerations {
+                        binding: binding_generation,
+                        target: Some(1),
+                        retired_target: Some(1),
+                    },
+                ),
+            );
+        }
+        assert_eq!(
+            binding.pending_automation_events.len(),
+            AUTOMATION_PENDING_EVENT_LIMIT
+        );
+        assert!(binding.automation_event_refresh_pending);
+    }
+    #[test]
+    fn automation_stale_terminal_events_publish_without_repopulating_rebased_cache() {
+        let state = test_state_with_config(|_| {});
+        let scope = MuxScope::new(
+            SpaceId::from_persistence(205),
+            BindingId::from_persistence(205),
+        );
+        let mut binding = test_binding_runtime(scope);
+        let context = AutomationTargetContext {
+            process: state.command_instance_handle.clone(),
+            window_state_key: state.window_state_key.clone(),
+            window_generation: state.command_window_generation,
+        };
+        let automation = AutomationHub::new();
+        automation
+            .events()
+            .replace_live_binding_scopes([automation_event_scope(scope)]);
+        let owner = crate::automation::OwnerIdentity::new(1, 1);
+        let subscription = automation
+            .events()
+            .subscribe(
+                owner.clone(),
+                [
+                    "terminal.process_changed".to_owned(),
+                    "terminal.title_changed".to_owned(),
+                    "backend.rebased".to_owned(),
+                ]
+                .into_iter()
+                .collect(),
+                automation_event_scope(scope),
+            )
+            .expect("subscribe to stale event topics")
+            .subscription;
+        let binding_generation = binding.mux.binding_generation();
+        let new_target = MuxEventTarget::pane("$new", "@new", "%new", "t-new", None);
+        let new_observation = observed_mux_event(
+            scope,
+            1,
+            MuxEventTopic::PaneStateChanged,
+            Some(new_target),
+            MuxEventPayload::PaneState {
+                state: MuxPaneState {
+                    title: Some("new-title".to_owned()),
+                    options: Vec::new(),
+                    foreground: Some(MuxForegroundState {
+                        pid: Some(2),
+                        command: Some("new-process".to_owned()),
+                        cwd: Some("/new".to_owned()),
+                        executable: None,
+                    }),
+                },
+            },
+            ObservationGenerations {
+                binding: binding_generation,
+                target: Some(2),
+                retired_target: None,
+            },
+        );
+        apply_automation_terminal_event_state(&mut binding, &new_observation);
+
+        let stale_binding_generation = binding_generation
+            .checked_sub(1)
+            .unwrap_or_else(|| binding_generation.saturating_add(1));
+        let old_target = MuxEventTarget::pane("$old", "@old", "%old", "t-old", None);
+        let old_state = observed_mux_event(
+            scope,
+            2,
+            MuxEventTopic::PaneStateChanged,
+            Some(old_target.clone()),
+            MuxEventPayload::PaneState {
+                state: MuxPaneState {
+                    title: Some("old-title".to_owned()),
+                    options: Vec::new(),
+                    foreground: Some(MuxForegroundState {
+                        pid: Some(1),
+                        command: Some("old-process".to_owned()),
+                        cwd: Some("/old".to_owned()),
+                        executable: None,
+                    }),
+                },
+            },
+            ObservationGenerations {
+                binding: stale_binding_generation,
+                target: Some(1),
+                retired_target: None,
+            },
+        );
+        let old_title = observed_mux_event(
+            scope,
+            3,
+            MuxEventTopic::PaneTitleChanged,
+            Some(old_target),
+            MuxEventPayload::Title {
+                old_title: None,
+                new_title: Some("old-title-delta".to_owned()),
+            },
+            ObservationGenerations {
+                binding: stale_binding_generation,
+                target: Some(1),
+                retired_target: None,
+            },
+        );
+        publish_mux_event(&automation, &mut binding, &context, &old_state)
+            .expect("publish stale pane state");
+        publish_mux_event(&automation, &mut binding, &context, &old_title)
+            .expect("publish stale title");
+        let rebase = observed_mux_event(
+            scope,
+            4,
+            MuxEventTopic::SnapshotRebased,
+            None,
+            MuxEventPayload::Rebase {
+                reason: MuxRebaseReason::Reconnect,
+            },
+            ObservationGenerations {
+                binding: binding_generation,
+                target: None,
+                retired_target: None,
+            },
+        );
+        publish_mux_event(&automation, &mut binding, &context, &rebase)
+            .expect("publish reconnect rebase");
+
+        let snapshot =
+            automation_binding_state_snapshot(&binding, &context, "terminal.title_changed");
+        let targets = snapshot["targets"].as_array().expect("title targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["target"]["terminal_id"], json!("t-new"));
+        assert_eq!(targets[0]["generation"], json!(2));
+        assert_eq!(targets[0]["value"]["new_title"], json!("new-title"));
+        let delivery = automation
+            .events()
+            .poll(&subscription, &owner, 0)
+            .expect("poll stale event delivery");
+        assert!(
+            delivery
+                .events
+                .iter()
+                .any(|event| event.topic == "terminal.process_changed")
+        );
+        assert!(
+            delivery
+                .events
+                .iter()
+                .any(|event| event.topic == "terminal.title_changed")
+        );
+        assert!(
+            delivery
+                .events
+                .iter()
+                .any(|event| event.topic == "backend.rebased")
         );
     }
 }
