@@ -1,4 +1,3 @@
-pub mod catalog;
 pub mod directory;
 pub mod hub;
 pub mod launch;
@@ -8,14 +7,6 @@ pub use hub::{
     EventRebase, EventSnapshot, EventUnsubscription, MetadataHub, MetadataPublication,
     MetadataRecord, OwnerIdentity, TaskHub, TaskState, TaskStatus, TerminalOutputChunk,
     TerminalOutputRead,
-};
-
-pub use catalog::{
-    BackendAvailability, CanonicalDescriptor, Catalog, CatalogArgumentSchema, CatalogAvailability,
-    CatalogCompleteness, CatalogError, CatalogMutation, CatalogOrigin, CatalogPaletteMetadata,
-    CatalogResultSchema, CatalogSource, CatalogSourceMapping, CatalogTarget, CatalogValueType,
-    ServiceRequiredRecord, SourceManifest, SourceManifestEntry, SourceMappingKind,
-    canonical_catalog,
 };
 
 pub use directory::{

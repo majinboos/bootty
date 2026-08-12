@@ -7695,9 +7695,8 @@ fn lua_descriptor(
     title: String,
     description: String,
 ) -> mlua::Result<CommandDescriptor> {
-    use crate::{
-        automation::catalog::{BackendAvailability, CatalogPaletteMetadata},
-        commands::{ArgumentSchema, CompactSchema, MutationClass},
+    use crate::commands::{
+        ArgumentSchema, BackendAvailability, CommandPaletteMetadata, CompactSchema, MutationClass,
     };
     let mutation = match table.get::<Option<String>>("mutation")? {
         None => MutationClass::Read,
@@ -7802,8 +7801,8 @@ fn lua_descriptor(
         .transpose()?;
     let palette_metadata = table
         .get::<Option<Table>>("palette_metadata")?
-        .map(|palette| -> mlua::Result<CatalogPaletteMetadata> {
-            Ok(CatalogPaletteMetadata {
+        .map(|palette| -> mlua::Result<CommandPaletteMetadata> {
+            Ok(CommandPaletteMetadata {
                 visible: palette.get::<Option<bool>>("visible")?.unwrap_or(true),
                 category: palette
                     .get::<Option<String>>("category")?
@@ -7856,31 +7855,27 @@ fn lua_value_type(value: &str) -> mlua::Result<crate::commands::ValueType> {
     }
 }
 
-fn lua_catalog_value_type(
-    value: &str,
-) -> mlua::Result<crate::automation::catalog::CatalogValueType> {
-    use crate::automation::catalog::CatalogValueType;
+fn lua_catalog_value_type(value: &str) -> mlua::Result<crate::commands::CommandResultType> {
+    use crate::commands::CommandResultType;
     match value {
-        "null" => Ok(CatalogValueType::Null),
-        "boolean" => Ok(CatalogValueType::Boolean),
-        "integer" => Ok(CatalogValueType::Integer),
-        "number" => Ok(CatalogValueType::Number),
-        "string" => Ok(CatalogValueType::String),
-        "enum" => Ok(CatalogValueType::Enum),
-        "array" => Ok(CatalogValueType::Array),
-        "object" => Ok(CatalogValueType::Object),
-        "resource_ref" => Ok(CatalogValueType::ResourceRef),
-        "json" => Ok(CatalogValueType::Json),
+        "null" => Ok(CommandResultType::Null),
+        "boolean" => Ok(CommandResultType::Boolean),
+        "integer" => Ok(CommandResultType::Integer),
+        "number" => Ok(CommandResultType::Number),
+        "string" => Ok(CommandResultType::String),
+        "enum" => Ok(CommandResultType::Enum),
+        "array" => Ok(CommandResultType::Array),
+        "object" => Ok(CommandResultType::Object),
+        "resource_ref" => Ok(CommandResultType::ResourceRef),
+        "json" => Ok(CommandResultType::Json),
         other => Err(mlua::Error::external(format!(
             "unknown result type {other}"
         ))),
     }
 }
 
-fn lua_result_schema(
-    table: &Table,
-) -> mlua::Result<crate::automation::catalog::CatalogResultSchema> {
-    use crate::automation::catalog::CatalogResultSchema;
+fn lua_result_schema(table: &Table) -> mlua::Result<crate::commands::CommandResultSchema> {
+    use crate::commands::CommandResultSchema;
     let properties = table
         .get::<Option<Table>>("properties")?
         .map(|properties| {
@@ -7898,7 +7893,7 @@ fn lua_result_schema(
         .get::<Option<Table>>("items")?
         .map(|items| lua_result_schema(&items).map(Box::new))
         .transpose()?;
-    Ok(CatalogResultSchema {
+    Ok(CommandResultSchema {
         value_type: lua_catalog_value_type(
             &table
                 .get::<Option<String>>("type")?
@@ -7909,39 +7904,37 @@ fn lua_result_schema(
     })
 }
 
-fn lua_catalog_target(value: &str) -> mlua::Result<crate::automation::catalog::CatalogTarget> {
-    use crate::automation::catalog::CatalogTarget;
+fn lua_catalog_target(value: &str) -> mlua::Result<crate::commands::CommandTargetKind> {
+    use crate::commands::CommandTargetKind;
     match value {
-        "instance" => Ok(CatalogTarget::Instance),
-        "application_window" => Ok(CatalogTarget::ApplicationWindow),
-        "binding" => Ok(CatalogTarget::Binding),
-        "space" => Ok(CatalogTarget::Space),
-        "session" => Ok(CatalogTarget::Session),
-        "window" | "mux_window" => Ok(CatalogTarget::Window),
-        "pane" => Ok(CatalogTarget::Pane),
-        "terminal" => Ok(CatalogTarget::Terminal),
-        "client" => Ok(CatalogTarget::Client),
-        "directory" => Ok(CatalogTarget::Directory),
-        "worktree" => Ok(CatalogTarget::Worktree),
-        "task" => Ok(CatalogTarget::Task),
-        "subscription" => Ok(CatalogTarget::Subscription),
-        "surface" => Ok(CatalogTarget::Surface),
-        "extension" => Ok(CatalogTarget::Extension),
+        "instance" => Ok(CommandTargetKind::Instance),
+        "application_window" => Ok(CommandTargetKind::ApplicationWindow),
+        "binding" => Ok(CommandTargetKind::Binding),
+        "space" => Ok(CommandTargetKind::Space),
+        "session" => Ok(CommandTargetKind::Session),
+        "window" | "mux_window" => Ok(CommandTargetKind::Window),
+        "pane" => Ok(CommandTargetKind::Pane),
+        "terminal" => Ok(CommandTargetKind::Terminal),
+        "client" => Ok(CommandTargetKind::Client),
+        "directory" => Ok(CommandTargetKind::Directory),
+        "worktree" => Ok(CommandTargetKind::Worktree),
+        "task" => Ok(CommandTargetKind::Task),
+        "subscription" => Ok(CommandTargetKind::Subscription),
+        "surface" => Ok(CommandTargetKind::Surface),
+        "extension" => Ok(CommandTargetKind::Extension),
         other => Err(mlua::Error::external(format!(
             "unknown command target {other}"
         ))),
     }
 }
 
-fn lua_catalog_availability(
-    value: &str,
-) -> mlua::Result<crate::automation::catalog::CatalogAvailability> {
-    use crate::automation::catalog::CatalogAvailability;
+fn lua_catalog_availability(value: &str) -> mlua::Result<crate::commands::CommandAvailability> {
+    use crate::commands::CommandAvailability;
     match value {
-        "available" => Ok(CatalogAvailability::Available),
-        "conditional" => Ok(CatalogAvailability::Conditional),
-        "unsupported" => Ok(CatalogAvailability::Unsupported),
-        "unavailable" => Ok(CatalogAvailability::Unavailable),
+        "available" => Ok(CommandAvailability::Available),
+        "conditional" => Ok(CommandAvailability::Conditional),
+        "unsupported" => Ok(CommandAvailability::Unsupported),
+        "unavailable" => Ok(CommandAvailability::Unavailable),
         other => Err(mlua::Error::external(format!(
             "unknown backend availability {other}"
         ))),
