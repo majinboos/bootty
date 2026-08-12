@@ -22,7 +22,7 @@ pub mod terminal {
     };
     pub use crate::terminal_frame::{
         CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, FrameSelection, FrameStats,
-        RenderCell, RenderFrame,
+        FrameTextRow, RenderCell, RenderFrame,
     };
     pub use crate::terminal_input_model::{
         KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,

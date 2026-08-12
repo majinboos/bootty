@@ -22,14 +22,17 @@ pub(super) fn frame_search_matches(frame: &RenderFrame, query: &str) -> Vec<Fram
         return Vec::new();
     }
 
-    let rows = frame.text_rows();
+    let rows = frame.text_rows_with_columns();
     let mut matches = Vec::new();
     let mut logical = Vec::new();
     let mut positions = Vec::new();
     for (row_index, row) in rows.iter().enumerate() {
-        for (col_index, ch) in row.chars().enumerate() {
+        for (char_index, ch) in row.text.chars().enumerate() {
             logical.push(search_char(ch));
-            positions.push((row_index as u16, col_index as u16));
+            positions.push((
+                row_index as u16,
+                row.columns.get(char_index).copied().unwrap_or_default(),
+            ));
         }
         if !frame.row_wraps.get(row_index).copied().unwrap_or(false) {
             push_frame_matches(&mut matches, &logical, &positions, &query);
@@ -83,7 +86,7 @@ fn push_position_range(matches: &mut Vec<FrameSelection>, positions: &[(u16, u16
     };
     let mut end_col = start_col;
     for &(next_row, next_col) in &positions[1..] {
-        if next_row == row && next_col == end_col.saturating_add(1) {
+        if next_row == row && (next_col == end_col || next_col == end_col.saturating_add(1)) {
             end_col = next_col;
             continue;
         }
@@ -105,4 +108,63 @@ fn push_position_range(matches: &mut Vec<FrameSelection>, positions: &[(u16, u16
 
 fn search_char(ch: char) -> char {
     ch.to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal_frame::{CellStyle, RenderCell};
+
+    fn combining_frame() -> RenderFrame {
+        RenderFrame {
+            cols: 2,
+            rows: 1,
+            cells: vec![
+                RenderCell {
+                    x: 0,
+                    y: 0,
+                    text_start: 0,
+                    text_len: 2,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+                RenderCell {
+                    x: 1,
+                    y: 0,
+                    text_start: 2,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+            ],
+            text: vec!['e', '\u{301}', 'x'],
+            ..RenderFrame::default()
+        }
+    }
+
+    #[test]
+    fn combining_scalars_map_to_their_terminal_cell_column() {
+        let frame = combining_frame();
+
+        assert_eq!(
+            frame_search_matches(&frame, "e\u{301}"),
+            vec![FrameSelection {
+                row: 0,
+                start_col: 0,
+                end_col: 0,
+            }]
+        );
+        assert_eq!(
+            frame_search_matches(&frame, "e\u{301}x"),
+            vec![FrameSelection {
+                row: 0,
+                start_col: 0,
+                end_col: 1,
+            }]
+        );
+    }
 }

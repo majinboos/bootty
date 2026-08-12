@@ -44,10 +44,7 @@ use crate::{
         MuxCommand, MuxDirection, MuxPaneLaunch, MuxPaneLaunchPlan, MuxPaneResize,
         MuxSessionLaunchPlan, MuxSplitDirection,
     },
-    operation::{
-        MuxAllocatedResources, MuxAllocatedWindow, MuxBackendOperationError,
-        RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
-    },
+    operation::{MuxAllocatedResources, MuxAllocatedWindow, MuxBackendOperationError},
     rmux::{
         RmuxWindowRow, list_pane_rows, list_window_rows, rmux_request, rmux_request_checked,
         rmux_response_checked, session_from_rows,
@@ -994,11 +991,14 @@ impl RmuxBridgeState {
         command: MuxCommand,
         precondition: Option<MuxScopedExecutionPrecondition>,
     ) -> Result<()> {
-        if precondition.is_some() {
-            return Err(MuxBackendOperationError::unsupported(
-                RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
-            )
-            .into());
+        if let Some(precondition) = precondition {
+            let snapshot = self.snapshot().await?;
+            if !precondition.matches_snapshot(&snapshot) {
+                return Err(MuxBackendOperationError::stale(
+                    "rmux command target changed before mutation",
+                )
+                .into());
+            }
         }
         self.execute(command).await
     }

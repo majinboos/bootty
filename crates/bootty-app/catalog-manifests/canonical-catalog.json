@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "expected_descriptor_count": 310,
-  "expected_namespace_count": 39,
-  "expected_source_entry_count": 675,
+  "expected_descriptor_count": 302,
+  "expected_namespace_count": 38,
+  "expected_source_entry_count": 570,
   "source_manifest_inventory": {
     "bootty_actions": {
       "entry_ids": [
@@ -244,118 +244,6 @@
         "worktree.open",
         "worktree.remove"
       ]
-    },
-    "rmux_cli_signatures_0_9_1": {
-      "entry_ids": [
-        "attach-session",
-        "bind-key",
-        "break-pane",
-        "broadcast-keys",
-        "capabilities",
-        "capture-pane",
-        "choose-buffer",
-        "choose-client",
-        "choose-tree",
-        "claude",
-        "clear-history",
-        "clear-prompt-history",
-        "clock-mode",
-        "collect-pane-output",
-        "command-prompt",
-        "confirm-before",
-        "copy-mode",
-        "customize-mode",
-        "delete-buffer",
-        "detach-client",
-        "display-menu",
-        "display-message",
-        "display-panes",
-        "display-popup",
-        "doctor",
-        "expect-pane",
-        "find-panes",
-        "find-sessions",
-        "find-window",
-        "has-session",
-        "if-shell",
-        "join-pane",
-        "kill-pane",
-        "kill-server",
-        "kill-session",
-        "kill-window",
-        "last-pane",
-        "last-window",
-        "link-window",
-        "list-buffers",
-        "list-clients",
-        "list-commands",
-        "list-keys",
-        "list-panes",
-        "list-sessions",
-        "list-windows",
-        "load-buffer",
-        "locator",
-        "lock-client",
-        "lock-server",
-        "lock-session",
-        "move-pane",
-        "move-window",
-        "new-session",
-        "new-window",
-        "next-layout",
-        "next-window",
-        "pane-snapshot",
-        "paste-buffer",
-        "pipe-pane",
-        "previous-layout",
-        "previous-window",
-        "refresh-client",
-        "rename-session",
-        "rename-window",
-        "resize-pane",
-        "resize-window",
-        "respawn-pane",
-        "respawn-window",
-        "rotate-window",
-        "run-shell",
-        "save-buffer",
-        "select-layout",
-        "select-pane",
-        "select-window",
-        "send-keys",
-        "send-prefix",
-        "server-access",
-        "set-buffer",
-        "set-environment",
-        "set-hook",
-        "set-option",
-        "set-window-option",
-        "setup",
-        "show-buffer",
-        "show-environment",
-        "show-hooks",
-        "show-messages",
-        "show-options",
-        "show-prompt-history",
-        "show-window-options",
-        "source-file",
-        "split-window",
-        "start-server",
-        "stream-pane",
-        "suspend-client",
-        "swap-pane",
-        "swap-window",
-        "switch-client",
-        "unbind-key",
-        "unlink-window",
-        "wait-for",
-        "wait-pane",
-        "web-share",
-        "with-session"
-      ],
-      "service_required": {
-        "web-share": "rmux.web-share"
-      }
     },
     "rmux_requests_0_9_1": {
       "entry_ids": [
@@ -804,7 +692,6 @@
     "notification",
     "option",
     "pane",
-    "prompt_history",
     "protocol",
     "server",
     "session",
@@ -894,39 +781,6 @@
         "keywords": [
           "system",
           "describe"
-        ]
-      }
-    },
-    {
-      "id": "system.doctor",
-      "title": "Doctor System",
-      "description": "Run non-destructive diagnostics and report actionable failures.",
-      "aliases": [
-        "doctor"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "instance"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "read",
-      "palette": {
-        "visible": false,
-        "category": "system",
-        "keywords": [
-          "system",
-          "doctor"
         ]
       }
     },
@@ -1262,39 +1116,6 @@
         "keywords": [
           "instance",
           "describe"
-        ]
-      }
-    },
-    {
-      "id": "instance.start",
-      "title": "Start Instance",
-      "description": "Launch a Bootty instance and wait for its control endpoint.",
-      "aliases": [
-        "start-server"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "instance"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "write",
-      "palette": {
-        "visible": false,
-        "category": "instance",
-        "keywords": [
-          "instance",
-          "start"
         ]
       }
     },
@@ -2535,39 +2356,6 @@
         "keywords": [
           "font",
           "reset"
-        ]
-      }
-    },
-    {
-      "id": "config.init",
-      "title": "Init Config",
-      "description": "Create Bootty configuration when absent.",
-      "aliases": [
-        "setup"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "application_window"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "write",
-      "palette": {
-        "visible": false,
-        "category": "config",
-        "keywords": [
-          "config",
-          "init"
         ]
       }
     },
@@ -5043,39 +4831,6 @@
       }
     },
     {
-      "id": "pane.locate",
-      "title": "Locate Pane",
-      "description": "Resolve a pane's owning instance, space, session, and window.",
-      "aliases": [
-        "locator"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "pane"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "read",
-      "palette": {
-        "visible": false,
-        "category": "pane",
-        "keywords": [
-          "pane",
-          "locate"
-        ]
-      }
-    },
-    {
       "id": "pane.neighbor",
       "title": "Neighbor Pane",
       "description": "Return the adjacent pane in a direction.",
@@ -6873,47 +6628,6 @@
       }
     },
     {
-      "id": "terminal.broadcast_keys",
-      "title": "Keys Broadcast Terminal",
-      "description": "Send logical keys to a validated pane set.",
-      "aliases": [
-        "broadcast-keys"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [
-        {
-          "name": "key",
-          "type": "string",
-          "required": true,
-          "repeated": true
-        }
-      ],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "terminal"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "write",
-      "palette": {
-        "visible": false,
-        "category": "terminal",
-        "keywords": [
-          "terminal",
-          "broadcast",
-          "keys"
-        ]
-      }
-    },
-    {
       "id": "terminal.paste",
       "title": "Paste Terminal",
       "description": "Paste text using configured terminal paste semantics.",
@@ -7715,40 +7429,6 @@
       }
     },
     {
-      "id": "terminal.customize_mode",
-      "title": "Mode Customize Terminal",
-      "description": "Enter backend customization mode where supported.",
-      "aliases": [
-        "customize-mode"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "terminal"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "write",
-      "palette": {
-        "visible": false,
-        "category": "terminal",
-        "keywords": [
-          "terminal",
-          "customize",
-          "mode"
-        ]
-      }
-    },
-    {
       "id": "terminal.scroll",
       "title": "Scroll Terminal",
       "description": "Scroll by a structured amount and unit.",
@@ -8538,77 +8218,6 @@
         "keywords": [
           "buffer",
           "save"
-        ]
-      }
-    },
-    {
-      "id": "prompt_history.list",
-      "title": "List History Prompt",
-      "description": "List backend prompt history where supported.",
-      "aliases": [
-        "show-prompt-history"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "array",
-        "items": {
-          "type": "object"
-        }
-      },
-      "targets": [
-        "binding"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "read",
-      "palette": {
-        "visible": false,
-        "category": "prompt_history",
-        "keywords": [
-          "prompt",
-          "history",
-          "list"
-        ]
-      }
-    },
-    {
-      "id": "prompt_history.clear",
-      "title": "Clear History Prompt",
-      "description": "Clear backend prompt history.",
-      "aliases": [
-        "clear-prompt-history"
-      ],
-      "origin": {
-        "kind": "core"
-      },
-      "argument_schema": [],
-      "result_schema": {
-        "type": "object"
-      },
-      "targets": [
-        "binding"
-      ],
-      "availability": {
-        "core": "unsupported",
-        "native": "unsupported",
-        "rmux": "unsupported",
-        "tmux": "unsupported"
-      },
-      "mutation": "write",
-      "palette": {
-        "visible": false,
-        "category": "prompt_history",
-        "keywords": [
-          "prompt",
-          "history",
-          "clear"
         ]
       }
     },

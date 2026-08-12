@@ -4,7 +4,6 @@ use rmux_sdk::{Rmux, SessionName};
 
 use crate::operation::{
     MuxAllocatedResources, MuxBackendCommandCompletion, MuxBackendOperationError, MuxEventTarget,
-    RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
 };
 
 #[cfg(feature = "app")]
@@ -106,21 +105,6 @@ pub trait RmuxSessionClient {
     ) -> BindingOperationOutcome<Result<()>> {
         BindingOperationOutcome::Unsupported
     }
-
-    /// Executes a preconditioned command at the client's serialized mutation boundary. Clients
-    /// without a server-side conditional protocol fail closed rather than snapshot-then-send.
-    #[cfg(feature = "app")]
-    fn execute_checked(
-        &self,
-        _command: MuxCommand,
-        _precondition: &MuxScopedExecutionPrecondition,
-    ) -> Result<()> {
-        Err(MuxBackendOperationError::unsupported(
-            "rmux client lacks an atomic checked mutation protocol",
-        )
-        .into())
-    }
-
     #[cfg(feature = "app")]
     fn event_capabilities(&self) -> Vec<MuxEventCapability> {
         MuxEventTopic::ALL
@@ -147,6 +131,7 @@ pub trait RmuxSessionClient {
     #[cfg(feature = "app")]
     fn topology_invalidated(&self) {}
 }
+pub struct SdkRmuxClient;
 
 pub struct RmuxBackend<C = SdkRmuxClient> {
     client: C,
@@ -408,14 +393,13 @@ impl<C: RmuxSessionClient> MuxBackend for RmuxBackend<C> {
                         )
                         .into());
                     }
-                    // rmux's `if-shell` evaluates its predicate and only then queues the nested
-                    // command. The state lock is released between those steps, so it is not a
-                    // compare-and-swap boundary. Without a server-side CAS request, executing the
-                    // command would let a replacement occupant receive a stale mutation.
-                    return Err(MuxBackendOperationError::unsupported(
-                        RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
-                    )
-                    .into());
+                    let snapshot = self.client.snapshot()?;
+                    if !precondition.matches_snapshot(&snapshot) {
+                        return Err(MuxBackendOperationError::stale(
+                            "rmux command target changed before mutation",
+                        )
+                        .into());
+                    }
                 }
                 self.execute(command)
             },
@@ -512,19 +496,6 @@ pub fn rmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
         ],
     )
 }
-
-/// These operations address an existing rmux resource and therefore need the checked mutation
-/// seam. rmux currently has no server-side compare-and-swap request, so the binding reports them
-/// unavailable before dispatch while the direct backend seam returns a typed `Unsupported`.
-#[cfg(feature = "app")]
-pub(crate) fn rmux_operation_requires_checked_boundary(operation: BindingOperation) -> bool {
-    !matches!(
-        operation,
-        BindingOperation::CreateProjectSession | BindingOperation::CreateWorktreeSession
-    )
-}
-
-pub struct SdkRmuxClient;
 
 impl SdkRmuxClient {
     pub fn new() -> Self {
@@ -1311,18 +1282,6 @@ mod tests {
             Ok(self.snapshot.clone())
         }
 
-        #[cfg(feature = "app")]
-        fn execute_checked(
-            &self,
-            _command: MuxCommand,
-            _precondition: &MuxScopedExecutionPrecondition,
-        ) -> Result<()> {
-            self.calls
-                .borrow_mut()
-                .push(vec!["execute_checked".to_owned()]);
-            Err(MuxBackendOperationError::stale("target changed").into())
-        }
-
         fn ensure_session(&self, session_name: &str, cwd: &str) -> Result<()> {
             self.calls.borrow_mut().push(vec![
                 "ensure_session".to_owned(),
@@ -1742,7 +1701,7 @@ mod tests {
 
     #[cfg(feature = "app")]
     #[test]
-    fn rmux_checked_mutation_is_typed_unsupported_before_client_side_effect() {
+    fn rmux_checked_mutation_rejects_stale_snapshot_before_side_effect() {
         let client = RecordingClient::default();
         let calls = client.calls.clone();
         let mut backend = RmuxBackend::with_client(client);
@@ -1770,13 +1729,13 @@ mod tests {
             BindingOperationOutcome::Supported(Err(error))
                 if matches!(
                     error.downcast_ref::<MuxBackendOperationError>(),
-                    Some(MuxBackendOperationError::Unsupported(message))
-                        if message == RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON
+                    Some(MuxBackendOperationError::Stale(_))
                 )
         ));
-        assert!(
-            calls.borrow().is_empty(),
-            "rmux must reject a checked mutation before invoking the client"
+        assert_eq!(
+            calls.borrow().as_slice(),
+            &[vec!["snapshot".to_owned()]],
+            "rmux must verify the authoritative snapshot before invoking the client"
         );
     }
 

@@ -233,31 +233,65 @@ impl RmuxEventHub {
     }
 
     fn release(&self, scope: MuxScope) {
-        let _lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let last_scope = {
-            let mut scopes = self
-                .scopes
+        let (last_scope, worker) = {
+            let _lifecycle = self
+                .lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            scopes.remove(&scope);
-            scopes.is_empty()
-        };
-        #[cfg(test)]
-        if let Some(barrier) = self
-            .release_barrier
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            barrier.wait();
-        }
-        self.events.remove_scope(scope);
-        if last_scope {
-            self.stop_locked();
+            let last_scope = {
+                let mut scopes = self
+                    .scopes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                scopes.remove(&scope);
+                scopes.is_empty()
+            };
+            #[cfg(test)]
+            if let Some(barrier) = self
+                .release_barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                barrier.wait();
+            }
             self.events.remove_scope(scope);
+            let worker = if last_scope {
+                self.request_stop_locked()
+            } else {
+                None
+            };
+            (last_scope, worker)
+        };
+        // The worker may invalidate topology while shutting down and reacquire
+        // lifecycle; never hold that mutex across the join.
+
+        if last_scope {
+            if let Some(worker) = worker
+                && worker.thread().id() != thread::current().id()
+            {
+                let _ = worker.join();
+            }
+            let _lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let has_scopes = {
+                let scopes = self
+                    .scopes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !scopes.contains(&scope) {
+                    // Discard any shutdown observations emitted after the first removal,
+                    // unless this scope was recreated while the worker was joining.
+                    self.events.remove_scope(scope);
+                }
+                !scopes.is_empty()
+            };
+            self.started.store(false, Ordering::Release);
+            if has_scopes {
+                self.start_locked();
+            }
         }
     }
 
@@ -281,6 +315,22 @@ impl RmuxEventHub {
         {
             self.start_locked();
         }
+    }
+
+    fn request_stop_locked(&self) -> Option<thread::JoinHandle<()>> {
+        if let Some(control) = self
+            .controls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+        {
+            let _ = control.send(RmuxHubControl::Stop);
+        }
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     fn start_locked(&self) {
@@ -343,29 +393,6 @@ impl RmuxEventHub {
                 );
             }
         }
-    }
-
-    fn stop_locked(&self) {
-        if let Some(control) = self
-            .controls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-            .cloned()
-        {
-            let _ = control.send(RmuxHubControl::Stop);
-        }
-        let worker = self
-            .worker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(worker) = worker
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
-        }
-        self.started.store(false, Ordering::Release);
     }
 }
 
@@ -1776,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn rmux_hub_stops_after_last_scope_and_restarts_for_recreated_scope() {
+    fn rmux_hub_release_does_not_deadlock_topology_invalidation() {
         let first_scope = MuxScope::new(
             crate::controller::SpaceId::from_persistence(91),
             BindingId::from_persistence(1),
@@ -1786,35 +1813,55 @@ mod tests {
             BindingId::from_persistence(2),
         );
         let hub = Arc::new(test_event_hub());
-        hub.release(first_scope);
-        hub.release(sibling_scope);
 
-        hub.subscribe(first_scope);
-        assert!(hub.started.load(Ordering::Acquire));
-        let barrier = Arc::new(std::sync::Barrier::new(3));
+        hub.scopes
+            .lock()
+            .expect("rmux hub scope lock")
+            .insert(first_scope);
+        hub.started.store(true, Ordering::Release);
+        let (control_tx, _control_rx) = tokio::sync::watch::channel(RmuxHubControl::Running);
+        *hub.controls.lock().expect("rmux control lock") = Some(control_tx);
+
+        // Four participants make the worker's topology-invalidation path and the
+        // concurrent subscriber reach the lifecycle edge while release owns it.
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let topology_hub = Arc::clone(&hub);
+        let topology_barrier = Arc::clone(&barrier);
+        let topology_worker = thread::spawn(move || {
+            topology_barrier.wait();
+            topology_hub.start_if_scoped();
+        });
+        *hub.worker.lock().expect("rmux worker lock") = Some(topology_worker);
         *hub.release_barrier
             .lock()
             .expect("rmux release barrier lock") = Some(Arc::clone(&barrier));
+
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
         let release_hub = Arc::clone(&hub);
-        let releaser = std::thread::spawn(move || release_hub.release(first_scope));
+        let releaser = thread::spawn(move || {
+            release_hub.release(first_scope);
+            released_tx.send(()).expect("release completion receiver");
+        });
         let subscribe_hub = Arc::clone(&hub);
         let subscribe_barrier = Arc::clone(&barrier);
-        let subscriber = std::thread::spawn(move || {
+        let subscriber = thread::spawn(move || {
             subscribe_barrier.wait();
             subscribe_hub.subscribe(sibling_scope);
         });
         barrier.wait();
+        released_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("last rmux release must not wait on a lifecycle-blocked worker");
         releaser.join().expect("last rmux release completed");
         subscriber
             .join()
             .expect("concurrent rmux subscribe completed");
 
-        assert!(
-            hub.scopes
-                .lock()
-                .expect("rmux hub scope lock")
-                .contains(&sibling_scope)
-        );
+        {
+            let scopes = hub.scopes.lock().expect("rmux hub scope lock");
+            assert!(scopes.contains(&sibling_scope));
+            assert!(!scopes.contains(&first_scope));
+        }
         assert!(hub.started.load(Ordering::Acquire));
         hub.release(sibling_scope);
         assert!(!hub.started.load(Ordering::Acquire));
@@ -1822,6 +1869,7 @@ mod tests {
         assert!(hub.started.load(Ordering::Acquire));
         hub.release(first_scope);
         assert!(!hub.started.load(Ordering::Acquire));
+        assert!(hub.scopes.lock().expect("rmux hub scope lock").is_empty());
     }
 
     #[test]

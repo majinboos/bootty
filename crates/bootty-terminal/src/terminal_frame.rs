@@ -65,25 +65,81 @@ impl RenderFrame {
         &self.text[cell.text_start..cell.text_start + cell.text_len]
     }
 
+    /// Returns visible terminal rows without allocating a `String` per cell.
+    ///
+    /// Each row is assembled from the cell spans in one pass. Combining
+    /// scalars stay in their cell's span, so the serialized terminal text
+    /// remains identical to the terminal's cell view.
     pub fn text_rows(&self) -> Vec<String> {
-        let mut rows =
-            vec![vec![String::from(" "); usize::from(self.cols)]; usize::from(self.rows)];
+        (0..self.rows)
+            .map(|row| {
+                let (slots, last_col) = self.text_row_slots(row);
+                let Some(last_col) = last_col else {
+                    return String::new();
+                };
+                let mut text = String::new();
+                for slot in slots.into_iter().take(last_col + 1) {
+                    if let Some(cell_text) = slot {
+                        text.extend(cell_text.iter().copied());
+                    } else {
+                        text.push(' ');
+                    }
+                }
+                text
+            })
+            .collect()
+    }
+
+    /// Returns visible terminal rows with one terminal-cell column per scalar.
+    ///
+    /// A grapheme containing multiple Unicode scalars contributes repeated
+    /// entries for the cell column that owns it. Consumers such as logical
+    /// search must use these columns rather than indexing the rendered string.
+    pub fn text_rows_with_columns(&self) -> Vec<FrameTextRow> {
+        (0..self.rows)
+            .map(|row| {
+                let (slots, last_col) = self.text_row_slots(row);
+                let Some(last_col) = last_col else {
+                    return FrameTextRow::default();
+                };
+                let mut text = String::new();
+                let mut columns = Vec::new();
+                for (column, slot) in slots.into_iter().enumerate().take(last_col + 1) {
+                    if let Some(cell_text) = slot {
+                        text.extend(cell_text.iter().copied());
+                        columns.extend(std::iter::repeat_n(column as u16, cell_text.len()));
+                    } else {
+                        text.push(' ');
+                        columns.push(column as u16);
+                    }
+                }
+                FrameTextRow { text, columns }
+            })
+            .collect()
+    }
+
+    fn text_row_slots(&self, row: u16) -> (Vec<Option<&[char]>>, Option<usize>) {
+        let mut slots = vec![None; usize::from(self.cols)];
+        let mut last_col = None;
         for cell in self
             .cells
             .iter()
-            .filter(|cell| cell.text_len > 0 && !cell.style.invisible)
+            .filter(|cell| cell.y == row && cell.text_len > 0 && !cell.style.invisible)
         {
-            let Some(row) = rows.get_mut(usize::from(cell.y)) else {
-                continue;
-            };
-            if let Some(slot) = row.get_mut(usize::from(cell.x)) {
-                *slot = self.cell_text(cell).iter().collect();
+            let column = usize::from(cell.x);
+            if let Some(slot) = slots.get_mut(column) {
+                *slot = Some(self.cell_text(cell));
+                last_col = Some(last_col.map_or(column, |last: usize| last.max(column)));
             }
         }
-        rows.into_iter()
-            .map(|row| row.concat().trim_end().to_owned())
-            .collect()
+        (slots, last_col)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameTextRow {
+    pub text: String,
+    pub columns: Vec<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -248,6 +304,46 @@ mod tests {
         };
 
         assert_eq!(frame.text_rows(), ["e\u{301}x"]);
+    }
+
+    #[test]
+    fn text_rows_with_columns_repeat_the_owner_cell_for_combining_scalars() {
+        let frame = RenderFrame {
+            cols: 2,
+            rows: 1,
+            cells: vec![
+                RenderCell {
+                    x: 0,
+                    y: 0,
+                    text_start: 0,
+                    text_len: 2,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+                RenderCell {
+                    x: 1,
+                    y: 0,
+                    text_start: 2,
+                    text_len: 1,
+                    fg: None,
+                    bg: None,
+                    style: CellStyle::default(),
+                    hyperlink: None,
+                },
+            ],
+            text: vec!['e', '\u{301}', 'x'],
+            ..RenderFrame::default()
+        };
+
+        assert_eq!(
+            frame.text_rows_with_columns(),
+            vec![FrameTextRow {
+                text: "e\u{301}x".to_owned(),
+                columns: vec![0, 0, 1],
+            }]
+        );
     }
 
     #[test]

@@ -1580,9 +1580,7 @@ fn legacy_target_for(id: &str) -> Option<ResourceKind> {
         | "paste_from_clipboard"
         | "csi"
         | "esc"
-        | "text"
-        | "terminal.read"
-        | "terminal.write" => Some(ResourceKind::Terminal),
+        | "text" => Some(ResourceKind::Terminal),
         _ => None,
     }
 }
@@ -1769,7 +1767,7 @@ mod tests {
     fn registry_lists_only_the_exact_canonical_catalog() {
         let ids = core_command_ids();
 
-        assert_eq!(ids.len(), 310);
+        assert_eq!(ids.len(), 302);
         assert_eq!(ids.len(), CommandRegistry::core().list().count());
         assert!(ids.contains("ui.sidebar.toggle"));
         assert!(ids.contains("window.move"));

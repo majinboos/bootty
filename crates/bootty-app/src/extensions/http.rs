@@ -283,7 +283,7 @@ mod tests {
         let port = listener.local_addr().expect("listener address").port();
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            let _ = listener.accept();
+            let (_connection, _) = listener.accept().expect("accept request");
             accepted_tx.send(()).expect("report accepted request");
             thread::sleep(Duration::from_millis(200));
         });

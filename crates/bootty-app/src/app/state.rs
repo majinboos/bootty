@@ -4470,6 +4470,7 @@ pub struct AppState {
     theme_picker_dialog: Option<ThemePickerDialog>,
     space_editor_dialog: Option<SpaceEditorDialog>,
     terminal_find_dialog: Option<TerminalFindDialog>,
+    terminal_read_snapshot: Option<Value>,
     terminal_find_return_focus_after_search: bool,
     last_terminal_search: String,
     last_terminal_search_direction: TerminalSearchDirection,
@@ -5043,12 +5044,13 @@ impl AppState {
             rename_tab_dialog: None,
             command_palette_dialog: None,
             theme_picker_dialog: None,
+            theme_picker_restore_config: None,
             space_editor_dialog: None,
             terminal_find_dialog: None,
+            terminal_read_snapshot: None,
             terminal_find_return_focus_after_search: false,
             last_terminal_search: String::new(),
             last_terminal_search_direction: TerminalSearchDirection::Next,
-            theme_picker_restore_config: None,
             pending_command: None,
             pending_app_commands: Vec::new(),
             pending_extension_commands: Vec::new(),
@@ -9039,6 +9041,26 @@ impl AppState {
                 }
                 self.pending_command = Some(invocation);
             }
+            CommandPaletteEvent::RunExtension(command) => {
+                self.input_focus = InputFocus::Terminal;
+                let mut invocation =
+                    CommandInvocation::from_action(&command, Caller::CommandPalette);
+                if let Some(kind) = self
+                    .extension_runtime
+                    .command_registry()
+                    .describe(&invocation.command)
+                    .and_then(|descriptor| descriptor.target)
+                {
+                    let Some(target) = self.current_command_target_for(&invocation.command, kind)
+                    else {
+                        self.pending_command = None;
+                        self.last_error = Some(format!("no current {kind:?} target is available"));
+                        return;
+                    };
+                    invocation.target = Some(target);
+                }
+                self.pending_command = Some(invocation);
+            }
         }
     }
 
@@ -9521,6 +9543,7 @@ impl AppState {
             terminal_scale_factor,
             terminal_view_transform,
         } = inputs;
+        self.terminal_read_snapshot = None;
         let mut effects = Vec::new();
 
         self.drain_app_commands(viewport, &mut effects);
@@ -9996,7 +10019,10 @@ impl AppState {
             .input
             .keybinds_for_backend(self.binding.multiplexer.backend);
         self.close_overlay_dialogs();
-        self.command_palette_dialog = Some(CommandPaletteDialog::open(&bindings));
+        self.command_palette_dialog = Some(CommandPaletteDialog::open_with_registry(
+            &bindings,
+            &self.extension_runtime.command_registry(),
+        ));
         self.input_focus = InputFocus::Picker;
     }
 
@@ -12110,9 +12136,19 @@ impl AppState {
     }
 
     fn read_active_terminal(&mut self) -> CommandOutcome {
+        let drained = self.binding.terminal.drain_native_window();
+        if drained.bytes > 0 {
+            self.terminal_read_snapshot = None;
+        }
+        if let Some(value) = self.terminal_read_snapshot.clone() {
+            return CommandOutcome::Success {
+                value,
+                warnings: Vec::new(),
+            };
+        }
         match self.binding.terminal.extract_frame() {
-            Ok(frame) => CommandOutcome::Success {
-                value: serde_json::json!({
+            Ok(frame) => {
+                let value = serde_json::json!({
                     "cols": frame.cols,
                     "rows": frame.rows,
                     "text": frame.text_rows().join("\n"),
@@ -12120,9 +12156,13 @@ impl AppState {
                         "x": cursor.x,
                         "y": cursor.y,
                     })),
-                }),
-                warnings: Vec::new(),
-            },
+                });
+                self.terminal_read_snapshot = Some(value.clone());
+                CommandOutcome::Success {
+                    value,
+                    warnings: Vec::new(),
+                }
+            }
             Err(error) => CommandOutcome::Failed {
                 code: "terminal_read_failed".to_owned(),
                 message: error.to_string(),

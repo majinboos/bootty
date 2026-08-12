@@ -1,6 +1,7 @@
+use std::hash::{Hash, Hasher};
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -156,9 +157,26 @@ pub struct ExtensionLogEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileBatchRollbackError {
+    pub path: String,
+    pub code: String,
+    pub message: String,
+    pub conflict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileBatchApplyError {
+    pub original_code: String,
+    pub original_message: String,
+    pub rolled_back: bool,
+    pub rollback_errors: Vec<FileBatchRollbackError>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionError {
     pub code: String,
     pub message: String,
+    pub details: Option<Box<FileBatchApplyError>>,
 }
 
 impl ExtensionError {
@@ -166,6 +184,34 @@ impl ExtensionError {
         Self {
             code: code.into(),
             message: message.into(),
+            details: None,
+        }
+    }
+
+    fn file_batch_failure(original: Self, rollback_errors: Vec<FileBatchRollbackError>) -> Self {
+        let rolled_back = rollback_errors.is_empty();
+        let message = if rolled_back {
+            format!(
+                "{}: {}; all applied file actions were rolled back",
+                original.code, original.message
+            )
+        } else {
+            format!(
+                "{}: {}; file batch rollback reported {} conflict(s)",
+                original.code,
+                original.message,
+                rollback_errors.len()
+            )
+        };
+        Self {
+            code: "file_batch_apply_failed".to_owned(),
+            message,
+            details: Some(Box::new(FileBatchApplyError {
+                original_code: original.code,
+                original_message: original.message,
+                rolled_back,
+                rollback_errors,
+            })),
         }
     }
 
@@ -566,6 +612,12 @@ pub struct ProcessLine {
     pub stream: String,
     pub line: String,
     pub sequence: u64,
+    /// Parsed JSONL payload. A non-JSON line stays visible in `line` and carries
+    /// a typed parse error rather than being silently discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 struct ProcessRecord {
@@ -651,12 +703,37 @@ struct FileSnapshot {
     version: Option<FileVersion>,
     bytes: Vec<u8>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileConfirmation {
+    /// Opaque host-minted one-use token. Packages must never construct this value.
+    pub token: String,
+    pub transaction_id: u64,
+    pub extension: ExtensionPackageId,
+    pub generation: u64,
+    pub digest: String,
+    pub preview: FileTransactionPreview,
+    #[serde(default)]
+    pub previews: Vec<FileTransactionPreview>,
+}
+
+#[derive(Clone)]
+struct FileConfirmationRecord {
+    confirmation: FileConfirmation,
+    transactions: Vec<FileTransaction>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FileTransactionOperation {
+    Write,
+    Remove,
+}
 
 #[derive(Clone, Debug)]
 pub struct FileTransaction {
     runtime: ExtensionRuntime,
     extension: ExtensionPackageId,
     generation: u64,
+    confirmation_id: u64,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     root: Arc<FileRootCapability>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -666,7 +743,14 @@ pub struct FileTransaction {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     snapshot: FileSnapshot,
     contents: Vec<u8>,
+    operation: FileTransactionOperation,
     preview: FileTransactionPreview,
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone, Debug)]
+struct FileTransactionCommit {
+    transaction: FileTransaction,
+    post_snapshot: FileSnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -796,6 +880,8 @@ impl LifecyclePublicationState {
 }
 
 struct RuntimeInner {
+    next_file_confirmation: AtomicU64,
+    file_confirmations: Mutex<BTreeMap<String, FileConfirmationRecord>>,
     state: RwLock<RuntimeState>,
     commands: ExtensionCommandRegistry,
     automation: AutomationHub,
@@ -870,7 +956,9 @@ impl ExtensionRuntime {
             work_tx,
             shutdown: AtomicBool::new(false),
             storage_root: RwLock::new(None),
+            file_confirmations: Mutex::new(BTreeMap::new()),
             file_transaction_lock: Mutex::new(()),
+            next_file_confirmation: AtomicU64::new(1),
             file_roots: RwLock::new(Vec::new()),
             next_process: AtomicU64::new(1),
             owner: OwnerIdentity::current_process()
@@ -1463,6 +1551,26 @@ impl ExtensionRuntime {
         })
     }
 
+    fn refresh_extension_scopes(&self) {
+        let scopes = self
+            .inner
+            .state
+            .read()
+            .map(|state| {
+                state
+                    .packages
+                    .values()
+                    .filter(|package| package.enabled)
+                    .map(|package| extension_scope(&package.manifest.id, package.generation))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.inner
+            .automation
+            .events()
+            .replace_live_extension_scopes(scopes);
+    }
+
     fn publish_lifecycle(
         &self,
         id: &str,
@@ -1470,6 +1578,7 @@ impl ExtensionRuntime {
         operation: &str,
         snapshot: Value,
     ) -> Result<(), ExtensionError> {
+        self.refresh_extension_scopes();
         let publication = LifecyclePublication {
             extension_id: id.to_owned(),
             generation,
@@ -1784,6 +1893,56 @@ impl ExtensionRuntime {
                 package.source.clone(),
             )
         };
+        if enabled && linked {
+            let root = source
+                .clone()
+                .ok_or_else(|| {
+                    ExtensionError::new(
+                        "extension_source_missing",
+                        "extension source is not linked",
+                    )
+                })?
+                .canonicalize()
+                .map_err(|error| {
+                    ExtensionError::new("extension_source_missing", error.to_string())
+                })?;
+            let entrypoint = manifest
+                .entrypoint
+                .clone()
+                .unwrap_or_else(|| "main.luau".to_owned());
+            let relative = PathBuf::from(&entrypoint);
+            if relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                return Err(ExtensionError::new(
+                    "extension_entrypoint_denied",
+                    "entrypoint traversal denied",
+                ));
+            }
+            let path = root.join(relative).canonicalize().map_err(|error| {
+                ExtensionError::new("extension_entrypoint_missing", error.to_string())
+            })?;
+            if !path.starts_with(&root) {
+                return Err(ExtensionError::new(
+                    "extension_entrypoint_denied",
+                    "entrypoint escapes package root",
+                ));
+            }
+            let bytes = fs::read(&path).map_err(|error| {
+                ExtensionError::new("extension_entrypoint_read_failed", error.to_string())
+            })?;
+            if bytes.len() > EXTENSION_FILE_BYTES {
+                return Err(ExtensionError::new(
+                    "extension_entrypoint_too_large",
+                    "entrypoint exceeds host limit",
+                ));
+            }
+            let source = String::from_utf8(bytes).map_err(|_| {
+                ExtensionError::new("extension_entrypoint_invalid", "entrypoint is not UTF-8")
+            })?;
+            validate_luau_source(&source, id)?;
+        }
         let new_generation = old_generation.checked_add(1).ok_or_else(|| {
             ExtensionError::new("generation_exhausted", "extension generation exhausted")
         })?;
@@ -2845,6 +3004,56 @@ impl ExtensionRuntime {
         }
     }
 
+    pub fn file_exists(&self, id: &str, path: &Path) -> Result<bool, ExtensionError> {
+        self.ensure_running()?;
+        #[cfg(unix)]
+        {
+            let access = self.ensure_file_access(id, path)?;
+            let (parent, name) = open_file_parent(&access.root, &access.relative)
+                .map_err(|error| ExtensionError::new("file_stat_failed", error.to_string()))?;
+            match open_file_at(&parent, &name) {
+                Ok(_) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(ExtensionError::new("file_stat_failed", error.to_string())),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (id, path);
+            Err(unsupported_file_api_error())
+        }
+    }
+
+    pub fn file_stat(&self, id: &str, path: &Path) -> Result<Value, ExtensionError> {
+        self.ensure_running()?;
+        #[cfg(unix)]
+        {
+            let access = self.ensure_file_access(id, path)?;
+            let (parent, name) = open_file_parent(&access.root, &access.relative)
+                .map_err(|error| ExtensionError::new("file_stat_failed", error.to_string()))?;
+            let file = open_file_at(&parent, &name)
+                .map_err(|error| ExtensionError::new("file_stat_failed", error.to_string()))?;
+            let metadata = file
+                .metadata()
+                .map_err(|error| ExtensionError::new("file_stat_failed", error.to_string()))?;
+            let identity = file_identity(&metadata);
+            let version = file_version(&metadata);
+            Ok(json!({
+                "size": version.size,
+                "device": identity.device,
+                "inode": identity.inode,
+                "modified_seconds": version.modified_seconds,
+                "modified_nanos": version.modified_nanos,
+                "changed_seconds": version.changed_seconds,
+                "changed_nanos": version.changed_nanos,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (id, path);
+            Err(unsupported_file_api_error())
+        }
+    }
     pub fn file_transaction(
         &self,
         id: &str,
@@ -2899,11 +3108,16 @@ impl ExtensionRuntime {
                 runtime: self.clone_internal(),
                 extension: ExtensionPackageId::new(id.to_owned())?,
                 generation,
+                confirmation_id: self
+                    .inner
+                    .next_file_confirmation
+                    .fetch_add(1, Ordering::Relaxed),
                 root: access.root,
                 relative: access.relative,
                 parent_identity,
                 snapshot,
                 contents,
+                operation: FileTransactionOperation::Write,
                 preview,
             })
         }
@@ -2911,6 +3125,313 @@ impl ExtensionRuntime {
         {
             let _ = (id, generation, path, contents);
             Err(unsupported_file_api_error())
+        }
+    }
+    pub fn file_removal_transaction(
+        &self,
+        id: &str,
+        generation: u64,
+        path: &Path,
+    ) -> Result<FileTransaction, ExtensionError> {
+        let mut transaction = self.file_transaction(id, generation, path, Vec::new())?;
+        transaction.operation = FileTransactionOperation::Remove;
+        transaction.preview.changed = transaction.preview.existed;
+        transaction.preview.destructive = transaction.preview.existed;
+        Ok(transaction)
+    }
+    /// Issues a host-owned confirmation bound to one exact file transaction.
+    ///
+    /// This is intentionally a runtime method rather than a capability method:
+    /// package Luau can prepare a transaction and inspect its preview, but only
+    /// the dispatcher/UI owner can authorize the destructive apply.
+    pub fn confirm_file_transaction(
+        &self,
+        transaction: &FileTransaction,
+    ) -> Result<FileConfirmation, ExtensionError> {
+        self.confirm_file_transactions(std::slice::from_ref(transaction))
+    }
+
+    pub fn confirm_file_transactions(
+        &self,
+        transactions: &[FileTransaction],
+    ) -> Result<FileConfirmation, ExtensionError> {
+        let first = transactions.first().ok_or_else(|| {
+            ExtensionError::new("invalid_confirmation", "file transaction batch is empty")
+        })?;
+        if !transactions.iter().all(|transaction| {
+            Arc::ptr_eq(&self.inner, &transaction.runtime.inner)
+                && transaction.extension == first.extension
+                && transaction.generation == first.generation
+        }) {
+            return Err(ExtensionError::new(
+                "invalid_confirmation",
+                "file transaction batch crosses runtime or generation boundaries",
+            ));
+        }
+        self.package_generation(first.extension.as_ref(), first.generation)?;
+        let nonce = self
+            .inner
+            .next_file_confirmation
+            .fetch_add(1, Ordering::Relaxed);
+        let digest = file_transactions_digest(transactions);
+        let token = format!("bootty-file-{nonce:016x}-{digest}");
+        let previews = transactions
+            .iter()
+            .map(|transaction| transaction.preview.clone())
+            .collect::<Vec<_>>();
+        let confirmation = FileConfirmation {
+            token: token.clone(),
+            transaction_id: first.confirmation_id,
+            extension: first.extension.clone(),
+            generation: first.generation,
+            digest,
+            preview: first.preview.clone(),
+            previews,
+        };
+        self.inner
+            .file_confirmations
+            .lock()
+            .map_err(|_| {
+                ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+            })?
+            .insert(
+                token,
+                FileConfirmationRecord {
+                    confirmation: confirmation.clone(),
+                    transactions: transactions.to_vec(),
+                },
+            );
+        Ok(confirmation)
+    }
+
+    pub fn validate_file_confirmation(
+        &self,
+        id: &str,
+        generation: u64,
+        expected: &Value,
+        token: &str,
+    ) -> Result<(), ExtensionError> {
+        let record = self
+            .inner
+            .file_confirmations
+            .lock()
+            .map_err(|_| {
+                ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+            })?
+            .get(token)
+            .map(|record| record.confirmation.clone())
+            .ok_or_else(|| {
+                ExtensionError::new(
+                    "invalid_confirmation",
+                    "file confirmation token is unknown or already consumed",
+                )
+            })?;
+        let expected = expected.as_object().ok_or_else(|| {
+            ExtensionError::new(
+                "invalid_confirmation",
+                "file confirmation expectation must be an object",
+            )
+        })?;
+        let expected_transaction = expected
+            .get("transaction_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ExtensionError::new(
+                    "invalid_confirmation",
+                    "file confirmation transaction_id is required",
+                )
+            })?;
+        let expected_digest = expected
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ExtensionError::new(
+                    "invalid_confirmation",
+                    "file confirmation digest is required",
+                )
+            })?;
+        let expected_preview = expected.get("preview").ok_or_else(|| {
+            ExtensionError::new(
+                "invalid_confirmation",
+                "file confirmation preview is required",
+            )
+        })?;
+        let actual_preview = serde_json::to_value(&record.preview)
+            .map_err(|error| ExtensionError::new("invalid_confirmation", error.to_string()))?;
+        let actual_previews = serde_json::to_value(&record.previews)
+            .map_err(|error| ExtensionError::new("invalid_confirmation", error.to_string()))?;
+        if record.extension.as_ref() != id
+            || record.generation != generation
+            || record.transaction_id != expected_transaction
+            || record.digest != expected_digest
+            || &actual_preview != expected_preview
+            || expected
+                .get("previews")
+                .is_some_and(|value| value != &actual_previews)
+        {
+            return Err(ExtensionError::new(
+                "invalid_confirmation",
+                "file confirmation does not match the exact transaction preview",
+            ));
+        }
+        self.package_generation(id, generation)?;
+        Ok(())
+    }
+    pub fn apply_file_confirmation(
+        &self,
+        id: &str,
+        generation: u64,
+        actions: &Value,
+        token: &str,
+        _context: &Value,
+    ) -> Result<Value, ExtensionError> {
+        let entries = actions.as_array().ok_or_else(|| {
+            ExtensionError::new("invalid_file_actions", "file actions must be an array")
+        })?;
+        let record = self
+            .inner
+            .file_confirmations
+            .lock()
+            .map_err(|_| {
+                ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+            })?
+            .get(token)
+            .cloned()
+            .ok_or_else(|| {
+                ExtensionError::new(
+                    "invalid_confirmation",
+                    "file confirmation token is unknown or already consumed",
+                )
+            })?;
+        if record.confirmation.extension.as_ref() != id
+            || record.confirmation.generation != generation
+            || entries.len() != record.transactions.len()
+        {
+            return Err(ExtensionError::new(
+                "invalid_confirmation",
+                "file confirmation does not match the exact file action batch",
+            ));
+        }
+        for (entry, transaction) in entries.iter().zip(record.transactions.iter()) {
+            let entry = entry.as_object().ok_or_else(|| {
+                ExtensionError::new("invalid_file_actions", "file action must be an object")
+            })?;
+            let path = entry.get("path").and_then(Value::as_str).ok_or_else(|| {
+                ExtensionError::new("invalid_file_actions", "file action path is required")
+            })?;
+            if path != transaction.preview.path {
+                return Err(ExtensionError::new(
+                    "invalid_confirmation",
+                    "file action path does not match the exact transaction",
+                ));
+            }
+            let operation = entry
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("write");
+            match transaction.operation {
+                FileTransactionOperation::Write => {
+                    if operation != "write" {
+                        return Err(ExtensionError::new(
+                            "invalid_file_actions",
+                            "file action operation does not match the exact transaction",
+                        ));
+                    }
+                    let content = entry.get("content").ok_or_else(|| {
+                        ExtensionError::new(
+                            "invalid_file_actions",
+                            "write action content is required",
+                        )
+                    })?;
+                    let contents = if let Some(content) = content.as_str() {
+                        content.as_bytes().to_vec()
+                    } else {
+                        serde_json::to_vec(content).map_err(|error| {
+                            ExtensionError::new("invalid_file_actions", error.to_string())
+                        })?
+                    };
+                    if contents != transaction.contents {
+                        return Err(ExtensionError::new(
+                            "invalid_confirmation",
+                            "file action content does not match the exact transaction",
+                        ));
+                    }
+                }
+                FileTransactionOperation::Remove => {
+                    if operation != "remove" {
+                        return Err(ExtensionError::new(
+                            "invalid_file_actions",
+                            "file action operation does not match the exact transaction",
+                        ));
+                    }
+                }
+            }
+        }
+        self.package_generation(id, generation)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let _transaction_guard = self.inner.file_transaction_lock.lock().map_err(|_| {
+                ExtensionError::new("file_unavailable", "file transaction lock poisoned")
+            })?;
+            for transaction in &record.transactions {
+                transaction.validate_current()?;
+            }
+            let transactions = {
+                let mut confirmations = self.inner.file_confirmations.lock().map_err(|_| {
+                    ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+                })?;
+                confirmations
+                    .remove(token)
+                    .ok_or_else(|| {
+                        ExtensionError::new(
+                            "invalid_confirmation",
+                            "file confirmation token is unknown or already consumed",
+                        )
+                    })?
+                    .transactions
+            };
+            let mut committed = Vec::with_capacity(transactions.len());
+            for transaction in transactions {
+                match transaction.apply_committed_unlocked() {
+                    Ok(commit) => committed.push(commit),
+                    Err(original) => {
+                        let rollback_errors = rollback_file_transactions(committed);
+                        return Err(ExtensionError::file_batch_failure(
+                            original,
+                            rollback_errors,
+                        ));
+                    }
+                }
+            }
+            let previews = committed
+                .into_iter()
+                .map(|commit| commit.transaction.preview)
+                .collect::<Vec<_>>();
+            serde_json::to_value(previews)
+                .map_err(|error| ExtensionError::new("invalid_file_actions", error.to_string()))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let transactions = {
+                let mut confirmations = self.inner.file_confirmations.lock().map_err(|_| {
+                    ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+                })?;
+                confirmations
+                    .remove(token)
+                    .ok_or_else(|| {
+                        ExtensionError::new(
+                            "invalid_confirmation",
+                            "file confirmation token is unknown or already consumed",
+                        )
+                    })?
+                    .transactions
+            };
+            let previews = transactions
+                .into_iter()
+                .map(FileTransaction::apply_committed)
+                .collect::<Result<Vec<_>, _>>()?;
+            serde_json::to_value(previews)
+                .map_err(|error| ExtensionError::new("invalid_file_actions", error.to_string()))
         }
     }
 
@@ -2927,7 +3448,7 @@ impl ExtensionRuntime {
                 "surface id is invalid",
             ));
         }
-        let mut state = self.inner.state.write().map_err(|_| {
+        let state = self.inner.state.write().map_err(|_| {
             ExtensionError::new("runtime_unavailable", "extension state lock poisoned")
         })?;
         let package = state.packages.get(id).ok_or_else(|| {
@@ -2962,18 +3483,21 @@ impl ExtensionRuntime {
             extension_id: id.to_owned(),
             generation,
         };
-        state.surfaces.insert(
-            spec.id.clone(),
-            SurfaceRecord {
-                spec: spec.clone(),
-                generation: generation.clone(),
-            },
-        );
-        Ok(SurfaceLifecycleEvent {
+        let event = SurfaceLifecycleEvent {
             operation: "opened".to_owned(),
             surface: spec,
             generation,
-        })
+        };
+        drop(state);
+        if let Err(error) =
+            self.publish_surface_lifecycle("opened", &event.surface, &event.generation)
+        {
+            if let Ok(mut state) = self.inner.state.write() {
+                state.surfaces.remove(&event.surface.id);
+            }
+            return Err(error);
+        }
+        Ok(event)
     }
 
     pub fn close_surface(
@@ -2983,7 +3507,7 @@ impl ExtensionRuntime {
         surface: &str,
     ) -> Result<Option<SurfaceLifecycleEvent>, ExtensionError> {
         let _ = self.package_generation(id, generation)?;
-        let mut state = self.inner.state.write().map_err(|_| {
+        let state = self.inner.state.write().map_err(|_| {
             ExtensionError::new("runtime_unavailable", "extension state lock poisoned")
         })?;
         let Some(record) = state.surfaces.get(surface).cloned() else {
@@ -2995,12 +3519,14 @@ impl ExtensionRuntime {
                 "surface generation is stale",
             ));
         }
-        let _ = state.surfaces.remove(surface);
-        Ok(Some(SurfaceLifecycleEvent {
+        let event = SurfaceLifecycleEvent {
             operation: "closed".to_owned(),
             surface: record.spec,
             generation: record.generation,
-        }))
+        };
+        drop(state);
+        self.publish_surface_lifecycle("closed", &event.surface, &event.generation)?;
+        Ok(Some(event))
     }
 
     pub fn surfaces(&self, id: Option<&str>) -> Vec<SurfaceLifecycleEvent> {
@@ -3252,6 +3778,31 @@ impl ExtensionRuntime {
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
+            .collect())
+    }
+
+    /// Returns bounded JSONL records newer than `cursor`. The sequence number
+    /// is the subscription cursor; callers can resume without replaying older
+    /// stdout/stderr lines after a poll.
+    pub fn process_read_since(
+        &self,
+        extension_id: &str,
+        generation: u64,
+        process: &str,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<ProcessLine>, ExtensionError> {
+        let record = self.process_for_owner(process, extension_id, generation)?;
+        let limit = limit.min(EXTENSION_PROCESS_LINES);
+        let output = record
+            .output
+            .lock()
+            .map_err(|_| ExtensionError::new("process_unavailable", "output lock poisoned"))?;
+        Ok(output
+            .iter()
+            .filter(|line| line.sequence > cursor)
+            .take(limit)
+            .cloned()
             .collect())
     }
 
@@ -3793,6 +4344,12 @@ impl ExtensionRuntime {
         generation: u64,
         lifecycle_operation: Option<&str>,
     ) -> Result<(), ExtensionError> {
+        if let Ok(mut confirmations) = self.inner.file_confirmations.lock() {
+            confirmations.retain(|_, record| {
+                record.confirmation.extension.as_ref() != id
+                    || record.confirmation.generation != generation
+            });
+        }
         let mut command_reservations = self.inner.command_reservations.lock().ok();
         if let Some(reservations) = command_reservations.as_mut() {
             reservations.retain(|_, generation_ref| {
@@ -4095,7 +4652,6 @@ impl ExtensionRuntime {
             self.release_process_reservation_locked(&mut state, generation_ref);
         }
     }
-
     fn release_process_reservation_locked(
         &self,
         state: &mut RuntimeState,
@@ -4216,46 +4772,303 @@ impl ExtensionRuntime {
     }
 }
 
+fn file_transaction_digest(transaction: &FileTransaction) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    transaction.confirmation_id.hash(&mut hasher);
+    transaction.extension.as_ref().hash(&mut hasher);
+    transaction.generation.hash(&mut hasher);
+    transaction.preview.path.hash(&mut hasher);
+    transaction.preview.existed.hash(&mut hasher);
+    transaction.preview.before_bytes.hash(&mut hasher);
+    transaction.preview.after_bytes.hash(&mut hasher);
+    transaction.preview.changed.hash(&mut hasher);
+    transaction.preview.destructive.hash(&mut hasher);
+    transaction.contents.hash(&mut hasher);
+    transaction.operation.hash(&mut hasher);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        transaction.snapshot.existed.hash(&mut hasher);
+        if let Some(identity) = transaction.snapshot.identity {
+            identity.device.hash(&mut hasher);
+            identity.inode.hash(&mut hasher);
+        }
+        if let Some(version) = transaction.snapshot.version {
+            version.size.hash(&mut hasher);
+            version.modified_seconds.hash(&mut hasher);
+            version.modified_nanos.hash(&mut hasher);
+            version.changed_seconds.hash(&mut hasher);
+            version.changed_nanos.hash(&mut hasher);
+        }
+        transaction.snapshot.bytes.hash(&mut hasher);
+        if let Some(parent) = transaction.parent_identity {
+            parent.device.hash(&mut hasher);
+            parent.inode.hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn file_transactions_digest(transactions: &[FileTransaction]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for transaction in transactions {
+        file_transaction_digest(transaction).hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
 impl FileTransaction {
     #[must_use]
     pub fn preview(&self) -> &FileTransactionPreview {
         &self.preview
     }
+    fn validate_current(&self) -> Result<(), ExtensionError> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let (parent, name) = open_file_parent(&self.root, &self.relative)
+                .map_err(|error| file_conflict(format!("unable to open file: {error}")))?;
+            match open_file_at(&parent, &name) {
+                Ok(file) => {
+                    let current =
+                        snapshot_file(file).map_err(|error| file_conflict(error.to_string()))?;
+                    if !self.snapshot.existed
+                        || current.identity != self.snapshot.identity
+                        || current.version != self.snapshot.version
+                        || current.bytes != self.snapshot.bytes
+                    {
+                        return Err(file_conflict("file changed before batch apply"));
+                    }
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && !self.snapshot.existed => {}
+                Err(error) => return Err(file_conflict(error.to_string())),
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            Err(unsupported_file_api_error())
+        }
+    }
 
-    pub fn apply(self, confirmed: bool) -> Result<FileTransactionPreview, ExtensionError> {
-        if self.preview.destructive && !confirmed {
+    pub fn apply(
+        self,
+        confirmation: FileConfirmation,
+    ) -> Result<FileTransactionPreview, ExtensionError> {
+        if confirmation.token.is_empty()
+            || confirmation.transaction_id != self.confirmation_id
+            || confirmation.extension != self.extension
+            || confirmation.generation != self.generation
+            || confirmation.preview != self.preview
+            || confirmation.digest != file_transactions_digest(std::slice::from_ref(&self))
+        {
             return Err(ExtensionError::new(
-                "confirmation_required",
-                "destructive file change requires exact confirmation",
+                "invalid_confirmation",
+                "file confirmation does not match the exact transaction",
+            ));
+        }
+        let record = self
+            .runtime
+            .inner
+            .file_confirmations
+            .lock()
+            .map_err(|_| {
+                ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+            })?
+            .get(&confirmation.token)
+            .cloned()
+            .ok_or_else(|| {
+                ExtensionError::new(
+                    "invalid_confirmation",
+                    "file confirmation token is unknown or already consumed",
+                )
+            })?;
+        if record.confirmation != confirmation
+            || record.transactions.len() != 1
+            || record.transactions[0].confirmation_id != self.confirmation_id
+        {
+            return Err(ExtensionError::new(
+                "invalid_confirmation",
+                "file confirmation token does not match one exact transaction",
             ));
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let _transaction_guard =
-                self.runtime
-                    .inner
-                    .file_transaction_lock
-                    .lock()
-                    .map_err(|_| {
-                        ExtensionError::new("file_unavailable", "file transaction lock poisoned")
-                    })?;
+            let transaction_runtime = self.runtime.clone_internal();
+            let transaction_guard = transaction_runtime
+                .inner
+                .file_transaction_lock
+                .lock()
+                .map_err(|_| {
+                    ExtensionError::new("file_unavailable", "file transaction lock poisoned")
+                })?;
+            self.validate_current()?;
             self.runtime
-                .package_generation(self.extension.as_ref(), self.generation)?;
-            apply_file_transaction(
+                .inner
+                .file_confirmations
+                .lock()
+                .map_err(|_| {
+                    ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+                })?
+                .remove(&confirmation.token)
+                .ok_or_else(|| {
+                    ExtensionError::new(
+                        "invalid_confirmation",
+                        "file confirmation token is unknown or already consumed",
+                    )
+                })?;
+            let commit = self.apply_committed_unlocked()?;
+            let preview = commit.transaction.preview;
+            drop(transaction_guard);
+            Ok(preview)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            self.runtime
+                .inner
+                .file_confirmations
+                .lock()
+                .map_err(|_| {
+                    ExtensionError::new("file_unavailable", "file confirmation lock poisoned")
+                })?
+                .remove(&confirmation.token)
+                .ok_or_else(|| {
+                    ExtensionError::new(
+                        "invalid_confirmation",
+                        "file confirmation token is unknown or already consumed",
+                    )
+                })?;
+            self.apply_committed()
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn current_snapshot(&self) -> Result<FileSnapshot, ExtensionError> {
+        let (parent, name) = open_file_parent(&self.root, &self.relative)
+            .map_err(|error| file_conflict(format!("unable to open file: {error}")))?;
+        let actual_parent =
+            file_identity(&parent.metadata().map_err(|error| {
+                file_conflict(format!("unable to validate file parent: {error}"))
+            })?);
+        if self.parent_identity != Some(actual_parent) {
+            return Err(file_conflict("file parent changed before rollback"));
+        }
+        match open_file_at(&parent, &name) {
+            Ok(file) => snapshot_file(file).map_err(|error| {
+                file_conflict(format!("unable to read file for rollback: {error}"))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileSnapshot {
+                existed: false,
+                identity: None,
+                version: None,
+                bytes: Vec::new(),
+            }),
+            Err(error) => Err(file_conflict(format!(
+                "unable to inspect file for rollback: {error}"
+            ))),
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn apply_committed_unlocked(self) -> Result<FileTransactionCommit, ExtensionError> {
+        self.runtime
+            .package_generation(self.extension.as_ref(), self.generation)?;
+        let post_snapshot = match self.operation {
+            FileTransactionOperation::Write => apply_file_transaction(
                 &self.root,
                 &self.relative,
                 self.parent_identity,
                 &self.snapshot,
                 &self.contents,
-            )?;
-            Ok(self.preview)
+            )?,
+            FileTransactionOperation::Remove => {
+                let (parent, name) = open_file_parent(&self.root, &self.relative)
+                    .map_err(|error| file_conflict(format!("unable to open file: {error}")))?;
+                let Some(identity) = self.snapshot.identity else {
+                    return Err(file_conflict("remove transaction target is missing"));
+                };
+                let Some(version) = self.snapshot.version else {
+                    return Err(file_conflict("remove transaction version is missing"));
+                };
+                if !remove_file_if_matches(&parent, &name, identity, version, &self.snapshot.bytes)
+                {
+                    return Err(file_conflict("file changed before removal"));
+                }
+                unix_fs::fsync(&parent)
+                    .map_err(|error| ExtensionError::new("file_write_failed", error.to_string()))?;
+                FileSnapshot {
+                    existed: false,
+                    identity: None,
+                    version: None,
+                    bytes: Vec::new(),
+                }
+            }
+        };
+        Ok(FileTransactionCommit {
+            transaction: self,
+            post_snapshot,
+        })
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl FileTransactionCommit {
+    fn rollback(self) -> Result<(), ExtensionError> {
+        let FileTransactionCommit {
+            transaction,
+            post_snapshot,
+        } = self;
+        let current = transaction.current_snapshot()?;
+        if !snapshot_matches(&current, &post_snapshot) {
+            return Err(file_conflict(
+                "file changed concurrently; preserving current post-state",
+            ));
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            let _ = (self, confirmed);
-            Err(unsupported_file_api_error())
+        if transaction.snapshot.existed {
+            let _ = apply_file_transaction(
+                &transaction.root,
+                &transaction.relative,
+                transaction.parent_identity,
+                &post_snapshot,
+                &transaction.snapshot.bytes,
+            )?;
+            Ok(())
+        } else {
+            let (parent, name) = open_file_parent(&transaction.root, &transaction.relative)
+                .map_err(|error| file_conflict(format!("unable to open file: {error}")))?;
+            let Some(identity) = post_snapshot.identity else {
+                return Err(file_conflict("rollback post-state identity is missing"));
+            };
+            let Some(version) = post_snapshot.version else {
+                return Err(file_conflict("rollback post-state version is missing"));
+            };
+            if !remove_file_if_matches(&parent, &name, identity, version, &post_snapshot.bytes) {
+                return Err(file_conflict(
+                    "file changed concurrently while removing rollback post-state",
+                ));
+            }
+            unix_fs::fsync(&parent)
+                .map_err(|error| ExtensionError::new("file_write_failed", error.to_string()))?;
+            Ok(())
         }
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn rollback_file_transactions(
+    committed: Vec<FileTransactionCommit>,
+) -> Vec<FileBatchRollbackError> {
+    committed
+        .into_iter()
+        .rev()
+        .filter_map(|commit| {
+            let path = commit.transaction.preview.path.clone();
+            commit.rollback().err().map(|error| FileBatchRollbackError {
+                path,
+                conflict: error.code == "file_conflict",
+                code: error.code,
+                message: error.message,
+            })
+        })
+        .collect()
 }
 
 impl ExtensionRuntime {
@@ -5033,7 +5846,7 @@ fn apply_file_transaction(
     expected_parent: Option<FileIdentity>,
     expected: &FileSnapshot,
     contents: &[u8],
-) -> Result<(), ExtensionError> {
+) -> Result<FileSnapshot, ExtensionError> {
     let (parent, name) = open_file_parent(root, relative)
         .map_err(|error| file_conflict(format!("unable to open file parent: {error}")))?;
     let actual_parent = file_identity(
@@ -5263,7 +6076,18 @@ fn apply_file_transaction(
         }
         unix_fs::fsync(&parent)
             .map_err(|error| ExtensionError::new("file_write_failed", error.to_string()))?;
-        Ok(())
+        let post_snapshot = snapshot_file_at(&parent, &name)
+            .ok_or_else(|| file_conflict("unable to snapshot committed file"))?;
+        if !post_snapshot.existed
+            || post_snapshot.identity != Some(temporary_identity)
+            || !post_snapshot
+                .version
+                .is_some_and(|current| file_content_version_matches(&current, &temporary_version))
+            || post_snapshot.bytes != contents
+        {
+            return Err(file_conflict("target changed during commit"));
+        }
+        Ok(post_snapshot)
     })();
     if result.is_err()
         && let Some((identity, version)) = temporary_identity_for_cleanup
@@ -5469,10 +6293,13 @@ fn append_process_line(record: &Arc<ProcessRecord>, stream: &str, bytes: &[u8]) 
     if line.len() > EXTENSION_PROCESS_BYTES {
         return;
     }
+    let parsed = serde_json::from_str::<Value>(&line);
     let entry = ProcessLine {
         stream: stream.to_owned(),
         line: line.clone(),
         sequence: record.next_sequence.fetch_add(1, Ordering::Relaxed),
+        value: parsed.as_ref().ok().cloned(),
+        error: parsed.err().map(|error| error.to_string()),
     };
     if let Ok(mut queue) = record.output.lock()
         && let Ok(mut bytes) = record.output_bytes.lock()
@@ -5524,8 +6351,7 @@ fn spawn_process_reader<R: Read + Send + 'static>(
 /// helpers in a dedicated Luau VM. The returned generation is owned by the
 /// package and command callbacks stay on this VM's worker thread.
 struct LuaCall {
-    command: String,
-    arguments: Vec<String>,
+    invocation: CommandInvocation,
     deadline: Instant,
     cancellation: CommandCancellation,
     generation_cancellation: CommandCancellation,
@@ -5547,7 +6373,7 @@ pub fn register_luau_package(
         .canonicalize()
         .map_err(|error| ExtensionError::new("extension_source_missing", error.to_string()))?;
     let (registration_tx, registration_rx) =
-        mpsc::sync_channel::<(Vec<CommandDescriptor>, Vec<String>)>(1);
+        mpsc::sync_channel::<Result<(Vec<CommandDescriptor>, Vec<String>), ExtensionError>>(1);
     let (call_tx, call_rx) = mpsc::sync_channel::<LuaCall>(EXTENSION_COMMAND_QUEUE_LIMIT);
     let package_id = id.to_owned();
     let package_source = source.to_owned();
@@ -5570,6 +6396,7 @@ pub fn register_luau_package(
     }
     let thread_cancellation = worker_cancellation.clone();
     let thread_generation_cancellation = generation_cancellation.clone();
+    let host_runtime = runtime.clone_internal();
     let handle = match thread::Builder::new()
         .name(format!("bootty-luau-{id}"))
         .spawn(move || {
@@ -5624,6 +6451,29 @@ pub fn register_luau_package(
                 Ok(table) => table,
                 Err(_) => return,
             };
+            if bootty.set("commands", commands).is_err() || bootty.set("events", events).is_err() {
+                let _ = registration_tx.send(Err(ExtensionError::new(
+                    "luau_host_api_failed",
+                    "unable to install command and event registration tables",
+                )));
+                return;
+            }
+            let host_runtime = host_runtime;
+            if let Err(error) = install_lua_host_api(
+                &lua,
+                &bootty,
+                host_runtime,
+                &package_id,
+                generation,
+                thread_cancellation.clone(),
+                thread_generation_cancellation.clone(),
+            ) {
+                let _ = registration_tx.send(Err(ExtensionError::new(
+                    "luau_host_api_failed",
+                    error.to_string(),
+                )));
+                return;
+            }
             let module_root = module_root;
             let mut module_cache = BTreeMap::<String, mlua::RegistryKey>::new();
             let require =
@@ -5675,10 +6525,7 @@ pub fn register_luau_package(
             if lua.globals().set("require", require).is_err() {
                 return;
             }
-            if bootty.set("commands", commands).is_err()
-                || bootty.set("events", events).is_err()
-                || lua.globals().set("bootty", bootty).is_err()
-            {
+            if lua.globals().set("bootty", bootty).is_err() {
                 return;
             }
             let deadline = Instant::now() + EXTENSION_LUA_LOAD_TIMEOUT;
@@ -5697,7 +6544,16 @@ pub fn register_luau_package(
             });
             let loaded = lua.load(&package_source).set_name(&package_id).exec();
             lua.remove_interrupt();
-            if loaded.is_err() {
+            if let Err(error) = loaded {
+                let message = error.to_string();
+                let code = if message.contains("deadline_exceeded") {
+                    "luau_registration_timeout"
+                } else if message.contains("cancelled") {
+                    "cancelled"
+                } else {
+                    "luau_load_failed"
+                };
+                let _ = registration_tx.send(Err(ExtensionError::new(code, message)));
                 return;
             }
             let registrations = match registrations.try_borrow_mut() {
@@ -5712,7 +6568,10 @@ pub fn register_luau_package(
                 .iter()
                 .map(|(descriptor, _)| descriptor.clone())
                 .collect::<Vec<_>>();
-            if registration_tx.send((descriptors, event_names)).is_err() {
+            if registration_tx
+                .send(Ok((descriptors, event_names)))
+                .is_err()
+            {
                 return;
             }
             let handlers = registrations
@@ -5751,32 +6610,36 @@ pub fn register_luau_package(
                     }
                     Ok(VmState::Continue)
                 });
-                let result = handlers
-                    .get(&call.command)
-                    .ok_or_else(|| {
-                        ExtensionError::new(
-                            "unknown_command",
-                            "Luau command handler is not registered",
-                        )
-                    })
-                    .and_then(|handler| {
-                        handler
-                            .call::<LuaValue>(call.arguments)
-                            .map_err(|error| {
-                                let message = error.to_string();
-                                let code = if message.contains("deadline_exceeded") {
-                                    "deadline_exceeded"
-                                } else if message.contains("cancelled") {
-                                    "cancelled"
-                                } else {
-                                    "luau_handler_failed"
-                                };
-                                ExtensionError::new(code, message)
+                let result = lua_invocation_context(&lua, &call.invocation, generation)
+                    .map_err(|error| ExtensionError::new("luau_context_invalid", error.to_string()))
+                    .and_then(|invocation| {
+                        handlers
+                            .get(&call.invocation.command)
+                            .ok_or_else(|| {
+                                ExtensionError::new(
+                                    "unknown_command",
+                                    "Luau command handler is not registered",
+                                )
                             })
-                            .and_then(|value| {
-                                lua_value_to_json(value).map_err(|error| {
-                                    ExtensionError::new("luau_result_invalid", error)
-                                })
+                            .and_then(|handler| {
+                                handler
+                                    .call::<LuaValue>(LuaValue::Table(invocation))
+                                    .map_err(|error| {
+                                        let message = error.to_string();
+                                        let code = if message.contains("deadline_exceeded") {
+                                            "deadline_exceeded"
+                                        } else if message.contains("cancelled") {
+                                            "cancelled"
+                                        } else {
+                                            "luau_handler_failed"
+                                        };
+                                        ExtensionError::new(code, message)
+                                    })
+                                    .and_then(|value| {
+                                        lua_value_to_json(value).map_err(|error| {
+                                            ExtensionError::new("luau_result_invalid", error)
+                                        })
+                                    })
                             })
                     });
                 lua.remove_interrupt();
@@ -5800,8 +6663,16 @@ pub fn register_luau_package(
         ));
     }
     let (descriptors, events) = match registration_rx.recv_timeout(EXTENSION_LUA_LOAD_TIMEOUT) {
-        Ok(registration) => registration,
-        Err(_) => {
+        Ok(Ok(registration)) => registration,
+        Ok(Err(error)) => {
+            worker.cancel_and_join();
+            runtime.remove_lua_worker(&worker);
+            if error.code == "luau_registration_timeout" {
+                let _ = runtime.cleanup_generation(id, generation, None);
+            }
+            return Err(error);
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
             worker.cancel_and_join();
             runtime.remove_lua_worker(&worker);
             // Registration owns the whole generation boundary. If a top-level
@@ -5812,6 +6683,14 @@ pub fn register_luau_package(
             return Err(ExtensionError::new(
                 "luau_registration_timeout",
                 "Luau package did not register in time",
+            ));
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            worker.cancel_and_join();
+            runtime.remove_lua_worker(&worker);
+            return Err(ExtensionError::new(
+                "luau_worker_stopped",
+                "Luau registration worker stopped before publishing its descriptor",
             ));
         }
     };
@@ -5831,14 +6710,12 @@ pub fn register_luau_package(
     }
     let mut registered_commands = Vec::new();
     for descriptor in descriptors {
-        let command_id = descriptor.id.clone();
-        let registered_command_id = command_id.clone();
+        let registered_command_id = descriptor.id.clone();
         let sender = call_tx.clone();
         let handler: ExtensionCommandHandler = Arc::new(move |context| {
             let (response, receiver) = mpsc::channel();
             let mut call = LuaCall {
-                command: command_id.clone(),
-                arguments: context.arguments().to_vec(),
+                invocation: context.invocation().clone(),
                 deadline: context.deadline(),
                 cancellation: context.cancellation.clone(),
                 generation_cancellation: context.generation_cancellation.clone(),
@@ -5920,106 +6797,1253 @@ pub fn register_luau_package(
     Ok(())
 }
 
+fn validate_luau_source(source: &str, id: &str) -> Result<(), ExtensionError> {
+    Lua::new()
+        .load(source)
+        .set_name(id)
+        .into_function()
+        .map(|_| ())
+        .map_err(|error| {
+            let message = error.to_string();
+            let code = if message.contains("syntax") {
+                "luau_syntax_invalid"
+            } else {
+                "luau_load_failed"
+            };
+            ExtensionError::new(code, message)
+        })
+}
+
+fn install_lua_host_api(
+    lua: &Lua,
+    bootty: &Table,
+    runtime: ExtensionRuntime,
+    id: &str,
+    generation: u64,
+    cancellation: CommandCancellation,
+    generation_cancellation: CommandCancellation,
+) -> mlua::Result<()> {
+    let extension_id = id.to_owned();
+    let owner = runtime.inner.owner.clone();
+    let scope = extension_scope(id, generation);
+
+    let command_table = bootty.get::<Table>("commands")?;
+    let command_runtime = runtime.clone_internal();
+    let command_id = extension_id.clone();
+    let command_cancel = cancellation.clone();
+    let invoke_command_cancel = command_cancel.clone();
+    let command_generation_cancel = generation_cancellation.clone();
+    command_table.set(
+        "invoke",
+        lua.create_function(move |lua, specification: Table| {
+            let command = specification.get::<String>("command")?;
+            let arguments = lua_arguments(specification.get::<LuaValue>("arguments")?)
+                .map_err(mlua::Error::external)?;
+            let target = lua_target_from_value(specification.get::<LuaValue>("target")?)
+                .map_err(mlua::Error::external)?;
+            let invocation = CommandInvocation {
+                command,
+                arguments,
+                caller: Caller::Luau,
+                target,
+                confirmation: None,
+            };
+            let outcome = command_runtime.invoke_blocking(
+                invocation,
+                Instant::now() + EXTENSION_LUA_LOAD_TIMEOUT,
+                invoke_command_cancel.clone(),
+            );
+            match outcome {
+                CommandOutcome::Success { value, .. } => json_to_lua(lua, value),
+                CommandOutcome::Pending { .. } => {
+                    Err(mlua::Error::external("pending: command is still pending"))
+                }
+                CommandOutcome::Unsupported { message } => {
+                    Err(mlua::Error::external(format!("unsupported: {message}")))
+                }
+                CommandOutcome::Unavailable { message } => {
+                    Err(mlua::Error::external(format!("unavailable: {message}")))
+                }
+                CommandOutcome::Denied { message } => {
+                    Err(mlua::Error::external(format!("denied: {message}")))
+                }
+                CommandOutcome::StaleTarget { message } => {
+                    Err(mlua::Error::external(format!("stale_target: {message}")))
+                }
+                CommandOutcome::Ambiguous { message, .. } => {
+                    Err(mlua::Error::external(format!("ambiguous: {message}")))
+                }
+                CommandOutcome::ConfirmationRequired { .. } => Err(mlua::Error::external(
+                    "confirmation_required: command requires confirmation",
+                )),
+                CommandOutcome::Failed { code, message } => {
+                    Err(mlua::Error::external(format!("{code}: {message}")))
+                }
+            }
+        })?,
+    )?;
+    let context_scope = scope.clone();
+    command_table.set(
+        "context",
+        lua.create_function(move |lua, _: ()| {
+            let table = lua.create_table()?;
+            table.set("extension_id", command_id.clone())?;
+            table.set("generation", generation)?;
+            table.set("scope", context_scope.clone())?;
+            table.set(
+                "cancelled",
+                command_generation_cancel.is_cancel_requested()
+                    || command_cancel.is_cancel_requested(),
+            )?;
+            Ok(table)
+        })?,
+    )?;
+
+    let events = bootty.get::<Table>("events")?;
+    let events_runtime = runtime.clone_internal();
+    let events_id = extension_id.clone();
+    let events_owner = owner.clone();
+    let events_scope = scope.clone();
+    events.set(
+        "publish",
+        lua.create_function(move |_, specification: Table| {
+            let topic = specification.get::<String>("topic")?;
+            let payload = lua_value_to_json(specification.get::<LuaValue>("payload")?)
+                .map_err(mlua::Error::external)?;
+            let target = lua_target_from_value(specification.get::<LuaValue>("target")?)
+                .map_err(mlua::Error::external)?;
+            let sequence = events_runtime
+                .publish_event(
+                    &events_id,
+                    generation,
+                    &topic,
+                    events_scope.clone(),
+                    payload,
+                    target,
+                )
+                .map_err(mlua::Error::external)?;
+            Ok(sequence)
+        })?,
+    )?;
+    let subscribe_runtime = runtime.clone_internal();
+    let subscribe_id = extension_id.clone();
+    let subscribe_owner = events_owner.clone();
+    let subscribe_scope = scope.clone();
+    events.set(
+        "subscribe",
+        lua.create_function(move |lua, topic: String| {
+            let (id, delivery) = subscribe_runtime
+                .subscribe_event(
+                    &subscribe_id,
+                    generation,
+                    subscribe_owner.clone(),
+                    &topic,
+                    subscribe_scope.clone(),
+                )
+                .map_err(mlua::Error::external)?;
+            let result = lua.create_table()?;
+            result.set("id", id)?;
+            result.set("topic", topic)?;
+            result.set("cursor", delivery.cursor)?;
+            result.set("revision", delivery.revision)?;
+            Ok(result)
+        })?,
+    )?;
+    let poll_runtime = runtime.clone_internal();
+    let poll_owner = events_owner.clone();
+    events.set(
+        "poll",
+        lua.create_function(move |lua, specification: Table| {
+            let subscription = specification.get::<String>("subscription")?;
+            let cursor = specification.get::<u64>("cursor").unwrap_or_default();
+            let delivery = poll_runtime
+                .poll_event(&subscription, &poll_owner, cursor)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(delivery).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let unsubscribe_runtime = runtime.clone_internal();
+    let unsubscribe_owner = events_owner;
+    events.set(
+        "unsubscribe",
+        lua.create_function(move |_, subscription: String| {
+            unsubscribe_runtime
+                .unsubscribe_event(&subscription, &unsubscribe_owner)
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+
+    let storage = lua.create_table()?;
+    let storage_runtime = runtime.clone_internal();
+    let storage_id = extension_id.clone();
+    let storage_owner = owner.clone();
+    storage.set(
+        "get",
+        lua.create_function(move |lua, key: String| {
+            let value = storage_runtime
+                .storage_get(&storage_id, generation, &storage_owner, &key)
+                .map_err(mlua::Error::external)?;
+            value.map_or(Ok(LuaValue::Nil), |value| json_to_lua(lua, value))
+        })?,
+    )?;
+    let storage_runtime = runtime.clone_internal();
+    let storage_id = extension_id.clone();
+    let storage_owner = owner.clone();
+    storage.set(
+        "put",
+        lua.create_function(move |_, (key, value): (String, LuaValue)| {
+            let value = lua_value_to_json(value).map_err(mlua::Error::external)?;
+            storage_runtime
+                .storage_put(&storage_id, generation, &storage_owner, &key, value)
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    let storage_runtime = runtime.clone_internal();
+    let storage_id = extension_id.clone();
+    let storage_owner = owner.clone();
+    storage.set(
+        "delete",
+        lua.create_function(move |_, key: String| {
+            storage_runtime
+                .storage_delete(&storage_id, generation, &storage_owner, &key)
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    let storage_runtime = runtime.clone_internal();
+    let storage_id = extension_id.clone();
+    let storage_owner = owner.clone();
+    storage.set(
+        "list",
+        lua.create_function(move |lua, _: ()| {
+            let keys = storage_runtime
+                .storage_list(&storage_id, generation, &storage_owner)
+                .map_err(mlua::Error::external)?;
+            let result = lua.create_table()?;
+            for (index, key) in keys.into_iter().enumerate() {
+                result.set(index + 1, key)?;
+            }
+            Ok(result)
+        })?,
+    )?;
+    bootty.set("storage", storage)?;
+
+    let tasks = lua.create_table()?;
+    let task_runtime = runtime.clone_internal();
+    let task_id = extension_id.clone();
+    let task_owner = owner.clone();
+    let task_cancel = cancellation.clone();
+    let task_scope = scope.clone();
+    tasks.set(
+        "start",
+        lua.create_function(move |lua, _: ()| {
+            let status = task_runtime
+                .start_task(
+                    &task_id,
+                    generation,
+                    task_owner.clone(),
+                    task_scope.clone(),
+                    task_cancel.clone(),
+                )
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(status).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let task_runtime = runtime.clone_internal();
+    let task_id = extension_id.clone();
+    let task_owner = owner.clone();
+    tasks.set(
+        "status",
+        lua.create_function(move |lua, task: String| {
+            let status = task_runtime
+                .task_status(&task, &task_id, generation, &task_owner)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(status).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let task_runtime = runtime.clone_internal();
+    let task_id = extension_id.clone();
+    let task_owner = owner.clone();
+    tasks.set(
+        "cancel",
+        lua.create_function(move |lua, task: String| {
+            let status = task_runtime
+                .cancel_task(&task, &task_id, generation, &task_owner)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(status).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let task_runtime = runtime.clone_internal();
+    let task_id = extension_id.clone();
+    let task_owner = owner.clone();
+    tasks.set(
+        "finish",
+        lua.create_function(move |_, specification: Table| {
+            let task = specification.get::<String>("task")?;
+            let outcome = lua_value_to_json(specification.get::<LuaValue>("outcome")?)
+                .map_err(mlua::Error::external)?;
+            task_runtime
+                .finish_task(&task, &task_id, generation, &task_owner, &outcome)
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    bootty.set("tasks", tasks)?;
+
+    let process = lua.create_table()?;
+    let process_runtime = runtime.clone_internal();
+    let process_id = extension_id.clone();
+    process.set(
+        "spawn",
+        lua.create_function(move |lua, specification: Table| {
+            let value = lua_table_to_json(&specification).map_err(mlua::Error::external)?;
+            let spec = serde_json::from_value::<ProcessSpec>(value)
+                .map_err(|error| mlua::Error::external(error.to_string()))?;
+            let status = process_runtime
+                .spawn_process(&process_id, generation, spec)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(status).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let process_runtime = runtime.clone_internal();
+    let process_id = extension_id.clone();
+    process.set(
+        "write",
+        lua.create_function(move |_, specification: Table| {
+            let process = specification.get::<String>("process")?;
+            let value = specification.get::<LuaValue>("data")?;
+            let bytes = match value {
+                LuaValue::String(value) => value.as_bytes().to_vec(),
+                value => {
+                    serde_json::to_vec(&lua_value_to_json(value).map_err(mlua::Error::external)?)
+                        .map_err(mlua::Error::external)?
+                }
+            };
+            process_runtime
+                .process_write(&process_id, generation, &process, &bytes)
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    let process_runtime = runtime.clone_internal();
+    let process_id = extension_id.clone();
+    process.set(
+        "read",
+        lua.create_function(move |lua, specification: Table| {
+            let process = specification.get::<String>("process")?;
+            let cursor = specification.get::<u64>("cursor").unwrap_or_default();
+            let limit = specification
+                .get::<usize>("limit")
+                .unwrap_or(EXTENSION_PROCESS_LINES);
+            let lines = process_runtime
+                .process_read_since(&process_id, generation, &process, cursor, limit)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(lines).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let process_runtime = runtime.clone_internal();
+    let process_id = extension_id.clone();
+    process.set(
+        "status",
+        lua.create_function(move |lua, process: String| {
+            let status = process_runtime
+                .process_status(&process_id, generation, &process)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(status).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let process_runtime = runtime.clone_internal();
+    let process_id = extension_id.clone();
+    process.set(
+        "signal",
+        lua.create_function(move |_, process: String| {
+            process_runtime
+                .process_signal(&process_id, generation, &process)
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    let process_runtime = runtime.clone_internal();
+    let process_id = extension_id.clone();
+    let process_cancel = cancellation.clone();
+    process.set(
+        "wait",
+        lua.create_function(move |lua, process: String| {
+            let status = process_runtime
+                .process_wait(
+                    &process_id,
+                    generation,
+                    &process,
+                    Instant::now() + EXTENSION_LUA_LOAD_TIMEOUT,
+                    &process_cancel,
+                )
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(status).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    bootty.set("process", process)?;
+
+    // IPC is intentionally local to this owner and uses the same bounded,
+    // revisioned event stream as the generic event API.
+    let ipc = lua.create_table()?;
+    let ipc_runtime = runtime.clone_internal();
+    let ipc_id = extension_id.clone();
+    let ipc_scope = scope.clone();
+    ipc.set(
+        "publish",
+        lua.create_function(move |_, specification: Table| {
+            let topic = specification.get::<String>("topic")?;
+            let payload = lua_value_to_json(specification.get::<LuaValue>("payload")?)
+                .map_err(mlua::Error::external)?;
+            let sequence = ipc_runtime
+                .publish_event(
+                    &ipc_id,
+                    generation,
+                    &topic,
+                    ipc_scope.clone(),
+                    payload,
+                    None,
+                )
+                .map_err(mlua::Error::external)?;
+            Ok(sequence)
+        })?,
+    )?;
+    let ipc_runtime = runtime.clone_internal();
+    let ipc_id = extension_id.clone();
+    let ipc_owner = owner.clone();
+    let ipc_scope = scope.clone();
+    ipc.set(
+        "subscribe",
+        lua.create_function(move |lua, topic: String| {
+            let (subscription, delivery) = ipc_runtime
+                .subscribe_event(
+                    &ipc_id,
+                    generation,
+                    ipc_owner.clone(),
+                    &topic,
+                    ipc_scope.clone(),
+                )
+                .map_err(mlua::Error::external)?;
+            let result = lua.create_table()?;
+            result.set("id", subscription)?;
+            result.set("cursor", delivery.cursor)?;
+            result.set("revision", delivery.revision)?;
+            Ok(result)
+        })?,
+    )?;
+    let ipc_runtime = runtime.clone_internal();
+    let ipc_owner = owner.clone();
+    ipc.set(
+        "poll",
+        lua.create_function(move |lua, specification: Table| {
+            let subscription = specification.get::<String>("subscription")?;
+            let cursor = specification.get::<u64>("cursor").unwrap_or_default();
+            let delivery = ipc_runtime
+                .poll_event(&subscription, &ipc_owner, cursor)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(delivery).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    bootty.set("ipc", ipc)?;
+
+    let metadata = lua.create_table()?;
+    let metadata_runtime = runtime.clone_internal();
+    let metadata_id = extension_id.clone();
+    let metadata_owner = owner.clone();
+    metadata.set(
+        "get",
+        lua.create_function(move |lua, specification: Table| {
+            let namespace = specification.get::<String>("namespace")?;
+            let key = specification.get::<String>("key")?;
+            let target = lua_target_from_value(specification.get::<LuaValue>("target")?)
+                .map_err(mlua::Error::external)?;
+            let value = metadata_runtime
+                .metadata_get(
+                    &metadata_id,
+                    generation,
+                    &metadata_owner,
+                    &namespace,
+                    &key,
+                    target.as_ref(),
+                )
+                .map_err(mlua::Error::external)?;
+            value.map_or(Ok(LuaValue::Nil), |value| {
+                json_to_lua(
+                    lua,
+                    serde_json::to_value(value).map_err(mlua::Error::external)?,
+                )
+            })
+        })?,
+    )?;
+    let metadata_runtime = runtime.clone_internal();
+    let metadata_id = extension_id.clone();
+    let metadata_owner = owner.clone();
+    metadata.set(
+        "publish",
+        lua.create_function(move |_, specification: Table| {
+            let namespace = specification.get::<String>("namespace")?;
+            let key = specification.get::<String>("key")?;
+            let value = lua_value_to_json(specification.get::<LuaValue>("value")?)
+                .map_err(mlua::Error::external)?;
+            let target = lua_target_from_value(specification.get::<LuaValue>("target")?)
+                .map_err(mlua::Error::external)?;
+            metadata_runtime
+                .publish_metadata(
+                    &metadata_id,
+                    generation,
+                    &metadata_owner,
+                    MetadataPublication::new(
+                        extension_scope(&metadata_id, generation),
+                        namespace,
+                        key,
+                        target,
+                        value,
+                        specification.get("expires_at_ms").ok(),
+                        json!({"extension_id": metadata_id, "generation": generation}),
+                    ),
+                )
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    bootty.set("metadata", metadata)?;
+
+    let host = lua.create_table()?;
+    let observe_runtime = runtime.clone_internal();
+    let observe_id = extension_id.clone();
+    let observe_owner = owner.clone();
+    host.set(
+        "observe",
+        lua.create_function(move |lua, _: ()| {
+            let observation = observe_runtime
+                .observe(&observe_id, generation, &observe_owner)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(observation).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    bootty.set("host", host)?;
+
+    let notify = lua.create_table()?;
+    notify.set(
+        "show",
+        lua.create_function(move |_, specification: Table| {
+            let title = specification.get::<String>("title")?;
+            let body = specification.get::<String>("body")?;
+            crate::platform::show_desktop_notification(&title, &body)
+                .map_err(|error| mlua::Error::external(error.to_string()))
+        })?,
+    )?;
+    bootty.set("notify", notify)?;
+
+    let files = lua.create_table()?;
+    let pending_files = Rc::new(RefCell::new(BTreeMap::<String, FileTransaction>::new()));
+    let next_file = Rc::new(std::cell::Cell::new(1_u64));
+    let files_runtime = runtime.clone_internal();
+    let files_id = extension_id.clone();
+    let files_pending = Rc::clone(&pending_files);
+    let files_next = Rc::clone(&next_file);
+    let files_read_runtime = runtime.clone_internal();
+    let files_read_id = extension_id.clone();
+    files.set(
+        "read",
+        lua.create_function(move |lua, path: String| {
+            let bytes = files_read_runtime
+                .file_read(&files_read_id, Path::new(&path))
+                .map_err(mlua::Error::external)?;
+            lua.create_string(bytes)
+        })?,
+    )?;
+    let files_exists_runtime = runtime.clone_internal();
+    let files_exists_id = extension_id.clone();
+    files.set(
+        "exists",
+        lua.create_function(move |_, path: String| {
+            files_exists_runtime
+                .file_exists(&files_exists_id, Path::new(&path))
+                .map_err(mlua::Error::external)
+        })?,
+    )?;
+    let files_stat_runtime = runtime.clone_internal();
+    let files_stat_id = extension_id.clone();
+    files.set(
+        "stat",
+        lua.create_function(move |lua, path: String| {
+            let value = files_stat_runtime
+                .file_stat(&files_stat_id, Path::new(&path))
+                .map_err(mlua::Error::external)?;
+            json_to_lua(lua, value)
+        })?,
+    )?;
+    let files_validation_runtime = runtime.clone_internal();
+    let files_validation_id = extension_id.clone();
+    files.set(
+        "validate_confirmation",
+        lua.create_function(move |_, (expected, token): (Table, String)| {
+            let expected = lua_table_to_json(&expected).map_err(mlua::Error::external)?;
+            files_validation_runtime
+                .validate_file_confirmation(&files_validation_id, generation, &expected, &token)
+                .map_err(mlua::Error::external)?;
+            Ok(true)
+        })?,
+    )?;
+    let files_apply_runtime = runtime.clone_internal();
+    let files_apply_id = extension_id.clone();
+    files.set(
+        "apply",
+        lua.create_function(
+            move |lua, (actions, token, context): (Table, String, Table)| {
+                let actions = lua_table_to_json(&actions).map_err(mlua::Error::external)?;
+                let context = lua_table_to_json(&context).map_err(mlua::Error::external)?;
+                let result = files_apply_runtime
+                    .apply_file_confirmation(
+                        &files_apply_id,
+                        generation,
+                        &actions,
+                        &token,
+                        &context,
+                    )
+                    .map_err(mlua::Error::external)?;
+                json_to_lua(lua, result)
+            },
+        )?,
+    )?;
+    files.set(
+        "prepare",
+        lua.create_function(move |lua, specification: Table| {
+            let path = PathBuf::from(specification.get::<String>("path")?);
+            let operation = specification
+                .get::<Option<String>>("operation")?
+                .unwrap_or_else(|| "write".to_owned());
+            let transaction = if operation == "remove" {
+                files_runtime
+                    .file_removal_transaction(&files_id, generation, &path)
+                    .map_err(mlua::Error::external)?
+            } else if operation == "write" {
+                let contents = match specification.get::<LuaValue>("contents")? {
+                    LuaValue::String(value) => value.as_bytes().to_vec(),
+                    value => serde_json::to_vec(
+                        &lua_value_to_json(value).map_err(mlua::Error::external)?,
+                    )
+                    .map_err(mlua::Error::external)?,
+                };
+                files_runtime
+                    .file_transaction(&files_id, generation, &path, contents)
+                    .map_err(mlua::Error::external)?
+            } else {
+                return Err(mlua::Error::external("unsupported file operation"));
+            };
+            let id = format!("file-{}", files_next.get());
+            files_next.set(files_next.get().saturating_add(1));
+            let preview =
+                serde_json::to_value(transaction.preview()).map_err(mlua::Error::external)?;
+            files_pending.borrow_mut().insert(id.clone(), transaction);
+            let result = lua.create_table()?;
+            result.set("id", id)?;
+            result.set("preview", json_to_lua(lua, preview)?)?;
+            Ok(result)
+        })?,
+    )?;
+    bootty.set("files", files)?;
+
+    let ui = lua.create_table()?;
+    let surface = lua.create_table()?;
+    let surface_runtime = runtime.clone_internal();
+    let surface_id = extension_id.clone();
+    surface.set(
+        "open",
+        lua.create_function(move |lua, specification: Table| {
+            let value = lua_table_to_json(&specification).map_err(mlua::Error::external)?;
+            let spec = serde_json::from_value::<SurfaceSpec>(value)
+                .map_err(|error| mlua::Error::external(error.to_string()))?;
+            let event = surface_runtime
+                .open_surface(&surface_id, generation, spec)
+                .map_err(mlua::Error::external)?;
+            json_to_lua(
+                lua,
+                serde_json::to_value(event).map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    let surface_runtime = runtime.clone_internal();
+    let surface_id = extension_id.clone();
+    surface.set(
+        "close",
+        lua.create_function(move |lua, surface: String| {
+            let event = surface_runtime
+                .close_surface(&surface_id, generation, &surface)
+                .map_err(mlua::Error::external)?;
+            event.map_or(Ok(LuaValue::Nil), |event| {
+                json_to_lua(
+                    lua,
+                    serde_json::to_value(event).map_err(mlua::Error::external)?,
+                )
+            })
+        })?,
+    )?;
+    let surface_runtime = runtime.clone_internal();
+    let surface_id = extension_id;
+    surface.set(
+        "list",
+        lua.create_function(move |lua, _: ()| {
+            json_to_lua(
+                lua,
+                serde_json::to_value(surface_runtime.surfaces(Some(&surface_id)))
+                    .map_err(mlua::Error::external)?,
+            )
+        })?,
+    )?;
+    ui.set("surface", surface)?;
+    bootty.set("ui", ui)?;
+    Ok(())
+}
+
+fn lua_arguments(value: LuaValue) -> Result<Vec<String>, String> {
+    let LuaValue::Table(table) = value else {
+        return Ok(Vec::new());
+    };
+    table
+        .sequence_values::<LuaValue>()
+        .map(|value| {
+            let value = value.map_err(|error| error.to_string())?;
+            match value {
+                LuaValue::String(value) => value
+                    .to_str()
+                    .map(|value| value.to_owned())
+                    .map_err(|error| error.to_string()),
+                LuaValue::Integer(value) => Ok(value.to_string()),
+                LuaValue::Number(value) => Ok(value.to_string()),
+                LuaValue::Boolean(value) => Ok(value.to_string()),
+                value => Err(format!("command argument must be scalar, got {value:?}")),
+            }
+        })
+        .collect()
+}
+
+fn lua_table_to_json(table: &Table) -> Result<Value, String> {
+    lua_value_to_json(LuaValue::Table(table.clone()))
+}
+
+fn lua_target_from_value(value: LuaValue) -> Result<Option<CommandTarget>, String> {
+    let LuaValue::Table(table) = value else {
+        return Ok(None);
+    };
+    let kind_name = table
+        .get::<String>("kind")
+        .map_err(|error| error.to_string())?;
+    let kind = match kind_name.as_str() {
+        "instance" => ResourceKind::Instance,
+        "application_window" => ResourceKind::ApplicationWindow,
+        "binding" => ResourceKind::Binding,
+        "space" => ResourceKind::Space,
+        "session" => ResourceKind::Session,
+        "mux_window" | "window" => ResourceKind::MuxWindow,
+        "pane" => ResourceKind::Pane,
+        "terminal" => ResourceKind::Terminal,
+        "client" => ResourceKind::Client,
+        "directory" => ResourceKind::Directory,
+        "worktree" => ResourceKind::Worktree,
+        "task" => ResourceKind::Task,
+        "subscription" => ResourceKind::Subscription,
+        "surface" => ResourceKind::Surface,
+        "extension" => ResourceKind::Extension,
+        other => return Err(format!("unknown target kind {other}")),
+    };
+    let generation_value = table
+        .get::<LuaValue>("generation")
+        .map_err(|error| error.to_string())?;
+    let generation = match generation_value {
+        LuaValue::Integer(value) if value >= 0 => value as u64,
+        LuaValue::Number(value) if value >= 0.0 => value as u64,
+        LuaValue::String(value) => value
+            .to_str()
+            .map_err(|error| error.to_string())?
+            .parse::<u64>()
+            .map_err(|error| error.to_string())?,
+        _ => return Err("target generation is required".to_owned()),
+    };
+    Ok(Some(CommandTarget {
+        kind,
+        handle: table
+            .get::<String>("handle")
+            .map_err(|error| error.to_string())?,
+        generation,
+    }))
+}
+
+fn lua_invocation_context(
+    lua: &Lua,
+    invocation: &CommandInvocation,
+    generation: u64,
+) -> mlua::Result<Table> {
+    let context = lua.create_table()?;
+    context.set("command", invocation.command.clone())?;
+    context.set("caller", lua_caller_name(invocation.caller))?;
+    context.set("arguments", {
+        let arguments = lua.create_table()?;
+        for (index, argument) in invocation.arguments.iter().enumerate() {
+            arguments.set(index + 1, argument.clone())?;
+        }
+        arguments
+    })?;
+    for (index, argument) in invocation.arguments.iter().enumerate() {
+        context.set(index + 1, argument.clone())?;
+    }
+    context.set(
+        "target",
+        invocation
+            .target
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(mlua::Error::external)?
+            .map_or(Ok(LuaValue::Nil), |target| json_to_lua(lua, target))?,
+    )?;
+    context.set(
+        "confirmation",
+        invocation
+            .confirmation
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(mlua::Error::external)?
+            .map_or(Ok(LuaValue::Nil), |confirmation| {
+                json_to_lua(lua, confirmation)
+            })?,
+    )?;
+    context.set(
+        "extension_id",
+        invocation.command.split('.').next().unwrap_or_default(),
+    )?;
+    context.set("generation", generation)?;
+    Ok(context)
+}
+
+fn lua_caller_name(caller: Caller) -> &'static str {
+    match caller {
+        Caller::CommandPalette => "command_palette",
+        Caller::Keybinding => "keybinding",
+        Caller::BuiltinKeybinding => "builtin_keybinding",
+        Caller::Cli => "cli",
+        Caller::Socket => "socket",
+        Caller::Luau => "luau",
+        Caller::Internal => "internal",
+    }
+}
+
+fn json_to_lua(lua: &Lua, value: Value) -> mlua::Result<LuaValue> {
+    match value {
+        Value::Null => Ok(LuaValue::Nil),
+        Value::Bool(value) => Ok(LuaValue::Boolean(value)),
+        Value::Number(value) => value
+            .as_f64()
+            .map(LuaValue::Number)
+            .ok_or_else(|| mlua::Error::external("JSON number is not representable in Luau")),
+        Value::String(value) => Ok(LuaValue::String(lua.create_string(&value)?)),
+        Value::Array(values) => {
+            let table = lua.create_table()?;
+            for (index, value) in values.into_iter().enumerate() {
+                table.set(index + 1, json_to_lua(lua, value)?)?;
+            }
+            Ok(LuaValue::Table(table))
+        }
+        Value::Object(values) => {
+            let table = lua.create_table()?;
+            for (key, value) in values {
+                table.set(key, json_to_lua(lua, value)?)?;
+            }
+            Ok(LuaValue::Table(table))
+        }
+    }
+}
+
 fn lua_descriptor(
     table: &Table,
     id: String,
     title: String,
     description: String,
 ) -> mlua::Result<CommandDescriptor> {
-    use crate::commands::{ArgumentSchema, CompactSchema, MutationClass, ValueType};
-    let mutation = match table
-        .get::<String>("mutation")
-        .unwrap_or_else(|_| "read".to_owned())
-        .as_str()
-    {
-        "destructive" => MutationClass::Destructive,
-        "write" => MutationClass::Write,
-        _ => MutationClass::Read,
+    use crate::{
+        automation::catalog::{BackendAvailability, CatalogPaletteMetadata},
+        commands::{ArgumentSchema, CompactSchema, MutationClass},
+    };
+    let mutation = match table.get::<Option<String>>("mutation")? {
+        None => MutationClass::Read,
+        Some(value) => match value.as_str() {
+            "read" => MutationClass::Read,
+            "write" => MutationClass::Write,
+            "destructive" => MutationClass::Destructive,
+            _ => {
+                return Err(mlua::Error::external(
+                    "mutation must be read, write, or destructive",
+                ));
+            }
+        },
     };
     let mut arguments = Vec::new();
-    if let Ok(args) = table.get::<Table>("arguments") {
+    if let Some(args) = table.get::<Option<Table>>("arguments")? {
         for pair in args.sequence_values::<Table>() {
             let arg = pair?;
             let name = arg.get::<String>("name")?;
-            let value_type = match arg
-                .get::<String>("type")
-                .unwrap_or_else(|_| "string".to_owned())
-                .as_str()
-            {
-                "boolean" => ValueType::Boolean,
-                "integer" => ValueType::Integer,
-                "number" => ValueType::Number,
-                "json" | "object" => ValueType::Json,
-                _ => ValueType::String,
-            };
+            if name.is_empty() || name.len() > 128 {
+                return Err(mlua::Error::external("argument name is invalid"));
+            }
+            let value_type = lua_value_type(
+                &arg.get::<Option<String>>("type")?
+                    .unwrap_or_else(|| "string".to_owned()),
+            )?;
+            let choices = arg
+                .get::<Option<Table>>("choices")?
+                .map(|choices| {
+                    choices
+                        .sequence_values::<String>()
+                        .collect::<mlua::Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
             arguments.push(ArgumentSchema {
                 name,
                 value_type,
-                required: arg.get("required").unwrap_or(false),
-                choices: Vec::new(),
-                minimum: None,
-                maximum: None,
-                default: arg.get("default").ok(),
-                repeated: arg.get("repeated").unwrap_or(false),
+                required: arg.get::<Option<bool>>("required")?.unwrap_or(false),
+                choices,
+                minimum: arg.get::<Option<i64>>("minimum")?,
+                maximum: arg.get::<Option<i64>>("maximum")?,
+                default: arg.get::<Option<String>>("default")?,
+                repeated: arg.get::<Option<bool>>("repeated")?.unwrap_or(false),
             });
         }
     }
+    let aliases = table
+        .get::<Option<Table>>("aliases")?
+        .map(|aliases| {
+            aliases
+                .sequence_values::<String>()
+                .collect::<mlua::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let result_schema = table
+        .get::<Option<Table>>("result_schema")?
+        .or(table.get::<Option<Table>>("result")?)
+        .map(|schema| lua_result_schema(&schema))
+        .transpose()?;
+    let targets = table
+        .get::<Option<Table>>("targets")?
+        .map(|targets| {
+            targets
+                .sequence_values::<String>()
+                .map(|target| target.and_then(|target| lua_catalog_target(&target)))
+                .collect::<mlua::Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let availability = table
+        .get::<Option<Table>>("availability")?
+        .map(|availability| -> mlua::Result<BackendAvailability> {
+            Ok(BackendAvailability {
+                core: lua_catalog_availability(
+                    &availability
+                        .get::<Option<String>>("core")?
+                        .unwrap_or_else(|| "available".to_owned()),
+                )?,
+                native: lua_catalog_availability(
+                    &availability
+                        .get::<Option<String>>("native")?
+                        .unwrap_or_else(|| "available".to_owned()),
+                )?,
+                rmux: lua_catalog_availability(
+                    &availability
+                        .get::<Option<String>>("rmux")?
+                        .unwrap_or_else(|| "available".to_owned()),
+                )?,
+                tmux: lua_catalog_availability(
+                    &availability
+                        .get::<Option<String>>("tmux")?
+                        .unwrap_or_else(|| "available".to_owned()),
+                )?,
+            })
+        })
+        .transpose()?;
+    let target = table
+        .get::<Option<String>>("target")?
+        .map(|target| lua_resource_kind(&target))
+        .transpose()?;
+    let palette_metadata = table
+        .get::<Option<Table>>("palette_metadata")?
+        .map(|palette| -> mlua::Result<CatalogPaletteMetadata> {
+            Ok(CatalogPaletteMetadata {
+                visible: palette.get::<Option<bool>>("visible")?.unwrap_or(true),
+                category: palette
+                    .get::<Option<String>>("category")?
+                    .unwrap_or_else(|| "extensions".to_owned()),
+                keywords: palette
+                    .get::<Option<Table>>("keywords")?
+                    .map(|keywords| {
+                        keywords
+                            .sequence_values::<String>()
+                            .collect::<mlua::Result<Vec<_>>>()
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+            })
+        })
+        .transpose()?;
     Ok(CommandDescriptor {
         id,
         title,
         description,
-        aliases: table.get("aliases").unwrap_or_default(),
+        aliases,
         origin: None,
         mutation,
         arguments: CompactSchema { arguments },
-        result_schema: None,
-        targets: Vec::new(),
-        availability: None,
-        target: None,
-        palette: table.get("palette").unwrap_or(false),
-        palette_metadata: None,
+        result_schema,
+        targets,
+        availability,
+        target,
+        palette: table.get::<Option<bool>>("palette")?.unwrap_or(false),
+        palette_metadata,
     })
 }
 
+fn lua_value_type(value: &str) -> mlua::Result<crate::commands::ValueType> {
+    use crate::commands::ValueType;
+    match value {
+        "null" => Ok(ValueType::Null),
+        "boolean" => Ok(ValueType::Boolean),
+        "integer" => Ok(ValueType::Integer),
+        "number" => Ok(ValueType::Number),
+        "string" => Ok(ValueType::String),
+        "enum" => Ok(ValueType::Enum),
+        "array" => Ok(ValueType::Array),
+        "object" => Ok(ValueType::Object),
+        "resource_ref" => Ok(ValueType::ResourceRef),
+        "json" => Ok(ValueType::Json),
+        other => Err(mlua::Error::external(format!(
+            "unknown argument type {other}"
+        ))),
+    }
+}
+
+fn lua_catalog_value_type(
+    value: &str,
+) -> mlua::Result<crate::automation::catalog::CatalogValueType> {
+    use crate::automation::catalog::CatalogValueType;
+    match value {
+        "null" => Ok(CatalogValueType::Null),
+        "boolean" => Ok(CatalogValueType::Boolean),
+        "integer" => Ok(CatalogValueType::Integer),
+        "number" => Ok(CatalogValueType::Number),
+        "string" => Ok(CatalogValueType::String),
+        "enum" => Ok(CatalogValueType::Enum),
+        "array" => Ok(CatalogValueType::Array),
+        "object" => Ok(CatalogValueType::Object),
+        "resource_ref" => Ok(CatalogValueType::ResourceRef),
+        "json" => Ok(CatalogValueType::Json),
+        other => Err(mlua::Error::external(format!(
+            "unknown result type {other}"
+        ))),
+    }
+}
+
+fn lua_result_schema(
+    table: &Table,
+) -> mlua::Result<crate::automation::catalog::CatalogResultSchema> {
+    use crate::automation::catalog::CatalogResultSchema;
+    let properties = table
+        .get::<Option<Table>>("properties")?
+        .map(|properties| {
+            properties
+                .pairs::<String, Table>()
+                .map(|pair| {
+                    let (name, schema) = pair?;
+                    Ok((name, lua_result_schema(&schema)?))
+                })
+                .collect::<mlua::Result<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let items = table
+        .get::<Option<Table>>("items")?
+        .map(|items| lua_result_schema(&items).map(Box::new))
+        .transpose()?;
+    Ok(CatalogResultSchema {
+        value_type: lua_catalog_value_type(
+            &table
+                .get::<Option<String>>("type")?
+                .unwrap_or_else(|| "json".to_owned()),
+        )?,
+        properties,
+        items,
+    })
+}
+
+fn lua_catalog_target(value: &str) -> mlua::Result<crate::automation::catalog::CatalogTarget> {
+    use crate::automation::catalog::CatalogTarget;
+    match value {
+        "instance" => Ok(CatalogTarget::Instance),
+        "application_window" => Ok(CatalogTarget::ApplicationWindow),
+        "binding" => Ok(CatalogTarget::Binding),
+        "space" => Ok(CatalogTarget::Space),
+        "session" => Ok(CatalogTarget::Session),
+        "window" | "mux_window" => Ok(CatalogTarget::Window),
+        "pane" => Ok(CatalogTarget::Pane),
+        "terminal" => Ok(CatalogTarget::Terminal),
+        "client" => Ok(CatalogTarget::Client),
+        "directory" => Ok(CatalogTarget::Directory),
+        "worktree" => Ok(CatalogTarget::Worktree),
+        "task" => Ok(CatalogTarget::Task),
+        "subscription" => Ok(CatalogTarget::Subscription),
+        "surface" => Ok(CatalogTarget::Surface),
+        "extension" => Ok(CatalogTarget::Extension),
+        other => Err(mlua::Error::external(format!(
+            "unknown command target {other}"
+        ))),
+    }
+}
+
+fn lua_catalog_availability(
+    value: &str,
+) -> mlua::Result<crate::automation::catalog::CatalogAvailability> {
+    use crate::automation::catalog::CatalogAvailability;
+    match value {
+        "available" => Ok(CatalogAvailability::Available),
+        "conditional" => Ok(CatalogAvailability::Conditional),
+        "unsupported" => Ok(CatalogAvailability::Unsupported),
+        "unavailable" => Ok(CatalogAvailability::Unavailable),
+        other => Err(mlua::Error::external(format!(
+            "unknown backend availability {other}"
+        ))),
+    }
+}
+
+fn lua_resource_kind(value: &str) -> mlua::Result<ResourceKind> {
+    match value {
+        "instance" => Ok(ResourceKind::Instance),
+        "application_window" => Ok(ResourceKind::ApplicationWindow),
+        "binding" => Ok(ResourceKind::Binding),
+        "space" => Ok(ResourceKind::Space),
+        "session" => Ok(ResourceKind::Session),
+        "mux_window" | "window" => Ok(ResourceKind::MuxWindow),
+        "pane" => Ok(ResourceKind::Pane),
+        "terminal" => Ok(ResourceKind::Terminal),
+        "client" => Ok(ResourceKind::Client),
+        "directory" => Ok(ResourceKind::Directory),
+        "worktree" => Ok(ResourceKind::Worktree),
+        "task" => Ok(ResourceKind::Task),
+        "subscription" => Ok(ResourceKind::Subscription),
+        "surface" => Ok(ResourceKind::Surface),
+        "extension" => Ok(ResourceKind::Extension),
+        other => Err(mlua::Error::external(format!(
+            "unknown resource target {other}"
+        ))),
+    }
+}
+
+const LUA_RESULT_MAX_DEPTH: usize = 32;
+const LUA_RESULT_MAX_NODES: usize = 4096;
+
 fn lua_value_to_json(value: LuaValue) -> Result<Value, String> {
+    let mut active = HashSet::new();
+    let mut nodes = 0;
+    lua_value_to_json_inner(value, 0, &mut nodes, &mut active)
+}
+
+fn lua_value_to_json_inner(
+    value: LuaValue,
+    depth: usize,
+    nodes: &mut usize,
+    active: &mut HashSet<usize>,
+) -> Result<Value, String> {
+    *nodes = nodes.saturating_add(1);
+    if *nodes > LUA_RESULT_MAX_NODES {
+        return Err("Luau result exceeds the node limit".to_owned());
+    }
+    if depth > LUA_RESULT_MAX_DEPTH {
+        return Err("Luau result exceeds the nesting depth limit".to_owned());
+    }
     match value {
         LuaValue::Nil => Ok(Value::Null),
         LuaValue::Boolean(value) => Ok(Value::Bool(value)),
         LuaValue::Integer(value) => Ok(json!(value)),
-        LuaValue::Number(value) => Ok(json!(value)),
+        LuaValue::Number(value) => serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| "Luau result contains a non-finite number".to_owned()),
         LuaValue::String(value) => value
             .to_str()
             .map(|value| Value::String(value.to_owned()))
             .map_err(|error| error.to_string()),
         LuaValue::Table(table) => {
-            let mut object = serde_json::Map::new();
-            let mut array = BTreeMap::new();
-            for pair in table.pairs::<LuaValue, LuaValue>() {
-                let (key, value) = pair.map_err(|error| error.to_string())?;
-                let json = lua_value_to_json(value)?;
-                match key {
-                    LuaValue::String(key) => {
-                        object.insert(
-                            key.to_str().map_err(|error| error.to_string())?.to_owned(),
-                            json,
-                        );
-                    }
-                    LuaValue::Integer(index) if index > 0 => {
-                        array.insert(index, json);
-                    }
-                    _ => {
-                        return Err(
-                            "Luau result table keys must be strings or positive integers"
-                                .to_owned(),
-                        );
+            let identity = table.to_pointer() as usize;
+            if !active.insert(identity) {
+                return Err("Luau result contains a cyclic table".to_owned());
+            }
+            let result = (|| {
+                let mut object = serde_json::Map::new();
+                let mut array = BTreeMap::new();
+                for pair in table.pairs::<LuaValue, LuaValue>() {
+                    let (key, value) = pair.map_err(|error| error.to_string())?;
+                    let json = lua_value_to_json_inner(value, depth + 1, nodes, active)?;
+                    match key {
+                        LuaValue::String(key) => {
+                            object.insert(
+                                key.to_str().map_err(|error| error.to_string())?.to_owned(),
+                                json,
+                            );
+                        }
+                        LuaValue::Integer(index) if index > 0 => {
+                            let index = usize::try_from(index)
+                                .map_err(|_| "Luau array index is too large".to_owned())?;
+                            array.insert(index, json);
+                        }
+                        _ => {
+                            return Err(
+                                "Luau result table keys must be strings or positive integers"
+                                    .to_owned(),
+                            );
+                        }
                     }
                 }
-            }
-            if !object.is_empty() {
-                Ok(Value::Object(object))
-            } else {
+                if !object.is_empty() && !array.is_empty() {
+                    return Err("Luau result tables cannot mix string and array keys".to_owned());
+                }
+                if !object.is_empty() {
+                    return Ok(Value::Object(object));
+                }
+                if array.is_empty() {
+                    return Ok(Value::Array(Vec::new()));
+                }
+                let length = array.len();
+                if array.keys().copied().ne(1..=length) {
+                    return Err("Luau result array keys must be contiguous from 1".to_owned());
+                }
                 Ok(Value::Array(array.into_values().collect()))
-            }
+            })();
+            active.remove(&identity);
+            result
         }
         _ => Err("unsupported Luau result value".to_owned()),
     }
@@ -6043,6 +8067,15 @@ mod tests {
             storage_namespace: None,
             default_enabled: false,
         }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn apply_confirmed_transaction(
+        runtime: &ExtensionRuntime,
+        transaction: FileTransaction,
+    ) -> Result<FileTransactionPreview, ExtensionError> {
+        let confirmation = runtime.confirm_file_transaction(&transaction)?;
+        transaction.apply(confirmation)
     }
 
     fn descriptor(id: &str) -> CommandDescriptor {
@@ -6157,13 +8190,14 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
 
         let moved = root.path().join("nested.original");
         fs::rename(&parent, &moved).unwrap();
         fs::create_dir(&parent).unwrap();
         fs::write(parent.join("state.json"), b"replacement-dir").unwrap();
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         assert_eq!(
             fs::read(parent.join("state.json")).unwrap(),
             b"replacement-dir"
@@ -6225,6 +8259,7 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
 
         let post_root = root.path().to_path_buf();
         let post_hook: Box<dyn Fn() + Send> = Box::new(move || {
@@ -6257,7 +8292,7 @@ mod tests {
             Err(_) => panic!("file transaction pre-rollback hook lock poisoned"),
         }
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"concurrent");
         let preserved = fs::read_dir(root.path())
             .unwrap()
@@ -6283,8 +8318,214 @@ mod tests {
             .file_transaction("sample.extension", generation, &path, b"new".to_vec())
             .unwrap();
         assert!(transaction.preview().destructive);
-        assert!(transaction.clone().apply(false).is_err());
-        assert_eq!(transaction.apply(true).unwrap().after_bytes, 3);
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
+        let mut invalid = confirmation.clone();
+        invalid.token.clear();
+        assert!(transaction.clone().apply(invalid).is_err());
+        assert_eq!(transaction.apply(confirmation).unwrap().after_bytes, 3);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn file_transaction_batch_applies_mixed_write_and_remove_once() {
+        let runtime = runtime();
+        let _ = runtime.install(manifest("sample.extension")).unwrap();
+        let _ = runtime.enable("sample.extension").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        runtime.set_file_roots([root.path().to_path_buf()]);
+        let write_path = root.path().join("write.txt");
+        let remove_path = root.path().join("remove.txt");
+        fs::write(&write_path, b"before-write").unwrap();
+        fs::write(&remove_path, b"before-remove").unwrap();
+        let generation = runtime.package("sample.extension").unwrap().generation;
+        let write = runtime
+            .file_transaction(
+                "sample.extension",
+                generation,
+                &write_path,
+                b"after-write".to_vec(),
+            )
+            .unwrap();
+        let remove = runtime
+            .file_removal_transaction("sample.extension", generation, &remove_path)
+            .unwrap();
+        let confirmation = runtime
+            .confirm_file_transactions(&[write.clone(), remove.clone()])
+            .unwrap();
+        assert_eq!(confirmation.previews.len(), 2);
+        let actions = json!([
+            {
+                "path": write.preview().path.clone(),
+                "operation": "write",
+                "content": "after-write",
+            },
+            {
+                "path": remove.preview().path.clone(),
+                "operation": "remove",
+            },
+        ]);
+
+        let result = runtime
+            .apply_file_confirmation(
+                "sample.extension",
+                generation,
+                &actions,
+                &confirmation.token,
+                &json!({}),
+            )
+            .unwrap();
+        assert_eq!(result.as_array().map(Vec::len), Some(2));
+        assert_eq!(fs::read(&write_path).unwrap(), b"after-write");
+        assert!(!remove_path.exists());
+        assert!(
+            runtime
+                .apply_file_confirmation(
+                    "sample.extension",
+                    generation,
+                    &actions,
+                    &confirmation.token,
+                    &json!({}),
+                )
+                .is_err()
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn file_transaction_batch_rolls_back_prior_actions_after_mid_batch_failure() {
+        let _serial = FILE_TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("file transaction test lock poisoned");
+        let runtime = runtime();
+        let _ = runtime.install(manifest("sample.extension")).unwrap();
+        let _ = runtime.enable("sample.extension").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        runtime.set_file_roots([root.path().to_path_buf()]);
+        let write_path = root.path().join("write.txt");
+        let remove_path = root.path().join("remove.txt");
+        fs::write(&write_path, b"before-write").unwrap();
+        fs::write(&remove_path, b"before-remove").unwrap();
+        let generation = runtime.package("sample.extension").unwrap().generation;
+        let write = runtime
+            .file_transaction(
+                "sample.extension",
+                generation,
+                &write_path,
+                b"after-write".to_vec(),
+            )
+            .unwrap();
+        let remove = runtime
+            .file_removal_transaction("sample.extension", generation, &remove_path)
+            .unwrap();
+        let confirmation = runtime
+            .confirm_file_transactions(&[write.clone(), remove.clone()])
+            .unwrap();
+        let concurrent_path = remove_path.clone();
+        let hook: Box<dyn Fn() + Send> = Box::new(move || {
+            fs::write(&concurrent_path, b"concurrent").unwrap();
+        });
+        *FILE_TRANSACTION_POST_EXCHANGE
+            .lock()
+            .expect("file transaction post-exchange hook lock poisoned") = Some(hook);
+        let actions = json!([
+            {
+                "path": write.preview().path.clone(),
+                "operation": "write",
+                "content": "after-write",
+            },
+            {
+                "path": remove.preview().path.clone(),
+                "operation": "remove",
+            },
+        ]);
+
+        let error = runtime
+            .apply_file_confirmation(
+                "sample.extension",
+                generation,
+                &actions,
+                &confirmation.token,
+                &json!({}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "file_batch_apply_failed");
+        let details = error.details.expect("file batch details");
+        assert_eq!(details.original_code, "file_conflict");
+        assert!(details.rolled_back);
+        assert!(details.rollback_errors.is_empty());
+        assert_eq!(fs::read(&write_path).unwrap(), b"before-write");
+        assert_eq!(fs::read(&remove_path).unwrap(), b"concurrent");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn file_transaction_batch_preserves_concurrent_edit_during_rollback() {
+        let _serial = FILE_TRANSACTION_TEST_SERIAL
+            .lock()
+            .expect("file transaction test lock poisoned");
+        let runtime = runtime();
+        let _ = runtime.install(manifest("sample.extension")).unwrap();
+        let _ = runtime.enable("sample.extension").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        runtime.set_file_roots([root.path().to_path_buf()]);
+        let remove_path = root.path().join("remove.txt");
+        let write_path = root.path().join("write.txt");
+        fs::write(&remove_path, b"before-remove").unwrap();
+        fs::write(&write_path, b"before-write").unwrap();
+        let generation = runtime.package("sample.extension").unwrap().generation;
+        let remove = runtime
+            .file_removal_transaction("sample.extension", generation, &remove_path)
+            .unwrap();
+        let write = runtime
+            .file_transaction(
+                "sample.extension",
+                generation,
+                &write_path,
+                b"after-write".to_vec(),
+            )
+            .unwrap();
+        let confirmation = runtime
+            .confirm_file_transactions(&[remove.clone(), write.clone()])
+            .unwrap();
+        let concurrent_remove_path = remove_path.clone();
+        let concurrent_write_path = write_path.clone();
+        let hook: Box<dyn Fn() + Send> = Box::new(move || {
+            fs::write(&concurrent_remove_path, b"concurrent-remove").unwrap();
+            fs::write(&concurrent_write_path, b"concurrent-write").unwrap();
+        });
+        *FILE_TRANSACTION_PRE_COMMIT
+            .lock()
+            .expect("file transaction pre-commit hook lock poisoned") = Some(hook);
+        let actions = json!([
+            {
+                "path": remove.preview().path.clone(),
+                "operation": "remove",
+            },
+            {
+                "path": write.preview().path.clone(),
+                "operation": "write",
+                "content": "after-write",
+            },
+        ]);
+
+        let error = runtime
+            .apply_file_confirmation(
+                "sample.extension",
+                generation,
+                &actions,
+                &confirmation.token,
+                &json!({}),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "file_batch_apply_failed");
+        let details = error.details.expect("file batch details");
+        assert_eq!(details.original_code, "file_conflict");
+        assert!(!details.rolled_back);
+        assert_eq!(details.rollback_errors.len(), 1);
+        assert_eq!(details.rollback_errors[0].path, remove.preview().path);
+        assert!(details.rollback_errors[0].conflict);
+        assert_eq!(fs::read(&remove_path).unwrap(), b"concurrent-remove");
+        assert_eq!(fs::read(&write_path).unwrap(), b"concurrent-write");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -6302,11 +8543,10 @@ mod tests {
             b"old"
         );
         let generation = runtime.package("sample.extension").unwrap().generation;
-        runtime
+        let transaction = runtime
             .file_transaction("sample.extension", generation, &existing, b"new".to_vec())
-            .unwrap()
-            .apply(true)
             .unwrap();
+        apply_confirmed_transaction(&runtime, transaction).unwrap();
         assert_eq!(fs::read(&existing).unwrap(), b"new");
 
         let created = root.path().join("created.txt");
@@ -6319,7 +8559,7 @@ mod tests {
             )
             .unwrap();
         assert!(!transaction.preview().existed);
-        transaction.apply(true).unwrap();
+        apply_confirmed_transaction(&runtime, transaction).unwrap();
         assert_eq!(fs::read(created).unwrap(), b"created");
     }
 
@@ -6345,12 +8585,13 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
 
         let moved = root.path().join("state.original");
         fs::rename(&path, &moved).unwrap();
         std::os::unix::fs::symlink(&outside_path, &path).unwrap();
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         assert_eq!(fs::read(outside_path).unwrap(), b"outside");
     }
 
@@ -6378,12 +8619,13 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
 
         let moved = root.path().join("nested.original");
         fs::rename(&parent, &moved).unwrap();
         std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         assert_eq!(fs::read(outside_path).unwrap(), b"outside");
     }
 
@@ -6406,9 +8648,11 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
+
         fs::write(&path, b"concurrent").unwrap();
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         assert_eq!(fs::read(path).unwrap(), b"concurrent");
     }
 
@@ -6435,6 +8679,8 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
+
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let hook: Box<dyn Fn() + Send> = Box::new(move || {
@@ -6452,7 +8698,7 @@ mod tests {
             release_tx.send(()).unwrap();
         });
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         writer.join().unwrap();
         assert_eq!(fs::read(path).unwrap(), b"writer");
     }
@@ -6480,6 +8726,8 @@ mod tests {
                 b"replacement".to_vec(),
             )
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
+
         let replacement = root.path().join("post-exchange-writer");
         let hook_replacement = replacement.clone();
         let target = path.clone();
@@ -6492,7 +8740,7 @@ mod tests {
             Err(_) => panic!("file transaction post-exchange hook lock poisoned"),
         }
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         assert_eq!(fs::read(path).unwrap(), b"concurrent");
         assert!(!replacement.exists());
     }
@@ -6514,6 +8762,8 @@ mod tests {
         let transaction = runtime
             .file_transaction("sample.extension", generation, &path, b"first".to_vec())
             .unwrap();
+        let confirmation = runtime.confirm_file_transaction(&transaction).unwrap();
+
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let hook: Box<dyn Fn() + Send> = Box::new(move || {
@@ -6531,7 +8781,7 @@ mod tests {
             release_tx.send(()).unwrap();
         });
 
-        assert!(transaction.apply(true).is_err());
+        assert!(transaction.apply(confirmation).is_err());
         writer.join().unwrap();
         assert_eq!(fs::read(path).unwrap(), b"writer");
     }

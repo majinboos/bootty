@@ -8,7 +8,8 @@
     "hook_script": "hook.sh",
     "hooks_config": "hooks.json",
     "installed_hook_script": "~/.config/bootty/agents/claude-hook.sh",
-    "hook_command": "~/.config/bootty/agents/claude-hook.sh --event <hook_event_name>"
+    "hook_command": "~/.config/bootty/agents/claude-hook.sh --event <hook_event_name>",
+    "ingest_command": "bootty command agents.ingest --adapter claude --event-name <hook_event_name> --stdin-json"
   },
   "protocol": {
     "interactive": {

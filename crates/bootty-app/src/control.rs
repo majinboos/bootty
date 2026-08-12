@@ -655,6 +655,15 @@ fn parse_rpc_request(line: &str) -> Result<RpcRequest, Box<RpcResponse>> {
             None,
         ))
     })?;
+    let Value::Object(object) = value else {
+        return Err(Box::new(RpcResponse::error(
+            Value::Null,
+            -32600,
+            "invalid JSON-RPC request envelope",
+            None,
+        )));
+    };
+    let value = Value::Object(object);
     let id = value
         .get("id")
         .filter(|id| matches!(id, Value::String(_) | Value::Number(_) | Value::Null))
@@ -1329,6 +1338,13 @@ fn event_scope(
             Err(RpcError::new(-32006, "binding event scope is not live"))
         };
     }
+    if is_owner_local_extension_scope(scope) {
+        return if automation.events().extension_scope_is_live(scope) {
+            Ok(scope.to_owned())
+        } else {
+            Err(RpcError::new(-32006, "extension event scope is not live"))
+        };
+    }
     Err(RpcError::new(-32602, "unsupported event scope"))
 }
 
@@ -1344,6 +1360,23 @@ fn is_owner_local_binding_scope(scope: &str) -> bool {
         && parts
             .next()
             .is_some_and(|binding| binding.parse::<i64>().is_ok())
+        && parts.next().is_none()
+}
+
+/// Extension scopes carry both the package identity and the generation that
+/// owns its registered event topics. The live registry performs the
+/// authoritative lifecycle check after this shape check.
+fn is_owner_local_extension_scope(scope: &str) -> bool {
+    let mut parts = scope.split(':');
+    matches!(parts.next(), Some("extension"))
+        && parts
+            .next()
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+        && parts.next().is_some_and(|generation| {
+            generation
+                .parse::<u64>()
+                .is_ok_and(|generation| generation > 0)
+        })
         && parts.next().is_none()
 }
 
@@ -1638,16 +1671,32 @@ pub fn select_instance(explicit: Option<&str>) -> Result<InstanceDescriptor> {
 
 pub fn discover_instances() -> Result<Vec<InstanceDescriptor>> {
     let directory = instance_directory()?;
-    let mut instances = Vec::new();
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return Ok(instances);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("read Bootty instance directory {}", directory.display())
+            });
+        }
     };
-    if set_owner_only_directory(&directory).is_err() {
-        return Ok(instances);
-    }
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(bytes) = fs::read(&path) else { continue };
+    set_owner_only_directory(&directory)
+        .with_context(|| format!("secure Bootty instance directory {}", directory.display()))?;
+
+    let mut instances = Vec::new();
+    for entry in entries {
+        let path = entry
+            .context("read Bootty instance directory entry")?
+            .path();
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read Bootty instance descriptor {}", path.display())
+                });
+            }
+        };
         let Ok(instance) = serde_json::from_slice::<InstanceDescriptor>(&bytes) else {
             continue;
         };
@@ -1662,25 +1711,55 @@ pub fn discover_instances() -> Result<Vec<InstanceDescriptor>> {
             .is_some_and(|expected| instance.endpoint.as_path() == expected.as_path());
         if !descriptor_path_matches || !endpoint_matches {
             if instance_process_is_dead(&instance) {
-                let _ = fs::remove_file(path);
+                remove_if_present(&path)?;
             }
             continue;
         }
-        let expected_endpoint = expected_endpoint.expect("a matching endpoint was derived");
-        let live = invoke_instance(&instance, "instance.describe", Value::Null)
-            .ok()
-            .and_then(|response| response.result)
+        let response = match invoke_instance(&instance, "instance.describe", Value::Null) {
+            Ok(response) => response,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+                }) || instance_process_is_dead(&instance) =>
+            {
+                if instance_process_is_dead(&instance) {
+                    remove_if_present(&path)?;
+                    if let Some(expected_endpoint) = expected_endpoint.as_deref() {
+                        remove_if_present(expected_endpoint)?;
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("query Bootty instance {}", instance.instance_id));
+            }
+        };
+        let live = response
+            .result
             .and_then(|value| serde_json::from_value::<InstanceDescriptor>(value).ok())
             .is_some_and(|descriptor| descriptor == instance);
         if live {
             instances.push(instance);
         } else if instance_process_is_dead(&instance) {
-            let _ = fs::remove_file(path);
-            let _ = fs::remove_file(expected_endpoint);
+            remove_if_present(&path)?;
+            if let Some(expected_endpoint) = expected_endpoint.as_deref() {
+                remove_if_present(expected_endpoint)?;
+            }
         }
     }
     instances.sort_by_key(|instance| instance.started_at_ms);
     Ok(instances)
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn instance_process_is_dead(instance: &InstanceDescriptor) -> bool {

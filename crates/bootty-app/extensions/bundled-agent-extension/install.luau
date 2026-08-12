@@ -63,13 +63,17 @@ local function call(object, method, ...)
 end
 
 local function normalize_read(value)
-    if type(value) == "table" then
-        if value.content ~= nil then return value.content end
-        if value.text ~= nil then return value.text end
-        if value.value ~= nil then return value.value end
-        if value.data ~= nil then return value.data end
+    if type(value) ~= "table" then return value, {} end
+    local metadata = {}
+    for _, key in ipairs({ "identity", "id", "etag", "inode", "version", "revision", "generation", "mtime", "bytes", "exists" }) do
+        if value[key] ~= nil then metadata[key] = value[key] end
     end
-    return value
+    if value.content ~= nil then return value.content, metadata end
+    if value.text ~= nil then return value.text, metadata end
+    if value.value ~= nil then return value.value, metadata end
+    if value.data ~= nil then return value.data, metadata end
+    if value.exists == false then return nil, metadata end
+    return value, metadata
 end
 
 -- Minimal JSON decoder for fixture runners. Hosts may provide a stricter decoder.
@@ -234,15 +238,40 @@ local function path_exists(files, path)
     return ok_read and raw ~= nil
 end
 
+local function read_metadata(files, path)
+    local metadata = {}
+    for _, method in ipairs({ "stat", "metadata" }) do
+        local ok, value = call(files, method, path)
+        if ok and type(value) == "table" then
+            for key, item in pairs(value) do metadata[key] = item end
+        end
+    end
+    return metadata
+end
+
 local function read_file(host, path)
     local files = files_for(host)
-    local exists = path_exists(files, path)
-    if not exists then return nil, false, nil end
+    local exists_known, exists = false, false
+    local exists_ok, exists_value = call(files, "exists", path)
+    if exists_ok then
+        exists_known, exists = true, exists_value == true
+        if not exists then return nil, false, nil, {} end
+    end
     local ok, value, error_message = call(files, "read", path)
-    if not ok then return nil, true, tostring(value) end
-    value = normalize_read(value)
-    if value == nil then return nil, true, tostring(error_message or "file read returned no content") end
-    return value, true, nil
+    if not ok then
+        if exists_known and not exists then return nil, false, nil, {} end
+        return nil, exists_known and exists or true, tostring(value), {}
+    end
+    local content, metadata = normalize_read(value)
+    if content == nil then
+        if (type(metadata) == "table" and metadata.exists == false) or (exists_known and not exists) then
+            return nil, false, nil, metadata
+        end
+        return nil, true, tostring(error_message or "file read returned no content"), metadata
+    end
+    local stat = read_metadata(files, path)
+    for key, item in pairs(stat) do if metadata[key] == nil then metadata[key] = item end end
+    return content, true, nil, metadata
 end
 
 local function option_copy(options)
@@ -325,7 +354,7 @@ end
 
 local function make_change_for_spec(host, spec, context)
     local path = common.resolve_path(spec.path, context)
-    local raw, exists, read_error = read_file(host, path)
+    local raw, exists, read_error, metadata = read_file(host, path)
     if read_error ~= nil then return nil, { code = "read_failed", path = path, message = read_error } end
     local before, after = raw, nil
     if spec.operation == "remove" then after = nil
@@ -334,22 +363,116 @@ local function make_change_for_spec(host, spec, context)
         if encode_error ~= nil then return nil, { code = "encode_failed", path = path, message = encode_error } end
         after = encoded
     end
-    return common.make_change(path, spec.operation, before, after, { format = spec.format, value = spec.value, existed = exists }), nil
+    local before_identity, identity_source = common.identity(before, exists, metadata)
+    local before_version = common.version(metadata)
+    return common.make_change(path, spec.operation, before, after, {
+        format = spec.format,
+        value = spec.value,
+        existed = exists,
+        before_identity = before_identity,
+        before_identity_source = identity_source,
+        before_version = before_version,
+        file_identity = before_identity,
+        file_version = before_version,
+    }), nil
 end
 
+local function snapshot_metadata(content, exists, metadata)
+    local identity, source = common.identity(content, exists, metadata)
+    return {
+        existed = exists,
+        before_identity = identity,
+        before_identity_source = source,
+        before_version = common.version(metadata),
+        file_identity = identity,
+        file_version = common.version(metadata),
+    }
+end
 local function owned_path(marker, path)
     if type(marker) ~= "table" or type(marker.files) ~= "table" then return false end
     for index = 1, #marker.files do if marker.files[index] == path then return true end end
     return false
 end
+local function validate_marker_ownership(adapter, marker, context, configured_path)
+    if not common.marker_matches(marker, adapter) then
+        return false, { code = "ownership_marker_mismatch", adapter = adapter.id, message = "ownership marker belongs to another adapter or generation" }
+    end
+    if type(marker.files) ~= "table" or #marker.files == 0 then
+        return false, { code = "ownership_marker_invalid", adapter = adapter.id, message = "ownership marker does not enumerate owned files" }
+    end
+    local marker_path = common.resolve_path(adapter.marker_path, context)
+    local marker_seen = false
+    for index = 1, #marker.files do
+        local raw_path = marker.files[index]
+        if type(raw_path) ~= "string" or not common.owned_path(adapter, raw_path, context, configured_path) then
+            return false, { code = "ownership_marker_mismatch", adapter = adapter.id, path = raw_path, message = "ownership marker lists a path outside the adapter-owned set" }
+        end
+        if common.resolve_path(raw_path, context) == marker_path then marker_seen = true end
+    end
+    if not marker_seen then
+        return false, { code = "ownership_marker_invalid", adapter = adapter.id, path = marker_path, message = "ownership marker does not own its marker file" }
+    end
+    if marker.version ~= nil and tostring(marker.version) ~= tostring(adapter.version) then
+        return false, { code = "ownership_marker_mismatch", adapter = adapter.id, message = "ownership marker belongs to a different adapter version" }
+    end
+    return true, nil
+end
 
-function M.confirmation_context(action, adapter, changes)
+function M.confirmation_context(action, adapter, changes, digest)
     local paths, changed = {}, false
     for index = 1, #(changes or {}) do
         if changes[index].changed then changed = true; paths[#paths + 1] = changes[index].path end
     end
     if not changed then return nil end
-    return { kind = "shared_dispatcher", command = "agents.integration." .. action, action = action, adapter = adapter.id, destructive = action == "uninstall", paths = paths }
+    return {
+        kind = "shared_dispatcher",
+        command = "agents.integration." .. action,
+        action = action,
+        adapter = adapter.id,
+        version = adapter.version,
+        destructive = action == "uninstall",
+        paths = paths,
+        digest = digest,
+        plan_id = digest,
+    }
+end
+
+local function finalize_plan(plan)
+    local digest = common.change_fingerprint(plan.changes)
+    local operations, identities = {}, {}
+    for index = 1, #(plan.changes or {}) do
+        local change = plan.changes[index]
+        operations[#operations + 1] = {
+            path = change.path,
+            operation = change.operation,
+            before = change.before,
+            after = change.after,
+            before_identity = change.before_identity,
+            before_version = change.before_version,
+        }
+        identities[change.path] = {
+            identity = change.before_identity,
+            version = change.before_version,
+            source = change.before_identity_source,
+        }
+    end
+    plan.digest = digest
+    plan.plan_id = digest
+    plan.operations = operations
+    plan.file_identities = identities
+    plan.preview_bytes = #(plan.preview or "")
+    plan.transaction = {
+        transaction_id = plan.transaction_id,
+        digest = digest,
+        preview = plan.preview,
+    }
+    if plan.confirmation ~= nil then
+        plan.confirmation.digest = digest
+        plan.confirmation.plan_id = digest
+        plan.confirmation.preview = plan.preview
+        plan.confirmation.transaction_id = plan.transaction_id
+    end
+    return plan
 end
 
 local function build_install_plan(adapter, action, options, host, context)
@@ -366,31 +489,46 @@ local function build_install_plan(adapter, action, options, host, context)
     common.sort_changes(changes, order)
     local changed = false
     for index = 1, #changes do if changes[index].changed then changed = true end end
-    return { action = action, adapter = adapter.id, version = adapter.version, changes = changes, changed = changed, preview = common.format_preview(changes), exact = true, transactional = true, confirmation = M.confirmation_context(action, adapter, changes) }, nil
+    local plan = {
+        action = action,
+        adapter = adapter.id,
+        transaction_id = options and options.transaction_id,
+        version = adapter.version,
+        changes = changes,
+        changed = changed,
+        preview = common.format_preview(changes),
+        exact = true,
+        bounded = true,
+        transactional = true,
+    }
+    plan.confirmation = M.confirmation_context(action, adapter, changes)
+    return finalize_plan(plan), nil
 end
 
 local function build_uninstall_plan(adapter, options, host, context)
     local marker, marker_error = marker_option(adapter, options, host, context)
     if marker == nil then
-        return { action = "uninstall", adapter = adapter.id, version = adapter.version, changes = {}, changed = false, preview = "", exact = true, transactional = true, diagnostics = { marker_error }, confirmation = nil }, nil
-    end
-    if not common.marker_matches(marker, adapter) then
-        return { action = "uninstall", adapter = adapter.id, version = adapter.version, changes = {}, changed = false, preview = "", exact = true, transactional = true, diagnostics = {{ code = "ownership_marker_mismatch", adapter = adapter.id, message = "ownership marker belongs to another adapter or generation" }}, confirmation = nil }, nil
+        return { action = "uninstall", adapter = adapter.id, version = adapter.version, changes = {}, changed = false, preview = "", exact = true, bounded = true, transactional = true, diagnostics = { marker_error }, confirmation = nil }, nil
     end
     local configured_path = options and options.config_path
+    local owned, ownership_error = validate_marker_ownership(adapter, marker, context, configured_path)
+    if not owned then
+        return { action = "uninstall", adapter = adapter.id, version = adapter.version, changes = {}, changed = false, preview = "", exact = true, bounded = true, transactional = true, diagnostics = { ownership_error }, confirmation = nil }, nil
+    end
     if configured_path == nil and type(marker.files) == "table" then
         for marker_index = 1, #marker.files do
             if marker.files[marker_index] ~= adapter.marker_path then configured_path = marker.files[marker_index]; break end
         end
     end
     local settings_path = common.resolve_path(configured_path or adapter.settings_path, context)
-    local settings, settings_error
+    local settings, settings_error, settings_metadata, settings_exists
     if common.ends_with(settings_path, ".toml") then
-        local raw, exists, read_error = read_file(host, settings_path)
+        local raw, exists, read_error, metadata = read_file(host, settings_path)
         if read_error ~= nil then return nil, { code = "read_failed", path = settings_path, message = read_error } end
-        settings = exists and raw or ""
+        settings, settings_metadata, settings_exists = exists and raw or "", metadata, exists
     else
         settings, settings_error = config_option_for(adapter, options, host, settings_path)
+        if settings_error ~= nil then return nil, settings_error end
     end
     local changes = {}
     if not common.ends_with(settings_path, ".toml") then
@@ -402,38 +540,39 @@ local function build_uninstall_plan(adapter, options, host, context)
     else
         local cleaned, clean_error = adapter.remove_toml(settings, marker)
         if cleaned == nil then return nil, clean_error end
-        changes[#changes + 1] = common.make_change(settings_path, "write", settings, cleaned, { owned = true, safe = true })
+        changes[#changes + 1] = common.make_change(settings_path, "write", settings, cleaned, common.merge({ owned = true, safe = true }, snapshot_metadata(settings, settings_exists == true, settings_metadata)))
     end
     local owned_files = marker.files or {}
     for index = 1, #owned_files do
         local path = common.resolve_path(owned_files[index], context)
         if path ~= settings_path and path ~= common.resolve_path(adapter.marker_path, context) then
-            local current, exists, read_error = read_file(host, path)
+            local current, exists, read_error, current_metadata = read_file(host, path)
             if read_error ~= nil then return nil, { code = "read_failed", path = path, message = read_error } end
             if exists and owned_path(marker, owned_files[index]) then
+                local identity_metadata = snapshot_metadata(current, exists, current_metadata)
                 if adapter.id == "codex" and owned_files[index] == adapter.inline_config_path then
                     local cleaned, clean_error = adapter.remove_toml(current, marker)
                     if cleaned == nil then
-                        changes[#changes + 1] = common.make_change(path, "keep", current, current, { diagnostic = clean_error })
+                        changes[#changes + 1] = common.make_change(path, "keep", current, current, common.merge({ diagnostic = clean_error }, identity_metadata))
                     else
-                        changes[#changes + 1] = common.make_change(path, "write", current, cleaned, { owned = true, safe = true })
+                        changes[#changes + 1] = common.make_change(path, "write", current, cleaned, common.merge({ owned = true, safe = true }, identity_metadata))
                     end
                 else
                     local expected = options and options.generated_files and options.generated_files[path]
                     if expected == nil and type(marker.owned_contents) == "table" then expected = marker.owned_contents[owned_files[index]] or marker.owned_contents[path] end
                     if expected ~= nil and current == expected then
-                        changes[#changes + 1] = common.make_change(path, "remove", current, nil, { owned = true, safe = true })
+                        changes[#changes + 1] = common.make_change(path, "remove", current, nil, common.merge({ owned = true, safe = true }, identity_metadata))
                     else
-                        changes[#changes + 1] = common.make_change(path, "keep", current, current, { owned = true, safe = false, diagnostic = { code = "owned_file_changed", path = path, message = "owned generated file changed or cannot be verified; preserving it" } })
+                        changes[#changes + 1] = common.make_change(path, "keep", current, current, common.merge({ owned = true, safe = false, diagnostic = { code = "owned_file_changed", path = path, message = "owned generated file changed or cannot be verified; preserving it" } }, identity_metadata))
                     end
                 end
             end
         end
     end
     local marker_path = common.resolve_path(adapter.marker_path, context)
-    local marker_raw, marker_exists, marker_read_error = read_file(host, marker_path)
+    local marker_raw, marker_exists, marker_read_error, marker_metadata = read_file(host, marker_path)
     if marker_read_error ~= nil then return nil, { code = "read_failed", path = marker_path, message = marker_read_error } end
-    if marker_exists then changes[#changes + 1] = common.make_change(marker_path, "remove", marker_raw, nil, { owned = true, safe = true }) end
+    if marker_exists then changes[#changes + 1] = common.make_change(marker_path, "remove", marker_raw, nil, common.merge({ owned = true, safe = true }, snapshot_metadata(marker_raw, marker_exists, marker_metadata))) end
     local order = {}
     for index = 1, #(adapter.config_order or {}) do order[index] = common.resolve_path(adapter.config_order[index], context) end
     common.sort_changes(changes, order)
@@ -442,7 +581,8 @@ local function build_uninstall_plan(adapter, options, host, context)
         if changes[index].changed then changed = true end
         if changes[index].diagnostic ~= nil then diagnostics[#diagnostics + 1] = changes[index].diagnostic end
     end
-    return { action = "uninstall", adapter = adapter.id, version = adapter.version, changes = changes, changed = changed, preview = common.format_preview(changes), exact = true, transactional = true, diagnostics = diagnostics, confirmation = M.confirmation_context("uninstall", adapter, changes) }, nil
+    local plan = { action = "uninstall", adapter = adapter.id, transaction_id = options and options.transaction_id, version = adapter.version, changes = changes, changed = changed, preview = common.format_preview(changes), exact = true, bounded = true, transactional = true, diagnostics = diagnostics, confirmation = M.confirmation_context("uninstall", adapter, changes) }
+    return finalize_plan(plan), nil
 end
 function M.plan(action, adapter_id, options)
     options = options or {}
@@ -457,92 +597,211 @@ function M.plan(action, adapter_id, options)
     return build_install_plan(adapter, action, options, host, context)
 end
 
-local function confirmation_matches(expected, supplied)
-    if supplied == true then return true end
-    if type(supplied) ~= "table" or type(expected) ~= "table" then return false end
-    return supplied.command == expected.command and supplied.action == expected.action and supplied.adapter == expected.adapter
+local function confirmation_matches(files, expected, supplied)
+    if type(expected) ~= "table" or type(supplied) ~= "table" or type(supplied.token) ~= "string" or supplied.token == "" then return false end
+    local ok, accepted = call(files, "validate_confirmation", expected, supplied.token)
+    return ok and accepted == true
 end
 
-local function invoke_write(files, path, content)
-    local ok, result, error_message = call(files, "write", path, content)
+local function invoke_write(files, path, content, precondition)
+    local method = type(files.write_if_unchanged) == "function" and "write_if_unchanged" or nil
+    if method == nil and type(files.compare_and_swap) == "function" then method = "compare_and_swap" end
+    if method ~= nil then
+        local ok, result, error_message
+        if method == "compare_and_swap" then
+            ok, result, error_message = call(files, method, path, precondition, content)
+        else
+            ok, result, error_message = call(files, method, path, content, precondition)
+        end
+        if not ok or result == false then return false, tostring(error_message or result or "compare-and-swap write failed") end
+        return true, nil
+    end
+    local ok, result, error_message = call(files, "write", path, content, precondition)
     if not ok or result == false then return false, tostring(error_message or result or "write failed") end
     return true, nil
 end
 
-local function invoke_remove(files, path)
-    local ok, result, error_message = call(files, "remove", path)
+local function invoke_remove(files, path, precondition)
+    local method = type(files.remove_if_unchanged) == "function" and "remove_if_unchanged" or nil
+    if method == nil and type(files.compare_and_swap) == "function" then method = "compare_and_swap" end
+    if method ~= nil then
+        local ok, result, error_message
+        if method == "compare_and_swap" then
+            ok, result, error_message = call(files, method, path, precondition, nil)
+        else
+            ok, result, error_message = call(files, method, path, precondition)
+        end
+        if not ok or result == false then return false, tostring(error_message or result or "compare-and-swap remove failed") end
+        return true, nil
+    end
+    local ok, result, error_message = call(files, "remove", path, precondition)
     if not ok or result == false then return false, tostring(error_message or result or "remove failed") end
     return true, nil
 end
 
-local function rollback(files, backups, applied)
+local function snapshot_matches(change, content, exists, metadata, after)
+    local expected, expected_exists, expected_identity, expected_source, expected_version
+    if after then
+        expected, expected_exists = change.after, change.after ~= nil
+        expected_identity = change.after_identity
+        expected_source = change.after_identity_source
+        expected_version = change.after_version
+    else
+        expected, expected_exists = change.before, change.existed == true
+        expected_identity = change.before_identity
+        expected_source = change.before_identity_source
+        expected_version = change.before_version
+    end
+    if not common.same_content(expected, content) or expected_exists ~= exists then return false end
+    if expected_identity ~= nil and expected_source == "host" then
+        local identity, source = common.identity(content, exists, metadata)
+        if source ~= "host" or identity ~= expected_identity then return false end
+    end
+    if expected_version ~= nil and common.version(metadata) ~= expected_version then return false end
+    return true
+end
+
+local function rollback(files, records)
     local errors = {}
-    for index = #applied, 1, -1 do
-        local path = applied[index]
-        local backup = backups[path]
-        local ok, error_message
-        if backup.exists then ok, error_message = invoke_write(files, path, backup.content) else ok, error_message = invoke_remove(files, path) end
-        if not ok then errors[#errors + 1] = { path = path, message = error_message } end
+    for index = #records, 1, -1 do
+        local record = records[index]
+        local backup = record.backup
+        local current, exists, read_error, metadata = read_file({ files = files }, record.action.path)
+        if read_error ~= nil then
+            errors[#errors + 1] = { path = record.action.path, code = "rollback_read_failed", message = read_error }
+        elseif snapshot_matches(record.action, current, exists, metadata, false) then
+            -- The failed action did not change this path; there is nothing to restore.
+        elseif not snapshot_matches(record.action, current, exists, metadata, true) then
+            errors[#errors + 1] = { path = record.action.path, code = "rollback_conflict", conflict = true, message = "concurrent edit detected; preserving current content" }
+        else
+            local precondition = {
+                before = record.action.after,
+                existed = record.action.after ~= nil,
+                before_identity = record.action.after_identity,
+                before_identity_source = record.action.after_identity_source,
+                before_version = record.action.after_version,
+            }
+            local ok, error_message
+            if backup.exists then
+                ok, error_message = invoke_write(files, record.action.path, backup.content, precondition)
+            else
+                ok, error_message = invoke_remove(files, record.action.path, precondition)
+            end
+            if not ok then
+                errors[#errors + 1] = { path = record.action.path, code = "rollback_failed", message = error_message }
+            end
+        end
     end
     return errors
 end
 
 function M.apply(plan, options)
     options = options or {}
-    if type(plan) ~= "table" then return nil, { code = "invalid_plan", message = "apply requires a plan" } end
+    if type(plan) ~= "table" or plan.exact ~= true or type(plan.plan_id) ~= "string" or type(plan.changes) ~= "table" then
+        return nil, { code = "invalid_plan", message = "apply requires an exact preview plan" }
+    end
     if not plan.changed then return { status = "noop", plan = plan, applied = false, rolled_back = false }, nil end
-    local supplied = options.confirmation or options.confirmation_context
-    if not confirmation_matches(plan.confirmation, supplied) and options.confirmed ~= true then return { status = "confirmation_required", plan = plan, applied = false, confirmation = plan.confirmation }, nil end
     local host, files = runtime_for(options), nil
     files = files_for(host)
-    local backups, actions = {}, {}
+    local supplied = options.confirmation
+    local transaction = plan.transaction
+    if type(transaction) ~= "table" or not confirmation_matches(files, transaction, supplied) then
+        return { status = "confirmation_required", plan = plan, applied = false, confirmation = plan.confirmation }, nil
+    end
+    local token = supplied.token
+    local backups, actions, records = {}, {}, {}
     for index = 1, #plan.changes do
         local change = plan.changes[index]
         if change.changed and change.operation ~= "keep" then
-            local raw, exists, read_error = read_file(host, change.path)
+            local raw, exists, read_error, metadata = read_file(host, change.path)
             if read_error ~= nil then return nil, { code = "read_failed", path = change.path, message = read_error } end
-            backups[change.path] = { exists = exists, content = raw }
-            actions[#actions + 1] = { path = change.path, operation = change.operation, content = change.after, before = raw }
+            if not snapshot_matches(change, raw, exists, metadata, false) then
+                return {
+                    status = "stale",
+                    plan = plan,
+                    applied = false,
+                    stale_paths = { { path = change.path, expected = change.before, actual = raw, expected_identity = change.before_identity, actual_identity = common.identity(raw, exists, metadata) } },
+                }, nil
+            end
+            backups[change.path] = {
+                exists = exists,
+                content = raw,
+                identity = change.before_identity,
+                version = change.before_version,
+            }
+            local action = {
+                path = change.path,
+                operation = change.operation,
+                content = change.after,
+                before = change.before,
+                existed = change.existed,
+                before_identity = change.before_identity,
+                before_version = change.before_version,
+                after = change.after,
+                after_identity = change.after_identity,
+                after_identity_source = change.after_identity_source,
+            }
+            actions[#actions + 1] = action
+            records[#records + 1] = { action = action, backup = backups[change.path] }
         end
     end
     if #actions == 0 then return { status = "noop", plan = plan, applied = false, rolled_back = false }, nil end
-    local preview_value
-    local preview_ok, preview_result = call(files, "preview", actions)
-    if preview_ok then preview_value = preview_result end
+    local preview_value = nil
     local applied = {}
-    local has_native_apply = type(files.apply) == "function"
-    if has_native_apply then
-        local apply_ok, apply_result = call(files, "apply", actions)
+    local function verify_action(action)
+        local current, exists, read_error, metadata = read_file(host, action.path)
+        if read_error ~= nil then return false, read_error end
+        if not snapshot_matches(action, current, exists, metadata, true) then return false, "file changed while applying" end
+        action.after_identity, action.after_identity_source = common.identity(current, exists, metadata)
+        action.after_version = common.version(metadata)
+        return true, nil
+    end
+    if type(files.apply) == "function" then
+        local apply_ok, apply_result = call(files, "apply", actions, token, { transaction_id = transaction.transaction_id, digest = transaction.digest })
         if not apply_ok or apply_result == false then
-            for index = 1, #actions do applied[#applied + 1] = actions[index].path end
-            local rollback_errors = rollback(files, backups, applied)
-            return {
-                status = "failed",
-                plan = plan,
-                applied = false,
-                rolled_back = #rollback_errors == 0,
-                rollback_errors = rollback_errors,
-                message = "atomic host apply failed",
-            }, nil
+            local rollback_errors = rollback(files, records)
+            return { status = "failed", plan = plan, applied = false, rolled_back = #rollback_errors == 0, rollback_errors = rollback_errors, message = "atomic host apply failed" }, nil
         end
-        for index = 1, #actions do applied[#applied + 1] = actions[index].path end
+        for index = 1, #actions do
+            local verified, verify_error = verify_action(actions[index])
+            if not verified then
+                local rollback_errors = rollback(files, records)
+                return { status = "failed", plan = plan, applied = false, rolled_back = #rollback_errors == 0, rollback_errors = rollback_errors, failed_path = actions[index].path, message = verify_error }, nil
+            end
+            applied[#applied + 1] = actions[index].path
+        end
     else
         for index = 1, #actions do
             local action = actions[index]
+            local current, exists, read_error, metadata = read_file(host, action.path)
+            if read_error ~= nil or not snapshot_matches(action, current, exists, metadata, false) then
+                local rollback_errors = rollback(files, records)
+                return { status = "stale", plan = plan, applied = false, rolled_back = #rollback_errors == 0, rollback_errors = rollback_errors, stale_paths = { { path = action.path } } }, nil
+            end
+            local precondition = { before = action.before, existed = action.before ~= nil, before_identity = action.before_identity, before_identity_source = action.before_identity_source, before_version = action.before_version }
             local ok, error_message
-            if action.operation == "remove" then ok, error_message = invoke_remove(files, action.path) else ok, error_message = invoke_write(files, action.path, action.content) end
+            if action.operation == "remove" then ok, error_message = invoke_remove(files, action.path, precondition) else ok, error_message = invoke_write(files, action.path, action.content, precondition) end
             if not ok then
-                local rollback_errors = rollback(files, backups, applied)
+                local rollback_errors = rollback(files, records)
                 return { status = "failed", plan = plan, applied = false, rolled_back = #rollback_errors == 0, rollback_errors = rollback_errors, failed_path = action.path, message = error_message }, nil
+            end
+            local verified, verify_error = verify_action(action)
+            if not verified then
+                local rollback_errors = rollback(files, records)
+                return { status = "failed", plan = plan, applied = false, rolled_back = #rollback_errors == 0, rollback_errors = rollback_errors, failed_path = action.path, message = verify_error }, nil
             end
             applied[#applied + 1] = action.path
         end
     end
     local storage = storage_for(host)
     if storage ~= nil and plan.adapter ~= nil then
-        local marker = { adapter = plan.adapter, version = plan.version, action = plan.action, paths = {} }
-        for index = 1, #plan.changes do if plan.changes[index].changed then marker.paths[#marker.paths + 1] = plan.changes[index].path end end
-        call(storage, "set", "agents.integration." .. plan.adapter, marker)
+        local key = "agents.integration." .. plan.adapter
+        if plan.action == "uninstall" and type(storage.remove) == "function" then
+            call(storage, "remove", key)
+        else
+            local marker = { adapter = plan.adapter, version = plan.version, action = plan.action, paths = applied, plan_id = plan.plan_id }
+            call(storage, "set", key, marker)
+        end
     end
     return { status = "applied", plan = plan, applied = true, rolled_back = false, paths = applied, host_preview = preview_value }, nil
 end
@@ -624,10 +883,26 @@ function M.doctor(adapter_id, observation, options)
     return diagnostics
 end
 
+local function integration_action(action, adapter_id, options)
+    options = options or {}
+    if options.plan ~= nil then return M.apply(options.plan, options) end
+    local plan, plan_error = M.plan(action, adapter_id, options)
+    if plan == nil or plan_error ~= nil then return plan, plan_error end
+    if options.confirmation ~= nil then
+        return M.apply(plan, options)
+    end
+    return plan, nil
+end
+
 function M.integration_list(options) return M.list(options) end
-function M.integration_install(adapter_id, options) return M.plan("install", adapter_id, options) end
-function M.integration_setup(adapter_id, options) return M.plan("setup", adapter_id, options) end
-function M.integration_uninstall(adapter_id, options) return M.plan("uninstall", adapter_id, options) end
+function M.integration_install(adapter_id, options) return integration_action("install", adapter_id, options) end
+function M.integration_setup(adapter_id, options) return integration_action("setup", adapter_id, options) end
+function M.integration_uninstall(adapter_id, options) return integration_action("uninstall", adapter_id, options) end
+function M.integration_apply(adapter_id, plan, options)
+    options = options or {}
+    options.plan = plan
+    return M.apply(plan, options)
+end
 function M.integration_doctor(adapter_id, options) return M.doctor(adapter_id, options and options.observation, options or {}) end
 
 M.adapters, M.adapter_order, M.action_order, M.manifests = adapters, adapter_order, action_order, adapters

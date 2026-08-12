@@ -17,8 +17,8 @@ use super::{
         BindingOperationOutcome,
     },
     command::{
-        MuxCommand, MuxDirection, MuxPaneLaunch, MuxPaneLaunchPlan, MuxSessionLaunchPlan,
-        MuxSplitDirection,
+        MuxCommand, MuxDirection, MuxPaneLaunch, MuxPaneLaunchPlan, MuxPaneResize,
+        MuxSessionLaunchPlan, MuxSplitDirection,
     },
     controller::MuxScope,
     operation::{
@@ -171,18 +171,20 @@ impl NativeTerminalLaunch {
         self.title.as_deref()
     }
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NativeWindow {
     id: String,
     index: u32,
     name: String,
     active_pane_id: String,
+    /// The previously selected live pane in this window, used by `SelectLastPane`.
+    last_pane_id: Option<String>,
+    /// The pane currently occupying the authoritative zoom surface, if any.
+    zoomed_pane_id: Option<String>,
     /// Durable recursive topology in declaration order.
     layout: MuxPaneLayout,
     panes: Vec<NativePane>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct NativeSession {
     id: String,
@@ -237,6 +239,8 @@ impl NativeMuxState {
             index: 1,
             name: default_window_name(),
             active_pane_id: pane_id.clone(),
+            last_pane_id: None,
+            zoomed_pane_id: None,
             layout: MuxPaneLayout::Pane(pane_id.clone()),
             panes: vec![NativePane {
                 id: pane_id,
@@ -294,6 +298,8 @@ impl NativeMuxState {
                 index: position as u32 + 1,
                 name: window_plan.name.clone().unwrap_or_else(default_window_name),
                 active_pane_id,
+                last_pane_id: None,
+                zoomed_pane_id: None,
                 layout,
                 panes,
             });
@@ -604,6 +610,8 @@ impl NativeMuxState {
                 index,
                 name: default_window_name(),
                 active_pane_id: pane_id.clone(),
+                last_pane_id: None,
+                zoomed_pane_id: None,
                 layout: MuxPaneLayout::Pane(pane_id.clone()),
                 panes: vec![NativePane {
                     id: pane_id,
@@ -740,6 +748,7 @@ impl NativeMuxState {
             ) {
                 return;
             }
+            window.last_pane_id = Some(window.active_pane_id.clone());
             window.active_pane_id = pane_id.clone();
             window.panes.insert(
                 source_index + 1,
@@ -759,8 +768,10 @@ impl NativeMuxState {
         self.activate_window_containing_pane(session_id, pane_id);
         if let Some(window) = self.active_window_mut(session_id)
             && window.panes.iter().any(|pane| pane.id == pane_id)
+            && window.active_pane_id != pane_id
         {
-            window.active_pane_id = pane_id.to_owned();
+            let previous = std::mem::replace(&mut window.active_pane_id, pane_id.to_owned());
+            window.last_pane_id = Some(previous);
             self.active_session_id = session_id.to_owned();
         }
     }
@@ -794,7 +805,10 @@ impl NativeMuxState {
             .iter_mut()
             .find(|window| window.id == window_id)
             .expect("validated native window remains present");
-        window.active_pane_id = pane_id;
+        let previous = std::mem::replace(&mut window.active_pane_id, pane_id);
+        if previous != window.active_pane_id {
+            window.last_pane_id = Some(previous);
+        }
         self.active_session_id = session_id.to_owned();
         Ok(())
     }
@@ -836,8 +850,134 @@ impl NativeMuxState {
             .iter_mut()
             .find(|window| window.id == window_id)
             .expect("validated native window remains present");
-        window.active_pane_id = pane_id;
+        let previous = std::mem::replace(&mut window.active_pane_id, pane_id);
+        if previous != window.active_pane_id {
+            window.last_pane_id = Some(previous);
+        }
         self.active_session_id = session_id.to_owned();
+        Ok(())
+    }
+
+    fn select_last_pane(&mut self, session_id: &str, window_id: Option<&str>) -> Result<()> {
+        let (window_id, pane_id) = {
+            let session = self.require_session(session_id)?;
+            let window_id = window_id.unwrap_or(&session.active_window_id);
+            let window = self.require_window(session, window_id)?;
+            let pane_id = window.last_pane_id.clone().ok_or_else(|| {
+                MuxBackendOperationError::Failed(
+                    "native window has no previous pane to select".to_owned(),
+                )
+            })?;
+            if pane_id == window.active_pane_id
+                || !window.panes.iter().any(|pane| pane.id == pane_id)
+            {
+                return Err(MuxBackendOperationError::Failed(
+                    "native window has no live previous pane to select".to_owned(),
+                )
+                .into());
+            }
+            (window.id.clone(), pane_id)
+        };
+        let session = self
+            .active_session_mut(session_id)
+            .expect("validated native session remains present");
+        select_native_window(session, &window_id);
+        let window = session
+            .windows
+            .iter_mut()
+            .find(|window| window.id == window_id)
+            .expect("validated native window remains present");
+        let previous = std::mem::replace(&mut window.active_pane_id, pane_id);
+        window.last_pane_id = Some(previous);
+        self.active_session_id = session_id.to_owned();
+        Ok(())
+    }
+
+    fn resize_pane(
+        &mut self,
+        session_id: &str,
+        pane_id: Option<&str>,
+        adjustment: MuxPaneResize,
+    ) -> Result<()> {
+        let session = self.active_session_mut(session_id).ok_or_else(|| {
+            MuxBackendOperationError::stale(format!(
+                "native session {session_id:?} no longer exists"
+            ))
+        })?;
+        let window_index = pane_id
+            .and_then(|pane_id| {
+                session
+                    .windows
+                    .iter()
+                    .position(|window| window.panes.iter().any(|pane| pane.id == pane_id))
+            })
+            .or_else(|| {
+                session
+                    .windows
+                    .iter()
+                    .position(|window| window.id == session.active_window_id)
+            })
+            .ok_or_else(|| {
+                MuxBackendOperationError::stale("native target window no longer exists")
+            })?;
+        let window = &mut session.windows[window_index];
+        let target_pane_id = pane_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| window.active_pane_id.clone());
+        match adjustment {
+            MuxPaneResize::Directional { direction, cells } if cells > 0 => {
+                if !resize_native_layout(&mut window.layout, &target_pane_id, direction, cells) {
+                    return Err(MuxBackendOperationError::unsupported(
+                        "native pane resize has no matching ancestor split",
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+            MuxPaneResize::Directional { .. } => Err(MuxBackendOperationError::Failed(
+                "native pane resize requires a positive cell count".to_owned(),
+            )
+            .into()),
+            MuxPaneResize::Absolute { .. } => Err(MuxBackendOperationError::unsupported(
+                "native pane resize only supports directional cell adjustments",
+            )
+            .into()),
+        }
+    }
+
+    fn toggle_pane_zoom(&mut self, session_id: &str, pane_id: Option<&str>) -> Result<()> {
+        let session = self.active_session_mut(session_id).ok_or_else(|| {
+            MuxBackendOperationError::stale(format!(
+                "native session {session_id:?} no longer exists"
+            ))
+        })?;
+        let window_index = pane_id
+            .and_then(|pane_id| {
+                session
+                    .windows
+                    .iter()
+                    .position(|window| window.panes.iter().any(|pane| pane.id == pane_id))
+            })
+            .or_else(|| {
+                session
+                    .windows
+                    .iter()
+                    .position(|window| window.id == session.active_window_id)
+            })
+            .ok_or_else(|| {
+                MuxBackendOperationError::stale("native target window no longer exists")
+            })?;
+        let window = &mut session.windows[window_index];
+        let target_pane_id = pane_id
+            .map(str::to_owned)
+            .unwrap_or_else(|| window.active_pane_id.clone());
+        if !window.panes.iter().any(|pane| pane.id == target_pane_id) {
+            return Err(
+                MuxBackendOperationError::stale("native target pane no longer exists").into(),
+            );
+        }
+        window.zoomed_pane_id = (window.zoomed_pane_id.as_deref() != Some(target_pane_id.as_str()))
+            .then_some(target_pane_id);
         Ok(())
     }
 
@@ -860,6 +1000,9 @@ impl NativeMuxState {
             .expect("a multi-pane native layout keeps a sibling");
         window.panes.remove(index);
         window.layout = layout;
+        if window.last_pane_id.as_deref() == Some(removed_pane_id.as_str()) {
+            window.last_pane_id = None;
+        }
         window.active_pane_id = window.panes[index.min(window.panes.len() - 1)].id.clone();
         true
     }
@@ -909,12 +1052,18 @@ impl NativeMuxState {
             let removed_active_pane = removed_pane_id == window.active_pane_id;
             let remaining_layout = remove_native_layout_pane(&window.layout, &removed_pane_id);
             window.panes.remove(pane_index);
+            if window.last_pane_id.as_deref() == Some(removed_pane_id.as_str()) {
+                window.last_pane_id = None;
+            }
             if let Some(layout) = remaining_layout {
                 window.layout = layout;
                 if removed_active_pane {
                     window.active_pane_id = window.panes[pane_index.min(window.panes.len() - 1)]
                         .id
                         .clone();
+                    if window.last_pane_id.as_deref() == Some(removed_pane_id.as_str()) {
+                        window.last_pane_id = None;
+                    }
                 }
                 changed_active_session = target_was_active;
             } else {
@@ -1552,6 +1701,84 @@ fn opposite_direction(direction: MuxDirection) -> MuxDirection {
     }
 }
 
+const NATIVE_RESIZE_STEP_MILLIS: u16 = 10;
+
+fn resize_native_layout(
+    layout: &mut MuxPaneLayout,
+    pane_id: &str,
+    direction: MuxDirection,
+    cells: u16,
+) -> bool {
+    let positive_axis = matches!(direction, MuxDirection::Right | MuxDirection::Down);
+    let matching_axis = |split_direction: &MuxPaneSplitDirection| {
+        matches!(
+            (split_direction, direction),
+            (
+                MuxPaneSplitDirection::Right,
+                MuxDirection::Left | MuxDirection::Right
+            ) | (
+                MuxPaneSplitDirection::Down,
+                MuxDirection::Up | MuxDirection::Down
+            )
+        )
+    };
+    let delta = cells.saturating_mul(NATIVE_RESIZE_STEP_MILLIS);
+
+    fn visit(
+        layout: &mut MuxPaneLayout,
+        pane_id: &str,
+        positive_axis: bool,
+        matching_axis: &impl Fn(&MuxPaneSplitDirection) -> bool,
+        delta: u16,
+    ) -> bool {
+        let MuxPaneLayout::Split {
+            direction: split_direction,
+            ratio_millis,
+            first,
+            second,
+        } = layout
+        else {
+            return false;
+        };
+        let in_first = native_layout_contains(first, pane_id);
+        let in_second = !in_first && native_layout_contains(second, pane_id);
+        if !in_first && !in_second {
+            return false;
+        }
+        // Recurse first so the nearest matching ancestor wins.
+        if (in_first && visit(first, pane_id, positive_axis, matching_axis, delta))
+            || (in_second && visit(second, pane_id, positive_axis, matching_axis, delta))
+        {
+            return true;
+        }
+        if !matching_axis(split_direction) {
+            return false;
+        }
+        // A pane in the first branch grows toward Right/Down by increasing the first
+        // branch's ratio. A pane in the second branch grows toward Right/Down by
+        // decreasing that ratio.
+        let increase = if in_first {
+            positive_axis
+        } else {
+            !positive_axis
+        };
+        *ratio_millis = if increase {
+            ratio_millis.saturating_add(delta).clamp(
+                crate::command::MIN_LAUNCH_RATIO_MILLIS,
+                crate::command::MAX_LAUNCH_RATIO_MILLIS,
+            )
+        } else {
+            ratio_millis.saturating_sub(delta).clamp(
+                crate::command::MIN_LAUNCH_RATIO_MILLIS,
+                crate::command::MAX_LAUNCH_RATIO_MILLIS,
+            )
+        };
+        true
+    }
+
+    visit(layout, pane_id, positive_axis, &matching_axis, delta)
+}
+
 fn native_allocated_resources(
     state: &NativeMuxState,
     plan: &MuxSessionLaunchPlan,
@@ -2149,12 +2376,10 @@ impl NativeBackend {
                 session_id,
                 window_id,
             } => state.select_relative_pane(&session_id, window_id.as_deref(), -1)?,
-            MuxCommand::SelectLastPane { .. } => {
-                return Err(MuxBackendOperationError::unsupported(
-                    "native backend does not retain pane-selection history",
-                )
-                .into());
-            }
+            MuxCommand::SelectLastPane {
+                session_id,
+                window_id,
+            } => state.select_last_pane(&session_id, window_id.as_deref())?,
             MuxCommand::KillPane {
                 session_id,
                 pane_id,
@@ -2178,18 +2403,15 @@ impl NativeBackend {
                     closed_targets.push((target, "native pane closed".to_owned()));
                 }
             }
-            MuxCommand::TogglePaneZoom { .. } => {
-                return Err(MuxBackendOperationError::unsupported(
-                    "native backend does not expose pane zoom",
-                )
-                .into());
-            }
-            MuxCommand::ResizePane { .. } => {
-                return Err(MuxBackendOperationError::unsupported(
-                    "native backend does not expose pane geometry",
-                )
-                .into());
-            }
+            MuxCommand::TogglePaneZoom {
+                session_id,
+                pane_id,
+            } => state.toggle_pane_zoom(&session_id, pane_id.as_deref())?,
+            MuxCommand::ResizePane {
+                session_id,
+                pane_id,
+                adjustment,
+            } => state.resize_pane(&session_id, pane_id.as_deref(), adjustment)?,
             MuxCommand::CreateSession { plan } => state.create_session_launch(&plan)?,
             MuxCommand::CreateProjectSession { session_id, cwd }
             | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
@@ -2224,9 +2446,8 @@ impl NativeBackend {
             MuxCommand::NewWindow { session_id, .. }
             | MuxCommand::SelectPane { session_id, .. }
             | MuxCommand::SelectNextPane { session_id, .. }
-            | MuxCommand::SelectPreviousPane { session_id, .. } => {
-                state.pane_target(session_id, None)
-            }
+            | MuxCommand::SelectPreviousPane { session_id, .. }
+            | MuxCommand::SelectLastPane { session_id, .. } => state.pane_target(session_id, None),
             _ => pre_mutation_target,
         };
         let allocated = match &event_command {
@@ -2274,6 +2495,9 @@ impl MuxBackend for NativeBackend {
                 BindingOperation::MoveWindow,
                 BindingOperation::SplitPane,
                 BindingOperation::NavigatePane,
+                BindingOperation::LastPane,
+                BindingOperation::ResizePane,
+                BindingOperation::TogglePaneZoom,
                 BindingOperation::ClosePane,
                 BindingOperation::CreateProjectSession,
                 BindingOperation::CreateWorktreeSession,
@@ -2604,6 +2828,98 @@ mod tests {
         let mut state = NativeMuxState::new();
         state.ensure_session("local", ".");
         state
+    }
+
+    #[test]
+    fn native_pane_history_resize_and_zoom_are_authoritative() {
+        let mut state = local_state();
+        state.split_pane("local", None, MuxSplitDirection::Right);
+
+        let first = state
+            .require_active_window(state.require_session("local").unwrap())
+            .unwrap()
+            .panes[0]
+            .id
+            .clone();
+        let second = state
+            .require_active_window(state.require_session("local").unwrap())
+            .unwrap()
+            .panes[1]
+            .id
+            .clone();
+        state.set_active_pane("local", &first);
+        state.select_last_pane("local", None).unwrap();
+        assert_eq!(
+            state
+                .require_active_window(state.require_session("local").unwrap())
+                .unwrap()
+                .active_pane_id,
+            second
+        );
+        state.select_last_pane("local", None).unwrap();
+        assert_eq!(
+            state
+                .require_active_window(state.require_session("local").unwrap())
+                .unwrap()
+                .active_pane_id,
+            first
+        );
+
+        state
+            .resize_pane(
+                "local",
+                Some(&first),
+                MuxPaneResize::Directional {
+                    direction: MuxDirection::Right,
+                    cells: 4,
+                },
+            )
+            .unwrap();
+        let ratio = match &state
+            .require_active_window(state.require_session("local").unwrap())
+            .unwrap()
+            .layout
+        {
+            MuxPaneLayout::Split { ratio_millis, .. } => *ratio_millis,
+            MuxPaneLayout::Pane(_) => panic!("split layout disappeared"),
+        };
+        assert_eq!(ratio, 540);
+        state
+            .resize_pane(
+                "local",
+                Some(&first),
+                MuxPaneResize::Directional {
+                    direction: MuxDirection::Left,
+                    cells: 100,
+                },
+            )
+            .unwrap();
+        let ratio = match &state
+            .require_active_window(state.require_session("local").unwrap())
+            .unwrap()
+            .layout
+        {
+            MuxPaneLayout::Split { ratio_millis, .. } => *ratio_millis,
+            MuxPaneLayout::Pane(_) => panic!("split layout disappeared"),
+        };
+        assert_eq!(ratio, 50);
+        state.toggle_pane_zoom("local", Some(&first)).unwrap();
+        assert_eq!(
+            state
+                .require_active_window(state.require_session("local").unwrap())
+                .unwrap()
+                .zoomed_pane_id
+                .as_deref(),
+            Some(first.as_str())
+        );
+        state.toggle_pane_zoom("local", Some(&first)).unwrap();
+        assert_eq!(
+            state
+                .require_active_window(state.require_session("local").unwrap())
+                .unwrap()
+                .zoomed_pane_id,
+            None
+        );
     }
 
     #[test]
@@ -2967,7 +3283,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_or_unsupported_native_commands_clear_pending_completion() {
+    fn failed_native_commands_clear_pending_completion() {
         let mut backend = NativeBackend::with_state(local_state());
 
         backend
@@ -2994,18 +3310,22 @@ mod tests {
                 session_id: "local".to_owned(),
                 name: "second".to_owned(),
             })
-            .expect("seed completion before unsupported command");
+            .expect("seed completion before rejected command");
         assert!(backend.authoritative_completion.is_some());
         assert!(matches!(
             backend.execute_checked(
                 native_scope(),
-                MuxCommand::TogglePaneZoom {
+                MuxCommand::ResizePane {
                     session_id: "local".to_owned(),
                     pane_id: None,
+                    adjustment: MuxPaneResize::Absolute {
+                        columns: Some(120),
+                        rows: Some(40),
+                    },
                 },
                 None,
             ),
-            BindingOperationOutcome::Unsupported
+            BindingOperationOutcome::Supported(Err(_))
         ));
         assert!(backend.take_authoritative_completion().is_none());
     }

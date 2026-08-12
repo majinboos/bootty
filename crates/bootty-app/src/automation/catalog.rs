@@ -13,14 +13,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-const EXPECTED_DESCRIPTOR_COUNT: usize = 310;
-const EXPECTED_NAMESPACE_COUNT: usize = 39;
+const EXPECTED_DESCRIPTOR_COUNT: usize = 302;
+const EXPECTED_NAMESPACE_COUNT: usize = 38;
+const EXPECTED_SOURCE_ENTRY_COUNT: usize = 570;
 const HERDR_REVISION: &str = "2863b715132fe29e53089e06f105943d1df0b3b4";
 const RMUX_PINNED_VERSION: &str = "0.9.1";
 const RMUX_RUNTIME_ADAPTER: &str = "embedded rmux 0.10 SDK/IPC only; never the standalone rmux CLI";
 
 const CATALOG_MANIFEST: &str = include_str!("../../catalog-manifests/canonical-catalog.json");
-const SOURCE_MANIFESTS: [(&str, &str); 7] = [
+const SOURCE_MANIFESTS: [(&str, &str); 6] = [
     (
         "bootty_actions",
         include_str!("../../catalog-manifests/bootty-actions.json"),
@@ -36,10 +37,6 @@ const SOURCE_MANIFESTS: [(&str, &str); 7] = [
     (
         "herdr_methods",
         include_str!("../../catalog-manifests/herdr-methods-2863b715.json"),
-    ),
-    (
-        "rmux_cli_signatures_0_9_1",
-        include_str!("../../catalog-manifests/rmux-cli-signatures-0.9.1.json"),
     ),
     (
         "rmux_requests_0_9_1",
@@ -85,7 +82,7 @@ struct SourceManifestInventory {
     service_required: BTreeMap<String, String>,
 }
 
-/// One of the 310 canonical command descriptors.
+/// One of the 302 canonical command descriptors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalDescriptor {
     pub id: String,
@@ -365,6 +362,12 @@ impl CanonicalCatalog {
                 document.expected_namespace_count
             )));
         }
+        if document.expected_source_entry_count != EXPECTED_SOURCE_ENTRY_COUNT {
+            return Err(CatalogError::new(format!(
+                "catalog declares {} source entries; expected {EXPECTED_SOURCE_ENTRY_COUNT}",
+                document.expected_source_entry_count
+            )));
+        }
 
         let declared_namespaces = document.namespaces.iter().cloned().collect::<BTreeSet<_>>();
         let actual_namespaces = document
@@ -418,7 +421,7 @@ impl CanonicalCatalog {
         validate_source_manifests(
             &source_manifests,
             &document.source_manifest_inventory,
-            document.expected_source_entry_count,
+            EXPECTED_SOURCE_ENTRY_COUNT,
             &descriptor_indices,
             &aliases,
             &service_required,
@@ -737,11 +740,9 @@ fn validate_source_provenance(
             "source manifest {manifest_name} does not pin HerdR revision {HERDR_REVISION}"
         )));
     }
-    if matches!(
-        manifest_name,
-        "rmux_cli_signatures_0_9_1" | "rmux_requests_0_9_1" | "rmux_sdk_0_9_1"
-    ) && (manifest.version.as_deref() != Some(RMUX_PINNED_VERSION)
-        || manifest.runtime_adapter.as_deref() != Some(RMUX_RUNTIME_ADAPTER))
+    if matches!(manifest_name, "rmux_requests_0_9_1" | "rmux_sdk_0_9_1")
+        && (manifest.version.as_deref() != Some(RMUX_PINNED_VERSION)
+            || manifest.runtime_adapter.as_deref() != Some(RMUX_RUNTIME_ADAPTER))
     {
         return Err(CatalogError::new(format!(
             "source manifest {manifest_name} must describe rmux {RMUX_PINNED_VERSION} with the embedded SDK/IPC adapter"
@@ -824,8 +825,9 @@ mod tests {
         let catalog = CanonicalCatalog::load_checked_in().expect("checked-in catalog");
 
         let completeness = catalog.completeness();
-        assert_eq!(completeness.descriptor_count, 310);
-        assert_eq!(completeness.namespace_count, 39);
+        assert_eq!(completeness.descriptor_count, 302);
+        assert_eq!(completeness.namespace_count, 38);
+        assert_eq!(completeness.source_entry_count, 570);
         assert_eq!(
             completeness.source_entry_count, catalog.document.expected_source_entry_count,
             "source entry count must match the pinned source inventory"

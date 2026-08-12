@@ -33,6 +33,7 @@ M.protocol = {
 }
 M.marker = "bootty-agents-pi-v1"
 M.settings_path = "~/.pi/agent/settings.json"
+M.marker_path = "~/.config/bootty/agents/pi.json"
 M.config_path = M.settings_path
 M.extension_path = "~/.pi/agent/extensions/bootty.ts"
 M.extension_source = [[import { spawn } from "node:child_process";

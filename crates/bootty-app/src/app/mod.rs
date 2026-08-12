@@ -2070,6 +2070,7 @@ impl BoottyApp {
         let run = matches!(
             event,
             crate::ui::command_palette::CommandPaletteEvent::Run(_)
+                | crate::ui::command_palette::CommandPaletteEvent::RunExtension(_)
         );
         self.state.apply_command_palette_event(dialog, event);
         // The chosen command runs on the next input pass; make sure that pass

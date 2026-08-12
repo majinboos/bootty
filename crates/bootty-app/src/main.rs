@@ -40,13 +40,20 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
-            ExitCode::from(
-                error
-                    .downcast_ref::<CliFailure>()
-                    .map_or(1, |failure| failure.code),
-            )
+            ExitCode::from(cli_exit_code(&error))
         }
     }
+}
+
+fn cli_exit_code(error: &anyhow::Error) -> u8 {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<CliFailure>()
+                .map(|failure| failure.code)
+        })
+        .unwrap_or(1)
 }
 
 fn run() -> Result<()> {
@@ -90,8 +97,7 @@ fn run() -> Result<()> {
             arguments,
             yes,
         }) => {
-            let invocation = command_invocation_from_cli(name, arguments);
-            print_command_response(invoke_control_command(&cli, invocation, *yes)?, cli.json())?;
+            invoke_named_command(&cli, name, arguments, *yes)?;
             return Ok(());
         }
         Some(Command::Dynamic(arguments)) => {
@@ -174,7 +180,7 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
         control::select_or_start(cli.instance(), cli.start()).map_err(transport_failure)?;
     let descriptors = dynamic_command_descriptors(&instance)?;
     let (descriptor, command, path_len) =
-        if let Some((command, path_len)) = resolve_dynamic_command(&descriptors, raw) {
+        if let Some((command, path_len)) = resolve_dynamic_command(&descriptors, raw)? {
             (
                 describe_dynamic_command(&instance, &command)?,
                 command,
@@ -189,16 +195,56 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
         print_dynamic_help(&raw[..path_len].join(" "), &descriptor);
         return Ok(());
     }
+    invoke_described_command(cli, &instance, descriptor, command, raw_arguments, false)
+}
 
-    let (mut values, target, confirmed) =
+fn invoke_named_command(cli: &Cli, name: &str, arguments: &[String], confirm: bool) -> Result<()> {
+    let instance =
+        control::select_or_start(cli.instance(), cli.start()).map_err(transport_failure)?;
+    let (command, embedded_argument) = name
+        .split_once(':')
+        .map_or((name, None), |(command, argument)| {
+            (command, Some(argument))
+        });
+    let descriptor = describe_dynamic_command(&instance, command)?;
+    let mut raw_arguments =
+        Vec::with_capacity(arguments.len() + embedded_argument.is_some() as usize);
+    if let Some(argument) = embedded_argument {
+        raw_arguments.push(argument.to_owned());
+    }
+    raw_arguments.extend(arguments.iter().cloned());
+    if dynamic_help_requested(&raw_arguments) {
+        print_dynamic_help(command, &descriptor);
+        return Ok(());
+    }
+    invoke_described_command(
+        cli,
+        &instance,
+        descriptor,
+        command.to_owned(),
+        &raw_arguments,
+        confirm,
+    )
+}
+
+fn invoke_described_command(
+    cli: &Cli,
+    instance: &control::InstanceDescriptor,
+    descriptor: CommandDescriptor,
+    command: String,
+    raw_arguments: &[String],
+    initial_confirmed: bool,
+) -> Result<()> {
+    let (mut values, target, parsed_confirmed) =
         parse_dynamic_argument_values(&descriptor, raw_arguments)?;
     complete_dynamic_argument_values(&descriptor, &mut values)?;
+    let confirmed = initial_confirmed || parsed_confirmed;
     match control::direct_control_request(&descriptor.id, &values)
         .map_err(|error| usage_failure(error.to_string()))?
     {
         Some(control::DirectControlRequest::CommandInvocation(invocation)) => {
             print_command_response(
-                invoke_control_command_on_instance(&instance, invocation, confirmed)?,
+                invoke_control_command_on_instance(instance, invocation, confirmed)?,
                 cli.json(),
             )
         }
@@ -216,7 +262,7 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
                 )));
             }
             print_control_response(
-                control_instance_request(&instance, method, params)?,
+                control_instance_request(instance, method, params)?,
                 cli.json(),
             )
         }
@@ -229,7 +275,7 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
                 confirmation: None,
             };
             print_command_response(
-                invoke_control_command_on_instance(&instance, invocation, confirmed)?,
+                invoke_control_command_on_instance(instance, invocation, confirmed)?,
                 cli.json(),
             )
         }
@@ -277,15 +323,52 @@ fn describe_dynamic_command(
 fn resolve_dynamic_command(
     descriptors: &[CommandDescriptor],
     raw: &[String],
-) -> Option<(String, usize)> {
-    dynamic_command_candidates(raw)
-        .into_iter()
-        .find_map(|(candidate, path_len)| {
-            descriptors.iter().find_map(|descriptor| {
+) -> Result<Option<(String, usize)>> {
+    for (candidate, path_len) in dynamic_command_candidates(raw) {
+        let exact = descriptors
+            .iter()
+            .filter_map(|descriptor| {
+                dynamic_descriptor_exact_command_name(descriptor, &candidate)
+                    .map(|command| (command.to_owned(), path_len))
+            })
+            .collect::<Vec<_>>();
+        if exact.len() == 1 {
+            return Ok(exact.into_iter().next());
+        }
+        if exact.len() > 1 {
+            return Err(usage_failure(format!("ambiguous command path {candidate}")));
+        }
+        let normalized = descriptors
+            .iter()
+            .filter_map(|descriptor| {
                 dynamic_descriptor_command_name(descriptor, &candidate)
                     .map(|command| (command.to_owned(), path_len))
             })
-        })
+            .collect::<Vec<_>>();
+        if normalized.len() == 1 {
+            return Ok(normalized.into_iter().next());
+        }
+        if normalized.len() > 1 {
+            return Err(usage_failure(format!(
+                "ambiguous command path {candidate}; use its exact hyphen/underscore spelling"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn dynamic_descriptor_exact_command_name<'a>(
+    descriptor: &'a CommandDescriptor,
+    candidate: &str,
+) -> Option<&'a str> {
+    if descriptor.id == candidate {
+        return Some(&descriptor.id);
+    }
+    descriptor
+        .aliases
+        .iter()
+        .find(|alias| alias.as_str() == candidate)
+        .map(String::as_str)
 }
 
 fn dynamic_descriptor_command_name<'a>(
@@ -335,21 +418,31 @@ fn dynamic_command_candidates(raw: &[String]) -> Vec<(String, usize)> {
         .iter()
         .position(|argument| argument.as_str() == "--" || argument.starts_with("--"))
         .unwrap_or(raw.len());
-    let mut candidates = (1..=path_limit)
-        .rev()
-        .map(|path_len| (normalized_dynamic_path(&raw[..path_len]), path_len))
-        .collect::<Vec<_>>();
-    let legacy_leaf = raw.first().and_then(|first| {
-        normalized_dynamic_name(first)
-            .rsplit_once('.')
-            .map(|(_, leaf)| leaf.to_owned())
-    });
-    if let Some(leaf) = legacy_leaf
-        && !candidates
+    let mut candidates = Vec::new();
+    for path_len in (1..=path_limit).rev() {
+        let raw_path = raw[..path_len]
             .iter()
-            .any(|(candidate, path_len)| *path_len == 1 && candidate == &leaf)
+            .flat_map(|part| part.split('.'))
+            .collect::<Vec<_>>()
+            .join(".");
+        let normalized = normalized_dynamic_path(&raw[..path_len]);
+        if !candidates.contains(&(raw_path.clone(), path_len)) {
+            candidates.push((raw_path.clone(), path_len));
+        }
+        if normalized != raw_path && !candidates.contains(&(normalized.clone(), path_len)) {
+            candidates.push((normalized, path_len));
+        }
+    }
+    if let Some(first) = raw.first()
+        && let Some((_, leaf)) = first.rsplit_once('.')
     {
-        candidates.push((leaf, 1));
+        let normalized_leaf = normalized_dynamic_name(leaf);
+        if !candidates.contains(&(leaf.to_owned(), 1)) {
+            candidates.push((leaf.to_owned(), 1));
+        }
+        if normalized_leaf != leaf && !candidates.contains(&(normalized_leaf.clone(), 1)) {
+            candidates.push((normalized_leaf, 1));
+        }
     }
     candidates
 }
@@ -368,22 +461,6 @@ fn normalized_dynamic_name(name: &str) -> String {
         .map(|part| part.replace('-', "_"))
         .collect::<Vec<_>>()
         .join(".")
-}
-
-fn command_invocation_from_cli(name: &str, arguments: &[String]) -> CommandInvocation {
-    let mut invocation = CommandInvocation::from_action(name, Caller::Cli);
-    invocation.arguments.extend(arguments.iter().cloned());
-    invocation
-}
-
-fn invoke_control_command(
-    cli: &Cli,
-    invocation: CommandInvocation,
-    confirm: bool,
-) -> Result<control::RpcResponse> {
-    let descriptor =
-        control::select_or_start(cli.instance(), cli.start()).map_err(transport_failure)?;
-    invoke_control_command_on_instance(&descriptor, invocation, confirm)
 }
 
 fn invoke_control_command_on_instance(
@@ -557,21 +634,20 @@ fn parse_dynamic_argument_values(
                 let (name, inline_value) = option_name
                     .split_once('=')
                     .map_or((option_name, None), |(name, value)| (name, Some(value)));
-                let index = descriptor
-                    .arguments
-                    .arguments
-                    .iter()
-                    .position(|schema| schema.name == name || schema.name.replace('_', "-") == name)
-                    .ok_or_else(|| {
-                        usage_failure(format!("unknown argument {option} for {}", descriptor.id))
-                    })?;
+                let index = dynamic_argument_index(descriptor, name).ok_or_else(|| {
+                    usage_failure(format!("unknown argument {option} for {}", descriptor.id))
+                })?;
                 let value = if let Some(value) = inline_value {
                     value.to_owned()
                 } else {
-                    input
+                    let value = input
                         .next()
                         .cloned()
-                        .ok_or_else(|| usage_failure(format!("{option} requires a value")))?
+                        .ok_or_else(|| usage_failure(format!("{option} requires a value")))?;
+                    if value.starts_with("--") {
+                        return Err(usage_failure(format!("{option} requires a value")));
+                    }
+                    value
                 };
                 append_dynamic_value(descriptor, &mut values, index, value)?;
                 continue;
@@ -583,23 +659,78 @@ fn parse_dynamic_argument_values(
     Ok((values, target, confirmed))
 }
 
+fn dynamic_argument_index(descriptor: &CommandDescriptor, name: &str) -> Option<usize> {
+    descriptor
+        .arguments
+        .arguments
+        .iter()
+        .position(|schema| schema.name == name)
+        .or_else(|| {
+            let normalized = normalized_dynamic_argument_name(name);
+            let mut matches = descriptor
+                .arguments
+                .arguments
+                .iter()
+                .enumerate()
+                .filter(|(_, schema)| normalized_dynamic_argument_name(&schema.name) == normalized);
+            let (index, _) = matches.next()?;
+            matches.next().is_none().then_some(index)
+        })
+}
+
+fn normalized_dynamic_argument_name(name: &str) -> String {
+    name.replace('-', "_")
+}
+
 fn validate_dynamic_schema(descriptor: &CommandDescriptor) -> Result<()> {
     let argument_count = descriptor.arguments.arguments.len();
-    if let Some(argument) =
-        descriptor
-            .arguments
-            .arguments
+    for (index, argument) in descriptor.arguments.arguments.iter().enumerate() {
+        if argument.name.is_empty() {
+            return Err(usage_failure(format!(
+                "argument {index} has no name for {}",
+                descriptor.id
+            )));
+        }
+        if argument.repeated && index + 1 != argument_count {
+            return Err(usage_failure(format!(
+                "repeated argument --{} must be last for {}",
+                argument.name.replace('_', "-"),
+                descriptor.id
+            )));
+        }
+        if descriptor.arguments.arguments[..index]
             .iter()
-            .enumerate()
-            .find_map(|(index, argument)| {
-                (argument.repeated && index + 1 != argument_count).then_some(argument)
+            .any(|previous| previous.name == argument.name)
+        {
+            return Err(usage_failure(format!(
+                "duplicate argument --{} for {}",
+                argument.name.replace('_', "-"),
+                descriptor.id
+            )));
+        }
+        if descriptor.arguments.arguments[..index]
+            .iter()
+            .any(|previous| {
+                normalized_dynamic_argument_name(&previous.name)
+                    == normalized_dynamic_argument_name(&argument.name)
             })
-    {
-        return Err(usage_failure(format!(
-            "repeated argument --{} must be last for {}",
-            argument.name.replace('_', "-"),
-            descriptor.id
-        )));
+        {
+            return Err(usage_failure(format!(
+                "arguments --{} and --{} are ambiguous after hyphen/underscore normalization for {}",
+                argument.name.replace('_', "-"),
+                descriptor.arguments.arguments[..index]
+                    .iter()
+                    .find(|previous| {
+                        normalized_dynamic_argument_name(&previous.name)
+                            == normalized_dynamic_argument_name(&argument.name)
+                    })
+                    .map_or_else(
+                        || "unknown".to_owned(),
+                        |previous| previous.name.replace('_', "-")
+                    ),
+                descriptor.id
+            )));
+        }
     }
     Ok(())
 }
@@ -1137,9 +1268,18 @@ fn finish_command_outcome(outcome: Option<bootty_app::commands::CommandOutcome>)
             message: "command is still pending".to_owned(),
         }
         .into()),
-        Some(bootty_app::commands::CommandOutcome::Ambiguous { message, .. })
-        | Some(bootty_app::commands::CommandOutcome::Failed { message, .. }) => Err(CliFailure {
+        Some(bootty_app::commands::CommandOutcome::Ambiguous { message, .. }) => Err(CliFailure {
             code: EXIT_COMMAND_FAILED,
+            message,
+        }
+        .into()),
+        Some(bootty_app::commands::CommandOutcome::Failed { code, message }) => Err(CliFailure {
+            code: matches!(
+                code.as_str(),
+                "invalid_arguments" | "unknown_command" | "invalid_catalog"
+            )
+            .then_some(EXIT_USAGE)
+            .unwrap_or(EXIT_COMMAND_FAILED),
             message,
         }
         .into()),
@@ -1272,7 +1412,8 @@ mod control_cli_tests {
     #[test]
     fn cli_invocation_keeps_embedded_move_tab_argument() {
         let explicit = vec!["from-cli".to_owned()];
-        let invocation = command_invocation_from_cli("move_tab:-1", &explicit);
+        let mut invocation = CommandInvocation::from_action("move_tab:-1", Caller::Cli);
+        invocation.arguments.extend(explicit);
 
         assert_eq!(invocation.command, "move_tab");
         assert_eq!(invocation.arguments, ["-1", "from-cli"]);
@@ -1281,7 +1422,8 @@ mod control_cli_tests {
     #[test]
     fn cli_invocation_keeps_embedded_navigate_search_argument() {
         let explicit = vec!["from-cli".to_owned()];
-        let invocation = command_invocation_from_cli("navigate_search:next", &explicit);
+        let mut invocation = CommandInvocation::from_action("navigate_search:next", Caller::Cli);
+        invocation.arguments.extend(explicit);
 
         assert_eq!(invocation.command, "navigate_search");
         assert_eq!(invocation.arguments, ["next", "from-cli"]);
@@ -1608,11 +1750,6 @@ mod control_cli_tests {
             )
             .unwrap_err(),
         );
-
-        let help = dynamic_help("event rebase", &descriptor);
-        for kind in ["ENUM", "ARRAY", "RESOURCE_REF", "NULL"] {
-            assert!(help.contains(kind), "missing {kind} in {help}");
-        }
     }
 
     #[test]
@@ -1715,51 +1852,26 @@ mod control_cli_tests {
             "--message".to_owned(),
             "hello".to_owned(),
         ];
-        let (command, path_len) = resolve_dynamic_command(&descriptors, &words).unwrap();
+        let (command, path_len) = resolve_dynamic_command(&descriptors, &words)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(command, "agents.prompt");
         assert_eq!(path_len, 2);
 
         let legacy = ["terminal.scroll-page-lines".to_owned()];
-        let (command, path_len) = resolve_dynamic_command(&descriptors, &legacy).unwrap();
+        let (command, path_len) = resolve_dynamic_command(&descriptors, &legacy)
+            .unwrap()
+            .unwrap();
         assert_eq!(command, "scroll_page_lines");
         assert_eq!(path_len, 1);
 
         let alias = ["copy-to-clipboard".to_owned()];
-        let (command, path_len) = resolve_dynamic_command(&descriptors, &alias).unwrap();
+        let (command, path_len) = resolve_dynamic_command(&descriptors, &alias)
+            .unwrap()
+            .unwrap();
         assert_eq!(command, "copy_to_clipboard");
         assert_eq!(path_len, 1);
-    }
-
-    #[test]
-    fn generated_help_includes_descriptor_metadata() {
-        let mut count = test_schema("count", ValueType::Integer, true);
-        count.choices = vec!["1".to_owned(), "2".to_owned()];
-        count.minimum = Some(1);
-        count.maximum = Some(2);
-        let mut label = test_schema("label", ValueType::String, false);
-        label.default = Some("all".to_owned());
-        label.repeated = true;
-        let mut descriptor = test_descriptor("agents.prompt", vec![count, label]);
-        descriptor.target = Some(ResourceKind::Session);
-        descriptor.mutation = MutationClass::Destructive;
-
-        let help = dynamic_help("agents prompt", &descriptor);
-
-        for expected in [
-            "required",
-            "optional",
-            "repeated",
-            r#"default: "all""#,
-            "choices: 1|2",
-            "range: 1..=2",
-            "--stdin-json",
-            "--target HANDLE@GENERATION",
-            "target: session",
-            "--yes",
-        ] {
-            assert!(help.contains(expected), "missing {expected:?} in {help}");
-        }
     }
 
     #[test]

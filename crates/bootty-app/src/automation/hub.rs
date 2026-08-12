@@ -545,6 +545,7 @@ struct EventState {
     snapshots: BTreeMap<String, BTreeMap<String, Value>>,
     snapshot_fragments: BTreeMap<String, BTreeMap<String, BTreeMap<String, Value>>>,
     live_binding_scopes: BTreeSet<String>,
+    live_extension_scopes: BTreeSet<String>,
     output_streams: BTreeMap<String, TerminalOutputStream>,
     output_stream_order: VecDeque<String>,
     output_tombstones: BTreeMap<String, u64>,
@@ -565,6 +566,7 @@ impl EventHub {
                 snapshots: BTreeMap::new(),
                 snapshot_fragments: BTreeMap::new(),
                 live_binding_scopes: BTreeSet::new(),
+                live_extension_scopes: BTreeSet::new(),
                 output_streams: BTreeMap::new(),
                 output_stream_order: VecDeque::new(),
                 output_tombstones: BTreeMap::new(),
@@ -704,6 +706,41 @@ impl EventHub {
         }
     }
 
+    /// Returns whether an extension generation is still authorized to expose
+    /// event subscriptions through the control plane.
+    pub fn extension_scope_is_live(&self, scope: &str) -> bool {
+        lock(&self.state).live_extension_scopes.contains(scope)
+    }
+
+    /// Atomically replaces live extension generations and purges all retained
+    /// event/output state for generations that have been retired.
+    pub fn replace_live_extension_scopes(&self, scopes: impl IntoIterator<Item = String>) {
+        let live_extension_scopes = scopes.into_iter().collect::<BTreeSet<_>>();
+        let mut state = lock(&self.state);
+        let retired = state
+            .live_extension_scopes
+            .difference(&live_extension_scopes)
+            .cloned()
+            .collect::<Vec<_>>();
+        state.live_extension_scopes = live_extension_scopes;
+        for scope in retired {
+            purge_retired_scope_locked(&mut state, &scope);
+        }
+    }
+
+    /// Marks one extension generation live or retired without replacing the
+    /// other generation registrations.
+    pub fn set_extension_scope_live(&self, scope: impl Into<String>, live: bool) {
+        let scope = scope.into();
+        let mut state = lock(&self.state);
+        if live {
+            state.live_extension_scopes.insert(scope);
+        } else {
+            state.live_extension_scopes.remove(&scope);
+            purge_retired_scope_locked(&mut state, &scope);
+        }
+    }
+
     pub fn subscribe(
         &self,
         owner: OwnerIdentity,
@@ -722,6 +759,12 @@ impl EventHub {
             return Err(AutomationError::new(
                 -32006,
                 "binding event scope is not live",
+            ));
+        }
+        if is_extension_scope(&scope) && !state.live_extension_scopes.contains(&scope) {
+            return Err(AutomationError::new(
+                -32006,
+                "extension event scope is not live",
             ));
         }
         reap_dead_subscriptions(&mut state);
@@ -1569,6 +1612,10 @@ fn terminal_output_projection(
 
 fn is_binding_scope(scope: &str) -> bool {
     scope.starts_with("binding:")
+}
+
+fn is_extension_scope(scope: &str) -> bool {
+    scope.starts_with("extension:")
 }
 
 fn subscription_sequence(subscription: &str) -> Option<u64> {

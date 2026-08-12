@@ -709,6 +709,53 @@ end
 -- The generic extension forwarder uses the same pure normalization boundary.
 M.forward = M.normalize
 
+function M.start(options)
+    if options ~= nil and type(options) ~= "table" then
+        return { supported = false, diagnostic = diagnostic("malformed_command", "Claude start options must be an object") }
+    end
+    return {
+        supported = true,
+        executable = "claude",
+        arguments = {
+            "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+            "--verbose", "--include-partial-messages", "--include-hook-events",
+            "--forward-subagent-text", "--replay-user-messages",
+        },
+        transport = "stdio_jsonl",
+        framing = "lf_jsonl",
+    }
+end
+
+local function control_request(subtype, options, record)
+    options = options or {}
+    local request_id = options.request_id or options.native_id or (record and record.native_id)
+    if type(request_id) ~= "string" and type(request_id) ~= "number" then
+        return { supported = false, diagnostic = diagnostic("missing_request_id", "Claude control requires an opaque request_id") }
+    end
+    return {
+        type = "control_request",
+        request_id = request_id,
+        request = { subtype = subtype },
+    }
+end
+
+function M.prompt(message, options)
+    if type(message) ~= "string" then
+        return { supported = false, diagnostic = diagnostic("malformed_command", "Claude prompt must be a string") }
+    end
+    return {
+        type = "user",
+        message = { role = "user", content = message },
+        session_id = options and options.adapter_session_id or nil,
+    }
+end
+M.send_text = M.prompt
+M.abort = function(options, record) return control_request("interrupt", options, record) end
+M.pause = function() return { supported = false, diagnostic = diagnostic("unsupported_control", "Claude pause is unavailable") } end
+M.resume = function() return { supported = false, diagnostic = diagnostic("unsupported_control", "Claude resume is unavailable") } end
+M.retry = function() return { supported = false, diagnostic = diagnostic("unsupported_control", "Claude retry is unavailable") } end
+M.send_keys = function() return { supported = false, diagnostic = diagnostic("unsupported_control", "Claude keyboard control is unavailable") } end
+
 M.manifest = {
     id = "claude",
     provider = "claude",

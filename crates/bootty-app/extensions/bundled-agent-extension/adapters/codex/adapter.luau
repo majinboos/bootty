@@ -1508,6 +1508,57 @@ adapter.managed_requests = {
   "serverRequest/resolved",
 }
 
+function adapter.start(options)
+  if options ~= nil and type(options) ~= "table" then
+    return { supported = false, diagnostic = diagnostic("malformed_control", "Codex start options must be an object") }
+  end
+  return {
+    supported = true,
+    executable = "codex",
+    arguments = { "app-server" },
+    transport = "stdio_jsonl",
+    framing = "lf_jsonl",
+  }
+end
+
+local function control_id(options)
+  options = options or {}
+  return options.request_id or options.native_id or options.id
+end
+
+local function control_thread(options)
+  options = options or {}
+  return options.thread_id or options.adapter_session_id or options.native_id
+end
+
+function adapter.prompt(message, options)
+  if not is_string(message) then return diagnostic("malformed_control", "Codex prompt must be a non-empty string") end
+  options = options or {}
+  local id = control_id(options)
+  local thread = control_thread(options)
+  if not is_id(id) or not is_id(thread) then
+    return diagnostic("malformed_control", "Codex prompt requires opaque request and thread IDs")
+  end
+  return adapter.request("turn/start", id, {
+    threadId = thread,
+    input = { { type = "text", text = message } },
+  })
+end
+adapter.send_text = adapter.prompt
+function adapter.abort(options)
+  options = options or {}
+  local id = control_id(options)
+  local thread = control_thread(options)
+  if not is_id(id) or not is_id(thread) then
+    return diagnostic("malformed_control", "Codex abort requires opaque request and thread IDs")
+  end
+  return adapter.request("turn/interrupt", id, { threadId = thread })
+end
+adapter.pause = function() return diagnostic("unsupported_control", "Codex pause is unavailable") end
+adapter.resume = function() return diagnostic("unsupported_control", "Codex resume is unavailable") end
+adapter.retry = function() return diagnostic("unsupported_control", "Codex retry is unavailable") end
+adapter.send_keys = function() return diagnostic("unsupported_control", "Codex keyboard control is unavailable") end
+
 adapter.id = PROVIDER
 adapter.adapter = PROVIDER
 adapter.display_name = "OpenAI Codex CLI"

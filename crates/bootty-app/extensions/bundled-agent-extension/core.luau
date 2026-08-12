@@ -206,6 +206,40 @@ local function decode_json(text)
 	if index <= length then return nil end
 	return result
 end
+local function encode_json(value, seen)
+	local value_type = type(value)
+	if value == nil then return "null" end
+	if value_type == "boolean" then return value and "true" or "false" end
+	if value_type == "number" then
+		if value ~= value or value == math.huge or value == -math.huge then error("non-finite JSON number") end
+		return tostring(value)
+	end
+	if value_type == "string" then
+		return '"' .. value:gsub('[%z\1-\31\\"]', function(character)
+			local escapes = { ['"'] = '\\"', ["\\"] = "\\\\", ["\b"] = "\\b", ["\f"] = "\\f", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+			return escapes[character] or string.format("\\u%04x", string.byte(character))
+		end) .. '"'
+	end
+	if value_type ~= "table" then error("unsupported JSON value") end
+	seen = seen or {}
+	if seen[value] then error("cyclic JSON value") end
+	seen[value] = true
+	local array = is_array(value)
+	local parts = {}
+	if array then
+		for index = 1, #value do parts[#parts + 1] = encode_json(value[index], seen) end
+		seen[value] = nil
+		return "[" .. table.concat(parts, ",") .. "]"
+	end
+	local keys = {}
+	for key in pairs(value) do keys[#keys + 1] = key end
+	table.sort(keys, function(left, right) return tostring(left) < tostring(right) end)
+	for _, key in ipairs(keys) do
+		parts[#parts + 1] = encode_json(tostring(key), seen) .. ":" .. encode_json(value[key], seen)
+	end
+	seen[value] = nil
+	return "{" .. table.concat(parts, ",") .. "}"
+end
 
 local function descriptor_for(id)
 	local canonical = ALIASES[id] or id
@@ -268,26 +302,44 @@ local function safe_call(object, method, ...)
 end
 
 local function load_module(name, paths)
-	local ok, value = pcall(require, name)
-	if ok then return value end
+	local candidates = { name }
+	if type(name) == "string" then
+		candidates[#candidates + 1] = name:gsub("%.", "/")
+	end
+	for _, candidate in ipairs(candidates) do
+		local ok, value = pcall(require, candidate)
+		if ok and value ~= nil then return value end
+	end
 	if type(loadfile) == "function" then
 		for _, path in ipairs(paths or {}) do
 			local chunk = loadfile(path)
 			if chunk ~= nil then
 				local loaded, result = pcall(chunk)
-				if loaded then return result end
+				if loaded and result ~= nil then return result end
 			end
 		end
 	end
 	return nil
 end
 
+local ADAPTER_IDS = { pi = true, claude = true, codex = true, opencode = true }
+
 local function adapter_for(state, provider)
 	if type(provider) ~= "string" or provider == "" then return nil end
-	if state.adapters[provider] ~= nil then return state.adapters[provider] end
-	local adapter = load_module("adapters." .. provider, {
-		"./adapters/" .. provider .. "/adapter.luau",
+	local cached = state.adapters[provider]
+	if cached ~= nil then
+		return cached == false and nil or cached
+	end
+	if not ADAPTER_IDS[provider] then
+		state.adapters[provider] = false
+		return nil
+	end
+	-- The extension runtime's require root is the package directory. Adapter
+	-- modules therefore use package-relative slash paths, not dotted names.
+	local adapter = load_module("adapters/" .. provider .. "/adapter", {
 		"adapters/" .. provider .. "/adapter.luau",
+		"./adapters/" .. provider .. "/adapter.luau",
+		"crates/bootty-app/extensions/bundled-agent-extension/adapters/" .. provider .. "/adapter.luau",
 	})
 	state.adapters[provider] = adapter or false
 	return adapter
@@ -328,12 +380,14 @@ local function storage_read(storage, key)
 end
 
 local function storage_write(storage, key, value)
-	if storage == nil then return false end
-	for _, method in ipairs({ "set", "write", "save" }) do
-		local ok = safe_call(storage, method, key, copy(value))
-		if ok then return true end
+	if storage == nil then
+		return false, result_error("storage_unavailable", "persistent extension storage is unavailable")
 	end
-	return false
+	for _, method in ipairs({ "put", "set", "write", "save" }) do
+		local ok, result = safe_call(storage, method, key, copy(value))
+		if ok and result ~= false then return true, nil end
+	end
+	return false, result_error("storage_failed", "persistent extension storage rejected the update", { key = key })
 end
 
 local function records_array(state)
@@ -347,38 +401,94 @@ end
 
 local function save_state(state)
 	local snapshot = { records = records_array(state), revision = state.revision }
-	storage_write(storage_for(state.host), state.storage_key, snapshot)
+	return storage_write(storage_for(state.host), state.storage_key, snapshot)
 end
 
 local function publish_changed(state, outcome)
-	local payload = { topic = "agents.changed", revision = state.revision, outcome = copy(outcome), records = records_array(state) }
+	local payload = {
+		topic = "agents.changed",
+		revision = state.revision,
+		outcome = copy(outcome),
+		records = records_array(state),
+	}
 	local events = is_table(state.host) and state.host.events or nil
-	if events ~= nil then
-		local ok = safe_call(events, "publish", "agents.changed", payload)
-		if not ok then safe_call(events, "emit", "agents.changed", payload) end
+	if not is_table(events) then
+		return nil, result_error("publication_unavailable", "generic event publication is unavailable", { topic = "agents.changed" })
 	end
-	return payload
+	local specification = { topic = "agents.changed", payload = payload }
+	local ok, result = safe_call(events, "publish", specification)
+	if not ok then
+		ok, result = safe_call(events, "publish", "agents.changed", payload)
+	end
+	if not ok then
+		ok, result = safe_call(state.host, "publish", "agents.changed", payload)
+	end
+	if not ok or result == false then
+		return nil, result_error("publication_failed", "generic event publication rejected the update", { topic = "agents.changed" })
+	end
+	return payload, nil
 end
 
-local function replace_record(state, record)
-	if not is_table(record) or type(record.agent_id) ~= "string" or record.agent_id == "" then return false end
+local function valid_agent_id(value)
+	if type(value) == "string" then return value ~= "" end
+	if type(value) == "number" then return value == value and value ~= math.huge and value ~= -math.huge end
+	return false
+end
+
+local function upsert_record(state, record)
+	if not is_table(record) or not valid_agent_id(record.agent_id) then return false end
 	local id = record.agent_id
 	if state.records[id] == nil then state.order[#state.order + 1] = id end
 	state.records[id] = copy(record)
-	state.revision = state.revision + 1
-	save_state(state)
 	return true
 end
 
+local function commit_records(state, records, removed)
+	local old_records = copy(state.records)
+	local old_order = copy(state.order)
+	local old_revision = state.revision
+	local changed = false
+	for _, agent_id in ipairs(removed or {}) do
+		if valid_agent_id(agent_id) and state.records[agent_id] ~= nil then
+			state.records[agent_id] = nil
+			for index, current in ipairs(state.order) do
+				if current == agent_id then table.remove(state.order, index); break end
+			end
+			changed = true
+		end
+	end
+	for _, record in ipairs(records or {}) do
+		if upsert_record(state, record) then changed = true end
+	end
+	if not changed then return true, nil, false end
+	state.revision = old_revision + 1
+	local saved, save_error = save_state(state)
+	if not saved then
+		state.records, state.order, state.revision = old_records, old_order, old_revision
+		return false, save_error, false
+	end
+	return true, nil, true
+end
+local function replace_record(state, record)
+	return commit_records(state, { record })
+end
+
 local function remove_record(state, agent_id)
-	if type(agent_id) ~= "string" or state.records[agent_id] == nil then return false end
+	if not valid_agent_id(agent_id) or state.records[agent_id] == nil then return true, nil, false end
+	local old_records = copy(state.records)
+	local old_order = copy(state.order)
+	local old_revision = state.revision
 	state.records[agent_id] = nil
 	for index, id in ipairs(state.order) do
 		if id == agent_id then table.remove(state.order, index); break end
 	end
-	state.revision = state.revision + 1
-	save_state(state)
-	return true
+	state.revision = old_revision + 1
+	local saved, save_error = save_state(state)
+	if not saved then
+		state.records, state.order, state.revision = old_records, old_order, old_revision
+		return false, save_error, false
+	end
+	return true, nil, true
 end
 
 local function state_new(host, options)
@@ -393,10 +503,14 @@ local function state_new(host, options)
 		model = options.model,
 		installers = options.installers,
 		storage_key = options.storage_key or "agents.records.v1",
+		handles = {},
+		pending_starts = {},
+		waiters = {},
+		wait_subscription = nil,
 	}
 	local persisted = storage_read(storage_for(state.host), state.storage_key)
 	if is_table(persisted) and is_table(persisted.records) then
-		for _, record in ipairs(persisted.records) do replace_record(state, record) end
+		for _, record in ipairs(persisted.records) do upsert_record(state, record) end
 		state.revision = tonumber(persisted.revision) or state.revision
 	end
 	return state
@@ -411,7 +525,10 @@ local function command_list(state, args)
 	local result = {}
 	for _, id in ipairs(state.order) do
 		local record = state.records[id]
-		if record ~= nil and (args.provider == nil or record.provider == args.provider) and (args.state == nil or (record.lifecycle or record.status) == args.state) then
+		if record ~= nil
+			and (args.provider == nil or record.provider == args.provider)
+			and (args.state == nil or (record.lifecycle or record.status) == args.state)
+		then
 			result[#result + 1] = copy(record)
 		end
 	end
@@ -420,43 +537,418 @@ end
 
 local function require_agent(state, args)
 	local id = args.agent_id
-	if type(id) ~= "string" or id == "" then return nil, result_error("invalid_argument", "agent_id is required", { argument = "agent_id" }) end
+	if not valid_agent_id(id) then
+		return nil, result_error("invalid_argument", "agent_id is required", { argument = "agent_id" })
+	end
 	local record = state.records[id]
-	if record == nil then return nil, result_error("not_found", "agent record was not found", { agent_id = id }) end
+	if record == nil then
+		return nil, result_error("not_found", "agent record was not found", { agent_id = id })
+	end
 	return record, nil
 end
 
 local function adapter_control(state, command, record, args, method)
 	local adapter = adapter_for(state, record.provider)
-	if adapter ~= nil and type(adapter[method]) == "function" then
-		local ok, value, detail = pcall(adapter[method], args, record)
-		if not ok then return result_error("adapter_failed", tostring(value), { provider = record.provider, agent_id = record.agent_id }) end
-		if value ~= nil then return value end
-		return { accepted = true, command_id = command, agent_id = record.agent_id, provider = record.provider }
+	if type(adapter) ~= "table" then
+		return unsupported(command, record, "adapter control is unavailable")
 	end
-	local ipc = is_table(state.host) and (state.host.ipc or state.host.process) or nil
-	if ipc ~= nil then
-		local ok, value = safe_call(ipc, "invoke", record.provider, method, copy(args))
-		if ok then return value end
+	local handle = state.handles[record.agent_id]
+	if handle == nil and record.process_id ~= nil then
+		handle = { process_id = record.process_id, transport = "stdio_jsonl" }
 	end
-	return unsupported(command, record, "adapter control is unavailable")
+	if not is_table(handle) then
+		return unsupported(command, record, "no live managed transport is attached")
+	end
+	local builder = adapter[method]
+	local value, detail
+	local control_args = copy(args)
+	control_args.native_id = control_args.native_id or record.native_id
+	control_args.adapter_session_id = control_args.adapter_session_id or record.adapter_session_id
+	control_args.thread_id = control_args.thread_id or record.adapter_session_id or record.native_id
+	if type(builder) == "function" then
+		local ok
+		if method == "prompt" or method == "send_text" then
+			ok, value, detail = pcall(builder, control_args.prompt or control_args.text, control_args)
+		elseif method == "send_keys" then
+			ok, value, detail = pcall(builder, control_args.keys, control_args)
+		else
+			ok, value, detail = pcall(builder, control_args, record)
+		end
+		if not ok then
+			return result_error("adapter_failed", tostring(value), { provider = record.provider, agent_id = record.agent_id })
+		end
+		if is_table(value) and value.supported == false then
+			return unsupported(command, record, value.diagnostic and value.diagnostic.message or "adapter control is unavailable")
+		end
+		if is_table(value) and value.ok == false then
+			if value.code == "unsupported_control" or value.code == "adapter.unsupported_control" then
+				return unsupported(command, record, value.message)
+			end
+			return result_error(value.code or "adapter_failed", value.message or "adapter rejected control", {
+				provider = record.provider,
+				agent_id = record.agent_id,
+				diagnostic = value.diagnostic,
+			})
+		end
+		if value == nil then
+			return unsupported(command, record, "adapter control did not produce a protocol request")
+		end
+	else
+		return unsupported(command, record, "adapter control is unavailable")
+	end
+	local process = is_table(state.host) and state.host.process or nil
+	if handle.process_id ~= nil and is_table(process) and type(process.write) == "function" then
+		local encoded_ok, encoded = pcall(function()
+			return type(value) == "string" and value or encode_json(value)
+		end)
+		if not encoded_ok then
+			return result_error("adapter_failed", tostring(encoded), { provider = record.provider, agent_id = record.agent_id })
+		end
+		local ok, response = safe_call(process, "write", {
+			process = handle.process_id,
+			data = encoded .. "\n",
+		})
+		if not ok then
+			ok, response = safe_call(process, "write", handle.process_id, encoded .. "\n")
+		end
+		if not ok or response == false then
+			return result_error("transport_failed", "managed process rejected the control request", {
+				agent_id = record.agent_id,
+				process_id = handle.process_id,
+			})
+		end
+		return {
+			accepted = true,
+			pending = true,
+			agent_id = record.agent_id,
+			provider = record.provider,
+			transport = "process",
+			process_id = handle.process_id,
+			request = copy(value),
+		}
+	end
+	local ipc = is_table(state.host) and state.host.ipc or nil
+	if handle.ipc_id ~= nil and is_table(ipc) and type(ipc.publish) == "function" then
+		local ok, response = safe_call(ipc, "publish", {
+			topic = handle.ipc_id,
+			payload = copy(value),
+		})
+		if not ok then
+			ok, response = safe_call(ipc, "publish", handle.ipc_id, copy(value))
+		end
+		if ok and response ~= false then
+			return {
+				accepted = true,
+				pending = true,
+				agent_id = record.agent_id,
+				provider = record.provider,
+				transport = "ipc",
+				ipc_id = handle.ipc_id,
+				request = copy(value),
+			}
+		end
+	end
+	return result_error("transport_unavailable", "managed control has no live process or IPC transport", {
+		agent_id = record.agent_id,
+		provider = record.provider,
+	})
 end
 
+local function invocation_parts(raw_args)
+	if is_table(raw_args) and is_table(raw_args.arguments) and raw_args.command ~= nil then
+		return raw_args.arguments, raw_args
+	end
+	return raw_args, nil
+end
+
+local function adapter_mode(provider, event, args)
+	if type(args.mode) == "string" and args.mode ~= "" then return args.mode end
+	if type(event.mode) == "string" and event.mode ~= "" then return event.mode end
+	if provider == "pi" then
+		if event.source == "rpc" or event.source == "managed" or event.type == "rpc_event" then return "rpc" end
+		return "hook"
+	end
+	if provider == "claude" then
+		if event.hook_event_name ~= nil or event.source == "hook" or event.source == "interactive" then return "hooks" end
+		return "managed"
+	end
+	if provider == "codex" then
+		if event.hook_event_name ~= nil or event.source == "hook" or event.source == "interactive" then return "hooks" end
+		return "app_server"
+	end
+	if provider == "opencode" then
+		return event.source == "managed" and "managed" or "existing"
+	end
+	return nil
+end
+
+local function normalized_events(adapter, raw_event, mode, context)
+	local normalize = adapter.forward or adapter.normalize or adapter.ingest
+	if type(normalize) ~= "function" then
+		return nil, { diagnostic = { code = "unsupported_normalization", message = "adapter does not expose normalization" } }
+	end
+	local ok, result = pcall(normalize, raw_event, mode, context)
+	if not ok then
+		return nil, { diagnostic = { code = "adapter_failed", message = tostring(result) } }
+	end
+	if not is_table(result) then
+		return nil, { diagnostic = { code = "malformed_adapter_result", message = "adapter normalization returned a non-object" } }
+	end
+	local events = {}
+	local diagnostics = {}
+	for _, item in ipairs(result.diagnostics or {}) do diagnostics[#diagnostics + 1] = copy(item) end
+	if result.diagnostic ~= nil and #diagnostics == 0 then diagnostics[1] = copy(result.diagnostic) end
+	if result.event ~= nil and is_table(result.event) then events[#events + 1] = copy(result.event) end
+	for _, event in ipairs(result.events or {}) do
+		if is_table(event) then events[#events + 1] = copy(event) end
+	end
+	if result.accepted == false and #diagnostics == 0 then
+		diagnostics[1] = { code = "adapter_rejected", message = "adapter rejected the event" }
+	end
+	return events, { diagnostics = diagnostics, result = result }
+end
+
+local function terminal_lifecycle(value)
+	return value == "completed" or value == "failed" or value == "aborted" or value == "released"
+end
+
+local function record_lifecycle(record)
+	if not is_table(record) then return nil end
+	local value = record.lifecycle or record.status or record.state
+	if value ~= nil then return value end
+	local facts = record.facts
+	if is_table(facts) then return facts.lifecycle or facts.status or facts.state end
+	return nil
+end
+local function waiter_finish(state, task_id, outcome)
+	local tasks = is_table(state.host) and state.host.tasks or nil
+	if not is_table(tasks) then return false end
+	local ok, result = safe_call(tasks, "finish", {
+		task = task_id,
+		outcome = copy(outcome),
+	})
+	if not ok then
+		ok, result = safe_call(tasks, "finish", task_id, copy(outcome))
+	end
+	if not ok or result == false then return false end
+	for agent_id, waiters in pairs(state.waiters) do
+		waiters[task_id] = nil
+		if next(waiters) == nil then state.waiters[agent_id] = nil end
+	end
+	return true
+end
+
+local function waiter_event(state, payload)
+	if not is_table(payload) then return end
+	local records = payload.records
+	if not is_table(records) then
+		records = {}
+		if is_table(payload.record) then records[1] = payload.record end
+	end
+	for _, record in ipairs(records) do
+		if is_table(record) and valid_agent_id(record.agent_id) then
+			local waiters = state.waiters[record.agent_id]
+			local lifecycle = record_lifecycle(record)
+			if waiters ~= nil and terminal_lifecycle(lifecycle) then
+				for task_id in pairs(waiters) do
+					waiter_finish(state, task_id, {
+						task_id = task_id,
+						agent_id = record.agent_id,
+						status = lifecycle,
+						completed = true,
+						timed_out = false,
+						record = copy(record),
+					})
+				end
+			end
+		end
+	end
+end
+
+local function ensure_wait_subscription(state)
+	if state.wait_subscription ~= nil then return true, nil end
+	local events = is_table(state.host) and state.host.events or nil
+	if not is_table(events) or type(events.subscribe) ~= "function" then
+		return false, result_error("events_unavailable", "agents.wait requires generic event subscription")
+	end
+	local ok, subscription = safe_call(events, "subscribe", "agents.changed", function(payload)
+		waiter_event(state, payload)
+	end)
+	if not ok then
+		return false, result_error("subscription_failed", "agents.wait could not subscribe to agents.changed")
+	end
+	state.wait_subscription = subscription or { topic = "agents.changed" }
+	return true, nil
+end
+
+local function poll_wait_events(state)
+	local events = is_table(state.host) and state.host.events or nil
+	local subscription = state.wait_subscription
+	if not is_table(events) or subscription == nil or type(events.poll) ~= "function" then return end
+	local id = subscription.subscription or subscription.id or subscription
+	local cursor = subscription.cursor or 0
+	local ok, delivery = safe_call(events, "poll", { subscription = id, cursor = cursor })
+	if not ok then
+		ok, delivery = safe_call(events, "poll", id, cursor)
+	end
+	if not ok or not is_table(delivery) then return end
+	subscription.cursor = delivery.cursor or cursor
+	for _, payload in ipairs(delivery.events or delivery.items or {}) do waiter_event(state, payload) end
+end
+
+local function wait_for_agent(state, record, args)
+	local tasks = is_table(state.host) and state.host.tasks or nil
+	if not is_table(tasks) or type(tasks.start) ~= "function" then
+		return result_error("tasks_unavailable", "agents.wait requires generic task support")
+	end
+	local subscribed, subscription_error = ensure_wait_subscription(state)
+	if not subscribed then return subscription_error end
+	local timeout_ms = tonumber(args.timeout_ms) or 0
+	if timeout_ms < 0 then
+		return result_error("invalid_argument", "timeout_ms must not be negative", { argument = "timeout_ms" })
+	end
+	local ok, task = safe_call(tasks, "start", {
+		kind = "agents.wait",
+		agent_id = record.agent_id,
+		timeout_ms = timeout_ms,
+	})
+	if not ok or not is_table(task) or task.id == nil then
+		return result_error("task_start_failed", "agents.wait task could not be created", { agent_id = record.agent_id })
+	end
+	local task_id = task.id
+	state.waiters[record.agent_id] = state.waiters[record.agent_id] or {}
+	state.waiters[record.agent_id][task_id] = true
+	poll_wait_events(state)
+	local lifecycle = record_lifecycle(record)
+	if terminal_lifecycle(lifecycle) then
+		if not waiter_finish(state, task_id, {
+			task_id = task_id,
+			agent_id = record.agent_id,
+			status = lifecycle,
+			completed = true,
+			timed_out = false,
+			record = copy(record),
+		}) then
+			return result_error("task_finish_failed", "agents.wait could not finish its task", { task_id = task_id })
+		end
+		return { task_id = task_id, agent_id = record.agent_id, status = lifecycle, completed = true, timed_out = false, record = copy(record) }
+	end
+	if timeout_ms == 0 then
+		if not waiter_finish(state, task_id, {
+			task_id = task_id,
+			agent_id = record.agent_id,
+			status = "timeout",
+			completed = false,
+			timed_out = true,
+		}) then
+			return result_error("task_finish_failed", "agents.wait could not finish its timeout task", { task_id = task_id })
+		end
+		return { task_id = task_id, agent_id = record.agent_id, status = "timeout", completed = false, timed_out = true }
+	end
+	return { task_id = task_id, agent_id = record.agent_id, status = "waiting", completed = false, timed_out = false, timeout_ms = timeout_ms }
+end
+local function start_managed(state, args, context)
+	local provider = args.provider
+	local adapter = adapter_for(state, provider)
+	if type(adapter) ~= "table" then
+		return result_error("unsupported_adapter", "requested adapter is unavailable", { provider = provider })
+	end
+	local launch
+	if type(adapter.start) == "function" then
+		local ok, value = pcall(adapter.start, args, context)
+		if not ok then return result_error("adapter_failed", tostring(value), { provider = provider }) end
+		launch = value
+	end
+	launch = is_table(launch) and launch or ADAPTER_MANIFESTS[provider]
+	if not is_table(launch) or launch.supported == false then
+		return unsupported("agents.start", nil, "adapter does not expose a managed launch protocol")
+	end
+	local process = is_table(state.host) and state.host.process or nil
+	if not is_table(process) or type(process.spawn) ~= "function" then
+		return result_error("process_unavailable", "managed start requires the generic supervised process API", { provider = provider })
+	end
+	local executable = launch.executable or launch.command
+	local arguments = launch.arguments or launch.args
+	if type(executable) ~= "string" or executable == "" then
+		return result_error("invalid_launch", "adapter launch metadata has no executable", { provider = provider })
+	end
+	if not is_table(arguments) then arguments = {} end
+	local spec = {
+		executable = executable,
+		arguments = copy(args.argv or arguments),
+		cwd = args.cwd,
+		environment = copy(args.environment),
+		protocol = launch.transport or launch.protocol,
+		framing = launch.framing,
+	}
+	local ok, status = safe_call(process, "spawn", spec)
+	if not ok or status == false or status == nil then
+		return result_error("process_spawn_failed", "managed adapter process could not be started", { provider = provider })
+	end
+	local process_id = is_table(status) and (status.id or status.process_id) or status
+	if process_id == nil then
+		return result_error("process_spawn_failed", "managed process did not return an opaque handle", { provider = provider })
+	end
+	local handle = {
+		process_id = process_id,
+		provider = provider,
+		transport = launch.transport or launch.protocol,
+	}
+	if is_table(status) and status.ipc_id ~= nil then handle.ipc_id = status.ipc_id end
+	state.pending_starts[provider] = handle
+	return {
+		accepted = true,
+		managed = true,
+		pending = true,
+		provider = provider,
+		process_id = process_id,
+		transport = handle.transport,
+	}
+end
+local function canonical_fallback(raw_event, provider)
+	if not is_table(raw_event) then return nil end
+	if raw_event.kind == nil and raw_event.native_id == nil and raw_event.record == nil then return nil end
+	local event = copy(raw_event)
+	event.adapter = event.adapter or provider
+	event.source = event.source or provider
+	if event.raw == nil then event.raw = copy(raw_event) end
+	return event
+end
 local function handle_command(state, command_id, raw_args)
 	local id = ALIASES[command_id] or command_id
-	local args = normalize_args(id, raw_args)
+	local raw_arguments, context = invocation_parts(raw_args)
+	local args = normalize_args(id, raw_arguments)
+	if not is_table(args) then args = {} end
+	state.last_context = context
 	if id == "agents.list" then return command_list(state, args) end
-	if id == "agents.manifest.list" then return manifest_list() end
-	if id == "agents.manifest.reload" then return { reloaded = true, manifest_id = args.manifest_id, manifests = manifest_list(args.manifest_id) } end
+	if id == "agents.manifest.list" then return manifest_list(args.provider) end
+	if id == "agents.manifest.reload" then
+		return { reloaded = true, manifest_id = args.manifest_id, manifests = manifest_list(args.manifest_id) }
+	end
 	if id == "agents.integration.list" then return manifest_list(args.provider) end
-	if id == "agents.integration.install" or id == "agents.integration.setup" or id == "agents.integration.uninstall" or id == "agents.integration.doctor" then
+	if id == "agents.integration.install"
+		or id == "agents.integration.setup"
+		or id == "agents.integration.uninstall"
+		or id == "agents.integration.doctor"
+	then
 		local provider = args.provider
-		if type(provider) ~= "string" or provider == "" then return result_error("invalid_argument", "provider is required", { argument = "provider" }) end
-		local installer = state.installers or load_module("install", { "./install.luau", "install.luau" })
-		if installer ~= nil then
-			local method = ({ ["agents.integration.install"] = "integration_install", ["agents.integration.setup"] = "integration_setup", ["agents.integration.uninstall"] = "integration_uninstall", ["agents.integration.doctor"] = "integration_doctor" })[id]
+		if type(provider) ~= "string" or provider == "" then
+			return result_error("invalid_argument", "provider is required", { argument = "provider" })
+		end
+		local installer = state.installers or load_module("install", {
+			"install.luau",
+			"./install.luau",
+			"crates/bootty-app/extensions/bundled-agent-extension/install.luau",
+		})
+		if is_table(installer) then
+			local method = ({
+				["agents.integration.install"] = "integration_install",
+				["agents.integration.setup"] = "integration_setup",
+				["agents.integration.uninstall"] = "integration_uninstall",
+				["agents.integration.doctor"] = "integration_doctor",
+			})[id]
 			if type(installer[method]) == "function" then
-				local ok, value = pcall(installer[method], provider, args)
+				local ok, value = pcall(installer[method], provider, args, context)
 				if ok then return value end
 				return result_error("installer_failed", tostring(value), { provider = provider })
 			end
@@ -465,118 +957,242 @@ local function handle_command(state, command_id, raw_args)
 	end
 	if id == "agents.ingest" then
 		local raw_event = copy(args.event)
-		if not is_table(raw_event) then return result_error("invalid_argument", "event must be an object", { argument = "event" }) end
-		local event = copy(raw_event)
+		if not is_table(raw_event) then
+			return result_error("invalid_argument", "event must be an object", { argument = "event" })
+		end
+		if raw_event.event ~= nil and type(raw_event.event) ~= "table" and type(raw_event.event) ~= "string" then
+			return result_error("invalid_argument", "event kind must be an object or JSON string", { argument = "event.event" })
+		end
 		local requested_adapter = args.adapter
 		if requested_adapter ~= nil and (type(requested_adapter) ~= "string" or requested_adapter == "") then
 			return result_error("invalid_argument", "adapter must be a non-empty string", { argument = "adapter" })
 		end
-		if requested_adapter ~= nil and requested_adapter ~= "pi" and requested_adapter ~= "claude" and requested_adapter ~= "codex" and requested_adapter ~= "opencode" then
-			return result_error("unsupported_adapter", "adapter must be pi, claude, codex, or opencode", { adapter = requested_adapter })
-		end
-		local existing_adapter = event.adapter or event.provider
-		if existing_adapter == nil and (event.source == "pi" or event.source == "claude" or event.source == "codex" or event.source == "opencode") then
-			existing_adapter = event.source
-		end
+		local existing_adapter = raw_event.adapter or raw_event.provider
+		if existing_adapter == nil and ADAPTER_IDS[raw_event.source] then existing_adapter = raw_event.source end
 		if existing_adapter ~= nil and (type(existing_adapter) ~= "string" or existing_adapter == "") then
 			return result_error("invalid_argument", "event adapter must be a non-empty string", { argument = "event.adapter" })
 		end
-		if existing_adapter ~= nil and existing_adapter ~= "pi" and existing_adapter ~= "claude" and existing_adapter ~= "codex" and existing_adapter ~= "opencode" then
-			return result_error("unsupported_adapter", "event adapter must be pi, claude, codex, or opencode", { adapter = existing_adapter })
+		if existing_adapter ~= nil and not ADAPTER_IDS[existing_adapter] then
+			return result_error("unsupported_adapter", "event adapter is not bundled", { adapter = existing_adapter })
 		end
 		if requested_adapter ~= nil and existing_adapter ~= nil and existing_adapter ~= requested_adapter then
-			return result_error("conflicting_argument", "adapter conflicts with the authoritative event source", { adapter = requested_adapter, source = existing_adapter })
+			return result_error("conflicting_argument", "adapter conflicts with the authoritative event source", {
+				adapter = requested_adapter,
+				source = existing_adapter,
+			})
 		end
-		if requested_adapter ~= nil and existing_adapter == nil then event.adapter = requested_adapter end
+		local provider = requested_adapter or existing_adapter
+		if provider == nil then
+			return result_error("unsupported_adapter", "agents.ingest requires a bundled adapter", {
+				adapter = requested_adapter,
+			})
+		end
+		local adapter = adapter_for(state, provider)
+		if type(adapter) ~= "table" then
+			return result_error("unsupported_adapter", "requested adapter is unavailable", { adapter = provider })
+		end
 		local event_name = args.event_name
 		if event_name ~= nil and (type(event_name) ~= "string" or event_name == "") then
 			return result_error("invalid_argument", "event_name must be a non-empty string", { argument = "event_name" })
 		end
-		local existing_name = event.type or event.event or event.event_name or event.hook_event
-		if existing_name ~= nil and (type(existing_name) ~= "string" or existing_name == "") then
-			return result_error("invalid_argument", "event kind must be a non-empty string", { argument = "event_name" })
+		if event_name ~= nil then
+			local existing_name = raw_event.hook_event_name or raw_event.event_name
+			if existing_name ~= nil and existing_name ~= event_name then
+				return result_error("conflicting_argument", "event_name conflicts with the authoritative event kind", {
+					event_name = event_name,
+					event_type = existing_name,
+				})
+			end
+			if provider == "claude" and raw_event.hook_event_name == nil then raw_event.hook_event_name = event_name end
+			raw_event.event_name = raw_event.event_name or event_name
 		end
-		if event_name ~= nil and existing_name ~= nil and existing_name ~= event_name then
-			return result_error("conflicting_argument", "event_name conflicts with the authoritative event kind", { event_name = event_name, event_type = existing_name })
+		raw_event.adapter = raw_event.adapter or provider
+		raw_event.source = raw_event.source or provider
+		if raw_event.raw == nil then raw_event.raw = copy(args.event) end
+		local mode = adapter_mode(provider, raw_event, args)
+		local normalization_context = is_table(context) and context or args.context
+		local normalized, adapter_result = normalized_events(adapter, raw_event, mode, normalization_context)
+		local diagnostics = adapter_result and adapter_result.diagnostics or {}
+		if #diagnostics == 0 and normalized == nil then
+			return result_error("adapter_diagnostic", "adapter normalization failed", {
+				adapter = provider,
+				diagnostics = diagnostics,
+			})
 		end
-		if event_name ~= nil and existing_name == nil then event.event_name = event_name end
-		if event.raw == nil then event.raw = raw_event end
+		if normalized == nil or #normalized == 0 then
+			local fallback = canonical_fallback(raw_event, provider)
+			if fallback ~= nil then
+				normalized = { fallback }
+			else
+				return result_error("adapter_diagnostic", "adapter did not produce an authoritative event", {
+					adapter = provider,
+					diagnostics = diagnostics,
+				})
+			end
+		end
 		local model = state.model
 		if model == nil then
-			local ok, loaded = pcall(function() return load_module("model", { "./model.luau", "model.luau" }) end)
+			local ok, loaded = pcall(function()
+				return load_module("model", { "model.luau", "./model.luau", "crates/bootty-app/extensions/bundled-agent-extension/model.luau" })
+			end)
 			if ok then model = loaded end
 			state.model = model
 		end
-		if model == nil or type(model.apply_event) ~= "function" then return result_error("runtime_unavailable", "normalized model is unavailable") end
-		state.model_store = state.model_store or model.new_store()
-		local outcome = model.apply_event(state.model_store, event)
-		if outcome.record ~= nil then replace_record(state, outcome.record) end
-		for _, record in ipairs(outcome.records or {}) do replace_record(state, record) end
-		if outcome.changed then return { accepted = true, changed = true, status = outcome.status, event = outcome.event, records = records_array(state), revision = state.revision, published = publish_changed(state, outcome) } end
-		return { accepted = true, changed = false, status = outcome.status, event = outcome.event, records = records_array(state), revision = state.revision }
+		if type(model) ~= "table" or type(model.apply_event) ~= "function" then
+			return result_error("runtime_unavailable", "normalized model is unavailable")
+		end
+		state.model_store = state.model_store or model.new_store({ max_events = 512 })
+		local records = {}
+		local removed = {}
+		local seen = {}
+		local outcomes = {}
+		local changed = false
+		for _, normalized_event in ipairs(normalized) do
+			normalized_event.adapter = normalized_event.adapter or provider
+			normalized_event.source = normalized_event.source or provider
+			if event_name ~= nil then normalized_event.event_name = event_name end
+			if is_table(raw_event.record) and normalized_event.record == nil then normalized_event.record = copy(raw_event.record) end
+			local outcome = model.apply_event(state.model_store, normalized_event)
+			outcomes[#outcomes + 1] = outcome
+			if outcome.changed then changed = true end
+			for _, agent_id in ipairs(outcome.removed or {}) do
+				if valid_agent_id(agent_id) then removed[#removed + 1] = agent_id end
+			end
+			local candidates = outcome.records or {}
+			if is_table(outcome.record) and valid_agent_id(outcome.record.agent_id) then
+				candidates[#candidates + 1] = outcome.record
+			end
+			for _, record in ipairs(candidates) do
+				if is_table(record) and valid_agent_id(record.agent_id) and not seen[record.agent_id] then
+					seen[record.agent_id] = true
+					records[#records + 1] = record
+					local pending = state.pending_starts[provider]
+					if pending ~= nil then
+						state.handles[record.agent_id] = pending
+						state.pending_starts[provider] = nil
+					end
+				end
+			end
+		end
+		if changed then
+			local committed, commit_error, did_change = commit_records(state, records, removed)
+			if not committed then return commit_error end
+			if did_change then
+				local published, publication_error = publish_changed(state, {
+					kind = "ingest",
+					adapter = provider,
+					outcomes = outcomes,
+					diagnostics = diagnostics,
+				})
+				if published == nil then return publication_error end
+				waiter_event(state, published)
+				return {
+					accepted = true,
+					changed = true,
+					status = outcomes[#outcomes] and outcomes[#outcomes].status or "accepted",
+					event = outcomes[#outcomes] and outcomes[#outcomes].event,
+					records = records_array(state),
+					revision = state.revision,
+					published = published,
+					diagnostics = diagnostics,
+				}
+			end
+		end
+		return {
+			accepted = true,
+			changed = false,
+			status = outcomes[#outcomes] and outcomes[#outcomes].status or "accepted",
+			event = outcomes[#outcomes] and outcomes[#outcomes].event,
+			records = records_array(state),
+			revision = state.revision,
+			diagnostics = diagnostics,
+		}
 	end
 	if id == "agents.get" or id == "agents.read" or id == "agents.explain" then
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
-		if id == "agents.explain" then return { agent_id = record.agent_id, provider = record.provider, lifecycle = record.lifecycle, authority = copy(record.authority), facts = copy(record.facts or record) } end
-		if id == "agents.read" then
-			return adapter_control(state, id, record, args, "read")
+		if id == "agents.explain" then
+			return {
+				agent_id = record.agent_id,
+				provider = record.provider,
+				lifecycle = record.lifecycle,
+				authority = copy(record.authority),
+				facts = copy(record.facts or record),
+			}
 		end
+		if id == "agents.read" then return adapter_control(state, id, record, args, "read") end
 		return { agent_id = record.agent_id, record = copy(record) }
 	end
 	if id == "agents.report" then
 		local agent_id = args.agent_id
-		if type(agent_id) ~= "string" or agent_id == "" then return result_error("invalid_argument", "agent_id is required", { argument = "agent_id" }) end
-		local record = state.records[agent_id]
-		if record == nil then
-			record = { agent_id = agent_id }
-			if args.facts ~= nil then record.facts = copy(args.facts) end
-			replace_record(state, record)
-		end
-		return { agent_id = agent_id, record = copy(record), reported = true, published = publish_changed(state, { kind = "report", record = record }) }
+		if not valid_agent_id(agent_id) then return result_error("invalid_argument", "agent_id is required", { argument = "agent_id" }) end
+		local record = state.records[agent_id] or { agent_id = agent_id }
+		if args.provider ~= nil then record.provider = args.provider end
+		if args.facts ~= nil then record.facts = copy(args.facts) end
+		local committed, commit_error = commit_records(state, { record })
+		if not committed then return commit_error end
+		local published, publication_error = publish_changed(state, { kind = "report", record = record })
+		if published == nil then return publication_error end
+		waiter_event(state, published)
+		return { agent_id = agent_id, record = copy(record), reported = true, published = published, revision = state.revision }
 	end
 	if id == "agents.report_session" then
 		local provider, native_id = args.provider, args.native_session_id
-		if type(provider) ~= "string" or provider == "" or type(native_id) ~= "string" or native_id == "" then
+		if type(provider) ~= "string" or provider == "" or not valid_agent_id(native_id) then
 			return result_error("invalid_argument", "provider and native_session_id are required")
 		end
 		for _, agent_id in ipairs(state.order) do
 			local record = state.records[agent_id]
-			local authority = record and record.authority
-			local native = record and (record.native_session_id or record.adapter_session_id or (authority and (authority.native_session_id or authority.adapter_session_id)))
-			if record ~= nil and record.provider == provider and native == native_id then return { agent_id = record.agent_id, record = copy(record), reported = true } end
+			if record ~= nil and record.provider == provider
+				and (record.native_id == native_id or record.adapter_session_id == native_id)
+			then
+				return { agent_id = record.agent_id, record = copy(record), reported = true }
+			end
 		end
-		local adapter = adapter_for(state, provider)
-		if adapter ~= nil and type(adapter.report_session) == "function" then
-			local ok, value = pcall(adapter.report_session, { provider = provider, native_session_id = native_id })
-			if ok and value ~= nil then return value end
+		if type(adapter_for(state, provider)) ~= "table" then
+			return result_error("unsupported_adapter", "requested adapter is unavailable", { adapter = provider })
 		end
-		return { accepted = true, pending = true, provider = provider, native_session_id = native_id, diagnostic = { code = "awaiting_authoritative_session", message = "the adapter has not published an agent identity for this opaque session" } }
+		return {
+			accepted = true,
+			pending = true,
+			provider = provider,
+			native_session_id = native_id,
+			diagnostic = {
+				code = "awaiting_authoritative_session",
+				message = "the adapter has not published an agent identity for this opaque session",
+			},
+		}
 	end
 	if id == "agents.start" then
-		if type(args.provider) ~= "string" or args.provider == "" then return result_error("invalid_argument", "provider is required", { argument = "provider" }) end
-		local adapter = adapter_for(state, args.provider)
-		if adapter ~= nil and type(adapter.start) == "function" then
-			local ok, value = pcall(adapter.start, args)
-			if ok and value ~= nil then return value end
+		if type(args.provider) ~= "string" or args.provider == "" then
+			return result_error("invalid_argument", "provider is required", { argument = "provider" })
 		end
-		return { accepted = false, pending = true, provider = args.provider, managed = args.managed == true, diagnostic = { code = "awaiting_authoritative_session", message = "agent identity will be published by the adapter; no identity was inferred" } }
+		if args.managed == false then
+			return result_error("unsupported", "interactive sessions are started by the native integration")
+		end
+		return start_managed(state, args, context)
 	end
 	if id == "agents.focus" then
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
 		local sessions = is_table(state.host) and state.host.sessions or nil
-		if sessions ~= nil then
+		if is_table(sessions) then
 			local ok, value = safe_call(sessions, "focus", record.terminal_id or (record.terminal and record.terminal.terminal_id), copy(record))
-			if ok then return value end
+			if ok and value ~= false then return value end
 		end
-		return adapter_control(state, id, record, args, "focus")
+		return unsupported(id, record, "terminal focus is unavailable")
 	end
 	if id == "agents.rename" then
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
-		record = copy(record); record.name = args.name; replace_record(state, record)
-		return { changed = true, agent_id = record.agent_id, record = copy(record), published = publish_changed(state, { kind = "rename", record = record }) }
+		if type(args.name) ~= "string" or args.name == "" then return result_error("invalid_argument", "name is required", { argument = "name" }) end
+		local updated = copy(record)
+		updated.name = args.name
+		local committed, commit_error = commit_records(state, { updated })
+		if not committed then return commit_error end
+		local published, publication_error = publish_changed(state, { kind = "rename", record = updated })
+		if published == nil then return publication_error end
+		return { changed = true, agent_id = updated.agent_id, record = updated, published = published, revision = state.revision }
 	end
 	if id == "agents.prompt" or id == "agents.send_text" or id == "agents.send_keys" then
 		local record, error_result = require_agent(state, args)
@@ -587,45 +1203,52 @@ local function handle_command(state, command_id, raw_args)
 	if id == "agents.wait" then
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
-		return { agent_id = record.agent_id, status = record.lifecycle or record.status or "unknown", completed = record.lifecycle == "completed" or record.lifecycle == "failed" or record.lifecycle == "aborted", timeout_ms = args.timeout_ms }
+		return wait_for_agent(state, record, args)
 	end
-	local control_states = { ["agents.pause"] = "paused", ["agents.resume"] = "running", ["agents.retry"] = "retrying", ["agents.abort"] = "aborted" }
-	if control_states[id] ~= nil then
+	if id == "agents.pause" or id == "agents.resume" or id == "agents.retry" or id == "agents.abort" then
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
-		local method = id:sub(8)
-		local result = adapter_control(state, id, record, args, method)
-		if not (is_table(result) and result.ok == false) then
-			local updated = copy(record); updated.lifecycle = control_states[id]; replace_record(state, updated)
-			if is_table(result) then result.agent_id = record.agent_id; result.record = copy(updated); result.published = publish_changed(state, { kind = id, record = updated }) end
-		end
-		return result
+		return adapter_control(state, id, record, args, id:sub(8))
 	end
 	if id == "agents.view.set" or id == "agents.view.clear" or id == "agents.clear_authority" then
 		if id == "agents.view.clear" and args.agent_id == nil then
-			local changed = false
+			local updates = {}
 			for _, agent_id in ipairs(state.order) do
 				local record = state.records[agent_id]
 				if record ~= nil and record.view ~= nil then
-					local updated = copy(record); updated.view = nil; replace_record(state, updated); changed = true
+					local updated = copy(record)
+					updated.view = nil
+					updates[#updates + 1] = updated
 				end
 			end
-			return { changed = changed, cleared = true, published = changed and publish_changed(state, { kind = id }) or nil }
+			local committed, commit_error, changed = commit_records(state, updates)
+			if not committed then return commit_error end
+			local published
+			if changed then
+				local publication, publication_error = publish_changed(state, { kind = id })
+				if publication == nil then return publication_error end
+				published = publication
+			end
+			return { changed = changed, cleared = true, published = published }
 		end
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
 		local updated = copy(record)
-		if id == "agents.view.set" then updated.view = copy(args.surface) elseif id == "agents.view.clear" then updated.view = nil else updated.authority = nil end
-		replace_record(state, updated)
-		return { changed = true, agent_id = updated.agent_id, record = copy(updated), published = publish_changed(state, { kind = id, record = updated }) }
+		if id == "agents.view.set" then updated.view = copy(args.surface)
+		elseif id == "agents.view.clear" then updated.view = nil
+		else updated.authority = nil end
+		local committed, commit_error = commit_records(state, { updated })
+		if not committed then return commit_error end
+		local published, publication_error = publish_changed(state, { kind = id, record = updated })
+		if published == nil then return publication_error end
+		return { changed = true, agent_id = updated.agent_id, record = updated, published = published, revision = state.revision }
 	end
 	if id == "agents.release" then
 		local record, error_result = require_agent(state, args)
 		if error_result ~= nil then return error_result end
-		local updated = copy(record)
-		updated.lifecycle = "released"
-		replace_record(state, updated)
-		return { changed = true, released = true, agent_id = updated.agent_id, record = copy(updated), published = publish_changed(state, { kind = id, record = updated }) }
+		-- Release is ownership cleanup; lifecycle remains adapter-authoritative.
+		state.handles[record.agent_id] = nil
+		return { released = true, agent_id = record.agent_id, record = copy(record) }
 	end
 	return result_error("unknown_command", "agent command is not registered", { command = command_id })
 end

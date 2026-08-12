@@ -1746,9 +1746,9 @@ fn contract_adapters() -> Vec<ContractAdapter> {
             normative_command_launch: true,
             recursive_split_launch: true,
             launch_intent: LaunchIntentEvidence::SnapshotCwd,
-            last_pane: false,
-            resize: false,
-            zoom: false,
+            last_pane: true,
+            resize: true,
+            zoom: true,
             full_pane_inventory: true,
             per_command_target_completion: true,
         },
@@ -2907,9 +2907,10 @@ fn run_contract(mut adapter: ContractAdapter) {
 
     let resize_before = snapshot(&adapter, "before resize");
     let geometry_before = adapter
-        .profile
-        .resize
-        .then(|| adapter.pane_geometry(&project_session_id, &split_pane_id));
+        .recording_state
+        .as_ref()
+        .filter(|_| adapter.profile.resize)
+        .map(|_| adapter.pane_geometry(&project_session_id, &split_pane_id));
     let resize = adapter.backend.execute_checked(
         scope,
         MuxCommand::ResizePane {
@@ -2928,6 +2929,12 @@ fn run_contract(mut adapter: ContractAdapter) {
             adapter.pane_geometry(&project_session_id, &split_pane_id),
             (columns.saturating_add(3), rows),
             "resize reaches the selected exact pane"
+        );
+    } else if adapter.profile.resize {
+        assert_supported("resize pane", resize);
+        assert!(
+            adapter.backend.take_authoritative_completion().is_some(),
+            "native resize publishes an authoritative completion"
         );
     } else {
         assert_unsupported("native resize pane", resize);
@@ -2949,10 +2956,17 @@ fn run_contract(mut adapter: ContractAdapter) {
     );
     if adapter.profile.zoom {
         assert_supported("toggle zoom", zoom);
-        assert!(
-            adapter.pane_zoomed(&project_session_id, &split_pane_id),
-            "zoom reaches the selected exact pane"
-        );
+        if adapter.recording_state.is_some() {
+            assert!(
+                adapter.pane_zoomed(&project_session_id, &split_pane_id),
+                "zoom reaches the selected exact pane"
+            );
+        } else {
+            assert!(
+                adapter.backend.take_authoritative_completion().is_some(),
+                "native zoom publishes an authoritative completion"
+            );
+        }
     } else {
         assert_unsupported("native toggle zoom", zoom);
         assert_eq!(snapshot(&adapter, "after unsupported zoom"), zoom_before);

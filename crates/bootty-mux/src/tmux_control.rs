@@ -42,7 +42,7 @@ const READY_TOKEN: &str = "bootty-control-ready";
 /// An all-pane inventory is taken immediately after the control handshake, then refreshed from
 /// bootty's normal chained snapshot replies. Its cwd and current-command fields describe
 /// foreground state; only the pane PID can confirm a lifecycle change.
-const PANE_INVENTORY_QUERY: &str = "list-panes -a -F 'p\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}'";
+const PANE_INVENTORY_QUERY: &str = "list-panes -a -F 'p\x1f#{session_id}\x1f#{window_id}\x1f#{pane_id}\x1f#{pane_tty}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}\x1f#{pane_title}'";
 
 /// Runs read-only tmux queries through a shared control-mode client, and everything else as its own
 /// process. Falls back to a process whenever the client is unavailable, so tmux versions without
@@ -117,12 +117,12 @@ impl CommandRunner for TmuxControlRunner {
                 MuxEventTopic::PaneCwdChanged
                 | MuxEventTopic::PaneForegroundChanged
                 | MuxEventTopic::PaneOccupantReplaced
-                | MuxEventTopic::PaneClosed => MuxEventCapability::best_effort(
+                | MuxEventTopic::PaneClosed
+                | MuxEventTopic::PaneTitleChanged => MuxEventCapability::best_effort(
                     topic,
                     "tmux exposes this through authoritative all-pane inventory snapshots, not a dedicated control notification",
                 ),
                 MuxEventTopic::PaneStateChanged
-                | MuxEventTopic::PaneTitleChanged
                 | MuxEventTopic::PaneOptionsChanged
                 | MuxEventTopic::BackendDisconnected => MuxEventCapability::unsupported(
                     topic,
@@ -378,15 +378,16 @@ struct TmuxEventMapper {
     pane_targets: HashMap<usize, MuxEventTarget>,
     pane_placements: HashMap<usize, Vec<MuxEventTarget>>,
     pane_cwds: HashMap<usize, Option<String>>,
+    pane_titles: HashMap<usize, Option<String>>,
     pane_foregrounds: HashMap<usize, Option<MuxForegroundState>>,
     unknown_output_targets: HashSet<usize>,
     control_degraded: bool,
 }
-
 #[derive(Clone, Copy)]
 struct TmuxPaneObservation<'a> {
     target: &'a MuxEventTarget,
     cwd: Option<&'a str>,
+    title: Option<&'a str>,
     foreground: Option<&'a MuxForegroundState>,
 }
 
@@ -484,11 +485,11 @@ impl TmuxEventMapper {
             TmuxControlNotification::BlockEnd(_) | TmuxControlNotification::BlockError(_) => {}
         }
     }
-
     fn record_snapshot(&mut self, snapshot: &str, events: &MuxEventQueue) {
         let mut refreshed: HashMap<usize, MuxEventTarget> = HashMap::new();
         let mut refreshed_placements: HashMap<usize, Vec<MuxEventTarget>> = HashMap::new();
         let mut refreshed_cwds = HashMap::new();
+        let mut refreshed_titles = HashMap::new();
         let mut refreshed_foregrounds = HashMap::new();
         let mut malformed_pane_row = false;
         for line in snapshot.lines() {
@@ -496,7 +497,21 @@ impl TmuxEventMapper {
                 continue;
             };
             let fields = line.split('\x1f').collect::<Vec<_>>();
+            let title = match fields.as_slice() {
+                [_, _, _, _, _, _, _, title] => Some(*title),
+                fields if fields.len() >= 14 => Some(fields[13]),
+                _ => None,
+            };
             let parsed = match fields.as_slice() {
+                [session, window, pane, terminal, pid, cwd, process, _title] => pane_target(
+                    session,
+                    window,
+                    pane,
+                    (Some(terminal), Some(pid)),
+                    cwd,
+                    process,
+                    &self.pane_lifecycle_epochs,
+                ),
                 [session, window, pane, terminal, pid, cwd, process] => pane_target(
                     session,
                     window,
@@ -566,6 +581,7 @@ impl TmuxEventMapper {
             if replace {
                 refreshed.insert(pane_id, target);
                 refreshed_cwds.insert(pane_id, cwd);
+                refreshed_titles.insert(pane_id, title.map(str::to_owned));
             }
         }
         if malformed_pane_row {
@@ -625,6 +641,7 @@ impl TmuxEventMapper {
                     .is_none_or(|previous| previous.len() != current.len())
             });
         let previous_cwds = std::mem::take(&mut self.pane_cwds);
+        let previous_titles = std::mem::take(&mut self.pane_titles);
         let previous_foregrounds = std::mem::take(&mut self.pane_foregrounds);
         for (pane_id, previous_targets) in &previous_placements {
             let Some(current_targets) = refreshed_placements.get(pane_id) else {
@@ -666,6 +683,9 @@ impl TmuxEventMapper {
                     previous_target.map(|target| TmuxPaneObservation {
                         target,
                         cwd: previous_cwds.get(pane_id).and_then(|cwd| cwd.as_deref()),
+                        title: previous_titles
+                            .get(pane_id)
+                            .and_then(|title| title.as_deref()),
                         foreground: previous_foregrounds
                             .get(pane_id)
                             .and_then(|foreground| foreground.as_ref()),
@@ -673,6 +693,9 @@ impl TmuxEventMapper {
                     TmuxPaneObservation {
                         target,
                         cwd: refreshed_cwds.get(pane_id).and_then(|cwd| cwd.as_deref()),
+                        title: refreshed_titles
+                            .get(pane_id)
+                            .and_then(|title| title.as_deref()),
                         foreground: refreshed_foregrounds
                             .get(pane_id)
                             .and_then(|foreground| foreground.as_ref()),
@@ -703,6 +726,7 @@ impl TmuxEventMapper {
         self.pane_targets = refreshed;
         self.pane_placements = refreshed_placements;
         self.pane_cwds = refreshed_cwds;
+        self.pane_titles = refreshed_titles;
         self.pane_foregrounds = refreshed_foregrounds;
         if topology_changed {
             self.topology(events, None);
@@ -718,10 +742,11 @@ impl TmuxEventMapper {
         let TmuxPaneObservation {
             target,
             cwd: new_cwd,
+            title: new_title,
             foreground: new_foreground,
         } = current;
-        let (old_cwd, old_foreground) = previous
-            .map(|previous| (previous.cwd, previous.foreground))
+        let (old_cwd, old_title, old_foreground) = previous
+            .map(|previous| (previous.cwd, previous.title, previous.foreground))
             .unwrap_or_default();
         if previous.is_some_and(|previous| !same_tmux_occupant(previous.target, target)) {
             events.publish(MuxEventDraft::new(
@@ -742,6 +767,18 @@ impl TmuxEventMapper {
                 || previous.target.terminal_id != target.terminal_id
         }) {
             self.topology(events, Some(target.clone()));
+        }
+        if previous.is_none() || old_title != new_title {
+            events.publish(MuxEventDraft::new(
+                MuxEventTopic::PaneTitleChanged,
+                MuxEventProvenance::TmuxSnapshotFallback,
+                Some(target.clone()),
+                None,
+                MuxEventPayload::Title {
+                    old_title: old_title.map(str::to_owned),
+                    new_title: new_title.map(str::to_owned),
+                },
+            ));
         }
         if previous.is_none() || old_cwd != new_cwd {
             events.publish(MuxEventDraft::new(
@@ -1144,6 +1181,19 @@ mod tests {
     ) -> String {
         format!(
             "p\x1f$1\x1f@{window_id}\x1f%{pane_id}\x1f/dev/ttys{pane_id}\x1f{pid}\x1f{cwd}\x1f{command}\n"
+        )
+    }
+
+    fn pane_inventory_with_title(
+        pane_id: usize,
+        window_id: usize,
+        pid: u32,
+        cwd: &str,
+        command: &str,
+        title: &str,
+    ) -> String {
+        format!(
+            "p\x1f$1\x1f@{window_id}\x1f%{pane_id}\x1f/dev/ttys{pane_id}\x1f{pid}\x1f{cwd}\x1f{command}\x1f{title}\n"
         )
     }
 
@@ -1706,6 +1756,25 @@ mod tests {
         let second_cursor = output_cursor(&mut mapper, &queue, scope, "after");
         assert_eq!(second_cursor.stream, first_cursor.stream);
         assert_eq!(second_cursor.sequence, first_cursor.sequence + 1);
+    }
+
+    #[test]
+    fn inventory_title_change_emits_authoritative_title_delta() {
+        let initial_inventory = pane_inventory_with_title(3, 2, 42, "/repo", "zsh", "shell");
+        let changed_inventory = pane_inventory_with_title(3, 2, 42, "/repo", "zsh", "editor");
+        let (mut mapper, queue, scope) = initialized_mapper(&initial_inventory);
+
+        mapper.record_snapshot(&changed_inventory, &queue);
+        let events = queue.drain(scope, 16);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].topic, MuxEventTopic::PaneTitleChanged);
+        assert_eq!(
+            events[0].payload,
+            MuxEventPayload::Title {
+                old_title: Some("shell".to_owned()),
+                new_title: Some("editor".to_owned()),
+            }
+        );
     }
 
     #[test]

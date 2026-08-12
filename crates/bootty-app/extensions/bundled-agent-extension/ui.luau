@@ -79,10 +79,6 @@ ui.command_ids = {
 	"agents.wait",
 }
 
-local COMMAND_SET = {}
-for _, id in ipairs(ui.command_ids) do
-	COMMAND_SET[id] = true
-end
 
 -- Commands that can be rendered as row actions. Catalog/handler commands that have no agent row
 -- target remain available through `invoke` and the workflow helpers below.

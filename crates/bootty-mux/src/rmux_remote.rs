@@ -31,9 +31,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::{
     backend::MuxBackendOperationError,
     command::MuxCommand,
-    operation::{
-        MuxBackendCommandCompletion, MuxEventTarget, RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
-    },
+    operation::{MuxBackendCommandCompletion, MuxEventTarget},
     rmux_bridge::{
         RmuxPaneEvent, RmuxPaneTarget, open_rmux_pane_io, resize_rmux_pane,
         resolve_rmux_pane_target, rmux_execute, rmux_launch_session, rmux_snapshot,
@@ -531,10 +529,13 @@ impl MuxBackend for RemoteRmuxBackend {
                         )
                         .into());
                     }
-                    return Err(MuxBackendOperationError::unsupported(
-                        RMUX_CHECKED_MUTATION_UNSUPPORTED_REASON,
-                    )
-                    .into());
+                    let snapshot = self.snapshot()?;
+                    if !precondition.matches_snapshot(&snapshot) {
+                        return Err(MuxBackendOperationError::stale(
+                            "remote rmux command target changed before mutation",
+                        )
+                        .into());
+                    }
                 }
                 self.execute(command)
             },

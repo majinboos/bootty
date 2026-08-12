@@ -176,6 +176,16 @@ local function nonempty_table(value)
     return is_table(value) and next(value) ~= nil
 end
 
+local function valid_identity(value)
+    if type(value) == "string" then
+        return value ~= ""
+    end
+    if type(value) == "number" then
+        return value == value and value ~= math.huge and value ~= -math.huge
+    end
+    return false
+end
+
 local function normalize_record(raw)
     if raw == nil then
         return {}
@@ -186,12 +196,39 @@ local function normalize_record(raw)
 
     local result = prune_absent(raw)
     local agent_id, has_agent_id = first_present(raw, { "agent_id", "id" })
+    local native_id, has_native_id = first_present(raw, { "native_id", "nativeId" })
+    local native_session_id, has_native_session_id =
+        first_present(raw, { "adapter_session_id", "native_session_id", "session_id" })
+    if (not has_agent_id or not valid_identity(agent_id))
+        and has_native_id
+    then
+        agent_id = native_id
+        has_agent_id = true
+    elseif (not has_agent_id or not valid_identity(agent_id))
+        and has_native_session_id
+        and valid_identity(native_session_id)
+    then
+        agent_id = native_session_id
+        has_agent_id = true
+    end
     if has_agent_id and not value_is_present(result, "agent_id") then
         result.agent_id = copy_value(agent_id)
+    end
+    if has_native_id and valid_identity(native_id) and not value_is_present(result, "native_id") then
+        result.native_id = copy_value(native_id)
     end
     local provider, has_provider = first_present(raw, { "provider", "adapter" })
     if has_provider and not value_is_present(result, "provider") then
         result.provider = copy_value(provider)
+    end
+    local kind, has_kind = first_present(raw, { "kind", "event_kind" })
+    if has_kind and not value_is_present(result, "kind") then
+        result.kind = copy_value(kind)
+    end
+    local adapter_session_id, has_adapter_session_id =
+        first_present(raw, { "adapter_session_id", "native_session_id", "session_id" })
+    if has_adapter_session_id and not value_is_present(result, "adapter_session_id") then
+        result.adapter_session_id = copy_value(adapter_session_id)
     end
     local name, has_name = first_present(raw, { "name", "display_name" })
     if has_name and not value_is_present(result, "name") then
@@ -241,14 +278,21 @@ local function record_key(record, fallback)
         end
         return "index:" .. tostring(fallback or 0)
     end
+    local provider, has_provider = first_present(record, { "provider", "adapter" })
+    local native_id, has_native = first_present(record, { "native_id", "nativeId" })
+    if has_native and valid_identity(native_id) then
+        -- The provider is part of the internal key; the native value itself is
+        -- never rewritten or parsed.
+        return "native:" .. stable_value(provider) .. ":" .. stable_value(native_id)
+    end
     local id, has_id = first_present(record, { "agent_id", "id" })
     if has_id then
         return "agent:" .. stable_value(id)
     end
-    local provider, has_provider = first_present(record, { "provider", "adapter" })
-    local native_id, has_native = first_present(record, { "native_session_id", "adapter_session_id", "session_id" })
-    if has_provider and has_native then
-        return "session:" .. stable_value(provider) .. ":" .. stable_value(native_id)
+    local native_session_id, has_native_session =
+        first_present(record, { "native_session_id", "adapter_session_id", "session_id" })
+    if has_provider and has_native_session then
+        return "session:" .. stable_value(provider) .. ":" .. stable_value(native_session_id)
     end
     return "record:" .. stable_value(record) .. ":" .. tostring(fallback or 0)
 end
@@ -514,37 +558,68 @@ local function source_cursor(store, source)
 end
 
 local function event_record(event)
+    local explicit
     if is_table(event.record) then
-        return normalize_record(event.record)
+        explicit = event.record
+    elseif is_table(event.update) then
+        explicit = event.update
+    elseif is_table(event.agent) then
+        explicit = event.agent
     end
-    if is_table(event.update) then
-        return normalize_record(event.update)
-    end
-    if is_table(event.agent) then
-        return normalize_record(event.agent)
+    if explicit ~= nil then
+        local record = normalize_record(explicit)
+        -- Adapter metadata is authoritative and must not be dropped merely
+        -- because the adapter placed it on the envelope rather than record.
+        for _, field in ipairs({
+            "provider", "adapter", "native_id", "kind", "adapter_session_id",
+            "terminal_id", "process_id", "sequence",
+        }) do
+            if record[field] == nil and event[field] ~= nil then
+                record[field] = copy_value(event[field])
+            end
+        end
+        return normalize_record(record)
     end
     local record = {}
     local copy_fields = {
-        "agent_id", "id", "provider", "adapter", "name", "display_name", "status", "state",
-        "lifecycle", "facts", "authority", "view", "terminal_id", "process_id", "native_session_id",
-        "adapter_session_id", "session_id", "pane_id", "worktree_id", "managed", "stale"
+        "agent_id", "id", "provider", "adapter", "native_id", "nativeId", "kind",
+        "name", "display_name", "status", "state", "lifecycle", "facts", "authority",
+        "view", "terminal_id", "process_id", "native_session_id", "adapter_session_id",
+        "session_id", "pane_id", "worktree_id", "managed", "stale", "sequence",
     }
-    for _, key in ipairs(copy_fields) do
-        if event[key] ~= nil then
-            record[key] = copy_value(event[key])
+    for _, field in ipairs(copy_fields) do
+        if event[field] ~= nil then
+            record[field] = copy_value(event[field])
         end
+    end
+    if record.provider == nil then
+        record.provider = copy_value(event.source)
     end
     return normalize_record(record)
 end
 
 local function event_agent_id(event, record)
     local agent_id, has_agent_id = first_present(event, { "agent_id" })
-    if has_agent_id then
+    if has_agent_id and valid_identity(agent_id) then
         return agent_id
     end
     local record_id, has_record_id = first_present(record, { "agent_id", "id" })
-    if has_record_id then
+    if has_record_id and valid_identity(record_id) then
         return record_id
+    end
+    local native_id, has_native_id = first_present(event, { "native_id", "nativeId" })
+    if has_native_id and valid_identity(native_id) then
+        return native_id
+    end
+    local event_session, has_event_session =
+        first_present(event, { "adapter_session_id", "native_session_id", "session_id" })
+    if has_event_session and valid_identity(event_session) then
+        return event_session
+    end
+    local record_session, has_record_session =
+        first_present(record, { "adapter_session_id", "native_session_id", "session_id" })
+    if has_record_session and valid_identity(record_session) then
+        return record_session
     end
     return nil
 end
@@ -554,39 +629,93 @@ local function record_map(store)
     return store.records
 end
 
-local function apply_snapshot(store, snapshot)
-    local records = record_map(store)
-    local applied = {}
+local function snapshot_values(snapshot)
     if not is_table(snapshot) then
-        return applied
+        return {}
     end
-    local array, count = is_array(snapshot)
-    if array then
-        for index = 1, count do
-            local record = normalize_record(snapshot[index])
-            local key = record_key(record, index)
-            local old = records[key]
-            records[key] = merge_partial(old, record)
-            applied[#applied + 1] = copy_value(records[key])
-        end
-    else
-        for key, value in pairs(snapshot) do
-            local record = normalize_record(value)
-            local record_key_value = record_key(record, key)
-            local old = records[record_key_value]
-            records[record_key_value] = merge_partial(old, record)
-            applied[#applied + 1] = copy_value(records[record_key_value])
-        end
+    if is_table(snapshot.records) then
+        return snapshot.records
     end
-    return applied
+    if is_table(snapshot.agents) then
+        return snapshot.agents
+    end
+    return snapshot
 end
 
--- Apply one authoritative event to a mutable store.  The returned table always
+local function apply_snapshot(store, snapshot, source)
+    local records = record_map(store)
+    local values = snapshot_values(snapshot)
+    local incoming = {}
+    local applied = {}
+    local array, count = is_array(values)
+    local function add_record(value, fallback)
+        local record = normalize_record(value)
+        if record.provider == nil and source ~= nil then
+            record.provider = copy_value(source)
+        end
+        if not valid_identity(record.agent_id) then
+            return
+        end
+        local key = record_key(record, fallback)
+        incoming[key] = record
+    end
+    if array then
+        for index = 1, count do
+            add_record(values[index], index)
+        end
+    else
+        for key, value in pairs(values) do
+            add_record(value, key)
+        end
+    end
+    local removed = {}
+    for key, old in pairs(records) do
+        local belongs = source == nil or old.provider == source or old.adapter == source
+        if belongs and incoming[key] == nil then
+            records[key] = nil
+            if valid_identity(old.agent_id) then
+                removed[#removed + 1] = copy_value(old.agent_id)
+            end
+        end
+    end
+    for key, record in pairs(incoming) do
+        records[key] = copy_value(record)
+        applied[#applied + 1] = copy_value(record)
+    end
+    return {
+        records = applied,
+        removed = removed,
+        changed = #applied > 0 or #removed > 0,
+    }
+end
+
+local function remember_event(store, key, status, event)
+    store.events = store.events or {}
+    store.event_order = store.event_order or {}
+    if store.events[key] == nil then
+        store.event_order[#store.event_order + 1] = key
+    end
+    -- Keep status/cursor identity only. Full native payloads are returned from
+    -- this call but are not retained indefinitely by the model.
+    store.events[key] = { status = status }
+    local limit = tonumber(store.max_events) or 512
+    if limit < 16 then limit = 16 end
+    if limit > 4096 then limit = 4096 end
+    while #store.event_order > limit do
+        local oldest = table.remove(store.event_order, 1)
+        if oldest ~= nil then
+            store.events[oldest] = nil
+        end
+    end
+end
+
+-- Apply one authoritative event to a mutable store. The returned table always
 -- identifies whether it changed state; callers can therefore avoid publishing
 -- duplicate or stale events.
 local function apply_event(store, raw_event)
     store = store or {}
     store.events = store.events or {}
+    store.event_order = store.event_order or {}
     store.records = store.records or {}
     local event = normalize_event(raw_event)
     local key = event_key(event)
@@ -594,7 +723,7 @@ local function apply_event(store, raw_event)
         return { status = "duplicate", changed = false, key = key, event = event }
     end
 
-    local source = event.source
+    local source = event.source or event.adapter
     local cursor = source_cursor(store, source)
     local generation = event.generation
     local sequence = event.sequence
@@ -613,35 +742,65 @@ local function apply_event(store, raw_event)
         stale = true
     end
     if stale then
-        store.events[key] = { status = "stale", event = copy_value(event) }
+        remember_event(store, key, "stale", event)
         return { status = "stale", changed = false, key = key, event = event }
     end
 
-    store.events[key] = { status = "accepted", event = copy_value(event) }
+    remember_event(store, key, "accepted", event)
     if sequence_number ~= nil then
         cursor.sequence = sequence_number
     end
 
-    local rebased = event.rebase == true or event.reconnect == true or event.kind == "rebase" or event.type == "rebase"
+    local rebased = event.rebase == true
+        or event.reconnect == true
+        or event.kind == "rebase"
+        or event.type == "rebase"
     local applied_records = {}
+    local removed = {}
+    local changed = false
+    local seen_records = {}
     if rebased and event.snapshot ~= nil then
-        applied_records = apply_snapshot(store, event.snapshot)
+        local snapshot_result = apply_snapshot(store, event.snapshot, source)
+        applied_records = snapshot_result.records
+        removed = snapshot_result.removed
+        changed = snapshot_result.changed
+        for _, item in ipairs(applied_records) do
+            seen_records[record_key(item)] = true
+        end
     end
 
+    local operation = event.operation or event.op
     local record = event_record(event)
     local agent_id = event_agent_id(event, record)
-    local changed = rebased and #applied_records > 0
-    local stored_record
-    if agent_id ~= nil then
+    if operation == "remove" or operation == "delete" or operation == "removed" then
+        if valid_identity(agent_id) then
+            for record_key_value, existing in pairs(store.records) do
+                if existing.agent_id == agent_id or existing.native_id == agent_id then
+                    store.records[record_key_value] = nil
+                    removed[#removed + 1] = copy_value(agent_id)
+                    changed = true
+                end
+            end
+        end
+    elseif valid_identity(agent_id) then
         if record.agent_id == nil then
             record.agent_id = copy_value(agent_id)
         end
+        if record.provider == nil then
+            record.provider = copy_value(source)
+        end
         local key_for_record = record_key(record)
         local old = store.records[key_for_record]
-        stored_record, changed = merge_partial(old, record)
-        store.records[key_for_record] = stored_record
-        changed = changed or old == nil
-        applied_records[#applied_records + 1] = copy_value(stored_record)
+        local merged, record_changed = merge_partial(old, record)
+        store.records[key_for_record] = merged
+        if record_changed or old == nil then
+            changed = true
+        end
+        record = merged
+        if not seen_records[key_for_record] then
+            applied_records[#applied_records + 1] = copy_value(record)
+            seen_records[key_for_record] = true
+        end
     end
 
     return {
@@ -649,19 +808,26 @@ local function apply_event(store, raw_event)
         changed = changed,
         key = key,
         event = event,
-        record = stored_record,
+        record = record,
         records = applied_records,
-        cursor = copy_value(cursor)
+        removed = removed,
+        cursor = copy_value(cursor),
     }
 end
 
 M.apply_event = apply_event
 M.accept_event = apply_event
 
-local function new_store()
+local function new_store(options)
+    options = options or {}
+    local max_events = tonumber(options.max_events or options.event_limit) or 512
+    if max_events < 16 then max_events = 16 end
+    if max_events > 4096 then max_events = 4096 end
     return {
         records = {},
         events = {},
+        event_order = {},
+        max_events = max_events,
         sources = {},
         rebases = {},
     }
@@ -681,7 +847,14 @@ local function rebase(store, events, options)
     end
     for _, event in ipairs(list) do
         local normalized = normalize_event(event)
-        if generation == nil or type(normalized.generation) ~= "number" or type(generation) ~= "number" or normalized.generation >= generation then
+        if options.reconnect == true or options.replace == true then
+            normalized.rebase = normalized.rebase == true or normalized.snapshot ~= nil
+        end
+        if generation == nil
+            or type(normalized.generation) ~= "number"
+            or type(generation) ~= "number"
+            or normalized.generation >= generation
+        then
             local outcome = apply_event(store, normalized)
             accepted[#accepted + 1] = outcome
         end

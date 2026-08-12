@@ -955,4 +955,31 @@ function Adapter.diagnostic(code, message, details, raw)
     return diagnostic(code, message, details, raw)
 end
 
+function Adapter.start(options)
+    if options ~= nil and type(options) ~= "table" then
+        return { supported = false, diagnostic = diagnostic("adapter.malformed_control", "OpenCode start options must be an object") }
+    end
+    return {
+        supported = true,
+        executable = "opencode",
+        arguments = { "serve" },
+        transport = "local_process_ipc",
+        framing = "sse",
+    }
+end
+
+local function unsupported_control(name)
+    return {
+        supported = false,
+        diagnostic = diagnostic("adapter.unsupported_control", "OpenCode control is unavailable for " .. name),
+    }
+end
+Adapter.prompt = function() return unsupported_control("prompt") end
+Adapter.send_text = function() return unsupported_control("send_text") end
+Adapter.send_keys = function() return unsupported_control("send_keys") end
+Adapter.pause = function() return unsupported_control("pause") end
+Adapter.resume = function() return unsupported_control("resume") end
+Adapter.retry = function() return unsupported_control("retry") end
+Adapter.abort = function() return unsupported_control("abort") end
+
 return Adapter

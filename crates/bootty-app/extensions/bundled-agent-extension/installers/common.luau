@@ -233,16 +233,65 @@ function M.resolve_path(path, context)
         return path
     end
     local home = context and (context.home or context.home_dir)
+    local config_dir = context and (context.config_dir or context.config)
     if M.starts_with(path, "~/") and type(home) == "string" then
         return M.path_join(home, path:sub(3))
     end
     if M.starts_with(path, "$HOME/") and type(home) == "string" then
         return M.path_join(home, path:sub(7))
     end
-    if M.starts_with(path, "$CONFIG/") and type(config) == "string" then
-        return M.path_join(config, path:sub(9))
+    if M.starts_with(path, "$CONFIG/") and type(config_dir) == "string" then
+        return M.path_join(config_dir, path:sub(9))
     end
     return path
+end
+
+-- A compact deterministic identity for hosts that do not expose inode/etag
+-- metadata. The content itself remains the authoritative compare-and-swap value.
+function M.content_identity(content, exists)
+    local text = exists == false and "<missing>" or tostring(content or "")
+    local hash = 2166136261
+    for index = 1, #text do
+        hash = (hash * 16777619 + string.byte(text, index)) % 4294967296
+    end
+    return string.format("content:%08x:%d", hash, #text)
+end
+
+function M.identity(content, exists, metadata)
+    if type(metadata) == "table" then
+        local identity = metadata.identity or metadata.id or metadata.etag or metadata.inode
+        if identity ~= nil then return tostring(identity), "host" end
+    end
+    return M.content_identity(content, exists), "content"
+end
+
+function M.version(metadata)
+    if type(metadata) ~= "table" then return nil end
+    local value = metadata.version or metadata.revision or metadata.generation or metadata.mtime
+    if value == nil then return nil end
+    return tostring(value)
+end
+
+function M.same_content(left, right)
+    if left == nil or right == nil then return left == right end
+    return left == right
+end
+
+function M.change_fingerprint(changes)
+    local rows = {}
+    for index = 1, #(changes or {}) do
+        local change = changes[index]
+        rows[#rows + 1] = {
+            path = change.path,
+            operation = change.operation,
+            before = change.before,
+            after = change.after,
+            before_identity = change.before_identity,
+            before_identity_source = change.before_identity_source,
+            before_version = change.before_version,
+        }
+    end
+    return M.content_identity(M.json_encode(rows), true)
 end
 
 function M.quote(value)
@@ -290,15 +339,44 @@ function M.make_change(path, operation, before, after, metadata)
         operation = operation,
         before = before,
         after = after,
-        changed = before ~= after,
+        changed = not M.same_content(before, after),
         diff = line_diff(before, after),
+        bounded = true,
+        before_bytes = type(before) == "string" and #before or 0,
+        after_bytes = type(after) == "string" and #after or 0,
     }
     if type(metadata) == "table" then
         for key, value in pairs(metadata) do
             change[key] = value
         end
     end
+    local before_exists = change.existed
+    if before_exists == nil then before_exists = before ~= nil end
+    if change.before_identity == nil then
+        local identity, source = M.identity(before, before_exists, change)
+        change.before_identity, change.before_identity_source = identity, source
+    end
+    if change.before_version == nil then
+        change.before_version = M.version(change)
+    end
+    if change.after_identity == nil then
+        change.after_identity = M.content_identity(after, after ~= nil)
+        change.after_identity_source = "content"
+    end
     return change
+end
+function M.owned_path(manifest, path, context, configured_path)
+    if type(path) ~= "string" then return false end
+    local expected = {}
+    local function add(candidate)
+        if type(candidate) == "string" then expected[M.resolve_path(candidate, context)] = true end
+    end
+    add(configured_path)
+    add(manifest.settings_path)
+    add(manifest.marker_path)
+    for _, candidate in ipairs(manifest.config_paths or {}) do add(candidate) end
+    for _, candidate in ipairs(manifest.owned_paths or {}) do add(candidate) end
+    return expected[M.resolve_path(path, context)] == true
 end
 
 function M.sort_changes(changes, order)

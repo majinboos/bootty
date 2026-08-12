@@ -10,6 +10,15 @@ return function()
 		commands = {},
 		events = {},
 	}
+	host.storage = { values = {} }
+	host.storage.get = function(key)
+		return host.storage.values[key]
+	end
+	host.storage.put = function(key, value)
+		host.storage.values[key] = value
+		return true
+	end
+	host.events.publish = function() end
 	host.commands.register = function(descriptor)
 		calls[descriptor.id] = descriptor
 	end

@@ -22,7 +22,6 @@ use crate::{
     capability::{BindingOperation, BindingOperationAvailability, BindingOperationOutcome},
     command::{MuxCommand, MuxPaneLaunchPlan, MuxSessionLaunchPlan, MuxSessionLaunchPlanError},
     config::{BackendFactory, build_backend_with, selected_backend},
-    rmux::rmux_operation_requires_checked_boundary,
     snapshot::{
         MuxPaneAnchor, MuxPaneLayout, MuxSession, MuxSnapshot, selection_after_refresh,
         session_matches,
@@ -2174,13 +2173,6 @@ impl BindingMuxController {
         if self.availability_error.is_some() {
             return BindingOperationOutcome::Unavailable;
         }
-        if matches!(selected_backend(config), MultiplexerBackendConfig::Rmux)
-            && rmux_operation_requires_checked_boundary(operation)
-        {
-            // rmux has no server-side CAS for a queued target mutation. Keep the command
-            // registry's dynamic outcome aligned with the backend's fail-closed checked seam.
-            return BindingOperationOutcome::Unavailable;
-        }
         if self
             .controller
             .build_backend(config)
@@ -3432,18 +3424,27 @@ impl MuxController {
                 .execute_native_command_with_completion(
                     config,
                     command,
-                    completion.selected_session.clone(),
-                    completion.selected_window.clone(),
                     execution_precondition.as_ref(),
                 )
                 .and_then(|(snapshot, authoritative)| {
                     MuxCommandCompletion::from_command_snapshot(
                         config.clone(),
-                        snapshot,
+                        snapshot.clone(),
                         &command_for_completion,
                         execution_precondition,
                         authoritative,
                     )
+                    .inspect(|completion| {
+                        // Do not let an invalid authoritative completion leave the controller
+                        // displaying a snapshot that was never accepted by the command boundary.
+                        self.apply_snapshot(
+                            MultiplexerBackendConfig::Native,
+                            snapshot,
+                            completion.selected_session.clone(),
+                            completion.selected_window.clone(),
+                        );
+                        self.last_session_refresh = None;
+                    })
                 });
             let _ = response_tx.send(result);
             repaint();
@@ -3552,7 +3553,6 @@ impl MuxController {
             generations: Arc::clone(self.execution_resource_generations.as_ref()?),
         })
     }
-
     fn execution_binding_generation_guard(
         &self,
         generation: Option<u64>,
@@ -3572,22 +3572,26 @@ impl MuxController {
     ) -> Result<MuxSnapshot, MuxCommandError> {
         freeze_implicit_command_target(&mut command, &self.sessions)?;
         let precondition = self.capture_execution_precondition(&command)?;
-        self.execute_native_command_with_completion(
-            config,
-            command,
-            preferred_session,
-            preferred_window,
-            precondition.as_ref(),
-        )
-        .map(|(snapshot, _)| snapshot)
+        let apply_window = preferred_window.clone();
+        let apply_session = preferred_session.clone();
+        let result =
+            self.execute_native_command_with_completion(config, command, precondition.as_ref());
+        if let Ok((snapshot, _)) = &result {
+            self.apply_snapshot(
+                MultiplexerBackendConfig::Native,
+                snapshot.clone(),
+                apply_session,
+                apply_window,
+            );
+            self.last_session_refresh = None;
+        }
+        result.map(|(snapshot, _)| snapshot)
     }
 
     fn execute_native_command_with_completion(
         &mut self,
         config: &MultiplexerConfig,
         command: MuxCommand,
-        preferred_session: Option<String>,
-        preferred_window: Option<String>,
         precondition: Option<&MuxScopedExecutionPrecondition>,
     ) -> Result<(MuxSnapshot, Option<MuxBackendCommandCompletion>), MuxCommandError> {
         let backend_kind = selected_backend(config);
@@ -3595,23 +3599,15 @@ impl MuxController {
             return Err(MuxCommandError::Unavailable);
         }
         let mut backend = self.build_backend(config);
-        execute_backend_command(backend.as_mut(), self.scope, command, precondition)
-            .and_then(|()| {
+        execute_backend_command(backend.as_mut(), self.scope, command, precondition).and_then(
+            |()| {
                 let authoritative = backend.take_authoritative_completion();
                 backend
                     .snapshot()
                     .map(|snapshot| (snapshot, authoritative))
                     .map_err(command_error_from_backend)
-            })
-            .inspect(|(snapshot, _)| {
-                self.apply_snapshot(
-                    backend_kind,
-                    snapshot.clone(),
-                    preferred_session,
-                    preferred_window,
-                );
-                self.last_session_refresh = None;
-            })
+            },
+        )
     }
 
     fn apply_refreshed_snapshot(
@@ -6542,7 +6538,7 @@ mod tests {
     }
 
     #[test]
-    fn rmux_checked_mutations_are_advertised_unavailable() {
+    fn rmux_checked_mutations_are_advertised_supported() {
         let binding = BindingMuxController::new(MuxScope::new(
             SpaceId::from_persistence(1),
             BindingId::from_persistence(1),
@@ -6553,7 +6549,9 @@ mod tests {
         };
 
         for operation in [
+            BindingOperation::ActivateWindow,
             BindingOperation::CreateWindow,
+            BindingOperation::RenameWindow,
             BindingOperation::NavigateWindow,
             BindingOperation::MoveWindow,
             BindingOperation::SplitPane,
@@ -6562,19 +6560,17 @@ mod tests {
             BindingOperation::ResizePane,
             BindingOperation::ClosePane,
             BindingOperation::TogglePaneZoom,
+            BindingOperation::CreateProjectSession,
+            BindingOperation::CreateWorktreeSession,
             BindingOperation::RenameSession,
             BindingOperation::DitchSession,
         ] {
             assert_eq!(
                 binding.operation_outcome(&config, operation),
-                BindingOperationOutcome::Unavailable,
+                BindingOperationOutcome::Supported(()),
                 "{operation:?}"
             );
         }
-        assert_eq!(
-            binding.operation_outcome(&config, BindingOperation::CreateProjectSession),
-            BindingOperationOutcome::Supported(())
-        );
     }
 
     #[test]
