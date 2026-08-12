@@ -6475,9 +6475,9 @@ pub fn register_luau_package(
                 return;
             }
             let module_root = module_root;
-            let mut module_cache = BTreeMap::<String, mlua::RegistryKey>::new();
+            let module_cache = Arc::new(Mutex::new(BTreeMap::<String, mlua::RegistryKey>::new()));
             let require =
-                match lua.create_function_mut(move |lua, name: String| -> mlua::Result<LuaValue> {
+                match lua.create_function(move |lua, name: String| -> mlua::Result<LuaValue> {
                     if name.is_empty() || name.len() > 128 {
                         return Err(mlua::Error::external("invalid module name"));
                     }
@@ -6488,8 +6488,13 @@ pub fn register_luau_package(
                     {
                         return Err(mlua::Error::external("module path traversal denied"));
                     }
-                    if let Some(key) = module_cache.get(&name) {
-                        return lua.registry_value::<LuaValue>(key);
+                    {
+                        let cache = module_cache
+                            .lock()
+                            .map_err(|_| mlua::Error::external("module cache lock poisoned"))?;
+                        if let Some(key) = cache.get(&name) {
+                            return lua.registry_value::<LuaValue>(key);
+                        }
                     }
                     let mut path = module_root.join(&relative);
                     if path.extension().is_none() {
@@ -6516,7 +6521,10 @@ pub fn register_luau_package(
                         .eval()?;
                     let key = lua.create_registry_value(value)?;
                     let result = lua.registry_value::<LuaValue>(&key)?;
-                    module_cache.insert(name, key);
+                    module_cache
+                        .lock()
+                        .map_err(|_| mlua::Error::external("module cache lock poisoned"))?
+                        .insert(name, key);
                     Ok(result)
                 }) {
                     Ok(function) => function,
@@ -9422,6 +9430,43 @@ mod tests {
             outcome,
             CommandOutcome::Success { value: Value::Array(values), .. }
                 if values == vec![Value::String("fixture-agent".to_owned())]
+        ));
+    }
+
+    #[test]
+    fn bundled_agent_extension_loads_ingests_and_lists_through_runtime() {
+        let runtime = ExtensionRuntime::new(AutomationHub::new());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("extensions");
+        let loaded = runtime.discover_and_load(&root).unwrap();
+        assert!(loaded.iter().any(|package| package.id == "bootty.agents"));
+        let invoke = |command: &str, arguments: Vec<String>| {
+            runtime.invoke_blocking(
+                CommandInvocation {
+                    command: command.to_owned(),
+                    arguments,
+                    caller: Caller::Cli,
+                    target: None,
+                    confirmation: None,
+                },
+                Instant::now() + Duration::from_secs(2),
+                CommandCancellation::new(),
+            )
+        };
+        let event = json!({
+            "source": "hook",
+            "event": "session_start",
+            "sessionId": "pi-e2e-session",
+            "cwd": "/work/bootty",
+            "sequence": 1
+        });
+        assert!(matches!(
+            invoke("agents.ingest", vec![event.to_string(), "pi".to_owned()]),
+            CommandOutcome::Success { .. }
+        ));
+        assert!(matches!(
+            invoke("agents.list", Vec::new()),
+            CommandOutcome::Success { value: Value::Array(records), .. }
+                if records.iter().any(|record| record["agent_id"] == "pi-e2e-session")
         ));
     }
 

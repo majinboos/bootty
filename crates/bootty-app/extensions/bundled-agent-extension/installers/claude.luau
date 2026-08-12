@@ -1,6 +1,6 @@
 --!strict
 local function load_common()
-    local ok, value = pcall(require, "./common")
+    local ok, value = pcall(require, "installers/common")
     if ok then return value end
     local candidates = {
         "./installers/common.luau",

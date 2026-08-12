@@ -2,7 +2,7 @@
 local M = {}
 
 local function load_adapter(name)
-    local ok, value = pcall(require, "./" .. name)
+    local ok, value = pcall(require, "installers/" .. name)
     if ok then return value end
     local candidates = {
         "./installers/" .. name .. ".luau",
