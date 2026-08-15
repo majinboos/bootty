@@ -1,4 +1,3 @@
-use libghostty_vt::style::RgbColor;
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,16 +29,6 @@ impl Color {
             b: (rgb & 0xff) as u8,
             a,
         })
-    }
-}
-
-impl From<Color> for RgbColor {
-    fn from(color: Color) -> Self {
-        RgbColor {
-            r: color.r,
-            g: color.g,
-            b: color.b,
-        }
     }
 }
 

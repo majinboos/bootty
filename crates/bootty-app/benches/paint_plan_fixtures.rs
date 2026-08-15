@@ -5,7 +5,6 @@ use bootty_app::{
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
-use eframe::egui::Vec2;
 
 pub type ScenarioBuilder = (&'static str, fn() -> TerminalEngine);
 
@@ -32,8 +31,9 @@ pub fn terminal_engine(cols: u16, rows: u16) -> TerminalEngine {
 }
 
 pub fn surface_for(cols: u16, rows: u16) -> TerminalSurface {
-    TerminalSurface::for_size(
-        Vec2::new(f32::from(cols) * 9.0 + 20.0, f32::from(rows) * 22.0 + 20.0),
+    TerminalSurface::for_logical_size(
+        f32::from(cols) * 9.0 + 20.0,
+        f32::from(rows) * 22.0 + 20.0,
         CellMetrics::new(9.0, 22.0),
         TerminalPadding::uniform(10.0),
     )

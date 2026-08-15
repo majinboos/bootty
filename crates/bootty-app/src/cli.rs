@@ -81,7 +81,7 @@ pub enum RemoteSpaceBackend {
     Zellij,
 }
 
-impl From<RemoteSpaceBackend> for bootty_config::config::MultiplexerBackendConfig {
+impl From<RemoteSpaceBackend> for bootty_mux::MuxBackendKind {
     fn from(value: RemoteSpaceBackend) -> Self {
         match value {
             RemoteSpaceBackend::Rmux => Self::Rmux,

@@ -1,7 +1,7 @@
 pub mod benchmark_trace;
+pub mod frame_source;
 pub mod latency;
 pub mod perf;
-pub mod render_source;
 pub mod scheduler;
 pub mod terminal_session;
 pub mod terminfo;

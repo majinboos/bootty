@@ -1,5 +1,3 @@
-use eframe::egui::{Pos2, Rect, Vec2};
-
 pub const COMPARISON_GHOSTTY_FONT_POINTS_MACOS: f32 = 11.75;
 pub const DEFAULT_FONT_DPI: f32 = 96.0;
 pub const DEFAULT_FONT_SIZE: f32 = COMPARISON_GHOSTTY_FONT_POINTS_MACOS * DEFAULT_FONT_DPI / 72.0;
@@ -184,15 +182,6 @@ pub struct SurfaceRect {
 }
 
 impl SurfaceRect {
-    pub fn from_egui(rect: Rect) -> Self {
-        Self {
-            min_x: rect.min.x,
-            min_y: rect.min.y,
-            max_x: rect.max.x,
-            max_y: rect.max.y,
-        }
-    }
-
     pub fn from_min_size(min_x: f32, min_y: f32, width: f32, height: f32) -> Self {
         Self {
             min_x,
@@ -208,6 +197,13 @@ impl SurfaceRect {
 
     pub fn height(self) -> f32 {
         self.max_y - self.min_y
+    }
+
+    pub fn contains(self, point: SurfacePoint) -> bool {
+        point.x >= self.min_x
+            && point.x <= self.max_x
+            && point.y >= self.min_y
+            && point.y <= self.max_y
     }
 }
 
@@ -257,7 +253,7 @@ impl ViewTransform {
         )
     }
 
-    pub fn pinched(self, factor: f32, focal: Pos2, surface: SurfaceRect) -> Self {
+    pub fn pinched(self, factor: f32, focal: SurfacePoint, surface: SurfaceRect) -> Self {
         let new_zoom = (self.zoom * factor).clamp(1.0, Self::MAX_ZOOM);
         if new_zoom == self.zoom {
             return self;
@@ -271,20 +267,20 @@ impl ViewTransform {
         .clamped(surface)
     }
 
-    pub fn panned(self, delta: Vec2, surface: SurfaceRect) -> Self {
+    pub fn panned(self, dx: f32, dy: f32, surface: SurfaceRect) -> Self {
         Self {
             zoom: self.zoom,
-            pan_x: self.pan_x + delta.x,
-            pan_y: self.pan_y + delta.y,
+            pan_x: self.pan_x + dx,
+            pan_y: self.pan_y + dy,
         }
         .clamped(surface)
     }
 
-    pub fn inverse_point(self, point: Pos2) -> Pos2 {
-        Pos2::new(
-            (point.x - self.pan_x) / self.zoom,
-            (point.y - self.pan_y) / self.zoom,
-        )
+    pub fn inverse_point(self, point: SurfacePoint) -> SurfacePoint {
+        SurfacePoint {
+            x: (point.x - self.pan_x) / self.zoom,
+            y: (point.y - self.pan_y) / self.zoom,
+        }
     }
 
     fn clamped(self, surface: SurfaceRect) -> Self {
@@ -310,13 +306,13 @@ pub struct MouseSurfaceMetrics {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TerminalSurface {
-    pub rect: Rect,
+    pub rect: SurfaceRect,
     pub padding: TerminalPadding,
     pub cell: CellMetrics,
 }
 
 impl TerminalSurface {
-    pub fn new(rect: Rect, cell: CellMetrics, padding: TerminalPadding) -> Self {
+    pub fn new(rect: SurfaceRect, cell: CellMetrics, padding: TerminalPadding) -> Self {
         Self {
             rect,
             cell,
@@ -324,12 +320,8 @@ impl TerminalSurface {
         }
     }
 
-    pub fn for_rect(rect: Rect, cell: CellMetrics) -> Self {
+    pub fn for_rect(rect: SurfaceRect, cell: CellMetrics) -> Self {
         Self::new(rect, cell, TerminalPadding::default())
-    }
-
-    pub fn for_size(size: Vec2, cell: CellMetrics, padding: TerminalPadding) -> Self {
-        Self::new(Rect::from_min_size(Pos2::ZERO, size), cell, padding)
     }
 
     pub fn for_logical_size(
@@ -338,15 +330,20 @@ impl TerminalSurface {
         cell: CellMetrics,
         padding: TerminalPadding,
     ) -> Self {
-        Self::for_size(Vec2::new(width, height), cell, padding)
-    }
-
-    pub fn default_for_size(size: Vec2) -> Self {
-        Self::for_size(size, CellMetrics::default(), TerminalPadding::default())
+        Self::new(
+            SurfaceRect::from_min_size(0.0, 0.0, width, height),
+            cell,
+            padding,
+        )
     }
 
     pub fn geometry(self) -> TerminalGeometry {
-        geometry_for_size(self.rect.size(), self.cell, self.padding)
+        geometry_for_pixels(
+            self.rect.width(),
+            self.rect.height(),
+            self.cell,
+            self.padding,
+        )
     }
 
     pub fn cell_size(self) -> (u32, u32) {
@@ -360,13 +357,13 @@ impl TerminalSurface {
 
     pub fn content_origin(self) -> SurfacePoint {
         SurfacePoint {
-            x: self.rect.min.x + self.padding.left,
-            y: self.rect.min.y + self.padding.top,
+            x: self.rect.min_x + self.padding.left,
+            y: self.rect.min_y + self.padding.top,
         }
     }
 
     pub fn surface_rect(self) -> SurfaceRect {
-        SurfaceRect::from_egui(self.rect)
+        self.rect
     }
 
     pub fn grid_rect(self, cols: u16, rows: u16) -> SurfaceRect {
@@ -443,18 +440,18 @@ impl TerminalSurface {
         )
     }
 
-    pub fn relative_position(self, pos: Pos2) -> Option<SurfacePoint> {
+    pub fn relative_position(self, pos: SurfacePoint) -> Option<SurfacePoint> {
         if !self.rect.contains(pos) {
             return None;
         }
 
         Some(SurfacePoint {
-            x: pos.x - self.rect.min.x,
-            y: pos.y - self.rect.min.y,
+            x: pos.x - self.rect.min_x,
+            y: pos.y - self.rect.min_y,
         })
     }
 
-    pub fn mouse_position(self, pos: Pos2) -> Option<SurfacePoint> {
+    pub fn mouse_position(self, pos: SurfacePoint) -> Option<SurfacePoint> {
         let position = self.relative_position(pos)?;
         let rounded_cell = self.rounded_cell();
         let padding = self.padding.rounded();
@@ -513,14 +510,6 @@ fn mouse_axis_position(
     }
 
     rounded_padding + content * (rounded_cell as f32 / rendered_cell.max(1.0))
-}
-
-pub fn geometry_for_size(
-    size: Vec2,
-    cell: CellMetrics,
-    padding: TerminalPadding,
-) -> TerminalGeometry {
-    geometry_for_pixels(size.x, size.y, cell, padding)
 }
 
 pub fn geometry_for_pixels(
@@ -583,7 +572,12 @@ mod tests {
 
     #[test]
     fn surface_geometry_includes_rounded_cell_size() {
-        let surface = TerminalSurface::default_for_size(Vec2::new(1000.0, 672.0));
+        let surface = TerminalSurface::for_logical_size(
+            1000.0,
+            672.0,
+            CellMetrics::default(),
+            TerminalPadding::default(),
+        );
         assert_eq!(
             surface.geometry(),
             TerminalGeometry {
@@ -597,20 +591,41 @@ mod tests {
 
     #[test]
     fn relative_position_is_rect_local() {
-        let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
+        let rect = SurfaceRect::from_min_size(20.0, 40.0, 200.0, 100.0);
         let surface = TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0));
 
         assert_eq!(
-            surface.relative_position(Pos2::new(35.0, 70.0)),
+            surface.relative_position(SurfacePoint { x: 35.0, y: 70.0 }),
             Some(SurfacePoint { x: 15.0, y: 30.0 })
         );
-        assert_eq!(surface.relative_position(Pos2::new(10.0, 70.0)), None);
+        assert_eq!(
+            surface.relative_position(SurfacePoint { x: 10.0, y: 70.0 }),
+            None
+        );
+    }
+
+    #[test]
+    fn surface_rect_contains_every_edge_like_egui_rect() {
+        let rect = SurfaceRect::from_min_size(20.0, 40.0, 200.0, 100.0);
+
+        assert!(rect.contains(SurfacePoint { x: 20.0, y: 40.0 }));
+        assert!(rect.contains(SurfacePoint { x: 220.0, y: 100.0 }));
+        assert!(rect.contains(SurfacePoint { x: 100.0, y: 140.0 }));
+        assert!(!rect.contains(SurfacePoint {
+            x: 220.001,
+            y: 100.0
+        }));
+        assert!(!rect.contains(SurfacePoint {
+            x: 100.0,
+            y: 140.001
+        }));
     }
 
     #[test]
     fn grid_rect_matches_rendered_frame_cell_extent() {
-        let surface = TerminalSurface::for_size(
-            Vec2::new(400.0, 300.0),
+        let surface = TerminalSurface::for_logical_size(
+            400.0,
+            300.0,
             CellMetrics::new(10.0, 20.0),
             TerminalPadding::uniform(5.0),
         );
@@ -660,8 +675,9 @@ mod tests {
 
     #[test]
     fn renderer_size_balanced_padding_equal_distributes_whitespace() {
-        let surface = TerminalSurface::for_size(
-            Vec2::new(1050.0, 850.0),
+        let surface = TerminalSurface::for_logical_size(
+            1050.0,
+            850.0,
             CellMetrics::new(10.0, 20.0),
             TerminalPadding::default(),
         );
@@ -685,8 +701,9 @@ mod tests {
 
     #[test]
     fn renderer_size_balanced_padding_capped_top_shifts_excess_to_bottom() {
-        let surface = TerminalSurface::for_size(
-            Vec2::new(1090.0, 1070.0),
+        let surface = TerminalSurface::for_logical_size(
+            1090.0,
+            1070.0,
             CellMetrics::new(20.0, 40.0),
             TerminalPadding::default(),
         );
@@ -754,8 +771,9 @@ mod tests {
 
     #[test]
     fn surface_to_grid_clamps_to_the_terminal_grid() {
-        let surface = TerminalSurface::for_size(
-            Vec2::new(100.0, 100.0),
+        let surface = TerminalSurface::for_logical_size(
+            100.0,
+            100.0,
             CellMetrics::new(5.0, 10.0),
             TerminalPadding::default(),
         );
@@ -794,8 +812,9 @@ mod tests {
             cell_height in 1_u32..80,
             padding in 0_u32..80,
         ) {
-            let surface = TerminalSurface::for_size(
-                Vec2::new(width as f32, height as f32),
+            let surface = TerminalSurface::for_logical_size(
+                width as f32,
+                height as f32,
                 CellMetrics::new(cell_width as f32, cell_height as f32),
                 TerminalPadding::uniform(padding as f32),
             );
@@ -833,14 +852,14 @@ mod tests {
     #[test]
     fn pinch_keeps_the_surface_point_under_the_cursor_anchored() {
         let surface = SurfaceRect::from_min_size(0.0, 0.0, 800.0, 600.0);
-        let focal = Pos2::new(200.0, 150.0);
+        let focal = SurfacePoint { x: 200.0, y: 150.0 };
         let before = ViewTransform::IDENTITY;
         let under_cursor = before.inverse_point(focal);
         let after = before.pinched(2.0, focal, surface);
-        let redisplayed = Pos2::new(
-            under_cursor.x * after.zoom + after.pan_x,
-            under_cursor.y * after.zoom + after.pan_y,
-        );
+        let redisplayed = SurfacePoint {
+            x: under_cursor.x * after.zoom + after.pan_x,
+            y: under_cursor.y * after.zoom + after.pan_y,
+        };
         assert!((redisplayed.x - focal.x).abs() < 1e-3);
         assert!((redisplayed.y - focal.y).abs() < 1e-3);
     }
@@ -848,7 +867,8 @@ mod tests {
     #[test]
     fn pinch_clamps_zoom_to_the_maximum() {
         let surface = SurfaceRect::from_min_size(0.0, 0.0, 800.0, 600.0);
-        let view = ViewTransform::IDENTITY.pinched(100.0, Pos2::new(400.0, 300.0), surface);
+        let view =
+            ViewTransform::IDENTITY.pinched(100.0, SurfacePoint { x: 400.0, y: 300.0 }, surface);
         assert_eq!(view.zoom, ViewTransform::MAX_ZOOM);
     }
 
@@ -860,9 +880,9 @@ mod tests {
             pan_x: 0.0,
             pan_y: 0.0,
         };
-        let forward = zoomed.panned(Vec2::new(10_000.0, 10_000.0), surface);
+        let forward = zoomed.panned(10_000.0, 10_000.0, surface);
         assert_eq!((forward.pan_x, forward.pan_y), (0.0, 0.0));
-        let backward = zoomed.panned(Vec2::new(-10_000.0, -10_000.0), surface);
+        let backward = zoomed.panned(-10_000.0, -10_000.0, surface);
         assert_eq!((backward.pan_x, backward.pan_y), (-800.0, -600.0));
     }
 
@@ -886,9 +906,10 @@ mod tests {
     #[test]
     fn pinching_back_to_1x_recenters_the_view() {
         let surface = SurfaceRect::from_min_size(0.0, 0.0, 800.0, 600.0);
-        let zoomed = ViewTransform::IDENTITY.pinched(3.0, Pos2::new(600.0, 400.0), surface);
+        let zoomed =
+            ViewTransform::IDENTITY.pinched(3.0, SurfacePoint { x: 600.0, y: 400.0 }, surface);
         assert!(zoomed.is_zoomed());
-        let reset = zoomed.pinched(0.01, Pos2::new(600.0, 400.0), surface);
+        let reset = zoomed.pinched(0.01, SurfacePoint { x: 600.0, y: 400.0 }, surface);
         assert_eq!(reset.zoom, 1.0);
         assert_eq!((reset.pan_x, reset.pan_y), (0.0, 0.0));
     }

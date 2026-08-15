@@ -27,7 +27,6 @@ use bootty_app::{
     terminal_render::{RenderFramePool, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
-use eframe::egui::Vec2;
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -106,8 +105,9 @@ fn filled_engine(cols: u16, rows: u16, colored: bool) -> TerminalEngine {
 }
 
 fn surface_for(cols: u16, rows: u16) -> TerminalSurface {
-    TerminalSurface::for_size(
-        Vec2::new(f32::from(cols) * 9.0 + 20.0, f32::from(rows) * 22.0 + 20.0),
+    TerminalSurface::for_logical_size(
+        f32::from(cols) * 9.0 + 20.0,
+        f32::from(rows) * 22.0 + 20.0,
         CellMetrics::new(9.0, 22.0),
         TerminalPadding::uniform(10.0),
     )

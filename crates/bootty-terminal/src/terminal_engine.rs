@@ -79,7 +79,7 @@ const TERMINAL_XTVERSION: &str = concat!("ghostty (Bootty ", env!("CARGO_PKG_VER
 pub const TERMINAL_BACKGROUND: (u8, u8, u8) = (0x1a, 0x1b, 0x25);
 pub const TERMINAL_FOREGROUND: (u8, u8, u8) = (0xc0, 0xca, 0xf5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalColorConfig {
     pub background: RgbColor,
     pub foreground: RgbColor,
@@ -158,6 +158,17 @@ impl Default for TerminalFeatureConfig {
             glyph_protocol: true,
         }
     }
+}
+
+/// Live terminal settings that can change without restarting the terminal session.
+///
+/// Callers apply this value as one unit. The terminal engine applies colors first, then the
+/// cursor, then terminal features.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalLiveConfig {
+    pub colors: TerminalColorConfig,
+    pub cursor: TerminalCursorConfig,
+    pub features: TerminalFeatureConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1293,6 +1304,12 @@ impl TerminalEngine {
         configure_terminal_features(&mut self.terminal, features)?;
         self.mark_content_changed();
         Ok(())
+    }
+
+    pub fn apply_live_config(&mut self, config: TerminalLiveConfig) -> Result<()> {
+        self.set_colors(config.colors)?;
+        self.set_cursor_config(config.cursor)?;
+        self.set_feature_config(config.features)
     }
 
     pub fn set_kitty_image_storage_limit(&mut self, limit: u64) -> Result<()> {

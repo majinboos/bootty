@@ -1,20 +1,26 @@
 use std::{
     collections::HashSet,
+    fs::File,
+    io,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
+use bootty_identity::ApplicationIdentity;
 use bootty_mux::{
+    MuxBackendKind, RemoteSpaceSummary,
     command::MuxCommand,
+    membership::{BackendMembership, MembershipOperation},
     rmux::RmuxBackend,
     snapshot::{MuxSnapshot, session_matches},
     tmux::TmuxBackend,
     zellij::ZellijBackend,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use toml_edit::DocumentMut;
+
+mod legacy_import;
 
 pub const CATALOG_VERSION: u32 = 3;
 
@@ -43,6 +49,14 @@ impl Backend {
             Self::Zellij => "zellij",
         }
     }
+
+    fn wire_kind(self) -> MuxBackendKind {
+        match self {
+            Self::Rmux => MuxBackendKind::Rmux,
+            Self::Tmux => MuxBackendKind::Tmux,
+            Self::Zellij => MuxBackendKind::Zellij,
+        }
+    }
     fn snapshot(self) -> Result<MuxSnapshot> {
         match self {
             Self::Rmux => RmuxBackend::new().snapshot(),
@@ -60,34 +74,35 @@ impl Backend {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct SpaceSummary {
-    pub catalog_version: u32,
-    pub id: String,
-    pub name: String,
-    pub backend: Backend,
-}
-
 struct LegacyCatalog {
     path: PathBuf,
-    inherited_backend: Option<Backend>,
-    inherited_remote: bool,
-}
-
-#[derive(Default)]
-struct LegacyConfig {
-    backend: Option<Backend>,
-    backend_set: bool,
-    remote: bool,
+    config_path: PathBuf,
 }
 
 pub struct Catalog {
     connection: Connection,
+    lock_directory: PathBuf,
+}
+
+/// Backend seam used by catalog mutations and recovery.
+pub trait CatalogBackend {
+    fn snapshot(&self) -> Result<MuxSnapshot>;
+    fn execute(&mut self, command: MuxCommand) -> Result<()>;
+}
+
+impl CatalogBackend for Backend {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        Backend::snapshot(*self)
+    }
+
+    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        Backend::execute(*self, command)
+    }
 }
 
 impl Catalog {
-    pub fn open(path: &Path) -> Result<Self> {
-        let legacy = default_legacy_catalog();
+    pub fn open(path: &Path, identity: ApplicationIdentity) -> Result<Self> {
+        let legacy = default_legacy_catalog(identity);
         Self::open_with_legacy(path, legacy.as_ref())
     }
 
@@ -96,6 +111,13 @@ impl Catalog {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create daemon state directory {}", parent.display()))?;
         }
+        let lock_directory = path.with_extension("locks");
+        std::fs::create_dir_all(&lock_directory).with_context(|| {
+            format!(
+                "create daemon catalog lock directory {}",
+                lock_directory.display()
+            )
+        })?;
         let connection = Connection::open(path)
             .with_context(|| format!("open daemon catalog {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
@@ -116,9 +138,24 @@ impl Catalog {
                  session_name TEXT NOT NULL,
                  position INTEGER NOT NULL,
                  PRIMARY KEY (space_id, session_name)
+             );
+             CREATE TABLE IF NOT EXISTS remote_space_pending_membership_operations (
+                 space_id TEXT PRIMARY KEY REFERENCES remote_spaces(id) ON DELETE CASCADE,
+                 operation TEXT NOT NULL CHECK (operation IN ('create', 'rename', 'ditch')),
+                 session_id TEXT NOT NULL CHECK (session_id != ''),
+                 old_name TEXT,
+                 new_name TEXT,
+                 CHECK (
+                     (operation = 'create' AND old_name IS NULL AND new_name IS NOT NULL)
+                     OR (operation = 'rename' AND old_name IS NOT NULL AND new_name IS NOT NULL)
+                     OR (operation = 'ditch' AND old_name IS NOT NULL AND new_name IS NULL)
+                 )
              );",
         )?;
-        let mut catalog = Self { connection };
+        let mut catalog = Self {
+            connection,
+            lock_directory,
+        };
         catalog.migrate_legacy(legacy)?;
         Ok(catalog)
     }
@@ -137,87 +174,87 @@ impl Catalog {
                 .query_row("SELECT COUNT(*) = 0 FROM remote_spaces", [], |row| {
                     row.get::<_, bool>(0)
                 })?;
-        if empty && let Some(legacy) = legacy.filter(|legacy| legacy.path.is_file()) {
-            let legacy_connection = Connection::open(&legacy.path)
-                .with_context(|| format!("open legacy remote catalog {}", legacy.path.display()))?;
-            legacy_connection.busy_timeout(Duration::from_secs(5))?;
-            if table_exists(&legacy_connection, "workspace_spaces")?
-                && table_exists(&legacy_connection, "workspace_bindings")?
-                && table_has_column(&legacy_connection, "workspace_spaces", "remote_id")?
-                && table_has_column(&legacy_connection, "workspace_bindings", "remote")?
-                && table_has_column(&legacy_connection, "workspace_bindings", "backend")?
-            {
-                let mut statement = legacy_connection.prepare(
-                    "SELECT spaces.remote_id, spaces.name, bindings.backend,
-                            spaces.position, bindings.id
-                     FROM workspace_spaces AS spaces
-                     JOIN workspace_bindings AS bindings ON bindings.id = (
-                         SELECT candidate.id
-                         FROM workspace_bindings AS candidate
-                         WHERE candidate.space_id = spaces.id
-                         ORDER BY candidate.id
-                         LIMIT 1
-                     )
-                     WHERE spaces.remote_id IS NOT NULL
-                       AND spaces.remote_id != ''
-                       AND (
-                           bindings.remote = '{\"source\":\"local\"}'
-                           OR (bindings.remote IS NULL AND ?1 = 0)
-                       )
-                     ORDER BY spaces.position",
-                )?;
-                let rows = statement
-                    .query_map([i64::from(legacy.inherited_remote)], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, i64>(4)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                drop(statement);
-                let transaction = self.connection.transaction()?;
-                for (id, name, stored_backend, position, binding_id) in rows {
-                    let backend = if stored_backend == "inherit" {
-                        legacy.inherited_backend
-                    } else {
-                        Backend::parse(&stored_backend).ok()
-                    };
-                    let Some(backend) = backend else {
-                        continue;
-                    };
-                    transaction.execute(
-                        "INSERT INTO remote_spaces (id, name, backend, position)
-                         VALUES (?1, ?2, ?3, ?4)",
-                        params![id, name, backend.name(), position],
-                    )?;
-                    if table_exists(&legacy_connection, "workspace_sessions")? {
-                        for (session_position, session_name) in
-                            legacy_session_names(&legacy_connection, binding_id)?
-                                .into_iter()
-                                .enumerate()
-                        {
-                            transaction.execute(
-                                "INSERT INTO remote_space_sessions
-                                 (space_id, session_name, position) VALUES (?1, ?2, ?3)",
-                                params![id, session_name, i64::try_from(session_position)?],
-                            )?;
-                        }
+        if !empty {
+            return self.commit_migration(None);
+        }
+        let Some(legacy) = legacy else {
+            return self.commit_migration(None);
+        };
+        match std::fs::metadata(&legacy.path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                bail!(
+                    "legacy remote catalog path is not a regular file: {}",
+                    legacy.path.display()
+                )
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&legacy.path) {
+                    Ok(_) => bail!(
+                        "legacy remote catalog path is not a regular file: {}",
+                        legacy.path.display()
+                    ),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return self.commit_migration(None);
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("inspect legacy remote catalog {}", legacy.path.display())
+                        });
                     }
                 }
-                transaction.commit()?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect legacy remote catalog {}", legacy.path.display())
+                });
             }
         }
-        self.connection.execute(
+        let plan = legacy_import::load(&legacy.config_path, &legacy.path)?;
+        self.commit_migration(Some(&plan))
+    }
+
+    fn commit_migration(&mut self, plan: Option<&legacy_import::ImportPlan>) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let migrated = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM daemon_metadata WHERE key = 'legacy_catalog_migrated')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if migrated {
+            transaction.commit()?;
+            return Ok(());
+        }
+        let empty = transaction.query_row("SELECT COUNT(*) = 0 FROM remote_spaces", [], |row| {
+            row.get::<_, bool>(0)
+        })?;
+        if empty && let Some(plan) = plan {
+            for space in &plan.spaces {
+                transaction.execute(
+                    "INSERT INTO remote_spaces (id, name, backend, position)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![space.id, space.name, space.backend.name(), space.position],
+                )?;
+                for (session_position, session_name) in space.sessions.iter().enumerate() {
+                    transaction.execute(
+                        "INSERT INTO remote_space_sessions
+                         (space_id, session_name, position) VALUES (?1, ?2, ?3)",
+                        params![space.id, session_name, i64::try_from(session_position)?],
+                    )?;
+                }
+            }
+        }
+        transaction.execute(
             "INSERT INTO daemon_metadata (key) VALUES ('legacy_catalog_migrated')",
             [],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
-    pub fn list(&self) -> Result<Vec<SpaceSummary>> {
+    pub fn list(&self) -> Result<Vec<RemoteSpaceSummary>> {
         let mut statement = self
             .connection
             .prepare("SELECT id, name, backend FROM remote_spaces ORDER BY position, id")?;
@@ -228,17 +265,17 @@ impl Catalog {
             })?
             .map(|row| {
                 let (id, name, backend) = row?;
-                Ok(SpaceSummary {
+                Ok(RemoteSpaceSummary {
                     catalog_version: CATALOG_VERSION,
                     id,
                     name,
-                    backend: Backend::parse(&backend)?,
+                    backend: Backend::parse(&backend)?.wire_kind(),
                 })
             })
             .collect()
     }
 
-    pub fn create(&mut self, requested_name: &str, backend: Backend) -> Result<SpaceSummary> {
+    pub fn create(&mut self, requested_name: &str, backend: Backend) -> Result<RemoteSpaceSummary> {
         let requested_name = requested_name.trim();
         if requested_name.is_empty() {
             bail!("remote Space name cannot be empty")
@@ -269,18 +306,29 @@ impl Catalog {
             params![id, name, backend.name(), position],
         )?;
         transaction.commit()?;
-        Ok(SpaceSummary {
+        Ok(RemoteSpaceSummary {
             catalog_version: CATALOG_VERSION,
             id,
             name,
-            backend,
+            backend: backend.wire_kind(),
         })
     }
 
     pub fn snapshot(&mut self, space_id: &str, expected: Backend) -> Result<MuxSnapshot> {
-        let backend = self.space_backend(space_id, expected)?;
+        let mut backend = self.space_backend(space_id, expected)?;
+        self.snapshot_with_backend(space_id, expected, &mut backend)
+    }
+
+    pub fn snapshot_with_backend(
+        &mut self,
+        space_id: &str,
+        expected: Backend,
+        backend: &mut dyn CatalogBackend,
+    ) -> Result<MuxSnapshot> {
+        let backend_kind = self.space_backend(space_id, expected)?;
+        let _lease = self.backend_lease(backend_kind)?;
         let mut snapshot = backend.snapshot()?;
-        let owned = self.sync_sessions(space_id, &snapshot)?;
+        let owned = self.reconcile_and_sync_sessions(space_id, &snapshot)?;
         snapshot
             .sessions
             .retain(|session| owned.contains(&session.name));
@@ -296,9 +344,21 @@ impl Catalog {
         expected: Backend,
         command: MuxCommand,
     ) -> Result<()> {
+        let mut backend = self.space_backend(space_id, expected)?;
+        self.execute_with_backend(space_id, expected, command, &mut backend)
+    }
+
+    pub fn execute_with_backend(
+        &mut self,
+        space_id: &str,
+        expected: Backend,
+        command: MuxCommand,
+        backend: &mut dyn CatalogBackend,
+    ) -> Result<()> {
         let backend_kind = self.space_backend(space_id, expected)?;
-        let snapshot = backend_kind.snapshot()?;
-        let owned = self.session_names(space_id)?;
+        let _lease = self.backend_lease(backend_kind)?;
+        let snapshot = backend.snapshot()?;
+        let owned = self.reconcile_and_sync_sessions(space_id, &snapshot)?;
         if let Some(session_id) = created_session_id(&command)
             && !owned.contains(session_id)
             && snapshot
@@ -309,25 +369,91 @@ impl Catalog {
             bail!("session already belongs to another remote Space")
         }
         let owned_name = resolve_owned_session_name(&snapshot, &owned, &command, space_id)?;
-        backend_kind.execute(command.clone())?;
-        match command {
-            MuxCommand::CreateProjectSession { session_id, .. }
-            | MuxCommand::CreateWorktreeSession { session_id, .. } => {
-                self.add_session(space_id, &session_id)?;
+        let operation = membership_operation(&command, owned_name.as_deref())?;
+        if let Some(operation) = operation.as_ref() {
+            operation
+                .validate()
+                .map_err(|error| anyhow::anyhow!(error))?;
+            self.journal(space_id, operation)?;
+        }
+        if let Err(error) = backend.execute(command) {
+            if operation.is_some() {
+                return Err(anyhow::anyhow!(
+                    "remote backend result is ambiguous: {error}; remote Space membership recovery is pending"
+                ));
             }
-            MuxCommand::RenameSession { name, .. } => {
-                if let Some(old_name) = owned_name {
-                    self.rename_session(space_id, &old_name, &name)?;
-                }
-            }
-            MuxCommand::DitchSession { .. } => {
-                if let Some(name) = owned_name {
-                    self.remove_session(space_id, &name)?;
-                }
-            }
-            _ => {}
+            return Err(error);
+        }
+        if let Some(operation) = operation {
+            self.commit_membership(space_id, &operation).map_err(|error| {
+                anyhow::anyhow!(
+                    "remote Space membership completed but catalog commit failed: {error}; recovery is pending"
+                )
+            })?;
         }
         Ok(())
+    }
+
+    fn journal(&mut self, space_id: &str, operation: &MembershipOperation) -> Result<()> {
+        let (operation_name, session_id, old_name, new_name) = operation_storage(operation);
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO remote_space_pending_membership_operations
+             (space_id, operation, session_id, old_name, new_name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![space_id, operation_name, session_id, old_name, new_name],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn commit_membership(&mut self, space_id: &str, operation: &MembershipOperation) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        let pending = load_pending_operation(&transaction, space_id)?
+            .context("pending remote Space membership operation is missing")?;
+        if pending != *operation {
+            bail!("pending remote Space membership operation does not match completion")
+        }
+        apply_membership_operation(&transaction, space_id, operation)?;
+        delete_pending_operation(&transaction, space_id)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn reconcile_and_sync_sessions(
+        &mut self,
+        space_id: &str,
+        snapshot: &MuxSnapshot,
+    ) -> Result<HashSet<String>> {
+        let memberships = snapshot
+            .sessions
+            .iter()
+            .map(|session| BackendMembership {
+                id: session.id.clone(),
+                name: session.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        let alive = memberships
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<HashSet<_>>();
+        let transaction = self.connection.transaction()?;
+        if let Some(operation) = load_pending_operation(&transaction, space_id)? {
+            if operation.effect_occurred(&memberships) {
+                apply_membership_operation(&transaction, space_id, &operation)?;
+            }
+            delete_pending_operation(&transaction, space_id)?;
+        }
+        let owned = session_names(&transaction, space_id)?;
+        for missing in owned.iter().filter(|name| !alive.contains(name.as_str())) {
+            transaction.execute(
+                "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
+                params![space_id, missing],
+            )?;
+        }
+        let owned = session_names(&transaction, space_id)?;
+        transaction.commit()?;
+        Ok(owned)
     }
 
     fn space_backend(&self, space_id: &str, expected: Backend) -> Result<Backend> {
@@ -351,208 +477,136 @@ impl Catalog {
         Ok(stored)
     }
 
-    fn session_names(&self, space_id: &str) -> Result<HashSet<String>> {
-        let mut statement = self.connection.prepare(
-            "SELECT session_name FROM remote_space_sessions WHERE space_id = ?1 ORDER BY position",
-        )?;
-        Ok(statement
-            .query_map([space_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<_>>()?)
-    }
-
-    fn sync_sessions(&mut self, space_id: &str, snapshot: &MuxSnapshot) -> Result<HashSet<String>> {
-        let alive = snapshot
-            .sessions
-            .iter()
-            .map(|session| session.name.as_str())
-            .collect::<HashSet<_>>();
-        let owned = self.session_names(space_id)?;
-        for missing in owned.iter().filter(|name| !alive.contains(name.as_str())) {
-            self.connection.execute(
-                "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
-                params![space_id, missing],
-            )?;
-        }
-        Ok(owned
-            .into_iter()
-            .filter(|name| alive.contains(name.as_str()))
-            .collect())
-    }
-
-    fn add_session(&self, space_id: &str, name: &str) -> Result<()> {
-        let position = self.connection.query_row(
-            "SELECT COALESCE(MAX(position) + 1, 0) FROM remote_space_sessions WHERE space_id = ?1",
-            [space_id],
-            |row| row.get::<_, i64>(0),
-        )?;
-        self.connection.execute(
-            "INSERT OR IGNORE INTO remote_space_sessions (space_id, session_name, position)
-             VALUES (?1, ?2, ?3)",
-            params![space_id, name, position],
-        )?;
-        Ok(())
-    }
-
-    fn rename_session(&self, space_id: &str, old_name: &str, name: &str) -> Result<()> {
-        self.connection.execute(
-            "UPDATE remote_space_sessions SET session_name = ?3
-             WHERE space_id = ?1 AND session_name = ?2",
-            params![space_id, old_name, name],
-        )?;
-        Ok(())
-    }
-
-    fn remove_session(&self, space_id: &str, name: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
-            params![space_id, name],
-        )?;
-        Ok(())
+    fn backend_lease(&self, backend: Backend) -> Result<BackendLease> {
+        BackendLease::acquire(&self.lock_directory, backend.name())
+            .with_context(|| format!("claim remote {} catalog operation lease", backend.name()))
     }
 }
 
-fn legacy_session_names(connection: &Connection, binding_id: i64) -> Result<Vec<String>> {
-    if table_exists(connection, "workspace_session_groups")?
-        && table_has_column(connection, "workspace_sessions", "group_id")?
-    {
-        let mut statement = connection.prepare(
-            "SELECT sessions.name
-             FROM workspace_sessions AS sessions
-             JOIN workspace_session_groups AS groups ON groups.id = sessions.group_id
-             WHERE sessions.binding_id = ?1 AND groups.binding_id = ?1
-             ORDER BY groups.position, sessions.position",
-        )?;
-        return Ok(statement
-            .query_map([binding_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?);
+struct BackendLease {
+    _file: File,
+}
+
+impl BackendLease {
+    fn acquire(directory: &Path, backend_name: &str) -> io::Result<Self> {
+        let path = directory.join(format!("{backend_name}.lock"));
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock()?;
+        Ok(Self { _file: file })
     }
-    let mut statement = connection.prepare(
-        "SELECT name FROM workspace_sessions
-         WHERE binding_id = ?1 ORDER BY position",
+}
+
+fn session_names(transaction: &Transaction<'_>, space_id: &str) -> Result<HashSet<String>> {
+    let mut statement = transaction.prepare(
+        "SELECT session_name FROM remote_space_sessions WHERE space_id = ?1 ORDER BY position",
     )?;
     Ok(statement
-        .query_map([binding_id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
+        .query_map([space_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
-fn load_legacy_config(path: &Path) -> Result<LegacyConfig> {
-    if !path.exists() {
-        return Ok(LegacyConfig::default());
+fn apply_membership_operation(
+    transaction: &Transaction<'_>,
+    space_id: &str,
+    operation: &MembershipOperation,
+) -> Result<()> {
+    operation
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    match operation {
+        MembershipOperation::Create { session_name, .. } => {
+            let position = transaction.query_row(
+                "SELECT COALESCE(MAX(position) + 1, 0)
+                 FROM remote_space_sessions WHERE space_id = ?1",
+                [space_id],
+                |row| row.get::<_, i64>(0),
+            )?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO remote_space_sessions
+                 (space_id, session_name, position) VALUES (?1, ?2, ?3)",
+                params![space_id, session_name, position],
+            )?;
+        }
+        MembershipOperation::Rename {
+            old_name, new_name, ..
+        } => {
+            let changed = transaction.execute(
+                "UPDATE remote_space_sessions SET session_name = ?3
+                 WHERE space_id = ?1 AND session_name = ?2",
+                params![space_id, old_name, new_name],
+            )?;
+            if changed == 0 {
+                let already_renamed = transaction.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM remote_space_sessions
+                         WHERE space_id = ?1 AND session_name = ?2
+                     )",
+                    params![space_id, new_name],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !already_renamed {
+                    bail!("pending rename membership is unavailable")
+                }
+            }
+        }
+        MembershipOperation::Ditch { old_name, .. } => {
+            transaction.execute(
+                "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
+                params![space_id, old_name],
+            )?;
+        }
     }
-    load_legacy_config_file(path, &mut Vec::new(), &mut HashSet::new())
+    Ok(())
 }
 
-fn load_legacy_config_file(
-    path: &Path,
-    stack: &mut Vec<PathBuf>,
-    loaded: &mut HashSet<PathBuf>,
-) -> Result<LegacyConfig> {
-    let id = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if stack.contains(&id) {
-        bail!("config include cycle detected at {}", path.display())
-    }
-    if loaded.contains(&id) {
-        return Ok(LegacyConfig::default());
-    }
-    let source = std::fs::read_to_string(path)
-        .with_context(|| format!("read legacy config {}", path.display()))?;
-    let document = source
-        .parse::<DocumentMut>()
-        .with_context(|| format!("parse legacy config {}", path.display()))?;
-    let backend = document
-        .get("multiplexer")
-        .and_then(|multiplexer| multiplexer.get("backend"))
-        .and_then(|backend| backend.as_str());
-    let mut config = LegacyConfig {
-        backend: match backend {
-            None | Some("native") => None,
-            Some(backend) => Some(Backend::parse(backend)?),
-        },
-        backend_set: backend.is_some(),
-        remote: document
-            .get("multiplexer")
-            .and_then(|multiplexer| multiplexer.get("remote"))
-            .is_some(),
-    };
-    let includes = document
-        .get("include")
-        .map(|item| {
-            item.as_array()
-                .context("legacy config include must be an array")?
-                .iter()
-                .map(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_owned)
-                        .context("legacy config include must contain strings")
-                })
-                .collect::<Result<Vec<_>>>()
+fn load_pending_operation(
+    transaction: &Transaction<'_>,
+    space_id: &str,
+) -> Result<Option<MembershipOperation>> {
+    let pending = transaction
+        .query_row(
+            "SELECT operation, session_id, old_name, new_name
+             FROM remote_space_pending_membership_operations WHERE space_id = ?1",
+            [space_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    pending
+        .map(|(operation, session_id, old_name, new_name)| {
+            operation_from_storage(&operation, session_id, old_name, new_name)
         })
-        .transpose()?
-        .unwrap_or_default();
-
-    stack.push(id.clone());
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    for include in includes {
-        let (optional, include) = include
-            .strip_prefix('?')
-            .map_or((false, include.as_str()), |include| (true, include));
-        let include = Path::new(include);
-        let include = if include.is_absolute() {
-            include.to_path_buf()
-        } else {
-            base.join(include)
-        };
-        if optional && !include.exists() {
-            continue;
-        }
-        let child = load_legacy_config_file(&include, stack, loaded)?;
-        if child.backend_set {
-            config.backend = child.backend;
-            config.backend_set = true;
-        }
-        config.remote |= child.remote;
-    }
-    stack.pop();
-    loaded.insert(id);
-    Ok(config)
+        .transpose()
 }
 
-fn default_legacy_catalog() -> Option<LegacyCatalog> {
-    let config_root = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    let config_path = config_root.join("bootty/config.toml");
-    let config = load_legacy_config(&config_path).unwrap_or(LegacyConfig {
-        backend: None,
-        backend_set: false,
-        remote: true,
-    });
+fn delete_pending_operation(transaction: &Transaction<'_>, space_id: &str) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM remote_space_pending_membership_operations WHERE space_id = ?1",
+        [space_id],
+    )?;
+    Ok(())
+}
+
+fn default_legacy_catalog(identity: ApplicationIdentity) -> Option<LegacyCatalog> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let config_path =
+        bootty_identity::legacy_config_path_from_env(identity, xdg.as_deref(), home.as_deref())?;
     Some(LegacyCatalog {
         path: config_path.with_file_name("session-order.sqlite3"),
-        inherited_backend: config.backend,
-        inherited_remote: config.remote,
+        config_path,
     })
-}
-
-fn table_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
-    connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [name],
-            |_| Ok(()),
-        )
-        .optional()
-        .map(|found| found.is_some())
-}
-
-fn table_has_column(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    Ok(statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == column))
 }
 
 fn unique_name(requested: &str, existing: &HashSet<String>) -> String {
@@ -608,6 +662,77 @@ fn command_session_id(command: &MuxCommand) -> Option<&str> {
         | MuxCommand::RenameSession { session_id, .. }
         | MuxCommand::DitchSession { session_id } => Some(session_id),
     }
+}
+
+fn membership_operation(
+    command: &MuxCommand,
+    old_name: Option<&str>,
+) -> Result<Option<MembershipOperation>> {
+    Ok(match command {
+        MuxCommand::CreateProjectSession { session_id, .. }
+        | MuxCommand::CreateWorktreeSession { session_id, .. } => {
+            Some(MembershipOperation::Create {
+                session_id: session_id.clone(),
+                session_name: session_id.clone(),
+            })
+        }
+        MuxCommand::RenameSession { session_id, name } => Some(MembershipOperation::Rename {
+            session_id: session_id.clone(),
+            old_name: old_name.context("session is unavailable")?.to_owned(),
+            new_name: name.clone(),
+        }),
+        MuxCommand::DitchSession { session_id } => Some(MembershipOperation::Ditch {
+            session_id: session_id.clone(),
+            old_name: old_name.context("session is unavailable")?.to_owned(),
+        }),
+        _ => None,
+    })
+}
+
+fn operation_storage(operation: &MembershipOperation) -> (&str, &str, Option<&str>, Option<&str>) {
+    match operation {
+        MembershipOperation::Create {
+            session_id,
+            session_name,
+        } => ("create", session_id, None, Some(session_name)),
+        MembershipOperation::Rename {
+            session_id,
+            old_name,
+            new_name,
+        } => ("rename", session_id, Some(old_name), Some(new_name)),
+        MembershipOperation::Ditch {
+            session_id,
+            old_name,
+        } => ("ditch", session_id, Some(old_name), None),
+    }
+}
+
+fn operation_from_storage(
+    operation: &str,
+    session_id: String,
+    old_name: Option<String>,
+    new_name: Option<String>,
+) -> Result<MembershipOperation> {
+    let operation = match operation {
+        "create" if old_name.is_none() => MembershipOperation::Create {
+            session_id,
+            session_name: new_name.context("pending create has no session name")?,
+        },
+        "rename" => MembershipOperation::Rename {
+            session_id,
+            old_name: old_name.context("pending rename has no old name")?,
+            new_name: new_name.context("pending rename has no new name")?,
+        },
+        "ditch" if new_name.is_none() => MembershipOperation::Ditch {
+            session_id,
+            old_name: old_name.context("pending ditch has no old name")?,
+        },
+        _ => bail!("pending membership operation has an invalid shape"),
+    };
+    operation
+        .validate()
+        .map_err(|error| anyhow::anyhow!(error))?;
+    Ok(operation)
 }
 
 fn created_session_id(command: &MuxCommand) -> Option<&str> {

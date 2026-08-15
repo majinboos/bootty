@@ -50,6 +50,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    let identity = ApplicationIdentity::current();
+    bootty_mux::prepare_local_rmux_daemon(identity)?;
     if let Some(code) = bootty_mux::run_embedded_rmux_daemon()? {
         std::process::exit(code);
     }

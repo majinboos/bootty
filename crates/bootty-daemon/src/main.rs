@@ -1,16 +1,16 @@
-mod catalog;
-
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use catalog::{Backend, Catalog};
+use bootty_daemon::catalog::{Backend, Catalog};
+use bootty_identity::{APPLICATION_IDENTITY_ENV, ApplicationIdentity};
 
 fn main() -> Result<()> {
+    let (identity, args) = parse_application_identity(std::env::args().skip(1).collect())?;
+    bootty_mux::prepare_local_rmux_daemon(identity)?;
     if let Some(code) = bootty_mux::run_embedded_rmux_daemon()? {
         std::process::exit(code);
     }
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    match args.first().map(String::as_str) {
         Some("remote-ping") => {
             println!(
                 "{}:{}",
@@ -20,28 +20,28 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some("remote-exec") => {
-            let payload = args.next().context("remote-exec requires a payload")?;
-            reject_extra(args)?;
-            std::process::exit(bootty_mux::run_remote_command(&payload)?);
+            let payload = args.get(1).context("remote-exec requires a payload")?;
+            reject_extra(args.iter().skip(2))?;
+            std::process::exit(bootty_mux::run_remote_command(payload)?);
         }
         Some("remote-rmux") => {
-            let payload = args.next().context("remote-rmux requires a payload")?;
-            reject_extra(args)?;
-            std::process::exit(bootty_mux::run_remote_rmux_command(&payload)?);
+            let payload = args.get(1).context("remote-rmux requires a payload")?;
+            reject_extra(args.iter().skip(2))?;
+            std::process::exit(bootty_mux::run_remote_rmux_command(payload)?);
         }
-        Some("remote-space") => run_remote_space(&args.collect::<Vec<_>>()),
-        Some("remote-project") => run_remote_project(&args.collect::<Vec<_>>()),
-        Some("remote-worktree") => run_remote_worktree(&args.collect::<Vec<_>>()),
+        Some("remote-space") => run_remote_space(&args[1..], identity),
+        Some("remote-project") => run_remote_project(&args[1..]),
+        Some("remote-worktree") => run_remote_worktree(&args[1..]),
         Some(command) => bail!("unknown command {command:?}"),
         None => bail!("bootty-daemon requires a command"),
     }
 }
 
-fn run_remote_space(args: &[String]) -> Result<()> {
+fn run_remote_space(args: &[String], identity: ApplicationIdentity) -> Result<()> {
     let Some((command, arguments)) = args.split_first() else {
         bail!("remote-space requires a command")
     };
-    let mut catalog = Catalog::open(&state_path()?)?;
+    let mut catalog = Catalog::open(&state_path(identity)?, identity)?;
     match command.as_str() {
         "list" => {
             if !arguments.is_empty() {
@@ -164,28 +164,80 @@ fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
     Ok(values)
 }
 
-fn reject_extra(mut args: impl Iterator<Item = String>) -> Result<()> {
+fn reject_extra<'a>(mut args: impl Iterator<Item = &'a String>) -> Result<()> {
     if let Some(extra) = args.next() {
         bail!("unexpected argument {extra:?}")
     }
     Ok(())
 }
 
-fn state_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("BOOTTY_DAEMON_STATE") {
-        return Ok(PathBuf::from(path));
+fn parse_application_identity(args: Vec<String>) -> Result<(ApplicationIdentity, Vec<String>)> {
+    let inherited = std::env::var_os(APPLICATION_IDENTITY_ENV);
+    parse_application_identity_with_inherited(args, inherited.as_deref())
+}
+
+fn parse_application_identity_with_inherited(
+    mut args: Vec<String>,
+    inherited: Option<&std::ffi::OsStr>,
+) -> Result<(ApplicationIdentity, Vec<String>)> {
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--application-identity")
+    {
+        if args.len() < 2 {
+            bail!("--application-identity requires a value")
+        }
+        let value = args.remove(1);
+        let identity = ApplicationIdentity::parse(&value)
+            .with_context(|| format!("unknown application identity {value:?}"))?;
+        args.remove(0);
+        Ok((identity, args))
+    } else if args
+        .first()
+        .is_some_and(|argument| argument == bootty_mux::INTERNAL_RMUX_DAEMON_FLAG)
+    {
+        Ok((inherited_application_identity(inherited)?, args))
+    } else {
+        Ok((ApplicationIdentity::Production, args))
     }
+}
+
+fn inherited_application_identity(value: Option<&std::ffi::OsStr>) -> Result<ApplicationIdentity> {
+    let Some(value) = value else {
+        return Ok(ApplicationIdentity::Production);
+    };
+    let value = value
+        .to_str()
+        .context("application identity environment value is not UTF-8")?;
+    ApplicationIdentity::parse(value)
+        .with_context(|| format!("unknown application identity {value:?}"))
+}
+
+fn state_path(identity: ApplicationIdentity) -> Result<PathBuf> {
+    let explicit = std::env::var_os("BOOTTY_DAEMON_STATE").map(PathBuf::from);
     #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA")
-        .or_else(|| std::env::var_os("APPDATA"))
-        .map(PathBuf::from)
-        .context("LOCALAPPDATA is unavailable")?;
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(windows)]
+    let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+    #[cfg(windows)]
+    let path = bootty_identity::windows_daemon_state_path(
+        identity,
+        explicit.as_deref(),
+        local_app_data.as_deref(),
+        app_data.as_deref(),
+    );
     #[cfg(not(windows))]
-    let root = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .context("HOME is unavailable")?;
-    Ok(root.join("bootty/daemon.sqlite"))
+    let xdg_state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let path = bootty_identity::unix_daemon_state_path(
+        identity,
+        explicit.as_deref(),
+        xdg_state_home.as_deref(),
+        home.as_deref(),
+    );
+    path.context("daemon state root is unavailable")
 }
 
 #[cfg(test)]
@@ -209,6 +261,66 @@ mod tests {
                 ],
                 "--name"
             )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn application_identity_defaults_to_production_and_accepts_a_leading_flag() {
+        assert_eq!(
+            parse_application_identity(vec!["remote-ping".to_owned()]).unwrap(),
+            (
+                ApplicationIdentity::Production,
+                vec!["remote-ping".to_owned()]
+            )
+        );
+        assert_eq!(
+            parse_application_identity(vec![
+                "--application-identity".to_owned(),
+                "bootty-dev".to_owned(),
+                "remote-space".to_owned(),
+            ])
+            .unwrap(),
+            (
+                ApplicationIdentity::Development,
+                vec!["remote-space".to_owned()]
+            )
+        );
+    }
+
+    #[test]
+    fn only_the_internal_rmux_child_inherits_the_local_identity() {
+        let inherited = std::ffi::OsStr::new("bootty-dev");
+
+        assert_eq!(
+            parse_application_identity_with_inherited(
+                vec![bootty_mux::INTERNAL_RMUX_DAEMON_FLAG.to_owned()],
+                Some(inherited),
+            )
+            .unwrap()
+            .0,
+            ApplicationIdentity::Development
+        );
+        assert_eq!(
+            parse_application_identity_with_inherited(
+                vec!["remote-ping".to_owned()],
+                Some(inherited),
+            )
+            .unwrap()
+            .0,
+            ApplicationIdentity::Production
+        );
+    }
+
+    #[test]
+    fn application_identity_flag_requires_a_known_value() {
+        assert!(parse_application_identity(vec!["--application-identity".to_owned()]).is_err());
+        assert!(
+            parse_application_identity(vec![
+                "--application-identity".to_owned(),
+                "other".to_owned(),
+                "remote-ping".to_owned(),
+            ])
             .is_err()
         );
     }

@@ -24,6 +24,7 @@ same renderer path as the main app.
 - `bootty-terminal` - Ghostty-backed terminal state and render frames.
 - `bootty-runtime` - PTY sessions, shell selection, drain scheduling, and frame
   publication.
+- `bootty-font` - OpenType feature values, parsing, and canonical formatting.
 - `bootty-render` - paint plans, text shaping, sprites, and WGPU rendering.
 - `bootty-winit` - native winit/WGPU host adapters.
 - `bootty` - convenience re-export crate for embedders.

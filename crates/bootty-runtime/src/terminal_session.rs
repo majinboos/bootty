@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     env,
+    fmt::{self, Display, Formatter},
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -24,7 +25,7 @@ use bootty_terminal::{
     terminal_engine::{
         TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TERMINAL_TERM, TerminalColorConfig,
         TerminalCopyModeAction, TerminalCopyModeOutcome, TerminalCursorConfig, TerminalEngine,
-        TerminalFeatureConfig, TerminalSearchDirection, TerminalSelectionEvent,
+        TerminalFeatureConfig, TerminalLiveConfig, TerminalSearchDirection, TerminalSelectionEvent,
         TerminalSelectionFormat, TerminalSideEffectEvent,
     },
     terminal_frame::RenderFrame,
@@ -104,6 +105,7 @@ pub struct TerminalSession {
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
+    worker_health: Arc<WorkerHealth>,
     current_working_directory: Arc<Mutex<Option<String>>>,
     geometry: TerminalGeometry,
     display_scale: f32,
@@ -138,11 +140,31 @@ fn terminate_child_without_blocking(mut child: Box<dyn Child + Send + Sync>) {
     });
 }
 
+struct PendingChild(Option<Box<dyn Child + Send + Sync>>);
+
+impl PendingChild {
+    fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        Self(Some(child))
+    }
+
+    fn release(mut self) -> Box<dyn Child + Send + Sync> {
+        self.0.take().expect("pending child must exist")
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            terminate_child_without_blocking(child);
+        }
+    }
+}
+
 type SpawnedPty = (
     Box<dyn MasterPty + Send>,
     Arc<Mutex<Box<dyn Write + Send>>>,
     Receiver<Vec<u8>>,
-    Box<dyn Child + Send + Sync>,
+    PendingChild,
     Option<String>,
 );
 
@@ -150,6 +172,95 @@ type RepaintWakeup = Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub(crate) struct PublishedFrame {
     latest: Mutex<Arc<RenderFrame>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalWorkerOperation {
+    Resize,
+    ApplyLiveConfig,
+    EncodeKey,
+    EncodeFocus,
+    EncodeMouse,
+    MouseTrackingForWheel,
+    EncodeMouseWheel,
+    EncodePaste,
+    EnterCopyMode,
+    SelectionBegin,
+    SelectionUpdate,
+    SelectionEnd,
+    SynchronizedOutput,
+    ExtractFrame,
+    PublishFrame,
+    PtyWriteLock,
+    PtyWriteAll,
+    PtyFlush,
+}
+
+impl TerminalWorkerOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Resize => "resize",
+            Self::ApplyLiveConfig => "apply_live_config",
+            Self::EncodeKey => "encode_key",
+            Self::EncodeFocus => "encode_focus",
+            Self::EncodeMouse => "encode_mouse",
+            Self::MouseTrackingForWheel => "mouse_tracking_for_wheel",
+            Self::EncodeMouseWheel => "encode_mouse_wheel",
+            Self::EncodePaste => "encode_paste",
+            Self::EnterCopyMode => "enter_copy_mode",
+            Self::SelectionBegin => "selection_begin",
+            Self::SelectionUpdate => "selection_update",
+            Self::SelectionEnd => "selection_end",
+            Self::SynchronizedOutput => "synchronized_output",
+            Self::ExtractFrame => "extract_frame",
+            Self::PublishFrame => "publish_frame",
+            Self::PtyWriteLock => "pty_write_lock",
+            Self::PtyWriteAll => "pty_write_all",
+            Self::PtyFlush => "pty_flush",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TerminalWorkerFailure {
+    operation: TerminalWorkerOperation,
+    source: String,
+}
+
+impl Display for TerminalWorkerFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "terminal worker {}: {}",
+            self.operation.as_str(),
+            self.source
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkerHealth {
+    latest: Mutex<Option<TerminalWorkerFailure>>,
+}
+
+impl WorkerHealth {
+    fn record(&self, operation: TerminalWorkerOperation, source: impl Display) {
+        let mut latest = self
+            .latest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *latest = Some(TerminalWorkerFailure {
+            operation,
+            source: source.to_string(),
+        });
+    }
+
+    fn take(&self) -> Result<Option<TerminalWorkerFailure>> {
+        self.latest
+            .lock()
+            .map(|mut latest| latest.take())
+            .map_err(|_| anyhow::anyhow!("terminal worker health lock poisoned"))
+    }
 }
 
 impl PublishedFrame {
@@ -196,10 +307,8 @@ type CopyModeActionResponse = std::result::Result<TerminalCopyModeOutcome, Strin
 enum TerminalCommand {
     DisplayScale(f32),
     RenderCellMetrics(CellMetrics),
-    Cursor(TerminalCursorConfig),
-    Features(TerminalFeatureConfig),
+    ApplyLiveConfig(TerminalLiveConfig),
     Resize(TerminalGeometry),
-    Colors(TerminalColorConfig),
     Key(KeyInput),
     Focus(bool),
     Mouse(MouseInput),
@@ -256,6 +365,7 @@ impl TerminalSession {
         let latest_frame = Arc::new(PublishedFrame::new());
         let latest_drain = Arc::new(Mutex::new(DrainStats::default()));
         let pending_pty_len = Arc::new(AtomicUsize::new(0));
+        let worker_health = Arc::new(WorkerHealth::default());
         let current_working_directory = Arc::new(Mutex::new(None));
         let benchmark_trace = match config.benchmark_trace.clone() {
             Some(trace) => Some(trace),
@@ -274,6 +384,7 @@ impl TerminalSession {
             latest_frame: latest_frame.clone(),
             latest_drain: latest_drain.clone(),
             pending_pty_len: pending_pty_len.clone(),
+            worker_health: Arc::clone(&worker_health),
             current_working_directory: current_working_directory.clone(),
             repaint_wakeup,
             side_effect_tx: config.side_effect_tx,
@@ -286,12 +397,13 @@ impl TerminalSession {
             latest_frame,
             latest_drain,
             pending_pty_len,
+            worker_health,
             current_working_directory,
             geometry,
             display_scale: 1.0,
             render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
             pty_master,
-            child: Some(child),
+            child: Some(child.release()),
             tty_name,
         })
     }
@@ -305,7 +417,6 @@ impl TerminalSession {
             return Ok(());
         }
 
-        self.geometry = geometry;
         self.send_command(TerminalCommand::Resize(geometry))?;
         self.pty_master.resize(PtySize {
             rows: geometry.rows,
@@ -313,6 +424,7 @@ impl TerminalSession {
             pixel_width: geometry.pixel_width(),
             pixel_height: geometry.pixel_height(),
         })?;
+        self.geometry = geometry;
 
         Ok(())
     }
@@ -326,28 +438,23 @@ impl TerminalSession {
         if (self.display_scale - display_scale).abs() <= f32::EPSILON {
             return Ok(());
         }
+        self.send_command(TerminalCommand::DisplayScale(display_scale))?;
         self.display_scale = display_scale;
-        self.send_command(TerminalCommand::DisplayScale(display_scale))
+        Ok(())
     }
 
     pub fn set_render_cell_metrics(&mut self, cell: CellMetrics) -> Result<()> {
         if self.render_cell == cell {
             return Ok(());
         }
+        self.send_command(TerminalCommand::RenderCellMetrics(cell))?;
         self.render_cell = cell;
-        self.send_command(TerminalCommand::RenderCellMetrics(cell))
+        Ok(())
     }
 
-    pub fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
-        self.send_command(TerminalCommand::Colors(colors))
-    }
-
-    pub fn set_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
-        self.send_command(TerminalCommand::Cursor(cursor))
-    }
-
-    pub fn set_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
-        self.send_command(TerminalCommand::Features(features))
+    pub fn apply_live_config(&mut self, config: TerminalLiveConfig) -> Result<()> {
+        // The worker applies the aggregate in colors, cursor, features order.
+        self.send_command(TerminalCommand::ApplyLiveConfig(config))
     }
 
     pub fn drain_pty(&mut self) -> DrainStats {
@@ -364,6 +471,7 @@ impl TerminalSession {
     }
 
     pub fn child_exited(&mut self) -> Result<bool> {
+        self.check_worker_error()?;
         match self.child.as_mut() {
             Some(child) => child
                 .try_wait()
@@ -506,13 +614,22 @@ impl TerminalSession {
     }
 
     pub fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
+        self.check_worker_error()?;
         self.latest_frame.load()
     }
 
     fn send_command(&self, command: TerminalCommand) -> Result<()> {
+        self.check_worker_error()?;
         self.command_tx
             .send(command)
             .map_err(|_| anyhow::anyhow!("terminal worker stopped"))
+    }
+
+    fn check_worker_error(&self) -> Result<()> {
+        if let Some(failure) = self.worker_health.take()? {
+            anyhow::bail!(failure);
+        }
+        Ok(())
     }
 }
 
@@ -529,6 +646,7 @@ struct TerminalWorkerConfig {
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
+    worker_health: Arc<WorkerHealth>,
     current_working_directory: Arc<Mutex<Option<String>>>,
     repaint_wakeup: RepaintWakeup,
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
@@ -554,8 +672,9 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             }
         };
         let callback_writer = config.pty_writer.clone();
+        let callback_health = Arc::clone(&config.worker_health);
         if let Err(error) = engine.on_pty_write(move |_terminal, bytes| {
-            write_pty(&callback_writer, bytes);
+            write_pty(&callback_writer, bytes, &callback_health);
         }) {
             let _ = startup_tx.send(Err(error.to_string()));
             return;
@@ -569,6 +688,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             latest_frame: config.latest_frame,
             latest_drain: config.latest_drain,
             pending_pty_len: config.pending_pty_len,
+            worker_health: config.worker_health,
             current_working_directory: config.current_working_directory,
             repaint_wakeup: config.repaint_wakeup,
             side_effect_tx: config.side_effect_tx,
@@ -612,6 +732,7 @@ struct TerminalWorker {
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
+    worker_health: Arc<WorkerHealth>,
     current_working_directory: Arc<Mutex<Option<String>>>,
     repaint_wakeup: RepaintWakeup,
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
@@ -697,7 +818,7 @@ impl TerminalWorker {
     }
 
     fn sync_output_suppressed(&mut self) -> bool {
-        let active = self.engine.is_synchronized_output().unwrap_or(false);
+        let active = synchronized_output_state(&self.engine, &self.worker_health);
         let elapsed = if active {
             self.sync_output_since
                 .get_or_insert_with(Instant::now)
@@ -748,56 +869,50 @@ impl TerminalWorker {
                     self.engine.set_render_cell_metrics(cell);
                     stats.terminal_changed = true;
                 }
-                TerminalCommand::Resize(geometry) => {
-                    if self.engine.resize(geometry).is_ok() {
-                        stats.terminal_changed = true;
-                    }
-                }
-                TerminalCommand::Colors(colors) => {
-                    if self.engine.set_colors(colors).is_ok() {
-                        stats.terminal_changed = true;
-                    }
-                }
-                TerminalCommand::Cursor(cursor) => {
-                    if self.engine.set_cursor_config(cursor).is_ok() {
-                        stats.terminal_changed = true;
-                    }
-                }
-                TerminalCommand::Features(features) => {
-                    if self.engine.set_feature_config(features).is_ok() {
-                        stats.terminal_changed = true;
+                TerminalCommand::Resize(geometry) => match self.engine.resize(geometry) {
+                    Ok(()) => stats.terminal_changed = true,
+                    Err(error) => self
+                        .worker_health
+                        .record(TerminalWorkerOperation::Resize, error),
+                },
+                TerminalCommand::ApplyLiveConfig(config) => {
+                    match self.engine.apply_live_config(config) {
+                        Ok(()) => stats.terminal_changed = true,
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::ApplyLiveConfig, error),
                     }
                 }
                 TerminalCommand::Key(input) => {
                     self.mark_input_fast_path();
                     self.engine.scroll_viewport_bottom();
                     stats.terminal_changed = true;
-                    if self
-                        .engine
-                        .encode_key_to_vec(input, &mut self.output_buf)
-                        .is_ok()
-                    {
-                        self.write_output_buf();
+                    match self.engine.encode_key_to_vec(input, &mut self.output_buf) {
+                        Ok(()) => self.write_output_buf(),
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::EncodeKey, error),
                     }
                 }
                 TerminalCommand::Focus(gained) => {
                     self.mark_input_fast_path();
-                    if self
+                    match self
                         .engine
                         .encode_focus_to_vec(gained, &mut self.output_buf)
-                        .is_ok()
                     {
-                        self.write_output_buf();
+                        Ok(()) => self.write_output_buf(),
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::EncodeFocus, error),
                     }
                 }
                 TerminalCommand::Mouse(input) => {
                     self.mark_input_fast_path();
-                    if self
-                        .engine
-                        .encode_mouse_to_vec(input, &mut self.output_buf)
-                        .is_ok()
-                    {
-                        self.write_output_buf();
+                    match self.engine.encode_mouse_to_vec(input, &mut self.output_buf) {
+                        Ok(()) => self.write_output_buf(),
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::EncodeMouse, error),
                     }
                 }
                 TerminalCommand::MouseWheel {
@@ -806,16 +921,15 @@ impl TerminalWorker {
                 } => match self.engine.is_mouse_tracking() {
                     Ok(true) => {
                         self.mark_input_fast_path();
-                        if self
-                            .engine
-                            .encode_mouse_wheel_to_vec(
-                                input,
-                                scroll_delta.unsigned_abs().max(1),
-                                &mut self.output_buf,
-                            )
-                            .is_ok()
-                        {
-                            self.write_output_buf();
+                        match self.engine.encode_mouse_wheel_to_vec(
+                            input,
+                            scroll_delta.unsigned_abs().max(1),
+                            &mut self.output_buf,
+                        ) {
+                            Ok(()) => self.write_output_buf(),
+                            Err(error) => self
+                                .worker_health
+                                .record(TerminalWorkerOperation::EncodeMouseWheel, error),
                         }
                     }
                     Ok(false) if scroll_delta != 0 => {
@@ -824,18 +938,19 @@ impl TerminalWorker {
                         stats.terminal_changed = true;
                     }
                     Ok(false) => {}
-                    Err(_) => {}
+                    Err(error) => self
+                        .worker_health
+                        .record(TerminalWorkerOperation::MouseTrackingForWheel, error),
                 },
                 TerminalCommand::Paste(text) => {
                     self.mark_input_fast_path();
                     self.engine.scroll_viewport_bottom();
                     stats.terminal_changed = true;
-                    if self
-                        .engine
-                        .encode_paste_to_vec(&text, &mut self.output_buf)
-                        .is_ok()
-                    {
-                        self.write_output_buf();
+                    match self.engine.encode_paste_to_vec(&text, &mut self.output_buf) {
+                        Ok(()) => self.write_output_buf(),
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::EncodePaste, error),
                     }
                 }
                 TerminalCommand::DiscardPendingOutput(done) => {
@@ -846,7 +961,7 @@ impl TerminalWorker {
                     self.mark_input_fast_path();
                     self.engine.scroll_viewport_bottom();
                     stats.terminal_changed = true;
-                    write_pty(&self.pty_writer, &bytes);
+                    write_pty(&self.pty_writer, &bytes, &self.worker_health);
                 }
                 TerminalCommand::MouseViewportScroll { delta } => {
                     self.mark_input_fast_path();
@@ -855,26 +970,38 @@ impl TerminalWorker {
                 }
                 TerminalCommand::EnterCopyMode => {
                     self.mark_input_fast_path();
-                    if self.engine.enter_copy_mode().is_ok() {
-                        stats.terminal_changed = true;
+                    match self.engine.enter_copy_mode() {
+                        Ok(()) => stats.terminal_changed = true,
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::EnterCopyMode, error),
                     }
                 }
                 TerminalCommand::SelectionBegin(event) => {
                     self.mark_input_fast_path();
-                    if self.engine.begin_selection(event).is_ok() {
-                        stats.terminal_changed = true;
+                    match self.engine.begin_selection(event) {
+                        Ok(()) => stats.terminal_changed = true,
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::SelectionBegin, error),
                     }
                 }
                 TerminalCommand::SelectionUpdate(event) => {
                     self.mark_input_fast_path();
-                    if self.engine.update_selection(event).is_ok() {
-                        stats.terminal_changed = true;
+                    match self.engine.update_selection(event) {
+                        Ok(()) => stats.terminal_changed = true,
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::SelectionUpdate, error),
                     }
                 }
                 TerminalCommand::SelectionEnd(event) => {
                     self.mark_input_fast_path();
-                    if self.engine.end_selection(event).is_ok() {
-                        stats.terminal_changed = true;
+                    match self.engine.end_selection(event) {
+                        Ok(()) => stats.terminal_changed = true,
+                        Err(error) => self
+                            .worker_health
+                            .record(TerminalWorkerOperation::SelectionEnd, error),
                     }
                 }
                 TerminalCommand::FormatSelection { format, done } => {
@@ -1013,13 +1140,14 @@ impl TerminalWorker {
             );
         }
         let engine = &mut self.engine;
-        let mut observed_sync_output = engine.is_synchronized_output().unwrap_or(false);
+        let worker_health = Arc::clone(&self.worker_health);
+        let mut observed_sync_output = synchronized_output_state(engine, &worker_health);
         let mut sync_output_escape_prefix_len = self.sync_output_escape_prefix_len;
         let mut write = |bytes: &[u8]| {
             observed_sync_output |=
                 observe_sync_output_start(bytes, &mut sync_output_escape_prefix_len);
             engine.write_vt(bytes);
-            observed_sync_output |= engine.is_synchronized_output().unwrap_or(false);
+            observed_sync_output |= synchronized_output_state(engine, &worker_health);
         };
         let stats = if self.force_next_frame_publish {
             drain_pty_backlog_with_limits(
@@ -1096,8 +1224,13 @@ impl TerminalWorker {
     fn publish_frame(&mut self) {
         let trace = self.benchmark_trace.clone();
         let extract_start = Instant::now();
-        let Ok(frame) = self.engine.extract_frame() else {
-            return;
+        let frame = match self.engine.extract_frame() {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.worker_health
+                    .record(TerminalWorkerOperation::ExtractFrame, error);
+                return;
+            }
         };
         let extract_elapsed_us = extract_start.elapsed().as_micros() as u64;
         if let Some(trace) = &trace {
@@ -1129,17 +1262,20 @@ impl TerminalWorker {
                 ],
             );
         }
-        if self.latest_frame.publish(frame).is_ok() {
-            if let Some(trace) = &trace {
-                trace.emit(
-                    "frame_presented",
-                    &[("presenter", TraceValue::Str("published_frame"))],
-                );
-            }
-            self.force_next_frame_publish = false;
-            self.has_unpublished_frame = false;
-            (self.repaint_wakeup)();
+        if let Err(error) = self.latest_frame.publish(frame) {
+            self.worker_health
+                .record(TerminalWorkerOperation::PublishFrame, error);
+            return;
         }
+        if let Some(trace) = &trace {
+            trace.emit(
+                "frame_presented",
+                &[("presenter", TraceValue::Str("published_frame"))],
+            );
+        }
+        self.force_next_frame_publish = false;
+        self.has_unpublished_frame = false;
+        (self.repaint_wakeup)();
     }
 
     fn trace_event(&self, event: &str, fields: &[(&str, TraceValue<'_>)]) {
@@ -1150,7 +1286,7 @@ impl TerminalWorker {
 
     fn write_output_buf(&self) {
         if !self.output_buf.is_empty() {
-            write_pty(&self.pty_writer, &self.output_buf);
+            write_pty(&self.pty_writer, &self.output_buf, &self.worker_health);
         }
     }
 }
@@ -1329,10 +1465,33 @@ fn drain_pty_backlog_with_limits(
     stats
 }
 
-fn write_pty(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8]) {
-    if let Ok(mut writer) = writer.lock() {
-        let _ = writer.write_all(bytes);
-        let _ = writer.flush();
+fn synchronized_output_state(engine: &TerminalEngine, health: &WorkerHealth) -> bool {
+    match engine.is_synchronized_output() {
+        Ok(active) => active,
+        Err(error) => {
+            health.record(TerminalWorkerOperation::SynchronizedOutput, error);
+            false
+        }
+    }
+}
+
+fn write_pty(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8], health: &WorkerHealth) {
+    let mut writer = match writer.lock() {
+        Ok(writer) => writer,
+        Err(_) => {
+            health.record(
+                TerminalWorkerOperation::PtyWriteLock,
+                "writer lock poisoned",
+            );
+            return;
+        }
+    };
+    if let Err(error) = writer.write_all(bytes) {
+        health.record(TerminalWorkerOperation::PtyWriteAll, error);
+        return;
+    }
+    if let Err(error) = writer.flush() {
+        health.record(TerminalWorkerOperation::PtyFlush, error);
     }
 }
 
@@ -1534,6 +1693,7 @@ fn spawn_shell(geometry: TerminalGeometry, config: &SessionLaunchConfig) -> Resu
         .slave
         .spawn_command(command)
         .context("spawn shell in PTY")?;
+    let child = PendingChild::new(child);
 
     let mut reader = pair.master.try_clone_reader()?;
     let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
@@ -1731,6 +1891,10 @@ fn parse_user_shell_output(output: &str) -> Option<String> {
         normalize_shell_path(shell.to_string())
     })
 }
+
+#[cfg(test)]
+#[path = "terminal_session/delivered_state_tests.rs"]
+mod delivered_state_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2612,6 +2776,173 @@ mod tests {
             wait_until_process_exits(pid),
             "dropping the session must kill its PTY child to avoid leaking a mux client"
         );
+    }
+
+    #[test]
+    fn worker_health_keeps_operation_and_consumes_latest_failure_once() {
+        let health = WorkerHealth::default();
+        health.record(
+            TerminalWorkerOperation::ApplyLiveConfig,
+            "first live config error",
+        );
+        health.record(TerminalWorkerOperation::Resize, "latest resize error");
+
+        let failure = health.take().expect("health lock").expect("worker failure");
+        assert_eq!(failure.operation, TerminalWorkerOperation::Resize);
+        assert_eq!(failure.source, "latest resize error");
+        assert!(health.take().expect("health lock").is_none());
+    }
+
+    #[derive(Debug)]
+    struct ErrorWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for ErrorWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail_write {
+                Err(std::io::Error::other("write failed"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush {
+                Err(std::io::Error::other("flush failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn test_worker(writer: Box<dyn Write + Send>) -> (TerminalWorker, Sender<TerminalCommand>) {
+        let geometry = TerminalGeometry {
+            cols: 8,
+            rows: 2,
+            cell_width: 10,
+            cell_height: 20,
+        };
+        let (pty_tx, pty_rx) = mpsc::channel();
+        drop(pty_tx);
+        let (command_tx, command_rx) = mpsc::channel();
+        let worker_health = Arc::new(WorkerHealth::default());
+        let worker = TerminalWorker {
+            engine: TerminalEngine::new(geometry).expect("terminal engine"),
+            pty_rx,
+            pty_writer: Arc::new(Mutex::new(writer)),
+            command_rx,
+            pending_command: None,
+            latest_frame: Arc::new(PublishedFrame::new()),
+            latest_drain: Arc::new(Mutex::new(DrainStats::default())),
+            pending_pty_len: Arc::new(AtomicUsize::new(0)),
+            worker_health,
+            current_working_directory: Arc::new(Mutex::new(None)),
+            repaint_wakeup: Arc::new(|| {}),
+            side_effect_tx: None,
+            side_effect_pane_id: None,
+            output_buf: Vec::new(),
+            pending_pty: PtyBacklog::with_capacity(MAX_COLLECT_CHUNKS_PER_TICK),
+            last_frame_publish: Instant::now(),
+            has_unpublished_frame: false,
+            sync_output_since: None,
+            sync_output_batch_pending: false,
+            sync_output_escape_prefix_len: 0,
+            last_terminal_change: None,
+            force_next_frame_publish: false,
+            command_disconnected: false,
+            pty_disconnected: false,
+            benchmark_trace: None,
+        };
+        (worker, command_tx)
+    }
+
+    fn poison_published_frame(frame: &Arc<PublishedFrame>) {
+        let frame = Arc::clone(frame);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = frame.latest.lock().expect("published frame lock");
+            panic!("poison published frame lock");
+        });
+    }
+
+    #[test]
+    fn failing_pty_write_reaches_health_after_raw_input_command() -> Result<()> {
+        let (mut worker, command_tx) = test_worker(Box::new(ErrorWriter {
+            fail_write: true,
+            fail_flush: false,
+        }));
+        command_tx.send(TerminalCommand::RawInput(vec![b'x']))?;
+
+        let stats = worker.process_commands();
+        assert_eq!(stats.commands, 1);
+        let failure = worker.worker_health.take()?.expect("pty write failure");
+        assert_eq!(failure.operation, TerminalWorkerOperation::PtyWriteAll);
+        assert_eq!(failure.source, "write failed");
+        Ok(())
+    }
+
+    #[test]
+    fn normal_frame_publication_failure_reaches_health() -> Result<()> {
+        let (mut worker, _command_tx) = test_worker(Box::new(ErrorWriter {
+            fail_write: false,
+            fail_flush: false,
+        }));
+        poison_published_frame(&worker.latest_frame);
+
+        worker.publish_frame();
+
+        let failure = worker
+            .worker_health
+            .take()?
+            .expect("frame publication failure");
+        assert_eq!(failure.operation, TerminalWorkerOperation::PublishFrame);
+        assert!(failure.source.contains("render frame lock poisoned"));
+        Ok(())
+    }
+
+    #[test]
+    fn response_search_failure_does_not_poison_worker_health() -> Result<()> {
+        let (mut worker, command_tx) = test_worker(Box::new(ErrorWriter {
+            fail_write: false,
+            fail_flush: false,
+        }));
+        poison_published_frame(&worker.latest_frame);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        command_tx.send(TerminalCommand::SearchViewport {
+            query: "missing".to_owned(),
+            direction: TerminalSearchDirection::Current,
+            done: done_tx,
+        })?;
+
+        worker.process_commands();
+
+        assert!(done_rx.recv()?.is_err());
+        assert!(worker.worker_health.take()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_session_extract_frame_consumes_worker_health_once() {
+        let mut session = TerminalSession::new(TerminalGeometry {
+            cols: 8,
+            rows: 2,
+            cell_width: 10,
+            cell_height: 20,
+        })
+        .expect("spawn terminal session");
+        session
+            .worker_health
+            .record(TerminalWorkerOperation::PtyWriteAll, "write failed");
+
+        let error = session
+            .extract_frame()
+            .expect_err("worker failure must surface through public health check");
+        assert_eq!(
+            error.to_string(),
+            "terminal worker pty_write_all: write failed"
+        );
+        assert!(session.extract_frame().is_ok());
     }
 
     #[cfg(unix)]

@@ -20,7 +20,7 @@ use crate::remote_exec::{REMOTE_EXEC_PROGRAM, REMOTE_PING_SUBCOMMAND, proxy_comm
 #[cfg(test)]
 use crate::remote_exec::{REMOTE_EXEC_SUBCOMMAND, RemoteCommand, decode_remote_command};
 use anyhow::Result;
-use bootty_config::config::SshRemoteConfig;
+use bootty_mux_model::SshTarget;
 
 use super::{
     process::{CommandOutput, CommandRunner, SystemCommandRunner},
@@ -36,7 +36,7 @@ const SERVER_ALIVE_COUNT_MAX: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub struct SshRemote {
-    config: SshRemoteConfig,
+    config: SshTarget,
     daemon_ready: Arc<Mutex<bool>>,
 }
 
@@ -49,7 +49,7 @@ impl PartialEq for SshRemote {
 impl Eq for SshRemote {}
 
 impl SshRemote {
-    pub fn new(config: SshRemoteConfig) -> Self {
+    pub fn new(config: SshTarget) -> Self {
         Self {
             config,
             daemon_ready: Arc::new(Mutex::new(false)),
@@ -245,14 +245,11 @@ pub fn remote_daemon_failure(host: &str, detail: &str) -> String {
         detail.lines().next().unwrap_or(detail)
     )
 }
-pub fn test_ssh_connection(config: &SshRemoteConfig) -> Result<()> {
+pub fn test_ssh_connection(config: &SshTarget) -> Result<()> {
     test_ssh_connection_with_runner(config, &SystemCommandRunner)
 }
 
-fn test_ssh_connection_with_runner<R: CommandRunner>(
-    config: &SshRemoteConfig,
-    runner: &R,
-) -> Result<()> {
+fn test_ssh_connection_with_runner<R: CommandRunner>(config: &SshTarget, runner: &R) -> Result<()> {
     SshRemote::new(config.clone()).ensure_daemon_with(runner)
 }
 
@@ -301,12 +298,12 @@ mod tests {
         time::Duration,
     };
 
-    fn remote(config: SshRemoteConfig) -> SshRemote {
+    fn remote(config: SshTarget) -> SshRemote {
         SshRemote::new(config)
     }
 
-    fn config(host: &str) -> SshRemoteConfig {
-        SshRemoteConfig {
+    fn config(host: &str) -> SshTarget {
+        SshTarget {
             host: host.to_owned(),
             user: None,
             port: None,
@@ -455,7 +452,7 @@ mod tests {
     /// a host that needs different timings has to be able to say so.
     #[test]
     fn every_connection_is_bounded_and_configured_flags_outrank_the_defaults() {
-        let (_, argv) = remote(SshRemoteConfig {
+        let (_, argv) = remote(SshTarget {
             args: args(&["-o", "ServerAliveInterval=30"]),
             ..config("devbox")
         })
@@ -481,7 +478,7 @@ mod tests {
     /// each has to reach argv, and `--` must terminate options before the destination.
     #[test]
     fn explicit_credentials_replace_what_ssh_config_would_have_carried() {
-        let (_, argv) = remote(SshRemoteConfig {
+        let (_, argv) = remote(SshTarget {
             user: Some("dev".to_owned()),
             port: Some(2222),
             args: args(&["-i", "C:\\keys\\id_ed25519"]),

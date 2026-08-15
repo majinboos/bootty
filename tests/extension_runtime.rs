@@ -141,6 +141,42 @@ fn module_files_use_safe_names_and_explicit_override_lifecycle() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_read_only_existing_module_is_atomically_replaceable_while_mode_is_retained() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("module directory");
+    let path = directory.path().join("read-only.luau");
+    let original = b"return function() return 'old' end";
+    std::fs::write(&path, original).expect("write original module");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+        .expect("make module read-only");
+
+    let replacement = "return function() return 'new' end";
+    let saved = save_module(
+        directory.path(),
+        ModuleKind::Status,
+        "read-only",
+        replacement,
+    )
+    .expect("replace read-only module");
+
+    assert_eq!(saved, path);
+    assert_eq!(
+        std::fs::read(&path).expect("read replacement"),
+        replacement.as_bytes()
+    );
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("stat replacement")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o444
+    );
+}
+
 #[test]
 fn module_catalogs_merge_builtin_and_user_modules_by_kind() {
     let directory = tempfile::tempdir().expect("module directory");

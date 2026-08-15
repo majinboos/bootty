@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
+use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -52,12 +52,12 @@ pub struct NewMuxSessionRequest {
     pub cwd: String,
 }
 
-type SessionRefreshSnapshot = std::result::Result<(MultiplexerBackendConfig, MuxSnapshot), String>;
+type SessionRefreshSnapshot = std::result::Result<(MuxBackendKind, MuxSnapshot), String>;
 type SessionRefreshResult = (u64, SessionRefreshSnapshot);
 
 struct SessionRefreshRequest {
     generation: u64,
-    config: MultiplexerConfig,
+    config: MuxBindingConfig,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,11 +128,11 @@ pub type MuxCommandResult = std::result::Result<MuxCommandCompletion, MuxCommand
 pub struct MuxCommandCompletion {
     pub selected_session: Option<String>,
     pub selected_window: Option<String>,
-    snapshot: Option<(MultiplexerConfig, MuxSnapshot)>,
+    snapshot: Option<(MuxBindingConfig, MuxSnapshot)>,
 }
 
 impl MuxCommandCompletion {
-    pub fn matches_config(&self, config: &MultiplexerConfig) -> bool {
+    pub fn matches_config(&self, config: &MuxBindingConfig) -> bool {
         self.snapshot
             .as_ref()
             .is_none_or(|(completed_config, _)| completed_config == config)
@@ -146,7 +146,7 @@ impl MuxCommandCompletion {
         }
     }
 
-    fn from_snapshot(config: MultiplexerConfig, snapshot: MuxSnapshot) -> Self {
+    fn from_snapshot(config: MuxBindingConfig, snapshot: MuxSnapshot) -> Self {
         let selected_session = snapshot.active_session_id.clone().or_else(|| {
             snapshot
                 .sessions
@@ -170,13 +170,13 @@ impl MuxCommandCompletion {
 }
 #[derive(Default)]
 struct CommandConfigState {
-    config: Option<MultiplexerConfig>,
+    config: Option<MuxBindingConfig>,
     generation: u64,
 }
 
 struct MuxCommandJob {
     scope: Option<MuxScope>,
-    config: MultiplexerConfig,
+    config: MuxBindingConfig,
     command: MuxCommand,
     completion: MuxCommandCompletion,
     response: Option<mpsc::Sender<MuxCommandResult>>,
@@ -472,7 +472,7 @@ pub struct BindingMuxController {
     binding_generation: u64,
     resource_generations: BTreeMap<MuxResourceKey, u64>,
     observed_resources: BTreeMap<MuxResourceKey, String>,
-    observed_backend: Option<MultiplexerBackendConfig>,
+    observed_backend: Option<MuxBackendKind>,
 }
 
 impl Default for BindingMuxController {
@@ -536,7 +536,7 @@ impl BindingMuxController {
 
     pub fn operation_outcome(
         &self,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         operation: BindingOperation,
     ) -> BindingOperationOutcome<()> {
         let Some(scope) = self.controller.scope else {
@@ -636,7 +636,7 @@ impl BindingMuxController {
         &mut self,
         request: NewMuxSessionRequest,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         self.controller
             .create_project_session(request, repaint, config);
@@ -646,7 +646,7 @@ impl BindingMuxController {
     pub fn execute_command(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
     ) {
         self.controller.execute_command(repaint, config, command);
@@ -656,7 +656,7 @@ impl BindingMuxController {
     pub fn refresh_sessions(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) -> Option<String> {
         let recovering = self.refresh_failed;
         let error = self.controller.refresh_sessions(repaint, config);
@@ -697,7 +697,7 @@ impl BindingMuxController {
     pub fn complete_authoritative_command(
         &mut self,
         result: MuxCommandResult,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) -> MuxCommandResult {
         let result = self
             .controller
@@ -740,7 +740,7 @@ pub struct MuxController {
     /// The selected session's active window from the previous snapshot, used to detect window
     /// switches made outside bootty so the highlight follows them.
     last_active_window: Option<ActiveWindow>,
-    current_backend: Option<MultiplexerBackendConfig>,
+    current_backend: Option<MuxBackendKind>,
     last_session_refresh: Option<Instant>,
     /// Cadence cap for [`Self::refresh_sessions`], driven by window focus.
     refresh_interval: Option<Duration>,
@@ -784,11 +784,11 @@ impl MuxController {
         self.backend_factory = Some(factory);
     }
 
-    fn build_backend(&self, config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
+    fn build_backend(&self, config: &MuxBindingConfig) -> Box<dyn MuxBackend> {
         build_backend_with(self.backend_factory.as_ref(), config)
     }
 
-    fn observe_command_config(&mut self, config: &MultiplexerConfig) -> u64 {
+    fn observe_command_config(&mut self, config: &MuxBindingConfig) -> u64 {
         let mut state = self
             .command_config
             .lock()
@@ -923,7 +923,7 @@ impl MuxController {
     pub fn refresh_sessions(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) -> Option<String> {
         self.observe_command_config(config);
         while let Some((generation, result)) = self.poll_session_refresh() {
@@ -946,7 +946,7 @@ impl MuxController {
             return None;
         }
 
-        if backend == MultiplexerBackendConfig::Native {
+        if backend == MuxBackendKind::Native {
             return self.refresh_native_sessions(config);
         }
 
@@ -978,11 +978,11 @@ impl MuxController {
         }
     }
 
-    fn refresh_native_sessions(&mut self, config: &MultiplexerConfig) -> Option<String> {
+    fn refresh_native_sessions(&mut self, config: &MuxBindingConfig) -> Option<String> {
         match self.build_backend(config).snapshot() {
             Ok(snapshot) => {
                 self.refresh_completed |=
-                    self.apply_refreshed_snapshot(MultiplexerBackendConfig::Native, snapshot);
+                    self.apply_refreshed_snapshot(MuxBackendKind::Native, snapshot);
                 self.last_session_refresh = Some(Instant::now());
                 None
             }
@@ -1018,7 +1018,7 @@ impl MuxController {
     fn complete_authoritative_command(
         &mut self,
         result: MuxCommandResult,
-        active_config: Option<&MultiplexerConfig>,
+        active_config: Option<&MuxBindingConfig>,
     ) -> MuxCommandResult {
         match result {
             Ok(completion) => {
@@ -1110,7 +1110,7 @@ impl MuxController {
         session_id: &str,
         window_id: &str,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         self.set_selected_session(Some(session_id.to_owned()));
         self.selected_window = Some(window_id.to_owned());
@@ -1148,7 +1148,7 @@ impl MuxController {
         window_id: &str,
         name: String,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         let command = MuxCommand::RenameWindow {
             session_id: session_id.to_owned(),
@@ -1163,7 +1163,7 @@ impl MuxController {
         session_id: &str,
         name: String,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         // Names change here; ids do not. Pin the selection to its id first so it still resolves once
         // the session answers to the new name, whichever backend applies the rename.
@@ -1179,7 +1179,7 @@ impl MuxController {
         &mut self,
         session_id: &str,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         self.execute_preserving_selection(
             repaint,
@@ -1195,7 +1195,7 @@ impl MuxController {
         session_id: &str,
         pane_id: Option<&str>,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         self.execute_preserving_selection(
             repaint,
@@ -1210,7 +1210,7 @@ impl MuxController {
     fn execute_preserving_selection(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
     ) {
         if self
@@ -1239,7 +1239,7 @@ impl MuxController {
         &mut self,
         request: NewMuxSessionRequest,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         let command = MuxCommand::CreateProjectSession {
             session_id: request.session_id.clone(),
@@ -1314,7 +1314,7 @@ impl MuxController {
     pub fn execute_command(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
     ) {
         let (selected_session, preferred_window) = self.command_completion(&command);
@@ -1344,7 +1344,7 @@ impl MuxController {
     pub fn execute_command_authoritatively(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
         deadline: Instant,
         cancellation: CommandCancellation,
@@ -1361,12 +1361,11 @@ impl MuxController {
             let _ = response_tx.send(Err(MuxCommandError::DeadlineExceeded));
             return response_rx;
         }
-        if selected_backend(config) == MultiplexerBackendConfig::Native && !cancellation.try_start()
-        {
+        if selected_backend(config) == MuxBackendKind::Native && !cancellation.try_start() {
             let _ = response_tx.send(Err(MuxCommandError::Cancelled));
             return response_rx;
         }
-        if selected_backend(config) == MultiplexerBackendConfig::Native {
+        if selected_backend(config) == MuxBackendKind::Native {
             let result = self
                 .execute_native_command(
                     config,
@@ -1403,13 +1402,13 @@ impl MuxController {
 
     fn execute_native_command(
         &mut self,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
         preferred_session: Option<String>,
         preferred_window: Option<String>,
     ) -> Result<MuxSnapshot, MuxCommandError> {
         let backend_kind = selected_backend(config);
-        if backend_kind != MultiplexerBackendConfig::Native {
+        if backend_kind != MuxBackendKind::Native {
             return Err(MuxCommandError::Unavailable);
         }
         let mut backend = self.build_backend(config);
@@ -1430,19 +1429,15 @@ impl MuxController {
             })
     }
 
-    fn apply_refreshed_snapshot(
-        &mut self,
-        backend: MultiplexerBackendConfig,
-        snapshot: MuxSnapshot,
-    ) -> bool {
+    fn apply_refreshed_snapshot(&mut self, backend: MuxBackendKind, snapshot: MuxSnapshot) -> bool {
         let same_backend = self.current_backend == Some(backend);
-        if backend == MultiplexerBackendConfig::Rmux
+        if backend == MuxBackendKind::Rmux
             && !snapshot.sessions.is_empty()
             && !sessions_have_renderable_pane(&snapshot.sessions)
         {
             return false;
         }
-        if backend == MultiplexerBackendConfig::Rmux
+        if backend == MuxBackendKind::Rmux
             && same_backend
             && sessions_have_renderable_pane(&self.sessions)
             && !sessions_have_renderable_pane(&snapshot.sessions)
@@ -1462,7 +1457,7 @@ impl MuxController {
 
     fn apply_snapshot(
         &mut self,
-        backend: MultiplexerBackendConfig,
+        backend: MuxBackendKind,
         mut snapshot: MuxSnapshot,
         preferred_session: Option<String>,
         preferred_window: Option<String>,
@@ -1583,7 +1578,7 @@ impl MuxController {
     fn enqueue_command(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
         completion: MuxCommandCompletion,
         response: Option<mpsc::Sender<MuxCommandResult>>,

@@ -5,7 +5,7 @@ use bootty_app::{
     paint_plan::{PlanColor, TextAttrs},
     terminal_render::TextCommand,
     terminal_text::{
-        CodepointPresentation, FontFeature, FontResolver, FontStyle, TerminalCodepointResolver,
+        CodepointPresentation, FontResolver, FontStyle, TerminalCodepointResolver,
         TerminalTextConfig,
     },
     terminal_text_atlas::{GlyphAtlas, TerminalTextShaper, TextAtlasBuilder},
@@ -37,6 +37,7 @@ fn text_command(text: impl Into<String>) -> TextCommand {
         attrs: attrs(),
         face: Arc::new(FontResolver::new(TerminalTextConfig::default()).resolve_face(&attrs())),
         font_size: TerminalTextConfig::default().font_size,
+        font_features: Arc::from(TerminalTextConfig::default().font_features),
     }
 }
 
@@ -152,7 +153,7 @@ fn prepare_command(builder: &mut TextAtlasBuilder, command: &TextCommand) -> usi
 }
 
 fn bench_text_shaping(c: &mut Criterion) {
-    let shaper = TerminalTextShaper::default();
+    let shaper = TerminalTextShaper;
     for (name, text) in unicode_workloads() {
         c.bench_function(&format!("text_shape_cold_{name}"), |b| {
             b.iter(|| black_box(shaper.shape(black_box(&text), 0).len()))
@@ -164,19 +165,6 @@ fn bench_text_shaping(c: &mut Criterion) {
             b.iter(|| black_box(shaper.shape_into(black_box(&text), 0, &mut clusters)))
         });
     }
-}
-
-fn bench_ligature_modes(c: &mut Criterion) {
-    let source = ligature_source_text();
-    let ligatures_on = TerminalTextShaper::default();
-    let ligatures_off = TerminalTextShaper::with_features(vec![FontFeature::new(*b"liga", 0)]);
-
-    c.bench_function("text_shape_ligatures_on_source", |b| {
-        b.iter(|| black_box(ligatures_on.shape(black_box(&source), 0).len()))
-    });
-    c.bench_function("text_shape_ligatures_off_source", |b| {
-        b.iter(|| black_box(ligatures_off.shape(black_box(&source), 0).len()))
-    });
 }
 
 fn bench_font_resolution(c: &mut Criterion) {
@@ -292,7 +280,6 @@ name = benches;
 config = Criterion::default().noise_threshold(0.15);
 targets =
     bench_text_shaping,
-    bench_ligature_modes,
     bench_font_resolution,
     bench_text_atlas,
     bench_glyph_atlas_reserve

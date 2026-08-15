@@ -13,7 +13,7 @@ use bootty_app::{
 
 #[test]
 fn text_shaper_groups_combining_emoji_and_variation_clusters() {
-    let shaper = TerminalTextShaper::default();
+    let shaper = TerminalTextShaper;
 
     let clusters = shaper.shape("fi e\u{301} 😀 \u{2764}\u{FE0F}", 1);
 
@@ -37,8 +37,8 @@ fn text_shaper_groups_combining_emoji_and_variation_clusters() {
 }
 
 #[test]
-fn text_shaper_noop_contract_maps_codepoints_to_cells() {
-    let shaper = TerminalTextShaper::with_features(vec![FontFeature::new(*b"liga", 0)]);
+fn text_shaper_maps_codepoints_to_cells() {
+    let shaper = TerminalTextShaper;
 
     let clusters = shaper.shape("A界e\u{301}", 4);
 
@@ -56,7 +56,7 @@ fn text_shaper_noop_contract_maps_codepoints_to_cells() {
 
 #[test]
 fn text_shaper_shape_into_replaces_previous_clusters() {
-    let shaper = TerminalTextShaper::default();
+    let shaper = TerminalTextShaper;
     let mut clusters = shaper.shape("stale", 0);
 
     let total_cells = shaper.shape_into("A界e\u{301}", 4, &mut clusters);
@@ -78,7 +78,7 @@ fn text_shaper_shape_into_replaces_previous_clusters() {
 
 #[test]
 fn text_shaper_ports_backend_complex_script_cell_cases() {
-    let shaper = TerminalTextShaper::default();
+    let shaper = TerminalTextShaper;
     let samples = [
         ("arabic forced LTR", "مَرْحَبًا"),
         ("devanagari", "कर्म"),
@@ -103,7 +103,7 @@ fn text_shaper_ports_backend_complex_script_cell_cases() {
 
 #[test]
 fn text_shaper_ports_backend_boundary_and_symbol_cases() {
-    let shaper = TerminalTextShaper::default();
+    let shaper = TerminalTextShaper;
 
     let clusters = shaper.shape("a  b", 3);
     assert_eq!(clusters[0].cell, 3);
@@ -324,6 +324,7 @@ fn text_atlas_builder_emits_one_textured_quad_per_shaped_cluster() {
         attrs: attrs(),
         face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
+        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
     };
     let mut builder = TextAtlasBuilder::new(128, 128);
 
@@ -343,6 +344,7 @@ fn text_atlas_builder_appends_textured_quads_without_replacing_existing_batch() 
         attrs: attrs(),
         face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
+        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
     };
     let sentinel = TexturedGlyphQuad {
         rect: SurfaceRect::from_min_size(99.0, 99.0, 1.0, 1.0),
@@ -367,6 +369,7 @@ fn atlas_keys_separate_same_glyph_at_different_pixel_scales() {
         attrs: attrs(),
         face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
+        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
     };
     let mut builder = TextAtlasBuilder::new(128, 128);
 
@@ -384,6 +387,7 @@ fn whitespace_clusters_do_not_create_invisible_quads_or_atlas_entries() {
         attrs: attrs(),
         face: Arc::new(face()),
         font_size: DEFAULT_FONT_SIZE,
+        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
     };
     let mut builder = TextAtlasBuilder::new(64, 64);
 

@@ -17,8 +17,9 @@ use crate::{
     app_actions::{AppAction, KeybindAction, MuxKeyAction},
     commands::{
         AppCommandReceiver, AppCommandRequest, AppCommandSender, BoundAppCommandSender, Caller,
-        CommandCancellation, CommandCatalog, CommandInvocation, CommandOutcome, CommandTarget,
-        CoreCommandExecutor, MutationClass, ResourceKind, app_command_channel_with_repaint,
+        CommandCancellation, CommandCatalog, CommandExecutor, CommandInvocation, CommandOutcome,
+        CommandTarget, CoreCommandExecutor, MutationClass, ResourceKind,
+        app_command_channel_with_repaint,
     },
     mux::{
         RepaintHandle,
@@ -288,41 +289,6 @@ impl AppState {
         effects: &mut Vec<AppEffect>,
         execution: Option<(Instant, CommandCancellation)>,
     ) -> CommandDispatch {
-        let extension = match self
-            .commands
-            .catalog()
-            .resolve_extension(invocation.clone())
-        {
-            Ok(extension) => extension,
-            Err(outcome) => return CommandDispatch::Complete(outcome),
-        };
-        if let Some(mut resolved) = extension {
-            let target = match self.resolve_command_target(
-                &resolved.invocation.command,
-                resolved.descriptor.target,
-                resolved.invocation.target.as_ref(),
-            ) {
-                Ok(target) => target,
-                Err(outcome) => return CommandDispatch::Complete(outcome),
-            };
-            resolved.invocation.target = target;
-            if resolved.descriptor.mutation == MutationClass::Destructive
-                && resolved.invocation.confirmation.as_ref()
-                    != Some(&resolved.invocation.confirmation())
-            {
-                return CommandDispatch::Complete(CommandOutcome::ConfirmationRequired {
-                    confirmation: Box::new(resolved.invocation.confirmation()),
-                });
-            }
-            let (deadline, cancellation) = execution.unwrap_or_else(|| {
-                (
-                    Instant::now() + Duration::from_secs(10),
-                    CommandCancellation::new(),
-                )
-            });
-            let result = (resolved.handler)(resolved.invocation, deadline, cancellation);
-            return CommandDispatch::Pending(PendingCommandResult::Outcome(result));
-        }
         let mut resolved = match self.commands.catalog().resolve(invocation) {
             Ok(resolved) => resolved,
             Err(outcome) => {
@@ -342,10 +308,6 @@ impl AppState {
             }
         };
         resolved.invocation.target = target;
-        if let Some(outcome) = self.preflight_command(&resolved.executor) {
-            self.last_error = command_outcome_message(&outcome);
-            return CommandDispatch::Complete(outcome);
-        }
         if resolved.descriptor.mutation == MutationClass::Destructive
             && matches!(
                 resolved.invocation.caller,
@@ -359,15 +321,35 @@ impl AppState {
             });
         }
         let caller = resolved.invocation.caller;
-        let target = resolved.invocation.target;
-        self.dispatch_resolved_command(
-            resolved.executor,
-            target.as_ref(),
-            caller,
-            viewport,
-            effects,
-            execution,
-        )
+        match resolved.executor {
+            CommandExecutor::Core(executor) => {
+                if let Some(outcome) = self.preflight_command(&executor) {
+                    self.last_error = command_outcome_message(&outcome);
+                    return CommandDispatch::Complete(outcome);
+                }
+                self.dispatch_resolved_command(
+                    executor,
+                    resolved.invocation.target.as_ref(),
+                    caller,
+                    viewport,
+                    effects,
+                    execution,
+                )
+            }
+            CommandExecutor::Extension(handler) => {
+                let (deadline, cancellation) = execution.unwrap_or_else(|| {
+                    (
+                        Instant::now() + Duration::from_secs(10),
+                        CommandCancellation::new(),
+                    )
+                });
+                CommandDispatch::Pending(PendingCommandResult::Outcome(handler(
+                    resolved.invocation,
+                    deadline,
+                    cancellation,
+                )))
+            }
+        }
     }
 
     fn preflight_command(&self, executor: &CoreCommandExecutor) -> Option<CommandOutcome> {
@@ -631,8 +613,6 @@ impl AppState {
                 }
                 let reloaded = self.reload_config(effects);
                 let outcome = if reloaded {
-                    let path = self.config().config_path.clone();
-                    self.config_hot_reload.refresh_after_reload(&path);
                     self.last_error
                         .clone()
                         .map_or_else(CommandOutcome::success, |warning| {

@@ -1,7 +1,7 @@
 use eframe::egui;
 
 use super::SettingsWindow;
-use bootty_render::terminal_text::parse_font_features;
+use bootty_font::{FontFeature, parse_font_features};
 
 pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
     let palette = win.palette;
@@ -547,7 +547,7 @@ fn write_features(win: &mut SettingsWindow, features: &str) {
 }
 
 fn normalized_feature(value: &str) -> Option<String> {
-    bootty_render::terminal_text::FontFeature::parse(value).map(|feature| feature.to_string())
+    FontFeature::parse(value).map(|feature| feature.to_string())
 }
 
 fn slider(ui: &mut egui::Ui, win: &mut SettingsWindow, row: MetricSliderRow<'_>) {

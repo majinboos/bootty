@@ -1,0 +1,11 @@
+[package]
+name = "bootty-mux-model"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }

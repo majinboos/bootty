@@ -1,7 +1,7 @@
 pub mod action_catalog;
 pub mod app;
 pub mod app_actions;
-pub mod application_identity;
+pub use bootty_identity as application_identity;
 mod assets;
 pub mod command_extensions;
 pub mod commands;

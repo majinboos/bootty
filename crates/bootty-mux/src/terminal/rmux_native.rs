@@ -12,16 +12,19 @@ use std::{
 use anyhow::Result;
 use bootty_runtime::{
     DrainStats, TerminalSessionConfig,
-    render_source::TerminalRenderSource,
+    frame_source::TerminalFrameSource,
     terminal_session::{should_publish_frame_after_work, sync_output_suppresses_publish},
 };
 use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
+#[cfg(test)]
+use bootty_terminal::terminal_engine::{
+    TerminalColorConfig, TerminalCursorConfig, TerminalFeatureConfig,
+};
 use bootty_terminal::{
     terminal_engine::{
-        NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE, TerminalColorConfig, TerminalCopyModeAction,
-        TerminalCopyModeOutcome, TerminalCursorConfig, TerminalEngine, TerminalFeatureConfig,
-        TerminalSearchDirection, TerminalSelectionEvent, TerminalSelectionFormat,
-        TerminalSideEffectEvent,
+        NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE, TerminalCopyModeAction, TerminalCopyModeOutcome,
+        TerminalEngine, TerminalLiveConfig, TerminalSearchDirection, TerminalSelectionEvent,
+        TerminalSelectionFormat, TerminalSideEffectEvent,
     },
     terminal_frame::RenderFrame,
     terminal_input_model::{KeyInput, MouseInput},
@@ -95,9 +98,7 @@ enum RmuxTerminalCommand {
     RenderCellMetrics(CellMetrics),
     Resize(TerminalGeometry),
     ForceResize,
-    Colors(TerminalColorConfig),
-    Cursor(TerminalCursorConfig),
-    Features(TerminalFeatureConfig),
+    ApplyLiveConfig(TerminalLiveConfig),
     Key(KeyInput),
     Focus(bool),
     Mouse(MouseInput),
@@ -377,7 +378,7 @@ impl RmuxNativeTerminal {
     }
 }
 
-impl TerminalRenderSource for RmuxNativeTerminal {
+impl TerminalFrameSource for RmuxNativeTerminal {
     fn set_display_scale(&mut self, display_scale: f32) -> Result<()> {
         let display_scale = if display_scale.is_finite() && display_scale > 0.0 {
             display_scale
@@ -411,6 +412,46 @@ impl TerminalRenderSource for RmuxNativeTerminal {
     fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
         self.check_worker_error()?;
         self.latest_frame.load()
+    }
+}
+
+impl TerminalRuntime for RmuxNativeTerminal {
+    fn drain_pty(&mut self) -> DrainStats {
+        // Keep worker errors for extract_frame, child_exited, or the next command to report.
+        self.take_drain_stats()
+    }
+
+    fn pending_pty_len(&self) -> usize {
+        self.pending_output_len.load(Ordering::Relaxed)
+    }
+
+    fn child_exited(&mut self) -> Result<bool> {
+        self.check_worker_error()?;
+        Ok(self.closed.load(Ordering::Relaxed))
+    }
+
+    fn tty_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn discard_pending_output(&mut self) -> Result<()> {
+        self.request(|done| RmuxTerminalCommand::DiscardPendingOutput { done })
+    }
+
+    fn force_resize(&mut self) -> Result<()> {
+        self.send_command(RmuxTerminalCommand::ForceResize)
+    }
+
+    fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
+        self.request(|done| RmuxTerminalCommand::FormatSelection { format, done })
+    }
+
+    fn current_working_directory(&mut self) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn apply_live_config(&mut self, config: TerminalLiveConfig) -> Result<()> {
+        self.send_command(RmuxTerminalCommand::ApplyLiveConfig(config))
     }
 
     fn is_mouse_tracking(&mut self) -> Result<bool> {
@@ -454,46 +495,6 @@ impl TerminalRenderSource for RmuxNativeTerminal {
 
     fn end_selection(&mut self, event: Option<TerminalSelectionEvent>) -> Result<()> {
         self.send_command(RmuxTerminalCommand::SelectionEnd(event))
-    }
-}
-
-impl TerminalRuntime for RmuxNativeTerminal {
-    fn drain_pty(&mut self) -> DrainStats {
-        let _ = self.check_worker_error();
-        self.take_drain_stats()
-    }
-
-    fn pending_pty_len(&self) -> usize {
-        self.pending_output_len.load(Ordering::Relaxed)
-    }
-
-    fn child_exited(&mut self) -> Result<bool> {
-        self.check_worker_error()?;
-        Ok(self.closed.load(Ordering::Relaxed))
-    }
-
-    fn discard_pending_output(&mut self) -> Result<()> {
-        self.request(|done| RmuxTerminalCommand::DiscardPendingOutput { done })
-    }
-
-    fn force_resize(&mut self) -> Result<()> {
-        self.send_command(RmuxTerminalCommand::ForceResize)
-    }
-
-    fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
-        self.request(|done| RmuxTerminalCommand::FormatSelection { format, done })
-    }
-
-    fn set_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
-        self.send_command(RmuxTerminalCommand::Cursor(cursor))
-    }
-
-    fn set_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
-        self.send_command(RmuxTerminalCommand::Features(features))
-    }
-
-    fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
-        self.send_command(RmuxTerminalCommand::Colors(colors))
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> Result<()> {
@@ -672,19 +673,10 @@ impl RmuxWorker {
                     self.queue_resize(self.geometry);
                     stats.terminal_changed = true;
                 }
-                RmuxTerminalCommand::Colors(colors) => {
-                    if self.engine.set_colors(colors).is_ok() {
-                        stats.terminal_changed = true;
-                    }
-                }
-                RmuxTerminalCommand::Cursor(cursor) => {
-                    if self.engine.set_cursor_config(cursor).is_ok() {
-                        stats.terminal_changed = true;
-                    }
-                }
-                RmuxTerminalCommand::Features(features) => {
-                    if self.engine.set_feature_config(features).is_ok() {
-                        stats.terminal_changed = true;
+                RmuxTerminalCommand::ApplyLiveConfig(config) => {
+                    match self.engine.apply_live_config(config) {
+                        Ok(()) => stats.terminal_changed = true,
+                        Err(error) => self.send_error(error),
                     }
                 }
                 RmuxTerminalCommand::Key(input) => {
@@ -1240,6 +1232,34 @@ mod tests {
         }
 
         assert!(closed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rmux_terminal_health_surfaces_a_worker_error_once() {
+        let (command_tx, _command_rx) = mpsc::channel();
+        let (error_tx, error_rx) = mpsc::channel();
+        let geometry = test_geometry();
+        let mut terminal = RmuxNativeTerminal {
+            command_tx,
+            latest_frame: Arc::new(RmuxPublishedFrame::new()),
+            latest_drain: Arc::new(Mutex::new(DrainStats::default())),
+            pending_output_len: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            error_rx,
+            geometry,
+            display_scale: 1.0,
+            render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
+            needs_initial_resize: false,
+        };
+        error_tx
+            .send("live config application failed".to_owned())
+            .unwrap();
+
+        assert_eq!(
+            terminal.extract_frame().unwrap_err().to_string(),
+            "live config application failed"
+        );
+        assert!(terminal.extract_frame().is_ok());
     }
 
     fn test_geometry() -> TerminalGeometry {

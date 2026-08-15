@@ -18,7 +18,7 @@ pub mod selection {
 pub mod terminal {
     pub use crate::terminal_engine::{
         TERMINAL_BACKGROUND, TERMINAL_FOREGROUND, TerminalCursorConfig, TerminalCursorStyle,
-        TerminalEngine, TerminalSearchDirection, TerminalSelectionFormat,
+        TerminalEngine, TerminalLiveConfig, TerminalSearchDirection, TerminalSelectionFormat,
     };
     pub use crate::terminal_frame::{
         CellStyle, CursorSnapshot, FrameColors, FrameScrollbar, FrameSelection, FrameStats,

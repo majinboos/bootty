@@ -6,14 +6,13 @@ use std::{
 
 use anyhow::Result;
 use bootty_runtime::{
-    DrainStats, TerminalSession, TerminalSessionConfig, render_source::TerminalRenderSource,
+    DrainStats, TerminalSession, TerminalSessionConfig, frame_source::TerminalFrameSource,
 };
 use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
 use bootty_terminal::{
     terminal_engine::{
-        TerminalColorConfig, TerminalCopyModeAction, TerminalCopyModeOutcome, TerminalCursorConfig,
-        TerminalFeatureConfig, TerminalSearchDirection, TerminalSelectionEvent,
-        TerminalSelectionFormat,
+        TerminalCopyModeAction, TerminalCopyModeOutcome, TerminalLiveConfig,
+        TerminalSearchDirection, TerminalSelectionEvent, TerminalSelectionFormat,
     },
     terminal_frame::RenderFrame,
     terminal_input_model::{KeyInput, MouseInput},
@@ -44,9 +43,7 @@ pub(super) struct StartingNativeTerminal {
     geometry: TerminalGeometry,
     display_scale: f32,
     render_cell: CellMetrics,
-    pending_colors: Option<TerminalColorConfig>,
-    pending_cursor: Option<TerminalCursorConfig>,
-    pending_features: Option<TerminalFeatureConfig>,
+    pending_live_config: Option<TerminalLiveConfig>,
     pending_commands: VecDeque<QueuedStartupCommand>,
     startup_error: Option<String>,
 }
@@ -73,9 +70,7 @@ impl StartingNativeTerminal {
             geometry,
             display_scale: 1.0,
             render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
-            pending_colors: None,
-            pending_cursor: None,
-            pending_features: None,
+            pending_live_config: None,
             pending_commands: VecDeque::new(),
             startup_error: None,
         }
@@ -111,14 +106,8 @@ impl StartingNativeTerminal {
         terminal.resize(self.geometry)?;
         terminal.set_display_scale(self.display_scale)?;
         terminal.set_render_cell_metrics(self.render_cell)?;
-        if let Some(colors) = self.pending_colors.clone() {
-            terminal.set_colors(colors)?;
-        }
-        if let Some(cursor) = self.pending_cursor {
-            terminal.set_cursor_config(cursor)?;
-        }
-        if let Some(features) = self.pending_features {
-            terminal.set_feature_config(features)?;
+        if let Some(config) = self.pending_live_config.take() {
+            terminal.apply_live_config(config)?;
         }
         while let Some(command) = self.pending_commands.pop_front() {
             apply_queued_startup_command(&mut terminal, command)?;
@@ -171,7 +160,7 @@ fn apply_queued_startup_command(
     }
 }
 
-impl TerminalRenderSource for StartingNativeTerminal {
+impl TerminalFrameSource for StartingNativeTerminal {
     fn set_display_scale(&mut self, display_scale: f32) -> Result<()> {
         self.display_scale = if display_scale.is_finite() && display_scale > 0.0 {
             display_scale
@@ -207,6 +196,70 @@ impl TerminalRenderSource for StartingNativeTerminal {
         } else {
             Ok(startup_placeholder_frame(self.geometry))
         }
+    }
+}
+
+impl TerminalRuntime for StartingNativeTerminal {
+    fn drain_pty(&mut self) -> DrainStats {
+        match self.ready_terminal() {
+            Ok(Some(terminal)) => terminal.drain_pty(),
+            Ok(None) | Err(_) => DrainStats::default(),
+        }
+    }
+
+    fn pending_pty_len(&self) -> usize {
+        self.terminal
+            .as_ref()
+            .map(TerminalSession::pending_pty_len)
+            .unwrap_or_default()
+    }
+
+    fn child_exited(&mut self) -> Result<bool> {
+        Ok(self
+            .ready_terminal()?
+            .map(TerminalSession::child_exited)
+            .transpose()?
+            .unwrap_or(false))
+    }
+
+    fn tty_name(&self) -> Option<&str> {
+        self.terminal.as_ref().and_then(TerminalSession::tty_name)
+    }
+
+    fn discard_pending_output(&mut self) -> Result<()> {
+        self.pending_commands.clear();
+        if let Some(terminal) = self.ready_terminal()? {
+            terminal.discard_pending_output()?;
+        }
+        Ok(())
+    }
+
+    fn force_resize(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
+        if let Some(terminal) = self.ready_terminal()? {
+            terminal.format_selection(format)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn current_working_directory(&mut self) -> Result<Option<String>> {
+        Ok(self
+            .ready_terminal()?
+            .and_then(|terminal| TerminalSession::current_working_directory(&*terminal)))
+    }
+
+    fn apply_live_config(&mut self, config: TerminalLiveConfig) -> Result<()> {
+        if let Some(terminal) = self.ready_terminal()? {
+            terminal.apply_live_config(config)?;
+        } else {
+            // Keep the latest aggregate. Startup applies it once after the worker is ready.
+            self.pending_live_config = Some(config);
+        }
+        Ok(())
     }
 
     fn is_mouse_tracking(&mut self) -> Result<bool> {
@@ -262,80 +315,6 @@ impl TerminalRenderSource for StartingNativeTerminal {
 
     fn end_selection(&mut self, event: Option<TerminalSelectionEvent>) -> Result<()> {
         self.queue_or_apply(QueuedStartupCommand::SelectionEnd(event))
-    }
-}
-
-impl TerminalRuntime for StartingNativeTerminal {
-    fn drain_pty(&mut self) -> DrainStats {
-        match self.ready_terminal() {
-            Ok(Some(terminal)) => terminal.drain_pty(),
-            Ok(None) | Err(_) => DrainStats::default(),
-        }
-    }
-
-    fn pending_pty_len(&self) -> usize {
-        self.terminal
-            .as_ref()
-            .map(TerminalSession::pending_pty_len)
-            .unwrap_or_default()
-    }
-
-    fn child_exited(&mut self) -> Result<bool> {
-        Ok(self
-            .ready_terminal()?
-            .map(TerminalSession::child_exited)
-            .transpose()?
-            .unwrap_or(false))
-    }
-
-    fn tty_name(&self) -> Option<&str> {
-        self.terminal.as_ref().and_then(TerminalSession::tty_name)
-    }
-
-    fn discard_pending_output(&mut self) -> Result<()> {
-        self.pending_commands.clear();
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.discard_pending_output()?;
-        }
-        Ok(())
-    }
-
-    fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.format_selection(format)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn current_working_directory(&mut self) -> Result<Option<String>> {
-        Ok(self
-            .ready_terminal()?
-            .and_then(|terminal| TerminalSession::current_working_directory(&*terminal)))
-    }
-
-    fn set_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
-        self.pending_cursor = Some(cursor);
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.set_cursor_config(cursor)?;
-        }
-        Ok(())
-    }
-
-    fn set_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
-        self.pending_features = Some(features);
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.set_feature_config(features)?;
-        }
-        Ok(())
-    }
-
-    fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
-        self.pending_colors = Some(colors.clone());
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.set_colors(colors)?;
-        }
-        Ok(())
     }
 
     fn write_input(&mut self, bytes: &[u8]) -> Result<()> {

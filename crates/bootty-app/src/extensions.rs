@@ -24,6 +24,8 @@ use starship_battery::{Manager as BatteryManager, State as BatteryState, units::
 use sysinfo::{MemoryRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 mod codexbar;
+#[path = "extension_source_writer.rs"]
+mod extension_source_writer;
 mod http;
 
 use codexbar::{
@@ -1775,7 +1777,7 @@ pub fn save_module(
     }
     std::fs::create_dir_all(dir)?;
     let path = user_module_path(dir, name).unwrap_or_else(|| dir.join(format!("{name}.luau")));
-    std::fs::write(&path, source)?;
+    extension_source_writer::save(&path, source)?;
     Ok(path)
 }
 

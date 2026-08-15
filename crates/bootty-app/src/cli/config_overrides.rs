@@ -9,7 +9,7 @@ use bootty_config::{
         WindowFullscreen, resolve_theme,
     },
 };
-use bootty_render::terminal_text::FontFeature;
+use bootty_font::FontFeature;
 use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
 use clap::{Args, ValueEnum};
 

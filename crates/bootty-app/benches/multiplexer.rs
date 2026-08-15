@@ -8,7 +8,6 @@ use bootty_app::{
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use eframe::egui::Vec2;
 
 const GEOMETRY: TerminalGeometry = TerminalGeometry {
     cols: 160,
@@ -114,11 +113,9 @@ fn terminal_engine() -> TerminalEngine {
 }
 
 fn surface() -> TerminalSurface {
-    TerminalSurface::for_size(
-        Vec2::new(
-            f32::from(GEOMETRY.cols) * GEOMETRY.cell_width as f32 + 20.0,
-            f32::from(GEOMETRY.rows) * GEOMETRY.cell_height as f32 + 20.0,
-        ),
+    TerminalSurface::for_logical_size(
+        f32::from(GEOMETRY.cols) * GEOMETRY.cell_width as f32 + 20.0,
+        f32::from(GEOMETRY.rows) * GEOMETRY.cell_height as f32 + 20.0,
         CellMetrics::new(GEOMETRY.cell_width as f32, GEOMETRY.cell_height as f32),
         TerminalPadding::uniform(10.0),
     )

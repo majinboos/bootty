@@ -822,7 +822,6 @@ mod tests {
             CellStyle, CursorSnapshot, FrameColors, FrameSelection, RenderCell, RenderFrame,
         },
     };
-    use eframe::egui::Vec2;
     use libghostty_vt::{render::Dirty, style::Underline};
     use proptest::prelude::*;
 
@@ -891,8 +890,9 @@ mod tests {
     }
 
     fn surface() -> TerminalSurface {
-        TerminalSurface::for_size(
-            Vec2::new(200.0, 80.0),
+        TerminalSurface::for_logical_size(
+            200.0,
+            80.0,
             CellMetrics::new(10.0, 20.0),
             TerminalPadding::uniform(5.0),
         )
@@ -1339,8 +1339,9 @@ mod tests {
 
     #[test]
     fn fitted_row_height_expands_line_spacing_without_stretching_text_runs() {
-        let fitted_surface = TerminalSurface::for_size(
-            Vec2::new(200.0, 96.0),
+        let fitted_surface = TerminalSurface::for_logical_size(
+            200.0,
+            96.0,
             CellMetrics::new(10.0, 24.0),
             TerminalPadding::uniform(5.0),
         );

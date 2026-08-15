@@ -5,10 +5,14 @@ use winit::{
 };
 
 use crate::{
-    geometry::{TerminalSurface, ViewTransform},
+    geometry::{SurfacePoint, TerminalSurface, ViewTransform},
     modifier_remap::ModifierRemapSet,
     terminal::{KeyInput, KeyMods, MouseAction, MouseButton, MouseInput, TerminalKey},
 };
+
+fn surface_point(pos: Pos2) -> SurfacePoint {
+    SurfacePoint { x: pos.x, y: pos.y }
+}
 
 pub fn key_mods_from_egui_modifiers(modifiers: egui::Modifiers) -> KeyMods {
     KeyMods {
@@ -278,8 +282,19 @@ fn terminal_key_from_winit_code(code: KeyCode) -> Option<TerminalKey> {
     })
 }
 
+#[cfg(feature = "bare-host")]
 pub fn mouse_input_from_surface(
     pos: Pos2,
+    action: MouseAction,
+    button: Option<MouseButton>,
+    mods: KeyMods,
+    surface: TerminalSurface,
+) -> Option<MouseInput> {
+    mouse_input_from_surface_point(surface_point(pos), action, button, mods, surface)
+}
+
+fn mouse_input_from_surface_point(
+    pos: SurfacePoint,
     action: MouseAction,
     button: Option<MouseButton>,
     mods: KeyMods,
@@ -305,9 +320,16 @@ pub fn mouse_input_from_surface_with_view(
     surface: TerminalSurface,
     view: ViewTransform,
 ) -> Option<MouseInput> {
-    mouse_input_from_surface(view.inverse_point(pos), action, button, mods, surface)
+    mouse_input_from_surface_point(
+        view.inverse_point(surface_point(pos)),
+        action,
+        button,
+        mods,
+        surface,
+    )
 }
 
+#[cfg(feature = "bare-host")]
 pub fn mouse_input_from_surface_clamped(
     pos: Pos2,
     action: MouseAction,
@@ -315,10 +337,20 @@ pub fn mouse_input_from_surface_clamped(
     mods: KeyMods,
     surface: TerminalSurface,
 ) -> MouseInput {
-    let clamped = Pos2::new(
-        pos.x.clamp(surface.rect.min.x, surface.rect.max.x),
-        pos.y.clamp(surface.rect.min.y, surface.rect.max.y),
-    );
+    mouse_input_from_surface_clamped_point(surface_point(pos), action, button, mods, surface)
+}
+
+fn mouse_input_from_surface_clamped_point(
+    pos: SurfacePoint,
+    action: MouseAction,
+    button: Option<MouseButton>,
+    mods: KeyMods,
+    surface: TerminalSurface,
+) -> MouseInput {
+    let clamped = SurfacePoint {
+        x: pos.x.clamp(surface.rect.min_x, surface.rect.max_x),
+        y: pos.y.clamp(surface.rect.min_y, surface.rect.max_y),
+    };
     let position = surface
         .mouse_position(clamped)
         .expect("clamped mouse position is inside the terminal surface");
@@ -340,7 +372,13 @@ pub fn mouse_input_from_surface_clamped_with_view(
     surface: TerminalSurface,
     view: ViewTransform,
 ) -> MouseInput {
-    mouse_input_from_surface_clamped(view.inverse_point(pos), action, button, mods, surface)
+    mouse_input_from_surface_clamped_point(
+        view.inverse_point(surface_point(pos)),
+        action,
+        button,
+        mods,
+        surface,
+    )
 }
 
 pub fn is_control_key(key: TerminalKey) -> bool {

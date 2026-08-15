@@ -1,14 +1,17 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
-use crate::config::{BoottyConfig, ConfigFileSnapshot, config_file_snapshot};
+use crate::config::{
+    BoottyConfig, ConfigFileSnapshot, ConfigResult, config_dependency_snapshot, load_config_attempt,
+};
 
 pub const CONFIG_HOT_RELOAD_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug)]
 pub struct ConfigHotReload {
+    path: PathBuf,
     last_check: Instant,
     snapshot: ConfigFileSnapshot,
 }
@@ -16,8 +19,9 @@ pub struct ConfigHotReload {
 impl ConfigHotReload {
     pub fn new(path: &Path) -> Self {
         Self {
+            path: path.to_path_buf(),
             last_check: Instant::now(),
-            snapshot: snapshot_for_config_path(path),
+            snapshot: config_dependency_snapshot(path),
         }
     }
 
@@ -34,11 +38,18 @@ impl ConfigHotReload {
         true
     }
 
-    pub fn refresh_after_reload(&mut self, path: &Path) {
-        self.snapshot = snapshot_for_config_path(path);
+    pub fn reload_config(&mut self) -> ConfigResult<BoottyConfig> {
+        let attempt = load_config_attempt(&self.path);
+        self.snapshot = attempt.snapshot;
+        attempt.config
+    }
+
+    pub fn refresh_dependency_graph(&mut self) {
+        self.snapshot = config_dependency_snapshot(&self.path);
     }
 }
 
+#[allow(clippy::float_cmp)]
 pub fn new_session_only_config_changed(previous: &BoottyConfig, next: &BoottyConfig) -> bool {
     previous.session != next.session
         || previous.window.width != next.window.width
@@ -46,11 +57,6 @@ pub fn new_session_only_config_changed(previous: &BoottyConfig, next: &BoottyCon
         || previous.window.fullscreen != next.window.fullscreen
         || previous.window.window_decoration != next.window.window_decoration
         || previous.window.macos_titlebar_style != next.window.macos_titlebar_style
-}
-
-fn snapshot_for_config_path(path: &Path) -> ConfigFileSnapshot {
-    config_file_snapshot(path)
-        .unwrap_or_else(|_| ConfigFileSnapshot::from_paths([path.to_path_buf()]))
 }
 
 #[cfg(test)]

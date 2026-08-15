@@ -1,6 +1,6 @@
 pub use crate::remote_space_protocol::decode_command;
 use anyhow::{Context, Result, bail};
-use bootty_config::config::MultiplexerBackendConfig;
+use bootty_mux_model::MuxBackendKind;
 
 use crate::{
     backend::MuxBackend,
@@ -21,15 +21,11 @@ const REMOTE_SPACE_SUBCOMMAND: &str = "remote-space";
 pub struct RemoteSpaceBackend {
     remote: SshRemote,
     space_id: String,
-    backend: MultiplexerBackendConfig,
+    backend: MuxBackendKind,
 }
 
 impl RemoteSpaceBackend {
-    pub fn new(
-        remote: SshRemote,
-        space_id: impl Into<String>,
-        backend: MultiplexerBackendConfig,
-    ) -> Self {
+    pub fn new(remote: SshRemote, space_id: impl Into<String>, backend: MuxBackendKind) -> Self {
         Self {
             remote,
             space_id: space_id.into(),
@@ -80,19 +76,19 @@ impl MuxBackend for RemoteSpaceBackend {
 
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
         match self.backend {
-            MultiplexerBackendConfig::Rmux => rmux_capabilities(scope),
-            MultiplexerBackendConfig::Tmux => tmux_capabilities(scope),
-            MultiplexerBackendConfig::Zellij => zellij_capabilities(scope),
-            MultiplexerBackendConfig::Native => BindingCapabilityDescriptor::new(scope, []),
+            MuxBackendKind::Rmux => rmux_capabilities(scope),
+            MuxBackendKind::Tmux => tmux_capabilities(scope),
+            MuxBackendKind::Zellij => zellij_capabilities(scope),
+            MuxBackendKind::Native => BindingCapabilityDescriptor::new(scope, []),
         }
     }
 }
 
-fn backend_name(backend: MultiplexerBackendConfig) -> &'static str {
+fn backend_name(backend: MuxBackendKind) -> &'static str {
     match backend {
-        MultiplexerBackendConfig::Native => "native",
-        MultiplexerBackendConfig::Rmux => "rmux",
-        MultiplexerBackendConfig::Tmux => "tmux",
-        MultiplexerBackendConfig::Zellij => "zellij",
+        MuxBackendKind::Native => "native",
+        MuxBackendKind::Rmux => "rmux",
+        MuxBackendKind::Tmux => "tmux",
+        MuxBackendKind::Zellij => "zellij",
     }
 }

@@ -10,23 +10,31 @@ use std::{
 use serde::{Deserialize, Deserializer, Serialize};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
-use bootty_render::terminal_text::{FontFeature, TerminalTextConfig};
-use bootty_runtime::{SessionLaunchConfig, TerminalSessionConfig};
-use bootty_terminal::{
-    terminal_engine::{
-        NATIVE_MAX_SCROLLBACK, TERMINAL_TERM, TerminalColorConfig, TerminalCursorConfig,
-        TerminalCursorStyle, TerminalFeatureConfig,
-    },
-    terminal_input_model::MacosOptionAsAlt,
+use bootty_font::FontFeature;
+pub use bootty_mux_model::{
+    MuxBackendKind as MultiplexerBackendConfig, MuxBindingConfig as MultiplexerConfig,
+    SshTarget as SshRemoteConfig,
 };
-use bootty_winit::modifier_remap::ModifierRemapSet;
 
 use crate::color::Color;
 
+const DEFAULT_MAX_SCROLLBACK: usize = 320_000_000;
+const DEFAULT_TERM: &str = "xterm-bootty";
+const DEFAULT_FONT_FAMILY: &str = "monospace";
+const DEFAULT_FONT_FEATURE: FontFeature = FontFeature::new(*b"liga", 1);
+const DEFAULT_FONT_SIZE: f32 = 11.75 * 96.0 / 72.0;
+const DEFAULT_FONT_FIT_CELL_HEIGHT: bool = true;
+const DEFAULT_FONT_FIT_CELL_WIDTH: bool = false;
+const DEFAULT_FONT_BASELINE_ADJUSTMENT: f32 = 3.0;
+const DEFAULT_FONT_UNDERLINE_POSITION: f32 = 2.0;
+const DEFAULT_FONT_UNDERLINE_THICKNESS: f32 = 1.0;
+
 mod keybind_presets;
 mod theme_catalog;
+mod writeback;
 
 pub use theme_catalog::{DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, builtin_theme_names};
+pub use writeback::{ConfigWriteOutcome, update_config_document};
 
 use keybind_presets::{
     owned_keybinds, preset_global_keybinds, preset_layout_keybinds, preset_tmux_backend_keybinds,
@@ -61,8 +69,6 @@ struct RawConfig {
     version: Option<u32>,
     #[serde(default)]
     theme: Option<String>,
-    #[serde(default)]
-    include: Vec<String>,
     #[serde(default)]
     colors: ColorPatch,
     #[serde(default)]
@@ -188,6 +194,7 @@ struct FontPatch {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ChromeConfig {
     pub sidebar: bool,
     /// Whether to show the module bar above the terminal.
@@ -368,68 +375,12 @@ fn default_status_segments() -> Vec<StatusSegment> {
     ]
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MultiplexerConfig {
-    pub backend: MultiplexerBackendConfig,
-    /// Hide tmux's own status bar in bootty's client by toggling the attached
-    /// session's `status` option off (and restoring it on detach). tmux-only.
-    pub hide_tmux_status: bool,
-    /// Reach the multiplexer on another host over SSH instead of this one. The backend's client
-    /// runs there and bootty renders it here, so its sessions attach like local ones. Set for the
-    /// client-server backends (`tmux`, `zellij`), which is what a remote client can drive.
-    pub remote: Option<SshRemoteConfig>,
-    /// The remote-owned Space selected through a named SSH profile.
-    pub remote_space_id: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct MultiplexerPatch {
     backend: Option<MultiplexerBackendConfig>,
     hide_tmux_status: Option<bool>,
     remote: Option<SshRemoteConfig>,
-}
-
-/// Where and how to run the multiplexer client for a remote binding.
-///
-/// `host` alone is enough when the host is an `~/.ssh/config` alias; `user`, `port` and `args`
-/// cover the machines where that file is absent or does not describe the host.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct SshRemoteConfig {
-    /// SSH config alias, hostname or address of the host running the multiplexer.
-    pub host: String,
-    /// Login user, when it is neither the local user nor covered by `~/.ssh/config`.
-    #[serde(default)]
-    pub user: Option<String>,
-    /// SSH port, when it is neither 22 nor covered by `~/.ssh/config`.
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// The SSH client to run. Both OpenSSH builds bootty targets are called `ssh`, including the
-    /// one shipped with Windows.
-    #[serde(default = "default_ssh_program")]
-    pub program: String,
-    /// Extra flags handed to the SSH client before the destination, for whatever `~/.ssh/config`
-    /// does not carry: `-i`, `-J`, `-o`.
-    #[serde(default)]
-    pub args: Vec<String>,
-}
-
-fn default_ssh_program() -> String {
-    "ssh".to_owned()
-}
-
-impl SshRemoteConfig {
-    /// A remote reached as `~/.ssh/config` describes it, or as the defaults do when it says nothing.
-    pub fn for_host(host: impl Into<String>) -> Self {
-        Self {
-            host: host.into(),
-            user: None,
-            port: None,
-            program: default_ssh_program(),
-            args: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -472,6 +423,10 @@ pub struct SshProfileConfig {
     pub args: Vec<String>,
 }
 
+fn default_ssh_program() -> String {
+    "ssh".to_owned()
+}
+
 impl SshProfileConfig {
     pub fn to_remote(&self) -> SshRemoteConfig {
         let mut args = Vec::new();
@@ -480,7 +435,7 @@ impl SshProfileConfig {
         }
         match self.host_key_policy {
             SshHostKeyPolicyConfig::Strict => {
-                args.extend(["-o".to_owned(), "StrictHostKeyChecking=yes".to_owned()])
+                args.extend(["-o".to_owned(), "StrictHostKeyChecking=yes".to_owned()]);
             }
             SshHostKeyPolicyConfig::AcceptNew => args.extend([
                 "-o".to_owned(),
@@ -542,49 +497,6 @@ fn nonempty_owned(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-}
-
-impl MultiplexerBackendConfig {
-    /// Whether this backend's multiplexer can live on another host. `tmux` and `zellij` are driven
-    /// through a client bootty can run anywhere, and `rmux` through its own command line on the
-    /// host holding the daemon. `native` panes are this process's own PTYs and have nowhere else to
-    /// be.
-    pub fn supports_remote(self) -> bool {
-        match self {
-            Self::Tmux | Self::Zellij | Self::Rmux => true,
-            Self::Native => false,
-        }
-    }
-}
-
-impl MultiplexerConfig {
-    pub fn validate_remote(&self) -> ConfigResult<()> {
-        let Some(remote) = &self.remote else {
-            return Ok(());
-        };
-        if remote.host.trim().is_empty() {
-            return Err(ConfigLoadError::new(
-                "multiplexer.remote.host must name a host".to_owned(),
-            ));
-        }
-        if self.backend.supports_remote() {
-            return Ok(());
-        }
-        Err(ConfigLoadError::new(format!(
-            "multiplexer.remote needs a backend with a client to run there, got {:?}",
-            self.backend
-        )))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum MultiplexerBackendConfig {
-    Rmux,
-    #[default]
-    Native,
-    Tmux,
-    Zellij,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -651,17 +563,6 @@ pub enum MacosOptionAsAltConfig {
     #[default]
     #[serde(alias = "true")]
     Both,
-}
-
-impl From<MacosOptionAsAltConfig> for MacosOptionAsAlt {
-    fn from(value: MacosOptionAsAltConfig) -> Self {
-        match value {
-            MacosOptionAsAltConfig::None => Self::None,
-            MacosOptionAsAltConfig::Left => Self::Left,
-            MacosOptionAsAltConfig::Right => Self::Right,
-            MacosOptionAsAltConfig::Both => Self::Both,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -845,18 +746,7 @@ pub enum CursorStyleConfig {
     HollowBlock,
 }
 
-impl From<CursorStyleConfig> for TerminalCursorStyle {
-    fn from(value: CursorStyleConfig) -> Self {
-        match value {
-            CursorStyleConfig::Bar => Self::Bar,
-            CursorStyleConfig::Block => Self::Block,
-            CursorStyleConfig::Underline => Self::Underline,
-            CursorStyleConfig::HollowBlock => Self::HollowBlock,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct CursorPatch {
     style: Option<CursorStyleConfig>,
@@ -888,20 +778,19 @@ pub type ConfigResult<T> = Result<T, ConfigLoadError>;
 
 impl Default for FontConfig {
     fn default() -> Self {
-        let text = TerminalTextConfig::default();
         Self {
-            family: text.families,
+            family: vec![DEFAULT_FONT_FAMILY.to_owned()],
             ui_family: Vec::new(),
             ui_use_terminal_family: false,
-            features: text.font_features,
-            size: text.font_size,
-            cell_width: text.cell_width,
-            cell_height: text.cell_height,
-            fit_cell_height: text.fit_cell_height,
-            fit_cell_width: text.fit_cell_width,
-            baseline_adjustment: text.baseline_adjustment,
-            underline_position: text.underline_position,
-            underline_thickness: text.underline_thickness,
+            features: vec![DEFAULT_FONT_FEATURE],
+            size: DEFAULT_FONT_SIZE,
+            cell_width: None,
+            cell_height: None,
+            fit_cell_height: DEFAULT_FONT_FIT_CELL_HEIGHT,
+            fit_cell_width: DEFAULT_FONT_FIT_CELL_WIDTH,
+            baseline_adjustment: DEFAULT_FONT_BASELINE_ADJUSTMENT,
+            underline_position: DEFAULT_FONT_UNDERLINE_POSITION,
+            underline_thickness: DEFAULT_FONT_UNDERLINE_THICKNESS,
         }
     }
 }
@@ -912,30 +801,6 @@ impl FontConfig {
             &self.family
         } else {
             &self.ui_family
-        }
-    }
-
-    pub fn terminal_text_config(&self) -> TerminalTextConfig {
-        TerminalTextConfig {
-            families: self.family.clone(),
-            font_size: self.size,
-            font_features: self.features.clone(),
-            cell_width: self.cell_width,
-            cell_height: self.cell_height,
-            fit_cell_height: self.fit_cell_height,
-            fit_cell_width: self.fit_cell_width,
-            baseline_adjustment: self.baseline_adjustment,
-            underline_position: self.underline_position,
-            underline_thickness: self.underline_thickness,
-            ..TerminalTextConfig::default()
-        }
-    }
-}
-
-impl SessionConfig {
-    pub fn terminal_feature_config(&self) -> TerminalFeatureConfig {
-        TerminalFeatureConfig {
-            glyph_protocol: self.glyph_protocol,
         }
     }
 }
@@ -964,60 +829,16 @@ impl Default for ChromeConfig {
     }
 }
 
-impl Default for MultiplexerConfig {
-    fn default() -> Self {
-        Self {
-            backend: MultiplexerBackendConfig::Native,
-            hide_tmux_status: false,
-            remote: None,
-            remote_space_id: None,
-        }
-    }
-}
-
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             shell: None,
             working_directory: None,
             env: Vec::new(),
-            term: TERMINAL_TERM.to_owned(),
+            term: DEFAULT_TERM.to_owned(),
             colorterm: "truecolor".to_owned(),
-            max_scrollback: NATIVE_MAX_SCROLLBACK,
+            max_scrollback: DEFAULT_MAX_SCROLLBACK,
             glyph_protocol: true,
-        }
-    }
-}
-
-impl SessionConfig {
-    pub fn launch_config(&self) -> SessionLaunchConfig {
-        SessionLaunchConfig {
-            shell: self.shell.clone(),
-            args: Vec::new(),
-            working_directory: self
-                .working_directory
-                .clone()
-                .or_else(default_working_directory),
-            env: self.env.clone(),
-            env_remove: Vec::new(),
-            term: self.term.clone(),
-            colorterm: self.colorterm.clone(),
-        }
-    }
-}
-
-impl BoottyConfig {
-    pub fn terminal_session_config(&self) -> TerminalSessionConfig {
-        TerminalSessionConfig {
-            launch: self.session.launch_config(),
-            colors: self.colors.terminal_color_config(),
-            cursor: self.cursor.terminal_cursor_config(),
-            features: self.session.terminal_feature_config(),
-            max_scrollback: self.session.max_scrollback,
-            macos_option_as_alt: self.input.macos_option_as_alt.into(),
-            side_effect_tx: None,
-            side_effect_pane_id: None,
-            benchmark_trace: None,
         }
     }
 }
@@ -1047,43 +868,6 @@ fn default_working_directory_from(
 
 fn non_empty_env_path(value: Option<OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
-}
-
-impl ColorConfig {
-    pub fn terminal_color_config(&self) -> TerminalColorConfig {
-        let mut terminal = TerminalColorConfig::default();
-        if let Some(background) = self.background {
-            terminal.background = background.into();
-        }
-        if let Some(foreground) = self.foreground {
-            terminal.foreground = foreground.into();
-        }
-        if let Some(cursor) = self.cursor {
-            terminal.cursor = Some(cursor.into());
-        }
-        terminal.cursor_text = self.cursor_text.map(Into::into);
-        terminal.pointer_foreground = self.pointer_foreground.map(Into::into);
-        terminal.pointer_background = self.pointer_background.map(Into::into);
-        terminal.tektronix_foreground = self.tektronix_foreground.map(Into::into);
-        terminal.tektronix_background = self.tektronix_background.map(Into::into);
-        terminal.highlight_background = self.highlight_background.map(Into::into);
-        terminal.tektronix_cursor = self.tektronix_cursor.map(Into::into);
-        terminal.highlight_foreground = self.highlight_foreground.map(Into::into);
-        terminal.selection_background = self.selection_background.map(Into::into);
-        terminal.selection_foreground = self.selection_foreground.map(Into::into);
-        if !self.palette.is_empty() {
-            terminal.palette = self
-                .palette
-                .iter()
-                .take(256)
-                .copied()
-                .map(Into::into)
-                .collect();
-        }
-        terminal.palette_generate = self.palette_generate;
-        terminal.palette_harmonious = self.palette_harmonious;
-        terminal
-    }
 }
 
 impl Default for AppearanceConfig {
@@ -1132,27 +916,7 @@ impl BoottyConfig {
     }
 }
 
-impl CursorConfig {
-    pub fn terminal_cursor_config(&self) -> TerminalCursorConfig {
-        TerminalCursorConfig {
-            style: self.style.map(Into::into),
-            blink: self.blink,
-        }
-    }
-}
-
 impl InputConfig {
-    pub fn modifier_remaps(&self) -> ConfigResult<ModifierRemapSet> {
-        let mut set = ModifierRemapSet::default();
-        for remap in &self.modifier_remap {
-            set.parse(remap).map_err(|error| {
-                ConfigLoadError::new(format!("invalid modifier-remap {remap:?}: {error}"))
-            })?;
-        }
-        set.finalize();
-        Ok(set)
-    }
-
     pub fn keybinds_for_backend(&self, backend: MultiplexerBackendConfig) -> Vec<String> {
         let mut keybinds = self.keybind.clone();
         let backend_keybinds = match backend {
@@ -1316,6 +1080,7 @@ impl ConfigFileSnapshot {
         Self { files }
     }
 
+    #[must_use]
     pub fn refresh_known_paths(&self) -> Self {
         Self::from_paths(self.files.iter().map(|file| file.path.clone()))
     }
@@ -1336,21 +1101,12 @@ impl ConfigFileStamp {
 
 #[derive(Clone, Debug)]
 pub struct ConfigDocument {
-    path: PathBuf,
     document: DocumentMut,
 }
 
 impl ConfigDocument {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn document(&self) -> &DocumentMut {
         &self.document
-    }
-
-    pub fn to_toml_string(&self) -> String {
-        self.document.to_string()
     }
 
     pub fn set_item(&mut self, path: &[&str], item: Item) -> ConfigResult<()> {
@@ -1392,23 +1148,6 @@ impl ConfigDocument {
         }
         table.remove(leaf);
         Ok(())
-    }
-
-    pub fn write_to_disk(&self) -> ConfigResult<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                ConfigLoadError::new(format!(
-                    "failed to create config directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        fs::write(&self.path, self.to_toml_string()).map_err(|error| {
-            ConfigLoadError::new(format!(
-                "failed to write config file {}: {error}",
-                self.path.display()
-            ))
-        })
     }
 }
 
@@ -1500,46 +1239,64 @@ pub fn config_path_from_env(
     xdg_config_home: Option<impl AsRef<Path>>,
     home: Option<impl AsRef<Path>>,
 ) -> PathBuf {
-    if let Some(xdg) = xdg_config_home {
-        return xdg.as_ref().join("bootty/config.toml");
-    }
-    if let Some(home) = home {
-        return home.as_ref().join(".config/bootty/config.toml");
-    }
-    PathBuf::from("bootty/config.toml")
+    bootty_identity::config_path_from_env(
+        bootty_identity::ApplicationIdentity::Production,
+        xdg_config_home,
+        home,
+    )
 }
 
 pub fn load_config_from_path(path: impl AsRef<Path>) -> ConfigResult<BoottyConfig> {
     let path = path.as_ref();
+    load_config_attempt(path).config
+}
+
+pub(crate) struct ConfigLoadAttempt {
+    pub(crate) config: ConfigResult<BoottyConfig>,
+    pub(crate) snapshot: ConfigFileSnapshot,
+}
+
+pub(crate) fn load_config_attempt(path: &Path) -> ConfigLoadAttempt {
     if !path.exists() {
         let config = BoottyConfig {
             config_path: path.to_path_buf(),
             ..Default::default()
         };
-        return Ok(config);
+        return ConfigLoadAttempt {
+            config: Ok(config),
+            snapshot: ConfigFileSnapshot::from_paths([path.to_path_buf()]),
+        };
     }
 
-    let mut stack = Vec::new();
-    let mut loaded = HashSet::new();
-    let mut document = load_merged_config_document(path, &mut stack, &mut loaded)?;
-    let compatibility_warnings = take_ghostty_compatibility_warnings(&mut document);
-    let raw = parse_raw_config_document(document, path)?;
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut config = ConfigResolver {
-        path: path.to_path_buf(),
-        config_dir,
-    }
-    .resolve(raw)?;
-    config.compatibility_warnings = compatibility_warnings;
-    Ok(config)
+    let ConfigGraphLoad { document, snapshot } = load_config_graph(path);
+    let config = document.and_then(|mut document| {
+        let compatibility_warnings = take_ghostty_compatibility_warnings(&mut document);
+        document.as_table_mut().remove("include");
+        let raw = parse_raw_config_document(document, path)?;
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut config = ConfigResolver {
+            path: path.to_path_buf(),
+            config_dir,
+        }
+        .resolve(raw)?;
+        config.compatibility_warnings = compatibility_warnings;
+        Ok(config)
+    });
+    ConfigLoadAttempt { config, snapshot }
 }
 
 pub fn config_file_snapshot(path: impl AsRef<Path>) -> ConfigResult<ConfigFileSnapshot> {
-    let mut stack = Vec::new();
-    let mut loaded = HashSet::new();
-    let mut paths = Vec::new();
-    collect_config_paths(path.as_ref(), &mut stack, &mut loaded, &mut paths)?;
-    Ok(ConfigFileSnapshot::from_paths(paths))
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(ConfigFileSnapshot::from_paths([path.to_path_buf()]));
+    }
+    let ConfigGraphLoad { document, snapshot } = load_config_graph(path);
+    document?;
+    Ok(snapshot)
+}
+
+pub(crate) fn config_dependency_snapshot(path: &Path) -> ConfigFileSnapshot {
+    load_config_graph(path).snapshot
 }
 
 pub fn load_config_document(path: impl AsRef<Path>) -> ConfigResult<Option<ConfigDocument>> {
@@ -1552,10 +1309,7 @@ pub fn load_config_document(path: impl AsRef<Path>) -> ConfigResult<Option<Confi
                     path.display()
                 ))
             })?;
-            Ok(Some(ConfigDocument {
-                path: path.to_path_buf(),
-                document,
-            }))
+            Ok(Some(ConfigDocument { document }))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(ConfigLoadError::new(format!(
@@ -1569,75 +1323,99 @@ pub fn load_or_create_config_document(path: impl AsRef<Path>) -> ConfigResult<Co
     let path = path.as_ref();
     load_config_document(path).map(|document| {
         document.unwrap_or_else(|| ConfigDocument {
-            path: path.to_path_buf(),
             document: DocumentMut::new(),
         })
     })
 }
 
-pub fn write_font_size_preference(path: impl AsRef<Path>, size: f32) -> ConfigResult<()> {
-    let mut document = load_or_create_config_document(path)?;
-    document.set_item(&["font", "size"], toml_edit::value(f64::from(size)))?;
-    document.write_to_disk()
+pub fn write_font_size_preference(
+    path: impl AsRef<Path>,
+    size: f32,
+) -> ConfigResult<ConfigWriteOutcome> {
+    update_config_document(path, |document| {
+        document.set_item(&["font", "size"], toml_edit::value(f64::from(size)))
+    })
 }
 
-fn load_merged_config_document(
-    path: &Path,
-    stack: &mut Vec<PathBuf>,
-    loaded: &mut HashSet<PathBuf>,
-) -> ConfigResult<DocumentMut> {
-    let id = config_file_id(path);
-    if stack.contains(&id) {
-        return Err(ConfigLoadError::new(format!(
-            "config include cycle detected at {}",
-            path.display()
-        )));
-    }
-    if loaded.contains(&id) {
-        return Ok(DocumentMut::new());
-    }
+struct ConfigGraphLoad {
+    document: ConfigResult<DocumentMut>,
+    snapshot: ConfigFileSnapshot,
+}
 
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+#[derive(Default)]
+struct ConfigGraphTraversal {
+    stack: Vec<PathBuf>,
+    loaded: HashSet<PathBuf>,
+    paths: Vec<PathBuf>,
+}
+
+fn load_config_graph(path: &Path) -> ConfigGraphLoad {
+    let mut traversal = ConfigGraphTraversal::default();
+    let document = traversal.load_merged_document(path);
+    ConfigGraphLoad {
+        document,
+        snapshot: ConfigFileSnapshot::from_paths(traversal.paths),
+    }
+}
+
+impl ConfigGraphTraversal {
+    fn load_merged_document(&mut self, path: &Path) -> ConfigResult<DocumentMut> {
+        let id = config_file_id(path);
+        self.paths.push(id.clone());
+        if self.stack.contains(&id) {
             return Err(ConfigLoadError::new(format!(
-                "config file not found: {}",
+                "config include cycle detected at {}",
                 path.display()
             )));
         }
-        Err(error) => {
-            return Err(ConfigLoadError::new(format!(
-                "failed to read config file {}: {error}",
-                path.display()
-            )));
+        if self.loaded.contains(&id) {
+            return Ok(DocumentMut::new());
         }
-    };
-    let mut document = source.parse::<DocumentMut>().map_err(|error| {
-        ConfigLoadError::new(format!(
-            "failed to parse config file {}: {error}",
-            path.display()
-        ))
-    })?;
-    let includes = config_document_includes(&document, path)?;
 
-    stack.push(id.clone());
-    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    for include in includes {
-        let include = IncludePath::parse(&include);
-        let include_path = include.resolve(base_dir);
-        if !include_path.exists() && include.optional {
-            continue;
+        let source = match fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ConfigLoadError::new(format!(
+                    "config file not found: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(ConfigLoadError::new(format!(
+                    "failed to read config file {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let mut document = source.parse::<DocumentMut>().map_err(|error| {
+            ConfigLoadError::new(format!(
+                "failed to parse config file {}: {error}",
+                path.display()
+            ))
+        })?;
+        let includes = config_document_includes(&document, path)?;
+
+        self.stack.push(id.clone());
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        for include in includes {
+            let include = IncludePath::parse(&include);
+            let include_path = include.resolve(base_dir);
+            if !include_path.exists() && include.optional {
+                self.paths.push(config_file_id(&include_path));
+                continue;
+            }
+            let child = self.load_merged_document(&include_path)?;
+            let child = child.into_table();
+            merge_toml_tables(document.as_table_mut(), &child);
         }
-        let child = load_merged_config_document(&include_path, stack, loaded)?;
-        merge_toml_tables(document.as_table_mut(), child.into_table());
+        self.stack.pop();
+        self.loaded.insert(id);
+        Ok(document)
     }
-    stack.pop();
-    loaded.insert(id);
-    Ok(document)
 }
 
-fn merge_toml_tables(target: &mut Table, overlay: Table) {
-    merge_toml_table_like(target, &overlay);
+fn merge_toml_tables(target: &mut Table, overlay: &Table) {
+    merge_toml_table_like(target, overlay);
 }
 
 fn merge_toml_table_like(target: &mut dyn TableLike, overlay: &dyn TableLike) {
@@ -1707,62 +1485,6 @@ fn config_document_includes(document: &DocumentMut, path: &Path) -> ConfigResult
             })
         })
         .collect()
-}
-
-fn parse_raw_config_source(source: &str, path: &Path) -> ConfigResult<RawConfig> {
-    let mut document = source.parse::<DocumentMut>().map_err(|error| {
-        ConfigLoadError::new(format!(
-            "failed to parse config file {}: {error}",
-            path.display()
-        ))
-    })?;
-    take_ghostty_compatibility_warnings(&mut document);
-    parse_raw_config_document(document, path)
-}
-
-fn collect_config_paths(
-    path: &Path,
-    stack: &mut Vec<PathBuf>,
-    loaded: &mut HashSet<PathBuf>,
-    paths: &mut Vec<PathBuf>,
-) -> ConfigResult<()> {
-    let id = config_file_id(path);
-    paths.push(id.clone());
-    if stack.contains(&id) {
-        return Err(ConfigLoadError::new(format!(
-            "config include cycle detected at {}",
-            path.display()
-        )));
-    }
-    if loaded.contains(&id) {
-        return Ok(());
-    }
-
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            loaded.insert(id);
-            return Ok(());
-        }
-        Err(error) => {
-            return Err(ConfigLoadError::new(format!(
-                "failed to read config file {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    let raw = parse_raw_config_source(&source, path)?;
-
-    stack.push(id.clone());
-    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    for include in raw.include {
-        let include = IncludePath::parse(&include);
-        let include_path = include.resolve(base_dir);
-        collect_config_paths(&include_path, stack, loaded, paths)?;
-    }
-    stack.pop();
-    loaded.insert(id);
-    Ok(())
 }
 
 fn config_file_id(path: &Path) -> PathBuf {
@@ -1966,7 +1688,9 @@ fn apply_partial_multiplexer(
     apply_value(&mut multiplexer.backend, partial.backend);
     apply_value(&mut multiplexer.hide_tmux_status, partial.hide_tmux_status);
     apply_present(&mut multiplexer.remote, partial.remote);
-    multiplexer.validate_remote()
+    multiplexer
+        .validate_remote()
+        .map_err(|error| ConfigLoadError::new(error.to_string()))
 }
 
 fn apply_partial_input(input: &mut InputConfig, partial: InputPatch) {

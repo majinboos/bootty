@@ -1,8 +1,5 @@
 use std::collections::HashSet;
 
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
     workspace::{
@@ -11,6 +8,8 @@ use crate::{
         SpaceRemoteOverride, WorkspaceBinding, WorkspaceRepository,
     },
 };
+use anyhow::{Result, bail};
+pub use bootty_mux::RemoteSpaceSummary;
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
     command::MuxCommand,
@@ -20,14 +19,6 @@ use bootty_mux::{
 };
 
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-pub struct RemoteSpaceSummary {
-    pub catalog_version: u32,
-    pub id: String,
-    pub name: String,
-    pub backend: MultiplexerBackendConfig,
-}
 
 pub fn list(config: &BoottyConfig) -> Result<Vec<RemoteSpaceSummary>> {
     let (_, snapshot) = WorkspaceRepository::open(&config.config_path)?;

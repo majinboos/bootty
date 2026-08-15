@@ -23,6 +23,12 @@ the remote user's home directory. The `.exe` suffix is intentional on every
 platform. It gives Bootty one shell-neutral remote path while Unix still
 executes the file normally.
 
+On Unix, Bootty uploads a unique candidate beside the installed path. It makes
+the candidate executable and verifies its exact protocol and package version.
+It then atomically replaces the installed path and verifies that path again.
+A failure before replacement leaves the prior installed daemon unchanged.
+Windows keeps first-writer publication for its versioned executable path.
+
 ## Publish a release
 
 Run one command from a clean, synced `main` branch:

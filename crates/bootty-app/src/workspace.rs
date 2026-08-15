@@ -14,7 +14,10 @@ pub use crate::{
 
 use crate::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig, default_config_path},
-    mux::controller::{BindingId, MuxScope, SpaceId},
+    mux::{
+        controller::{BindingId, MuxScope, SpaceId},
+        membership::{BackendMembership, MembershipOperation},
+    },
     session_order::SessionGroup,
 };
 
@@ -83,6 +86,38 @@ pub enum BindingMembershipMutation {
     },
 }
 
+impl BindingMembershipMutation {
+    fn backend_operation(&self) -> MembershipOperation {
+        match self {
+            Self::Create {
+                session_id,
+                session_name,
+                ..
+            } => MembershipOperation::Create {
+                session_id: session_id.clone(),
+                session_name: session_name.clone(),
+            },
+            Self::Rename {
+                session_id,
+                old_name,
+                new_name,
+                ..
+            } => MembershipOperation::Rename {
+                session_id: session_id.clone(),
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            },
+            Self::Ditch {
+                session_id,
+                old_name,
+            } => MembershipOperation::Ditch {
+                session_id: session_id.clone(),
+                old_name: old_name.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingBindingMembershipMutation {
     mutation: BindingMembershipMutation,
@@ -94,11 +129,7 @@ impl PendingBindingMembershipMutation {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BackendSessionMembership {
-    pub id: String,
-    pub name: String,
-}
+pub type BackendSessionMembership = BackendMembership;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpaceMuxOverride {
@@ -644,7 +675,11 @@ impl WorkspaceRepository {
         let Some(pending) = self.load_pending_binding_membership_mutation(&tx, scope)? else {
             return Ok(false);
         };
-        if binding_membership_effect_occurred(&pending.mutation, memberships) {
+        if pending
+            .mutation
+            .backend_operation()
+            .effect_occurred(memberships)
+        {
             let mut next_order = session_order.clone();
             let mut next_names = session_names.clone();
             apply_binding_membership_mutation(&pending.mutation, &mut next_order, &mut next_names)?;
@@ -1093,40 +1128,26 @@ fn validate_pending_binding_operations(
 fn validate_binding_membership_mutation(
     mutation: &BindingMembershipMutation,
 ) -> WorkspaceResult<()> {
+    mutation
+        .backend_operation()
+        .validate()
+        .map_err(|_| WorkspacePersistenceError::new("binding membership mutation is invalid"))?;
     let valid_text = |value: &str| !value.is_empty() && !value.contains('\0');
     let valid_cwd = |cwd: &Option<String>| cwd.as_deref().is_none_or(|cwd| !cwd.contains('\0'));
     let valid = match mutation {
         BindingMembershipMutation::Create {
-            session_id,
-            session_name,
             display_name,
             explicit: _,
             cwd,
-        } => {
-            valid_text(session_id)
-                && valid_text(session_name)
-                && valid_text(display_name)
-                && valid_cwd(cwd)
-        }
+            ..
+        } => valid_text(display_name) && valid_cwd(cwd),
         BindingMembershipMutation::Rename {
-            session_id,
-            old_name,
-            new_name,
             display_name,
             explicit: _,
             cwd,
-        } => {
-            valid_text(session_id)
-                && valid_text(old_name)
-                && valid_text(new_name)
-                && valid_text(display_name)
-                && old_name != new_name
-                && valid_cwd(cwd)
-        }
-        BindingMembershipMutation::Ditch {
-            session_id,
-            old_name,
-        } => valid_text(session_id) && valid_text(old_name),
+            ..
+        } => valid_text(display_name) && valid_cwd(cwd),
+        BindingMembershipMutation::Ditch { .. } => true,
     };
     valid
         .then_some(())
@@ -1357,44 +1378,6 @@ fn apply_binding_membership_mutation(
         }
     }
     Ok(())
-}
-
-fn binding_membership_effect_occurred(
-    mutation: &BindingMembershipMutation,
-    memberships: &[BackendSessionMembership],
-) -> bool {
-    match mutation {
-        BindingMembershipMutation::Create {
-            session_id,
-            session_name,
-            ..
-        } => memberships
-            .iter()
-            .any(|session| session.id == *session_id || session.name == *session_name),
-        BindingMembershipMutation::Rename {
-            session_id,
-            old_name,
-            new_name,
-            ..
-        } => {
-            let renamed_stable_id = memberships
-                .iter()
-                .any(|session| session.id == *session_id && session.name == *new_name);
-            let renamed_name_key = memberships
-                .iter()
-                .any(|session| session.id == *new_name && session.name == *new_name)
-                && !memberships
-                    .iter()
-                    .any(|session| session.id == *old_name || session.name == *old_name);
-            renamed_stable_id || renamed_name_key
-        }
-        BindingMembershipMutation::Ditch {
-            session_id,
-            old_name,
-        } => !memberships.iter().any(|session| {
-            session.id == *session_id || session.name == *old_name || session.name == *session_id
-        }),
-    }
 }
 
 pub(crate) fn sqlite_path(config_path: &Path) -> PathBuf {

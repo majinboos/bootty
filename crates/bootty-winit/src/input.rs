@@ -445,7 +445,7 @@ fn terminal_mouse_button(button: egui::PointerButton) -> Option<MouseButton> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::{CellMetrics, TerminalSurface};
+    use crate::geometry::{CellMetrics, SurfaceRect, TerminalSurface};
     use crate::input_binding::{BindingKey, BindingMods, BindingTrigger};
     use crate::modifier_remap::ModifierRemapSet;
     use crate::terminal::{KeyMods, MouseEncoderSize};
@@ -459,6 +459,18 @@ mod tests {
             command,
             ..Default::default()
         }
+    }
+
+    fn terminal_surface(rect: Rect, cell: CellMetrics) -> TerminalSurface {
+        TerminalSurface::for_rect(
+            SurfaceRect {
+                min_x: rect.min.x,
+                min_y: rect.min.y,
+                max_x: rect.max.x,
+                max_y: rect.max.y,
+            },
+            cell,
+        )
     }
 
     fn mouse_wheel_scroll_delta_for(command: &TerminalInputCommand) -> isize {
@@ -934,7 +946,7 @@ mod tests {
             MouseAction::Press,
             Some(MouseButton::Left),
             modifiers(true, false, false),
-            Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+            Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
             ViewTransform::IDENTITY,
         )
         .expect("inside terminal rect");
@@ -954,7 +966,7 @@ mod tests {
     #[test]
     fn mouse_input_inverts_view_transform_before_encoding() {
         let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
-        let surface = TerminalSurface::for_rect(rect, CellMetrics::new(10.0, 20.0));
+        let surface = terminal_surface(rect, CellMetrics::new(10.0, 20.0));
         let view = ViewTransform {
             zoom: 2.0,
             pan_x: -15.0,
@@ -1007,7 +1019,7 @@ mod tests {
     #[test]
     fn mouse_input_scales_fractional_rendered_cell_height_to_encoder_grid() {
         let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(1_000.0, 765.0));
-        let surface = TerminalSurface::for_rect(rect, CellMetrics::new(10.0, 22.5));
+        let surface = terminal_surface(rect, CellMetrics::new(10.0, 22.5));
         let commands = terminal_input_commands(InputSnapshot {
             events: vec![egui::Event::PointerButton {
                 pos: Pos2::new(5.0, 33.0 * 22.5),
@@ -1056,7 +1068,7 @@ mod tests {
             modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(35.0, 70.0)),
             pressed_mouse_button: Some(MouseButton::Left),
-            surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+            surface: Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
             mouse_exclusion: None,
             view: ViewTransform::IDENTITY,
         });
@@ -1111,7 +1123,7 @@ mod tests {
             modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(35.0, 70.0)),
             pressed_mouse_button: None,
-            surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+            surface: Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
             mouse_exclusion: None,
             view: ViewTransform::IDENTITY,
         });
@@ -1173,7 +1185,7 @@ mod tests {
             modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(35.0, 70.0)),
             pressed_mouse_button: None,
-            surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+            surface: Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
             mouse_exclusion: None,
             view: ViewTransform::IDENTITY,
         });
@@ -1184,7 +1196,7 @@ mod tests {
     #[test]
     fn mouse_wheel_point_units_emit_only_after_cell_threshold() {
         let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
-        let surface = TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0));
+        let surface = terminal_surface(rect, CellMetrics::new(9.0, 22.0));
         let mut wheel_state = WheelScrollState::default();
 
         let first = terminal_input_commands_with_wheel_state(
@@ -1246,7 +1258,7 @@ mod tests {
             modifier_sides: ModifierSideState::default(),
             hover_pos: None,
             pressed_mouse_button: Some(MouseButton::Left),
-            surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+            surface: Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
             mouse_exclusion: None,
             view: ViewTransform::IDENTITY,
         });
@@ -1287,7 +1299,7 @@ mod tests {
             modifier_sides: ModifierSideState::default(),
             hover_pos: None,
             pressed_mouse_button: None,
-            surface: Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+            surface: Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
             mouse_exclusion: None,
             view: ViewTransform::IDENTITY,
         });
@@ -1319,10 +1331,7 @@ mod tests {
             modifier_sides: ModifierSideState::default(),
             hover_pos: Some(Pos2::new(210.0, 72.0)),
             pressed_mouse_button: Some(MouseButton::Left),
-            surface: Some(TerminalSurface::for_rect(
-                terminal_rect,
-                CellMetrics::new(9.0, 22.0),
-            )),
+            surface: Some(terminal_surface(terminal_rect, CellMetrics::new(9.0, 22.0))),
             mouse_exclusion: Some(exclusion),
             view: ViewTransform::IDENTITY,
         });
@@ -1339,7 +1348,7 @@ mod tests {
                 MouseAction::Motion,
                 None,
                 egui::Modifiers::default(),
-                Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+                Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
                 ViewTransform::IDENTITY,
             )
             .is_none()
@@ -1359,7 +1368,7 @@ mod tests {
                 MouseAction::Motion,
                 None,
                 egui::Modifiers::default(),
-                Some(TerminalSurface::for_rect(rect, CellMetrics::new(9.0, 22.0))),
+                Some(terminal_surface(rect, CellMetrics::new(9.0, 22.0))),
                 ViewTransform::IDENTITY,
             ).expect("generated point is inside");
 

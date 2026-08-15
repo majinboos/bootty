@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+mod favorite_paths;
+
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
@@ -198,48 +200,7 @@ fn toggle_favorite_project_path_at(
     home: Option<&Path>,
     project_path: &str,
 ) -> io::Result<bool> {
-    let content = match fs::read_to_string(favorites_file) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
-    let selected = PathBuf::from(project_path);
-    let mut lines = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if let Some(index) = lines
-        .iter()
-        .position(|line| same_project_path(&expand_home_path(home, line), &selected))
-    {
-        lines.remove(index);
-        write_favorite_project_paths(favorites_file, &lines)?;
-        return Ok(false);
-    }
-    lines.push(project_path.to_owned());
-    write_favorite_project_paths(favorites_file, &lines)?;
-    Ok(true)
-}
-
-fn write_favorite_project_paths(favorites_file: &Path, lines: &[String]) -> io::Result<()> {
-    if let Some(parent) = favorites_file.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let content = if lines.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", lines.join("\n"))
-    };
-    fs::write(favorites_file, content)
-}
-
-fn same_project_path(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
+    favorite_paths::toggle_favorite_project_path_at(favorites_file, home, project_path)
 }
 
 fn main_worktree_entry(project_path: &str) -> WorktreePickerEntry {

@@ -13,8 +13,8 @@ persistence failure from appearing as an empty workspace.
 
 - `WorkspaceRepository` loads and commits persistent Space and binding facts.
 - `WorkspaceRuntime` owns the committed live snapshot.
-- The headless `RemoteSpaceRuntime` owns one loaded binding value for one remote
-  catalog request. It commits only through `WorkspaceRepository`.
+- The owner-local headless `RemoteSpaceRuntime` owns one loaded binding value for
+  one remote catalog request. It commits only through `WorkspaceRepository`.
 - `WorkspaceSnapshot` is a transfer and candidate value. `WorkspaceRepository`
   retains persistence access state after load. It does not retain a mutable
   workspace model.
@@ -49,7 +49,10 @@ first record one durable binding-scoped intent. An ambiguous backend failure kee
 the intent. Backend success commits the metadata and clears the intent in one
 transaction. A later authoritative snapshot resolves an intent left by a crash,
 backend error, or metadata failure. Bootty reports a typed partial-completion
-failure until recovery. GUI and headless catalog flows use the same journal.
+failure until recovery. GUI and owner-local headless flows use the same workspace
+journal. The installed remote daemon uses its own catalog journal under the same
+journal-before-backend rule. See
+[`0010-installed-daemon-journals-remote-space-membership.md`](0010-installed-daemon-journals-remote-space-membership.md).
 Create and rename intents retain the backend name, the Bootty display name, and
 the explicit-name state.
 
@@ -78,8 +81,8 @@ Schema revision 2 adds the pending binding membership-operation journal.
 Schema revision 3 adds durable display-name and explicit-name intent to that journal.
 Session ordering and naming become in-memory domain values.
 Their SQL moves behind `WorkspaceRepository`.
-GUI durable mutations pass through `WorkspaceRuntime`. The headless catalog uses
-its focused `RemoteSpaceRuntime` and the same repository operations.
+GUI durable mutations pass through `WorkspaceRuntime`. The owner-local headless
+projection uses its focused `RemoteSpaceRuntime` and the same repository operations.
 Callers handle typed failures at the UI boundary.
 
 ## Proof

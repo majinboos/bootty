@@ -266,7 +266,7 @@ pub(crate) fn open_rmux_pane_io(
 }
 
 pub(crate) async fn connect_bootty_rmux() -> Result<Rmux> {
-    ensure_rmux_sdk_daemon_binary()?;
+    prepare_local_rmux_daemon(bootty_identity::ApplicationIdentity::for_process())?;
     let endpoint = crate::bootty_rmux_endpoint_path().context("resolve Bootty rmux endpoint")?;
     let endpoint = RmuxEndpoint::UnixSocket(endpoint);
     Rmux::builder()
@@ -284,7 +284,7 @@ pub fn run_embedded_rmux_daemon() -> Result<Option<i32>> {
     }
     if arguments
         .first()
-        .is_none_or(|argument| argument != rmux_client::INTERNAL_DAEMON_FLAG)
+        .is_none_or(|argument| argument != crate::INTERNAL_RMUX_DAEMON_FLAG)
     {
         return Ok(None);
     }
@@ -340,13 +340,21 @@ pub fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
 
 const BOOTTY_DAEMON_BINARY_ENV: &str = "BOOTTY_DAEMON_BINARY";
 
-fn ensure_rmux_sdk_daemon_binary() -> Result<()> {
+pub(crate) fn prepare_local_rmux_daemon(
+    identity: bootty_identity::ApplicationIdentity,
+) -> Result<()> {
+    identity.initialize_process()?;
     static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     RESOLVED
         .get_or_init(|| {
             let binary = bootty_daemon_binary().map_err(|error| error.to_string())?;
-            // SAFETY: rmux workers are started only after this one-time initialization.
+            // SAFETY: Product composition calls this before rmux workers start. Both values must
+            // be visible to the child process created by the rmux SDK.
             unsafe {
+                env::set_var(
+                    bootty_identity::APPLICATION_IDENTITY_ENV,
+                    identity.namespace(),
+                );
                 env::set_var(
                     rmux_sdk::bootstrap::discovery::SDK_DAEMON_BINARY_ENV,
                     binary,

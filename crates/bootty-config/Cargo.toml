@@ -2,17 +2,22 @@
 name = "bootty-config"
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
-libghostty-vt.workspace = true
+bootty-font = { path = "../bootty-font" }
+bootty-mux-model = { path = "../bootty-mux-model" }
 serde.workspace = true
+tempfile.workspace = true
 toml_edit.workspace = true
-bootty-render = { path = "../bootty-render" }
-bootty-runtime = { path = "../bootty-runtime" }
-bootty-terminal = { path = "../bootty-terminal" }
-bootty-winit = { path = "../bootty-winit", default-features = false }
+bootty-identity = { path = "../bootty-identity" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+bootty-winit = { path = "../bootty-winit", default-features = false }
 indoc.workspace = true
 proptest.workspace = true
 rstest.workspace = true
-tempfile.workspace = true
