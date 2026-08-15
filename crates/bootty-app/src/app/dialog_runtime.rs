@@ -10,7 +10,7 @@ use crate::ui::{
 };
 
 /// The one floating modal owned by an application window.
-pub(super) enum ModalDialog {
+pub enum ModalDialog {
     NewSession(NewMuxSessionDialog),
     SpaceEditor(SpaceEditorDialog),
     SessionPicker(SessionPickerDialog),
@@ -22,20 +22,6 @@ pub(super) enum ModalDialog {
     ThemePicker(ThemePickerDialog),
 }
 
-/// Defines a taker that removes the open modal only when it holds the named dialog variant.
-macro_rules! take_dialog {
-    ($name:ident, $variant:ident, $ty:ty) => {
-        pub(super) fn $name(&mut self) -> Option<$ty> {
-            if !matches!(self.modal.as_deref(), Some(ModalDialog::$variant(_))) {
-                return None;
-            }
-            match *self.modal.take()? {
-                ModalDialog::$variant(dialog) => Some(dialog),
-                _ => unreachable!("modal variant was checked"),
-            }
-        }
-    };
-}
 
 #[derive(Default)]
 pub(super) struct DialogRuntime {
@@ -90,13 +76,7 @@ impl DialogRuntime {
         }
     }
 
-    take_dialog!(take_new_session, NewSession, NewMuxSessionDialog);
-    take_dialog!(take_space_editor, SpaceEditor, SpaceEditorDialog);
-    take_dialog!(take_session_picker, SessionPicker, SessionPickerDialog);
-    take_dialog!(take_rename_session, RenameSession, RenameSessionDialog);
-    take_dialog!(take_rename_tab, RenameTab, RenameTabDialog);
-    take_dialog!(take_ditch_session, DitchSession, DitchSessionDialog);
-    take_dialog!(take_keybind_help, KeybindHelp, KeybindHelpDialog);
-    take_dialog!(take_command_palette, CommandPalette, CommandPaletteDialog);
-    take_dialog!(take_theme_picker, ThemePicker, ThemePickerDialog);
+    pub(super) fn take(&mut self) -> Option<ModalDialog> {
+        self.modal.take().map(|dialog| *dialog)
+    }
 }

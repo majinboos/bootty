@@ -7,8 +7,8 @@ mod status_bar;
 pub(crate) use sidebar_panel::{MACOS_TITLEBAR_BUTTON_SAFE_WIDTH, SPACE_SWITCHER_HEIGHT};
 pub use sidebar_panel::{
     SessionContextAction, SidebarEvent, SidebarModel, SidebarSpaceSwipeState, SpaceSwitcherEvent,
-    SpaceSwitcherItem, load_app_icon_texture, selected_session_name, show_sidebar,
-    show_space_switcher, sidebar_rect, take_sidebar_space_swipe,
+    SpaceSwitcherItem, load_app_icon_texture, show_sidebar, show_space_switcher,
+    take_sidebar_space_swipe,
 };
 pub use status_bar::{
     ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, StatusBarEvent, StatusBarModel, TabContext,

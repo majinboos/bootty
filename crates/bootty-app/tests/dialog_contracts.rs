@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs};
 
 use bootty_app::{
-    app::AppState,
+    app::{AppState, ModalDialog},
     config::{AppearanceVariant, BoottyConfig},
     mux::{
         controller::{BindingId, MuxScope, SpaceId},
@@ -207,6 +207,8 @@ fn opening_a_modal_replaces_the_previous_modal() {
     assert!(state.open_session_picker_dialog_from_ui());
     assert!(state.open_create_space_dialog_from_ui());
 
-    assert!(state.take_session_picker_dialog().is_none());
-    assert!(state.take_space_editor_dialog().is_some());
+    assert!(matches!(
+        state.take_modal_dialog(),
+        Some(ModalDialog::SpaceEditor(_))
+    ));
 }

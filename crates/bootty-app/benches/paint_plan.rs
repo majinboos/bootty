@@ -1,4 +1,4 @@
-use std::hint::black_box;
+use std::{collections::HashMap, hint::black_box};
 
 mod paint_plan_fixtures;
 
@@ -26,7 +26,7 @@ use bootty_app::{
         icons,
         session_navigation::BindingSessionGroup,
         session_picker::SessionPickerDialog,
-        sidebar::{build_sidebar_items, build_visible_sidebar_items},
+        sidebar::build_binding_sidebar_items,
     },
 };
 use bootty_terminal::terminal_frame::FrameSelection;
@@ -90,6 +90,18 @@ fn sidebar_sessions(count: usize) -> Vec<MuxSession> {
             }
         })
         .collect()
+}
+
+fn sidebar_group(sessions: Vec<MuxSession>, selected_session: String) -> BindingSessionGroup {
+    BindingSessionGroup {
+        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
+        label: "Native".to_owned(),
+        sessions,
+        selected_session: Some(selected_session),
+        active: true,
+        can_return_to_last_session: false,
+        display_names: HashMap::new(),
+    }
 }
 
 fn usage_footer_items(name: &str) -> Vec<ModuleItem> {
@@ -600,42 +612,12 @@ fn bench_sidebar_items(c: &mut Criterion) {
         let sessions = sidebar_sessions(count);
         let selected = sessions
             .get(count / 2)
-            .map(|session| session.id.as_str())
-            .unwrap_or("$1");
+            .map(|session| session.id.clone())
+            .unwrap_or_else(|| "$1".to_owned());
+        let groups = [sidebar_group(sessions, selected)];
         c.bench_function(&format!("sidebar_items_{count}_rich_sessions"), |b| {
-            b.iter(|| {
-                black_box(build_sidebar_items(
-                    black_box(&sessions),
-                    black_box(Some(selected)),
-                ))
-                .len()
-            })
+            b.iter(|| black_box(build_binding_sidebar_items(black_box(&groups))).len())
         });
-    }
-}
-
-fn bench_visible_sidebar_items(c: &mut Criterion) {
-    const VISIBLE_ROWS: usize = 42;
-
-    for count in SIDEBAR_BENCH_SESSION_COUNTS {
-        let sessions = sidebar_sessions(count);
-        let selected = sessions
-            .get(count / 2)
-            .map(|session| session.id.as_str())
-            .unwrap_or("$1");
-        c.bench_function(
-            &format!("visible_sidebar_items_{count}_rich_sessions"),
-            |b| {
-                b.iter(|| {
-                    black_box(build_visible_sidebar_items(
-                        black_box(&sessions),
-                        black_box(Some(selected)),
-                        black_box(VISIBLE_ROWS),
-                    ))
-                    .len()
-                })
-            },
-        );
     }
 }
 
@@ -644,9 +626,10 @@ fn bench_sidebar_ui(c: &mut Criterion) {
         let sessions = sidebar_sessions(count);
         let selected = sessions
             .get(count / 2)
-            .map(|session| session.id.as_str())
-            .unwrap_or("$1");
-        let items = build_sidebar_items(&sessions, Some(selected));
+            .map(|session| session.id.clone())
+            .unwrap_or_else(|| "$1".to_owned());
+        let group = sidebar_group(sessions, selected);
+        let items = build_binding_sidebar_items(std::slice::from_ref(&group));
         let context = egui::Context::default();
         icons::install_icon_fonts(&context);
         let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 900.0));
@@ -668,8 +651,8 @@ fn bench_sidebar_ui(c: &mut Criterion) {
                                 SidebarModel {
                                     items: black_box(&items),
                                     footer_items: &[],
-                                    session_count: sessions.len(),
-                                    has_sessions: !sessions.is_empty(),
+                                    session_count: group.sessions.len(),
+                                    has_sessions: !group.sessions.is_empty(),
                                     title_visible: true,
                                     reserve_titlebar_buttons: true,
                                     title_icon: None,
@@ -700,9 +683,10 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
     let sessions = sidebar_sessions(count);
     let selected = sessions
         .get(count / 2)
-        .map(|session| session.id.as_str())
-        .unwrap_or("$1");
-    let items = build_sidebar_items(&sessions, Some(selected));
+        .map(|session| session.id.clone())
+        .unwrap_or_else(|| "$1".to_owned());
+    let group = sidebar_group(sessions, selected);
+    let items = build_binding_sidebar_items(std::slice::from_ref(&group));
     let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 900.0));
 
     for name in ["plain_usage_footer", "compact_usage_footer"] {
@@ -734,8 +718,8 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
                                 SidebarModel {
                                     items: black_box(&items),
                                     footer_items: black_box(&footer_items),
-                                    session_count: sessions.len(),
-                                    has_sessions: !sessions.is_empty(),
+                                    session_count: group.sessions.len(),
+                                    has_sessions: !group.sessions.is_empty(),
                                     title_visible: true,
                                     reserve_titlebar_buttons: true,
                                     title_icon: None,
@@ -842,7 +826,6 @@ targets =
     bench_terminal_input_pipeline,
     bench_render_commands,
     bench_sidebar_items,
-    bench_visible_sidebar_items,
     bench_sidebar_ui,
     bench_sidebar_ui_usage_footer,
     bench_session_picker_ui,

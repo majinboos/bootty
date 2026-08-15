@@ -1,29 +1,18 @@
 use bootty_app::{
-    config::{ChromeConfig, ColorConfig, SegmentAlign},
-    mux::{controller::SpaceId, snapshot::MuxSession},
+    config::{ColorConfig, SegmentAlign},
+    mux::controller::SpaceId,
     theme::theme_palette_from_colors,
     ui::{
         chrome::{
             ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState,
-            SpaceSwitcherEvent, SpaceSwitcherItem, StatusBarModel, selected_session_name,
-            show_space_switcher, show_status_bar, sidebar_rect, status_bar_window_tab_row_count,
-            status_bar_windows_intersect_x_range, take_sidebar_space_swipe,
+            SpaceSwitcherEvent, SpaceSwitcherItem, StatusBarModel, show_space_switcher,
+            show_status_bar, status_bar_window_tab_row_count, status_bar_windows_intersect_x_range,
+            take_sidebar_space_swipe,
         },
         icons::install_icon_fonts,
     },
 };
 use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
-
-fn session(id: &str, name: &str) -> MuxSession {
-    MuxSession {
-        id: id.to_owned(),
-        name: name.to_owned(),
-        active: false,
-        anchor: Default::default(),
-        active_window_id: None,
-        windows: Vec::new(),
-    }
-}
 
 fn space(id: i64, name: &str, active: bool) -> SpaceSwitcherItem {
     SpaceSwitcherItem {
@@ -43,33 +32,6 @@ fn wheel(delta: Vec2, phase: TouchPhase) -> Event {
         phase,
         modifiers: egui::Modifiers::NONE,
     }
-}
-
-#[test]
-fn sidebar_width_follows_the_public_chrome_configuration() {
-    let available = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 300.0));
-    let mut chrome = ChromeConfig {
-        sidebar_width: 240.0,
-        ..ChromeConfig::default()
-    };
-
-    assert_eq!(sidebar_rect(available, &chrome).width(), 240.0);
-
-    chrome.sidebar = false;
-    assert_eq!(sidebar_rect(available, &chrome).width(), 0.0);
-}
-
-#[test]
-fn selected_session_names_resolve_from_backend_identity_or_name() {
-    let sessions = [session("$1", "alpha"), session("$2", "beta")];
-
-    assert_eq!(selected_session_name(&sessions, Some("$2")), Some("beta"));
-    assert_eq!(
-        selected_session_name(&sessions, Some("alpha")),
-        Some("alpha")
-    );
-    assert_eq!(selected_session_name(&sessions, Some("missing")), None);
-    assert_eq!(selected_session_name(&sessions, None), None);
 }
 
 #[test]
