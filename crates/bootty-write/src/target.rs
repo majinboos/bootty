@@ -254,6 +254,8 @@ fn replace_file(temporary: &Path, target: &Path, _target_exists: bool) -> io::Re
 
 #[cfg(windows)]
 fn replace_file(temporary: &Path, target: &Path, target_exists: bool) -> io::Result<()> {
+    use winsafe::{self as w, co};
+
     let temporary = temporary.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -267,13 +269,9 @@ fn replace_file(temporary: &Path, target: &Path, target_exists: bool) -> io::Res
         )
     })?;
     let result = if target_exists {
-        winsafe::ReplaceFile(target, temporary, None, winsafe::co::REPLACEFILE::default())
+        w::ReplaceFile(target, temporary, None, co::REPLACEFILE::default())
     } else {
-        winsafe::MoveFileEx(
-            temporary,
-            Some(target),
-            winsafe::co::MOVEFILE::WRITE_THROUGH,
-        )
+        w::MoveFileEx(temporary, Some(target), co::MOVEFILE::WRITE_THROUGH)
     };
     result.map_err(|error| io::Error::from_raw_os_error(error.raw() as i32))
 }

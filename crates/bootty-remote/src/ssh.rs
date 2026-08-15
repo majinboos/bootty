@@ -7,11 +7,9 @@
 //! does.
 
 use std::path::{Path, PathBuf};
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::{collections::hash_map::DefaultHasher, hash::Hash as _, hash::Hasher as _};
 
 pub use crate::exec::run_remote_command;
 pub use crate::exec::{REMOTE_DAEMON_PROGRAM, REMOTE_DAEMON_PROTOCOL_VERSION};
