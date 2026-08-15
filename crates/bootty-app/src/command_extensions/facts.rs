@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use mlua::{Lua, Table, Value};
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
