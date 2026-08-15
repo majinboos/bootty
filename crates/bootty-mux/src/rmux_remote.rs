@@ -175,16 +175,7 @@ fn remote_rmux_argv(
     )
 }
 
-#[cfg(feature = "app")]
 impl RemoteRmuxRequest {
-    pub fn encode(&self) -> Result<String> {
-        let json = serde_json::to_vec(self).context("encode remote terminal request")?;
-        if json.len() > MAX_REMOTE_RMUX_PAYLOAD {
-            bail!("remote terminal request is too large")
-        }
-        Ok(URL_SAFE_NO_PAD.encode(json))
-    }
-
     pub fn decode(payload: &str) -> Result<Self> {
         if payload.len() > MAX_REMOTE_RMUX_PAYLOAD * 2 {
             bail!("remote terminal request is too large")
@@ -193,6 +184,17 @@ impl RemoteRmuxRequest {
             .decode(payload)
             .context("decode remote terminal request")?;
         serde_json::from_slice(&json).context("parse remote terminal request")
+    }
+}
+
+#[cfg(feature = "app")]
+impl RemoteRmuxRequest {
+    pub fn encode(&self) -> Result<String> {
+        let json = serde_json::to_vec(self).context("encode remote terminal request")?;
+        if json.len() > MAX_REMOTE_RMUX_PAYLOAD {
+            bail!("remote terminal request is too large")
+        }
+        Ok(URL_SAFE_NO_PAD.encode(json))
     }
 }
 

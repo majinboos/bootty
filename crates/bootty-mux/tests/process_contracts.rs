@@ -1,9 +1,13 @@
-use std::{process::Command, thread, time::Duration};
+#[cfg(target_os = "macos")]
+use std::process::Command;
+#[cfg(unix)]
+use std::{thread, time::Duration};
 
-use bootty_mux::process::{
-    CancellableCommandRunner, CommandCancellation, CommandRunner, SystemCommandRunner,
-};
+#[cfg(target_os = "macos")]
+use bootty_mux::process::SystemCommandRunner;
+use bootty_mux::process::{CancellableCommandRunner, CommandCancellation, CommandRunner};
 
+#[cfg(target_os = "macos")]
 const HELPER_ENV: &str = "BOOTTY_MUX_PROCESS_CONTRACT_HELPER";
 
 #[cfg(target_os = "macos")]
@@ -55,31 +59,28 @@ fn disowned_commands_resolve_programs_and_preserve_the_bootty_environment() {
     );
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn process_contract_helper() {
     if std::env::var_os(HELPER_ENV).is_none() {
         return;
     }
+    let program = std::env::var("BOOTTY_ENV_PROBE_PROGRAM").expect("probe program");
+    let captured_path = std::env::var("BOOTTY_ENV_PROBE_PATH").expect("captured PATH");
+    let captured_custom =
+        std::env::var("BOOTTY_ENV_PROBE_CUSTOM").expect("captured custom environment");
+    let resolved = bootty_mux::process::resolve_program("bootty-env-probe")
+        .expect("resolve bare program through PATH");
+    assert_eq!(resolved, program);
+    assert_eq!(
+        bootty_mux::process::resolve_program("./tmux").expect("keep relative program"),
+        "./tmux"
+    );
 
-    #[cfg(target_os = "macos")]
-    {
-        let program = std::env::var("BOOTTY_ENV_PROBE_PROGRAM").expect("probe program");
-        let captured_path = std::env::var("BOOTTY_ENV_PROBE_PATH").expect("captured PATH");
-        let captured_custom =
-            std::env::var("BOOTTY_ENV_PROBE_CUSTOM").expect("captured custom environment");
-        let resolved = bootty_mux::process::resolve_program("bootty-env-probe")
-            .expect("resolve bare program through PATH");
-        assert_eq!(resolved, program);
-        assert_eq!(
-            bootty_mux::process::resolve_program("./tmux").expect("keep relative program"),
-            "./tmux"
-        );
-
-        let output = SystemCommandRunner
-            .run_disowned("bootty-env-probe", &[captured_path, captured_custom])
-            .expect("run disowned environment probe");
-        assert!(output.success, "probe failed: {}", output.stderr);
-    }
+    let output = SystemCommandRunner
+        .run_disowned("bootty-env-probe", &[captured_path, captured_custom])
+        .expect("run disowned environment probe");
+    assert!(output.success, "probe failed: {}", output.stderr);
 }
 
 #[test]
