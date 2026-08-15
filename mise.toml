@@ -1,5 +1,5 @@
 [tools]
-rust = "nightly"
+rust = { version = "nightly", components = ["rustfmt", "clippy"] }
 zig = "0.16.0"
 "cargo:cargo-xwin" = "0.23.0"
 "cargo:cargo-zigbuild" = "0.23.0"
