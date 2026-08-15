@@ -1,8 +1,9 @@
 use eframe::egui;
 
-use crate::terminal::{KeyInput, TerminalKey, TerminalSearchDirection};
-
-use bootty_terminal::terminal_engine::{TerminalCopyModeAction, TerminalCopyModeMotion};
+use bootty_terminal::{
+    terminal_engine::{TerminalCopyModeAction, TerminalCopyModeMotion, TerminalSearchDirection},
+    terminal_input_model::{KeyInput, TerminalKey},
+};
 
 pub(super) fn copy_shortcut_pressed(event: &egui::Event) -> bool {
     matches!(

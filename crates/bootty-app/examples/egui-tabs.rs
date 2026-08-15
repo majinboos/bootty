@@ -6,8 +6,8 @@ use bootty_app::{
     },
     renderer::TerminalWidget,
     scheduler::{RepaintScheduler, RepaintSignal},
-    terminal::TerminalSession,
 };
+use bootty_runtime::terminal_session::TerminalSession;
 use eframe::{
     egui::{self, RichText},
     wgpu,

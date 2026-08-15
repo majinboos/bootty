@@ -8,9 +8,12 @@ use bootty_app::{
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::TerminalSurface,
     paint_plan::PaintPlanner,
-    terminal::{KeyInput, KeyMods, TerminalEngine, TerminalKey},
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
+};
+use bootty_terminal::{
+    terminal_engine::TerminalEngine,
+    terminal_input_model::{KeyInput, KeyMods, TerminalKey},
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use paint_plan_fixtures::{surface_for, terminal_engine};

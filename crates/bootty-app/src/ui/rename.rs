@@ -1,7 +1,7 @@
-use bootty_ui::Theme;
+use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
-use crate::ui::overlay::{self, FloatingWindow, TextPrompt};
+use bootty_ui::overlay::{FloatingWindow, TextPrompt};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RenameSessionDialog {

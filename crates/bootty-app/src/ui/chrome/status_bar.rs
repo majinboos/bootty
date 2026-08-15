@@ -1,13 +1,14 @@
 use std::ops::Range;
 
-use bootty_ui::{ThemePalette, readable_color};
+use bootty_extension::ModulePrimitive;
+use bootty_ui::{
+    ThemePalette,
+    icons::{has_slug, paint_icon_slug},
+    readable_color,
+};
 use eframe::egui::{self, CornerRadius, Pos2, Rect, Stroke, StrokeKind};
 
-use crate::{
-    command_extensions::ModulePrimitive,
-    config::SegmentAlign,
-    ui::icons::{has_slug, paint_icon_slug},
-};
+use crate::config::SegmentAlign;
 
 use super::{
     item_primitives::{paint_item_hover_overlay, paint_item_primitives, primitive_background},

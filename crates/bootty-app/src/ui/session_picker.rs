@@ -1,11 +1,10 @@
 use bootty_ui::Theme;
 use eframe::egui;
 
+use bootty_ui::overlay::{self, FloatingWindow, ListRow, ListView};
+
 use crate::mux::snapshot::MuxSession;
-use crate::ui::{
-    overlay::{self, FloatingWindow, ListRow, ListView, list},
-    session_navigation::{BindingSessionGroup, ScopedSessionTarget},
-};
+use crate::ui::session_navigation::{BindingSessionGroup, ScopedSessionTarget};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionPickerDialog {
@@ -43,7 +42,7 @@ impl SessionPickerDialog {
         groups: &[BindingSessionGroup],
     ) -> SessionPickerEvent {
         let picker_rows = picker_rows(groups, &self.filter);
-        self.selected = list::clamp_selection(self.selected, picker_rows.len());
+        self.selected = overlay::clamp_selection(self.selected, picker_rows.len());
         let rows = picker_rows
             .iter()
             .map(|entry| entry.row.clone())

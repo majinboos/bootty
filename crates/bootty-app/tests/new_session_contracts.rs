@@ -1,11 +1,9 @@
 use bootty_app::{
     config::{AppearanceVariant, BoottyConfig},
     theme::theme_from_config,
-    ui::{
-        icons::install_icon_fonts,
-        new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
-    },
+    ui::new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
 };
+use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, Key, Modifiers, RawInput};
 
 fn key_event(key: Key) -> Event {

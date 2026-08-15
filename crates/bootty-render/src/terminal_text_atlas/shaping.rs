@@ -1,21 +1,13 @@
 use rustybuzz::ttf_parser::Tag;
 use rustybuzz::{BufferClusterLevel, Direction, Face, Feature, UnicodeBuffer};
 
-use crate::terminal_text::FontFeature;
+use ab_glyph::{Font, FontArc, GlyphId};
 
-/// One glyph produced by shaping a text run. Glyph ids index the same font face
-/// that ab_glyph loads from the identical bytes, so they can be rasterized
-/// directly via [`ab_glyph::GlyphId`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ShapedGlyph {
-    pub glyph_id: u16,
-    /// Cell-relative origin chosen by the Ghostty-compatible shaper. Glyphs
-    /// that belong to the same ligature can share this origin even when
-    /// HarfBuzz reports different source clusters.
-    pub cluster: u32,
-    pub x_offset: f32,
-    pub y_offset: f32,
-}
+use super::clusters::{
+    ShapedCluster, ShapedGlyph, is_combining_mark, is_default_emoji_presentation, is_private_use,
+    is_symbol_like, is_variation_selector, shaped_cluster_slot,
+};
+use crate::terminal_text::{FontFeature, terminal_char_width, terminal_grapheme_cells};
 
 /// Shapes a run of text against a font's GSUB/GPOS tables via HarfBuzz
 /// (`rustybuzz`). Ligatures and contextual alternates only form when the font
@@ -128,8 +120,7 @@ struct SourceCodepoint {
 }
 
 fn is_attached_codepoint(ch: char) -> bool {
-    crate::terminal_text_atlas::is_combining_mark(ch)
-        || crate::terminal_text_atlas::is_variation_selector(ch)
+    is_combining_mark(ch) || is_variation_selector(ch)
 }
 
 /// Translates the user's [`FontFeature`] list into HarfBuzz features. The
@@ -174,4 +165,212 @@ fn ligatures_enabled(features: &[FontFeature]) -> bool {
         .rev()
         .find(|feature| feature.tag() == *b"liga")
         .is_none_or(|feature| feature.value() != 0)
+}
+
+/// Shapes `text` with the primary font and emits cell-aligned clusters,
+/// attaching shaped glyph ids to ligature/contextual clusters. Returns
+/// `None` when the font has no ligature features, so the caller can keep the
+/// cheaper per-character paths.
+pub(super) fn shape_clusters(
+    database: &fontdb::Database,
+    id: fontdb::ID,
+    font: &FontArc,
+    text: &str,
+    font_size: f32,
+    features: &[FontFeature],
+    clusters: &mut Vec<ShapedCluster>,
+) -> Option<(u16, usize)> {
+    let hb_features = harfbuzz_features(features);
+    let glyphs = database
+        .with_face_data(id, |data, index| {
+            shape_run(data, index, text, font_size, &hb_features)
+        })
+        .flatten()?;
+    let total_cells = text_cell_count(text);
+    let mut cluster_index = 0;
+    let mut glyph_index = 0;
+    while glyph_index < glyphs.len() {
+        let group = shaped_glyph_group(text, &glyphs, glyph_index, total_cells, font);
+        let mut glyph_end = group.end;
+        let mut cells = group.cells;
+        let mut source_end = group.source_end;
+        let draw_by_glyph = group.draw_by_glyph;
+
+        if draw_by_glyph {
+            while glyph_end < glyphs.len() {
+                let next_group = shaped_glyph_group(text, &glyphs, glyph_end, total_cells, font);
+                if !next_group.draw_by_glyph || next_group.cell != group.cell.saturating_add(cells)
+                {
+                    break;
+                }
+                glyph_end = next_group.end;
+                cells = cells.saturating_add(next_group.cells);
+                source_end = next_group.source_end;
+            }
+        }
+
+        let slice = &text[group.source_start..source_end];
+        let cluster = shaped_cluster_slot(clusters, cluster_index);
+        cluster.text.clear();
+        cluster.glyphs.clear();
+        cluster.text.push_str(slice);
+        cluster.cell = group.cell;
+        cluster.is_whitespace = slice.chars().all(char::is_whitespace);
+        cluster.cells = cells;
+        if draw_by_glyph {
+            cluster
+                .glyphs
+                .extend(glyphs[glyph_index..glyph_end].iter().copied());
+        }
+        cluster_index += 1;
+        glyph_index = glyph_end;
+    }
+    Some((total_cells.max(1), cluster_index))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShapedGlyphGroup {
+    cell: u16,
+    cells: u16,
+    source_start: usize,
+    source_end: usize,
+    end: usize,
+    draw_by_glyph: bool,
+}
+
+fn shaped_glyph_group(
+    text: &str,
+    glyphs: &[ShapedGlyph],
+    start: usize,
+    total_cells: u16,
+    font: &FontArc,
+) -> ShapedGlyphGroup {
+    let cell = glyphs[start].cluster;
+    let mut end = start + 1;
+    while end < glyphs.len() && glyphs[end].cluster == cell {
+        end += 1;
+    }
+
+    let cell = u16::try_from(cell).unwrap_or(u16::MAX);
+    let next_cell = glyphs.get(end).map_or(total_cells, |glyph| {
+        u16::try_from(glyph.cluster).unwrap_or(u16::MAX)
+    });
+    let cells = next_cell.saturating_sub(cell).max(1);
+    let (source_start, source_end) =
+        text_byte_range_for_cells(text, cell, cell.saturating_add(cells));
+    let slice = &text[source_start..source_end];
+
+    ShapedGlyphGroup {
+        cell,
+        cells,
+        source_start,
+        source_end,
+        end,
+        draw_by_glyph: draw_span_by_glyph(slice, &glyphs[start..end], font),
+    }
+}
+
+// Cell counting and cell→byte mapping group base + attached marks into one grapheme and advance
+// by its full width, matching `shape_run`. A VS16 emoji presentation sequence spans two cells, so
+// per-char counting (which sees the base as one and the selector as zero) would desync the cluster
+// slices from the shaped cell positions.
+fn text_cell_count(text: &str) -> u16 {
+    let mut total = 0_u16;
+    let mut chars = text.chars().peekable();
+    let mut grapheme = Vec::new();
+    while let Some(ch) = chars.next() {
+        if is_combining_mark(ch) || is_variation_selector(ch) {
+            continue;
+        }
+        grapheme.clear();
+        grapheme.push(ch);
+        while let Some(&next) = chars.peek() {
+            if is_combining_mark(next) || is_variation_selector(next) {
+                grapheme.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        total = total.saturating_add(terminal_grapheme_cells(&grapheme));
+    }
+    total
+}
+
+fn text_byte_range_for_cells(text: &str, start: u16, end: u16) -> (usize, usize) {
+    let mut cell = 0_u16;
+    let mut range_start = None;
+    let mut range_end = None;
+    let mut chars = text.char_indices().peekable();
+    let mut grapheme = Vec::new();
+
+    while let Some((byte_start, ch)) = chars.next() {
+        let mut byte_end = byte_start + ch.len_utf8();
+        if is_combining_mark(ch) || is_variation_selector(ch) {
+            // Standalone mark (run starts mid-grapheme): belongs to the previous cell.
+            let mark_cell = cell.saturating_sub(1);
+            if mark_cell < end && mark_cell.saturating_add(1) > start {
+                range_start.get_or_insert(byte_start);
+                range_end = Some(byte_end);
+            }
+            continue;
+        }
+
+        grapheme.clear();
+        grapheme.push(ch);
+        while let Some(&(next_byte, next)) = chars.peek() {
+            if is_combining_mark(next) || is_variation_selector(next) {
+                byte_end = next_byte + next.len_utf8();
+                grapheme.push(next);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        let grapheme_end = cell.saturating_add(terminal_grapheme_cells(&grapheme));
+        if cell < end && grapheme_end > start {
+            range_start.get_or_insert(byte_start);
+            range_end = Some(byte_end);
+        }
+        cell = grapheme_end;
+    }
+
+    (range_start.unwrap_or(0), range_end.unwrap_or(text.len()))
+}
+
+/// Whether a shaped span should be drawn directly from its glyph ids rather than
+/// the per-character path. True only for genuine font output the per-character
+/// path cannot reproduce: a ligature (several source cells shaped together) or a
+/// single character the font swapped for a contextual alternate. Everything with
+/// dedicated handling (whitespace, private-use icons, symbols/box-drawing, emoji,
+/// combining marks, or any uncovered `.notdef` glyph) stays on the legacy path.
+fn draw_span_by_glyph(slice: &str, glyphs: &[ShapedGlyph], font: &FontArc) -> bool {
+    if glyphs.is_empty() || glyphs.iter().any(|glyph| glyph.glyph_id == 0) {
+        return false;
+    }
+    if slice.chars().any(|ch| {
+        ch.is_whitespace()
+            || is_private_use(ch)
+            || is_symbol_like(ch)
+            || is_combining_mark(ch)
+            || is_variation_selector(ch)
+            || ch == '\u{fe0f}'
+            || is_default_emoji_presentation(ch)
+    }) {
+        return false;
+    }
+    let width_chars = slice
+        .chars()
+        .filter(|ch| terminal_char_width(*ch) >= 1)
+        .count();
+    if width_chars >= 2 {
+        return true;
+    }
+    width_chars == 1
+        && glyphs.len() == 1
+        && slice
+            .chars()
+            .next()
+            .is_some_and(|ch| GlyphId(glyphs[0].glyph_id) != font.glyph_id(ch))
 }

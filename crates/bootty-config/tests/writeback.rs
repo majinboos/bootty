@@ -1,6 +1,10 @@
-use std::fs;
+use std::{fs, path::PathBuf};
 
-use bootty_config::config::{load_config_from_path, update_config_document};
+use bootty_config::color::Color;
+use bootty_config::config::{
+    SegmentAlign, SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment,
+    load_config_from_path, update_config_document,
+};
 
 #[test]
 fn atomic_writeback_preserves_structure_and_unix_mode() {
@@ -48,6 +52,80 @@ fn atomic_writeback_preserves_structure_and_unix_mode() {
 }
 
 #[test]
+fn ssh_profile_writeback_replaces_and_removes_only_the_named_profile() {
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        "# preserve this comment\n\n[window]\n# preserve this window comment\ntitle = \"Keep\"\n",
+    )
+    .expect("write initial config");
+
+    let full = SshProfileConfig {
+        name: "Full Profile".to_owned(),
+        host: "full.example.test".to_owned(),
+        user: Some("luan".to_owned()),
+        port: Some(2222),
+        authentication: SshAuthenticationConfig::KeyFile,
+        host_key_policy: SshHostKeyPolicyConfig::AcceptNew,
+        identity_file: Some(PathBuf::from("/tmp/full-key")),
+        proxy_jump: Some("gateway".to_owned()),
+        program: "ssh-wrapper".to_owned(),
+        args: vec!["-v".to_owned(), "--flag".to_owned()],
+    };
+    update_config_document(&path, |document| document.set_ssh_profile("lab", &full))
+        .expect("write full SSH profile");
+    assert_eq!(
+        load_config_from_path(&path)
+            .expect("load full SSH profile")
+            .ssh_profiles
+            .get("lab"),
+        Some(&full)
+    );
+
+    let replacement = SshProfileConfig {
+        name: "Replacement".to_owned(),
+        host: "replacement.example.test".to_owned(),
+        user: None,
+        port: None,
+        authentication: SshAuthenticationConfig::Auto,
+        host_key_policy: SshHostKeyPolicyConfig::Strict,
+        identity_file: None,
+        proxy_jump: None,
+        program: "ssh".to_owned(),
+        args: Vec::new(),
+    };
+    update_config_document(&path, |document| {
+        document.set_ssh_profile("lab", &replacement)
+    })
+    .expect("replace SSH profile");
+    let written = fs::read_to_string(&path).expect("read replaced config");
+    assert!(written.contains("# preserve this comment"));
+    assert!(written.contains("# preserve this window comment"));
+    assert!(written.contains("title = \"Keep\""));
+    assert!(!written.contains("user = \"luan\""));
+    assert!(!written.contains("port = 2222"));
+    assert!(!written.contains("identity-file = \"/tmp/full-key\""));
+    assert!(!written.contains("proxy-jump = \"gateway\""));
+    assert!(!written.contains("args ="));
+    assert_eq!(
+        load_config_from_path(&path)
+            .expect("load replacement SSH profile")
+            .ssh_profiles
+            .get("lab"),
+        Some(&replacement)
+    );
+
+    update_config_document(&path, |document| document.remove_ssh_profile("lab"))
+        .expect("remove SSH profile");
+    let written = fs::read_to_string(&path).expect("read deleted config");
+    assert!(!written.contains("[ssh-profiles.lab]"));
+    assert!(written.contains("# preserve this comment"));
+    assert!(written.contains("# preserve this window comment"));
+    assert!(written.contains("title = \"Keep\""));
+}
+
+#[test]
 fn a_pre_replacement_error_keeps_the_existing_file() {
     let directory = tempfile::tempdir().expect("temporary config directory");
     let path = directory.path().join("config.toml");
@@ -61,6 +139,91 @@ fn a_pre_replacement_error_keeps_the_existing_file() {
 
     assert_eq!(error.to_string(), "config writeback path cannot be empty");
     assert_eq!(fs::read_to_string(&path).expect("read config"), original);
+}
+
+#[test]
+fn status_bar_writeback_preserves_segments_legacy_cleanup_comments_and_order() {
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        "# keep this comment\ninclude = [\"?local.toml\"]\n\n[window]\n# keep window comment\ntitle = \"Keep\"\n\n[chrome]\nstatus-bar = false\nstatus-segment = [{ module = \"legacy\" }]\ntop-segment = [{ module = \"old-top\" }]\nbottom-segment = [{ module = \"old-bottom\" }]\nsidebar = true\n",
+    )
+    .expect("write initial config");
+
+    let top_segments = vec![
+        StatusSegment {
+            align: SegmentAlign::Left,
+            module: "left".to_owned(),
+            fg: Some(Color {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef,
+                a: 0xff,
+            }),
+            bg: None,
+            icon: Some(String::new()),
+        },
+        StatusSegment {
+            align: SegmentAlign::Center,
+            module: "center".to_owned(),
+            fg: None,
+            bg: Some(Color {
+                r: 0x01,
+                g: 0x02,
+                b: 0x03,
+                a: 0x80,
+            }),
+            icon: Some("◆".to_owned()),
+        },
+        StatusSegment {
+            align: SegmentAlign::Right,
+            module: "right".to_owned(),
+            ..StatusSegment::default()
+        },
+    ];
+    let bottom_segments = vec![StatusSegment {
+        align: SegmentAlign::Right,
+        module: "bottom".to_owned(),
+        ..StatusSegment::default()
+    }];
+
+    update_config_document(&path, |document| {
+        document.set_bottom_status_segments(&bottom_segments)
+    })
+    .expect("write bottom status segments");
+    let after_bottom = fs::read_to_string(&path).expect("read bottom status segments");
+    assert!(after_bottom.contains("status-bar = false"));
+    assert!(after_bottom.contains("status-segment = [{ module = \"legacy\" }]"));
+
+    update_config_document(&path, |document| {
+        document.set_top_bar_enabled(true)?;
+        document.set_top_status_segments(&top_segments)
+    })
+    .expect("write top status segments");
+
+    let written = fs::read_to_string(&path).expect("read status segments");
+    assert!(written.contains("# keep this comment"));
+    assert!(written.contains("# keep window comment"));
+    assert!(written.contains("sidebar = true"));
+    assert!(!written.contains("status-bar ="));
+    assert!(!written.contains("status-segment ="));
+    assert!(written.contains("top-bar = true"));
+    assert!(written.contains("align = \"left\""));
+    assert!(written.contains("align = \"center\""));
+    assert!(written.contains("align = \"right\""));
+    assert!(written.contains("fg = \"#abcdef\""));
+    assert!(written.contains("bg = \"#01020380\""));
+    assert!(!written.contains("icon = \"\""));
+    assert!(written.find("top-segment").unwrap() < written.find("bottom-segment").unwrap());
+    assert!(written.find("include").unwrap() < written.find("[window]").unwrap());
+    assert!(written.find("[window]").unwrap() < written.find("[chrome]").unwrap());
+
+    let config = load_config_from_path(&path).expect("load status segments");
+    let mut expected_top_segments = top_segments.clone();
+    expected_top_segments[0].icon = None;
+    assert_eq!(config.chrome.top_segments, expected_top_segments);
+    assert_eq!(config.chrome.bottom_segments, bottom_segments);
 }
 
 #[cfg(unix)]

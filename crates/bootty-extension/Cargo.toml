@@ -1,0 +1,22 @@
+[package]
+name = "bootty-extension"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bootty-command = { path = "../bootty-command" }
+bootty-write = { path = "../bootty-write" }
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+mlua = { version = "0.12.0", features = ["luau", "serialize"] }
+notify.workspace = true
+process-wrap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+starship-battery.workspace = true
+sysinfo.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -23,10 +23,10 @@ use std::time::Instant;
 use bootty_app::{
     geometry::{CellMetrics, SurfaceRect, TerminalGeometry, TerminalPadding, TerminalSurface},
     paint_plan::PaintPlanner,
-    terminal::TerminalEngine,
     terminal_render::{RenderFramePool, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
+use bootty_terminal::terminal_engine::TerminalEngine;
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);

@@ -1,9 +1,8 @@
 use std::{env, hint::black_box};
 
-use bootty_app::{
-    geometry::TerminalGeometry,
-    terminal::TerminalEngine,
-    terminal_engine::{NATIVE_MAX_SCROLLBACK, NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE},
+use bootty_app::geometry::TerminalGeometry;
+use bootty_terminal::terminal_engine::{
+    NATIVE_MAX_SCROLLBACK, NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE, TerminalEngine,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 

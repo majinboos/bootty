@@ -1,0 +1,27 @@
+[package]
+name = "bootty-control"
+version.workspace = true
+edition.workspace = true
+
+[features]
+bootty-dev = ["bootty-identity/bootty-dev"]
+
+[dependencies]
+anyhow.workspace = true
+bootty-command = { path = "../bootty-command" }
+bootty-extension = { path = "../bootty-extension" }
+bootty-identity = { path = "../bootty-identity" }
+getrandom.workspace = true
+rmux-ipc.workspace = true
+rmux-os.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync", "time"] }
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

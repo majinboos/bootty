@@ -5,9 +5,11 @@ use std::{
 };
 
 use anyhow::Result;
+use bootty_command::{Caller, CommandInvocation};
 use bootty_config::config::MultiplexerBackendConfig;
 use eframe::egui::{self, Pos2, Rect};
 
+mod mux_actions;
 mod recorded_chord;
 
 use super::binding_session_names::RenameSessionOutcome;
@@ -21,7 +23,7 @@ use super::terminal_config::{
 use super::terminal_interaction::{
     TerminalFocusIntent, TerminalInteractionInput, TerminalInteractionRuntime,
 };
-use super::workspace_runtime::{BindingStateCandidate, WorkspaceRuntime};
+use super::workspace_runtime::WorkspaceRuntime;
 use recorded_chord::normalize_recorded_chord;
 
 use crate::{
@@ -29,7 +31,7 @@ use crate::{
         AppAction, FontSizeAction, KeybindAction, MuxKeyAction, SidebarAction, TerminalFindAction,
         TerminalScrollAction, builtin_app_invocation_for_direct_key,
     },
-    commands::{Caller, CommandInvocation, CommandTarget, ResourceKind},
+    commands::command_invocation_from_catalog,
     config::{
         AppearanceMode, AppearanceVariant, BoottyConfig, ConfigWriteOutcome, WindowConfig,
         update_config_document,
@@ -44,10 +46,9 @@ use crate::{
         router::{RoutedInput, route_events},
     },
     input_binding::CopyToClipboard,
-    layout::{Divider, SplitDirection},
+    layout::Divider,
     mux::{
         RepaintHandle,
-        capability::BindingOperation,
         command::MuxCommand,
         controller::{MuxController, MuxScope, SpaceId},
         provider::{MuxAppBackendRegistry, SelectionPublicationPolicy, selected_backend},
@@ -61,7 +62,6 @@ use crate::{
     },
     renderer::RendererMetrics,
     scheduler::{RepaintScheduler, RepaintSignal},
-    terminal::{DrainStats, MouseButton},
     terminal_text::TerminalTextConfig,
     theme::theme_from_config,
     ui::{
@@ -76,12 +76,14 @@ use crate::{
         terminal_find::{TerminalFindDialog, TerminalFindEvent},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::SpaceMuxOverride,
+    workspace::{SpaceMuxOverride, WorkspacePersistenceError},
 };
+use bootty_runtime::terminal_session::DrainStats;
 use bootty_terminal::terminal_engine::{
     TerminalLiveConfig, TerminalSideEffect, TerminalSideEffectEvent,
     encode_iterm2_report_cell_size, encode_iterm2_report_variable, encode_osc52_response,
 };
+use bootty_terminal::terminal_input_model::MouseButton;
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
 
@@ -971,10 +973,14 @@ impl AppState {
         self.direct_terminal_input_enabled()
     }
 
-    /// Mirror the settings overlay's open/closed state so the direct input path stops feeding the
+    /// Own the settings overlay's open/closed state so the direct input path stops feeding the
     /// terminal behind it (otherwise shortcuts like ⌘V paste into the hidden terminal).
-    pub fn set_settings_open(&mut self, open: bool) {
+    pub(super) fn set_settings_open(&mut self, open: bool) {
         self.settings_open = open;
+    }
+
+    pub(super) fn settings_open(&self) -> bool {
+        self.settings_open
     }
 
     /// Mirror whether a Luau floating window is showing so the direct input path stops feeding the
@@ -1131,30 +1137,8 @@ impl AppState {
         }
     }
 
-    fn split_focused_pane(&mut self, direction: SplitDirection, target_pane_id: Option<&str>) {
-        self.workspace
-            .active
-            .binding
-            .split_focused_pane(&self.repaint, direction, target_pane_id);
-    }
-
     pub fn record_pane_area(&mut self, area: Rect) {
         self.last_pane_area = Some(area);
-    }
-
-    fn focus_pane_neighbor(&mut self, direction: crate::mux::command::MuxDirection) {
-        let Some(area) = self.last_pane_area else {
-            return;
-        };
-        let gap = self.config().chrome.pane_divider_width;
-        self.workspace
-            .active
-            .binding
-            .focus_pane_neighbor(direction, area, gap);
-    }
-
-    fn focus_pane_relative(&mut self, delta: isize) {
-        self.workspace.active.binding.focus_pane_relative(delta);
     }
 
     pub fn activate_scoped_session_from_ui(&mut self, target: &ScopedSessionTarget) -> bool {
@@ -1322,19 +1306,6 @@ impl AppState {
             .close_pane_for_window(&self.repaint, session_id, window_id)
     }
 
-    pub(super) fn commit_binding_state_candidate(
-        &mut self,
-        candidate: BindingStateCandidate,
-    ) -> bool {
-        match self.workspace.commit_binding_state_candidate(candidate) {
-            Ok(()) => true,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
-        }
-    }
-
     fn begin_active_binding_membership_mutation(&mut self, command: &MuxCommand) -> bool {
         match self
             .workspace
@@ -1348,19 +1319,9 @@ impl AppState {
             }
         }
     }
-    /// Every session name the backend already answers to, plus the names bootty has asked it for and
-    /// is still waiting on. `keep` is the name of the session being renamed, which must not count as
-    /// taken against itself.
-    pub(super) fn taken_session_names(&self, keep: Option<&str>) -> Vec<String> {
-        self.workspace.taken_session_names(keep)
-    }
-
     fn create_project_session_for_cwd(&mut self, cwd: String) {
-        match self.workspace.create_project_session(cwd, &self.repaint) {
-            Ok(true) => self.input_focus = InputFocus::Terminal,
-            Ok(false) => {}
-            Err(error) => self.last_error = Some(error.to_string()),
-        }
+        let command = self.workspace.project_session_command(&cwd);
+        self.execute_mux_command(command);
     }
 
     fn move_selected_session(&mut self, delta: i32) -> bool {
@@ -1378,59 +1339,26 @@ impl AppState {
     }
 
     pub fn move_session_from_ui(&mut self, session_id: &str, delta: i32) -> bool {
-        let Some(session_name) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
-            .map(|session| session.name.clone())
-        else {
-            return false;
-        };
-        let sessions = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
-        let mut candidate = self.workspace.active_binding_state_candidate();
-        if !candidate.session_order.move_session(
-            &session_name,
-            delta,
-            sessions.iter().map(String::as_str),
-        ) {
-            return false;
-        }
-        self.commit_binding_state_candidate(candidate)
+        let result = self.workspace.move_active_session(session_id, delta);
+        self.apply_session_order_change(result)
     }
 
     pub fn reorder_session_before(&mut self, source: &str, target: Option<&str>) -> bool {
-        // Per-session anchors: a drag reorders within a group when source and target share one,
-        // and moves the whole group across groups.
-        let sessions = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
-        let mut candidate = self.workspace.active_binding_state_candidate();
-        if !candidate.session_order.move_session_before(
-            source,
-            target,
-            sessions.iter().map(String::as_str),
-        ) {
-            return false;
+        let result = self.workspace.reorder_active_session_before(source, target);
+        self.apply_session_order_change(result)
+    }
+
+    fn apply_session_order_change(
+        &mut self,
+        result: Result<bool, WorkspacePersistenceError>,
+    ) -> bool {
+        match result {
+            Ok(changed) => changed,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
         }
-        self.commit_binding_state_candidate(candidate)
     }
 
     pub fn take_modal_dialog(&mut self) -> Option<ModalDialog> {
@@ -1474,30 +1402,14 @@ impl AppState {
     }
 
     pub fn detach_scoped_session_from_space(&mut self, target: &ScopedSessionTarget) -> bool {
-        let Some(binding) = self.workspace.binding(target.scope) else {
-            return false;
-        };
-        let Some(name) = binding
-            .mux
-            .all_sessions()
-            .iter()
-            .find(|session| session.id == target.session_id || session.name == target.session_id)
-            .map(|session| session.name.clone())
-        else {
-            return false;
-        };
-        let mut candidate = self
+        let result = self
             .workspace
-            .binding_state_candidate(target.scope)
-            .expect("a live binding has committed workspace state");
-        if !candidate.session_order.remove_session(&name) {
-            return false;
+            .detach_session_from_space(target.scope, &target.session_id);
+        let changed = self.apply_session_order_change(result);
+        if changed {
+            (self.repaint)();
         }
-        if !self.commit_binding_state_candidate(candidate) {
-            return false;
-        }
-        (self.repaint)();
-        true
+        changed
     }
 
     pub fn apply_session_picker_event(
@@ -1514,24 +1426,12 @@ impl AppState {
             }
             SessionPickerEvent::ActivateSession(target) => {
                 self.input_focus = InputFocus::Terminal;
-                if let Some(binding) = self.workspace.binding(target.scope)
-                    && let Some(name) = binding
-                        .mux
-                        .all_sessions()
-                        .iter()
-                        .find(|session| {
-                            session.id == target.session_id || session.name == target.session_id
-                        })
-                        .map(|session| session.name.clone())
+                if let Err(error) = self
+                    .workspace
+                    .add_session_to_binding(target.scope, &target.session_id)
                 {
-                    let mut candidate = self
-                        .workspace
-                        .binding_state_candidate(target.scope)
-                        .expect("a live binding has committed workspace state");
-                    candidate.session_order.add_session(&name);
-                    if !self.commit_binding_state_candidate(candidate) {
-                        return;
-                    }
+                    self.last_error = Some(error.to_string());
+                    return;
                 }
                 self.activate_scoped_session_from_ui(&target);
             }
@@ -1713,7 +1613,7 @@ impl AppState {
                 // Resolve the user's current context before another queued caller can change it.
                 self.input_focus = InputFocus::Terminal;
                 let Some(mut invocation) =
-                    CommandInvocation::from_catalog(command, Caller::CommandPalette)
+                    command_invocation_from_catalog(command, Caller::CommandPalette)
                 else {
                     return;
                 };
@@ -1788,7 +1688,7 @@ impl AppState {
                 self.dialogs.open(ModalDialog::NewSession(dialog));
             }
             NewSessionPickerEvent::CreateWorktree { repo, branch } => {
-                match crate::git::add_worktree(&repo, &branch) {
+                match bootty_mux::project::add_worktree(&repo, &branch) {
                     Ok(path) => {
                         self.create_project_session_for_cwd(path);
                         self.input_focus = InputFocus::Terminal;
@@ -2276,9 +2176,7 @@ impl AppState {
             .active
             .binding
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .map(|session| {
                 // Prefill what bootty shows, so a backend-only uniqueness suffix is not something
                 // the user has to delete out of the field.
@@ -2317,9 +2215,7 @@ impl AppState {
             .active
             .binding
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .and_then(|session| {
                 session
                     .windows
@@ -2346,9 +2242,7 @@ impl AppState {
             .active
             .binding
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == selected || session.name == selected)?;
+            .session_by_id_or_name(selected)?;
         let window_id = self
             .workspace
             .active
@@ -2382,9 +2276,7 @@ impl AppState {
             .active
             .binding
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .map(|session| (session.id.clone(), session.anchor.cwd.clone()))
         else {
             return false;
@@ -2779,33 +2671,6 @@ impl AppState {
         count
     }
 
-    pub(super) fn apply_resolved_keybind_action(
-        &mut self,
-        action: KeybindAction,
-        target: Option<&CommandTarget>,
-        viewport: ViewportSnapshot,
-        effects: &mut Vec<AppEffect>,
-    ) {
-        if let KeybindAction::Mux(action) = action {
-            let target_id = |target: &CommandTarget| {
-                serde_json::from_str::<Vec<String>>(&target.handle)
-                    .expect("validated mux target")
-                    .pop()
-                    .expect("mux target identity")
-            };
-            let window_id = target
-                .filter(|target| target.kind == ResourceKind::MuxWindow)
-                .map(target_id);
-            let pane_id = target
-                .filter(|target| target.kind == ResourceKind::Pane)
-                .map(target_id);
-            self.apply_mux_key_action_to_target(action, window_id, pane_id);
-            effects.push(AppEffect::RequestRepaint);
-        } else {
-            self.apply_keybind_action(action, viewport, effects);
-        }
-    }
-
     pub(super) fn apply_sidebar_action(&mut self, action: SidebarAction) -> bool {
         match action {
             SidebarAction::Ignore => {}
@@ -3013,243 +2878,6 @@ impl AppState {
     pub fn reconnect_space_from_ui(&mut self, space_id: SpaceId) -> bool {
         self.workspace.reconnect_space(space_id, Instant::now())
     }
-    fn close_target_pane(&mut self, target_pane_id: Option<&str>) {
-        if self.uses_native_terminal_layout() {
-            if let Some(pane_id) = target_pane_id
-                .map(str::to_owned)
-                .or_else(|| self.focused_pane())
-            {
-                self.close_pane(&pane_id);
-            }
-            return;
-        }
-        let session_id = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .unwrap_or("local")
-            .to_owned();
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.execute_command(
-            &self.repaint,
-            &mux_config,
-            MuxCommand::ClosePane {
-                session_id,
-                pane_id: target_pane_id.map(str::to_owned),
-            },
-        );
-        self.workspace.active.binding.terminal.discard_active_pane();
-    }
-
-    /// Close a specific native pane: remove it from the backend window, kill its PTY, collapse the
-    /// split layout, and re-activate the surviving focused pane this frame so it doesn't flash idle.
-    fn close_pane(&mut self, pane_id: &str) {
-        self.workspace
-            .active
-            .binding
-            .close_focused_pane(&self.repaint, pane_id);
-    }
-
-    pub(super) fn mux_operation_for_action(
-        &self,
-        action: MuxKeyAction,
-    ) -> Option<BindingOperation> {
-        match action {
-            MuxKeyAction::NewTab
-                if self
-                    .workspace
-                    .active
-                    .binding
-                    .mux
-                    .selected_session()
-                    .is_none() =>
-            {
-                Some(BindingOperation::CreateProjectSession)
-            }
-            MuxKeyAction::NewTab => Some(BindingOperation::CreateWindow),
-            MuxKeyAction::NextTab
-            | MuxKeyAction::PreviousTab
-            | MuxKeyAction::LastTab
-            | MuxKeyAction::SelectTab(_) => Some(BindingOperation::NavigateWindow),
-            MuxKeyAction::MoveTab(_) => Some(BindingOperation::MoveWindow),
-            MuxKeyAction::SplitPane(_) => Some(BindingOperation::SplitPane),
-            MuxKeyAction::SelectPane(_) | MuxKeyAction::NextPane | MuxKeyAction::PreviousPane => {
-                Some(BindingOperation::NavigatePane)
-            }
-            MuxKeyAction::KillPane | MuxKeyAction::ClosePane => Some(BindingOperation::ClosePane),
-            MuxKeyAction::TogglePaneZoom => Some(BindingOperation::TogglePaneZoom),
-            MuxKeyAction::NextSession
-            | MuxKeyAction::PreviousSession
-            | MuxKeyAction::LastSession
-            | MuxKeyAction::SelectSession(_)
-            | MuxKeyAction::MoveSession(_) => None,
-        }
-    }
-
-    fn apply_mux_key_action(&mut self, action: MuxKeyAction) {
-        self.apply_mux_key_action_to_target(action, None, None);
-    }
-
-    fn apply_mux_key_action_to_target(
-        &mut self,
-        action: MuxKeyAction,
-        target_window_id: Option<String>,
-        target_pane_id: Option<String>,
-    ) {
-        if self.apply_session_navigation_action(action) {
-            return;
-        }
-        if let MuxKeyAction::MoveSession(delta) = action {
-            self.move_selected_session(delta);
-            return;
-        }
-        if matches!(action, MuxKeyAction::ClosePane) {
-            self.close_target_pane(target_pane_id.as_deref());
-            return;
-        }
-        // On the native engine, killing a pane means removing the focused split leaf and collapsing
-        // the layout, same as closing it. Other backends keep tmux/zellij kill-pane semantics.
-        if self.uses_native_terminal_layout() && matches!(action, MuxKeyAction::KillPane) {
-            self.close_target_pane(target_pane_id.as_deref());
-            return;
-        }
-        if let MuxKeyAction::SplitPane(direction) = action {
-            self.split_focused_pane(direction, target_pane_id.as_deref());
-            return;
-        }
-        // On the native engine, directional pane selection moves focus geometrically across the
-        // egui split layout. Other backends keep their own (cycling) pane selection.
-        if let MuxKeyAction::SelectPane(direction) = action
-            && self.uses_native_terminal_layout()
-        {
-            self.focus_pane_neighbor(direction);
-            return;
-        }
-        // Likewise next/previous pane cycle focus across the split layout's leaves; the mux-state
-        // pane selection the command path mutates is invisible to the native layout.
-        if self.uses_native_terminal_layout() {
-            let delta = match action {
-                MuxKeyAction::NextPane => Some(1),
-                MuxKeyAction::PreviousPane => Some(-1),
-                _ => None,
-            };
-            if let Some(delta) = delta {
-                self.focus_pane_relative(delta);
-                return;
-            }
-        }
-        if matches!(action, MuxKeyAction::NewTab)
-            && self
-                .workspace
-                .active
-                .binding
-                .mux
-                .selected_session()
-                .is_none()
-        {
-            let cwd = new_mux_session_request_with_name(self.config(), "").cwd;
-            self.create_project_session_for_cwd(cwd);
-            self.sync_native_layout_terminal_now();
-            return;
-        }
-        let selected_session = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .unwrap_or("local")
-            .to_owned();
-        let selected_cwd = terminal_cwd_for_mux_command(
-            self.workspace
-                .active
-                .binding
-                .terminal
-                .current_working_directory()
-                .ok()
-                .flatten(),
-            self.workspace
-                .active
-                .binding
-                .mux
-                .selected_session_anchor()
-                .and_then(|anchor| anchor.cwd.clone()),
-        );
-        let command = match action {
-            MuxKeyAction::NewTab => MuxCommand::NewWindow {
-                session_id: selected_session,
-                cwd: selected_cwd,
-            },
-            MuxKeyAction::NextTab => MuxCommand::ActivateNextWindow {
-                session_id: selected_session,
-            },
-            MuxKeyAction::PreviousTab => MuxCommand::ActivatePreviousWindow {
-                session_id: selected_session,
-            },
-            MuxKeyAction::LastTab => MuxCommand::ActivateLastWindow {
-                session_id: selected_session,
-            },
-            MuxKeyAction::SelectTab(index) => MuxCommand::ActivateWindowIndex {
-                session_id: selected_session,
-                index,
-            },
-            MuxKeyAction::MoveTab(delta) => MuxCommand::MoveWindow {
-                session_id: selected_session,
-                window_id: self
-                    .workspace
-                    .active
-                    .binding
-                    .mux
-                    .selected_window()
-                    .map(str::to_owned),
-                delta,
-            },
-            MuxKeyAction::SplitPane(_) => {
-                unreachable!("split pane is handled before the command match")
-            }
-            MuxKeyAction::SelectPane(direction) => MuxCommand::SelectPane {
-                session_id: selected_session,
-                window_id: target_window_id.clone(),
-                direction,
-            },
-            MuxKeyAction::NextPane => MuxCommand::SelectNextPane {
-                session_id: selected_session,
-                window_id: target_window_id.clone(),
-            },
-            MuxKeyAction::PreviousPane => MuxCommand::SelectPreviousPane {
-                session_id: selected_session,
-                window_id: target_window_id.clone(),
-            },
-            MuxKeyAction::KillPane => MuxCommand::KillPane {
-                session_id: selected_session,
-                pane_id: target_pane_id.clone(),
-            },
-            MuxKeyAction::ClosePane => {
-                unreachable!("close pane is handled before the command match")
-            }
-            MuxKeyAction::TogglePaneZoom => MuxCommand::TogglePaneZoom {
-                session_id: selected_session,
-                pane_id: target_pane_id.clone(),
-            },
-            MuxKeyAction::NextSession
-            | MuxKeyAction::PreviousSession
-            | MuxKeyAction::LastSession
-            | MuxKeyAction::SelectSession(_)
-            | MuxKeyAction::MoveSession(_) => {
-                unreachable!("session actions are handled by Bootty state")
-            }
-        };
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace
-            .active
-            .binding
-            .mux
-            .execute_command(&self.repaint, &mux_config, command);
-        self.sync_native_layout_terminal_now();
-    }
-
     fn ensure_sidebar_hovered_session(&mut self) {
         if self.sidebar_hovered_index().is_some() {
             return;
@@ -3308,9 +2936,7 @@ impl AppState {
             .active
             .binding
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == value || session.name == value)
+            .session_by_id_or_name(value)
             .map(|session| {
                 ScopedSessionTarget::new(self.workspace.active.binding.scope, session.id.clone())
             })
@@ -3519,8 +3145,8 @@ fn run_ditch_cleanup(cwd: Option<&str>, action: &DitchAction) -> Result<(), Stri
     };
     match action {
         DitchAction::KillOnly => Ok(()),
-        DitchAction::DetachWorktree => crate::git::detach_head(cwd),
-        DitchAction::RemoveWorktree { force } => crate::git::remove_worktree(cwd, *force),
+        DitchAction::DetachWorktree => bootty_mux::project::detach_head(cwd),
+        DitchAction::RemoveWorktree { force } => bootty_mux::project::remove_worktree(cwd, *force),
         DitchAction::RemoveWorktreeAndBranch {
             force,
             branch,
@@ -3532,9 +3158,9 @@ fn run_ditch_cleanup(cwd: Option<&str>, action: &DitchAction) -> Result<(), Stri
             // missing path; instead finish by deleting the branch from `repo`,
             // resolved while the worktree still existed.
             if std::path::Path::new(cwd).exists() {
-                crate::git::remove_worktree(cwd, *force)?;
+                bootty_mux::project::remove_worktree(cwd, *force)?;
             }
-            crate::git::delete_branch(repo, branch, *force)
+            bootty_mux::project::delete_branch(repo, branch, *force)
         }
     }
 }

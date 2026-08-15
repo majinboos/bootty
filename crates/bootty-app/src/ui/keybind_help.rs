@@ -1,7 +1,8 @@
-use bootty_ui::Theme;
+use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
-use crate::ui::overlay::{self, FloatingWindow, ListRow, ListView, list};
+use crate::ui::keybind_source::parse_keybind;
+use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 
 /// A read-only, filterable cheatsheet of the currently active keybindings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -25,7 +26,7 @@ impl KeybindHelpDialog {
     pub fn open(raw_bindings: &[String]) -> Self {
         let mut bindings: Vec<(String, String)> = raw_bindings
             .iter()
-            .filter_map(|raw| overlay::parse_keybind(raw))
+            .filter_map(|raw| parse_keybind(raw))
             .collect();
         bindings.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         Self {
@@ -38,7 +39,7 @@ impl KeybindHelpDialog {
 
     pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> KeybindHelpEvent {
         let matches = filtered(&self.bindings, &self.filter);
-        self.selected = list::clamp_selection(self.selected, matches.len());
+        self.selected = overlay::clamp_selection(self.selected, matches.len());
         let rows: Vec<ListRow> = matches
             .iter()
             .filter_map(|&index| self.bindings.get(index))

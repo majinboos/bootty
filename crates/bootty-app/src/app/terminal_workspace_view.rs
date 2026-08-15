@@ -610,10 +610,10 @@ fn show_pane_dividers(
 fn paint_empty_terminal(ui: &egui::Ui, rect: Rect, palette: bootty_ui::ThemePalette) {
     let painter = ui.painter_at(rect);
     let color = palette.muted;
-    let galley = crate::ui::keycaps::inline_shortcut_galley_from_painter(
+    let galley = bootty_ui::keycaps::inline_shortcut_galley_from_painter(
         &painter,
         palette,
-        crate::ui::keycaps::InlineShortcut {
+        bootty_ui::keycaps::InlineShortcut {
             prefix: "No open tabs - press ",
             trigger: crate::platform::new_tab_shortcut_trigger(),
             suffix: " to open one",

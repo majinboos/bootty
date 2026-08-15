@@ -1,13 +1,14 @@
+use bootty_ui::{icons, keycaps};
 use eframe::egui;
 
 mod model;
 mod trigger_edit;
 
 use super::SettingsWindow;
-use crate::config::KeybindPreset;
+use crate::config::{KeybindPreset, split_keybind_entry};
 use crate::direct_input::ModifierSideState;
 pub(super) use model::{BindingRow, ChordCapture, KeybindScope};
-use model::{action_options, effective_bindings, read_scope_entries, split_entry, write_scope};
+use model::{action_options, effective_bindings, read_scope_entries, write_scope};
 use trigger_edit::{
     MODIFIER_TOKENS, TRIGGER_FLAGS, add_default_modifier_sides, captured_step, join_trigger_flags,
     parse_trigger_flags, prefix_combo, scroll_step, strip_modifier_sides, trigger_step,
@@ -482,11 +483,9 @@ fn conflict_banner(
                 } else {
                     palette.destructive
                 };
-                if let Some(icon) = crate::ui::icons::icon_text(
-                    if ok { "check" } else { "circle-alert" },
-                    16.0,
-                    color,
-                ) {
+                if let Some(icon) =
+                    icons::icon_text(if ok { "check" } else { "circle-alert" }, 16.0, color)
+                {
                     ui.label(icon);
                 }
                 ui.label(
@@ -545,7 +544,10 @@ fn effective_bindings_panel(win: &SettingsWindow, ui: &mut egui::Ui, scope: Keyb
                 let entries: Vec<(String, String, [bool; 4])> = effective_bindings(win, scope)
                     .iter()
                     .filter_map(|entry| {
-                        let (trigger, action) = split_entry(entry);
+                        let (trigger, action) = split_keybind_entry(entry).map_or_else(
+                            || (entry.to_owned(), String::new()),
+                            |(trigger, action)| (trigger.to_owned(), action.to_owned()),
+                        );
                         let haystack = format!("{trigger} {action}").to_ascii_lowercase();
                         if !needle.is_empty() && !haystack.contains(&needle) {
                             return None;
@@ -679,8 +681,7 @@ fn binding_editor_row(
                     *ctx.toggle_capture = Some(ctx.index);
                 }
 
-                if let Some(icon) = crate::ui::icons::icon_text("arrow-right", 14.0, palette.muted)
-                {
+                if let Some(icon) = icons::icon_text("arrow-right", 14.0, palette.muted) {
                     ui.label(icon);
                 }
 
@@ -889,7 +890,7 @@ fn flags_button(
     } else {
         palette.muted
     };
-    crate::ui::icons::paint_icon_slug(
+    icons::paint_icon_slug(
         ui.painter(),
         "sliders-horizontal",
         rect.center(),
@@ -941,7 +942,7 @@ fn record_cell(
                 palette.text,
             );
         } else {
-            let galley = crate::ui::keycaps::trigger_galley_from_painter(
+            let galley = keycaps::trigger_galley_from_painter(
                 ui.painter(),
                 palette,
                 capture_text,
@@ -973,13 +974,8 @@ fn record_cell(
                 palette.muted,
             );
         } else {
-            let galley = crate::ui::keycaps::trigger_galley(
-                ui,
-                palette,
-                trigger,
-                palette.text,
-                rect.width() - 20.0,
-            );
+            let galley =
+                keycaps::trigger_galley(ui, palette, trigger, palette.text, rect.width() - 20.0);
             let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5);
             ui.painter().galley(pos, galley, palette.text);
         }
@@ -1010,7 +1006,7 @@ fn binding_status(
                 .size(11.0),
         );
     } else if scope.entry_is_valid(trigger, action) {
-        if let Some(icon) = crate::ui::icons::icon_text("check", 16.0, palette.success) {
+        if let Some(icon) = icons::icon_text("check", 16.0, palette.success) {
             ui.label(icon);
         }
     } else {
@@ -1030,8 +1026,7 @@ fn keycap_chip(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, trigger: &st
         .corner_radius(egui::CornerRadius::same(palette.radius))
         .inner_margin(egui::Margin::symmetric(10, 5))
         .show(ui, |ui| {
-            let galley =
-                crate::ui::keycaps::trigger_galley(ui, palette, trigger, palette.text, 320.0);
+            let galley = keycaps::trigger_galley(ui, palette, trigger, palette.text, 320.0);
             ui.add(egui::Label::new(galley).selectable(false));
         });
 }

@@ -1,32 +1,23 @@
 use bootty_render::{
     paint_plan::PlanColor,
     terminal_render::SpriteCommandBatch,
-    terminal_sprite::{SpriteCommand, SpriteFamily, SpritePoint, SpriteRegistry, SpriteShape},
+    terminal_sprite::{SpriteCommand, SpriteFamily, SpriteGlyph, SpritePoint, SpriteShape},
     terminal_text_atlas::{TextAtlasBuilder, TexturedGlyphQuad},
 };
 use bootty_surface::geometry::SurfaceRect;
 
-fn sprite_fixture() -> (SpriteRegistry, SurfaceRect) {
-    (
-        SpriteRegistry::prompt_graphics(),
-        SurfaceRect::from_min_size(0.0, 0.0, 16.0, 24.0),
-    )
+fn sprite_fixture() -> SurfaceRect {
+    SurfaceRect::from_min_size(0.0, 0.0, 16.0, 24.0)
 }
 
-fn sprite_command_batch(
-    registry: &SpriteRegistry,
-    ch: char,
-    rect: SurfaceRect,
-) -> SpriteCommandBatch {
-    let glyph = registry
-        .glyph_for(ch)
-        .unwrap_or_else(|| panic!("missing glyph {ch}"));
+fn sprite_command_batch(ch: char, rect: SurfaceRect) -> SpriteCommandBatch {
+    let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph {ch}"));
     SpriteCommandBatch {
         ch: glyph.ch,
         glyph,
         rect,
         color: color(),
-        commands: registry.commands_for(glyph, rect),
+        commands: glyph.commands_for(rect),
     }
 }
 
@@ -36,8 +27,7 @@ fn prepare_sprite_quads(
     atlas_width: u32,
     atlas_height: u32,
 ) -> (TextAtlasBuilder, Vec<TexturedGlyphQuad>) {
-    let registry = SpriteRegistry::prompt_graphics();
-    let batch = sprite_command_batch(&registry, ch, rect);
+    let batch = sprite_command_batch(ch, rect);
     let mut builder = TextAtlasBuilder::new(atlas_width, atlas_height);
     let quads = vec![builder.prepare_sprite_command(&batch, 1.0)];
     (builder, quads)
@@ -53,7 +43,7 @@ fn sprite_atlas_pixels(ch: char, rect: SurfaceRect) -> Vec<u8> {
 // codepoint-to-block geometry at the renderer command boundary.
 #[test]
 fn terminal_block_elements_draw_complete_known_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, expected) in [
         ('▀', vec![fill(0.0, 0.0, 16.0, 12.0, 1.0)]),
@@ -129,11 +119,9 @@ fn terminal_block_elements_draw_complete_known_geometry() {
             ],
         ),
     ] {
-        let glyph = registry
-            .glyph_for(ch)
-            .unwrap_or_else(|| panic!("missing glyph {ch}"));
+        let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph {ch}"));
         assert_eq!(
-            registry.commands_for(glyph, rect),
+            glyph.commands_for(rect),
             expected,
             "{ch} should match Ghostty block element geometry"
         );
@@ -145,7 +133,7 @@ fn terminal_block_elements_draw_complete_known_geometry() {
 // glyphs as deterministic native sprite geometry before font fallback.
 #[test]
 fn terminal_nerd_progress_indicators_use_upstream_constrained_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, expected) in [
         (
@@ -170,11 +158,9 @@ fn terminal_nerd_progress_indicators_use_upstream_constrained_geometry() {
         ('\u{EE0A}', fill(0.0, 0.0, 10.07855, 20.485153, 1.0)),
         ('\u{EE0B}', fill(0.0, 6.00302, 8.0, 17.99698, 1.0)),
     ] {
-        let glyph = registry
-            .glyph_for(ch)
-            .unwrap_or_else(|| panic!("missing glyph {ch}"));
+        let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph {ch}"));
         assert_eq!(glyph.family, SpriteFamily::ProgressIndicator);
-        assert_sprite_command_close(&registry.commands_for(glyph, rect), &[expected], ch);
+        assert_sprite_command_close(&glyph.commands_for(rect), &[expected], ch);
     }
 }
 
@@ -182,7 +168,7 @@ fn terminal_nerd_progress_indicators_use_upstream_constrained_geometry() {
 // draw2500_257F linesChar cases for light/heavy line junctions.
 #[test]
 fn terminal_box_drawing_line_junctions_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, expected) in [
         (
@@ -246,7 +232,6 @@ fn terminal_box_drawing_line_junctions_match_upstream_geometry() {
         ),
     ] {
         assert_sprite_commands(
-            &registry,
             rect,
             ch,
             SpriteFamily::BoxDrawing,
@@ -260,7 +245,7 @@ fn terminal_box_drawing_line_junctions_match_upstream_geometry() {
 // draw2500_257F dashHorizontal, dashVertical, and lightDiagonal* cases.
 #[test]
 fn terminal_box_drawing_dashes_and_diagonals_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, expected) in [
         (
@@ -364,7 +349,6 @@ fn terminal_box_drawing_dashes_and_diagonals_match_upstream_geometry() {
         ),
     ] {
         assert_sprite_commands(
-            &registry,
             rect,
             ch,
             SpriteFamily::BoxDrawing,
@@ -378,7 +362,7 @@ fn terminal_box_drawing_dashes_and_diagonals_match_upstream_geometry() {
 // draw2500_257F linesChar double-line cases.
 #[test]
 fn terminal_box_drawing_double_lines_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, expected) in [
         (
@@ -423,7 +407,6 @@ fn terminal_box_drawing_double_lines_match_upstream_geometry() {
         ),
     ] {
         assert_sprite_commands(
-            &registry,
             rect,
             ch,
             SpriteFamily::BoxDrawing,
@@ -437,7 +420,7 @@ fn terminal_box_drawing_double_lines_match_upstream_geometry() {
 // draw2500_257F arc cases for rounded corners.
 #[test]
 fn terminal_box_drawing_rounded_corners_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, corner) in [
         ('╭', "upper_left"),
@@ -446,7 +429,6 @@ fn terminal_box_drawing_rounded_corners_match_upstream_geometry() {
         ('╰', "lower_left"),
     ] {
         assert_sprite_commands(
-            &registry,
             rect,
             ch,
             SpriteFamily::BoxDrawing,
@@ -459,7 +441,7 @@ fn terminal_box_drawing_rounded_corners_match_upstream_geometry() {
 // Ported from Ghostty ce6a00b src/font/sprite/draw/powerline.zig drawE0D2/drawE0D4.
 #[test]
 fn terminal_powerline_extra_split_glyphs_use_upstream_polygons() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (ch, expected) in [
         (
@@ -477,11 +459,9 @@ fn terminal_powerline_extra_split_glyphs_use_upstream_polygons() {
             ],
         ),
     ] {
-        let glyph = registry
-            .glyph_for(ch)
-            .unwrap_or_else(|| panic!("missing glyph {ch}"));
+        let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph {ch}"));
         assert_eq!(
-            registry.commands_for(glyph, rect),
+            glyph.commands_for(rect),
             expected,
             "{ch} should match Ghostty Powerline Extra split geometry"
         );
@@ -491,7 +471,7 @@ fn terminal_powerline_extra_split_glyphs_use_upstream_polygons() {
 // Ported from Ghostty ce6a00b src/font/sprite/draw/powerline.zig drawE0B0..drawE0BF.
 #[test]
 fn terminal_powerline_draw_uses_upstream_geometry_for_all_drawn_codepoints() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
     let right_round = terminal_right_round_points(rect);
     let left_round = flip_points(&right_round, rect);
 
@@ -558,7 +538,6 @@ fn terminal_powerline_draw_uses_upstream_geometry_for_all_drawn_codepoints() {
         ),
     ] {
         assert_sprite_commands(
-            &registry,
             rect,
             ch,
             SpriteFamily::Powerline,
@@ -573,7 +552,7 @@ fn terminal_powerline_draw_uses_upstream_geometry_for_all_drawn_codepoints() {
 // and draw1FB9A_1FB9B.
 #[test]
 fn terminal_legacy_edge_triangles_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (0x1FB68, inverted_edge_triangles("left")),
@@ -588,7 +567,6 @@ fn terminal_legacy_edge_triangles_match_upstream_geometry() {
         (0x1FB9B, vec![edge_triangle("left"), edge_triangle("right")]),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputing,
@@ -603,7 +581,7 @@ fn terminal_legacy_edge_triangles_match_upstream_geometry() {
 // cornerTriangleShade cases.
 #[test]
 fn terminal_legacy_corner_triangle_shades_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (
@@ -627,7 +605,6 @@ fn terminal_legacy_corner_triangle_shades_match_upstream_geometry() {
         ),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputing,
@@ -641,7 +618,7 @@ fn terminal_legacy_corner_triangle_shades_match_upstream_geometry() {
 // src/font/sprite/draw/symbols_for_legacy_computing.zig draw1FBD0_1FBDF.
 #[test]
 fn terminal_legacy_cell_diagonals_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (0x1FBD0, diagonal_segments(&[((16.0, 12.0), (0.0, 24.0))])),
@@ -686,7 +663,6 @@ fn terminal_legacy_cell_diagonals_match_upstream_geometry() {
         ),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputing,
@@ -700,7 +676,7 @@ fn terminal_legacy_cell_diagonals_match_upstream_geometry() {
 // src/font/sprite/draw/symbols_for_legacy_computing.zig draw1FBA0_1FBAE.
 #[test]
 fn terminal_legacy_corner_diagonal_lines_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (0x1FBA0, corner_diagonal_segments(&["tl"])),
@@ -720,7 +696,6 @@ fn terminal_legacy_corner_diagonal_lines_match_upstream_geometry() {
         (0x1FBAE, corner_diagonal_segments(&["tl", "tr", "bl", "br"])),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputing,
@@ -734,9 +709,8 @@ fn terminal_legacy_corner_diagonal_lines_match_upstream_geometry() {
 // src/font/sprite/draw/symbols_for_legacy_computing.zig draw1FBAF.
 #[test]
 fn terminal_legacy_mixed_box_connector_matches_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
     assert_sprite_commands(
-        &registry,
         rect,
         '\u{1FBAF}',
         SpriteFamily::LegacyComputing,
@@ -754,7 +728,6 @@ fn terminal_legacy_mixed_box_connector_matches_upstream_geometry() {
 // draw1FBCF, and draw1FBE0_1FBEF block cases.
 #[test]
 fn terminal_legacy_fractional_blocks_match_upstream_geometry() {
-    let registry = SpriteRegistry::prompt_graphics();
     let rect = SurfaceRect::from_min_size(0.0, 0.0, 18.0, 24.0);
 
     for (cp, expected) in [
@@ -766,7 +739,6 @@ fn terminal_legacy_fractional_blocks_match_upstream_geometry() {
         (0x1FBE7, vec![fill(9.0, 6.0, 9.0, 12.0, 1.0)]),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputing,
@@ -781,7 +753,7 @@ fn terminal_legacy_fractional_blocks_match_upstream_geometry() {
 // circle cases.
 #[test]
 fn terminal_legacy_circles_match_upstream_clipped_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (0x1FBE0, vec![circle_arc("top")]),
@@ -798,7 +770,6 @@ fn terminal_legacy_circles_match_upstream_clipped_geometry() {
         (0x1FBEF, vec![circle_sector("top_left")]),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputing,
@@ -813,7 +784,7 @@ fn terminal_legacy_circles_match_upstream_clipped_geometry() {
 // draw1CC1B_1CC1E and draw1CE16_1CE19.
 #[test]
 fn terminal_legacy_supplement_box_fragments_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (
@@ -874,7 +845,6 @@ fn terminal_legacy_supplement_box_fragments_match_upstream_geometry() {
         ),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputingSupplement,
@@ -889,7 +859,7 @@ fn terminal_legacy_supplement_box_fragments_match_upstream_geometry() {
 // draw1CE00, draw1CE01, draw1CE0B, and draw1CE0C.
 #[test]
 fn terminal_legacy_supplement_split_circles_and_ellipses_match_upstream_geometry() {
-    let (registry, rect) = sprite_fixture();
+    let rect = sprite_fixture();
 
     for (cp, expected) in [
         (0x1CE00, vec![circle_arc("left"), circle_arc("right")]),
@@ -910,7 +880,6 @@ fn terminal_legacy_supplement_split_circles_and_ellipses_match_upstream_geometry
         ),
     ] {
         assert_sprite_commands_for_cp(
-            &registry,
             rect,
             cp,
             SpriteFamily::LegacyComputingSupplement,
@@ -922,8 +891,6 @@ fn terminal_legacy_supplement_split_circles_and_ellipses_match_upstream_geometry
 
 #[test]
 fn terminal_sprite_face_owns_representative_native_symbols_before_font_fallback() {
-    let registry = SpriteRegistry::prompt_graphics();
-
     for (ch, family) in [
         ('╭', SpriteFamily::BoxDrawing),
         ('▟', SpriteFamily::Block),
@@ -935,14 +902,114 @@ fn terminal_sprite_face_owns_representative_native_symbols_before_font_fallback(
         ('\u{1CE0B}', SpriteFamily::LegacyComputingSupplement),
     ] {
         assert_eq!(
-            registry.glyph_for(ch).map(|glyph| glyph.family),
+            SpriteGlyph::from_char(ch).map(|glyph| glyph.family),
             Some(family)
         );
     }
 
     for recorded_not_implemented in ['■', '\u{E0C0}', '\u{1CC00}', '\u{1FBC0}', '\u{F5D0}'] {
-        assert_eq!(registry.glyph_for(recorded_not_implemented), None);
+        assert_eq!(SpriteGlyph::from_char(recorded_not_implemented), None);
     }
+}
+
+#[test]
+fn terminal_sprite_family_range_edges_are_stable() {
+    let ranges = [
+        (0x2500, 0x257F, SpriteFamily::BoxDrawing),
+        (0x2800, 0x28FF, SpriteFamily::Braille),
+        (0xEE00, 0xEE0B, SpriteFamily::ProgressIndicator),
+        (0x1FB00, 0x1FB67, SpriteFamily::LegacyComputing),
+        (0x1FB68, 0x1FB6F, SpriteFamily::LegacyComputing),
+        (0x1FB70, 0x1FB99, SpriteFamily::LegacyComputing),
+        (0x1FB9A, 0x1FB9F, SpriteFamily::LegacyComputing),
+        (0x1FBA0, 0x1FBAF, SpriteFamily::LegacyComputing),
+        (0x1FBBD, 0x1FBBF, SpriteFamily::LegacyComputing),
+        (0x1FBCE, 0x1FBCF, SpriteFamily::LegacyComputing),
+        (0x1FBD0, 0x1FBDF, SpriteFamily::LegacyComputing),
+        (0x1FBE0, 0x1FBEF, SpriteFamily::LegacyComputing),
+        (0x1CC1B, 0x1CC1E, SpriteFamily::LegacyComputingSupplement),
+        (0x1CC21, 0x1CC2F, SpriteFamily::LegacyComputingSupplement),
+        (0x1CC30, 0x1CC3F, SpriteFamily::LegacyComputingSupplement),
+        (0x1CD00, 0x1CDE5, SpriteFamily::LegacyComputingSupplement),
+        (0x1CE00, 0x1CE01, SpriteFamily::LegacyComputingSupplement),
+        (0x1CE0B, 0x1CE0C, SpriteFamily::LegacyComputingSupplement),
+        (0x1CE16, 0x1CE19, SpriteFamily::LegacyComputingSupplement),
+        (0x1CE51, 0x1CE8F, SpriteFamily::LegacyComputingSupplement),
+        (0x1CE90, 0x1CEAF, SpriteFamily::LegacyComputingSupplement),
+    ];
+
+    for (start, end, family) in ranges {
+        for cp in [start, end] {
+            let ch = char::from_u32(cp).expect("range edge should be a Unicode scalar");
+            assert_eq!(
+                SpriteGlyph::from_char(ch).map(|glyph| glyph.family),
+                Some(family),
+                "U+{cp:04X} should stay in {family:?}"
+            );
+        }
+    }
+
+    for cp in [
+        0x24FF, 0x27FF, 0x2900, 0xEE0C, 0x1FBB0, 0x1FBC0, 0x1CC1F, 0x1CC20, 0x1CC40, 0x1CE02,
+        0x1CE0D, 0x1CE1A, 0x1CE50, 0x1CEB0,
+    ] {
+        let ch = char::from_u32(cp).expect("gap should be a Unicode scalar");
+        assert_eq!(
+            SpriteGlyph::from_char(ch),
+            None,
+            "U+{cp:04X} should stay unowned"
+        );
+    }
+}
+
+#[test]
+fn owned_sprite_commands_fit_cell_bounds() {
+    let cell = SurfaceRect::from_min_size(11.0, 7.0, 19.0, 23.0);
+
+    for cp in 0..=0x10FFFF {
+        let Some(ch) = char::from_u32(cp) else {
+            continue;
+        };
+        let Some(glyph) = SpriteGlyph::from_char(ch) else {
+            continue;
+        };
+        for command in glyph.commands_for(cell) {
+            assert_sprite_command_fits_cell(&command, cell, ch);
+        }
+    }
+}
+
+fn assert_sprite_command_fits_cell(command: &SpriteCommand, cell: SurfaceRect, ch: char) {
+    const EPSILON: f32 = 0.0001;
+    match command {
+        SpriteCommand::FillRect { rect, .. } => {
+            assert_between(rect.min_x, cell.min_x, cell.max_x, EPSILON, ch);
+            assert_between(rect.max_x, cell.min_x, cell.max_x, EPSILON, ch);
+            assert_between(rect.min_y, cell.min_y, cell.max_y, EPSILON, ch);
+            assert_between(rect.max_y, cell.min_y, cell.max_y, EPSILON, ch);
+        }
+        SpriteCommand::FillPolygon { points, .. } => {
+            for point in points {
+                assert_between(point.x, cell.min_x, cell.max_x, EPSILON, ch);
+                assert_between(point.y, cell.min_y, cell.max_y, EPSILON, ch);
+            }
+        }
+        SpriteCommand::StrokePolyline { points, width, .. }
+        | SpriteCommand::ClearStrokePolyline { points, width, .. } => {
+            let margin = *width * 0.5 + EPSILON;
+            for point in points {
+                assert_between(point.x, cell.min_x, cell.max_x, margin, ch);
+                assert_between(point.y, cell.min_y, cell.max_y, margin, ch);
+            }
+        }
+    }
+}
+
+fn assert_between(value: f32, min: f32, max: f32, margin: f32, ch: char) {
+    assert!(
+        value >= min - margin && value <= max + margin,
+        "{ch} emitted coordinate {value} outside [{min}, {max}] with margin {margin}"
+    );
 }
 
 #[test]
@@ -1053,26 +1120,22 @@ fn fill(x: f32, y: f32, width: f32, height: f32, alpha: f32) -> SpriteCommand {
 }
 
 fn assert_sprite_commands(
-    registry: &SpriteRegistry,
     rect: SurfaceRect,
     ch: char,
     family: SpriteFamily,
     expected: Vec<SpriteCommand>,
     detail: &str,
 ) {
-    let glyph = registry
-        .glyph_for(ch)
-        .unwrap_or_else(|| panic!("missing glyph {ch}"));
+    let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph {ch}"));
     assert_eq!(glyph.family, family, "{ch} should be owned as {family:?}");
     assert_eq!(
-        registry.commands_for(glyph, rect),
+        glyph.commands_for(rect),
         expected,
         "{ch} should match {detail}"
     );
 }
 
 fn assert_sprite_commands_for_cp(
-    registry: &SpriteRegistry,
     rect: SurfaceRect,
     cp: u32,
     family: SpriteFamily,
@@ -1080,15 +1143,13 @@ fn assert_sprite_commands_for_cp(
     detail: &str,
 ) {
     let ch = char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}"));
-    let glyph = registry
-        .glyph_for(ch)
-        .unwrap_or_else(|| panic!("missing glyph U+{cp:04X}"));
+    let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph U+{cp:04X}"));
     assert_eq!(
         glyph.family, family,
         "U+{cp:04X} should be owned as {family:?}"
     );
     assert_eq!(
-        registry.commands_for(glyph, rect),
+        glyph.commands_for(rect),
         expected,
         "U+{cp:04X} should match {detail}"
     );

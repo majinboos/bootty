@@ -56,9 +56,9 @@ fn background_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
-pub(super) fn text_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+pub(super) fn texture_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bootty_terminal_text_bind_group_layout"),
+        label: Some("bootty_terminal_texture_bind_group_layout"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -85,30 +85,6 @@ pub(super) fn text_texture_format(format: GlyphAtlasFormat) -> wgpu::TextureForm
         GlyphAtlasFormat::Alpha => wgpu::TextureFormat::R8Unorm,
         GlyphAtlasFormat::Bgr | GlyphAtlasFormat::Rgba => wgpu::TextureFormat::Rgba8Unorm,
     }
-}
-
-pub(super) fn image_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("bootty_terminal_image_bind_group_layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    })
 }
 
 pub(super) fn text_pipeline(

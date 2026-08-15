@@ -11,7 +11,6 @@ use std::{
 use anyhow::Result;
 use bootty_app::{
     app::{AppState, FrameInputs, ViewportSnapshot},
-    commands::{AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome},
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig},
     geometry::ViewTransform,
     mux::{
@@ -38,6 +37,9 @@ use bootty_app::{
         BindingMembershipMutation, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
         WorkspaceRepository,
     },
+};
+use bootty_command::{
+    AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome,
 };
 use rusqlite::Connection;
 

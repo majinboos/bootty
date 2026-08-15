@@ -13,6 +13,7 @@ app = [
 ]
 
 [dependencies]
+bootty-command = { path = "../bootty-command" }
 bootty-mux-model = { path = "../bootty-mux-model" }
 bootty-write = { path = "../bootty-write" }
 anyhow.workspace = true

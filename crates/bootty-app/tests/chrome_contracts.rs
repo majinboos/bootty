@@ -2,16 +2,14 @@ use bootty_app::{
     config::{ColorConfig, SegmentAlign},
     mux::controller::SpaceId,
     theme::theme_palette_from_colors,
-    ui::{
-        chrome::{
-            ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState,
-            SpaceSwitcherEvent, SpaceSwitcherItem, StatusBarModel, show_space_switcher,
-            show_status_bar, status_bar_window_tab_row_count, status_bar_windows_intersect_x_range,
-            take_sidebar_space_swipe,
-        },
-        icons::install_icon_fonts,
+    ui::chrome::{
+        ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState, SpaceSwitcherEvent,
+        SpaceSwitcherItem, StatusBarModel, show_space_switcher, show_status_bar,
+        status_bar_window_tab_row_count, status_bar_windows_intersect_x_range,
+        take_sidebar_space_swipe,
     },
 };
+use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
 
 fn space(id: i64, name: &str, active: bool) -> SpaceSwitcherItem {

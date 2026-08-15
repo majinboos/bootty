@@ -13,7 +13,7 @@ use bootty_mux::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
     command::{MuxCommand, MuxSplitDirection},
-    controller::{BindingId, BindingMuxController, MuxScope, RepaintHandle, SpaceId},
+    controller::{BindingId, MuxController, MuxScope, RepaintHandle, SpaceId},
     provider::{
         GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider,
         MuxAppBackendRegistry, MuxBackendProvider, MuxCommandDispatch, PaneBehavior, PaneTopology,
@@ -282,7 +282,7 @@ fn refresh_outcome_reports_one_applied_snapshot_without_latching_completion() {
     };
     let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1));
     let repaint: RepaintHandle = Arc::new(|| {});
-    let mut controller = BindingMuxController::new(scope, registry, None);
+    let mut controller = MuxController::new(scope, registry, None);
 
     let first = controller.refresh_sessions(&repaint, &config, Duration::from_secs(1));
     let applied = if first.applied {
@@ -328,7 +328,7 @@ fn refresh_outcome_keeps_applied_and_error_as_independent_fields() {
     };
     let scope = MuxScope::new(SpaceId::from_persistence(2), BindingId::from_persistence(2));
     let repaint: RepaintHandle = Arc::new(|| {});
-    let mut controller = BindingMuxController::new(scope, registry, None);
+    let mut controller = MuxController::new(scope, registry, None);
 
     let queued = controller.refresh_sessions(&repaint, &config, Duration::ZERO);
     assert!(!queued.applied);

@@ -10,8 +10,10 @@ mod remote;
 #[cfg(feature = "app")]
 pub use backend::rmux_capabilities;
 pub use backend::{RmuxBackend, RmuxControl};
-pub use bridge::{run_embedded_rmux_daemon, start_embedded_rmux_daemon_for_tests};
-pub use local::{endpoint_path_for, prepare_local_rmux_daemon, socket_name};
+pub use bridge::{
+    prepare_local_rmux_daemon, run_embedded_rmux_daemon, start_embedded_rmux_daemon_for_tests,
+};
+pub use local::{endpoint_path_for, socket_name};
 #[cfg(feature = "app")]
 pub use pane::RmuxPanePolicy;
 pub use provider::link;

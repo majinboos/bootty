@@ -23,9 +23,7 @@ impl BindingRuntime {
         delta: isize,
     ) -> Option<(String, String)> {
         self.mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .and_then(|session| {
                 let mut windows = session.windows.iter().collect::<Vec<_>>();
                 windows.sort_by_key(|window| window.index);
@@ -42,9 +40,7 @@ impl BindingRuntime {
     ) -> bool {
         let Some(session_id) = self
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .filter(|session| session.windows.len() > 1)
             .map(|session| session.id.clone())
         else {
@@ -69,9 +65,7 @@ impl BindingRuntime {
         let selected_window = self.mux.selected_window().map(str::to_owned);
         let Some((session_id, anchor_cwd, target_is_current)) = self
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .and_then(|session| {
                 let window = session
                     .windows
@@ -164,9 +158,7 @@ impl BindingRuntime {
         let selected_window = self.mux.selected_window().map(str::to_owned);
         let Some((session_id, position, window_count, active_window_id)) = self
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .and_then(|session| {
                 let mut windows = session.windows.iter().collect::<Vec<_>>();
                 windows.sort_by_key(|window| window.index);
@@ -226,9 +218,7 @@ impl BindingRuntime {
     ) -> bool {
         let Some((session_id, window_id, pane_id)) = self
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .and_then(|session| {
                 session
                     .windows

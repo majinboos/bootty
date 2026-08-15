@@ -1,10 +1,10 @@
 use std::hint::black_box;
 
-use bootty_app::{
-    geometry::TerminalGeometry,
-    terminal::{
-        KeyInput, KeyMods, MouseAction, MouseButton, MouseEncoderSize, MouseInput, TerminalEngine,
-        TerminalKey,
+use bootty_app::geometry::TerminalGeometry;
+use bootty_terminal::{
+    terminal_engine::TerminalEngine,
+    terminal_input_model::{
+        KeyInput, KeyMods, MouseAction, MouseButton, MouseEncoderSize, MouseInput, TerminalKey,
     },
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};

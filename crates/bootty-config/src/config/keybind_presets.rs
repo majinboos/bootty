@@ -35,7 +35,7 @@ fn expand_macos_option_alt_keybind(
         .collect()
 }
 
-fn split_keybind_entry(entry: &str) -> Option<(&str, &str)> {
+pub fn split_keybind_entry(entry: &str) -> Option<(&str, &str)> {
     let bytes = entry.as_bytes();
     let mut offset = 0;
     while let Some(rel) = entry[offset..].find('=') {

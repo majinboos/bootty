@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, ops::Range};
+use std::ops::Range;
 
 use libghostty_vt::{
     render::Dirty,
@@ -32,99 +32,6 @@ pub struct RendererFrame {
     pub images: KittyImageFrame,
     source_dirty: Dirty,
     paint_plan: TerminalPaintPlan,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RendererLinkMods {
-    pub ctrl: bool,
-    pub alt: bool,
-    pub shift: bool,
-    pub super_key: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RendererLinkHighlight {
-    Always,
-    AlwaysWithMods(RendererLinkMods),
-    Hover,
-    HoverWithMods(RendererLinkMods),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RendererLinkPattern {
-    pub pattern: String,
-    pub highlight: RendererLinkHighlight,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RendererCellPoint {
-    pub x: u16,
-    pub y: u16,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RendererLinkCellMap {
-    cells: BTreeSet<RendererCellPoint>,
-}
-
-impl RendererLinkCellMap {
-    pub fn contains(&self, x: u16, y: u16) -> bool {
-        self.cells.contains(&RendererCellPoint { x, y })
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RendererPreedit {
-    pub codepoints: Vec<RendererPreeditCodepoint>,
-}
-
-impl RendererPreedit {
-    pub fn width(&self) -> u16 {
-        self.codepoints
-            .iter()
-            .map(|codepoint| if codepoint.wide { 2 } else { 1 })
-            .sum()
-    }
-
-    pub fn range(&self, start: u16, max: u16) -> RendererPreeditRange {
-        let max_width = max.saturating_sub(start).saturating_add(1);
-        let mut width = 0;
-        let mut codepoint_offset = 0;
-
-        for (index, codepoint) in self.codepoints.iter().enumerate().rev() {
-            width += if codepoint.wide { 2 } else { 1 };
-            if width > max_width {
-                codepoint_offset = index;
-                break;
-            }
-        }
-
-        let end = if width > 0 {
-            start.saturating_add(width - 1)
-        } else {
-            start
-        };
-        let start_offset = end.saturating_sub(max);
-
-        RendererPreeditRange {
-            start: start.saturating_sub(start_offset),
-            end: end.saturating_sub(start_offset),
-            codepoint_offset,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RendererPreeditCodepoint {
-    pub codepoint: char,
-    pub wide: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RendererPreeditRange {
-    pub start: u16,
-    pub end: u16,
-    pub codepoint_offset: usize,
 }
 
 impl RendererFrame {
@@ -326,52 +233,6 @@ impl RendererFrame {
         }
     }
 
-    pub fn link_cell_map(
-        &self,
-        links: &[RendererLinkPattern],
-        hover: Option<RendererCellPoint>,
-        mods: RendererLinkMods,
-    ) -> RendererLinkCellMap {
-        let mut text = String::new();
-        let mut byte_to_cell = Vec::new();
-        for row in &self.rows {
-            for cell in &self.cells[row.cells.clone()] {
-                for ch in cell.text.chars() {
-                    text.push(ch);
-                    for _ in 0..ch.len_utf8() {
-                        byte_to_cell.push(RendererCellPoint {
-                            x: cell.x,
-                            y: cell.y,
-                        });
-                    }
-                }
-            }
-        }
-
-        let mut result = RendererLinkCellMap::default();
-        for link in links {
-            if !link.highlight.applies(hover, mods) {
-                continue;
-            }
-            let mut offset = 0;
-            while offset < text.len() {
-                let Some(found) = text[offset..].find(&link.pattern) else {
-                    break;
-                };
-                let start = offset + found;
-                let end = start + link.pattern.len();
-                offset = end;
-
-                let matched_cells = &byte_to_cell[start..end];
-                if !link.highlight.allows_cells(matched_cells, hover) {
-                    continue;
-                }
-                result.cells.extend(matched_cells.iter().copied());
-            }
-        }
-        result
-    }
-
     fn resolved_cell_colors(&self, cell: &RendererCell) -> (PlanColor, PlanColor) {
         if let RendererSelectionIntent::Selected {
             foreground,
@@ -413,26 +274,6 @@ impl RendererFrame {
                 .resolve_foreground(foreground, background)
                 != foreground
         })
-    }
-}
-
-impl RendererLinkHighlight {
-    fn applies(self, hover: Option<RendererCellPoint>, mods: RendererLinkMods) -> bool {
-        match self {
-            Self::Always => true,
-            Self::AlwaysWithMods(required) => mods == required,
-            Self::Hover => hover.is_some(),
-            Self::HoverWithMods(required) => hover.is_some() && mods == required,
-        }
-    }
-
-    fn allows_cells(self, cells: &[RendererCellPoint], hover: Option<RendererCellPoint>) -> bool {
-        match self {
-            Self::Always | Self::AlwaysWithMods(_) => true,
-            Self::Hover | Self::HoverWithMods(_) => {
-                hover.is_some_and(|point| cells.contains(&point))
-            }
-        }
     }
 }
 
@@ -574,68 +415,6 @@ pub enum RendererSelectionIntent {
 pub enum RendererCellGraphics {
     Text,
     Ghostty(GhosttyGraphicsElement),
-}
-
-pub fn renderer_cell_constraint_width(cells: &[RendererCell], x: usize, cols: usize) -> u16 {
-    let Some(cell) = cells.get(x) else {
-        return 1;
-    };
-    let grid_width = text_cell_width(&cell.text);
-    if grid_width > 1 {
-        return grid_width;
-    }
-
-    let Some(ch) = single_cell_char(cell) else {
-        return grid_width;
-    };
-    if !is_symbol_like(ch) {
-        return grid_width;
-    }
-    if x == cols.saturating_sub(1) {
-        return 1;
-    }
-    if x > 0
-        && let Some(previous) = single_cell_char(&cells[x - 1])
-        && is_symbol_like(previous)
-        && !is_graphics_element(previous)
-    {
-        return 1;
-    }
-    let Some(next) = cells.get(x + 1).and_then(single_cell_char) else {
-        return 2;
-    };
-    if next == ' ' || next == '\u{2002}' {
-        return 2;
-    }
-
-    1
-}
-
-fn single_cell_char(cell: &RendererCell) -> Option<char> {
-    let mut chars = cell.text.chars();
-    let ch = chars.next()?;
-    if chars.next().is_some() {
-        return None;
-    }
-    Some(ch)
-}
-
-fn is_symbol_like(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{2190}'..='\u{21FF}'
-            | '\u{2460}'..='\u{24FF}'
-            | '\u{25A0}'..='\u{25FF}'
-            | '\u{2600}'..='\u{27BF}'
-            | '\u{1F300}'..='\u{1FAFF}'
-            | '\u{E000}'..='\u{F8FF}'
-            | '\u{F0000}'..='\u{FFFFD}'
-            | '\u{100000}'..='\u{10FFFD}'
-    )
-}
-
-fn is_graphics_element(ch: char) -> bool {
-    GhosttyGraphicsElement::classify(ch).is_some()
 }
 
 impl RendererCellGraphics {

@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Result;
 use bootty_config::config::MultiplexerBackendConfig;
+use bootty_runtime::terminal_session::DrainStats;
 use bootty_terminal::terminal_engine::TerminalSideEffectEvent;
 
 use super::{
@@ -21,7 +22,7 @@ use crate::{
     mux::{
         RepaintHandle,
         command::MuxCommand,
-        controller::{BindingMuxController, MuxScope, SpaceId, mux_session_refresh_interval},
+        controller::{MuxController, MuxScope, SpaceId, mux_session_refresh_interval},
         provider::{
             MuxAppBackendPolicy, MuxAppBackendRegistry, MuxCommandDispatch, PaneTopology,
             PersistedSessionPolicy, TerminalResidency,
@@ -32,7 +33,6 @@ use crate::{
     renderer::TerminalWidget,
     session_names::SessionNameStore,
     session_order::SessionOrderStore,
-    terminal::DrainStats,
     workspace::{
         BackendMembership, BindingMembershipMutation, SpaceMuxOverride, SpaceRemoteOverride,
         WorkspaceBinding, WorkspacePersistenceError, WorkspaceRepository, WorkspaceSpace,
@@ -189,7 +189,7 @@ pub(super) struct BindingRuntime {
     pub(super) reconnect: BindingReconnect,
     pub(super) multiplexer: crate::config::MultiplexerConfig,
     pub(super) terminal: Box<ActiveTerminal>,
-    pub(super) mux: BindingMuxController,
+    pub(super) mux: MuxController,
     pub(super) session_order: SessionOrderStore,
     pub(super) session_names: SessionNameStore,
     pub(super) pending_generated_names: HashMap<String, PendingGeneratedName>,
@@ -239,7 +239,7 @@ impl BindingRuntime {
         // other's, and reopening a window keeps its own. Native sessions live in this process rather
         // than in a server, so which state a binding reaches is a choice bootty has to make.
         let workspace = config.config_path.clone();
-        let mux = BindingMuxController::new(scope, Arc::clone(&backends), Some(workspace));
+        let mux = MuxController::new(scope, Arc::clone(&backends), Some(workspace));
         let mut binding = Self {
             backends,
             backend_policy,
@@ -1324,6 +1324,109 @@ impl WorkspaceRuntime {
             .expect("the active binding has committed workspace state")
     }
 
+    pub(super) fn move_active_session(
+        &mut self,
+        session_id: &str,
+        delta: i32,
+    ) -> Result<bool, WorkspacePersistenceError> {
+        let Some(session_name) = self
+            .active
+            .binding
+            .mux
+            .session_by_id_or_name(session_id)
+            .map(|session| session.name.clone())
+        else {
+            return Ok(false);
+        };
+        let sessions = self
+            .active
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+        let mut candidate = self.active_binding_state_candidate();
+        if !candidate.session_order.move_session(
+            &session_name,
+            delta,
+            sessions.iter().map(String::as_str),
+        ) {
+            return Ok(false);
+        }
+        self.commit_binding_state_candidate(candidate)
+            .map(|()| true)
+    }
+
+    pub(super) fn reorder_active_session_before(
+        &mut self,
+        source: &str,
+        before: Option<&str>,
+    ) -> Result<bool, WorkspacePersistenceError> {
+        let sessions = self
+            .active
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+        let mut candidate = self.active_binding_state_candidate();
+        if !candidate.session_order.move_session_before(
+            source,
+            before,
+            sessions.iter().map(String::as_str),
+        ) {
+            return Ok(false);
+        }
+        self.commit_binding_state_candidate(candidate)
+            .map(|()| true)
+    }
+
+    pub(super) fn add_session_to_binding(
+        &mut self,
+        scope: MuxScope,
+        session_id: &str,
+    ) -> Result<bool, WorkspacePersistenceError> {
+        let Some(session_name) = self.binding(scope).and_then(|binding| {
+            binding
+                .mux
+                .backend_session_by_id_or_name(session_id)
+                .map(|session| session.name.clone())
+        }) else {
+            return Ok(false);
+        };
+        let mut candidate = self
+            .binding_state_candidate(scope)
+            .expect("a live binding has committed workspace state");
+        let added = candidate.session_order.add_session(&session_name);
+        self.commit_binding_state_candidate(candidate)?;
+        Ok(added)
+    }
+
+    pub(super) fn detach_session_from_space(
+        &mut self,
+        scope: MuxScope,
+        session_id: &str,
+    ) -> Result<bool, WorkspacePersistenceError> {
+        let Some(session_name) = self.binding(scope).and_then(|binding| {
+            binding
+                .mux
+                .backend_session_by_id_or_name(session_id)
+                .map(|session| session.name.clone())
+        }) else {
+            return Ok(false);
+        };
+        let mut candidate = self
+            .binding_state_candidate(scope)
+            .expect("a live binding has committed workspace state");
+        if !candidate.session_order.remove_session(&session_name) {
+            return Ok(false);
+        }
+        self.commit_binding_state_candidate(candidate)
+            .map(|()| true)
+    }
+
     pub(super) fn begin_active_binding_membership_mutation(
         &mut self,
         command: &MuxCommand,
@@ -1347,9 +1450,7 @@ impl WorkspaceRuntime {
                     .active
                     .binding
                     .mux
-                    .all_sessions()
-                    .iter()
-                    .find(|session| session.id == *session_id || session.name == *session_id);
+                    .backend_session_by_id_or_name(session_id);
                 let old_name = session
                     .map(|session| session.name.clone())
                     .or_else(|| {
@@ -1396,9 +1497,7 @@ impl WorkspaceRuntime {
                     .active
                     .binding
                     .mux
-                    .all_sessions()
-                    .iter()
-                    .find(|session| session.id == *session_id || session.name == *session_id)
+                    .backend_session_by_id_or_name(session_id)
                     .map(|session| session.name.clone())
                     .or_else(|| {
                         self.active

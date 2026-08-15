@@ -3,13 +3,14 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc,
     },
     thread,
     time::{Duration, Instant},
 };
 
+use bootty_command::CommandCancellation;
 use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 use serde::{Deserialize, Serialize};
 
@@ -66,45 +67,6 @@ pub struct MuxSessionRefreshOutcome {
 struct SessionRefreshRequest {
     generation: u64,
     config: MuxBindingConfig,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CommandCancellation(Arc<AtomicU8>);
-
-impl CommandCancellation {
-    const PENDING: u8 = 0;
-    const STARTED: u8 = 1;
-    const CANCELLED: u8 = 2;
-
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn cancel(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::PENDING,
-                Self::CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire) == Self::CANCELLED
-    }
-
-    pub fn try_start(&self) -> bool {
-        self.0
-            .compare_exchange(
-                Self::PENDING,
-                Self::STARTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -478,8 +440,7 @@ impl MuxResourceKey {
     }
 }
 
-pub struct BindingMuxController {
-    controller: MuxController,
+pub struct MuxController {
     last_error: Option<String>,
     availability_error: Option<BindingAvailabilityError>,
     refresh_failed: bool,
@@ -487,16 +448,40 @@ pub struct BindingMuxController {
     resource_generations: BTreeMap<MuxResourceKey, u64>,
     observed_resources: BTreeMap<MuxResourceKey, String>,
     observed_backend: Option<MuxBackendKind>,
+    scope: Option<MuxScope>,
+    sessions: Vec<MuxSession>,
+    all_sessions: Vec<MuxSession>,
+    backend_session_names: Vec<String>,
+    selected_session: Option<String>,
+    /// A session this binding just asked the backend to create and still expects to see. Selection
+    /// falls back to whatever the backend calls active whenever the current one is missing, so
+    /// without this the session being created loses focus in the frames before it shows up.
+    expected_session: Option<String>,
+    previous_selected_session: Option<String>,
+    selected_window: Option<String>,
+    /// The selected session's active window from the previous snapshot, used to detect window
+    /// switches made outside bootty so the highlight follows them.
+    last_active_window: Option<ActiveWindow>,
+    current_backend: Option<MuxBackendKind>,
+    last_session_refresh: Option<Instant>,
+    session_refresh_generation: u64,
+    session_refresh_tx: Option<mpsc::Sender<SessionRefreshRequest>>,
+    session_refresh_rx: Option<mpsc::Receiver<SessionRefreshResult>>,
+    session_refresh_pending: bool,
+    mux_command_tx: Option<mpsc::Sender<MuxCommandJob>>,
+    mux_command_rx: Option<mpsc::Receiver<MuxCommandResult>>,
+    registry: Arc<MuxAppBackendRegistry>,
+    workspace: Option<PathBuf>,
+    command_config: Arc<Mutex<CommandConfigState>>,
 }
 
-impl BindingMuxController {
+impl MuxController {
     pub fn new(
         scope: MuxScope,
         registry: Arc<MuxAppBackendRegistry>,
         workspace: Option<PathBuf>,
     ) -> Self {
         Self {
-            controller: MuxController::with_scope(scope, registry, workspace),
             last_error: None,
             availability_error: None,
             refresh_failed: false,
@@ -504,6 +489,26 @@ impl BindingMuxController {
             resource_generations: BTreeMap::new(),
             observed_resources: BTreeMap::new(),
             observed_backend: None,
+            scope: Some(scope),
+            sessions: Vec::new(),
+            all_sessions: Vec::new(),
+            backend_session_names: Vec::new(),
+            selected_session: None,
+            expected_session: None,
+            previous_selected_session: None,
+            selected_window: None,
+            last_active_window: None,
+            current_backend: None,
+            last_session_refresh: None,
+            session_refresh_generation: 0,
+            session_refresh_tx: None,
+            session_refresh_rx: None,
+            session_refresh_pending: false,
+            mux_command_tx: None,
+            mux_command_rx: None,
+            registry,
+            workspace,
+            command_config: Arc::new(Mutex::new(CommandConfigState::default())),
         }
     }
 
@@ -546,14 +551,13 @@ impl BindingMuxController {
         config: &MuxBindingConfig,
         operation: BindingOperation,
     ) -> BindingOperationOutcome<()> {
-        let Some(scope) = self.controller.scope else {
+        let Some(scope) = self.scope else {
             return BindingOperationOutcome::Supported(());
         };
         if self.availability_error.is_some() {
             return BindingOperationOutcome::Unavailable;
         }
         if self
-            .controller
             .registry
             .capabilities(config, scope)
             .supports(operation)
@@ -594,7 +598,7 @@ impl BindingMuxController {
 
     fn record_resource_snapshot(&mut self) {
         let mut current = BTreeMap::new();
-        for session in self.controller.sessions() {
+        for session in self.sessions() {
             current.insert(MuxResourceKey::Session(session.id.clone()), String::new());
             for window in &session.windows {
                 current.insert(
@@ -635,194 +639,6 @@ impl BindingMuxController {
         self.observed_resources = current;
     }
 
-    pub fn create_project_session(
-        &mut self,
-        request: NewMuxSessionRequest,
-        repaint: &RepaintHandle,
-        config: &MuxBindingConfig,
-    ) {
-        if self.availability_error.is_some() {
-            return;
-        }
-        self.controller
-            .create_project_session(request, repaint, config);
-        self.record_resource_snapshot();
-    }
-
-    pub fn execute_command(
-        &mut self,
-        repaint: &RepaintHandle,
-        config: &MuxBindingConfig,
-        command: MuxCommand,
-    ) {
-        if self.availability_error.is_some() {
-            return;
-        }
-        self.controller.execute_command(repaint, config, command);
-        self.record_resource_snapshot();
-    }
-
-    pub fn execute_command_authoritatively(
-        &mut self,
-        repaint: &RepaintHandle,
-        config: &MuxBindingConfig,
-        command: MuxCommand,
-        deadline: Instant,
-        cancellation: CommandCancellation,
-    ) -> mpsc::Receiver<MuxCommandResult> {
-        if self.availability_error.is_some() {
-            let (response_tx, response_rx) = mpsc::channel();
-            let _ = response_tx.send(Err(MuxCommandError::Unavailable));
-            return response_rx;
-        }
-        self.controller.execute_command_authoritatively(
-            repaint,
-            config,
-            command,
-            deadline,
-            cancellation,
-        )
-    }
-
-    pub fn refresh_sessions(
-        &mut self,
-        repaint: &RepaintHandle,
-        config: &MuxBindingConfig,
-        interval: Duration,
-    ) -> MuxSessionRefreshOutcome {
-        if let Some(BindingAvailabilityError::Configured(error)) = &self.availability_error {
-            self.last_error = Some(error.clone());
-            return MuxSessionRefreshOutcome {
-                applied: false,
-                error: Some(error.clone()),
-            };
-        }
-        let recovering = self.refresh_failed;
-        let outcome = self.controller.refresh_sessions(repaint, config, interval);
-        if let Some(error) = &outcome.error {
-            self.last_error = Some(error.clone());
-            self.refresh_failed = true;
-            self.availability_error = Some(BindingAvailabilityError::Runtime(error.clone()));
-        }
-        if outcome.applied {
-            let backend = self.controller.current_backend;
-            let backend_changed = self
-                .observed_backend
-                .is_some_and(|observed| Some(observed) != backend);
-            if recovering || backend_changed {
-                self.binding_generation = self.binding_generation.saturating_add(1);
-                self.observed_resources.clear();
-            }
-            self.observed_backend = backend;
-            if outcome.error.is_none() {
-                self.last_error = None;
-                self.availability_error = None;
-                self.refresh_failed = false;
-            }
-            self.record_resource_snapshot();
-        }
-        outcome
-    }
-
-    pub fn poll_command(&mut self) -> Option<Result<(), String>> {
-        let result = self.controller.poll_command();
-        if let Some(result) = &result {
-            self.last_error = result.as_ref().err().cloned();
-            if result.is_ok() {
-                self.record_resource_snapshot();
-            }
-        }
-        result
-    }
-
-    pub fn complete_authoritative_command(
-        &mut self,
-        result: MuxCommandResult,
-        config: &MuxBindingConfig,
-    ) -> MuxCommandResult {
-        let result = self
-            .controller
-            .complete_authoritative_command(result, Some(config));
-        self.last_error = result.as_ref().err().map(ToString::to_string);
-        if result.is_ok() {
-            self.record_resource_snapshot();
-        }
-        result
-    }
-}
-
-impl std::ops::Deref for BindingMuxController {
-    type Target = MuxController;
-
-    fn deref(&self) -> &Self::Target {
-        &self.controller
-    }
-}
-
-impl std::ops::DerefMut for BindingMuxController {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.controller
-    }
-}
-
-pub struct MuxController {
-    scope: Option<MuxScope>,
-    sessions: Vec<MuxSession>,
-    all_sessions: Vec<MuxSession>,
-    backend_session_names: Vec<String>,
-    selected_session: Option<String>,
-    /// A session this binding just asked the backend to create and still expects to see. Selection
-    /// falls back to whatever the backend calls active whenever the current one is missing, so
-    /// without this the session being created loses focus in the frames before it shows up.
-    expected_session: Option<String>,
-    previous_selected_session: Option<String>,
-    selected_window: Option<String>,
-    /// The selected session's active window from the previous snapshot, used to detect window
-    /// switches made outside bootty so the highlight follows them.
-    last_active_window: Option<ActiveWindow>,
-    current_backend: Option<MuxBackendKind>,
-    last_session_refresh: Option<Instant>,
-    session_refresh_generation: u64,
-    session_refresh_tx: Option<mpsc::Sender<SessionRefreshRequest>>,
-    session_refresh_rx: Option<mpsc::Receiver<SessionRefreshResult>>,
-    session_refresh_pending: bool,
-    mux_command_tx: Option<mpsc::Sender<MuxCommandJob>>,
-    mux_command_rx: Option<mpsc::Receiver<MuxCommandResult>>,
-    registry: Arc<MuxAppBackendRegistry>,
-    workspace: Option<PathBuf>,
-    command_config: Arc<Mutex<CommandConfigState>>,
-}
-
-impl MuxController {
-    fn with_scope(
-        scope: MuxScope,
-        registry: Arc<MuxAppBackendRegistry>,
-        workspace: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            scope: Some(scope),
-            sessions: Vec::new(),
-            all_sessions: Vec::new(),
-            backend_session_names: Vec::new(),
-            selected_session: None,
-            expected_session: None,
-            previous_selected_session: None,
-            selected_window: None,
-            last_active_window: None,
-            current_backend: None,
-            last_session_refresh: None,
-            session_refresh_generation: 0,
-            session_refresh_tx: None,
-            session_refresh_rx: None,
-            session_refresh_pending: false,
-            mux_command_tx: None,
-            mux_command_rx: None,
-            registry,
-            workspace,
-            command_config: Arc::new(Mutex::new(CommandConfigState::default())),
-        }
-    }
-
     fn build_backend(&self, config: &MuxBindingConfig) -> Box<dyn MuxBackend> {
         self.registry
             .build_backend(config, self.workspace.as_deref())
@@ -855,6 +671,18 @@ impl MuxController {
         } else {
             &self.all_sessions
         }
+    }
+
+    pub fn session_by_id_or_name(&self, key: &str) -> Option<&MuxSession> {
+        self.sessions()
+            .iter()
+            .find(|session| session_matches(session, key))
+    }
+
+    pub fn backend_session_by_id_or_name(&self, key: &str) -> Option<&MuxSession> {
+        self.all_sessions()
+            .iter()
+            .find(|session| session_matches(session, key))
     }
 
     pub fn backend_session_names(&self) -> &[String] {
@@ -962,6 +790,45 @@ impl MuxController {
         config: &MuxBindingConfig,
         interval: Duration,
     ) -> MuxSessionRefreshOutcome {
+        if let Some(BindingAvailabilityError::Configured(error)) = &self.availability_error {
+            self.last_error = Some(error.clone());
+            return MuxSessionRefreshOutcome {
+                applied: false,
+                error: Some(error.clone()),
+            };
+        }
+        let recovering = self.refresh_failed;
+        let outcome = self.refresh_sessions_inner(repaint, config, interval);
+        if let Some(error) = &outcome.error {
+            self.last_error = Some(error.clone());
+            self.refresh_failed = true;
+            self.availability_error = Some(BindingAvailabilityError::Runtime(error.clone()));
+        }
+        if outcome.applied {
+            let backend_changed = self
+                .observed_backend
+                .is_some_and(|observed| Some(observed) != self.current_backend);
+            if recovering || backend_changed {
+                self.binding_generation = self.binding_generation.saturating_add(1);
+                self.observed_resources.clear();
+            }
+            self.observed_backend = self.current_backend;
+            if outcome.error.is_none() {
+                self.last_error = None;
+                self.availability_error = None;
+                self.refresh_failed = false;
+            }
+            self.record_resource_snapshot();
+        }
+        outcome
+    }
+
+    fn refresh_sessions_inner(
+        &mut self,
+        repaint: &RepaintHandle,
+        config: &MuxBindingConfig,
+        interval: Duration,
+    ) -> MuxSessionRefreshOutcome {
         self.observe_command_config(config);
         let mut outcome = MuxSessionRefreshOutcome::default();
         while let Some((generation, result)) = self.poll_session_refresh() {
@@ -1052,21 +919,45 @@ impl MuxController {
                 Some(Err(mpsc::TryRecvError::Disconnected)) => {
                     self.mux_command_tx = None;
                     self.mux_command_rx = None;
-                    return Some(Err("mux command worker stopped".to_owned()));
+                    let result = Some(Err("mux command worker stopped".to_owned()));
+                    self.last_error = result
+                        .as_ref()
+                        .and_then(|result| result.as_ref().err().cloned());
+                    return result;
                 }
             };
             completed = true;
-            if let Err(error) = self.complete_authoritative_command(result, None)
+            if let Err(error) = self.complete_authoritative_command_inner(result, None)
                 && first_error.is_none()
             {
                 first_error = Some(error.to_string());
             }
         }
 
-        completed.then(|| first_error.map_or(Ok(()), Err))
+        let result = completed.then(|| first_error.map_or(Ok(()), Err));
+        if let Some(result) = &result {
+            self.last_error = result.as_ref().err().cloned();
+            if result.is_ok() {
+                self.record_resource_snapshot();
+            }
+        }
+        result
     }
 
-    fn complete_authoritative_command(
+    pub fn complete_authoritative_command(
+        &mut self,
+        result: MuxCommandResult,
+        config: &MuxBindingConfig,
+    ) -> MuxCommandResult {
+        let result = self.complete_authoritative_command_inner(result, Some(config));
+        self.last_error = result.as_ref().err().map(ToString::to_string);
+        if result.is_ok() {
+            self.record_resource_snapshot();
+        }
+        result
+    }
+
+    fn complete_authoritative_command_inner(
         &mut self,
         result: MuxCommandResult,
         active_config: Option<&MuxBindingConfig>,
@@ -1292,6 +1183,9 @@ impl MuxController {
         repaint: &RepaintHandle,
         config: &MuxBindingConfig,
     ) {
+        if self.availability_error.is_some() {
+            return;
+        }
         let command = MuxCommand::CreateProjectSession {
             session_id: request.session_id.clone(),
             cwd: request.cwd,
@@ -1307,6 +1201,7 @@ impl MuxController {
             .is_ok()
         {
             repaint();
+            self.record_resource_snapshot();
             return;
         }
         self.activate_session(&request.session_id);
@@ -1318,6 +1213,7 @@ impl MuxController {
             None,
             None,
         );
+        self.record_resource_snapshot();
     }
 
     fn poll_session_refresh(&mut self) -> Option<SessionRefreshResult> {
@@ -1370,6 +1266,9 @@ impl MuxController {
         config: &MuxBindingConfig,
         command: MuxCommand,
     ) {
+        if self.availability_error.is_some() {
+            return;
+        }
         let (selected_session, preferred_window) = self.command_completion(&command);
         if self
             .execute_inline_command(
@@ -1381,6 +1280,7 @@ impl MuxController {
             .is_ok()
         {
             repaint();
+            self.record_resource_snapshot();
             return;
         }
         let selected_window = self.apply_optimistic_command_selection(&command);
@@ -1392,6 +1292,7 @@ impl MuxController {
             None,
             None,
         );
+        self.record_resource_snapshot();
     }
 
     pub fn execute_command_authoritatively(
@@ -1403,6 +1304,10 @@ impl MuxController {
         cancellation: CommandCancellation,
     ) -> mpsc::Receiver<MuxCommandResult> {
         let (response_tx, response_rx) = mpsc::channel();
+        if self.availability_error.is_some() {
+            let _ = response_tx.send(Err(MuxCommandError::Unavailable));
+            return response_rx;
+        }
         let (selected_session, selected_window) = self.command_completion(&command);
         let completion = MuxCommandCompletion::requested(selected_session, selected_window);
         if cancellation.is_cancelled() {

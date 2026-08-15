@@ -1,7 +1,7 @@
-use bootty_ui::Theme;
+use bootty_ui::{Theme, icons};
 use eframe::egui;
 
-use crate::{terminal::TerminalSearchDirection, ui::icons};
+use bootty_terminal::terminal_engine::TerminalSearchDirection;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalFindResult {

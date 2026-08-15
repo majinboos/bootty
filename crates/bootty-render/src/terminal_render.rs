@@ -181,7 +181,7 @@ impl TerminalRenderFrame {
                     );
                     text_active = false;
                 }
-                self.push_sprite_fragment(run, cell, ch, glyph, text_contract);
+                self.push_sprite_fragment(run, cell, ch, glyph);
                 cell = cell.saturating_add(crate::terminal_text::terminal_char_cell_delta(ch));
                 continue;
             }
@@ -289,14 +289,7 @@ impl TerminalRenderFrame {
         }));
     }
 
-    fn push_sprite_fragment(
-        &mut self,
-        run: &TextRun,
-        cell: u16,
-        ch: char,
-        glyph: SpriteGlyph,
-        text_contract: &TerminalTextContract,
-    ) {
+    fn push_sprite_fragment(&mut self, run: &TextRun, cell: u16, ch: char, glyph: SpriteGlyph) {
         let cell_width = run.cell_rect.width() / f32::from(run.cells.max(1));
         let rect = cell_rect(run.cell_rect, cell_width, cell, 1);
         self.commands
@@ -305,7 +298,7 @@ impl TerminalRenderFrame {
                 glyph,
                 rect,
                 color: run.attrs.fg,
-                commands: text_contract.sprite_registry.commands_for(glyph, rect),
+                commands: glyph.commands_for(rect),
             }));
     }
 

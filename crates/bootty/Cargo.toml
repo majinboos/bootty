@@ -5,7 +5,7 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-bootty-dev = ["bootty-app/bootty-dev"]
+bootty-dev = ["bootty-app/bootty-dev", "bootty-control/bootty-dev"]
 
 [[bin]]
 name = "bootty"
@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bootty-app = { path = "../bootty-app" }
+bootty-command = { path = "../bootty-command" }
+bootty-control = { path = "../bootty-control" }
 bootty-mux = { path = "../bootty-mux" }
 bootty-native = { path = "../bootty-native" }
 bootty-remote = { path = "../bootty-remote" }
@@ -28,6 +30,7 @@ bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 embed-resource.workspace = true
 
 [dev-dependencies]
+bootty-extension = { path = "../bootty-extension" }
 egui.workspace = true
 tempfile.workspace = true
 

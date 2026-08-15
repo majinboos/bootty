@@ -11,16 +11,16 @@ use bootty_app::{
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
     renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
-    terminal::{RenderFrame, TerminalEngine},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
-        icons,
         session_navigation::BindingSessionGroup,
         sidebar::build_binding_sidebar_items,
         space::SpaceEditorEvent,
     },
     workspace::SpaceMuxOverride,
 };
+use bootty_terminal::{terminal_engine::TerminalEngine, terminal_frame::RenderFrame};
+use bootty_ui::icons;
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::{egui, wgpu};
 

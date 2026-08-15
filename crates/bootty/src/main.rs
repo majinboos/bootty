@@ -7,10 +7,14 @@ use anyhow::{Context, Result};
 use bootty_app::application_identity::ApplicationIdentity;
 use bootty_app::{
     cli::{Cli, Command, EventCommand, RemoteSpaceCommand, TaskCommand},
-    commands::{Caller, CommandDescriptor, CommandInvocation, CommandTarget, ValueType},
-    control, remote_catalog,
+    remote_catalog,
     update::{self, UpdateResult},
 };
+use bootty_command::{
+    Caller, CommandDescriptor, CommandInvocation, CommandOutcome, CommandTarget, MutationClass,
+    ValueType,
+};
+use bootty_control as control;
 use clap::Parser;
 
 const EXIT_USAGE: u8 = 2;
@@ -303,9 +307,8 @@ fn invoke_control_command_on_instance(
     let Some(result) = response.result.as_ref() else {
         return Ok(response);
     };
-    let outcome = serde_json::from_value::<bootty_app::commands::CommandOutcome>(result.clone())?;
-    let bootty_app::commands::CommandOutcome::ConfirmationRequired { confirmation } = outcome
-    else {
+    let outcome = serde_json::from_value::<CommandOutcome>(result.clone())?;
+    let CommandOutcome::ConfirmationRequired { confirmation } = outcome else {
         return Ok(response);
     };
     invocation.confirmation = Some(*confirmation);
@@ -456,10 +459,7 @@ fn print_dynamic_help(path: &str, descriptor: &CommandDescriptor) {
     if descriptor.target.is_some() {
         println!("  --target HANDLE@GENERATION");
     }
-    if matches!(
-        descriptor.mutation,
-        bootty_app::commands::MutationClass::Destructive
-    ) {
+    if matches!(descriptor.mutation, MutationClass::Destructive) {
         println!("  --yes");
     }
     println!("  --detach");
@@ -469,41 +469,38 @@ fn print_command_response(response: control::RpcResponse, json_output: bool) -> 
     let outcome = response
         .result
         .as_ref()
-        .map(|value| serde_json::from_value::<bootty_app::commands::CommandOutcome>(value.clone()))
+        .map(|value| serde_json::from_value::<CommandOutcome>(value.clone()))
         .transpose()?;
     print_control_response(response, json_output)?;
     match outcome {
-        None | Some(bootty_app::commands::CommandOutcome::Success { .. }) => Ok(()),
-        Some(
-            bootty_app::commands::CommandOutcome::Unsupported { message }
-            | bootty_app::commands::CommandOutcome::Unavailable { message },
-        ) => Err(CliFailure {
-            code: EXIT_UNAVAILABLE,
-            message,
+        None | Some(CommandOutcome::Success { .. }) => Ok(()),
+        Some(CommandOutcome::Unsupported { message } | CommandOutcome::Unavailable { message }) => {
+            Err(CliFailure {
+                code: EXIT_UNAVAILABLE,
+                message,
+            }
+            .into())
         }
-        .into()),
-        Some(bootty_app::commands::CommandOutcome::Denied { message }) => Err(CliFailure {
+        Some(CommandOutcome::Denied { message }) => Err(CliFailure {
             code: EXIT_DENIED,
             message,
         }
         .into()),
-        Some(bootty_app::commands::CommandOutcome::StaleTarget { message }) => Err(CliFailure {
+        Some(CommandOutcome::StaleTarget { message }) => Err(CliFailure {
             code: EXIT_STALE_TARGET,
             message,
         }
         .into()),
-        Some(bootty_app::commands::CommandOutcome::Failed { message, .. }) => Err(CliFailure {
+        Some(CommandOutcome::Failed { message, .. }) => Err(CliFailure {
             code: EXIT_COMMAND_FAILED,
             message,
         }
         .into()),
-        Some(bootty_app::commands::CommandOutcome::ConfirmationRequired { .. }) => {
-            Err(CliFailure {
-                code: EXIT_CONFIRMATION,
-                message: "command requires confirmation".to_owned(),
-            }
-            .into())
+        Some(CommandOutcome::ConfirmationRequired { .. }) => Err(CliFailure {
+            code: EXIT_CONFIRMATION,
+            message: "command requires confirmation".to_owned(),
         }
+        .into()),
     }
 }
 

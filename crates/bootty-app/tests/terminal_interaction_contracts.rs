@@ -9,16 +9,18 @@ use std::{
 
 use bootty_app::{
     app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
-    commands::{AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome},
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::ViewTransform,
     renderer::RendererMetrics,
-    terminal::TerminalSearchDirection,
     ui::{
         new_session_picker::NewSessionPickerEvent,
         terminal_find::{TerminalFindDialog, TerminalFindEvent},
     },
 };
+use bootty_command::{
+    AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome,
+};
+use bootty_terminal::terminal_engine::TerminalSearchDirection;
 
 mod support;
 

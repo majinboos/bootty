@@ -1,6 +1,7 @@
 use std::hint::black_box;
 
-use bootty_app::{geometry::TerminalGeometry, terminal::TerminalEngine};
+use bootty_app::geometry::TerminalGeometry;
+use bootty_terminal::terminal_engine::TerminalEngine;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 #[derive(Clone, Copy)]

@@ -4,7 +4,6 @@ use bootty_app::{
         BackgroundRect, CursorPlan, CursorShape, CursorTextPlan, DecorationLine, DecorationStyle,
         PlanColor, TerminalPaintPlan, TextAttrs, TextRun,
     },
-    terminal::TerminalEngine,
     terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement},
     terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
@@ -12,6 +11,7 @@ use bootty_app::{
         TerminalRendererId, TerminalWgpuRenderer, terminal_render_callback_for_renderer,
     },
 };
+use bootty_terminal::terminal_engine::TerminalEngine;
 use bootty_winit::bare_host::{BareTerminalViewport, terminal_render_frame_for_bare_host};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -444,6 +444,7 @@ fn cursor_frame(shape: CursorShape) -> TerminalRenderFrame {
 
 #[test]
 fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
+    let renderer_id = TerminalRendererId::unique();
     for (name, frame) in [
         ("mixed", mixed_background_image_text_cursor_frame()),
         ("sprite-only", prompt_sprite_frame()),
@@ -451,7 +452,7 @@ fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
         ("cursor-only", cursor_frame(CursorShape::Block)),
     ] {
         let shape = terminal_render_callback_for_renderer(
-            TerminalRendererId::unique(),
+            renderer_id.clone(),
             &frame,
             eframe::wgpu::TextureFormat::Rgba8Unorm,
             ViewTransform::IDENTITY,

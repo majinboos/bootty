@@ -1,10 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::{
-    project_catalog::ProjectPickerEntry,
-    strings::{display_path, expand_home_path},
-    worktree_catalog::WorktreePickerEntry,
-};
+use bootty_extension::display_path;
+use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
+
+use crate::strings::{expand_home_path, home_dir};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NewMuxSessionStep {
@@ -22,7 +21,7 @@ pub(super) fn filtered_project_entries(
         .iter()
         .filter(|entry| {
             filter.is_empty()
-                || display_path(&entry.path)
+                || display_path(&entry.path, home_dir().as_deref())
                     .to_ascii_lowercase()
                     .contains(&filter)
         })

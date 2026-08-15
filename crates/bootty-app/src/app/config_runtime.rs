@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use anyhow::Result;
+use bootty_command::CommandInvocation;
 use eframe::egui;
 
 use super::terminal_config::{
@@ -10,7 +11,6 @@ use crate::{
     app_actions::{
         AppKeyBindings, SidebarKeyBindings, split_app_actions_for_bindings_with_modifier_sides,
     },
-    commands::CommandInvocation,
     config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig},
     config_reload::ConfigHotReload,
     diagnostics::{StabilityTrace, StabilityTraceSample},
@@ -20,10 +20,10 @@ use crate::{
         terminal_input_commands_with_wheel_state,
     },
     modifier_remap::ModifierRemapSet,
-    terminal::{KeyInput, KeyMods, MacosOptionAsAlt},
     terminal_text::TerminalTextConfig,
 };
 use bootty_terminal::terminal_engine::TerminalLiveConfig;
+use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, MacosOptionAsAlt};
 
 pub(super) struct AcceptedConfigChange {
     pub(super) config: BoottyConfig,
