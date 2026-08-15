@@ -35,11 +35,17 @@ Native Bootty app bundles are built from `bootty-app --bin bootty`.
 ```sh
 mise run package          # local dynamic package using dynamic-release
 mise run package --static # static release package for distribution/CI
-mise run package:windows  # local dynamic Windows zip using dynamic-release
+mise run package:windows  # Windows zip from a staged complete daemon set
 mise run install          # local dynamic package and install for the current OS
 mise run build --fast     # dynamic build with --profile fast-release
 mise run install --fast   # dynamic install using --profile fast-release
 ```
+
+Every package contains the five daemon targets listed in
+`scripts/bootty-daemon-targets.txt`. Unix packaging builds the complete matrix.
+On non-macOS hosts, Apple targets require an installed Apple SDK in `SDKROOT`.
+Windows packaging requires a complete staged daemon directory through
+`BOOTTY_DAEMON_OUTPUT_DIR`. CI builds that directory on target-capable runners.
 
 The CI workflow runs full Rust validation on pull requests and pushes. Pushing
 a version tag matching `Cargo.toml` creates a GitHub Release with native macOS,

@@ -1,0 +1,71 @@
+name: Daemon artifacts
+
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  targets:
+    name: Read daemon target manifest
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Build target matrix from manifest
+        id: targets
+        shell: bash
+        run: |
+          matrix="$(awk 'NF && $1 !~ /^#/ { print $1 }' scripts/bootty-daemon-targets.txt | jq -Rnc '[inputs | {target: ., runner: (if endswith("-apple-darwin") then (if startswith("aarch64") then "macos-26" else "macos-15-intel" end) elif endswith("-windows-msvc") then "windows-2025" else "ubuntu-24.04" end), command: (if endswith("-unknown-linux-gnu") and startswith("aarch64") then "cargo zigbuild" else "cargo build" end)}]')"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: targets
+    name: Daemon ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up mise toolchain
+        uses: jdx/mise-action@v4
+
+      - name: Install Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: daemon-${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build daemon
+        shell: bash
+        run: |
+          ${{ matrix.command }} --profile daemon-release -p bootty-daemon --target "${{ matrix.target }}"
+
+      - name: Normalize daemon artifact
+        shell: bash
+        run: |
+          mkdir -p daemon-output
+          binary=bootty-daemon
+          if [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+            binary=bootty-daemon.exe
+          fi
+          cp "target/${{ matrix.target }}/daemon-release/$binary" \
+            "daemon-output/bootty-daemon-${{ matrix.target }}"
+
+      - name: Upload daemon artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.target }}
+          if-no-files-found: error
+          path: daemon-output/bootty-daemon-${{ matrix.target }}

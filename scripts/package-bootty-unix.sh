@@ -5,10 +5,11 @@ APP_NAME="Bootty"
 BINARY_NAME="bootty"
 PACKAGE_NAME="bootty-app"
 DAEMON_BINARY_NAME="bootty-daemon"
-DAEMON_PACKAGE_NAME="bootty-daemon"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
 TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
 DAEMON_OUTPUT_DIR="${BOOTTY_DAEMON_OUTPUT_DIR:-$TARGET_ROOT/bootty-daemons}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DAEMON_TARGET_MANIFEST="$SCRIPT_DIR/bootty-daemon-targets.txt"
 MACOS_ICON_NAME="bootty"
 MACOS_ICON_SOURCE="crates/bootty-app/assets/$MACOS_ICON_NAME.icon"
 VERSION="${BOOTTY_VERSION:-$(awk '
@@ -21,7 +22,6 @@ PROFILE="release"
 CARGO_PROFILE_ARGS=(--release)
 FAST=0
 LINKAGE="dynamic"
-ALL_DAEMONS=0
 while (($#)); do
   case "$1" in
     --fast)
@@ -29,9 +29,6 @@ while (($#)); do
       ;;
     --static)
       LINKAGE="static"
-      ;;
-    --all-daemons)
-      ALL_DAEMONS=1
       ;;
     *)
       echo "unknown package argument: $1" >&2
@@ -70,6 +67,39 @@ ensure_project_zig() {
     echo "Zig $required_zig is required to package $APP_NAME; found $zig_version at $(command -v zig)" >&2
     exit 1
   fi
+}
+
+daemon_targets=()
+while IFS= read -r target || [[ -n "$target" ]]; do
+  [[ -z "$target" || "$target" == \#* ]] && continue
+  daemon_targets+=("$target")
+done < "$DAEMON_TARGET_MANIFEST"
+if [[ "${#daemon_targets[@]}" -eq 0 ]]; then
+  echo "daemon target manifest is empty: $DAEMON_TARGET_MANIFEST" >&2
+  exit 1
+fi
+
+verify_daemons() {
+  local target
+  for target in "${daemon_targets[@]}"; do
+    if [[ ! -s "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" ]]; then
+      echo "missing daemon artifact: $DAEMON_OUTPUT_DIR/bootty-daemon-$target" >&2
+      exit 1
+    fi
+  done
+}
+
+host_daemon_target() {
+  case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) echo "aarch64-apple-darwin" ;;
+    Darwin:x86_64) echo "x86_64-apple-darwin" ;;
+    Linux:x86_64) echo "x86_64-unknown-linux-gnu" ;;
+    Linux:aarch64|Linux:arm64) echo "aarch64-unknown-linux-gnu" ;;
+    *)
+      echo "unsupported host daemon target: $(uname -s) $(uname -m)" >&2
+      exit 1
+      ;;
+  esac
 }
 
 append_rustflags() {
@@ -146,6 +176,8 @@ copy_dynamic_libraries() {
 }
 
 ensure_project_zig
+RUSTFLAGS= "$SCRIPT_DIR/build-bootty-daemons.sh"
+verify_daemons
 if [[ "$LINKAGE" == "dynamic" ]]; then
   enable_dynamic_linkage
 fi
@@ -153,11 +185,6 @@ rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
 cargo build "${CARGO_PROFILE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
-if [[ "$ALL_DAEMONS" -eq 1 ]]; then
-  RUSTFLAGS= ./scripts/build-bootty-daemons.sh
-else
-  RUSTFLAGS= cargo build --profile daemon-release -p "$DAEMON_PACKAGE_NAME" --bin "$DAEMON_BINARY_NAME"
-fi
 
 case "$(uname -s)" in
   Darwin)
@@ -169,21 +196,14 @@ case "$(uname -s)" in
 
     mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$MACOS_DIR/$BINARY_NAME"
-    if [[ "$ALL_DAEMONS" -eq 1 ]]; then
-      case "$ARCH" in
-        arm64) HOST_DAEMON_TARGET="aarch64-apple-darwin" ;;
-        x86_64) HOST_DAEMON_TARGET="x86_64-apple-darwin" ;;
-        *)
-          echo "unsupported macOS architecture: $ARCH" >&2
-          exit 1
-          ;;
-      esac
-      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$MACOS_DIR/$DAEMON_BINARY_NAME"
-      mkdir -p "$RESOURCES_DIR/daemons"
-      cp "$DAEMON_OUTPUT_DIR"/bootty-daemon-* "$RESOURCES_DIR/daemons/"
-    else
-      cp "$TARGET_ROOT/daemon-release/$DAEMON_BINARY_NAME" "$MACOS_DIR/$DAEMON_BINARY_NAME"
-    fi
+    HOST_DAEMON_TARGET="$(host_daemon_target)"
+    cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$MACOS_DIR/$DAEMON_BINARY_NAME"
+    mkdir -p "$RESOURCES_DIR/daemons"
+    for target in "${daemon_targets[@]}"; do
+      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$RESOURCES_DIR/daemons/"
+      chmod +x "$RESOURCES_DIR/daemons/bootty-daemon-$target"
+    done
+    chmod +x "$MACOS_DIR/$DAEMON_BINARY_NAME"
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$MACOS_DIR/$BINARY_NAME" "$CONTENTS_DIR/Frameworks"
     fi
@@ -273,7 +293,13 @@ PLIST
       "$ROOT_DIR/share/icons/hicolor/scalable/apps"
 
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$ROOT_DIR/bin/$BINARY_NAME"
-    cp "$TARGET_ROOT/daemon-release/$DAEMON_BINARY_NAME" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
+    HOST_DAEMON_TARGET="$(host_daemon_target)"
+    cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
+    mkdir -p "$ROOT_DIR/share/bootty/daemons"
+    for target in "${daemon_targets[@]}"; do
+      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$ROOT_DIR/share/bootty/daemons/"
+      chmod +x "$ROOT_DIR/share/bootty/daemons/bootty-daemon-$target"
+    done
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$ROOT_DIR/bin/$BINARY_NAME" "$ROOT_DIR/lib"
     fi
