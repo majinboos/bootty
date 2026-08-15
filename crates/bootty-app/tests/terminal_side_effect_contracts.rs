@@ -15,6 +15,8 @@ use bootty_app::{
     renderer::RendererMetrics,
 };
 
+mod support;
+
 fn frame(now: Instant) -> FrameInputs {
     FrameInputs {
         now,
@@ -49,7 +51,8 @@ fn native_terminal_progress_updates_active_binding_presentation() {
     std::fs::write(&config_path, "[multiplexer]\nbackend = \"native\"\n").expect("write config");
     let mut config = load_config_from_path(&config_path).expect("load config");
     config.session.shell = Some(script.to_string_lossy().into_owned());
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
     let pane = MuxPaneAnchor {
         session_id: "facts".to_owned(),
         pane_id: Some("%1".to_owned()),

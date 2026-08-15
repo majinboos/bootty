@@ -788,44 +788,46 @@ fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction
     };
     let show = |events| {
         let mut event = None;
-        let _ = context.run_ui(
-            RawInput {
-                screen_rect: Some(screen),
-                events,
-                ..RawInput::default()
-            },
-            |ui| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ui, |ui| {
-                        event = show_sidebar(
-                            ui,
-                            bootty_ui::ThemePalette::default(),
-                            screen.height(),
-                            SidebarModel {
-                                items: &rows,
-                                footer_items: &footer_items,
-                                session_count: 1,
-                                has_sessions: true,
-                                title_visible: false,
-                                reserve_titlebar_buttons: false,
-                                title_icon: None,
-                                top_inset: 0.0,
-                                border_visible: false,
-                                border_bottom: false,
-                                separator_visible: false,
-                                focused: false,
-                                hovered_session: None,
-                                unfocused_dim: 0.0,
-                                fullscreen: false,
-                                hover_override: None,
-                                current_override: None,
-                                border_override: None,
-                            },
-                        );
-                    });
-            },
-        );
+        context
+            .run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            event = show_sidebar(
+                                ui,
+                                bootty_ui::ThemePalette::default(),
+                                screen.height(),
+                                SidebarModel {
+                                    items: &rows,
+                                    footer_items: &footer_items,
+                                    session_count: 1,
+                                    has_sessions: true,
+                                    title_visible: false,
+                                    reserve_titlebar_buttons: false,
+                                    title_icon: None,
+                                    top_inset: 0.0,
+                                    border_visible: false,
+                                    border_bottom: false,
+                                    separator_visible: false,
+                                    focused: false,
+                                    hovered_session: None,
+                                    unfocused_dim: 0.0,
+                                    fullscreen: false,
+                                    hover_override: None,
+                                    current_override: None,
+                                    border_override: None,
+                                },
+                            );
+                        });
+                },
+            )
+            .drop_without_applying_deltas();
         event
     };
 

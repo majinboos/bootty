@@ -22,13 +22,15 @@ fn show(dialog: &mut NewMuxSessionDialog, input: RawInput) -> NewSessionPickerEv
     let context = egui::Context::default();
     install_icon_fonts(&context);
     let mut event = NewSessionPickerEvent::None;
-    let _ = context.run_ui(input, |ui| {
-        event = dialog.show(
-            ui.ctx(),
-            theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-            &[],
-        );
-    });
+    context
+        .run_ui(input, |ui| {
+            event = dialog.show(
+                ui.ctx(),
+                theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+                &[],
+            );
+        })
+        .drop_without_applying_deltas();
     event
 }
 

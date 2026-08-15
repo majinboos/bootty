@@ -1,13 +1,37 @@
 use std::{
-    sync::{Arc, mpsc},
+    path::Path,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
+use anyhow::Result;
 use bootty_app::{
     app::{AppState, FrameInputs, ViewportSnapshot},
     commands::{AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome},
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig},
     geometry::ViewTransform,
+    mux::{
+        MuxBackendKind, MuxBindingConfig, SshTarget,
+        backend::MuxBackend,
+        capability::{BindingCapabilityDescriptor, BindingOperation},
+        command::MuxCommand,
+        controller::MuxScope,
+        provider::{
+            GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider,
+            MuxAppBackendRegistry, MuxBackendProvider, MuxCommandDispatch, PaneBehavior,
+            PaneTopology, PersistedSessionPolicy, SelectionPublicationPolicy,
+            TerminalProgressPolicy, TerminalResidency,
+        },
+        snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot},
+        terminal::{
+            BackendPanePolicy, PaneLayoutResizeRequest, PaneStartRequest, ScopedMuxPaneTarget,
+            TerminalRuntime,
+        },
+    },
     renderer::RendererMetrics,
     ui::new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
     workspace::{
@@ -16,6 +40,150 @@ use bootty_app::{
     },
 };
 use rusqlite::Connection;
+
+mod support;
+
+struct RestoreBackend {
+    sessions: Arc<Mutex<Vec<MuxSession>>>,
+    create_calls: Arc<AtomicUsize>,
+}
+
+impl MuxBackend for RestoreBackend {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("restore backend sessions lock")
+            .clone();
+        Ok(MuxSnapshot {
+            active_session_id: sessions.first().map(|session| session.id.clone()),
+            sessions,
+            ..MuxSnapshot::default()
+        })
+    }
+
+    fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        if let MuxCommand::CreateProjectSession { session_id, cwd } = command {
+            self.create_calls.fetch_add(1, Ordering::SeqCst);
+            self.sessions
+                .lock()
+                .expect("restore backend sessions lock")
+                .push(MuxSession {
+                    anchor: MuxPaneAnchor {
+                        session_id: session_id.clone(),
+                        cwd: Some(cwd),
+                        ..MuxPaneAnchor::default()
+                    },
+                    id: session_id.clone(),
+                    name: session_id,
+                    active: true,
+                    active_window_id: None,
+                    windows: Vec::new(),
+                });
+        }
+        Ok(())
+    }
+}
+
+struct RestoreProvider {
+    sessions: Arc<Mutex<Vec<MuxSession>>>,
+    create_calls: Arc<AtomicUsize>,
+}
+
+impl MuxBackendProvider for RestoreProvider {
+    fn kind(&self) -> MuxBackendKind {
+        MuxBackendKind::Tmux
+    }
+
+    fn command_dispatch(&self) -> MuxCommandDispatch {
+        MuxCommandDispatch::CallerThread
+    }
+
+    fn build_backend(
+        &self,
+        _config: &MuxBindingConfig,
+        _workspace: Option<&Path>,
+    ) -> Box<dyn MuxBackend> {
+        Box::new(RestoreBackend {
+            sessions: Arc::clone(&self.sessions),
+            create_calls: Arc::clone(&self.create_calls),
+        })
+    }
+}
+
+struct NoTerminalPanePolicy;
+
+impl BackendPanePolicy for NoTerminalPanePolicy {
+    fn remote_target(&self) -> Option<&SshTarget> {
+        None
+    }
+
+    fn start_terminal(
+        &mut self,
+        _request: PaneStartRequest<'_>,
+    ) -> Result<Option<Box<dyn TerminalRuntime>>> {
+        Ok(None)
+    }
+
+    fn sync_target(&mut self, _target: Option<&ScopedMuxPaneTarget>, _hide_tmux_status: bool) {}
+
+    fn set_layout_window(&mut self, _window_id: Option<&str>) {}
+
+    fn resize_layout_window(&mut self, _request: PaneLayoutResizeRequest<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn deactivate(&mut self) {}
+}
+
+impl MuxAppBackendProvider for RestoreProvider {
+    fn build_pane_policy(&self, _config: &MuxBindingConfig) -> Box<dyn BackendPanePolicy> {
+        Box::new(NoTerminalPanePolicy)
+    }
+
+    fn app_policy(&self) -> MuxAppBackendPolicy {
+        MuxAppBackendPolicy {
+            panes: PaneBehavior {
+                topology: PaneTopology::Attach,
+                cache_terminals: false,
+                resize_cached_terminals: false,
+            },
+            progress: TerminalProgressPolicy::BackendSnapshot,
+            persisted_sessions: PersistedSessionPolicy::AfterEmptyInitialSnapshot,
+            generated_session_names: GeneratedSessionNamePolicy::PreserveBackend,
+            terminal_residency: TerminalResidency::BindingScoped,
+            selection_publication: SelectionPublicationPolicy::Direct,
+        }
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        BindingCapabilityDescriptor::new(
+            scope,
+            [
+                BindingOperation::CreateProjectSession,
+                BindingOperation::RenameSession,
+            ],
+        )
+    }
+}
+
+fn backends_after_empty_restore() -> (Arc<MuxAppBackendRegistry>, Arc<AtomicUsize>) {
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let provider = || RestoreProvider {
+        sessions: Arc::clone(&sessions),
+        create_calls: Arc::clone(&create_calls),
+    };
+    let registry = Arc::new(
+        MuxAppBackendRegistry::from_providers(
+            [Arc::new(provider()) as Arc<dyn MuxBackendProvider>],
+            [Arc::new(provider()) as Arc<dyn MuxAppBackendProvider>],
+            [MuxBackendKind::Tmux],
+        )
+        .expect("restore test backend registry"),
+    );
+    (registry, create_calls)
+}
 
 fn frame(now: Instant) -> FrameInputs {
     FrameInputs {
@@ -48,7 +216,8 @@ fn a_failed_placement_commit_preserves_the_live_and_durable_binding() {
         ..BoottyConfig::default()
     };
     let repaint = Arc::new(|| {});
-    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), repaint, None, None).expect("app state");
     let space = state.space_summaries()[0].clone();
     let database = directory.path().join("session-order.sqlite3");
     let lock = Connection::open(&database).expect("open lock connection");
@@ -89,7 +258,8 @@ fn a_failed_session_membership_commit_preserves_the_live_runtime_and_database() 
     };
     config.multiplexer.backend = MultiplexerBackendConfig::Native;
     let repaint = Arc::new(|| {});
-    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), repaint, None, None).expect("app state");
     let commands = state.app_command_sender(Caller::Socket);
     let (response, outcomes) = mpsc::channel();
     commands
@@ -158,13 +328,13 @@ fn a_failed_session_membership_commit_preserves_the_live_runtime_and_database() 
 }
 
 #[test]
-fn rebuilding_one_binding_preserves_another_bindings_pending_recovery() {
+fn one_frame_recovers_active_binding_without_publishing_inactive_recovery() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
         multiplexer: bootty_app::config::MultiplexerConfig {
-            backend: MultiplexerBackendConfig::Native,
+            backend: MultiplexerBackendConfig::Tmux,
             ..bootty_app::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
@@ -172,6 +342,19 @@ fn rebuilding_one_binding_preserves_another_bindings_pending_recovery() {
     let (mut repository, snapshot) =
         WorkspaceRepository::open(&config_path).expect("workspace repository");
     let first_scope = snapshot.spaces()[0].bindings()[0].mux_scope();
+    let first_binding = snapshot.spaces()[0].bindings()[0].clone();
+    let mut session_order = first_binding.session_order().clone();
+    assert!(session_order.add_session("persisted-first"));
+    let mut session_names = first_binding.session_names().clone();
+    assert!(session_names.remember_generated(
+        "persisted-first",
+        directory.path().to_str().expect("workspace path"),
+        "persisted-first",
+        "persisted-first",
+    ));
+    repository
+        .commit_binding_state(first_scope, &session_order, &session_names)
+        .expect("persist first binding state");
     let second_space = repository
         .create_space(
             "Second",
@@ -203,7 +386,16 @@ fn rebuilding_one_binding_preserves_another_bindings_pending_recovery() {
     }
 
     let repaint = Arc::new(|| {});
-    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    let (backends, create_calls) = backends_after_empty_restore();
+    let mut state = AppState::new(config, backends, repaint, None, None).expect("app state");
+    assert_eq!(create_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        state
+            .binding_session_groups()
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .all(|session| session.name != "persisted-first")
+    );
     let spaces = state.space_summaries();
     let first_space = spaces
         .iter()
@@ -235,18 +427,13 @@ fn rebuilding_one_binding_preserves_another_bindings_pending_recovery() {
             .is_some_and(|error| error.contains("pending binding membership recovery"))
     );
 
-    let started = Instant::now();
-    let first_recovered = (0..250).any(|tick| {
-        state.update_frame(frame(started + Duration::from_millis(tick)));
-        std::thread::sleep(Duration::from_millis(1));
+    state.update_frame(frame(Instant::now()));
+    assert!(
         repository
             .pending_binding_membership_mutation(first_scope)
             .expect("read first pending operation")
-            .is_none()
-    });
-    assert!(
-        first_recovered,
-        "startup refresh must resolve the first journal"
+            .is_none(),
+        "one active frame must resolve the first journal"
     );
     assert!(
         repository
@@ -255,6 +442,11 @@ fn rebuilding_one_binding_preserves_another_bindings_pending_recovery() {
             .is_some(),
         "the inactive binding must keep its own recovery"
     );
+    let active_groups = state.binding_session_groups();
+    assert_eq!(active_groups.len(), 1);
+    assert_eq!(active_groups[0].scope, first_scope);
+    assert!(active_groups[0].active);
+    assert_eq!(create_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(state.update_space_from_ui(
         first_space.id,
         &first_space.name,
@@ -273,17 +465,17 @@ fn rebuilding_one_binding_preserves_another_bindings_pending_recovery() {
     ));
 
     assert!(state.activate_space_from_ui(second_space.id));
-    let second_recovered = (0..250).any(|tick| {
-        state.update_frame(frame(started + Duration::from_millis(250 + tick)));
-        std::thread::sleep(Duration::from_millis(1));
+    let active_groups = state.binding_session_groups();
+    assert_eq!(active_groups.len(), 1);
+    assert_eq!(active_groups[0].scope, second_scope);
+    assert!(active_groups[0].active);
+    state.update_frame(frame(Instant::now()));
+    assert!(
         repository
             .pending_binding_membership_mutation(second_scope)
             .expect("read second pending operation")
-            .is_none()
-    });
-    assert!(
-        second_recovered,
-        "activation must resolve the second journal"
+            .is_none(),
+        "one frame after activation must resolve the second journal"
     );
     assert!(state.update_space_from_ui(
         second_space.id,
@@ -358,7 +550,8 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
     std::fs::create_dir_all(&first_cwd).expect("first project directory");
     std::fs::create_dir_all(&second_cwd).expect("second project directory");
     let repaint = Arc::new(|| {});
-    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), repaint, None, None).expect("app state");
     state.apply_picker_event(
         NewMuxSessionDialog::open(),
         NewSessionPickerEvent::CreateSession {
@@ -443,12 +636,45 @@ fn a_corrected_ssh_profile_rebuilds_an_unavailable_binding() {
             },
         )
         .expect("configure missing profile binding");
+    let binding = space.bindings()[0].clone();
+    let mut session_order = binding.session_order().clone();
+    assert!(session_order.add_session("persisted-local-fallback"));
+    let mut session_names = binding.session_names().clone();
+    assert!(session_names.remember_generated(
+        "persisted-local-fallback",
+        directory.path().to_str().expect("workspace path"),
+        "persisted-local-fallback",
+        "persisted-local-fallback",
+    ));
+    repository
+        .commit_binding_state(scope, &session_order, &session_names)
+        .expect("persist unavailable binding restore state");
 
     let repaint = Arc::new(|| {});
-    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), repaint, None, None).expect("app state");
     assert_eq!(
         state.space_summaries()[0].error.as_deref(),
         Some("SSH profile 'development' is unavailable")
+    );
+    assert!(
+        state
+            .binding_session_groups()
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .all(|session| session.name != "persisted-local-fallback")
+    );
+    state.update_frame(frame(Instant::now()));
+    assert_eq!(
+        state.space_summaries()[0].error.as_deref(),
+        Some("SSH profile 'development' is unavailable")
+    );
+    assert!(
+        state
+            .binding_session_groups()
+            .iter()
+            .flat_map(|group| &group.sessions)
+            .all(|session| session.name != "persisted-local-fallback")
     );
 
     std::fs::write(

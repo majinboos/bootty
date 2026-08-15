@@ -1,9 +1,12 @@
 use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
+use strum::{Display, EnumIter};
 
 /// A backend that Bootty can drive for one terminal binding.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Display, EnumIter, Hash, Serialize, PartialEq, Eq,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum MuxBackendKind {
     Rmux,

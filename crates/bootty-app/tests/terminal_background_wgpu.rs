@@ -183,6 +183,7 @@ fn offscreen_wgpu_context() -> &'static Mutex<OffscreenWgpuContext> {
                 power_preference: eframe::wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             },
         ))
         .expect("request WGPU adapter");
@@ -292,7 +293,7 @@ fn render_frame_to_pixels(frame: &TerminalRenderFrame, width: u32, height: u32) 
         .recv()
         .expect("receive map result")
         .expect("map readback buffer");
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("read mapped WGPU buffer");
     let mut pixels = Vec::with_capacity((width * height * bytes_per_pixel) as usize);
     for row in mapped
         .chunks(padded_bytes_per_row as usize)
@@ -404,7 +405,7 @@ fn render_frames_with_reused_renderer(
             .recv()
             .expect("receive map result")
             .expect("map readback buffer");
-        let mapped = slice.get_mapped_range();
+        let mapped = slice.get_mapped_range().expect("read mapped WGPU buffer");
         let mut pixels = Vec::with_capacity((width * height * bytes_per_pixel) as usize);
         for row in mapped
             .chunks(padded_bytes_per_row as usize)
@@ -522,13 +523,17 @@ fn kitty_apc_image_renders_visible_pixels_through_bare_host_wgpu_path() {
     assert_eq!(image.source.y, 0);
     let pixels = render_frame_to_pixels(&render_frame, 200, 80);
     let max_pixel = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .max_by_key(|rgba| u16::from(rgba[0]) + u16::from(rgba[1]) + u16::from(rgba[2]))
         .unwrap_or(&[0, 0, 0, 0]);
 
     assert!(
         pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|rgba| rgba[0] > 200 && rgba[1] < 20 && rgba[2] < 20 && rgba[3] > 200),
         "kitty APC image should render visible red pixels through bootty-bare WGPU; max pixel {max_pixel:?}"
     );
@@ -541,7 +546,9 @@ fn image_only_frame_renders_visible_pixels_offscreen() {
 
     assert!(
         pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|rgba| rgba[0] > 200 && rgba[1] < 20 && rgba[2] < 20 && rgba[3] > 200),
         "kitty image command should render visible red pixels"
     );
@@ -554,7 +561,9 @@ fn image_after_surface_background_renders_visible_pixels_offscreen() {
 
     assert!(
         pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|rgba| rgba[0] > 200 && rgba[1] < 20 && rgba[2] < 20 && rgba[3] > 200),
         "image command after surface background should render visible red pixels"
     );
@@ -578,7 +587,9 @@ fn reused_renderer_preserves_mixed_layer_order_without_pixel_drift() {
     assert_eq!(pixels[0], pixels[1]);
     assert!(
         pixels[0]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|rgba| rgba[0] > 200 && rgba[1] < 20 && rgba[2] < 20 && rgba[3] > 200),
         "mixed layer frame should preserve visible image pixels"
     );

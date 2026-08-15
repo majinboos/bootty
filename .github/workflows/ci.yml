@@ -207,20 +207,6 @@ jobs:
             libxrandr-dev \
             pkg-config
 
-      - name: Select Xcode 26
-        if: runner.os == 'macOS'
-        # Oldest 26.x on the image: actool needs 26.0+ for the Liquid Glass
-        # icon, while the 26.4 SDK breaks zig's linker (ziglang/zig#31658).
-        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_26*.app | sort -V | head -1)/Contents/Developer"
-
-      - name: Set up Homebrew Zig on macOS
-        if: runner.os == 'macOS'
-        run: |
-          brew install zig@0.15
-          zig_bin="$(brew --prefix zig@0.15)/bin/zig"
-          echo "$(dirname "$zig_bin")" >> "$GITHUB_PATH"
-          test "$("$zig_bin" version)" = "0.15.2"
-
       - name: Set up mise toolchain
         uses: jdx/mise-action@v4
 

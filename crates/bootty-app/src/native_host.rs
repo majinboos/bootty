@@ -1,4 +1,8 @@
-use std::{cell::RefCell, rc::Rc, sync::mpsc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::{Arc, mpsc},
+};
 
 use anyhow::{Context, Result};
 use eframe::UserEvent;
@@ -23,6 +27,7 @@ pub fn run(
     options: eframe::NativeOptions,
     config: BoottyConfig,
     window_state_key: String,
+    backends: Arc<bootty_mux::provider::MuxAppBackendRegistry>,
 ) -> Result<()> {
     // Must run before any window is created (the flag is read at window-creation time), otherwise
     // macOS automatic window tabbing keeps the Cmd+T key equivalent and the keypress never reaches
@@ -42,6 +47,7 @@ pub fn run(
             cc,
             config,
             window_state_key.clone(),
+            backends,
             direct_input_rx,
             modifier_side_rx,
             control_plane.clone(),

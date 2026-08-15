@@ -113,11 +113,8 @@ fn encode_with_kitty_flags(case: KeyEncodeCase<'_>, flags: key::KittyKeyFlags) -
 }
 
 fn encode_legacy_case(case: KeyEncodeCase<'_>) -> Result<Vec<u8>> {
-    let terminal = Terminal::new(TerminalOptions {
-        cols: 80,
-        rows: 24,
-        max_scrollback: 0,
-    })?;
+    let mut terminal = Terminal::new(80, 24)?;
+    terminal.set_scrollback_max_bytes(Some(0))?;
     encode_key_case(case, |encoder| {
         encoder
             .set_options_from_terminal(&terminal)
@@ -890,11 +887,8 @@ fn key_encoder_ports_modify_other_keys_terminal_state() -> Result<()> {
 
 #[test]
 fn key_encoder_adapter_ports_options_and_kitty_ctrl_release() -> Result<()> {
-    let terminal = Terminal::new(TerminalOptions {
-        cols: 80,
-        rows: 24,
-        max_scrollback: 0,
-    })?;
+    let mut terminal = Terminal::new(80, 24)?;
+    terminal.set_scrollback_max_bytes(Some(0))?;
     let mut encoder = key::Encoder::new()?;
     let mut event = key::Event::new()?;
 

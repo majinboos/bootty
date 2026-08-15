@@ -122,7 +122,7 @@ fn ping_reports_the_compatible_protocol_and_release() {
         String::from_utf8(output.stdout).expect("UTF-8"),
         format!(
             "{}:{}\n",
-            bootty_mux::REMOTE_DAEMON_PROTOCOL_VERSION,
+            bootty_remote::REMOTE_DAEMON_PROTOCOL_VERSION,
             env!("CARGO_PKG_VERSION")
         )
     );

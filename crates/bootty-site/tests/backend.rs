@@ -86,7 +86,7 @@ fn product_pages_render_complete_content_without_markdown_fences() {
     let quickstart = scrolling_text(&mut SiteBackend::for_page("quickstart"));
     assert!(quickstart.contains("Native app"));
     assert!(quickstart.contains("Glyph probe"));
-    assert!(quickstart.contains("cargo run -p bootty-app --bin bootty"));
+    assert!(quickstart.contains("cargo run -p bootty --bin bootty"));
 
     let renderer = scrolling_text(&mut SiteBackend::for_page("renderer"));
     assert!(renderer.contains("Frame contract"));

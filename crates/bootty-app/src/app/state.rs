@@ -1,7 +1,6 @@
 use std::{
-    collections::HashSet,
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
@@ -9,29 +8,21 @@ use anyhow::Result;
 use bootty_config::config::MultiplexerBackendConfig;
 use eframe::egui::{self, Pos2, Rect};
 
-mod copy_mode;
 mod recorded_chord;
-mod selection;
-
-use copy_mode::{
-    CopyModeKeyAction, copy_mode_action_for_egui_event, copy_mode_action_for_input,
-    copy_mode_egui_key_may_emit_text, copy_mode_egui_key_should_pass_to_app,
-    copy_mode_input_should_pass_to_app, copy_mode_key_input_present, copy_shortcut_pressed,
-    direct_copy_shortcut_pressed,
-};
-use recorded_chord::normalize_recorded_chord;
-use selection::{TerminalSelectionAction, TerminalSelectionRouteContext, TerminalSelectionRouter};
 
 use super::binding_session_names::RenameSessionOutcome;
 use super::binding_terminal_facts::TerminalProgress;
 use super::command_runtime::CommandRuntime;
 use super::config_runtime::AppConfigRuntime;
 use super::dialog_runtime::{DialogRuntime, ModalDialog};
-use super::remote_reconnect::AttachExit;
 use super::terminal_config::{
     terminal_live_config, terminal_session_config_with_side_effects, terminal_text_config,
 };
+use super::terminal_interaction::{
+    TerminalFocusIntent, TerminalInteractionInput, TerminalInteractionRuntime,
+};
 use super::workspace_runtime::{BindingStateCandidate, WorkspaceRuntime};
+use recorded_chord::normalize_recorded_chord;
 
 use crate::{
     app_actions::{
@@ -58,19 +49,19 @@ use crate::{
         RepaintHandle,
         capability::BindingOperation,
         command::MuxCommand,
-        config::selected_backend,
-        controller::{MuxController, MuxScope, SpaceId, mux_session_refresh_interval},
+        controller::{MuxController, MuxScope, SpaceId},
+        provider::{MuxAppBackendRegistry, SelectionPublicationPolicy, selected_backend},
         snapshot::{MuxSession, MuxWindow},
         terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
     },
     platform::{
         apply_macos_non_native_fullscreen_presentation, macos_handles_non_native_fullscreen_frame,
         read_clipboard_text, restore_macos_presentation, show_desktop_notification,
-        write_clipboard_html, write_clipboard_text,
+        write_clipboard_text,
     },
-    renderer::{RendererMetrics, TerminalFrameSource},
+    renderer::RendererMetrics,
     scheduler::{RepaintScheduler, RepaintSignal},
-    terminal::{DrainStats, MouseButton, TerminalSearchDirection},
+    terminal::{DrainStats, MouseButton},
     terminal_text::TerminalTextConfig,
     theme::theme_from_config,
     ui::{
@@ -82,28 +73,18 @@ use crate::{
         session_navigation::{BindingSessionGroup, ScopedSessionTarget},
         session_picker::{SessionPickerDialog, SessionPickerEvent},
         space::{SpaceEditorDialog, SpaceEditorEvent, default_space_icon},
-        terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
+        terminal_find::{TerminalFindDialog, TerminalFindEvent},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::{SpaceMuxOverride, SpaceRemoteOverride},
+    workspace::SpaceMuxOverride,
 };
 use bootty_terminal::terminal_engine::{
-    TerminalCopyModeAction, TerminalLiveConfig, TerminalSelectionFormat, TerminalSideEffect,
-    TerminalSideEffectEvent, encode_iterm2_report_cell_size, encode_iterm2_report_variable,
-    encode_osc52_response,
+    TerminalLiveConfig, TerminalSideEffect, TerminalSideEffectEvent,
+    encode_iterm2_report_cell_size, encode_iterm2_report_variable, encode_osc52_response,
 };
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
 
-/// How soon to wake up for the next session poll, for backends that only report through polling.
-/// Native sessions live in-process and report themselves, so they schedule nothing.
-fn mux_refresh_repaint_after(
-    config: &crate::config::MultiplexerConfig,
-    window_focused: bool,
-) -> Option<Duration> {
-    (selected_backend(config) != MultiplexerBackendConfig::Native)
-        .then(|| mux_session_refresh_interval(window_focused))
-}
 /// Per-frame snapshot of everything the state machine needs from the host.
 /// Captured once at frame start; `egui::Context` never enters this module.
 #[derive(Clone, Debug)]
@@ -208,14 +189,13 @@ pub struct AppState {
     modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     modifier_sides: ModifierSideState,
     pending_direct_input: Vec<DirectKeyInput>,
-    suppress_next_egui_paste: bool,
     /// While the settings overlay is open the terminal behind it must receive no input, so the
     /// direct (winit) input path is gated on this just like it is on the modal mux dialogs.
     settings_open: bool,
     /// Mirrors whether a Luau-opened floating window is showing. That window lives on `BoottyApp`
     /// rather than here, so input gating reads this mirror to stop feeding the terminal behind it.
     extension_overlay_open: bool,
-    terminal_selection: TerminalSelectionRouter,
+    terminal_interaction: TerminalInteractionRuntime,
     /// Screen rects of chrome resize handles (sidebar edge, pane dividers) registered during the
     /// previous frame's UI build. A primary press inside one of these must not begin a terminal
     /// text selection — the handle owns that drag. Populated each frame in `show_fixed_layout`.
@@ -224,28 +204,11 @@ pub struct AppState {
     terminal_cursor_icon: egui::CursorIcon,
     mouse_pointer_hidden_while_typing: bool,
     last_mouse_hover_pos: Option<Pos2>,
-    deferred_profile_binding_rebuilds: HashSet<MuxScope>,
     dialogs: DialogRuntime,
     sidebar_hovered_session: Option<ScopedSessionTarget>,
-    terminal_find_dialog: Option<TerminalFindDialog>,
-    terminal_find_return_focus_after_search: bool,
-    last_terminal_search: String,
-    last_terminal_search_direction: TerminalSearchDirection,
     theme_picker_restore_config: Option<BoottyConfig>,
     macos_non_native_fullscreen_active: bool,
     macos_non_native_fullscreen_pending_apply: bool,
-}
-
-fn remove_first_paste_event(events: &mut Vec<egui::Event>) -> bool {
-    if let Some(index) = events
-        .iter()
-        .position(|event| matches!(event, egui::Event::Paste(_)))
-    {
-        events.remove(index);
-        true
-    } else {
-        false
-    }
 }
 
 fn route_find_modeless_events(
@@ -431,6 +394,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 impl AppState {
     pub fn new(
         config: BoottyConfig,
+        backends: Arc<MuxAppBackendRegistry>,
         repaint: RepaintHandle,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
@@ -438,6 +402,7 @@ impl AppState {
         Self::new_for_window(
             config,
             PRIMARY_WINDOW_STATE_KEY.to_owned(),
+            backends,
             repaint,
             direct_input_rx,
             modifier_side_rx,
@@ -447,6 +412,7 @@ impl AppState {
     pub fn new_for_window(
         config: BoottyConfig,
         window_state_key: String,
+        backends: Arc<MuxAppBackendRegistry>,
         repaint: RepaintHandle,
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
@@ -457,6 +423,7 @@ impl AppState {
         let workspace = WorkspaceRuntime::open(
             config,
             &window_state_key,
+            backends,
             active_appearance_variant,
             repaint.clone(),
         )?;
@@ -489,21 +456,15 @@ impl AppState {
             modifier_side_rx,
             modifier_sides: ModifierSideState::default(),
             pending_direct_input: Vec::new(),
-            suppress_next_egui_paste: false,
             settings_open: false,
             extension_overlay_open: false,
-            terminal_selection: TerminalSelectionRouter::default(),
+            terminal_interaction: TerminalInteractionRuntime::default(),
             wheel_scroll_state: WheelScrollState::default(),
             terminal_cursor_icon: egui::CursorIcon::Text,
             mouse_pointer_hidden_while_typing: false,
             last_mouse_hover_pos: None,
-            deferred_profile_binding_rebuilds: HashSet::new(),
             dialogs: DialogRuntime::default(),
             sidebar_hovered_session: None,
-            terminal_find_dialog: None,
-            terminal_find_return_focus_after_search: false,
-            last_terminal_search: String::new(),
-            last_terminal_search_direction: TerminalSearchDirection::Next,
             theme_picker_restore_config: None,
             macos_non_native_fullscreen_active,
             macos_non_native_fullscreen_pending_apply,
@@ -827,13 +788,18 @@ impl AppState {
         self.activate_space_from_ui(target.id)
     }
 
-    fn persist_rmux_selection_before_publish(
+    fn persist_selection_before_publish(
         &mut self,
         session_id: &str,
         window_id: Option<&str>,
     ) -> bool {
-        if selected_backend(&self.workspace.active.binding.multiplexer)
-            != MultiplexerBackendConfig::Rmux
+        if self
+            .workspace
+            .active
+            .binding
+            .backend_policy
+            .selection_publication
+            != SelectionPublicationPolicy::PersistBeforePublish
         {
             return true;
         }
@@ -1052,13 +1018,6 @@ impl AppState {
         self.chrome_handle_rects.push(rect);
     }
 
-    fn is_native(&self) -> bool {
-        matches!(
-            self.active_multiplexer().backend,
-            crate::config::MultiplexerBackendConfig::Native
-        )
-    }
-
     pub(super) fn uses_native_terminal_layout(&self) -> bool {
         self.workspace.active.binding.uses_native_terminal_layout()
     }
@@ -1068,7 +1027,7 @@ impl AppState {
     }
 
     fn sync_terminal_panes(&mut self) -> Result<()> {
-        self.workspace.active.binding.sync_terminal_panes()
+        self.workspace.sync_active_terminal_panes()
     }
 
     pub fn native_multi_pane(&self) -> bool {
@@ -1225,7 +1184,7 @@ impl AppState {
             self.terminal_surface = None;
             self.last_pane_area = None;
         }
-        if !self.persist_rmux_selection_before_publish(&target.session_id, None) {
+        if !self.persist_selection_before_publish(&target.session_id, None) {
             return false;
         }
         self.workspace
@@ -1277,7 +1236,7 @@ impl AppState {
     }
 
     pub fn activate_window_from_ui(&mut self, session_id: &str, window_id: &str) {
-        if !self.persist_rmux_selection_before_publish(session_id, Some(window_id)) {
+        if !self.persist_selection_before_publish(session_id, Some(window_id)) {
             return;
         }
         let mux_config = self.active_multiplexer().clone();
@@ -1363,12 +1322,6 @@ impl AppState {
             .close_pane_for_window(&self.repaint, session_id, window_id)
     }
 
-    fn sync_session_order(&mut self) {
-        if let Err(error) = self.workspace.reconcile_binding_states() {
-            self.last_error = Some(error.to_string());
-        }
-    }
-
     pub(super) fn commit_binding_state_candidate(
         &mut self,
         candidate: BindingStateCandidate,
@@ -1395,15 +1348,6 @@ impl AppState {
             }
         }
     }
-    fn sync_generated_session_names(&mut self) {
-        if let Err(error) = self
-            .workspace
-            .reconcile_generated_session_names(&self.repaint)
-        {
-            self.last_error = Some(error.to_string());
-        }
-    }
-
     /// Every session name the backend already answers to, plus the names bootty has asked it for and
     /// is still waiting on. `keep` is the name of the session being renamed, which must not count as
     /// taken against itself.
@@ -1659,41 +1603,32 @@ impl AppState {
     }
 
     pub fn take_terminal_find_dialog(&mut self) -> Option<TerminalFindDialog> {
-        self.terminal_find_dialog.take()
+        self.terminal_interaction.take_find_dialog()
     }
 
     pub fn apply_terminal_find_event(
         &mut self,
-        mut dialog: TerminalFindDialog,
+        dialog: TerminalFindDialog,
         event: TerminalFindEvent,
     ) {
-        match event {
-            TerminalFindEvent::None => {
-                self.terminal_find_dialog = Some(dialog);
-            }
-            TerminalFindEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-                self.clear_terminal_search();
-                self.terminal_find_return_focus_after_search = false;
-            }
-            TerminalFindEvent::FocusFind => {
-                self.input_focus = InputFocus::Picker;
-                self.terminal_find_dialog = Some(dialog);
-            }
-            TerminalFindEvent::FocusTerminal => {
-                self.input_focus = InputFocus::Terminal;
-                self.terminal_find_dialog = Some(dialog);
-            }
-            TerminalFindEvent::Search { query, direction } => {
-                let result = self.search_terminal(&query, direction);
-                dialog.set_result(result);
-                if direction != TerminalSearchDirection::Current
-                    && self.terminal_find_return_focus_after_search
-                {
-                    self.input_focus = InputFocus::Terminal;
-                }
-                self.terminal_find_dialog = Some(dialog);
-            }
+        let focused_pane_id = self.focused_pane();
+        let outcome = self.terminal_interaction.apply_find_event(
+            &mut self.workspace.active.binding.terminal,
+            dialog,
+            event,
+            focused_pane_id.as_deref(),
+        );
+        self.apply_terminal_focus_intent(outcome.focus_intent);
+        if let Some(error) = outcome.last_error {
+            self.last_error = Some(error);
+        }
+    }
+
+    fn apply_terminal_focus_intent(&mut self, intent: TerminalFocusIntent) {
+        match intent {
+            TerminalFocusIntent::None => {}
+            TerminalFocusIntent::Terminal => self.input_focus = InputFocus::Terminal,
+            TerminalFocusIntent::Find => self.input_focus = InputFocus::Picker,
         }
     }
 
@@ -1735,7 +1670,12 @@ impl AppState {
                     &self.repaint,
                     &mux_config,
                 );
-                if selected_backend(&mux_config) == MultiplexerBackendConfig::Native {
+                if self
+                    .workspace
+                    .active
+                    .binding
+                    .membership_completion_is_immediate()
+                {
                     self.workspace
                         .active
                         .binding
@@ -1880,18 +1820,12 @@ impl AppState {
 
     fn drain_terminal_side_effects(
         &mut self,
+        side_effects: Vec<TerminalSideEffectEvent>,
         effects: &mut Vec<AppEffect>,
         terminal_cell_width: f32,
         terminal_cell_height: f32,
         terminal_scale_factor: f32,
     ) {
-        let side_effects = self
-            .workspace
-            .active
-            .binding
-            .terminal_side_effect_rx
-            .try_iter()
-            .collect::<Vec<_>>();
         for side_effect in side_effects {
             self.apply_terminal_side_effect_event(
                 side_effect,
@@ -2143,133 +2077,30 @@ impl AppState {
         }
 
         self.sync_macos_non_native_fullscreen_presentation();
-        // Drain the focused pane plus every live sibling in the active native window so background
-        // panes keep processing output. For non-native this is just the single attach surface.
-        self.last_drain = self.workspace.active.binding.terminal.drain_native_window();
-        for binding in &mut self.workspace.active.inactive_bindings {
-            binding.terminal.drain_native_window();
-            binding.discard_terminal_side_effects();
-        }
-        for space in &mut self.workspace.inactive_spaces {
-            for binding in space.bindings_mut() {
-                binding.terminal.drain_native_window();
-                binding.discard_terminal_side_effects();
-            }
-        }
-        if let Some(owner) = &mut self.workspace.parked_native_terminal {
-            owner.drain_inactive();
-        }
+        let drain = self.workspace.drain();
+        self.last_drain = drain.active_drain;
         self.drain_terminal_side_effects(
+            drain.active_terminal_side_effects,
             &mut effects,
             terminal_cell_width,
             terminal_cell_height,
             terminal_scale_factor,
         );
-        self.workspace.reset_after_network_change(now);
-        // A shell exiting closes its pane, collapsing the split (or cascading to the tab when it was
-        // the last pane). On native, any pane's shell can exit, not just the focused one.
-        if self.is_native() {
-            for pane in self.workspace.active.binding.terminal.native_exited_panes() {
-                self.close_pane(&pane);
-            }
-        } else {
-            match self.workspace.active.binding.terminal.child_exited() {
-                Ok(true) => match self.workspace.active.binding.handle_attach_client_exit(now) {
-                    AttachExit::CloseLocalPane => self.close_active_pane(),
-                    AttachExit::Reconnecting(error) => self.last_error = Some(error),
-                    AttachExit::AlreadyWaiting => {}
-                },
-                Ok(false) => self.workspace.active.binding.note_attach_client_alive(now),
-                Err(error) => self.last_error = Some(error.to_string()),
-            }
-            if let Some(wait) = self.workspace.active.binding.reattach_wait(now) {
-                effects.push(AppEffect::RepaintAfter(wait));
-            }
-        }
-
-        for binding in self.workspace.bindings_mut() {
-            binding.poll_membership_command();
-        }
-        let active_config = self.workspace.active.binding.multiplexer.clone();
-        self.workspace
-            .active
-            .binding
-            .mux
-            .set_refresh_interval(mux_session_refresh_interval(window_focused));
-        let _ = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .refresh_sessions(&self.repaint, &active_config);
-        self.workspace
-            .active
-            .binding
-            .restore_persisted_sessions(&self.repaint);
-        let refresh_completed = self.workspace.active.binding.mux.take_refresh_completed();
-        if refresh_completed
-            && self
-                .workspace
-                .active
-                .binding
-                .membership_reconciliation_waiting_for_refresh
-        {
-            self.workspace
-                .active
-                .binding
-                .membership_reconciliation_ready = true;
-        }
-        if self
-            .workspace
-            .active
-            .binding
-            .resolve_attach_exit_after_refresh(refresh_completed)
-            && self
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.starts_with("lost the connection to "))
-        {
-            self.last_error = None;
-        }
-        let mux_refresh_after = mux_refresh_repaint_after(&active_config, window_focused);
-        for binding in &mut self.workspace.active.inactive_bindings {
-            binding.restore_persisted_sessions(&self.repaint);
-        }
-        for space in &mut self.workspace.inactive_spaces {
-            for binding in space.bindings_mut() {
-                binding.restore_persisted_sessions(&self.repaint);
-            }
-        }
-        if let Some(after) = mux_refresh_after {
+        let frame_config = self.config().clone();
+        let workspace_frame = self.workspace.advance_frame(
+            &frame_config,
+            self.active_appearance_variant,
+            &self.repaint,
+            now,
+            window_focused,
+        );
+        if let Some(after) = workspace_frame.next_wake {
             effects.push(AppEffect::RepaintAfter(after));
         }
-        if let Err(error) = self.workspace.reconcile_binding_membership_mutations() {
-            self.last_error = Some(error.to_string());
-        }
-        if !self.deferred_profile_binding_rebuilds.is_empty() {
-            let requested_scopes = self.deferred_profile_binding_rebuilds.clone();
-            let config = self.config().clone();
-            if let Err(error) = self.rebuild_profile_bindings(&config, Some(&requested_scopes)) {
-                self.last_error = Some(error.to_string());
-            }
-        }
-        self.sync_generated_session_names();
-        self.sync_session_order();
-        let phase = crate::diagnostics::latency_start();
-        let waiting_to_reattach = self.workspace.active.binding.waiting_to_reattach();
-        if !waiting_to_reattach && let Err(error) = self.sync_terminal_panes() {
-            if self.workspace.active.binding.multiplexer.remote.is_some() {
-                self.last_error = self
-                    .workspace
-                    .active
-                    .binding
-                    .handle_attach_start_failure(now, &error.to_string());
-            } else {
-                self.last_error = Some(error.to_string());
-            }
-        }
-        crate::diagnostics::trace_slow("frame.sync_terminal_panes", phase, 4.0);
         self.hot_reload_config_if_changed(&mut effects, now);
+        for error in workspace_frame.errors {
+            self.last_error = Some(error);
+        }
         self.terminal_view_transform = terminal_view_transform;
         self.restore_mouse_pointer_after_pointer_moved(&events, hover_pos, &mut effects);
         let input_commands = self.handle_direct_input(viewport, &mut effects)
@@ -2322,8 +2153,13 @@ impl AppState {
         let restored_preview = self.restore_theme_picker_preview();
         self.theme_picker_restore_config = None;
         self.dialogs.clear();
-        self.terminal_find_dialog = None;
-        self.terminal_find_return_focus_after_search = false;
+        let outcome = self
+            .terminal_interaction
+            .close_overlay_dialogs(&mut self.workspace.active.binding.terminal);
+        if let Some(error) = outcome.last_error {
+            self.last_error = Some(error);
+        }
+        self.apply_terminal_focus_intent(outcome.focus_intent);
         restored_preview
     }
 
@@ -2586,23 +2422,6 @@ impl AppState {
         self.input_focus = InputFocus::Picker;
     }
 
-    fn open_terminal_find_dialog(&mut self) {
-        self.open_terminal_find_dialog_with_direction(TerminalSearchDirection::Next);
-    }
-
-    fn open_terminal_find_dialog_with_direction(&mut self, direction: TerminalSearchDirection) {
-        let query = self.last_terminal_search.clone();
-        self.close_overlay_dialogs();
-        let mut dialog = TerminalFindDialog::open_with_direction(query.clone(), direction);
-        if !query.trim().is_empty() {
-            let result = self.search_terminal(&query, TerminalSearchDirection::Current);
-            dialog.set_result(result);
-        }
-        self.terminal_find_dialog = Some(dialog);
-        self.terminal_find_return_focus_after_search = false;
-        self.input_focus = InputFocus::Picker;
-    }
-
     fn open_theme_picker_dialog(&mut self) {
         let config = self.config();
         let branch = match self.active_appearance_variant {
@@ -2632,62 +2451,6 @@ impl AppState {
             && !self.settings_open
     }
 
-    fn rebuild_profile_bindings(
-        &mut self,
-        config: &BoottyConfig,
-        requested_scopes: Option<&HashSet<MuxScope>>,
-    ) -> Result<(), crate::workspace::WorkspacePersistenceError> {
-        let repaint = self.repaint.clone();
-        let variant = self.active_appearance_variant;
-        let profile_scopes = self
-            .workspace
-            .binding_scopes()
-            .filter(|scope| requested_scopes.is_none_or(|scopes| scopes.contains(scope)))
-            .filter(|scope| {
-                self.workspace
-                    .binding_placement(*scope)
-                    .is_some_and(|placement| {
-                        matches!(placement.remote, SpaceRemoteOverride::Profile(_))
-                    })
-            })
-            .collect::<Vec<_>>();
-        let mut pending_scopes = HashSet::new();
-        for scope in &profile_scopes {
-            match self
-                .workspace
-                .binding_has_pending_membership_operation(*scope)
-            {
-                Ok(true) => {
-                    pending_scopes.insert(*scope);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    self.deferred_profile_binding_rebuilds
-                        .extend(profile_scopes.iter().copied());
-                    return Err(error);
-                }
-            }
-        }
-        self.deferred_profile_binding_rebuilds
-            .extend(pending_scopes.iter().copied());
-        let mut rebuilt_scopes = Vec::new();
-        for binding in self.workspace.bindings_mut() {
-            if !profile_scopes.contains(&binding.scope) {
-                continue;
-            }
-            if pending_scopes.contains(&binding.scope) {
-                continue;
-            }
-            let placement = binding.placement().clone();
-            binding.rebuild(config, placement, variant, repaint.clone());
-            rebuilt_scopes.push(binding.scope);
-        }
-        for scope in rebuilt_scopes {
-            self.deferred_profile_binding_rebuilds.remove(&scope);
-        }
-        Ok(())
-    }
-
     pub fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
         let change = match self.config_runtime.reload(
             self.workspace.active.binding.multiplexer.backend,
@@ -2711,7 +2474,13 @@ impl AppState {
 
         let mut warnings = Vec::new();
         let profile_reload_error = if change.ssh_profiles_changed {
-            self.rebuild_profile_bindings(&change.config, None)
+            self.workspace
+                .rebuild_profile_bindings(
+                    &change.config,
+                    None,
+                    self.active_appearance_variant,
+                    self.repaint.clone(),
+                )
                 .err()
                 .map(|error| error.to_string())
         } else {
@@ -2730,7 +2499,9 @@ impl AppState {
             .active
             .binding
             .clear_pending_generated_names();
-        self.sync_session_order();
+        if let Err(error) = self.workspace.reconcile_binding_states() {
+            warnings.push(error.to_string());
+        }
         if self.config_runtime.has_new_session_config_changes() {
             warnings.push(
                 "config reloaded; session/window settings require a new window or restart"
@@ -2791,228 +2562,6 @@ impl AppState {
         true
     }
 
-    fn terminal_mouse_tracking_for_selection(
-        &mut self,
-        events: &[egui::Event],
-        terminal_input_enabled: bool,
-        pressed_mouse_button: Option<MouseButton>,
-    ) -> bool {
-        let primary_drag_active = pressed_mouse_button == Some(MouseButton::Left);
-        if !terminal_input_enabled
-            || !events.iter().any(|event| match event {
-                egui::Event::PointerButton {
-                    button: egui::PointerButton::Primary,
-                    ..
-                } => true,
-                egui::Event::PointerMoved(_) => primary_drag_active,
-                _ => false,
-            })
-        {
-            return false;
-        }
-
-        match TerminalRuntime::is_mouse_tracking(self.workspace.active.binding.terminal.as_mut()) {
-            Ok(mouse_tracking) => mouse_tracking,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
-        }
-    }
-
-    fn apply_terminal_selection_actions(
-        &mut self,
-        actions: Vec<TerminalSelectionAction>,
-        effects: &mut Vec<AppEffect>,
-    ) -> usize {
-        let count = actions.len();
-        for action in actions {
-            let copy_on_select = self.config().input.copy_on_select
-                && matches!(&action, TerminalSelectionAction::End(_));
-            let result = match action {
-                TerminalSelectionAction::Begin(event) => TerminalRuntime::begin_selection(
-                    self.workspace.active.binding.terminal.as_mut(),
-                    event,
-                ),
-                TerminalSelectionAction::Scroll(delta) => TerminalRuntime::scroll_viewport_delta(
-                    self.workspace.active.binding.terminal.as_mut(),
-                    delta,
-                ),
-                TerminalSelectionAction::Update(event) => TerminalRuntime::update_selection(
-                    self.workspace.active.binding.terminal.as_mut(),
-                    event,
-                ),
-                TerminalSelectionAction::End(event) => TerminalRuntime::end_selection(
-                    self.workspace.active.binding.terminal.as_mut(),
-                    event,
-                ),
-            };
-            match result {
-                Ok(()) => {
-                    effects.push(AppEffect::RequestRepaint);
-                    if copy_on_select {
-                        self.copy_terminal_selection_if_any(CopyToClipboard::Mixed);
-                    }
-                }
-                Err(error) => self.last_error = Some(error.to_string()),
-            }
-        }
-        count
-    }
-
-    fn terminal_copy_mode_active(&mut self) -> bool {
-        match TerminalRuntime::copy_mode_active(self.workspace.active.binding.terminal.as_mut()) {
-            Ok(active) => active,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
-        }
-    }
-
-    fn enter_terminal_copy_mode(&mut self, effects: &mut Vec<AppEffect>) {
-        match TerminalRuntime::enter_copy_mode(self.workspace.active.binding.terminal.as_mut()) {
-            Ok(()) => effects.push(AppEffect::RequestRepaint),
-            Err(error) => self.last_error = Some(error.to_string()),
-        }
-    }
-
-    fn apply_copy_mode_key_action(
-        &mut self,
-        action: CopyModeKeyAction,
-        effects: &mut Vec<AppEffect>,
-    ) -> bool {
-        match action {
-            CopyModeKeyAction::Terminal(action) => {
-                self.apply_terminal_copy_mode_action(action, effects)
-            }
-            CopyModeKeyAction::SearchPrompt(direction) => {
-                self.record_terminal_search_direction(direction);
-                self.open_terminal_find_dialog_with_direction(direction);
-                self.terminal_find_return_focus_after_search = true;
-                effects.push(AppEffect::RequestRepaint);
-                true
-            }
-            CopyModeKeyAction::SearchWord(direction) => self.apply_terminal_copy_mode_action(
-                TerminalCopyModeAction::SearchWord(direction),
-                effects,
-            ),
-            CopyModeKeyAction::SearchRepeat(repeat) => {
-                let direction = repeat.direction(self.last_terminal_search_direction);
-                let query = self.last_terminal_search.clone();
-                if !query.trim().is_empty() {
-                    let result =
-                        self.search_terminal_with_direction_recording(&query, direction, false);
-                    if let Some(dialog) = self.terminal_find_dialog.as_mut() {
-                        dialog.set_result(result);
-                    }
-                    effects.push(AppEffect::RequestRepaint);
-                }
-                true
-            }
-        }
-    }
-
-    fn record_terminal_search_direction(&mut self, direction: TerminalSearchDirection) {
-        if direction != TerminalSearchDirection::Current {
-            self.last_terminal_search_direction = direction;
-        }
-    }
-
-    fn apply_terminal_copy_mode_action(
-        &mut self,
-        action: TerminalCopyModeAction,
-        effects: &mut Vec<AppEffect>,
-    ) -> bool {
-        let search_direction = match &action {
-            TerminalCopyModeAction::Search { direction, .. }
-            | TerminalCopyModeAction::SearchWord(direction) => Some(*direction),
-            _ => None,
-        };
-        match TerminalRuntime::handle_copy_mode_action(
-            self.workspace.active.binding.terminal.as_mut(),
-            action,
-        ) {
-            Ok(outcome) => {
-                if let Some(bytes) = outcome.copied {
-                    let text = String::from_utf8_lossy(&bytes);
-                    if let Err(error) = write_clipboard_text(&text) {
-                        self.last_error = Some(error.to_string());
-                    }
-                }
-                let search_result = outcome.search.map(|search| {
-                    self.last_terminal_search = search.query;
-                    if let Some(direction) = search_direction {
-                        self.record_terminal_search_direction(direction);
-                    }
-                    self.terminal_find_result_from_frame(search.found)
-                });
-                if let Some(result) = search_result
-                    && let Some(dialog) = self.terminal_find_dialog.as_mut()
-                {
-                    dialog.set_result(result);
-                }
-                effects.push(AppEffect::RequestRepaint);
-                outcome.active
-            }
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
-        }
-    }
-
-    fn consume_copy_mode_egui_events(
-        &mut self,
-        events: &mut Vec<egui::Event>,
-        effects: &mut Vec<AppEffect>,
-        terminal_input_enabled: bool,
-    ) -> usize {
-        if !terminal_input_enabled
-            || (self.terminal_find_dialog.is_some() && self.input_focus != InputFocus::Terminal)
-            || !copy_mode_key_input_present(events)
-            || !self.terminal_copy_mode_active()
-        {
-            return 0;
-        }
-
-        let mut count = 0;
-        let mut retained = Vec::with_capacity(events.len());
-        let mut suppress_next_text = false;
-        let mut pass_next_text_to_app = false;
-        for event in events.drain(..) {
-            match &event {
-                egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } if copy_mode_egui_key_should_pass_to_app(*key, *modifiers) => {
-                    pass_next_text_to_app = copy_mode_egui_key_may_emit_text(*key);
-                    retained.push(event);
-                }
-                egui::Event::Text(_) if std::mem::take(&mut pass_next_text_to_app) => {
-                    retained.push(event);
-                }
-                _ if matches!(event, egui::Event::Key { .. } | egui::Event::Text(_)) => {
-                    pass_next_text_to_app = false;
-                    count += 1;
-                    if let Some(action) =
-                        copy_mode_action_for_egui_event(&event, &mut suppress_next_text)
-                    {
-                        self.apply_copy_mode_key_action(action, effects);
-                    }
-                }
-                _ => {
-                    pass_next_text_to_app = false;
-                    retained.push(event);
-                }
-            }
-        }
-        *events = retained;
-        count
-    }
-
     fn handle_egui_input(
         &mut self,
         events: Vec<egui::Event>,
@@ -3022,49 +2571,36 @@ impl AppState {
         viewport: ViewportSnapshot,
         effects: &mut Vec<AppEffect>,
     ) -> usize {
-        let suppress_next_egui_paste = std::mem::take(&mut self.suppress_next_egui_paste);
-        let mut events = events;
-        if suppress_next_egui_paste {
-            remove_first_paste_event(&mut events);
-        }
         let terminal_input_enabled = self.direct_terminal_input_enabled();
-        let selection_surface = terminal_input_enabled
-            .then_some(self.terminal_surface)
-            .flatten();
-        let mouse_tracking = self.terminal_mouse_tracking_for_selection(
-            &events,
-            terminal_input_enabled,
-            pressed_mouse_button,
-        );
-        let mut chrome_handle_rects = self.chrome_handle_rects.clone();
-        if let Some(rect) = self
-            .terminal_find_dialog
-            .as_ref()
-            .and_then(TerminalFindDialog::last_rect)
-        {
-            chrome_handle_rects.push(rect);
-        }
-        let (mut events, mut selection_actions) = self.terminal_selection.route_events(
-            events,
-            TerminalSelectionRouteContext {
-                surface: selection_surface,
-                view: self.terminal_view_transform,
-                mouse_tracking,
-                frame_modifiers: modifiers,
+        let copy_on_select = self.config().input.copy_on_select;
+        let surface = self.terminal_surface;
+        let view = self.terminal_view_transform;
+        let input_focus = self.input_focus;
+        let chrome_handle_rects = self.chrome_handle_rects.clone();
+        let outcome = self.terminal_interaction.handle_egui_input(
+            &mut self.workspace.active.binding.terminal,
+            TerminalInteractionInput {
+                events,
+                modifiers,
+                pressed_mouse_button,
+                input_focus,
+                terminal_input_enabled,
+                surface,
+                view,
                 chrome_handle_rects: &chrome_handle_rects,
+                copy_on_select,
             },
         );
-        selection_actions.extend(self.terminal_selection.autoscroll_actions(
-            selection_surface,
-            self.terminal_view_transform,
-            modifiers,
-        ));
-        let selection_count = self.apply_terminal_selection_actions(selection_actions, effects);
-        let copy_mode_count =
-            self.consume_copy_mode_egui_events(&mut events, effects, terminal_input_enabled);
-        let copy_selection_count = self.consume_copy_shortcut_for_terminal_selection(&mut events);
+        let count = outcome.handled_count;
+        if let Some(error) = outcome.last_error {
+            self.last_error = Some(error);
+        }
+        effects.extend(outcome.effects);
+        self.apply_terminal_focus_intent(outcome.focus_intent);
+
+        let mut events = outcome.events;
         // `cmd+shift+,` over a palette row jumps to that command's keybinding editor.
-        // Consume it here so it doesn't also fire its own global binding.
+        // Consume it here so it does not also fire its own global binding.
         if self.take_configure_keybind_chord(&mut events) {
             let action = self
                 .dialogs
@@ -3078,26 +2614,24 @@ impl AppState {
             }
         }
         let (events, actions) = self.split_app_actions(events);
-        let routed = if self.terminal_find_dialog.is_some() {
-            route_find_modeless_events(
-                self.input_focus,
-                events,
-                self.terminal_find_dialog
-                    .as_ref()
-                    .and_then(TerminalFindDialog::last_rect),
-                hover_pos,
-            )
+        let routed = if let Some(find_rect) = self
+            .terminal_interaction
+            .find_dialog()
+            .and_then(TerminalFindDialog::last_rect)
+        {
+            route_find_modeless_events(self.input_focus, events, Some(find_rect), hover_pos)
         } else {
             route_events(self.input_focus, events)
         };
         let sidebar_count = self.handle_sidebar_input(routed.ui_events, viewport, effects);
-        let events = if terminal_input_enabled || self.terminal_find_dialog.is_some() {
-            routed.terminal_events
-        } else {
-            Vec::new()
-        };
+        let terminal_events =
+            if terminal_input_enabled || self.terminal_interaction.find_dialog().is_some() {
+                routed.terminal_events
+            } else {
+                Vec::new()
+            };
         let snapshot = InputSnapshot {
-            events,
+            events: terminal_events,
             modifiers,
             modifier_sides: self.modifier_sides,
             hover_pos,
@@ -3111,21 +2645,13 @@ impl AppState {
         let commands = self
             .config_runtime
             .terminal_input_commands(snapshot, &mut self.wheel_scroll_state);
-        let count = commands.len()
-            + actions.len()
-            + sidebar_count
-            + selection_count
-            + copy_mode_count
-            + copy_selection_count;
-
+        let count = count + commands.len() + actions.len() + sidebar_count;
         for invocation in actions {
             let _ = self.dispatch_command(invocation, viewport, effects);
         }
-
         for command in commands {
             self.apply_terminal_input(command, effects);
         }
-
         count
     }
 
@@ -3173,27 +2699,36 @@ impl AppState {
             return count;
         }
 
-        let mut copy_mode_active = self.terminal_copy_mode_active();
+        let mut copy_mode_active = match self
+            .terminal_interaction
+            .copy_mode_active(&mut self.workspace.active.binding.terminal)
+        {
+            Ok(active) => active,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        };
         for input in inputs {
             let mut input = input.input();
             input.mods = self.config_runtime.remap_mods(input.mods);
-            if copy_mode_active {
-                if let Some(action) = copy_mode_action_for_input(input) {
-                    copy_mode_active = self.apply_copy_mode_key_action(action, effects);
-                    continue;
-                }
-                if !copy_mode_input_should_pass_to_app(input) {
-                    continue;
-                }
+            let interaction = self.terminal_interaction.handle_direct_input(
+                &mut self.workspace.active.binding.terminal,
+                input,
+                copy_mode_active,
+            );
+            copy_mode_active = interaction.copy_mode_active;
+            effects.extend(interaction.effects);
+            if let Some(error) = interaction.last_error {
+                self.last_error = Some(error);
             }
-            if direct_copy_shortcut_pressed(input)
-                && self.copy_terminal_selection_if_any(CopyToClipboard::Mixed)
-            {
+            self.apply_terminal_focus_intent(interaction.focus_intent);
+            if interaction.consumed {
                 continue;
             }
             if let Some(invocation) = self.config_runtime.invocation_for_input(input) {
                 if invocation.command == "paste_from_clipboard" {
-                    self.suppress_next_egui_paste = true;
+                    self.terminal_interaction.mark_paste_suppression();
                 }
                 let _ = self.dispatch_command(invocation, viewport, effects);
                 continue;
@@ -3451,71 +2986,14 @@ impl AppState {
         }
     }
 
-    fn consume_copy_shortcut_for_terminal_selection(
-        &mut self,
-        events: &mut Vec<egui::Event>,
-    ) -> usize {
-        let Some(index) = events.iter().position(copy_shortcut_pressed) else {
-            return 0;
-        };
-        if !self.copy_terminal_selection_if_any(CopyToClipboard::Mixed) {
-            return 0;
+    fn enter_terminal_copy_mode(&mut self, effects: &mut Vec<AppEffect>) {
+        let outcome = self
+            .terminal_interaction
+            .enter_copy_mode(&mut self.workspace.active.binding.terminal);
+        if let Some(error) = outcome.last_error {
+            self.last_error = Some(error);
         }
-        events.remove(index);
-        1
-    }
-
-    fn write_terminal_selection_to_clipboard(&mut self, format: CopyToClipboard) -> Result<bool> {
-        let mut selection = |format| {
-            self.workspace
-                .active
-                .binding
-                .terminal
-                .format_selection(format)
-        };
-        match format {
-            CopyToClipboard::Plain => {
-                let Some(bytes) = selection(TerminalSelectionFormat::PlainText)? else {
-                    return Ok(false);
-                };
-                write_clipboard_text(&String::from_utf8_lossy(&bytes))?;
-            }
-            CopyToClipboard::Vt => {
-                let Some(bytes) = selection(TerminalSelectionFormat::Vt)? else {
-                    return Ok(false);
-                };
-                write_clipboard_text(&String::from_utf8_lossy(&bytes))?;
-            }
-            CopyToClipboard::Html => {
-                let Some(bytes) = selection(TerminalSelectionFormat::Html)? else {
-                    return Ok(false);
-                };
-                write_clipboard_html(&String::from_utf8_lossy(&bytes), None)?;
-            }
-            CopyToClipboard::Mixed => {
-                let Some(plain) = selection(TerminalSelectionFormat::PlainText)? else {
-                    return Ok(false);
-                };
-                let Some(html) = selection(TerminalSelectionFormat::Html)? else {
-                    return Ok(false);
-                };
-                write_clipboard_html(
-                    &String::from_utf8_lossy(&html),
-                    Some(&String::from_utf8_lossy(&plain)),
-                )?;
-            }
-        }
-        Ok(true)
-    }
-
-    fn copy_terminal_selection_if_any(&mut self, format: CopyToClipboard) -> bool {
-        match self.write_terminal_selection_to_clipboard(format) {
-            Ok(copied) => copied,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
-        }
+        effects.extend(outcome.effects);
     }
 
     fn copy_terminal_selection_or_request_copy(
@@ -3523,21 +3001,18 @@ impl AppState {
         format: CopyToClipboard,
         effects: &mut Vec<AppEffect>,
     ) {
-        if !self.copy_terminal_selection_if_any(format) {
-            effects.push(AppEffect::RequestCopy);
+        let outcome = self
+            .terminal_interaction
+            .copy_selection_or_request(&mut self.workspace.active.binding.terminal, format);
+        if let Some(error) = outcome.last_error {
+            self.last_error = Some(error);
         }
+        effects.extend(outcome.effects);
     }
 
     pub fn reconnect_space_from_ui(&mut self, space_id: SpaceId) -> bool {
         self.workspace.reconnect_space(space_id, Instant::now())
     }
-    // Close the focused pane (cmd+w or its shell exiting) and let the mux cascade to the tab. The
-    // active terminal is dropped here so its PTY is reaped; sync_mux_anchor then attaches whatever
-    // pane the mux selected next (or idle when the session has no tabs left).
-    fn close_active_pane(&mut self) {
-        self.close_target_pane(None);
-    }
-
     fn close_target_pane(&mut self, target_pane_id: Option<&str>) {
         if self.uses_native_terminal_layout() {
             if let Some(pane_id) = target_pane_id
@@ -3867,7 +3342,7 @@ impl AppState {
         // target (e.g. last_session with no prior session) is a no-op here; falling through would
         // reach the command builder's `unreachable!` for these Bootty-owned actions and panic.
         if let Some(target) = target {
-            if !self.persist_rmux_selection_before_publish(&target, None) {
+            if !self.persist_selection_before_publish(&target, None) {
                 return true;
             }
             self.workspace.active.binding.mux.activate_session(&target);
@@ -3898,190 +3373,20 @@ impl AppState {
         action: TerminalFindAction,
         effects: &mut Vec<AppEffect>,
     ) {
-        match action {
-            TerminalFindAction::Prompt => {
-                self.open_terminal_find_dialog();
-                effects.push(AppEffect::RequestRepaint);
-            }
-            TerminalFindAction::Close => {
-                self.terminal_find_dialog = None;
-                self.clear_terminal_search();
-                self.input_focus = InputFocus::Terminal;
-                effects.push(AppEffect::RequestRepaint);
-            }
-            TerminalFindAction::Search(query) => {
-                self.search_terminal(&query, TerminalSearchDirection::Current);
-                effects.push(AppEffect::RequestRepaint);
-            }
-            TerminalFindAction::SearchSelection => {
-                if let Some(query) = self.selected_terminal_text() {
-                    self.search_terminal(&query, TerminalSearchDirection::Current);
-                    effects.push(AppEffect::RequestRepaint);
-                }
-            }
-            TerminalFindAction::Previous => {
-                let query = self.last_terminal_search.clone();
-                if query.is_empty() {
-                    self.open_terminal_find_dialog();
-                } else {
-                    self.search_terminal(&query, TerminalSearchDirection::Previous);
-                }
-                effects.push(AppEffect::RequestRepaint);
-            }
-            TerminalFindAction::Next => {
-                let query = self.last_terminal_search.clone();
-                if query.is_empty() {
-                    self.open_terminal_find_dialog();
-                } else {
-                    self.search_terminal(&query, TerminalSearchDirection::Next);
-                }
-                effects.push(AppEffect::RequestRepaint);
-            }
+        if self.terminal_interaction.find_action_opens_dialog(&action) {
+            self.close_overlay_dialogs();
         }
-    }
-
-    fn selected_terminal_text(&mut self) -> Option<String> {
-        match self
-            .workspace
-            .active
-            .binding
-            .terminal
-            .format_selection(TerminalSelectionFormat::PlainText)
-        {
-            Ok(Some(bytes)) => Some(String::from_utf8_lossy(&bytes).trim().to_owned())
-                .filter(|text| !text.is_empty()),
-            Ok(None) => None,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                None
-            }
+        let focused_pane_id = self.focused_pane();
+        let outcome = self.terminal_interaction.apply_find_action(
+            &mut self.workspace.active.binding.terminal,
+            action,
+            focused_pane_id.as_deref(),
+        );
+        if let Some(error) = outcome.last_error {
+            self.last_error = Some(error);
         }
-    }
-
-    fn clear_terminal_search(&mut self) {
-        if let Err(error) = self
-            .workspace
-            .active
-            .binding
-            .terminal
-            .search_viewport("", TerminalSearchDirection::Current)
-        {
-            self.last_error = Some(error.to_string());
-        }
-    }
-
-    fn search_terminal(
-        &mut self,
-        query: &str,
-        direction: TerminalSearchDirection,
-    ) -> TerminalFindResult {
-        self.search_terminal_with_direction_recording(query, direction, true)
-    }
-
-    fn search_terminal_with_direction_recording(
-        &mut self,
-        query: &str,
-        direction: TerminalSearchDirection,
-        record_direction: bool,
-    ) -> TerminalFindResult {
-        let query = query.trim();
-        if query.is_empty() {
-            self.clear_terminal_search();
-            return TerminalFindResult::default();
-        }
-        self.last_terminal_search = query.to_owned();
-        if record_direction {
-            self.record_terminal_search_direction(direction);
-        }
-        if self.terminal_copy_mode_active() {
-            return self.search_copy_mode_terminal(query, direction);
-        }
-        match self.search_focused_terminal_runtime(query, direction) {
-            Ok(result) => result,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                TerminalFindResult::default()
-            }
-        }
-    }
-
-    fn search_focused_terminal_runtime(
-        &mut self,
-        query: &str,
-        direction: TerminalSearchDirection,
-    ) -> Result<TerminalFindResult> {
-        if let Some(pane_id) = self.focused_pane()
-            && let Some(source) = self
-                .workspace
-                .active
-                .binding
-                .terminal
-                .focused_terminal_runtime(&pane_id)
-        {
-            let found = source.search_viewport(query, direction)?;
-            let frame = source.extract_frame()?;
-            return Ok(TerminalFindResult {
-                found,
-                active_index: frame.active_search_match_index,
-                match_count: frame.search_match_count,
-            });
-        }
-
-        let found = self
-            .workspace
-            .active
-            .binding
-            .terminal
-            .search_viewport(query, direction)?;
-        let frame = self.workspace.active.binding.terminal.extract_frame()?;
-        Ok(TerminalFindResult {
-            found,
-            active_index: frame.active_search_match_index,
-            match_count: frame.search_match_count,
-        })
-    }
-
-    fn search_copy_mode_terminal(
-        &mut self,
-        query: &str,
-        direction: TerminalSearchDirection,
-    ) -> TerminalFindResult {
-        match TerminalRuntime::handle_copy_mode_action(
-            self.workspace.active.binding.terminal.as_mut(),
-            TerminalCopyModeAction::Search {
-                query: query.to_owned(),
-                direction,
-            },
-        ) {
-            Ok(outcome) => outcome
-                .search
-                .map_or_else(TerminalFindResult::default, |search| {
-                    self.terminal_find_result_from_frame(search.found)
-                }),
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                TerminalFindResult::default()
-            }
-        }
-    }
-
-    fn terminal_find_result_from_frame(&mut self, found: bool) -> TerminalFindResult {
-        let (active_index, match_count) = self
-            .workspace
-            .active
-            .binding
-            .terminal
-            .extract_frame()
-            .map(|frame| (frame.active_search_match_index, frame.search_match_count))
-            .unwrap_or_else(|error| {
-                self.last_error = Some(error.to_string());
-                (None, 0)
-            });
-        TerminalFindResult {
-            found,
-            active_index,
-            match_count,
-        }
+        effects.extend(outcome.effects);
+        self.apply_terminal_focus_intent(outcome.focus_intent);
     }
 
     fn apply_terminal_scroll_action(&mut self, action: TerminalScrollAction) {

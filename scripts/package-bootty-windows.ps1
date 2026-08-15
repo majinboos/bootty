@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $AppName = "Bootty"
 $BinaryName = "bootty.exe"
-$PackageName = "bootty-app"
+$PackageName = "bootty"
 $DaemonBinaryName = "bootty-daemon.exe"
 $DistDir = if ($env:BOOTTY_DIST_DIR) { $env:BOOTTY_DIST_DIR } else { "dist" }
 $TargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }

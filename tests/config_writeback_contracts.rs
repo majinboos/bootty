@@ -8,7 +8,11 @@ use std::{
 };
 
 use bootty_app::app::AppState;
-use bootty_config::config::{load_config_from_path, update_config_document};
+use bootty_config::config::{
+    MultiplexerBackendConfig, load_config_from_path, update_config_document,
+};
+
+mod support;
 
 #[test]
 fn atomic_writeback_preserves_structure_and_unix_mode() {
@@ -162,8 +166,10 @@ fn a_failed_app_write_keeps_the_error_visible() {
     let directory = tempfile::tempdir().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     fs::write(&path, "[chrome]\nsidebar-width = 320\n").expect("write initial config");
-    let config = load_config_from_path(&path).expect("load initial config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut config = load_config_from_path(&path).expect("load initial config");
+    config.multiplexer.backend = MultiplexerBackendConfig::Rmux;
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
     fs::remove_file(&path).expect("remove config file");
     fs::create_dir(&path).expect("replace config with directory");
 

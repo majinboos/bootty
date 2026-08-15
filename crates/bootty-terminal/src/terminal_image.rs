@@ -135,7 +135,9 @@ pub fn collect_kitty_image_frame(
             let width = image.width()?;
             let height = image.height()?;
             let format = image.format()?;
-            let image_bytes = image.data()?;
+            let Some(image_bytes) = image.data()? else {
+                continue;
+            };
             let fingerprint = KittyImageFingerprint {
                 number: image.number()?,
                 width,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_NAME="bootty-app"
+PACKAGE_NAME="bootty"
 BINARY_NAME="bootty"
 CARGO_PROFILE_ARGS=(--release)
 CARGO_FEATURE_ARGS=(--features bootty-dev)

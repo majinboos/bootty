@@ -1,9 +1,27 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub enum MuxSnapshotDisposition {
+    #[default]
+    Authoritative,
+    Transient,
+}
+
+impl MuxSnapshotDisposition {
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::Authoritative)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct MuxSnapshot {
     pub sessions: Vec<MuxSession>,
     pub active_session_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "MuxSnapshotDisposition::is_authoritative"
+    )]
+    pub disposition: MuxSnapshotDisposition,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]

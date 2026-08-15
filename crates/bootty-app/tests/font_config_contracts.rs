@@ -6,13 +6,16 @@ use bootty_app::{
 };
 use bootty_font::FontFeature;
 
+mod support;
+
 #[test]
 fn font_reload_publishes_the_complete_realized_text_config() {
     let directory = tempfile::tempdir().expect("temporary config directory");
     let config_path = directory.path().join("config.toml");
     std::fs::write(&config_path, "").expect("write initial config");
     let config = load_config_from_path(&config_path).expect("load initial config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
 
     std::fs::write(
         &config_path,
@@ -70,7 +73,8 @@ fn invalid_font_reload_keeps_the_last_good_font_config() {
     let config_path = directory.path().join("config.toml");
     std::fs::write(&config_path, "[font]\nfeatures = [\"-liga\"]\n").expect("write valid config");
     let config = load_config_from_path(&config_path).expect("load valid config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
     let last_good_font = state.config().font.clone();
 
     std::fs::write(&config_path, "[font]\nfeatures = [\"toolong\"]\n")

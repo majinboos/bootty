@@ -5,7 +5,7 @@ Bootty is a native GPU-rendered terminal and a set of reusable terminal crates.
 ## Run
 
 ```sh
-cargo run -p bootty-app --bin bootty
+cargo run -p bootty --bin bootty
 cargo run -p bootty-app --example bare
 cargo run -p bootty-app --example egui-tabs
 ```
@@ -17,8 +17,9 @@ same renderer path as the main app.
 
 ## Workspace
 
-- `bootty-app` - desktop app, default `bootty` binary, examples, app behavior,
-  and integration tests.
+- `bootty` - executable startup, CLI dispatch, and native packaging.
+- `bootty-app` - desktop application library, examples, app behavior, and
+  integration tests.
 - `bootty-ui` - shared egui UI helpers.
 - `bootty-surface` - terminal geometry and surface math.
 - `bootty-terminal` - Ghostty-backed terminal state and render frames.
@@ -27,11 +28,10 @@ same renderer path as the main app.
 - `bootty-font` - OpenType feature values, parsing, and canonical formatting.
 - `bootty-render` - paint plans, text shaping, sprites, and WGPU rendering.
 - `bootty-winit` - native winit/WGPU host adapters.
-- `bootty` - convenience re-export crate for embedders.
 
 ## Native app bundles
 
-Native Bootty app bundles are built from `bootty-app --bin bootty`.
+Native Bootty app bundles are built from `bootty --bin bootty`.
 
 ```sh
 mise run package          # local dynamic package using dynamic-release

@@ -1,10 +1,4 @@
-use std::{
-    fs,
-    panic::{AssertUnwindSafe, catch_unwind},
-    sync::Arc,
-    thread,
-    time::Duration,
-};
+use std::{fs, sync::Arc, thread, time::Duration};
 
 use bootty_runtime::{
     BenchmarkTrace, PtyBacklog, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
@@ -44,19 +38,10 @@ fn scheduler_prioritizes_input_and_backlog_over_idle_chrome() {
 }
 
 #[test]
+#[should_panic(expected = "git status spawned a subprocess on the frame path")]
 fn frame_path_guard_names_a_forbidden_subprocess() {
-    let failure = catch_unwind(AssertUnwindSafe(|| {
-        let _guard = guard_frame_path();
-        record_subprocess("git status");
-    }))
-    .expect_err("guard must reject the subprocess");
-    let message = failure
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| failure.downcast_ref::<&str>().copied())
-        .expect("panic message");
-
-    assert!(message.contains("git status spawned a subprocess on the frame path"));
+    let _guard = guard_frame_path();
+    record_subprocess("git status");
 }
 
 #[test]

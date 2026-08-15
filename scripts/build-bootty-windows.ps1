@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$PackageName = "bootty-app"
+$PackageName = "bootty"
 $CargoProfileArgs = @("--release")
 $Fast = $false
 $Linkage = "dynamic"

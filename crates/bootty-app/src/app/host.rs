@@ -57,6 +57,7 @@ impl BoottyApp {
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
         window_state_key: String,
+        backends: std::sync::Arc<bootty_mux::provider::MuxAppBackendRegistry>,
         direct_input_rx: mpsc::Receiver<DirectKeyInput>,
         modifier_side_rx: mpsc::Receiver<ModifierSideState>,
         control_plane: ControlPlane,
@@ -89,6 +90,7 @@ impl BoottyApp {
         let state = AppState::new_for_window(
             config.clone(),
             window_state_key,
+            backends,
             repaint,
             direct_input_rx,
             modifier_side_rx,
@@ -450,7 +452,7 @@ impl eframe::App for BoottyApp {
                     .raw
                     .dropped_files
                     .iter()
-                    .filter_map(|file| file.path.clone())
+                    .map(|file| file.path().to_path_buf())
                     .collect::<Vec<PathBuf>>(),
                 input.modifiers,
                 input.pointer.hover_pos(),

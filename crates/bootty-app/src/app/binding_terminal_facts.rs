@@ -1,12 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use bootty_config::config::MultiplexerBackendConfig;
-
 use crate::{
     layout::PaneLayout,
     mux::{
         RepaintHandle,
-        config::selected_backend,
+        provider::{PaneTopology, TerminalProgressPolicy},
         snapshot::{MuxSession, MuxWindow, MuxWindowProgress},
     },
 };
@@ -184,7 +182,7 @@ impl BindingRuntime {
         // OSC 9;4 only for the pane it currently shows. Recording that copy would credit it to the
         // attach pane and leave a stale bar on the wrong window.
         if state == "unknown"
-            || selected_backend(&self.multiplexer) == MultiplexerBackendConfig::Tmux
+            || self.backend_policy.progress == TerminalProgressPolicy::BackendSnapshot
         {
             return;
         }
@@ -323,11 +321,8 @@ impl BindingRuntime {
     }
 
     pub(super) fn current_pane_layout(&self) -> Option<&PaneLayout> {
-        matches!(
-            selected_backend(&self.multiplexer),
-            MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux
-        )
-        .then(|| self.pane_layouts.get(&self.current_window_id()))
-        .flatten()
+        (self.backend_policy.panes.topology != PaneTopology::Attach)
+            .then(|| self.pane_layouts.get(&self.current_window_id()))
+            .flatten()
     }
 }

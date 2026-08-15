@@ -143,7 +143,7 @@ fn defaults_put_current_status_modules_in_visible_top_bar() {
 
     assert!(config.chrome.top_bar);
     assert!(!config.chrome.bottom_bar);
-    assert!(config.chrome.bottom_segments.is_empty());
+    assert_eq!(config.chrome.bottom_segments, Vec::new());
     assert!(session < windows, "session should appear before windows");
 }
 
@@ -703,7 +703,7 @@ fn user_theme_shadows_builtin_theme_name() {
         config.colors.foreground,
         Some(Color::from_hex("#030405").unwrap())
     );
-    assert!(config.colors.palette.is_empty());
+    assert_eq!(config.colors.palette, Vec::new());
 }
 
 #[test]
@@ -1178,7 +1178,7 @@ fn rmux_backend_defaults_mirror_native_layout_bindings() {
     assert!(keybinds.iter().any(|entry| entry == "ctrl+space>c=new_tab"));
 
     let default_input = &BoottyConfig::default().input;
-    assert!(!default_input.backend_keybinds.rmux.is_empty());
+    assert_ne!(default_input.backend_keybinds.rmux, Vec::<String>::new());
     assert_eq!(
         default_input.backend_keybinds.rmux,
         default_input.backend_keybinds.native
@@ -1368,7 +1368,7 @@ fn ghostty_preset_ignores_prefix_and_ships_direct_combos() {
         .input
         .keybinds_for_backend(MultiplexerBackendConfig::Native);
     assert!(keybinds.iter().all(|entry| !entry.contains('>')));
-    assert!(config.input.backend_keybinds.tmux.is_empty());
+    assert_eq!(config.input.backend_keybinds.tmux, Vec::<String>::new());
 }
 
 // An empty prefix (recorder cleared) must fall back to the preset default instead of producing

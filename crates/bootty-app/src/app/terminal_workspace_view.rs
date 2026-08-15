@@ -14,7 +14,6 @@ use super::{
     state::AppState,
 };
 use crate::{
-    config::MultiplexerBackendConfig,
     geometry::ViewTransform,
     layout::SplitDirection,
     renderer::{RendererMetrics, TerminalWidget},
@@ -113,7 +112,7 @@ impl TerminalWorkspaceView {
         background: egui::Color32,
         divider_color_override: Option<egui::Color32>,
     ) {
-        let native_layout = backend_uses_native_layout_renderer(state.multiplexer_backend());
+        let native_layout = state.uses_native_terminal_layout();
         let has_terminal = !native_layout
             || state
                 .mux()
@@ -377,13 +376,6 @@ fn new_widget(
     let mut widget = TerminalWidget::new(target_format).with_text_config(text_config);
     widget.set_terminal_cursor_icon(cursor_icon);
     widget
-}
-
-fn backend_uses_native_layout_renderer(backend: MultiplexerBackendConfig) -> bool {
-    matches!(
-        backend,
-        MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux
-    )
 }
 
 fn pane_corner_radius_px(rect: Rect, px: f32) -> f32 {

@@ -179,7 +179,7 @@ scripts/run-external-benchmark-adapters.py \
 
 scripts/run-live-remote-bench.sh artifacts/live-remote/results.jsonl
 scripts/run-hostile-soak.sh artifacts/hostile-soak/local
-scripts/run-power-thermal-sample.sh artifacts/power/local -- cargo run -p bootty-app --bin bootty
+scripts/run-power-thermal-sample.sh artifacts/power/local -- cargo run -p bootty --bin bootty
 scripts/record-replay-fixture.sh <fixture-name> artifacts/replays -- <command> [args...]
 ```
 
@@ -232,10 +232,10 @@ not apples-to-apples competitive evidence because competitors cannot expose the
 same internal milestones.
 
 ```bash
-BOOTTY_BENCH_TRACE=/tmp/bootty-trace.jsonl cargo run -p bootty-app --bin bootty
+BOOTTY_BENCH_TRACE=/tmp/bootty-trace.jsonl cargo run -p bootty --bin bootty
 BOOTTY_BENCH_TRACE=/tmp/bootty-trace.jsonl \
 BOOTTY_BENCH_TRACE_SAMPLE_EVERY=10 \
-cargo run -p bootty-app --bin bootty
+cargo run -p bootty --bin bootty
 ```
 
 Trace records include `schema_version`, `ts_ns`, and `event`. Current events

@@ -59,7 +59,7 @@ pub(super) fn rgba_image_pixels(image: &KittyImagePlacement) -> Option<Cow<'_, [
                 return None;
             }
             let mut rgba = Vec::with_capacity(pixels * 4);
-            for rgb in image.data[..expected].chunks_exact(3) {
+            for rgb in image.data[..expected].as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
             }
             Some(Cow::Owned(rgba))
@@ -70,7 +70,7 @@ pub(super) fn rgba_image_pixels(image: &KittyImagePlacement) -> Option<Cow<'_, [
                 return None;
             }
             let mut rgba = Vec::with_capacity(pixels * 4);
-            for gray_alpha in image.data[..expected].chunks_exact(2) {
+            for gray_alpha in image.data[..expected].as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[
                     gray_alpha[0],
                     gray_alpha[0],
@@ -97,12 +97,17 @@ pub(super) fn rgba_image_pixels(image: &KittyImagePlacement) -> Option<Cow<'_, [
 
 pub(super) fn rgba_image_texture_pixels(image: &KittyImagePlacement) -> Option<Cow<'_, [u8]>> {
     let pixels = rgba_image_pixels(image)?;
-    if pixels.chunks_exact(4).all(|pixel| pixel[3] == 255) {
+    if pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|pixel| pixel[3] == 255)
+    {
         return Some(pixels);
     }
 
     let mut premultiplied = Vec::with_capacity(pixels.len());
-    for pixel in pixels.chunks_exact(4) {
+    for pixel in pixels.as_chunks::<4>().0 {
         premultiplied.extend_from_slice(&[
             premultiply_unorm_channel(pixel[0], pixel[3]),
             premultiply_unorm_channel(pixel[1], pixel[3]),
@@ -133,14 +138,14 @@ fn decode_png_rgba(image: &KittyImagePlacement) -> Option<Cow<'_, [u8]>> {
         (png::ColorType::Rgba, png::BitDepth::Eight) => Some(Cow::Owned(data.to_vec())),
         (png::ColorType::Rgb, png::BitDepth::Eight) => {
             let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
-            for rgb in data.chunks_exact(3) {
+            for rgb in data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
             }
             Some(Cow::Owned(rgba))
         }
         (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
             let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
-            for gray_alpha in data.chunks_exact(2) {
+            for gray_alpha in data.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[
                     gray_alpha[0],
                     gray_alpha[0],

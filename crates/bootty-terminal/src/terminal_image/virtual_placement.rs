@@ -421,13 +421,16 @@ fn append_run(
     let Some(rendered) = placement.render(grid, image.width()?, image.height()?, surface) else {
         return Ok(None);
     };
+    let Some(image_bytes) = image.data()? else {
+        return Ok(None);
+    };
     let data = image_cache.data_for_image(
         image_id,
         image.number()?,
         image.width()?,
         image.height()?,
         image.format()?,
-        image.data()?,
+        image_bytes,
     );
 
     frame.placements.push(KittyImagePlacement {

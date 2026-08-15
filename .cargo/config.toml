@@ -13,3 +13,25 @@ LIBGHOSTTY_VT_SYS_OPTIMIZE = "ReleaseSafe"
 # milliseconds. Nothing here reads its own bundle resources, and the path has to
 # name a file that exists, so borrow a system binary that lives in a small directory.
 CFProcessPath = "/bin/sh"
+
+[unstable]
+codegen-backend = true
+
+# Inventory submit uses Mach-O constructors unsupported by current macOS
+# Cranelift. Only the four submitting crates use LLVM in development builds.
+[profile.dev.package.bootty-native]
+codegen-backend = "llvm"
+
+[profile.dev.package.bootty-rmux]
+codegen-backend = "llvm"
+
+[profile.dev.package.bootty-tmux]
+codegen-backend = "llvm"
+
+[profile.dev.package.bootty-zellij]
+codegen-backend = "llvm"
+
+[profile.test]
+# Current macOS Cranelift also aborts on SIMD emitted by the egui test path.
+# The repository correctness gate must use one reliable backend for all tests.
+codegen-backend = "llvm"

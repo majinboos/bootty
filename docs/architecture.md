@@ -85,10 +85,18 @@ Backend membership cannot share the SQLite transaction.
 Bootty writes a binding-scoped journal before create, rename, or ditch.
 The next authoritative backend snapshot resolves partial completion.
 
-`bootty-mux-model` owns dependency-neutral backend, SSH target, binding, and
-remote Space wire values.
-`bootty-mux` owns backend commands, protocol adapters, SSH processes, remote
-installation, and pane runtime behavior.
+`bootty-mux-model` owns neutral mux values.
+`bootty-mux` owns the core provider contract and registry.
+Its application facet owns a separately validated pane-policy and capability
+registry.
+It also owns generic commands, snapshots, controller, process, project, and
+pane orchestration.
+`bootty-native`, `bootty-rmux`, `bootty-tmux`, and `bootty-zellij` own concrete
+control and pane policies.
+`bootty-remote` owns SSH commands, remote daemon installation, remote command
+framing, and remote Space transport.
+The `bootty` executable links all four providers.
+The daemon links rmux, tmux, and Zellij.
 
 ## Terminal path
 
@@ -166,14 +174,18 @@ contents, or transcripts.
 
 ## Crates
 
-- `bootty-app` owns product composition, the desktop host, workspace UI,
-  commands, control, extensions, and agent integration assets.
+- `bootty` owns executable startup, CLI dispatch, and native packaging.
+- `bootty-app` owns the desktop host, workspace UI, commands, control,
+  extensions, and agent integration assets.
 - `bootty-config` owns product configuration.
 - `bootty-daemon` owns the installed headless catalog and remote commands.
 - `bootty-font` owns the shared OpenType feature value and grammar.
 - `bootty-identity` owns the closed application identity.
 - `bootty-mux-model` owns dependency-neutral mux values.
-- `bootty-mux` owns backend and SSH execution.
+- `bootty-mux` owns the core provider contract, the validated core and app
+  registries, and generic mux orchestration.
+- `bootty-native`, `bootty-rmux`, `bootty-tmux`, and `bootty-zellij` own concrete provider policies.
+- `bootty-remote` owns SSH commands, remote installation, command framing, and Space transport.
 - `bootty-render` owns paint planning and WGPU preparation.
 - `bootty-runtime` owns PTY sessions and terminal workers.
 - `bootty-surface` owns host-neutral geometry.
@@ -181,7 +193,6 @@ contents, or transcripts.
 - `bootty-ui` owns shared egui theme values and widgets.
 - `bootty-winit` owns native host and input adapters.
 - `bootty-site` owns the documentation site.
-- `bootty` is the stable library facade.
 
 ## Application modules
 

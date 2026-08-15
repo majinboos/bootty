@@ -16,6 +16,8 @@ use bootty_app::{
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
+mod support;
+
 const FIRST_FRAME_MARKER: &str = "BOOTTY_STARTUP_READY";
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -205,7 +207,8 @@ fn load_to_native_options(path: &Path) -> eframe::NativeOptions {
 
 fn app_state_ready(config: BoottyConfig) -> usize {
     let repaint: bootty_app::mux::RepaintHandle = Arc::new(|| {});
-    let state = AppState::new(config, repaint, None, None).expect("create app state");
+    let state =
+        AppState::new(config, support::backends(), repaint, None, None).expect("create app state");
     black_box(state.config().window.title.len())
 }
 

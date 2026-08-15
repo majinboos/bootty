@@ -49,28 +49,28 @@ pub(crate) fn png_frame_to_rgba8(
         (png::ColorType::Rgba, png::BitDepth::Eight) => Some(data.to_vec()),
         (png::ColorType::Rgba, png::BitDepth::Sixteen) => {
             let mut rgba = Vec::with_capacity(data.len() / 2);
-            for pixel in data.chunks_exact(8) {
+            for pixel in data.as_chunks::<8>().0 {
                 rgba.extend_from_slice(&[pixel[0], pixel[2], pixel[4], pixel[6]]);
             }
             Some(rgba)
         }
         (png::ColorType::Rgb, png::BitDepth::Eight) => {
             let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
-            for rgb in data.chunks_exact(3) {
+            for rgb in data.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
             }
             Some(rgba)
         }
         (png::ColorType::Rgb, png::BitDepth::Sixteen) => {
             let mut rgba = Vec::with_capacity(data.len() / 6 * 4);
-            for rgb in data.chunks_exact(6) {
+            for rgb in data.as_chunks::<6>().0 {
                 rgba.extend_from_slice(&[rgb[0], rgb[2], rgb[4], 255]);
             }
             Some(rgba)
         }
         (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
             let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
-            for gray_alpha in data.chunks_exact(2) {
+            for gray_alpha in data.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[
                     gray_alpha[0],
                     gray_alpha[0],
@@ -82,7 +82,7 @@ pub(crate) fn png_frame_to_rgba8(
         }
         (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen) => {
             let mut rgba = Vec::with_capacity(data.len() / 4 * 4);
-            for gray_alpha in data.chunks_exact(4) {
+            for gray_alpha in data.as_chunks::<4>().0 {
                 rgba.extend_from_slice(&[
                     gray_alpha[0],
                     gray_alpha[0],
@@ -101,7 +101,7 @@ pub(crate) fn png_frame_to_rgba8(
         }
         (png::ColorType::Grayscale, png::BitDepth::Sixteen) => {
             let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
-            for gray in data.chunks_exact(2) {
+            for gray in data.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[gray[0], gray[0], gray[0], 255]);
             }
             Some(rgba)

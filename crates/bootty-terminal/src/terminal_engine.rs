@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    io::Write as _,
     rc::Rc,
     sync::{Arc, Mutex, Once},
     time::{Duration, Instant},
@@ -45,14 +44,14 @@ pub use crate::terminal_side_effect::{TerminalSideEffect, TerminalSideEffectEven
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use libghostty_vt::{
-    Terminal, TerminalOptions,
+    Terminal,
     fmt::Format,
     focus, key,
     kitty::graphics::set_png_decoder,
     mouse, paste,
     render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIteration, RowIterator},
     selection::{FormatOptions as SelectionFormatOptions, Selection, gesture},
-    style::{RgbColor, StyleColor},
+    style::{Palette as GhosttyPalette, RgbColor, StyleColor},
     terminal::{
         ColorScheme, ConformanceLevel, CursorStyle, DeviceAttributeFeature, DeviceAttributes,
         DeviceType, Mode, Point, PointCoordinate, PrimaryDeviceAttributes, ScrollViewport,
@@ -584,7 +583,7 @@ fn configure_default_colors(
             config.palette_harmonious,
         );
     }
-    terminal.set_default_color_palette(Some(palette))?;
+    terminal.set_default_color_palette(Some(GhosttyPalette(palette)))?;
     terminal
         .set_default_bg_color(Some(config.background))?
         .set_default_fg_color(Some(config.foreground))?
@@ -694,11 +693,6 @@ fn default_device_attributes() -> DeviceAttributes {
         },
         tertiary: TertiaryDeviceAttributes { unit_id: 0 },
     }
-}
-
-fn parse_palette_index(bytes: &[u8]) -> Option<u8> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    text.parse().ok()
 }
 
 fn parse_osc_number(bytes: &[u8]) -> Option<u16> {
@@ -888,12 +882,9 @@ impl TerminalEngine {
         macos_option_as_alt: MacosOptionAsAlt,
     ) -> Result<Self> {
         install_libghostty_logger();
-        let mut terminal = Terminal::new(TerminalOptions {
-            cols: geometry.cols,
-            rows: geometry.rows,
-            max_scrollback,
-        })?;
-        let base_color_palette = terminal.default_color_palette()?;
+        let mut terminal = Terminal::new(geometry.cols, geometry.rows)?;
+        terminal.set_scrollback_max_bytes(Some(max_scrollback))?;
+        let base_color_palette = terminal.default_color_palette()?.0;
         configure_default_colors(&mut terminal, &base_color_palette, &colors)?;
         configure_default_cursor(&mut terminal, cursor)?;
         configure_terminal_features(&mut terminal, features)?;
@@ -957,7 +948,10 @@ impl TerminalEngine {
             geometry.cell_height,
         )?;
         terminal.set_kitty_image_from_file_allowed(true)?;
-        terminal.set_kitty_image_from_temp_file_allowed(true)?;
+        let temp_dir = std::env::temp_dir();
+        #[cfg(unix)]
+        let temp_dir = temp_dir.canonicalize().unwrap_or(temp_dir);
+        terminal.set_kitty_image_temp_file_dir(Some(&temp_dir))?;
         terminal.set_kitty_image_from_shared_mem_allowed(true)?;
         set_png_decoder(Some(Box::new(BoottyPngDecoder)))?;
 
@@ -1151,7 +1145,7 @@ impl TerminalEngine {
         }
     }
 
-    fn write_vt_with_ordered_osc_color_responses(&mut self, data: &[u8]) {
+    fn write_vt_with_ordered_osc_color_state(&mut self, data: &[u8]) {
         let mut search_start = 0;
         while let Some(relative_start) = find_subslice(&data[search_start..], b"\x1b]") {
             let start = search_start + relative_start;
@@ -1168,7 +1162,7 @@ impl TerminalEngine {
 
             self.terminal.vt_write(&data[search_start..terminator_end]);
             self.apply_osc_color_state(&data[payload_start..payload_end]);
-            if let Some(response) = self.osc_color_query_response(
+            if let Some(response) = self.extended_color_query_response(
                 &data[payload_start..payload_end],
                 &data[payload_end..terminator_end],
             ) {
@@ -1212,17 +1206,8 @@ impl TerminalEngine {
         }
     }
 
-    fn xterm_dynamic_color(&self, code: u8) -> Option<RgbColor> {
+    fn extended_dynamic_color(&self, code: u8) -> Option<RgbColor> {
         match code {
-            10 => self.terminal.fg_color().ok().flatten(),
-            11 => self.terminal.bg_color().ok().flatten(),
-            12 => self
-                .terminal
-                .cursor_color()
-                .ok()
-                .flatten()
-                .or(self.colors.cursor)
-                .or(Some(self.colors.foreground)),
             13 => self
                 .xterm_color_overrides
                 .pointer_foreground
@@ -1265,41 +1250,20 @@ impl TerminalEngine {
         }
     }
 
-    fn osc_color_query_response(&self, payload: &[u8], terminator: &[u8]) -> Option<Vec<u8>> {
+    fn extended_color_query_response(&self, payload: &[u8], terminator: &[u8]) -> Option<Vec<u8>> {
         let (command, rest) = split_osc_payload(payload)?;
+        let start_code = parse_osc_number(command)? as u8;
+        if !(13..=19).contains(&start_code) {
+            return None;
+        }
         let mut response = Vec::new();
-        match command {
-            b"4" => {
-                let palette = self.terminal.color_palette().ok()?;
-                let mut parts = rest.split(|byte| *byte == b';');
-                while let Some(index_bytes) = parts.next() {
-                    let operation = parts.next()?;
-                    if operation != b"?" {
-                        return None;
-                    }
-                    let index = parse_palette_index(index_bytes)?;
-                    write!(
-                        response,
-                        "\x1b]4;{};{}",
-                        index,
-                        rgb_spec(palette[usize::from(index)])
-                    )
-                    .ok()?;
-                    response.extend_from_slice(terminator);
-                }
+        for (code, operation) in (start_code..=19).zip(rest.split(|byte| *byte == b';')) {
+            if operation != b"?" {
+                return None;
             }
-            b"10" | b"11" | b"12" | b"13" | b"14" | b"15" | b"16" | b"17" | b"18" | b"19" => {
-                let start_code = parse_osc_number(command)? as u8;
-                for (code, operation) in (start_code..=19).zip(rest.split(|byte| *byte == b';')) {
-                    if operation != b"?" {
-                        return None;
-                    }
-                    let color = self.xterm_dynamic_color(code)?;
-                    write!(response, "\x1b]{};{}", code, rgb_spec(color)).ok()?;
-                    response.extend_from_slice(terminator);
-                }
-            }
-            _ => return None,
+            let color = self.extended_dynamic_color(code)?;
+            response.extend_from_slice(format!("\x1b]{code};{}", rgb_spec(color)).as_bytes());
+            response.extend_from_slice(terminator);
         }
         (!response.is_empty()).then_some(response)
     }
@@ -1511,7 +1475,7 @@ impl TerminalEngine {
         }
         self.sgr_optimizer.reset();
         if features.osc_color {
-            self.write_vt_with_ordered_osc_color_responses(sanitized.bytes.as_ref());
+            self.write_vt_with_ordered_osc_color_state(sanitized.bytes.as_ref());
         } else {
             self.terminal.vt_write(sanitized.bytes.as_ref());
         }
