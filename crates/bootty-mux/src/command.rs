@@ -66,13 +66,17 @@ pub enum MuxCommand {
     },
     SelectPane {
         session_id: String,
+        /// The window whose pane selection should move. `None` uses the session's active window.
+        window_id: Option<String>,
         direction: MuxDirection,
     },
     SelectNextPane {
         session_id: String,
+        window_id: Option<String>,
     },
     SelectPreviousPane {
         session_id: String,
+        window_id: Option<String>,
     },
     KillPane {
         session_id: String,
@@ -88,6 +92,8 @@ pub enum MuxCommand {
     },
     TogglePaneZoom {
         session_id: String,
+        /// The pane to zoom. `None` targets the window's active pane.
+        pane_id: Option<String>,
     },
     CreateProjectSession {
         session_id: String,

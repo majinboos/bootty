@@ -220,8 +220,8 @@ impl<R: CommandRunner> TmuxBackend<R> {
             }
             MuxCommand::SplitPane {
                 session_id,
+                pane_id,
                 direction,
-                ..
             } => {
                 let flag = match direction {
                     MuxSplitDirection::Right => "-h",
@@ -231,11 +231,12 @@ impl<R: CommandRunner> TmuxBackend<R> {
                     "split-window".into(),
                     flag.into(),
                     "-t".into(),
-                    session_id,
+                    pane_id.unwrap_or(session_id),
                 ])?;
             }
             MuxCommand::SelectPane {
                 session_id,
+                window_id,
                 direction,
             } => {
                 let flag = match direction {
@@ -247,23 +248,29 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 self.run_owned(vec![
                     "select-pane".into(),
                     "-t".into(),
-                    session_id,
+                    window_id.unwrap_or(session_id),
                     flag.into(),
                 ])?;
             }
-            MuxCommand::SelectNextPane { session_id } => {
-                self.run_owned(vec![
-                    "select-pane".into(),
-                    "-t".into(),
-                    format!("{session_id}:.+"),
-                ])?;
+            MuxCommand::SelectNextPane {
+                session_id,
+                window_id,
+            } => {
+                let target = window_id.map_or_else(
+                    || format!("{session_id}:.+"),
+                    |window_id| format!("{window_id}.+"),
+                );
+                self.run_owned(vec!["select-pane".into(), "-t".into(), target])?;
             }
-            MuxCommand::SelectPreviousPane { session_id } => {
-                self.run_owned(vec![
-                    "select-pane".into(),
-                    "-t".into(),
-                    format!("{session_id}:.-"),
-                ])?;
+            MuxCommand::SelectPreviousPane {
+                session_id,
+                window_id,
+            } => {
+                let target = window_id.map_or_else(
+                    || format!("{session_id}:.-"),
+                    |window_id| format!("{window_id}.-"),
+                );
+                self.run_owned(vec!["select-pane".into(), "-t".into(), target])?;
             }
             MuxCommand::KillPane {
                 session_id,
@@ -279,12 +286,15 @@ impl<R: CommandRunner> TmuxBackend<R> {
                     pane_id.unwrap_or(session_id),
                 ])?;
             }
-            MuxCommand::TogglePaneZoom { session_id } => {
+            MuxCommand::TogglePaneZoom {
+                session_id,
+                pane_id,
+            } => {
                 self.run_owned(vec![
                     "resize-pane".into(),
                     "-Z".into(),
                     "-t".into(),
-                    session_id,
+                    pane_id.unwrap_or(session_id),
                 ])?;
             }
         }
@@ -707,10 +717,25 @@ mod tests {
             },
             MuxCommand::SelectPane {
                 session_id: "$1".to_owned(),
+                window_id: Some("@1".to_owned()),
                 direction: MuxDirection::Left,
+            },
+            MuxCommand::SelectNextPane {
+                session_id: "$1".to_owned(),
+                window_id: Some("@1".to_owned()),
+            },
+            MuxCommand::SelectPreviousPane {
+                session_id: "$1".to_owned(),
+                window_id: Some("@1".to_owned()),
+            },
+            MuxCommand::SplitPane {
+                session_id: "$1".to_owned(),
+                pane_id: Some("%2".to_owned()),
+                direction: MuxSplitDirection::Right,
             },
             MuxCommand::TogglePaneZoom {
                 session_id: "$1".to_owned(),
+                pane_id: Some("%2".to_owned()),
             },
         ] {
             backend.execute(command).unwrap();
@@ -722,8 +747,11 @@ mod tests {
                 RecordedCall::foreground(["tmux", "new-window", "-t", "$1", "-c", "/repo"]),
                 RecordedCall::foreground(["tmux", "select-window", "-t", "$1:3"]),
                 RecordedCall::foreground(["tmux", "next-window", "-t", "$1"]),
-                RecordedCall::foreground(["tmux", "select-pane", "-t", "$1", "-L"]),
-                RecordedCall::foreground(["tmux", "resize-pane", "-Z", "-t", "$1"]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "@1", "-L"]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "@1.+"]),
+                RecordedCall::foreground(["tmux", "select-pane", "-t", "@1.-"]),
+                RecordedCall::foreground(["tmux", "split-window", "-h", "-t", "%2"]),
+                RecordedCall::foreground(["tmux", "resize-pane", "-Z", "-t", "%2"]),
             ]
             .as_slice()
         );

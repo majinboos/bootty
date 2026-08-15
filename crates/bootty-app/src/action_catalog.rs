@@ -278,6 +278,31 @@ pub enum Command {
     )]
     SetFontSize,
     #[strum(
+        message = "Search Terminal",
+        detailed_message = "Search the terminal scrollback for text"
+    )]
+    Search,
+    #[strum(
+        message = "Search Selection",
+        detailed_message = "Search the terminal scrollback for the selected text"
+    )]
+    SearchSelection,
+    #[strum(
+        message = "Next Search Match",
+        detailed_message = "Move to the next terminal search match"
+    )]
+    NavigateSearchNext,
+    #[strum(
+        message = "Previous Search Match",
+        detailed_message = "Move to the previous terminal search match"
+    )]
+    NavigateSearchPrevious,
+    #[strum(
+        message = "Close Terminal Search",
+        detailed_message = "Close the terminal search surface"
+    )]
+    EndSearch,
+    #[strum(
         message = "Copy",
         detailed_message = "Copy the selection to the clipboard"
     )]
@@ -379,6 +404,11 @@ impl Command {
             Self::ScrollPageDown => "scroll_page_down",
             Self::ScrollPageLines => "scroll_page_lines",
             Self::SetFontSize => "set_font_size",
+            Self::Search => "search",
+            Self::SearchSelection => "search_selection",
+            Self::NavigateSearchNext => "navigate_search:next",
+            Self::NavigateSearchPrevious => "navigate_search:previous",
+            Self::EndSearch => "end_search",
             Self::Copy => "copy_to_clipboard",
             Self::Paste => "paste_from_clipboard",
             Self::SendCsi => "csi",
@@ -424,7 +454,12 @@ impl Command {
             Self::IncreaseFontSize => "zoom-in",
             Self::DecreaseFontSize => "zoom-out",
             Self::ResetFontSize | Self::SetFontSize => "type",
-            Self::Find => "search",
+            Self::Find
+            | Self::Search
+            | Self::SearchSelection
+            | Self::NavigateSearchNext
+            | Self::NavigateSearchPrevious
+            | Self::EndSearch => "search",
             Self::KeyboardShortcuts => "keyboard",
             Self::UseSystemAppearance | Self::UseLightAppearance | Self::UseDarkAppearance => {
                 "sun-moon"
@@ -471,6 +506,11 @@ impl Command {
             | Self::ScrollPageDown
             | Self::ScrollPageLines
             | Self::SetFontSize
+            | Self::Search
+            | Self::SearchSelection
+            | Self::NavigateSearchNext
+            | Self::NavigateSearchPrevious
+            | Self::EndSearch
             | Self::Copy
             | Self::Paste
             | Self::SendCsi

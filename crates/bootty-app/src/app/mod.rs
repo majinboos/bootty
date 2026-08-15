@@ -325,6 +325,7 @@ pub struct BoottyApp {
     error_details_open: bool,
     // Held for the process lifetime so the native menu stays installed.
     _menu: Option<AppMenu>,
+    _control_server: Option<crate::control::ControlServer>,
     status_extensions: crate::extensions::ExtensionHost,
     sidebar_extensions: crate::extensions::ExtensionHost,
     extension_theme: Vec<(String, String)>,
@@ -360,6 +361,28 @@ impl BoottyApp {
             Some(direct_input_rx),
             Some(modifier_side_rx),
         )
+    }
+
+    pub fn new_with_control(
+        cc: &eframe::CreationContext<'_>,
+        config: BoottyConfig,
+        window_state_key: String,
+        direct_input_rx: mpsc::Receiver<DirectKeyInput>,
+        modifier_side_rx: mpsc::Receiver<ModifierSideState>,
+    ) -> Result<Self> {
+        let mut app = Self::new_inner(
+            cc,
+            config,
+            window_state_key.clone(),
+            Some(direct_input_rx),
+            Some(modifier_side_rx),
+        )?;
+        app._control_server = Some(crate::control::ControlServer::spawn(
+            window_state_key,
+            app.state
+                .app_command_sender(crate::commands::Caller::Socket),
+        )?);
+        Ok(app)
     }
 
     fn new_inner(
@@ -404,14 +427,15 @@ impl BoottyApp {
             extension_theme.clone(),
         );
 
+        let state = AppState::new_for_window(
+            config.clone(),
+            window_state_key,
+            repaint,
+            direct_input_rx,
+            modifier_side_rx,
+        )?;
         Ok(Self {
-            state: AppState::new_for_window(
-                config.clone(),
-                window_state_key,
-                repaint,
-                direct_input_rx,
-                modifier_side_rx,
-            )?,
+            state,
             terminal_widget,
             pane_widgets: HashMap::new(),
             focused_widget_key: None,
@@ -422,6 +446,7 @@ impl BoottyApp {
             settings: SettingsSurface::new(config.clone()),
             error_details_open: false,
             _menu: crate::menu::install(),
+            _control_server: None,
             status_extensions,
             sidebar_extensions,
             extension_theme,
@@ -496,6 +521,13 @@ impl BoottyApp {
             match effect {
                 AppEffect::CloseWindow => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                AppEffect::QuitApplication => {
+                    let viewport_ids =
+                        ctx.input(|input| input.raw.viewports.keys().copied().collect::<Vec<_>>());
+                    for viewport_id in viewport_ids {
+                        ctx.send_viewport_cmd_to(viewport_id, egui::ViewportCommand::Close);
+                    }
                 }
                 AppEffect::SetWindowTitle(title) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
