@@ -1,4 +1,4 @@
-use std::sync::mpsc;
+use std::{cell::RefCell, rc::Rc, sync::mpsc};
 
 use anyhow::{Context, Result};
 use eframe::UserEvent;
@@ -12,7 +12,9 @@ use winit::{
 
 use crate::{
     app::BoottyApp,
+    application_identity::ApplicationIdentity,
     config::BoottyConfig,
+    control::{ControlPlane, ControlServer},
     direct_input::{DirectKeyInput, ModifierSideState, direct_key_input_from_winit_event},
     platform::disable_automatic_window_tabbing,
 };
@@ -32,18 +34,36 @@ pub fn run(
     event_loop.set_control_flow(ControlFlow::Wait);
     let (direct_input_tx, direct_input_rx) = mpsc::channel();
     let (modifier_side_tx, modifier_side_rx) = mpsc::channel();
+    let control_server = Rc::new(RefCell::new(None));
+    let app_control_server = Rc::clone(&control_server);
     let app_creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
-        Ok(Box::new(BoottyApp::new_with_control(
+        let control_plane = ControlPlane::default();
+        let app = BoottyApp::new_for_native_host(
             cc,
             config,
-            window_state_key,
+            window_state_key.clone(),
             direct_input_rx,
             modifier_side_rx,
-        )?) as Box<dyn eframe::App>)
+            control_plane.clone(),
+        )?;
+        let (commands, catalog) = app.control_binding();
+        app_control_server.replace(Some(ControlServer::spawn(
+            window_state_key,
+            commands,
+            catalog,
+            control_plane,
+        )?));
+        Ok(Box::new(app) as Box<dyn eframe::App>)
     });
-    let inner = eframe::create_native("Bootty", options, app_creator, &event_loop);
+    let inner = eframe::create_native(
+        ApplicationIdentity::current().display_name(),
+        options,
+        app_creator,
+        &event_loop,
+    );
     let mut app = BoottyNativeHost {
         inner,
+        _control_server: control_server,
         direct_input_tx,
         modifier_side_tx,
         input_state: NativeInputState::default(),
@@ -55,6 +75,7 @@ pub fn run(
 
 struct BoottyNativeHost<'app> {
     inner: eframe::EframeWinitApplication<'app>,
+    _control_server: Rc<RefCell<Option<ControlServer>>>,
     direct_input_tx: mpsc::Sender<DirectKeyInput>,
     modifier_side_tx: mpsc::Sender<ModifierSideState>,
     input_state: NativeInputState,

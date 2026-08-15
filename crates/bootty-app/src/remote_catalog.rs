@@ -8,7 +8,7 @@ use crate::{
     session_order::SessionOrderStore,
     workspace::{
         DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SpaceMuxOverride, SpaceRemoteOverride,
-        WorkspaceBinding, WorkspaceStore,
+        WorkspaceBinding, WorkspaceRepository,
     },
 };
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
@@ -30,7 +30,7 @@ pub struct RemoteSpaceSummary {
 }
 
 pub fn list(config: &BoottyConfig) -> Result<Vec<RemoteSpaceSummary>> {
-    let workspace = WorkspaceStore::try_for_config_path(&config.config_path)?;
+    let workspace = WorkspaceRepository::open(&config.config_path)?;
     Ok(workspace
         .spaces()
         .iter()
@@ -60,7 +60,7 @@ pub fn create(
     if !backend.supports_remote() {
         bail!("remote Spaces need tmux, zellij, or rmux")
     }
-    let mut workspace = WorkspaceStore::try_for_config_path(&config.config_path)?;
+    let mut workspace = WorkspaceRepository::open(&config.config_path)?;
     let space = workspace
         .create_space(
             name,
@@ -184,7 +184,7 @@ fn remote_space_runtime(
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<(Box<dyn bootty_mux::backend::MuxBackend>, SessionOrderStore)> {
-    let workspace = WorkspaceStore::try_for_config_path(&config.config_path)?;
+    let workspace = WorkspaceRepository::open(&config.config_path)?;
     let space = workspace
         .spaces()
         .iter()

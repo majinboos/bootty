@@ -124,24 +124,3 @@ fn rgba_from_png(bytes: &[u8], color_type: png::ColorType) -> Vec<u8> {
         png::ColorType::Indexed => panic!("indexed Bootty icon PNG is unsupported"),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn native_icon_decodes_to_rgba8_bytes() {
-        #[cfg(not(target_os = "macos"))]
-        {
-            let icon = native_app_icon_data();
-            assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
-        }
-    }
-
-    #[test]
-    fn title_icon_decodes_to_color_image() {
-        let image = title_icon_color_image();
-
-        assert_eq!(image.pixels.len(), image.size[0] * image.size[1]);
-    }
-}

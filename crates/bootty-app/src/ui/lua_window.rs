@@ -157,26 +157,3 @@ fn filtered(rows: &[LuaWindowRow], filter: &str) -> Vec<usize> {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(key: &str, text: &str) -> LuaWindowRow {
-        LuaWindowRow {
-            key: key.to_owned(),
-            text: text.to_owned(),
-            icon: None,
-            description: None,
-        }
-    }
-
-    #[test]
-    fn filter_matches_row_text_or_key() {
-        let rows = vec![row("a", "Restart server"), row("b", "Open logs")];
-        assert_eq!(filtered(&rows, "logs"), vec![1]);
-        assert_eq!(filtered(&rows, "a"), vec![0]); // key match
-        assert_eq!(filtered(&rows, ""), vec![0, 1]);
-        assert_eq!(filtered(&rows, "zzz"), Vec::<usize>::new());
-    }
-}

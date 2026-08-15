@@ -109,6 +109,10 @@ run = "./scripts/build-bootty-daemons.sh"
 description = "Package the app bundle with all daemon targets; pass --static for distribution or --fast for fast-release"
 run = "./scripts/package-bootty-unix.sh"
 
+[tasks."package:dev"]
+description = "Package the isolated BoottyDev application"
+run = "./scripts/package-bootty-unix.sh --dev"
+
 [tasks."package:windows"]
 description = "Package the Windows zip from BOOTTY_DAEMON_OUTPUT_DIR; pass --static or --fast"
 run = "pwsh ./scripts/package-bootty-windows.ps1"
@@ -117,3 +121,7 @@ run = "pwsh ./scripts/package-bootty-windows.ps1"
 description = "Package and install Bootty with dynamic local linkage; pass --static for distribution or --fast for fast-release"
 run = "./scripts/install-bootty-unix.sh"
 run_windows = "pwsh ./scripts/install-bootty-windows.ps1"
+
+[tasks."install:dev"]
+description = "Package and install the isolated BoottyDev application"
+run = "./scripts/install-bootty-unix.sh --dev"

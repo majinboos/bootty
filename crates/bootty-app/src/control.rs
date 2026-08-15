@@ -15,9 +15,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
-use crate::commands::{
-    AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
-    CommandCatalog, CommandInvocation,
+use crate::{
+    application_identity::ApplicationIdentity,
+    commands::{
+        AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
+        CommandCatalog, CommandInvocation,
+    },
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -42,7 +45,7 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     pub fn register_extension_topic(&self, package: &str, topic: &str) -> Result<(), String> {
-        if !crate::commands::is_namespaced(topic, package) {
+        if !topic.starts_with(package) || !topic[package.len()..].starts_with('.') {
             return Err("extension event topic must be namespaced by its package".to_owned());
         }
         lock_control_state(&self.state)
@@ -129,9 +132,13 @@ impl ControlServer {
         plane: ControlPlane,
     ) -> Result<Self> {
         let descriptor = new_instance_descriptor(&window_state_key)?;
-        prepare_endpoint(&LocalEndpoint::from_path(descriptor.endpoint.clone()))?;
+        let descriptor_path = claim_instance_descriptor(&descriptor)?;
         let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
         let endpoint_path = descriptor.endpoint.clone();
+        if let Err(error) = prepare_endpoint(&endpoint) {
+            remove_control_files(&descriptor_path, &endpoint_path);
+            return Err(error);
+        }
         let state = Arc::clone(&plane.state);
         *plane
             .instance_scope
@@ -199,36 +206,28 @@ impl ControlServer {
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                let _ = fs::remove_file(&endpoint_path);
+                remove_control_files(&descriptor_path, &endpoint_path);
                 return Err(error).context("spawn control server");
             }
         };
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => match write_instance_descriptor(&descriptor) {
-                Ok(descriptor_path) => Ok(Self {
-                    shutdown: Some(shutdown_tx),
-                    thread: Some(server_thread),
-                    descriptor_path,
-                    endpoint_path,
-                    state,
-                }),
-                Err(error) => {
-                    let _ = shutdown_tx.send(());
-                    let _ = server_thread.join();
-                    let _ = fs::remove_file(&endpoint_path);
-                    Err(error)
-                }
-            },
+            Ok(Ok(())) => Ok(Self {
+                shutdown: Some(shutdown_tx),
+                thread: Some(server_thread),
+                descriptor_path,
+                endpoint_path,
+                state,
+            }),
             Ok(Err(error)) => {
                 let _ = shutdown_tx.send(());
                 let _ = server_thread.join();
-                let _ = fs::remove_file(&endpoint_path);
+                remove_control_files(&descriptor_path, &endpoint_path);
                 anyhow::bail!(error)
             }
             Err(error) => {
                 let _ = shutdown_tx.send(());
                 let _ = server_thread.join();
-                let _ = fs::remove_file(&endpoint_path);
+                remove_control_files(&descriptor_path, &endpoint_path);
                 anyhow::bail!("control server did not start: {error}")
             }
         }
@@ -244,8 +243,7 @@ impl Drop for ControlServer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        let _ = fs::remove_file(&self.descriptor_path);
-        let _ = fs::remove_file(&self.endpoint_path);
+        remove_control_files(&self.descriptor_path, &self.endpoint_path);
     }
 }
 
@@ -513,6 +511,13 @@ fn wait_for_task(
 ) -> Value {
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
+        match response_rx.try_recv() {
+            Ok(outcome) => return serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return failed_outcome("-32003", "command response channel closed");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
         if cancellation.is_cancelled() {
             return match response_rx.try_recv() {
                 Ok(outcome) => serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
@@ -1045,33 +1050,22 @@ fn internal_error(error: serde_json::Error) -> RpcError {
     RpcError::new(-32603, error.to_string())
 }
 
-pub fn invoke_or_start(
-    instance: Option<&str>,
-    start: bool,
-    method: &str,
-    params: Value,
-) -> Result<RpcResponse> {
-    let descriptor = select_or_start(instance, start)?;
+pub fn invoke_or_start(start: bool, method: &str, params: Value) -> Result<RpcResponse> {
+    let descriptor = select_or_start(start)?;
     invoke_instance(&descriptor, method, params)
 }
 
-pub fn select_or_start(instance: Option<&str>, start: bool) -> Result<InstanceDescriptor> {
-    if !start || instance.is_some() || std::env::var("BOOTTY_INSTANCE").is_ok() {
-        return select_instance(instance);
+pub fn select_or_start(start: bool) -> Result<InstanceDescriptor> {
+    if !start {
+        return select_instance();
     }
-    let instances = discover_instances()?;
-    match instances.as_slice() {
-        [] => start_instance(),
-        [instance] => Ok(instance.clone()),
-        _ => select_instance(None),
+    match discover_instance()? {
+        Some(instance) => Ok(instance),
+        None => start_instance(),
     }
 }
 
 fn start_instance() -> Result<InstanceDescriptor> {
-    let existing = discover_instances()?
-        .into_iter()
-        .map(|instance| instance.instance_id)
-        .collect::<BTreeSet<_>>();
     let executable = std::env::current_exe().context("find Bootty executable")?;
     let mut child = ProcessCommand::new(executable)
         .stdin(std::process::Stdio::null())
@@ -1087,16 +1081,15 @@ fn start_instance() -> Result<InstanceDescriptor> {
         {
             anyhow::bail!("started Bootty instance exited with {status}");
         }
-        let started = discover_instances()?
-            .into_iter()
-            .filter(|instance| !existing.contains(&instance.instance_id))
-            .collect::<Vec<_>>();
-        match started.as_slice() {
-            [instance] => return Ok(instance.clone()),
-            [] if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-            [] => anyhow::bail!("started Bootty instance did not become ready"),
-            _ => anyhow::bail!("multiple Bootty instances started; pass --instance"),
+        if let Some(instance) = discover_instance()?
+            && invoke_instance(&instance, "instance.describe", Value::Null).is_ok()
+        {
+            return Ok(instance);
         }
+        if Instant::now() >= deadline {
+            anyhow::bail!("started Bootty instance did not become ready");
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1135,75 +1128,32 @@ pub fn invoke_instance(
     serde_json::from_str(&response).context("decode control response")
 }
 
-pub fn select_instance(explicit: Option<&str>) -> Result<InstanceDescriptor> {
-    let selected = explicit
-        .map(str::to_owned)
-        .or_else(|| std::env::var("BOOTTY_INSTANCE").ok());
-    let mut instances = discover_instances()?;
-    if let Some(selected) = selected {
-        return instances
-            .into_iter()
-            .find(|instance| instance.instance_id == selected)
-            .with_context(|| format!("Bootty instance {selected} was not found"));
-    }
-    match instances.len() {
-        0 => anyhow::bail!("no running Bootty instance was found"),
-        1 => Ok(instances.remove(0)),
-        _ => {
-            let candidates = instances
-                .iter()
-                .map(|instance| instance.instance_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "multiple Bootty instances are running ({candidates}); pass --instance or set BOOTTY_INSTANCE"
-            )
-        }
-    }
+fn select_instance() -> Result<InstanceDescriptor> {
+    discover_instance()?.context("no running Bootty application was found")
 }
 
-pub fn discover_instances() -> Result<Vec<InstanceDescriptor>> {
-    let directory = instance_directory()?;
-    let mut instances = Vec::new();
-    let Ok(entries) = fs::read_dir(&directory) else {
-        return Ok(instances);
+fn discover_instance() -> Result<Option<InstanceDescriptor>> {
+    let path = instance_descriptor_path()?;
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(None);
     };
-    if set_owner_only_directory(&directory).is_err() {
-        return Ok(instances);
+    let Ok(instance) = serde_json::from_slice::<InstanceDescriptor>(&bytes) else {
+        remove_control_files(&path, &control_endpoint()?);
+        return Ok(None);
+    };
+    let identity = ApplicationIdentity::current();
+    let expected_endpoint = control_endpoint()?;
+    if instance.instance_id != identity.endpoint_namespace()
+        || instance.endpoint != expected_endpoint
+    {
+        remove_control_files(&path, &expected_endpoint);
+        return Ok(None);
     }
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(bytes) = fs::read(&path) else { continue };
-        let Ok(instance) = serde_json::from_slice::<InstanceDescriptor>(&bytes) else {
-            continue;
-        };
-        let Ok(expected_endpoint) =
-            endpoint_for_label(format!("bootty-control-{}", instance.instance_id))
-                .map(LocalEndpoint::into_path)
-        else {
-            let _ = fs::remove_file(path);
-            continue;
-        };
-        if instance.endpoint != expected_endpoint
-            || path.file_stem().and_then(|stem| stem.to_str()) != Some(&instance.instance_id)
-        {
-            let _ = fs::remove_file(path);
-            continue;
-        }
-        let live = invoke_instance(&instance, "instance.describe", Value::Null)
-            .ok()
-            .and_then(|response| response.result)
-            .and_then(|value| serde_json::from_value::<InstanceDescriptor>(value).ok())
-            .is_some_and(|descriptor| descriptor == instance);
-        if live {
-            instances.push(instance);
-        } else if instance_process_is_dead(&instance) {
-            let _ = fs::remove_file(path);
-            let _ = fs::remove_file(expected_endpoint);
-        }
+    if instance_process_is_dead(&instance) {
+        remove_control_files(&path, &expected_endpoint);
+        return Ok(None);
     }
-    instances.sort_by_key(|instance| instance.started_at_ms);
-    Ok(instances)
+    Ok(Some(instance))
 }
 
 fn instance_process_is_dead(instance: &InstanceDescriptor) -> bool {
@@ -1219,30 +1169,74 @@ fn new_instance_descriptor(window_state_key: &str) -> Result<InstanceDescriptor>
         .context("system clock before epoch")?
         .as_millis();
     let pid = std::process::id();
-    let instance_id = format!("{pid}-{started_at_ms}");
-    let label = format!("bootty-control-{instance_id}");
-    let endpoint = endpoint_for_label(label)?.into_path();
+    let identity = ApplicationIdentity::current();
     Ok(InstanceDescriptor {
-        instance_id,
+        instance_id: identity.endpoint_namespace().to_owned(),
         generation: 1,
         pid,
         window_state_key: window_state_key.to_owned(),
-        endpoint,
+        endpoint: control_endpoint()?,
         started_at_ms,
         protocol_version: PROTOCOL_VERSION,
     })
 }
 
-fn write_instance_descriptor(descriptor: &InstanceDescriptor) -> Result<PathBuf> {
+fn claim_instance_descriptor(descriptor: &InstanceDescriptor) -> Result<PathBuf> {
     let directory = instance_directory()?;
     fs::create_dir_all(&directory)?;
     set_owner_only_directory(&directory)?;
-    let path = directory.join(format!("{}.json", descriptor.instance_id));
-    let temporary = directory.join(format!(".{}.json.tmp", descriptor.instance_id));
+    let path = instance_descriptor_path()?;
+    let temporary = directory.join(format!(
+        ".control-{}-{}.json.tmp",
+        descriptor.pid, descriptor.started_at_ms
+    ));
     fs::write(&temporary, serde_json::to_vec(descriptor)?)?;
     set_owner_only_file(&temporary)?;
-    fs::rename(&temporary, &path)?;
-    Ok(path)
+    loop {
+        match fs::hard_link(&temporary, &path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&temporary);
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<InstanceDescriptor>(&bytes).ok());
+                if existing
+                    .as_ref()
+                    .is_some_and(|instance| !instance_process_is_dead(instance))
+                {
+                    let _ = fs::remove_file(&temporary);
+                    anyhow::bail!(
+                        "{} is already running",
+                        ApplicationIdentity::current().display_name()
+                    );
+                }
+                remove_control_files(&path, &control_endpoint()?);
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error).context("claim Bootty application identity");
+            }
+        }
+    }
+}
+
+fn instance_descriptor_path() -> Result<PathBuf> {
+    Ok(instance_directory()?.join("control.json"))
+}
+
+fn control_endpoint() -> Result<PathBuf> {
+    Ok(endpoint_for_label(format!(
+        "{}-control",
+        ApplicationIdentity::current().endpoint_namespace()
+    ))
+    .map(LocalEndpoint::into_path)?)
+}
+
+fn remove_control_files(descriptor: &Path, endpoint: &Path) {
+    let _ = fs::remove_file(descriptor);
+    let _ = fs::remove_file(endpoint);
 }
 
 fn instance_directory() -> Result<PathBuf> {
@@ -1251,7 +1245,7 @@ fn instance_directory() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .context("no user-private runtime directory is available")?;
-    Ok(base.join("bootty"))
+    Ok(base.join(ApplicationIdentity::current().state_namespace()))
 }
 
 fn prepare_endpoint(endpoint: &LocalEndpoint) -> Result<()> {

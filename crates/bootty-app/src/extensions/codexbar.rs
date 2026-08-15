@@ -23,17 +23,7 @@ pub(super) fn reject_reserved_shell_command(cmd: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(super) fn command_invokes_usage(cmd: &str) -> bool {
-    command_invokes_usage_inner(cmd)
-}
-
-#[cfg(not(test))]
 fn command_invokes_usage(cmd: &str) -> bool {
-    command_invokes_usage_inner(cmd)
-}
-
-fn command_invokes_usage_inner(cmd: &str) -> bool {
     let tokens = shellish_tokens(cmd);
     let mut command_start = true;
     let mut previous_command_is_codexbar = false;

@@ -6,7 +6,7 @@ use bootty_app::{
         resolve_theme, write_font_size_preference,
     },
     input_binding_set::BindingSet,
-    session_order::SessionOrderStore,
+    workspace::{SessionOrderStore, WorkspaceRepository},
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -153,6 +153,14 @@ fn session_names(count: usize) -> Vec<String> {
         .collect()
 }
 
+fn session_order(config_path: &std::path::Path) -> SessionOrderStore {
+    let repository = WorkspaceRepository::open(config_path).expect("workspace repository");
+    let binding = repository
+        .default_binding_id()
+        .expect("default workspace binding");
+    repository.session_order(binding)
+}
+
 fn parse_keybinds(config: &BoottyConfig) -> usize {
     let mut set = BindingSet::default();
     for entry in config
@@ -220,7 +228,7 @@ fn bench_session_order(c: &mut Criterion) {
 
     let steady_dir = BenchDir::new("session-order-steady");
     let steady_config_path = steady_dir.path("config.toml");
-    let mut steady_store = SessionOrderStore::for_config_path(&steady_config_path);
+    let mut steady_store = session_order(&steady_config_path);
     steady_store.sync_sessions(session_refs.iter().copied());
     c.bench_function("session_order_steady_sync_384", |b| {
         b.iter(|| {
@@ -234,7 +242,7 @@ fn bench_session_order(c: &mut Criterion) {
 
     let move_dir = BenchDir::new("session-order-move");
     let move_config_path = move_dir.path("config.toml");
-    let mut move_store = SessionOrderStore::for_config_path(&move_config_path);
+    let mut move_store = session_order(&move_config_path);
     move_store.sync_sessions(session_refs.iter().copied());
     c.bench_function("session_order_move_session_persist_384", |b| {
         b.iter(|| {
@@ -258,7 +266,7 @@ fn bench_session_order(c: &mut Criterion) {
             cold_index = cold_index.wrapping_add(1);
             let dir = BenchDir::new(&format!("session-order-cold-{cold_index}"));
             let config_path = dir.path("config.toml");
-            let mut store = SessionOrderStore::for_config_path(&config_path);
+            let mut store = session_order(&config_path);
             black_box(store.sync_sessions(session_refs.iter().copied()).len())
         })
     });

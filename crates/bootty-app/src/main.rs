@@ -4,6 +4,7 @@ use std::{fmt, io::Read, process::ExitCode};
 
 use anyhow::{Context, Result};
 use bootty_app::{
+    application_identity::ApplicationIdentity,
     cli::{Cli, Command, RemoteSpaceCommand},
     commands::{Caller, CommandDescriptor, CommandInvocation, CommandTarget, ValueType},
     control, remote_catalog,
@@ -66,7 +67,7 @@ fn run() -> Result<()> {
     match cli.subcommand() {
         Some(Command::Commands) => {
             print_control_response(
-                control_request(&cli, "command.list", serde_json::Value::Null)?,
+                control_request(cli.start(), "command.list", serde_json::Value::Null)?,
                 cli.json(),
             )?;
             return Ok(());
@@ -74,7 +75,7 @@ fn run() -> Result<()> {
         Some(Command::Describe { name }) => {
             print_control_response(
                 control_request(
-                    &cli,
+                    cli.start(),
                     "command.describe",
                     serde_json::json!({"command": name}),
                 )?,
@@ -171,8 +172,7 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
         .map(|segment| segment.replace('-', "_"))
         .collect::<Vec<_>>()
         .join(".");
-    let instance =
-        control::select_or_start(cli.instance(), cli.start()).map_err(transport_failure)?;
+    let instance = control::select_or_start(cli.start()).map_err(transport_failure)?;
     let mut described = control_instance_request(
         &instance,
         "command.describe",
@@ -225,8 +225,7 @@ fn invoke_control_command(
     invocation: CommandInvocation,
     confirm: bool,
 ) -> Result<control::RpcResponse> {
-    let descriptor =
-        control::select_or_start(cli.instance(), cli.start()).map_err(transport_failure)?;
+    let descriptor = control::select_or_start(cli.start()).map_err(transport_failure)?;
     invoke_control_command_on_instance(&descriptor, invocation, confirm)
 }
 
@@ -268,11 +267,11 @@ fn control_instance_request(
 }
 
 fn control_request(
-    cli: &Cli,
+    start: bool,
     method: &str,
     params: serde_json::Value,
 ) -> Result<control::RpcResponse> {
-    control::invoke_or_start(cli.instance(), cli.start(), method, params).map_err(transport_failure)
+    control::invoke_or_start(start, method, params).map_err(transport_failure)
 }
 
 fn transport_failure(error: anyhow::Error) -> anyhow::Error {
@@ -547,7 +546,7 @@ fn install_macos_cli_link_at(
     executable: &std::path::Path,
     directory: &std::path::Path,
 ) -> std::io::Result<()> {
-    let link = directory.join("bootty");
+    let link = directory.join(ApplicationIdentity::current().cli_name());
     std::fs::create_dir_all(directory)?;
     match std::fs::symlink_metadata(&link) {
         Ok(metadata) if metadata.file_type().is_symlink() => {

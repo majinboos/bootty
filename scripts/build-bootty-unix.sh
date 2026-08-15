@@ -4,6 +4,7 @@ set -euo pipefail
 PACKAGE_NAME="bootty-app"
 BINARY_NAME="bootty"
 CARGO_PROFILE_ARGS=(--release)
+CARGO_FEATURE_ARGS=(--features bootty-dev)
 FAST=0
 LINKAGE="dynamic"
 
@@ -23,6 +24,9 @@ while (($#)); do
     --static)
       LINKAGE="static"
       ;;
+    --production)
+      CARGO_FEATURE_ARGS=()
+      ;;
     *)
       echo "unknown build argument: $1" >&2
       exit 2
@@ -40,4 +44,4 @@ if [[ "$LINKAGE" == "dynamic" ]]; then
   append_rustflags -C prefer-dynamic -C rpath
 fi
 
-cargo build "${CARGO_PROFILE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
+cargo build "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"

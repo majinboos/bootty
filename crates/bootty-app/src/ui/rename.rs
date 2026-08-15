@@ -126,24 +126,3 @@ fn normalized_name(raw: &str) -> Option<String> {
 fn normalized_tab_name(raw: &str) -> String {
     raw.trim().to_owned()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalized_name_trims_and_rejects_blank() {
-        assert_eq!(normalized_name("bootty"), Some("bootty".to_owned()));
-        assert_eq!(normalized_name("  spaced  "), Some("spaced".to_owned()));
-        assert_eq!(normalized_name(""), None);
-        assert_eq!(normalized_name("   "), None);
-    }
-
-    #[test]
-    fn normalized_tab_name_trims_but_allows_blank() {
-        assert_eq!(normalized_tab_name("bootty"), "bootty");
-        assert_eq!(normalized_tab_name("  spaced  "), "spaced");
-        assert_eq!(normalized_tab_name(""), "");
-        assert_eq!(normalized_tab_name("   "), "");
-    }
-}

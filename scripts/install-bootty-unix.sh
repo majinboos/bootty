@@ -3,7 +3,17 @@ set -euo pipefail
 
 APP_NAME="Bootty"
 BINARY_NAME="bootty"
+CLI_NAME="bootty"
+BUNDLE_IDENTIFIER="dev.bootty.desktop"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
+
+for argument in "$@"; do
+  if [[ "$argument" == "--dev" ]]; then
+    APP_NAME="BoottyDev"
+    CLI_NAME="bootty-dev"
+    BUNDLE_IDENTIFIER="dev.bootty.desktop.dev"
+  fi
+done
 
 ensure_user_path() {
   local directory="$1"
@@ -60,9 +70,9 @@ case "$(uname -s)" in
       esac
     done
     mkdir -p "$CLI_DIR"
-    ln -sfn "$APP_TARGET/Contents/MacOS/$BINARY_NAME" "$CLI_DIR/$BINARY_NAME"
+    ln -sfn "$APP_TARGET/Contents/MacOS/$BINARY_NAME" "$CLI_DIR/$CLI_NAME"
     ensure_user_path "$CLI_DIR"
-    echo "Installed $APP_TARGET and $CLI_DIR/$BINARY_NAME"
+    echo "Installed $APP_TARGET and $CLI_DIR/$CLI_NAME"
     ;;
   Linux)
     PREFIX="${BOOTTY_INSTALL_PREFIX:-$HOME/.local}"
@@ -74,7 +84,7 @@ case "$(uname -s)" in
       exit 1
     fi
 
-    install -Dm755 "$ROOT_DIR/bin/$BINARY_NAME" "$PREFIX/bin/$BINARY_NAME"
+    install -Dm755 "$ROOT_DIR/bin/$CLI_NAME" "$PREFIX/bin/$CLI_NAME"
     install -Dm755 "$ROOT_DIR/bin/bootty-daemon" "$PREFIX/bin/bootty-daemon"
     ensure_user_path "$PREFIX/bin"
     if [[ -d "$ROOT_DIR/lib" ]]; then
@@ -85,8 +95,8 @@ case "$(uname -s)" in
       install -d "$PREFIX/share/bootty/daemons"
       install -m755 "$ROOT_DIR/share/bootty/daemons/"* "$PREFIX/share/bootty/daemons/"
     fi
-    install -Dm644 "$ROOT_DIR/share/applications/dev.bootty.desktop" \
-      "$PREFIX/share/applications/dev.bootty.desktop"
+    install -Dm644 "$ROOT_DIR/share/applications/$BUNDLE_IDENTIFIER.desktop" \
+      "$PREFIX/share/applications/$BUNDLE_IDENTIFIER.desktop"
     install -Dm644 "$ROOT_DIR/share/icons/hicolor/256x256/apps/bootty.png" \
       "$PREFIX/share/icons/hicolor/256x256/apps/bootty.png"
     install -Dm644 "$ROOT_DIR/share/icons/hicolor/scalable/apps/bootty.svg" \
@@ -99,7 +109,7 @@ case "$(uname -s)" in
       gtk-update-icon-cache -q "$PREFIX/share/icons/hicolor" >/dev/null 2>&1 || true
     fi
 
-    echo "Installed $PREFIX/bin/$BINARY_NAME"
+    echo "Installed $PREFIX/bin/$CLI_NAME"
     ;;
   *)
     echo "unsupported OS: $(uname -s)" >&2

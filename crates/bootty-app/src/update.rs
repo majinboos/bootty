@@ -1,6 +1,8 @@
-use std::{path::Path, process::Command};
+use std::process::Command;
 
 use anyhow::{Context, Result};
+
+use crate::application_identity::ApplicationIdentity;
 
 const REPOSITORY_OWNER: &str = "majindotboo";
 const REPOSITORY_NAME: &str = "bootty";
@@ -22,8 +24,7 @@ pub fn automatic_update() -> Result<UpdateResult> {
 }
 
 pub fn update(show_output: bool) -> Result<UpdateResult> {
-    let executable = std::env::current_exe().context("resolve the Bootty executable path")?;
-    if is_development_binary(&executable) {
+    if !ApplicationIdentity::current().automatic_updates_enabled() {
         return Ok(UpdateResult::Skipped);
     }
 
@@ -98,34 +99,4 @@ pub fn restart_after_update() -> Result<()> {
         .spawn()
         .context("restart Bootty after updating")?;
     Ok(())
-}
-
-fn is_development_binary(executable: &Path) -> bool {
-    executable
-        .ancestors()
-        .any(|path| path.ends_with("target") || path.join(".rustc_info.json").is_file())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, path::Path};
-
-    use super::is_development_binary;
-
-    #[test]
-    fn development_binaries_skip_updates() {
-        assert!(is_development_binary(Path::new(
-            "/repo/target/debug/bootty"
-        )));
-
-        let custom_target = tempfile::tempdir().unwrap();
-        fs::write(custom_target.path().join(".rustc_info.json"), "").unwrap();
-        assert!(is_development_binary(
-            &custom_target.path().join("debug/bootty")
-        ));
-
-        assert!(!is_development_binary(Path::new(
-            "/home/user/.local/bin/bootty"
-        )));
-    }
 }

@@ -7,6 +7,11 @@ use std::{
     time::Duration,
 };
 
+pub use crate::{
+    session_names::{SessionNameRecord, SessionNameStore},
+    session_order::SessionOrderStore,
+};
+
 use crate::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig, default_config_path},
     mux::controller::{BindingId, MuxScope, SpaceId},
@@ -14,8 +19,8 @@ use crate::{
 
 const WORKSPACE_SNAPSHOT_REVISION: i64 = 1;
 const DEFAULT_SPACE_NAME: &str = "Default Space";
-pub(crate) const DEFAULT_SPACE_ICON: &str = "folder";
-pub(crate) const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
+pub const DEFAULT_SPACE_ICON: &str = "folder";
+pub const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
 const DEFAULT_TINT_SIDEBAR: bool = false;
 const DEFAULT_BINDING_NAME: &str = "Default Binding";
 
@@ -44,7 +49,7 @@ pub enum SpaceRemoteOverride {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkspaceBinding {
+pub struct WorkspaceBinding {
     scope: MuxScope,
     name: String,
     backend_override: Option<MultiplexerBackendConfig>,
@@ -54,48 +59,48 @@ pub(crate) struct WorkspaceBinding {
 }
 
 impl WorkspaceBinding {
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub(crate) fn backend_override(&self) -> Option<MultiplexerBackendConfig> {
+    pub fn backend_override(&self) -> Option<MultiplexerBackendConfig> {
         self.backend_override
     }
 
-    pub(crate) fn remote_override(&self) -> &SpaceRemoteOverride {
+    pub fn remote_override(&self) -> &SpaceRemoteOverride {
         &self.remote_override
     }
 
-    pub(crate) fn mux_scope(&self) -> MuxScope {
+    pub fn mux_scope(&self) -> MuxScope {
         self.scope
     }
 
-    pub(crate) fn unavailable(&self) -> bool {
+    pub fn unavailable(&self) -> bool {
         self.unavailable
     }
 
-    pub(crate) fn selection(&self) -> Option<&WorkspaceBindingSelection> {
+    pub fn selection(&self) -> Option<&WorkspaceBindingSelection> {
         self.selection.as_ref()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkspaceBindingSelection {
+pub struct WorkspaceBindingSelection {
     session_id: String,
     window_id: Option<String>,
 }
 
 impl WorkspaceBindingSelection {
-    pub(crate) fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
-    pub(crate) fn window_id(&self) -> Option<&str> {
+    pub fn window_id(&self) -> Option<&str> {
         self.window_id.as_deref()
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorkspaceSpace {
+pub struct WorkspaceSpace {
     id: SpaceId,
     remote_id: String,
     name: String,
@@ -107,54 +112,60 @@ pub(crate) struct WorkspaceSpace {
 }
 
 impl WorkspaceSpace {
-    pub(crate) fn id(&self) -> SpaceId {
+    pub fn id(&self) -> SpaceId {
         self.id
     }
 
-    pub(crate) fn remote_id(&self) -> &str {
+    pub fn remote_id(&self) -> &str {
         &self.remote_id
     }
 
-    pub(crate) fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub(crate) fn icon(&self) -> &str {
+    pub fn icon(&self) -> &str {
         &self.icon
     }
 
-    pub(crate) fn color(&self) -> [u8; 3] {
+    pub fn color(&self) -> [u8; 3] {
         self.color
     }
 
-    pub(crate) fn tint_sidebar(&self) -> bool {
+    pub fn tint_sidebar(&self) -> bool {
         self.tint_sidebar
     }
 
-    pub(crate) fn position(&self) -> i64 {
+    pub fn position(&self) -> i64 {
         self.position
     }
 
-    pub(crate) fn bindings(&self) -> &[WorkspaceBinding] {
+    pub fn bindings(&self) -> &[WorkspaceBinding] {
         &self.bindings
     }
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WorkspaceStore {
+pub struct WorkspaceRepository {
+    config_path: PathBuf,
     path: PathBuf,
     spaces: Vec<WorkspaceSpace>,
 }
 
-impl WorkspaceStore {
-    pub(crate) fn try_for_config_path(config_path: &Path) -> rusqlite::Result<Self> {
+impl WorkspaceRepository {
+    pub fn open(config_path: &Path) -> rusqlite::Result<Self> {
         let path = sqlite_path(config_path);
         let spaces = Self::load_or_migrate(&path)?;
-        Ok(Self { path, spaces })
+        Ok(Self {
+            config_path: config_path.to_path_buf(),
+            path,
+            spaces,
+        })
     }
 
     pub(crate) fn for_config_path(config_path: &Path) -> Self {
-        Self::try_for_config_path(config_path).unwrap_or_else(|_| Self {
+        Self::open(config_path).unwrap_or_else(|_| Self {
+            config_path: config_path.to_path_buf(),
             path: sqlite_path(config_path),
             spaces: Vec::new(),
         })
@@ -164,28 +175,23 @@ impl WorkspaceStore {
         self.spaces.first()?.bindings.first()
     }
 
-    #[cfg(test)]
-    pub(crate) fn bindings(&self) -> &[WorkspaceBinding] {
-        self.spaces
-            .first()
-            .map(WorkspaceSpace::bindings)
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn spaces(&self) -> &[WorkspaceSpace] {
+    pub fn spaces(&self) -> &[WorkspaceSpace] {
         &self.spaces
     }
 
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    pub fn default_binding_id(&self) -> Option<BindingId> {
+        self.binding().map(|binding| binding.scope.binding_id())
     }
 
-    pub(crate) fn binding_id(&self) -> Option<i64> {
-        self.binding()
-            .map(|binding| binding.scope.binding_id().persistence_value())
+    pub fn session_order(&self, binding_id: BindingId) -> SessionOrderStore {
+        SessionOrderStore::for_binding(&self.config_path, binding_id.persistence_value())
     }
 
-    pub(crate) fn create_space(
+    pub fn session_names(&self, binding_id: BindingId) -> SessionNameStore {
+        SessionNameStore::for_binding(&self.config_path, binding_id.persistence_value())
+    }
+
+    pub fn create_space(
         &mut self,
         name: &str,
         icon: &str,
@@ -1014,708 +1020,5 @@ fn backend_from_storage(backend: &str) -> Option<MultiplexerBackendConfig> {
         "tmux" => Some(MultiplexerBackendConfig::Tmux),
         "zellij" => Some(MultiplexerBackendConfig::Zellij),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{fs, path::PathBuf};
-
-    use rusqlite::params;
-
-    use super::*;
-
-    fn temp_config_path(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bootty-workspace-{name}-{unique}"));
-        fs::create_dir_all(&dir).expect("create workspace directory");
-        dir.join("config.toml")
-    }
-
-    #[test]
-    fn isolated_workspace_does_not_read_global_tmux_legacy_order() {
-        let config_path = temp_config_path("isolated-legacy-order");
-        let database_path = sqlite_path(&config_path);
-
-        let paths = legacy_order_paths(&database_path);
-        assert_eq!(paths.len(), 1);
-        assert_eq!(
-            paths[0],
-            database_path.parent().unwrap().join("session-order")
-        );
-    }
-
-    /// The host a space's sessions live on has to survive storage whole: bootty reads it back to
-    /// decide which machine to attach, and a detail lost on the way would attach a different one —
-    /// or none, once the host itself is gone.
-    #[test]
-    fn a_space_remembers_the_host_its_sessions_live_on() {
-        let config_path = temp_config_path("space-remote");
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-        let remote = SshRemoteConfig {
-            host: "devbox".to_owned(),
-            user: Some("dev".to_owned()),
-            port: Some(2222),
-            program: "ssh".to_owned(),
-            args: vec!["-i".to_owned(), "~/.ssh/devbox".to_owned()],
-        };
-        let space = store
-            .create_space(
-                "Remote",
-                "terminal",
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride {
-                    backend: Some(MultiplexerBackendConfig::Tmux),
-                    remote: SpaceRemoteOverride::Inline(remote.clone()),
-                },
-                &MultiplexerConfig::default(),
-            )
-            .expect("create remote space")
-            .expect("space");
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        let stored = reopened
-            .spaces()
-            .iter()
-            .find(|candidate| candidate.id() == space.id())
-            .expect("persisted space");
-        assert_eq!(
-            stored.bindings()[0].remote_override(),
-            &SpaceRemoteOverride::Inline(remote)
-        );
-
-        assert!(
-            store
-                .update_space(
-                    space.id(),
-                    "Remote",
-                    "terminal",
-                    DEFAULT_SPACE_COLOR,
-                    false,
-                    SpaceMuxOverride {
-                        backend: Some(MultiplexerBackendConfig::Tmux),
-                        remote: SpaceRemoteOverride::Local,
-                    },
-                )
-                .expect("clear remote")
-        );
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        let stored = reopened
-            .spaces()
-            .iter()
-            .find(|candidate| candidate.id() == space.id())
-            .expect("persisted space");
-        assert_eq!(
-            stored.bindings()[0].remote_override(),
-            &SpaceRemoteOverride::Local
-        );
-    }
-
-    #[test]
-    fn a_space_remembers_its_remote_space_reference() {
-        let config_path = temp_config_path("remote-space-reference");
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-        let reference = RemoteSpaceRef {
-            profile_id: "home-lab".to_owned(),
-            remote_space_id: "remote-42".to_owned(),
-            remote_space_name: "Production".to_owned(),
-            backend: MultiplexerBackendConfig::Tmux,
-        };
-        store
-            .create_space(
-                "Production",
-                "terminal",
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride {
-                    backend: Some(reference.backend),
-                    remote: SpaceRemoteOverride::Profile(reference.clone()),
-                },
-                &MultiplexerConfig::default(),
-            )
-            .expect("create remote Space")
-            .expect("Space");
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-
-        assert_eq!(
-            reopened.spaces()[1].bindings()[0].remote_override(),
-            &SpaceRemoteOverride::Profile(reference)
-        );
-    }
-
-    #[test]
-    fn legacy_inline_remote_json_still_loads() {
-        let remote = SshRemoteConfig::for_host("legacy-host");
-        let stored = serde_json::to_string(&remote).expect("legacy JSON");
-
-        assert_eq!(
-            remote_from_storage(Some(&stored)),
-            SpaceRemoteOverride::Inline(remote)
-        );
-    }
-
-    #[test]
-    fn fresh_configuration_creates_default_space_and_binding() {
-        let config_path = temp_config_path("fresh");
-
-        let store = WorkspaceStore::for_config_path(&config_path);
-        let binding = store.binding().expect("default binding");
-        assert_eq!(binding.backend_override(), None);
-
-        let conn = open_db(&sqlite_path(&config_path)).expect("open workspace database");
-        let names: (String, String) = conn
-            .query_row(
-                "SELECT s.name, b.name
-                 FROM workspace_spaces s
-                 JOIN workspace_bindings b ON b.space_id = s.id",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("default scope names");
-        assert_eq!(
-            names,
-            (
-                DEFAULT_SPACE_NAME.to_owned(),
-                DEFAULT_BINDING_NAME.to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn reopening_loads_multiple_bindings_in_the_same_space() {
-        let config_path = temp_config_path("multiple-bindings");
-        let store = WorkspaceStore::for_config_path(&config_path);
-        let default = store.binding().expect("default binding");
-        let space_id = default.mux_scope().space_id().persistence_value();
-        let conn = open_db(store.path()).expect("open workspace database");
-        conn.execute(
-            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![space_id, "Remote", "tmux", 1_i64],
-        )
-        .expect("insert second binding");
-        conn.execute(
-            "INSERT INTO workspace_spaces (remote_id, name, position) VALUES (?1, ?2, 1)",
-            ["other-space", "Other Space"],
-        )
-        .expect("insert other space");
-        let other_space_id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![other_space_id, "Other Space Binding", "zellij", 0_i64],
-        )
-        .expect("insert other space binding");
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        assert_eq!(reopened.spaces().len(), 2);
-        assert_eq!(reopened.spaces()[0].name(), DEFAULT_SPACE_NAME);
-        assert_eq!(reopened.spaces()[0].bindings().len(), 2);
-        assert_eq!(reopened.spaces()[1].name(), "Other Space");
-        assert_eq!(reopened.spaces()[1].bindings().len(), 1);
-        assert_eq!(
-            reopened.spaces()[1].bindings()[0].name(),
-            "Other Space Binding"
-        );
-
-        assert_eq!(reopened.bindings().len(), 2);
-        assert_eq!(reopened.bindings()[0].name(), DEFAULT_BINDING_NAME);
-        assert_eq!(reopened.bindings()[1].name(), "Remote");
-        assert_eq!(
-            reopened.bindings()[1].backend_override(),
-            Some(MultiplexerBackendConfig::Tmux)
-        );
-        assert_ne!(
-            reopened.bindings()[0].mux_scope(),
-            reopened.bindings()[1].mux_scope()
-        );
-        assert!(
-            reopened
-                .bindings()
-                .iter()
-                .all(|binding| { binding.mux_scope().space_id().persistence_value() == space_id })
-        );
-    }
-
-    #[test]
-    fn reopening_repairs_a_configured_space_without_a_binding() {
-        let config_path = temp_config_path("empty-space");
-        let store = WorkspaceStore::for_config_path(&config_path);
-        let conn = open_db(store.path()).expect("open workspace database");
-        conn.execute(
-            "INSERT INTO workspace_spaces (remote_id, name, position) VALUES (?1, ?2, 1)",
-            ["empty-space", "Empty Space"],
-        )
-        .expect("insert empty space");
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-
-        assert_eq!(reopened.spaces().len(), 2);
-        assert_eq!(reopened.spaces()[1].name(), "Empty Space");
-        assert_eq!(reopened.spaces()[1].bindings().len(), 1);
-        assert_eq!(reopened.spaces()[1].bindings()[0].backend_override(), None);
-    }
-
-    #[test]
-    fn creating_spaces_persists_a_default_binding_and_unique_name() {
-        let config_path = temp_config_path("create-space");
-        let config = MultiplexerConfig {
-            backend: MultiplexerBackendConfig::Tmux,
-            hide_tmux_status: true,
-            ..MultiplexerConfig::default()
-        };
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-
-        assert!(
-            store
-                .create_space(
-                    "   ",
-                    DEFAULT_SPACE_ICON,
-                    DEFAULT_SPACE_COLOR,
-                    false,
-                    SpaceMuxOverride::default(),
-                    &config,
-                )
-                .expect("ignore blank name")
-                .is_none()
-        );
-        let review = store
-            .create_space(
-                " Review ",
-                "terminal",
-                [1, 2, 3],
-                true,
-                SpaceMuxOverride::default(),
-                &config,
-            )
-            .expect("create review space")
-            .expect("nonblank space");
-        let duplicate = store
-            .create_space(
-                "review",
-                DEFAULT_SPACE_ICON,
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride::default(),
-                &config,
-            )
-            .expect("create duplicate space")
-            .expect("nonblank space");
-
-        assert_eq!(review.name(), "Review");
-        assert_eq!(review.icon(), "terminal");
-        assert_eq!(review.color(), [1, 2, 3]);
-        assert!(review.tint_sidebar());
-        assert_eq!(review.bindings().len(), 1);
-        assert_eq!(review.bindings()[0].name(), DEFAULT_BINDING_NAME);
-        assert_eq!(review.bindings()[0].backend_override(), None);
-        assert_eq!(duplicate.name(), "review 2");
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        assert_eq!(
-            reopened
-                .spaces()
-                .iter()
-                .map(WorkspaceSpace::name)
-                .collect::<Vec<_>>(),
-            vec![DEFAULT_SPACE_NAME, "Review", "review 2"]
-        );
-        assert!(
-            reopened
-                .spaces()
-                .iter()
-                .all(|space| space.bindings().len() == 1)
-        );
-    }
-
-    #[test]
-    fn icon_migration_round_trips_edits_and_cascades_deleted_space_bindings() {
-        let config_path = temp_config_path("space-icon-migration");
-        let db_path = sqlite_path(&config_path);
-        let conn = open_db(&db_path).expect("open old workspace database");
-        conn.execute_batch(
-            "CREATE TABLE workspace_spaces (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                position INTEGER NOT NULL UNIQUE
-            );
-            CREATE TABLE workspace_bindings (
-                id INTEGER PRIMARY KEY,
-                space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                hide_tmux_status INTEGER NOT NULL
-            );
-            INSERT INTO workspace_spaces (id, name, position) VALUES (1, 'Default Space', 0);
-            INSERT INTO workspace_bindings
-                (id, space_id, name, backend, hide_tmux_status)
-            VALUES (1, 1, 'Default Binding', 'native', 0);",
-        )
-        .expect("create pre-icon workspace");
-
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-        assert_eq!(store.spaces()[0].icon(), DEFAULT_SPACE_ICON);
-        assert_eq!(store.spaces()[0].color(), DEFAULT_SPACE_COLOR);
-        assert!(!store.spaces()[0].tint_sidebar());
-        let review = store
-            .create_space(
-                "Review",
-                "terminal",
-                [1, 2, 3],
-                true,
-                SpaceMuxOverride::default(),
-                &MultiplexerConfig::default(),
-            )
-            .expect("create space")
-            .expect("space");
-        assert!(
-            store
-                .update_space(
-                    review.id(),
-                    "Planning",
-                    "calendar",
-                    [4, 5, 6],
-                    false,
-                    SpaceMuxOverride {
-                        backend: Some(MultiplexerBackendConfig::Zellij),
-                        remote: SpaceRemoteOverride::Inherit,
-                    },
-                )
-                .expect("update space")
-        );
-        let mut reopened = WorkspaceStore::for_config_path(&config_path);
-        let planning = reopened
-            .spaces()
-            .iter()
-            .find(|space| space.id() == review.id())
-            .expect("persisted Space");
-        assert_eq!(planning.name(), "Planning");
-        assert_eq!(planning.icon(), "calendar");
-        assert_eq!(planning.color(), [4, 5, 6]);
-        assert!(!planning.tint_sidebar());
-        assert_eq!(
-            planning.bindings()[0].backend_override(),
-            Some(MultiplexerBackendConfig::Zellij)
-        );
-        assert!(reopened.delete_space(review.id()).expect("delete"));
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        assert_eq!(reopened.spaces().len(), 1);
-        let conn = open_db(reopened.path()).expect("open migrated database");
-        let binding_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM workspace_bindings WHERE space_id = ?1",
-                [review.id().persistence_value()],
-                |row| row.get(0),
-            )
-            .expect("binding count");
-        assert_eq!(binding_count, 0);
-    }
-
-    #[test]
-    fn existing_single_binding_schema_migrates_without_losing_scoped_metadata() {
-        let config_path = temp_config_path("binding-cardinality-migration");
-        let db_path = sqlite_path(&config_path);
-        let conn = open_db(&db_path).expect("open old workspace database");
-        conn.execute_batch(
-            "CREATE TABLE workspace_spaces (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                position INTEGER NOT NULL UNIQUE
-            );
-            CREATE TABLE workspace_bindings (
-                id INTEGER PRIMARY KEY,
-                space_id INTEGER NOT NULL UNIQUE REFERENCES workspace_spaces(id) ON DELETE CASCADE,
-                name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                hide_tmux_status INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_session_name_metadata (
-                binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
-                session_id TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                generated_name TEXT NOT NULL,
-                explicit INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(binding_id, session_id)
-            );
-            INSERT INTO workspace_spaces (id, name, position)
-            VALUES (1, 'Default Space', 0);
-            INSERT INTO workspace_bindings
-                (id, space_id, name, backend, hide_tmux_status)
-            VALUES (1, 1, 'Default Binding', 'native', 0);
-            INSERT INTO workspace_session_name_metadata
-                (binding_id, session_id, cwd, generated_name, explicit)
-            VALUES (1, '$1', '/repo', 'repo', 0);",
-        )
-        .expect("create old single-binding schema");
-
-        let store = WorkspaceStore::for_config_path(&config_path);
-        let conn = open_db(store.path()).expect("open migrated database");
-        conn.execute(
-            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
-             VALUES (1, 'Remote', 'tmux', 1)",
-            [],
-        )
-        .expect("single-binding constraint removed");
-        let metadata_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM workspace_session_name_metadata
-                 WHERE binding_id = 1 AND session_id = '$1'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("preserved metadata count");
-
-        assert_eq!(store.bindings().len(), 1);
-        assert_eq!(metadata_count, 1);
-    }
-
-    #[test]
-    fn reopening_keeps_scoped_metadata_when_legacy_tables_change() {
-        let config_path = temp_config_path("repeat");
-        let db_path = sqlite_path(&config_path);
-        let mut conn = open_db(&db_path).expect("open legacy database");
-        let tx = conn.transaction().expect("legacy transaction");
-        tx.execute_batch(
-            "CREATE TABLE session_groups (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                position INTEGER NOT NULL UNIQUE
-            );
-            CREATE TABLE sessions (
-                name TEXT PRIMARY KEY,
-                group_id INTEGER NOT NULL,
-                position INTEGER NOT NULL
-            );
-            CREATE TABLE session_name_metadata (
-                session_id TEXT PRIMARY KEY,
-                cwd TEXT NOT NULL,
-                generated_name TEXT NOT NULL,
-                explicit INTEGER NOT NULL
-            );",
-        )
-        .expect("create legacy schema");
-        tx.execute(
-            "INSERT INTO session_groups (name, position) VALUES (?1, 0)",
-            ["project"],
-        )
-        .expect("insert legacy group");
-        let group_id = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO sessions (name, group_id, position) VALUES (?1, ?2, 0)",
-            params!["project/main", group_id],
-        )
-        .expect("insert legacy session");
-        tx.execute(
-            "INSERT INTO session_name_metadata (session_id, cwd, generated_name, explicit)
-             VALUES (?1, ?2, ?3, ?4)",
-            params!["$1", "/repo", "project/main", 0_i64],
-        )
-        .expect("insert legacy name");
-        tx.execute(
-            "INSERT INTO session_name_metadata (session_id, cwd, generated_name, explicit)
-             VALUES (?1, ?2, ?3, ?4)",
-            params!["$2", "/release", "project/release", 1_i64],
-        )
-        .expect("insert explicit legacy name");
-        tx.commit().expect("commit legacy state");
-
-        let first = WorkspaceStore::for_config_path(&config_path);
-        let binding_id = first.binding_id().expect("default binding");
-        let conn = open_db(&db_path).expect("open scoped database");
-        let imported_name: String = conn
-            .query_row(
-                "SELECT name FROM workspace_sessions WHERE binding_id = ?1",
-                [binding_id],
-                |row| row.get(0),
-            )
-            .expect("imported session");
-        assert_eq!(imported_name, "project/main");
-        let mut order =
-            crate::session_order::SessionOrderStore::for_binding(&config_path, binding_id);
-        assert_eq!(order.sync_sessions(["project/main"]), vec!["project/main"]);
-        let mut names =
-            crate::session_names::SessionNameStore::for_binding(&config_path, binding_id);
-        let name = names
-            .observe_session("$1", "project/main", "/repo")
-            .expect("imported generated name");
-        assert!(!name.explicit);
-        assert_eq!(name.generated_name, "project/main");
-        let explicit_name = names
-            .observe_session("$2", "release", "/release")
-            .expect("imported explicit name");
-        assert!(explicit_name.explicit);
-        assert_eq!(explicit_name.generated_name, "project/release");
-
-        conn.execute(
-            "UPDATE sessions SET name = 'changed' WHERE name = 'project/main'",
-            [],
-        )
-        .expect("mutate legacy session");
-        conn.execute(
-            "UPDATE session_name_metadata SET generated_name = 'changed' WHERE session_id = '$1'",
-            [],
-        )
-        .expect("mutate legacy metadata");
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        assert_eq!(reopened.binding_id(), Some(binding_id));
-        let conn = open_db(&db_path).expect("open unchanged scoped database");
-        let scoped_name: String = conn
-            .query_row(
-                "SELECT name FROM workspace_sessions WHERE binding_id = ?1",
-                [binding_id],
-                |row| row.get(0),
-            )
-            .expect("scoped session");
-        let generated_name: String = conn
-            .query_row(
-                "SELECT generated_name FROM workspace_session_name_metadata WHERE binding_id = ?1",
-                [binding_id],
-                |row| row.get(0),
-            )
-            .expect("scoped metadata");
-
-        assert_eq!(scoped_name, "project/main");
-        assert_eq!(generated_name, "project/main");
-    }
-
-    #[test]
-    fn host_snapshot_round_trips_window_and_binding_selection() {
-        let config_path = temp_config_path("host-snapshot");
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-        let first = store.spaces()[0].id();
-        let second = store
-            .create_space(
-                "Review",
-                DEFAULT_SPACE_ICON,
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride {
-                    backend: Some(MultiplexerBackendConfig::Tmux),
-                    remote: SpaceRemoteOverride::Inherit,
-                },
-                &MultiplexerConfig::default(),
-            )
-            .expect("create second space")
-            .expect("space");
-        let scope = second.bindings()[0].mux_scope();
-
-        store
-            .set_selected_space("window-a", second.id())
-            .expect("select second space");
-        store
-            .set_selected_space("window-b", first)
-            .expect("select first space");
-        assert!(
-            store
-                .set_binding_restore_state(scope, true, Some("$review"), Some("@2"))
-                .expect("persist binding state")
-        );
-
-        let reopened = WorkspaceStore::for_config_path(&config_path);
-        assert_eq!(
-            reopened.selected_space("window-a").expect("window a"),
-            Some(second.id())
-        );
-        assert_eq!(
-            reopened.selected_space("window-b").expect("window b"),
-            Some(first)
-        );
-        let binding = &reopened.spaces()[1].bindings()[0];
-        assert!(binding.unavailable());
-        let selection = binding.selection().expect("selection");
-        assert_eq!(selection.session_id(), "$review");
-        assert_eq!(selection.window_id(), Some("@2"));
-    }
-
-    #[test]
-    fn unavailable_binding_metadata_survives_reopen_and_reconnect() {
-        let config_path = temp_config_path("unavailable");
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-        let scope = store.binding().expect("binding").mux_scope();
-        store
-            .set_binding_restore_state(scope, true, Some("$1"), None)
-            .expect("mark unavailable");
-
-        let mut reopened = WorkspaceStore::for_config_path(&config_path);
-        assert!(reopened.binding().expect("binding").unavailable());
-        reopened
-            .set_binding_restore_state(scope, false, Some("$1"), Some("@1"))
-            .expect("mark available");
-
-        let restored = WorkspaceStore::for_config_path(&config_path);
-        let binding = restored.binding().expect("binding");
-        assert!(!binding.unavailable());
-        assert_eq!(
-            binding
-                .selection()
-                .and_then(WorkspaceBindingSelection::window_id),
-            Some("@1")
-        );
-    }
-
-    #[test]
-    fn future_snapshot_revision_fails_without_mutating_the_database() {
-        let config_path = temp_config_path("future-revision");
-        let store = WorkspaceStore::for_config_path(&config_path);
-        let path = store.path().to_path_buf();
-        let conn = open_db(&path).expect("open workspace database");
-        conn.pragma_update(None, "user_version", WORKSPACE_SNAPSHOT_REVISION + 1)
-            .expect("set future revision");
-        let before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
-                row.get(0)
-            })
-            .expect("space count");
-        drop(conn);
-
-        assert!(WorkspaceStore::load_or_migrate(&path).is_err());
-        assert!(WorkspaceStore::try_for_config_path(&config_path).is_err());
-        let conn = open_db(&path).expect("reopen workspace database");
-        let after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
-                row.get(0)
-            })
-            .expect("space count");
-        assert_eq!(after, before);
-    }
-
-    #[test]
-    fn deleted_space_remote_identity_is_not_reused() {
-        let config_path = temp_config_path("remote-id");
-        let mut store = WorkspaceStore::for_config_path(&config_path);
-        let first = store
-            .create_space(
-                "First",
-                "folder",
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride::default(),
-                &MultiplexerConfig::default(),
-            )
-            .unwrap()
-            .unwrap();
-        let first_remote_id = first.remote_id().to_owned();
-        assert!(store.delete_space(first.id()).unwrap());
-        let second = store
-            .create_space(
-                "Second",
-                "folder",
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride::default(),
-                &MultiplexerConfig::default(),
-            )
-            .unwrap()
-            .unwrap();
-
-        assert_ne!(second.remote_id(), first_remote_id);
     }
 }

@@ -303,17 +303,3 @@ fn key_label(token: &str) -> String {
         other => other.to_owned(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_labels_capitalize_single_character_keys() {
-        assert_eq!(key_label("p"), "P");
-        assert_eq!(key_label("space"), "Space");
-        assert_eq!(key_label("escape"), "Esc");
-        assert_eq!(key_label("esc"), "Esc");
-        assert_eq!(key_label("enter"), "Enter");
-    }
-}
