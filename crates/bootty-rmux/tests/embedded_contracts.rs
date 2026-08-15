@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use bootty_identity::ApplicationIdentity;
-use bootty_mux::{command::MuxCommand, provider::MuxAppBackendRegistry, terminal::ActiveTerminal};
+use bootty_mux::{command::MuxCommand, provider::MuxBackendRegistry, terminal::ActiveTerminal};
 use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 use bootty_rmux::{RmuxBackend, endpoint_path_for, start_embedded_rmux_daemon_for_tests};
 use bootty_runtime::{frame_source::TerminalFrameSource, terminal_session::TerminalSessionConfig};
@@ -26,7 +26,7 @@ fn embedded_rmux_owns_session_lifecycle_without_an_external_executable_helper() 
 
     start_embedded_rmux_daemon_for_tests()?;
     bootty_rmux::link();
-    let registry = std::sync::Arc::new(MuxAppBackendRegistry::collect([MuxBackendKind::Rmux])?);
+    let registry = std::sync::Arc::new(MuxBackendRegistry::collect([MuxBackendKind::Rmux])?);
     let session_id = format!("bootty-mux-contract-{}", std::process::id());
     let mut backend = RmuxBackend::new();
     backend.execute(MuxCommand::CreateProjectSession {
@@ -119,14 +119,14 @@ fn run_embedded_helper(name: &str) -> Result<()> {
 
 fn create_embedded_session() -> Result<(
     RmuxBackend,
-    std::sync::Arc<MuxAppBackendRegistry>,
+    std::sync::Arc<MuxBackendRegistry>,
     String,
     String,
     bootty_mux::snapshot::MuxPaneAnchor,
 )> {
     start_embedded_rmux_daemon_for_tests()?;
     bootty_rmux::link();
-    let registry = std::sync::Arc::new(MuxAppBackendRegistry::collect([MuxBackendKind::Rmux])?);
+    let registry = std::sync::Arc::new(MuxBackendRegistry::collect([MuxBackendKind::Rmux])?);
     let session_id = format!("bootty-mux-contract-{}", std::process::id());
     let mut backend = RmuxBackend::new();
     backend.execute(MuxCommand::CreateProjectSession {
@@ -146,7 +146,7 @@ fn create_embedded_session() -> Result<(
 }
 
 fn open_terminal(
-    registry: std::sync::Arc<MuxAppBackendRegistry>,
+    registry: std::sync::Arc<MuxBackendRegistry>,
     pane: &bootty_mux::snapshot::MuxPaneAnchor,
     window_id: &str,
 ) -> Result<ActiveTerminal> {

@@ -9,7 +9,7 @@ use std::{
 };
 
 use bootty_app::{
-    app::{AppState, FrameInputs, ViewportSnapshot},
+    AppState, FrameInputs, ViewportSnapshot,
     commands::CommandCatalog,
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::ViewTransform,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bootty_app::{app::AppState, config::load_config_from_path};
+use bootty_app::{AppState, config::load_config_from_path};
 
 mod support;
 

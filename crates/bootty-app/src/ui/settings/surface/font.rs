@@ -562,7 +562,7 @@ fn slider(ui: &mut egui::Ui, win: &mut SettingsWindow, row: MetricSliderRow<'_>)
             win.palette,
             &mut value,
             super::NumberEditSpec {
-                path: row.path,
+                id_salt: row.path,
                 range: row.range,
                 suffix: row.suffix,
                 precision: 1,
@@ -603,7 +603,7 @@ fn optional_slider(ui: &mut egui::Ui, win: &mut SettingsWindow, row: MetricOverr
             win.palette,
             &mut value,
             super::NumberEditSpec {
-                path: row.path,
+                id_salt: row.path,
                 range: row.range.clone(),
                 suffix: row.suffix,
                 precision: 1,

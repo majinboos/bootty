@@ -7,8 +7,8 @@ use bootty_app::{
     },
     input::resolve_modifier_remaps,
     input_binding_set::BindingSet,
-    workspace::{SessionOrderStore, WorkspaceRepository},
 };
+use bootty_workspace::{SessionOrderStore, WorkspaceRepository};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 struct BenchDir {

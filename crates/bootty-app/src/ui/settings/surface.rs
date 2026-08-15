@@ -4,7 +4,6 @@
 //! window's `ConfigHotReload` watcher then re-reads the file and applies it.
 
 mod appearance;
-mod controls;
 mod font;
 mod keybinds;
 mod modules;
@@ -14,11 +13,16 @@ mod status_bar;
 mod window;
 mod writeback;
 
-use controls::*;
-
 use std::path::PathBuf;
 
-use bootty_ui::{Theme, ThemePalette, contrast_ratio, icons, readable_color};
+use bootty_ui::settings::{
+    ComboStyle, DragHandle, NumberEditSpec, apply_reorder, described_combo, path_row,
+    reorderable_list, searchable_combo, section, settings_button, settings_color_picker,
+    settings_icon_button, settings_notice, settings_number_edit, settings_page_header,
+    settings_row, settings_segmented, settings_segmented_ltr, settings_slider_with_edit,
+    settings_text_edit, settings_text_edit_width, settings_toggle, settings_toggle_row,
+};
+use bootty_ui::{Theme, ThemePalette, icons, readable_color};
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, UiBuilder, Vec2};
 
 use crate::{
@@ -616,7 +620,7 @@ impl SettingsSurface {
                         })
                         .show(ui, |ui| {
                             let meta = page_meta(self.page);
-                            settings_page_header(ui, self.palette, meta.title);
+                            settings_page_header(ui, self.palette, "Bootty Settings", meta.title);
                             if let Some(error) = self.writeback.last_error().map(str::to_owned) {
                                 settings_notice(
                                     ui,
@@ -787,7 +791,7 @@ impl SettingsSurface {
                     self.palette,
                     &mut width,
                     NumberEditSpec {
-                        path: &["chrome", "sidebar-width"],
+                        id_salt: &["chrome", "sidebar-width"],
                         range: 120.0..=600.0,
                         suffix: " px",
                         precision: 1,
@@ -1125,7 +1129,7 @@ fn chrome_color_row_with_alpha(
             win.palette,
             &mut opacity,
             NumberEditSpec {
-                path,
+                id_salt: path,
                 range: 0.0..=1.0,
                 suffix: "%",
                 precision: 0,

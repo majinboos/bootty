@@ -13,7 +13,6 @@ use bootty_app::{
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
     paint_plan::PaintPlanner,
-    renderer_frame::RendererFrame,
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
     ui::{
@@ -308,35 +307,6 @@ fn bench_paint_plan_overlay_scaling(c: &mut Criterion) {
         });
     }
 }
-fn bench_renderer_frame_scaling(c: &mut Criterion) {
-    let scenario = prepared_scenarios()
-        .into_iter()
-        .find(|scenario| scenario.name == "complex_shell_180x80")
-        .expect("complex shell scenario");
-    let text_config = TerminalTextConfig::default();
-
-    for matches in [0, 64, 1_024] {
-        let mut frame = scenario.frame.clone();
-        frame.search_matches = (0..matches)
-            .map(|index| FrameSelection {
-                row: (index % usize::from(frame.rows)) as u16,
-                start_col: (index * 7 % usize::from(frame.cols)) as u16,
-                end_col: ((index * 7 % usize::from(frame.cols)) + 4)
-                    .min(usize::from(frame.cols) - 1) as u16,
-            })
-            .collect();
-        c.bench_function(&format!("renderer_frame_overlay_matches_{matches}"), |b| {
-            b.iter(|| {
-                black_box(RendererFrame::from_terminal(
-                    black_box(&frame),
-                    scenario.surface,
-                    &text_config,
-                ))
-            })
-        });
-    }
-}
-
 /// NOTE: bootty currently reports `Dirty::Full` with every row dirty for any
 /// edit (see the `dirty_tracking` characterization test in bootty-terminal), so
 /// the `one_row` arm exercises a full-dirty frame and tracks `full` today. It
@@ -643,7 +613,6 @@ fn bench_sidebar_ui(c: &mut Criterion) {
                                     separator_visible: true,
                                     focused: false,
                                     hovered_session: None,
-                                    unfocused_dim: 0.0,
                                     fullscreen: false,
                                     hover_override: None,
                                     current_override: None,
@@ -710,7 +679,6 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
                                     separator_visible: true,
                                     focused: false,
                                     hovered_session: None,
-                                    unfocused_dim: 0.0,
                                     fullscreen: false,
                                     hover_override: None,
                                     current_override: None,
@@ -797,7 +765,6 @@ config = Criterion::default().noise_threshold(0.15);
 targets =
     bench_paint_plan,
     bench_paint_plan_overlay_scaling,
-    bench_renderer_frame_scaling,
     bench_paint_plan_dirty_scope,
     bench_extract_frame,
     bench_extract_frame_one_row_mutate,

@@ -8,7 +8,7 @@ use std::{
 };
 
 use bootty_app::{
-    app::AppState,
+    AppState,
     config::{BoottyConfig, MultiplexerBackendConfig, load_config_from_path},
     geometry::TerminalGeometry,
     platform::native_options_for_config,

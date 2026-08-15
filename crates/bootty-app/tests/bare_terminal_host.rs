@@ -416,6 +416,23 @@ fn bare_host_render_frame_preserves_terminal_text_commands_without_egui_callback
 }
 
 #[test]
+fn bare_host_uses_minimum_contrast_for_low_contrast_text() {
+    let viewport = bare_viewport(120, 40, 10.0, 20.0);
+    let mut frame = render_frame_with_text('a');
+    frame.colors.background = rgb(12, 12, 12);
+    frame.colors.foreground = rgb(10, 10, 10);
+
+    let render_frame =
+        terminal_render_frame_for_bare_host(&frame, viewport, &TerminalTextConfig::default());
+
+    assert!(render_frame.commands.iter().any(|command| matches!(
+        command,
+        TerminalRenderCommand::Text(text)
+            if text.text == "a" && text.attrs.fg == plan_color(255, 255, 255)
+    )));
+}
+
+#[test]
 fn bare_host_routes_cursor_and_decorations_through_structured_commands() {
     let viewport = BareTerminalViewport::new(
         120,
@@ -794,6 +811,16 @@ fn bare_host_preserves_generated_256_color_palette() {
     let frame = engine.extract_frame().expect("generated palette frame");
     let render_frame =
         terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+
+    let text_commands = render_frame
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            TerminalRenderCommand::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(text_commands, ["B", "W"]);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Text(text)

@@ -1,23 +1,22 @@
 use std::collections::HashSet;
 
-use crate::{
-    config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
-    workspace::{
-        BackendMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON,
-        SessionNameStore, SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride,
-        WorkspaceBinding, WorkspaceRepository,
-    },
-};
+use crate::config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig};
 use anyhow::{Result, bail};
 pub use bootty_mux::RemoteSpaceSummary;
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
     command::MuxCommand,
+    membership::BackendMembership,
     process::{CommandRunner, SystemCommandRunner},
-    provider::MuxAppBackendRegistry,
+    provider::MuxBackendRegistry,
     snapshot::{MuxSnapshot, session_matches},
 };
 use bootty_remote::ssh::{SshRemote, remote_daemon_failure};
+use bootty_workspace::{
+    BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SessionNameStore,
+    SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride, WorkspaceBinding,
+    WorkspaceRepository,
+};
 
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
 
@@ -61,9 +60,9 @@ pub fn create(
             false,
             SpaceMuxOverride {
                 backend: Some(backend),
-                remote: crate::workspace::SpaceRemoteOverride::Local,
+                remote: SpaceRemoteOverride::Local,
             },
-            &config.multiplexer,
+            config.multiplexer.hide_tmux_status,
         )?
         .ok_or_else(|| anyhow::anyhow!("remote Space name cannot be empty"))?;
     Ok(RemoteSpaceSummary {
@@ -76,7 +75,7 @@ pub fn create(
 
 pub fn snapshot(
     config: &BoottyConfig,
-    backends: &MuxAppBackendRegistry,
+    backends: &MuxBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<MuxSnapshot> {
@@ -116,7 +115,7 @@ fn filter_snapshot_for_space(
 
 pub fn execute(
     config: &BoottyConfig,
-    backends: &MuxAppBackendRegistry,
+    backends: &MuxBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
     payload: &str,
@@ -219,7 +218,7 @@ impl RemoteSpaceRuntime {
 
 fn remote_space_runtime(
     config: &BoottyConfig,
-    backends: &MuxAppBackendRegistry,
+    backends: &MuxBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<RemoteSpaceRuntime> {

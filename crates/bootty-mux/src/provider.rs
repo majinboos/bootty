@@ -2,9 +2,12 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Result, bail};
 use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
+#[cfg(feature = "app")]
 use strum::IntoEnumIterator;
 
-use crate::{backend::MuxBackend, command::MuxCommand};
+use crate::backend::MuxBackend;
+#[cfg(feature = "app")]
+use crate::command::MuxCommand;
 #[cfg(feature = "app")]
 use crate::{
     capability::{
@@ -110,38 +113,74 @@ pub trait MuxAppBackendProvider: MuxBackendProvider {
     fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor;
 }
 
+#[derive(Clone)]
+pub struct MuxBackendEntry {
+    core: Arc<dyn MuxBackendProvider>,
+    #[cfg(feature = "app")]
+    app: Option<Arc<dyn MuxAppBackendProvider>>,
+}
+
+impl MuxBackendEntry {
+    #[cfg(feature = "app")]
+    pub fn from_app_provider<P>(provider: Arc<P>) -> Self
+    where
+        P: MuxAppBackendProvider + 'static,
+    {
+        let core: Arc<dyn MuxBackendProvider> = provider.clone();
+        let app: Arc<dyn MuxAppBackendProvider> = provider;
+        Self {
+            core,
+            app: Some(app),
+        }
+    }
+
+    #[cfg(not(feature = "app"))]
+    pub fn from_core_provider(provider: Arc<dyn MuxBackendProvider>) -> Self {
+        Self { core: provider }
+    }
+
+    #[cfg(feature = "app")]
+    pub fn from_core_provider(provider: Arc<dyn MuxBackendProvider>) -> Self {
+        Self {
+            core: provider,
+            app: None,
+        }
+    }
+}
+
 pub struct MuxBackendRegistration {
-    pub constructor: fn() -> Arc<dyn MuxBackendProvider>,
+    pub constructor: fn() -> MuxBackendEntry,
 }
 
 inventory::collect!(MuxBackendRegistration);
 
 #[cfg(feature = "app")]
-pub struct MuxAppBackendRegistration {
-    pub constructor: fn() -> Arc<dyn MuxAppBackendProvider>,
-}
-
-#[cfg(feature = "app")]
-inventory::collect!(MuxAppBackendRegistration);
-
 #[macro_export]
 macro_rules! register_mux_backend {
     ($provider:expr) => {
         inventory::submit! {
             $crate::provider::MuxBackendRegistration {
-                constructor: || std::sync::Arc::new($provider),
+                constructor: || {
+                    $crate::provider::MuxBackendEntry::from_app_provider(
+                        std::sync::Arc::new($provider),
+                    )
+                },
             }
         }
     };
 }
 
-#[cfg(feature = "app")]
+#[cfg(not(feature = "app"))]
 #[macro_export]
-macro_rules! register_mux_app_backend {
+macro_rules! register_mux_backend {
     ($provider:expr) => {
         inventory::submit! {
-            $crate::provider::MuxAppBackendRegistration {
-                constructor: || std::sync::Arc::new($provider),
+            $crate::provider::MuxBackendRegistration {
+                constructor: || {
+                    $crate::provider::MuxBackendEntry::from_core_provider(
+                        std::sync::Arc::new($provider),
+                    )
+                },
             }
         }
     };
@@ -149,27 +188,63 @@ macro_rules! register_mux_app_backend {
 
 #[derive(Clone)]
 pub struct MuxBackendRegistry {
-    providers: Arc<HashMap<MuxBackendKind, Arc<dyn MuxBackendProvider>>>,
+    providers: Arc<HashMap<MuxBackendKind, MuxBackendEntry>>,
 }
 
 impl MuxBackendRegistry {
     pub fn collect(required: impl IntoIterator<Item = MuxBackendKind>) -> Result<Self> {
-        Self::from_providers(
+        Self::from_entries(
             inventory::iter::<MuxBackendRegistration>
                 .into_iter()
                 .map(|registration| (registration.constructor)()),
             required,
+            cfg!(feature = "app"),
         )
     }
 
-    pub fn from_providers(
+    pub fn from_core_providers(
         providers: impl IntoIterator<Item = Arc<dyn MuxBackendProvider>>,
         required: impl IntoIterator<Item = MuxBackendKind>,
     ) -> Result<Self> {
+        Self::from_entries(
+            providers
+                .into_iter()
+                .map(MuxBackendEntry::from_core_provider),
+            required,
+            false,
+        )
+    }
+
+    #[cfg(feature = "app")]
+    pub fn from_app_providers<P>(
+        providers: impl IntoIterator<Item = Arc<P>>,
+        required: impl IntoIterator<Item = MuxBackendKind>,
+    ) -> Result<Self>
+    where
+        P: MuxAppBackendProvider + 'static,
+    {
+        Self::from_entries(
+            providers
+                .into_iter()
+                .map(MuxBackendEntry::from_app_provider),
+            required,
+            true,
+        )
+    }
+
+    fn from_entries(
+        entries: impl IntoIterator<Item = MuxBackendEntry>,
+        required: impl IntoIterator<Item = MuxBackendKind>,
+        _require_app: bool,
+    ) -> Result<Self> {
         let mut by_kind = HashMap::new();
-        for provider in providers {
-            let kind = provider.kind();
-            if by_kind.insert(kind, provider).is_some() {
+        for entry in entries {
+            let kind = entry.core.kind();
+            #[cfg(feature = "app")]
+            if _require_app && entry.app.is_none() {
+                bail!("missing app mux backend provider for {kind:?}")
+            }
+            if by_kind.insert(kind, entry).is_some() {
                 bail!("duplicate mux backend provider for {kind:?}")
             }
         }
@@ -204,6 +279,7 @@ impl MuxBackendRegistry {
         self.providers
             .get(&kind)
             .expect("validated mux backend registry lost a provider")
+            .core
             .build_backend(config, workspace)
     }
 
@@ -212,105 +288,40 @@ impl MuxBackendRegistry {
         self.providers
             .get(&kind)
             .expect("validated mux backend registry lost a provider")
+            .core
             .command_dispatch()
     }
-}
 
-#[cfg(feature = "app")]
-#[derive(Clone)]
-pub struct MuxAppBackendRegistry {
-    core: MuxBackendRegistry,
-    providers: Arc<HashMap<MuxBackendKind, Arc<dyn MuxAppBackendProvider>>>,
-}
-
-#[cfg(feature = "app")]
-impl MuxAppBackendRegistry {
-    pub fn collect(required: impl IntoIterator<Item = MuxBackendKind>) -> Result<Self> {
-        let required = required.into_iter().collect::<Vec<_>>();
-        Self::from_providers(
-            inventory::iter::<MuxBackendRegistration>
-                .into_iter()
-                .map(|registration| (registration.constructor)()),
-            inventory::iter::<MuxAppBackendRegistration>
-                .into_iter()
-                .map(|registration| (registration.constructor)()),
-            required,
-        )
-    }
-
+    #[cfg(feature = "app")]
     pub fn desktop() -> Result<Self> {
         Self::collect(MuxBackendKind::iter())
     }
 
-    pub fn from_providers(
-        core_providers: impl IntoIterator<Item = Arc<dyn MuxBackendProvider>>,
-        app_providers: impl IntoIterator<Item = Arc<dyn MuxAppBackendProvider>>,
-        required: impl IntoIterator<Item = MuxBackendKind>,
-    ) -> Result<Self> {
-        let required = required.into_iter().collect::<Vec<_>>();
-        let core = MuxBackendRegistry::from_providers(core_providers, required.iter().copied())?;
-        let mut by_kind = HashMap::new();
-        for provider in app_providers {
-            let kind = provider.kind();
-            if !core.providers.contains_key(&kind) {
-                bail!("app mux backend provider for {kind:?} has no core provider")
-            }
-            if by_kind.insert(kind, provider).is_some() {
-                bail!("duplicate app mux backend provider for {kind:?}")
-            }
-        }
-        for kind in required {
-            if !by_kind.contains_key(&kind) {
-                bail!("missing app mux backend provider for {kind:?}")
-            }
-        }
-        Ok(Self {
-            core,
-            providers: Arc::new(by_kind),
-        })
-    }
-
-    pub fn selected_kind(&self, config: &MuxBindingConfig) -> MuxBackendKind {
-        self.core.selected_kind(config)
-    }
-
-    pub fn build_backend(
-        &self,
-        config: &MuxBindingConfig,
-        workspace: Option<&Path>,
-    ) -> Box<dyn MuxBackend> {
-        self.core.build_backend(config, workspace)
-    }
-
-    pub fn build_backend_for_kind(
-        &self,
-        kind: MuxBackendKind,
-        config: &MuxBindingConfig,
-        workspace: Option<&Path>,
-    ) -> Box<dyn MuxBackend> {
-        self.core.build_backend_for_kind(kind, config, workspace)
-    }
-
-    pub fn command_dispatch(&self, config: &MuxBindingConfig) -> MuxCommandDispatch {
-        self.core.command_dispatch(config)
-    }
-
+    #[cfg(feature = "app")]
     pub fn build_pane_policy(&self, config: &MuxBindingConfig) -> Box<dyn BackendPanePolicy> {
         let kind = self.selected_kind(config);
         self.providers
             .get(&kind)
-            .expect("validated app mux backend registry lost a provider")
+            .expect("validated mux backend registry lost a provider")
+            .app
+            .as_ref()
+            .expect("validated mux backend registry lost app policy")
             .build_pane_policy(config)
     }
 
+    #[cfg(feature = "app")]
     pub fn app_policy(&self, config: &MuxBindingConfig) -> MuxAppBackendPolicy {
         let kind = self.selected_kind(config);
         self.providers
             .get(&kind)
-            .expect("validated app mux backend registry lost a provider")
+            .expect("validated mux backend registry lost a provider")
+            .app
+            .as_ref()
+            .expect("validated mux backend registry lost app policy")
             .app_policy()
     }
 
+    #[cfg(feature = "app")]
     pub fn capabilities(
         &self,
         config: &MuxBindingConfig,
@@ -320,9 +331,13 @@ impl MuxAppBackendRegistry {
         self.providers
             .get(&kind)
             .expect("validated mux backend registry lost a provider")
+            .app
+            .as_ref()
+            .expect("validated mux backend registry lost app policy")
             .capabilities(scope)
     }
 
+    #[cfg(feature = "app")]
     pub fn execute_checked(
         &self,
         config: &MuxBindingConfig,

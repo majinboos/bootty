@@ -23,7 +23,7 @@ use bootty_terminal::{
 
 use crate::{
     controller::MuxScope,
-    provider::{MuxAppBackendRegistry, PaneBehavior, PaneTopology},
+    provider::{MuxBackendRegistry, PaneBehavior, PaneTopology},
     snapshot::MuxPaneAnchor,
 };
 
@@ -56,7 +56,7 @@ pub trait BackendPanePolicy: Send {
 
 #[derive(Deref, DerefMut)]
 pub struct BackendPaneTerminal {
-    registry: Arc<MuxAppBackendRegistry>,
+    registry: Arc<MuxBackendRegistry>,
     policy_kind: MuxBackendKind,
     policy: Box<dyn BackendPanePolicy>,
     behavior: PaneBehavior,
@@ -342,7 +342,7 @@ impl TerminalRuntime for TerminalSession {
 impl BackendPaneTerminal {
     pub fn new(
         geometry: TerminalGeometry,
-        registry: Arc<MuxAppBackendRegistry>,
+        registry: Arc<MuxBackendRegistry>,
         config: &MuxBindingConfig,
         terminal_config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -363,7 +363,7 @@ impl BackendPaneTerminal {
 
     fn new_with_policy(
         geometry: TerminalGeometry,
-        registry: Arc<MuxAppBackendRegistry>,
+        registry: Arc<MuxBackendRegistry>,
         policy_kind: MuxBackendKind,
         policy: Box<dyn BackendPanePolicy>,
         behavior: PaneBehavior,

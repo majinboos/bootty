@@ -103,7 +103,5 @@ impl MuxBackend for FailedBackend {
 }
 
 bootty_mux::register_mux_backend!(ZellijProvider);
-#[cfg(feature = "app")]
-bootty_mux::register_mux_app_backend!(ZellijProvider);
 
 pub fn link() {}

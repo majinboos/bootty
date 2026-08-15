@@ -676,6 +676,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bootty-app",
+ "bootty-cli",
  "bootty-command",
  "bootty-control",
  "bootty-extension",
@@ -715,9 +716,9 @@ dependencies = [
  "bootty-tmux",
  "bootty-ui",
  "bootty-winit",
+ "bootty-workspace",
  "bootty-workspace-hack",
  "bootty-zellij",
- "clap",
  "criterion",
  "eframe",
  "egui",
@@ -726,20 +727,32 @@ dependencies = [
  "keepawake",
  "libghostty-vt",
  "muda",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
  "png",
  "pollster 0.4.0",
  "rusqlite",
- "self_update",
- "serde",
  "serde_json",
  "strum",
  "tempfile",
  "ttf-parser",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "bootty-cli"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "bootty-config",
+ "bootty-font",
+ "bootty-identity",
+ "bootty-mux-model",
+ "bootty-runtime",
+ "bootty-terminal",
+ "bootty-workspace-hack",
+ "clap",
+ "self_update",
+ "tempfile",
 ]
 
 [[package]]
@@ -998,7 +1011,6 @@ dependencies = [
  "bootty-workspace-hack",
  "serde_json",
  "tempfile",
- "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -1036,9 +1048,25 @@ dependencies = [
  "bootty-terminal",
  "eframe",
  "libghostty-vt",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "pollster 0.4.0",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "bootty-workspace"
+version = "0.4.0"
+dependencies = [
+ "bootty-config",
+ "bootty-mux",
+ "bootty-workspace-hack",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

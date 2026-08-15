@@ -2,6 +2,8 @@ use bootty_extension::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModulePrimi
 use bootty_ui::{icons::paint_icon_slug, readable_color};
 use eframe::egui::{self, Pos2, Rect, Stroke, StrokeKind};
 
+use crate::theme::module_color32;
+
 fn coord_x(rect: Rect, coord: ModuleCoord) -> f32 {
     rect.min.x + rect.width() * coord.frac + coord.px
 }
@@ -16,10 +18,6 @@ fn coord_w(rect: Rect, coord: ModuleCoord) -> f32 {
 
 fn coord_h(rect: Rect, coord: ModuleCoord) -> f32 {
     rect.height() * coord.frac + coord.px
-}
-
-fn color(value: ModuleColor) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
 }
 
 fn corner_radius(value: ModuleCornerRadius) -> egui::CornerRadius {
@@ -62,7 +60,7 @@ pub(super) fn paint_item_primitives(
 ) {
     let dim = |color: egui::Color32| blend_toward(color, background, keep);
     let resolve = |value: &Option<ModuleColor>| {
-        let value = value.map_or(default_color, color);
+        let value = value.map_or(default_color, module_color32);
         let value = if respect_color {
             value
         } else {
@@ -86,13 +84,13 @@ pub(super) fn paint_item_primitives(
                     egui::vec2(coord_w(item_rect, *w), coord_h(item_rect, *h)),
                 );
                 if let Some(fill) = fill {
-                    painter.rect_filled(rect, corner_radius(*radius), dim(color(*fill)));
+                    painter.rect_filled(rect, corner_radius(*radius), dim(module_color32(*fill)));
                 }
                 if let Some(stroke) = stroke {
                     painter.rect_stroke(
                         rect,
                         corner_radius(*radius),
-                        Stroke::new(1.0, dim(color(*stroke))),
+                        Stroke::new(1.0, dim(module_color32(*stroke))),
                         StrokeKind::Inside,
                     );
                 }
@@ -110,14 +108,14 @@ pub(super) fn paint_item_primitives(
                     if let Some(fill) = fill {
                         painter.add(egui::Shape::convex_polygon(
                             points.clone(),
-                            dim(color(*fill)),
+                            dim(module_color32(*fill)),
                             Stroke::new(0.0, egui::Color32::TRANSPARENT),
                         ));
                     }
                     if let Some(stroke) = stroke {
                         painter.add(egui::Shape::closed_line(
                             points,
-                            Stroke::new(1.0, dim(color(*stroke))),
+                            Stroke::new(1.0, dim(module_color32(*stroke))),
                         ));
                     }
                 }
@@ -249,7 +247,7 @@ pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egu
                 && h.frac == 1.0
                 && h.px == 0.0 =>
             {
-                Some(color(*fill))
+                Some(module_color32(*fill))
             }
             ModulePrimitive::Rect { .. }
             | ModulePrimitive::Polygon { .. }
@@ -261,7 +259,7 @@ pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egu
                 .iter()
                 .rev()
                 .find_map(|primitive| match primitive {
-                    ModulePrimitive::Rect { fill, .. } => fill.map(color),
+                    ModulePrimitive::Rect { fill, .. } => fill.map(module_color32),
                     ModulePrimitive::Polygon { .. }
                     | ModulePrimitive::Text { .. }
                     | ModulePrimitive::Icon { .. } => None,
@@ -272,7 +270,7 @@ pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egu
                 .iter()
                 .rev()
                 .find_map(|primitive| match primitive {
-                    ModulePrimitive::Polygon { fill, .. } => fill.map(color),
+                    ModulePrimitive::Polygon { fill, .. } => fill.map(module_color32),
                     ModulePrimitive::Rect { .. }
                     | ModulePrimitive::Text { .. }
                     | ModulePrimitive::Icon { .. } => None,

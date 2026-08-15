@@ -1,15 +1,21 @@
 use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 use bootty_app::commands::{CommandCatalog, CommandExecutor};
 use bootty_app::{
-    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
+    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::ViewTransform,
     renderer::RendererMetrics,
-    ui::new_session_picker::NewSessionPickerEvent,
+    ui::{
+        ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
+        new_session_picker::NewSessionPickerEvent,
+    },
 };
 use bootty_command::{
     AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandCancellation,
@@ -17,6 +23,8 @@ use bootty_command::{
     app_command_channel as command_channel,
 };
 use bootty_extension::{ExtensionHost, event_queue};
+use bootty_workspace::WorkspaceRepository;
+use rusqlite::Connection;
 
 mod support;
 
@@ -279,6 +287,241 @@ fn native_split_command_publishes_the_binding_owned_layout() {
         3,
         "unsupported mux commands must not mutate the native layout"
     );
+}
+
+#[test]
+fn ditch_session_commits_membership_after_authoritative_command() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let started = Instant::now();
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
+    let created = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_tab", Caller::Socket),
+        started,
+    );
+    assert!(
+        matches!(created, CommandOutcome::Success { .. }),
+        "{created:?}"
+    );
+
+    let target = (0..250)
+        .find_map(|tick| {
+            state.update_frame(frame(started + Duration::from_millis(250 + tick)));
+            std::thread::sleep(Duration::from_millis(1));
+            state
+                .binding_session_groups()
+                .into_iter()
+                .find_map(|group| group.sessions.first().map(|session| group.target(session)))
+        })
+        .expect("native session becomes available");
+    let original_name = state
+        .binding_session_groups()
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .find(|session| session.id == target.session_id)
+        .expect("live session")
+        .name
+        .clone();
+
+    assert!(state.open_ditch_session_dialog_for(&target.session_id));
+    let ModalDialog::DitchSession(dialog) = state.take_modal_dialog().expect("ditch dialog") else {
+        panic!("expected ditch dialog");
+    };
+    state.apply_ditch_session_event(
+        dialog,
+        DitchSessionEvent::Ditch {
+            session_id: target.session_id.clone(),
+            cwd: None,
+            action: DitchAction::KillOnly,
+        },
+    );
+
+    let removed = (0..250).any(|tick| {
+        state.update_frame(frame(started + Duration::from_millis(500 + tick)));
+        std::thread::sleep(Duration::from_millis(1));
+        !state
+            .binding_session_groups()
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .any(|session| session.id == target.session_id)
+    });
+    assert!(
+        removed,
+        "authoritative ditch result must remove the live session"
+    );
+
+    drop(state);
+    let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
+    assert!(
+        !reopened.spaces()[0].bindings()[0]
+            .session_order()
+            .session_names()
+            .contains(&original_name)
+    );
+}
+
+#[test]
+fn ditch_submits_after_worktree_removal_when_branch_deletion_fails() {
+    let (_repository, main, worktree, duplicate) = repo_with_duplicate_branch();
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config = BoottyConfig {
+        config_path: directory.path().join("config.toml"),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let started = Instant::now();
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
+    let open = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_mux_session", Caller::Socket),
+        started,
+    );
+    assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
+    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
+    else {
+        panic!("expected new session dialog");
+    };
+    state.apply_picker_event(
+        dialog,
+        NewSessionPickerEvent::CreateSession {
+            cwd: worktree.to_string_lossy().into_owned(),
+        },
+    );
+    for tick in 1..5 {
+        state.update_frame(frame(started + Duration::from_millis(tick)));
+    }
+    let session_id = state.mux().sessions()[0].id.clone();
+
+    let cwd = worktree.to_string_lossy().into_owned();
+    let action = DitchAction::RemoveWorktreeAndBranch {
+        force: true,
+        branch: "feature".to_owned(),
+        repo: main.to_string_lossy().into_owned(),
+    };
+    let ditch_event = || DitchSessionEvent::Ditch {
+        session_id: session_id.clone(),
+        cwd: Some(cwd.clone()),
+        action: action.clone(),
+    };
+    let database = directory.path().join("session-order.sqlite3");
+    let lock = Connection::open(&database).expect("open lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold workspace write lock");
+    state.apply_ditch_session_event(
+        DitchSessionDialog::open(session_id.clone(), Some(cwd.clone())),
+        ditch_event(),
+    );
+    assert!(
+        worktree.exists(),
+        "failed Ditch preparation must not remove the worktree"
+    );
+    let reopened = match state.take_modal_dialog() {
+        Some(ModalDialog::DitchSession(dialog)) => dialog,
+        _ => panic!("expected reopened Ditch dialog"),
+    };
+    lock.execute_batch("ROLLBACK")
+        .expect("release workspace write lock");
+    drop(lock);
+
+    state.apply_ditch_session_event(reopened, ditch_event());
+
+    assert!(!worktree.exists(), "ditch must remove the linked worktree");
+    assert!(
+        state
+            .last_error()
+            .is_some_and(|warning| warning.contains("branch 'feature' remains")),
+        "partial cleanup warning must name the remaining branch"
+    );
+    assert!(
+        (0..250).any(|tick| {
+            state.update_frame(frame(started + Duration::from_millis(10 + tick)));
+            std::thread::sleep(Duration::from_millis(1));
+            !state
+                .binding_session_groups()
+                .iter()
+                .flat_map(|group| group.sessions.iter())
+                .any(|session| session.id == session_id)
+        }),
+        "partial cleanup must still submit Ditch"
+    );
+    assert!(duplicate.exists(), "duplicate branch checkout must remain");
+    assert!(git_read(&main, &["branch", "--list", "feature"]).contains("feature"));
+}
+
+fn repo_with_duplicate_branch() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().expect("temporary repository root");
+    let main = root.path().join("main");
+    let worktree = root.path().join("worktree");
+    let duplicate = root.path().join("duplicate");
+    fs::create_dir(&main).expect("create main worktree");
+    git_ok(&main, &["init", "-q", "-b", "main"]);
+    git_ok(&main, &["config", "user.email", "test@bootty.dev"]);
+    git_ok(&main, &["config", "user.name", "Bootty Test"]);
+    fs::write(main.join("README"), "hello").expect("write initial file");
+    git_ok(&main, &["add", "."]);
+    git_ok(&main, &["commit", "-q", "-m", "init"]);
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().expect("UTF-8 worktree path"),
+        ],
+    );
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--force",
+            duplicate.to_str().expect("UTF-8 duplicate path"),
+            "feature",
+        ],
+    );
+    (root, main, worktree, duplicate)
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_read(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 #[test]

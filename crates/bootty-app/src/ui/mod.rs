@@ -12,3 +12,8 @@ pub mod sidebar;
 pub mod space;
 pub mod terminal_find;
 pub mod theme_picker;
+
+mod dialog_runtime;
+
+pub(crate) use dialog_runtime::DialogRuntime;
+pub use dialog_runtime::ModalDialog;

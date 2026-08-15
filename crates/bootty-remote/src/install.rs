@@ -65,52 +65,44 @@ impl RemoteTarget {
     }
 }
 
-trait ArtifactProvider {
-    fn daemon(&self, target: RemoteTarget) -> Result<PathBuf>;
-}
-
-struct ReleaseArtifacts;
-
-impl ArtifactProvider for ReleaseArtifacts {
-    fn daemon(&self, target: RemoteTarget) -> Result<PathBuf> {
-        let executable = std::env::current_exe().context("resolve Bootty executable")?;
-        if let Some(daemon) = bundled_daemon(&executable, target) {
-            return Ok(daemon);
-        }
-        let asset = target.asset_name();
-        let release = format!("v{}", env!("CARGO_PKG_VERSION"));
-        let root = format!(
-            "https://github.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}/releases/download/{release}"
-        );
-        let checksums = String::from_utf8(download(&format!("{root}/SHA256SUMS"))?)
-            .context("decode daemon checksums")?;
-        let expected = checksums
-            .lines()
-            .find_map(|line| {
-                let (checksum, name) = line.split_once(char::is_whitespace)?;
-                (name.trim_start_matches([' ', '*']) == asset).then_some(checksum)
-            })
-            .with_context(|| format!("SHA256SUMS has no entry for {asset}"))?;
-        let cache = daemon_cache_dir()?.join(env!("CARGO_PKG_VERSION"));
-        prepare_private_cache_dir(&cache)?;
-        let _cache_lock = lock_cache(&cache)?;
-        let path = cache.join(&asset);
-        if verified_cached_daemon(&path, expected)? {
-            return Ok(path);
-        }
-        let bytes =
-            download(&format!("{root}/{asset}")).with_context(|| format!("download {asset}"))?;
-        if checksum(&bytes) != expected {
-            bail!("checksum mismatch for {asset}")
-        }
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let temporary = path.with_extension(format!("{}-{nonce}.download", std::process::id()));
-        write_private_file(&temporary, &bytes)?;
-        publish_cached_daemon(&temporary, &path, expected)?;
-        Ok(path)
+fn release_daemon(target: RemoteTarget) -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("resolve Bootty executable")?;
+    if let Some(daemon) = bundled_daemon(&executable, target) {
+        return Ok(daemon);
     }
+    let asset = target.asset_name();
+    let release = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let root = format!(
+        "https://github.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}/releases/download/{release}"
+    );
+    let checksums = String::from_utf8(download(&format!("{root}/SHA256SUMS"))?)
+        .context("decode daemon checksums")?;
+    let expected = checksums
+        .lines()
+        .find_map(|line| {
+            let (checksum, name) = line.split_once(char::is_whitespace)?;
+            (name.trim_start_matches([' ', '*']) == asset).then_some(checksum)
+        })
+        .with_context(|| format!("SHA256SUMS has no entry for {asset}"))?;
+    let cache = daemon_cache_dir()?.join(env!("CARGO_PKG_VERSION"));
+    prepare_private_cache_dir(&cache)?;
+    let _cache_lock = lock_cache(&cache)?;
+    let path = cache.join(&asset);
+    if verified_cached_daemon(&path, expected)? {
+        return Ok(path);
+    }
+    let bytes =
+        download(&format!("{root}/{asset}")).with_context(|| format!("download {asset}"))?;
+    if checksum(&bytes) != expected {
+        bail!("checksum mismatch for {asset}")
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let temporary = path.with_extension(format!("{}-{nonce}.download", std::process::id()));
+    write_private_file(&temporary, &bytes)?;
+    publish_cached_daemon(&temporary, &path, expected)?;
+    Ok(path)
 }
 
 fn bundled_daemon(executable: &std::path::Path, target: RemoteTarget) -> Option<PathBuf> {
@@ -223,14 +215,10 @@ fn download(url: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn ensure<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result<()> {
-    ensure_with(remote, runner, &ReleaseArtifacts)
+    ensure_with(remote, runner)
 }
 
-fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
-    remote: &SshRemote,
-    runner: &R,
-    artifacts: &A,
-) -> Result<()> {
+fn ensure_with<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result<()> {
     let (program, args) = remote.ping_command();
     if daemon_matches(&runner.run(&program, &args)?) {
         return Ok(());
@@ -245,7 +233,7 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
     }
 
     let target = detect_target(remote, runner)?;
-    let daemon = artifacts.daemon(target)?;
+    let daemon = release_daemon(target)?;
     let installed = remote_daemon_path();
     let mut generation = [0_u8; 16];
     getrandom::fill(&mut generation).context("allocate remote daemon candidate generation")?;

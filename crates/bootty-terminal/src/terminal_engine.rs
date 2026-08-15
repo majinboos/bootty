@@ -468,6 +468,8 @@ pub struct TerminalEngine {
     current_working_directory_state: Arc<Mutex<String>>,
     side_effects: TerminalSideEffectCollector,
     terminal_write_pending: Vec<u8>,
+    synchronized_output_prefix_len: usize,
+    synchronized_output_observed: bool,
     cursor_home_pending_len: usize,
     sgr_optimizer: SgrOptimizer,
     pty_write_callback: PtyWriteCallback,
@@ -911,6 +913,8 @@ impl TerminalEngine {
             size_report_state,
             side_effects,
             terminal_write_pending: Vec::new(),
+            synchronized_output_prefix_len: 0,
+            synchronized_output_observed: false,
             cursor_home_pending_len: 0,
             sgr_optimizer: SgrOptimizer::default(),
             pty_write_callback,
@@ -936,6 +940,26 @@ impl TerminalEngine {
 
     fn mark_content_changed(&mut self) {
         self.content_epoch = self.content_epoch.wrapping_add(1);
+    }
+
+    fn observe_synchronized_output_start(&mut self, bytes: &[u8]) {
+        const START: &[u8] = b"\x1b[?2026h";
+        for byte in bytes {
+            self.synchronized_output_prefix_len =
+                if *byte == START[self.synchronized_output_prefix_len] {
+                    self.synchronized_output_prefix_len + 1
+                } else {
+                    usize::from(*byte == START[0])
+                };
+            if self.synchronized_output_prefix_len == START.len() {
+                self.synchronized_output_observed = true;
+                self.synchronized_output_prefix_len = 0;
+            }
+        }
+    }
+
+    pub fn take_synchronized_output_observed(&mut self) -> bool {
+        std::mem::take(&mut self.synchronized_output_observed)
     }
 
     pub fn begin_selection(&mut self, event: TerminalSelectionEvent) -> Result<()> {
@@ -1332,6 +1356,7 @@ impl TerminalEngine {
     }
 
     pub fn write_vt(&mut self, bytes: &[u8]) {
+        self.observe_synchronized_output_start(bytes);
         let can_fast_write = self.terminal_write_pending.is_empty()
             && !self.side_effects.has_pending_osc()
             && !contains_tracked_streaming_control(bytes);

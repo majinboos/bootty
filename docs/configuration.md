@@ -286,17 +286,3 @@ the Bootty writer lease, so writeback is not a cross-program compare-and-swap.
   `[diagnostics].stability-trace` is not set.
 - Bootty config is TOML with Ghostty-inspired vocabulary; it is not Ghostty's
   config syntax.
-
-## Manual review notes
-
-Recorded on May 19, 2026 during the config implementation branch review:
-
-- Default/no-config behavior: covered by `missing_config_file_loads_current_defaults`
-  and startup/app default tests.
-- Built-in theme smoke: covered by `builtin_theme_loads_colors_through_config_theme_name`
-  and terminal color frame tests.
-- User theme shadowing smoke: covered by `user_theme_shadows_builtin_theme_name`.
-- Reload/writeback smoke: covered by `reload_keeps_last_good_config_when_new_config_is_invalid`,
-  live keybinding/app scope tests, terminal live color tests, and round-trip
-  writeback fixtures.
-- Visual screenshot review was not captured in the headless agent environment.

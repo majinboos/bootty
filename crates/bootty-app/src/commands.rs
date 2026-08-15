@@ -15,6 +15,10 @@ use crate::{
     app_actions::{KeybindAction, SidebarAction, keybind_action_for_name},
 };
 
+mod runtime;
+
+pub(crate) use runtime::CommandRuntime;
+
 pub fn command_invocation_from_catalog(
     command: Command,
     caller: Caller,

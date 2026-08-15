@@ -18,7 +18,7 @@ use crate::{
     backend::MuxBackend,
     capability::{BindingOperation, BindingOperationOutcome},
     command::MuxCommand,
-    provider::{MuxAppBackendRegistry, MuxCommandDispatch},
+    provider::{MuxBackendRegistry, MuxCommandDispatch},
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh, session_matches},
 };
 
@@ -156,7 +156,7 @@ struct MuxCommandJob {
 }
 
 fn execute_backend_command(
-    registry: &MuxAppBackendRegistry,
+    registry: &MuxBackendRegistry,
     backend: &mut dyn MuxBackend,
     config: &MuxBindingConfig,
     scope: Option<MuxScope>,
@@ -470,7 +470,7 @@ pub struct MuxController {
     session_refresh_pending: bool,
     mux_command_tx: Option<mpsc::Sender<MuxCommandJob>>,
     mux_command_rx: Option<mpsc::Receiver<MuxCommandResult>>,
-    registry: Arc<MuxAppBackendRegistry>,
+    registry: Arc<MuxBackendRegistry>,
     workspace: Option<PathBuf>,
     command_config: Arc<Mutex<CommandConfigState>>,
 }
@@ -478,7 +478,7 @@ pub struct MuxController {
 impl MuxController {
     pub fn new(
         scope: MuxScope,
-        registry: Arc<MuxAppBackendRegistry>,
+        registry: Arc<MuxBackendRegistry>,
         workspace: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -1115,21 +1115,6 @@ impl MuxController {
             name,
         };
         self.execute_preserving_selection(repaint, config, command);
-    }
-
-    pub fn ditch_session(
-        &mut self,
-        session_id: &str,
-        repaint: &RepaintHandle,
-        config: &MuxBindingConfig,
-    ) {
-        self.execute_preserving_selection(
-            repaint,
-            config,
-            MuxCommand::DitchSession {
-                session_id: session_id.to_owned(),
-            },
-        );
     }
 
     pub fn close_pane(

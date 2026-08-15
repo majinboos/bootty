@@ -2,7 +2,7 @@ use std::{collections::HashMap, hint::black_box, path::PathBuf, sync::Arc, time:
 
 use anyhow::Result;
 use bootty_app::{
-    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
+    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::{TerminalGeometry, ViewTransform},
     mux::{
@@ -17,10 +17,10 @@ use bootty_app::{
         sidebar::build_binding_sidebar_items,
         space::SpaceEditorEvent,
     },
-    workspace::SpaceMuxOverride,
 };
 use bootty_terminal::{terminal_engine::TerminalEngine, terminal_frame::RenderFrame};
 use bootty_ui::icons;
+use bootty_workspace::SpaceMuxOverride;
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::{egui, wgpu};
 
@@ -239,7 +239,6 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, group: &BindingSessionGroup) {
                     separator_visible: true,
                     focused: false,
                     hovered_session: None,
-                    unfocused_dim: 0.0,
                     fullscreen: false,
                     hover_override: None,
                     current_override: None,

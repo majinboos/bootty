@@ -185,7 +185,6 @@ bootty-mux = { path = "crates/bootty-mux" }
 bootty-rmux = { path = "crates/bootty-rmux" }
 serde_json.workspace = true
 tempfile.workspace = true
-toml_edit.workspace = true
 
 [dependencies]
 bootty-workspace-hack = { version = "0.1", path = "crates/bootty-workspace-hack" }

@@ -24,13 +24,48 @@ impl ConfigWriteOutcome {
 }
 
 impl ConfigDocument {
+    pub fn set_f32(&mut self, path: &[&str], value: f32) -> ConfigResult<()> {
+        self.set_item(path, toml_edit::value(f64::from(value)))
+    }
+
+    pub fn set_bool(&mut self, path: &[&str], value: bool) -> ConfigResult<()> {
+        self.set_item(path, toml_edit::value(value))
+    }
+
+    pub fn set_str(&mut self, path: &[&str], value: &str) -> ConfigResult<()> {
+        self.set_item(path, toml_edit::value(value))
+    }
+
+    pub fn set_i64(&mut self, path: &[&str], value: i64) -> ConfigResult<()> {
+        self.set_item(path, toml_edit::value(value))
+    }
+
+    pub fn set_strings(&mut self, path: &[&str], values: &[String]) -> ConfigResult<()> {
+        let mut array = Array::new();
+        for value in values {
+            array.push(value.as_str());
+        }
+        self.set_item(path, toml_edit::value(array))
+    }
+
+    pub fn set_env(&mut self, path: &[&str], entries: &[(String, String)]) -> ConfigResult<()> {
+        let mut array = Array::new();
+        for (name, value) in entries {
+            let mut table = InlineTable::new();
+            table.insert("name", Value::from(name.as_str()));
+            table.insert("value", Value::from(value.as_str()));
+            array.push(table);
+        }
+        self.set_item(path, toml_edit::value(array))
+    }
+
     pub fn set_top_bar_enabled(&mut self, enabled: bool) -> ConfigResult<()> {
-        self.remove_item(&["chrome", "status-bar"])?;
-        self.set_item(&["chrome", "top-bar"], toml_edit::value(enabled))
+        self.remove(&["chrome", "status-bar"])?;
+        self.set_bool(&["chrome", "top-bar"], enabled)
     }
 
     pub fn set_top_status_segments(&mut self, segments: &[StatusSegment]) -> ConfigResult<()> {
-        self.remove_item(&["chrome", "status-segment"])?;
+        self.remove(&["chrome", "status-segment"])?;
         self.set_item(
             &["chrome", "top-segment"],
             toml_edit::value(serialize_status_segments(segments)),
@@ -102,7 +137,7 @@ impl ConfigDocument {
     }
 
     pub fn remove_ssh_profile(&mut self, id: &str) -> ConfigResult<()> {
-        self.remove_item(&["ssh-profiles", id])
+        self.remove(&["ssh-profiles", id])
     }
 }
 
@@ -187,9 +222,7 @@ pub fn write_font_size_preference(
     path: impl AsRef<Path>,
     size: f32,
 ) -> ConfigResult<ConfigWriteOutcome> {
-    update_config_document(path, |document| {
-        document.set_item(&["font", "size"], toml_edit::value(f64::from(size)))
-    })
+    update_config_document(path, |document| document.set_f32(&["font", "size"], size))
 }
 
 fn resolve_config_target(path: &Path) -> ConfigResult<WriteTarget> {

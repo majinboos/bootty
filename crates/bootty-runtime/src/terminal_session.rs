@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fmt::{self, Display, Formatter},
     io::{Read, Write},
     path::PathBuf,
@@ -13,6 +12,8 @@ use std::{
 };
 
 use crate::benchmark_trace::{BenchmarkTrace, TraceValue};
+use crate::pty_backlog::drain_pty_backlog_with_limits;
+pub use crate::pty_backlog::{DrainStats, PtyBacklog, drain_pty_backlog};
 use anyhow::{Context, Result};
 use portable_pty::{MasterPty, PtySize};
 
@@ -29,17 +30,12 @@ use bootty_terminal::{
     terminal_side_effect::deliver_terminal_side_effects,
 };
 
-pub(crate) const MAX_DRAIN_BYTES_PER_FRAME: usize = 4 * 1024 * 1024;
-pub(crate) const MAX_DRAIN_CHUNKS_PER_FRAME: usize = 32;
-pub(crate) const MAX_DRAIN_SLICE_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_DRAIN_TIME_US: u128 = 20_000;
 const INPUT_FAST_PATH_DRAIN_BYTES: usize = 64 * 1024;
 const INPUT_FAST_PATH_DRAIN_CHUNKS: usize = 8;
 const INPUT_FAST_PATH_DRAIN_TIME_US: u128 = 2_000;
 const MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
 const MAX_READER_QUEUE_CHUNKS: usize = MAX_COLLECT_CHUNKS_PER_TICK * 2;
-const CURSOR_HOME: &[u8; 3] = b"\x1b[H";
 pub use crate::terminal_launch::{BOOTTY_SHELL_ENV, configured_user_shell};
 pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_BACKLOG_FRAME_INTERVAL: Duration = Duration::from_millis(64);
@@ -98,7 +94,6 @@ pub struct TerminalSession {
     geometry: TerminalGeometry,
     display_scale: f32,
     render_cell: CellMetrics,
-    pty_master: Box<dyn MasterPty + Send>,
     child: crate::terminal_launch::OwnedChild,
     tty_name: Option<String>,
 }
@@ -243,7 +238,10 @@ enum TerminalCommand {
     DisplayScale(f32),
     RenderCellMetrics(CellMetrics),
     ApplyLiveConfig(TerminalLiveConfig),
-    Resize(TerminalGeometry),
+    Resize {
+        geometry: TerminalGeometry,
+        done: SyncSender<()>,
+    },
     Key(KeyInput),
     Focus(bool),
     Mouse(MouseInput),
@@ -301,28 +299,9 @@ impl TerminalSession {
         let (pty_tx, pty_rx) = mpsc::sync_channel(MAX_READER_QUEUE_CHUNKS);
         thread::spawn(move || {
             let mut buf = [0_u8; 8192];
-            let mut compactor = CursorHomeFloodCompactor::default();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        if let Some(bytes) = compactor.finish() {
-                            let _ = pty_tx.send(bytes);
-                        }
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Some(bytes) = compactor.compact(buf[..n].to_vec())
-                            && pty_tx.send(bytes).is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        if let Some(bytes) = compactor.finish() {
-                            let _ = pty_tx.send(bytes);
-                        }
-                        break;
-                    }
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || pty_tx.send(buf[..n].to_vec()).is_err() {
+                    break;
                 }
             }
         });
@@ -343,6 +322,7 @@ impl TerminalSession {
             features: config.features,
             max_scrollback: config.max_scrollback,
             macos_option_as_alt: config.macos_option_as_alt,
+            pty_master,
             pty_rx,
             pty_writer,
             command_rx,
@@ -367,7 +347,6 @@ impl TerminalSession {
             geometry,
             display_scale: 1.0,
             render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
-            pty_master,
             child,
             tty_name,
         })
@@ -382,13 +361,15 @@ impl TerminalSession {
             return Ok(());
         }
 
-        self.send_command(TerminalCommand::Resize(geometry))?;
-        self.pty_master.resize(PtySize {
-            rows: geometry.rows,
-            cols: geometry.cols,
-            pixel_width: geometry.pixel_width(),
-            pixel_height: geometry.pixel_height(),
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        self.send_command(TerminalCommand::Resize {
+            geometry,
+            done: done_tx,
         })?;
+        done_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("terminal worker stopped before resizing"))?;
+        self.check_worker_error()?;
         self.geometry = geometry;
 
         Ok(())
@@ -599,6 +580,7 @@ struct TerminalWorkerConfig {
     features: TerminalFeatureConfig,
     max_scrollback: usize,
     macos_option_as_alt: MacosOptionAsAlt,
+    pty_master: Box<dyn MasterPty + Send>,
     pty_rx: Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     command_rx: Receiver<TerminalCommand>,
@@ -611,6 +593,15 @@ struct TerminalWorkerConfig {
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     side_effect_pane_id: Option<String>,
     benchmark_trace: Option<BenchmarkTrace>,
+}
+
+fn pty_size(geometry: TerminalGeometry) -> PtySize {
+    PtySize {
+        rows: geometry.rows,
+        cols: geometry.cols,
+        pixel_width: geometry.pixel_width(),
+        pixel_height: geometry.pixel_height(),
+    }
 }
 
 fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
@@ -641,6 +632,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
         let _ = startup_tx.send(Ok(()));
         let mut worker = TerminalWorker {
             engine,
+            pty_master: config.pty_master,
             pty_rx: config.pty_rx,
             pty_writer: config.pty_writer,
             command_rx: config.command_rx,
@@ -655,11 +647,11 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             benchmark_trace: config.benchmark_trace,
             output_buf: Vec::with_capacity(1024),
             pending_pty: PtyBacklog::with_capacity(MAX_COLLECT_CHUNKS_PER_TICK),
+            pending_resize_ack: None,
             last_frame_publish: Instant::now() - WORKER_READY_FRAME_INTERVAL,
             has_unpublished_frame: false,
             sync_output_since: None,
             sync_output_batch_pending: false,
-            sync_output_escape_prefix_len: 0,
             last_terminal_change: None,
             force_next_frame_publish: false,
             command_disconnected: false,
@@ -684,10 +676,12 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
 
 struct TerminalWorker {
     engine: TerminalEngine,
+    pty_master: Box<dyn MasterPty + Send>,
     pty_rx: Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     command_rx: Receiver<TerminalCommand>,
     pending_command: Option<TerminalCommand>,
+    pending_resize_ack: Option<SyncSender<()>>,
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
@@ -702,7 +696,6 @@ struct TerminalWorker {
     has_unpublished_frame: bool,
     sync_output_since: Option<Instant>,
     sync_output_batch_pending: bool,
-    sync_output_escape_prefix_len: usize,
     last_terminal_change: Option<Instant>,
     force_next_frame_publish: bool,
     command_disconnected: bool,
@@ -828,12 +821,17 @@ impl TerminalWorker {
                     self.engine.set_render_cell_metrics(cell);
                     stats.terminal_changed = true;
                 }
-                TerminalCommand::Resize(geometry) => match self.engine.resize(geometry) {
-                    Ok(()) => stats.terminal_changed = true,
-                    Err(error) => self
-                        .worker_health
-                        .record(TerminalWorkerOperation::Resize, error),
-                },
+                TerminalCommand::Resize { geometry, done } => {
+                    let result = self.resize(geometry);
+                    if let Err(error) = result {
+                        self.worker_health
+                            .record(TerminalWorkerOperation::Resize, error);
+                        let _ = done.send(());
+                    } else {
+                        stats.terminal_changed = true;
+                        self.pending_resize_ack = Some(done);
+                    }
+                }
                 TerminalCommand::ApplyLiveConfig(config) => {
                     match self.engine.apply_live_config(config) {
                         Ok(()) => stats.terminal_changed = true,
@@ -1022,6 +1020,29 @@ impl TerminalWorker {
         stats
     }
 
+    fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        let previous = self.engine.geometry();
+        self.pty_master.resize(pty_size(geometry))?;
+        if let Err(error) = self.engine.resize(geometry) {
+            let engine_rollback = self.engine.resize(previous).err();
+            let pty_rollback = self.pty_master.resize(pty_size(previous)).err();
+            if engine_rollback.is_none() && pty_rollback.is_none() {
+                return Err(error);
+            }
+
+            let details = [
+                engine_rollback.map(|error| format!("engine rollback: {error}")),
+                pty_rollback.map(|error| format!("PTY rollback: {error}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            return Err(error.context(format!("resize rollback failed: {details}")));
+        }
+        Ok(())
+    }
+
     fn discard_pending_output_queue(&mut self) {
         self.pending_pty.clear();
         loop {
@@ -1037,7 +1058,6 @@ impl TerminalWorker {
         self.pending_pty_len.store(0, Ordering::Relaxed);
         self.has_unpublished_frame = false;
         self.sync_output_batch_pending = false;
-        self.sync_output_escape_prefix_len = 0;
         self.last_terminal_change = None;
     }
 
@@ -1101,11 +1121,9 @@ impl TerminalWorker {
         let engine = &mut self.engine;
         let worker_health = Arc::clone(&self.worker_health);
         let mut observed_sync_output = synchronized_output_state(engine, &worker_health);
-        let mut sync_output_escape_prefix_len = self.sync_output_escape_prefix_len;
         let mut write = |bytes: &[u8]| {
-            observed_sync_output |=
-                observe_sync_output_start(bytes, &mut sync_output_escape_prefix_len);
             engine.write_vt(bytes);
+            observed_sync_output |= engine.take_synchronized_output_observed();
             observed_sync_output |= synchronized_output_state(engine, &worker_health);
         };
         let stats = if self.force_next_frame_publish {
@@ -1119,7 +1137,6 @@ impl TerminalWorker {
         } else {
             drain_pty_backlog(&mut self.pending_pty, &mut write)
         };
-        self.sync_output_escape_prefix_len = sync_output_escape_prefix_len;
         self.sync_output_batch_pending |= observed_sync_output;
         if stats.bytes > 0 {
             self.publish_current_working_directory();
@@ -1179,6 +1196,7 @@ impl TerminalWorker {
             Err(error) => {
                 self.worker_health
                     .record(TerminalWorkerOperation::ExtractFrame, error);
+                self.acknowledge_resize();
                 return;
             }
         };
@@ -1215,6 +1233,7 @@ impl TerminalWorker {
         if let Err(error) = self.latest_frame.publish(frame) {
             self.worker_health
                 .record(TerminalWorkerOperation::PublishFrame, error);
+            self.acknowledge_resize();
             return;
         }
         if let Some(trace) = &trace {
@@ -1225,7 +1244,14 @@ impl TerminalWorker {
         }
         self.force_next_frame_publish = false;
         self.has_unpublished_frame = false;
+        self.acknowledge_resize();
         (self.repaint_wakeup)();
+    }
+
+    fn acknowledge_resize(&mut self) {
+        if let Some(done) = self.pending_resize_ack.take() {
+            let _ = done.send(());
+        }
     }
 
     fn trace_event(&self, event: &str, fields: &[(&str, TraceValue<'_>)]) {
@@ -1239,180 +1265,6 @@ impl TerminalWorker {
             write_pty(&self.pty_writer, &self.output_buf, &self.worker_health);
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct CursorHomeFloodCompactor {
-    pending_len: usize,
-    active: bool,
-}
-
-impl CursorHomeFloodCompactor {
-    fn compact(&mut self, bytes: Vec<u8>) -> Option<Vec<u8>> {
-        let mut state = self.pending_len;
-        let mut complete = 0;
-
-        for (index, byte) in bytes.iter().enumerate() {
-            if *byte == CURSOR_HOME[state] {
-                state += 1;
-                if state == CURSOR_HOME.len() {
-                    complete += 1;
-                    state = 0;
-                }
-                continue;
-            }
-
-            if !self.active && complete <= 1 {
-                if self.pending_len == 0 {
-                    return Some(bytes);
-                }
-                let mut out = Vec::with_capacity(self.pending_len + bytes.len());
-                out.extend_from_slice(&CURSOR_HOME[..self.pending_len]);
-                out.extend_from_slice(&bytes);
-                self.pending_len = 0;
-                return Some(out);
-            }
-
-            let mut out =
-                Vec::with_capacity(CURSOR_HOME.len() + self.pending_len + bytes.len() - index);
-            if !self.active && complete > 0 {
-                out.extend_from_slice(CURSOR_HOME);
-            }
-            if self.pending_len > 0 {
-                out.extend_from_slice(&CURSOR_HOME[..self.pending_len]);
-            }
-            out.extend_from_slice(&bytes[index..]);
-            self.pending_len = 0;
-            self.active = false;
-            return Some(out);
-        }
-
-        self.pending_len = state;
-        if complete > 0 && !self.active {
-            self.active = true;
-            return Some(CURSOR_HOME.to_vec());
-        }
-        if complete > 0 {
-            self.active = true;
-        }
-        None
-    }
-
-    fn finish(&mut self) -> Option<Vec<u8>> {
-        if self.pending_len == 0 {
-            return None;
-        }
-        let bytes = CURSOR_HOME[..self.pending_len].to_vec();
-        self.pending_len = 0;
-        self.active = false;
-        Some(bytes)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PtyBacklog {
-    chunks: VecDeque<Vec<u8>>,
-    bytes: usize,
-    front_offset: usize,
-}
-
-impl PtyBacklog {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            chunks: VecDeque::with_capacity(capacity),
-            bytes: 0,
-            front_offset: 0,
-        }
-    }
-
-    pub fn push_back(&mut self, bytes: Vec<u8>) {
-        self.bytes = self.bytes.saturating_add(bytes.len());
-        self.chunks.push_back(bytes);
-    }
-
-    pub fn len(&self) -> usize {
-        self.bytes
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.chunks.clear();
-        self.bytes = 0;
-        self.front_offset = 0;
-    }
-
-    pub(crate) fn front_len(&self) -> Option<usize> {
-        self.chunks
-            .front()
-            .map(|front| front.len().saturating_sub(self.front_offset))
-    }
-
-    pub(crate) fn consume_front(&mut self, len: usize, mut consume: impl FnMut(&[u8])) {
-        let end = self.front_offset + len;
-        if let Some(front) = self.chunks.front() {
-            consume(&front[self.front_offset..end]);
-        }
-
-        self.front_offset = end;
-        self.bytes = self.bytes.saturating_sub(len);
-        if self
-            .chunks
-            .front()
-            .is_some_and(|front| self.front_offset >= front.len())
-        {
-            self.chunks.pop_front();
-            self.front_offset = 0;
-        }
-    }
-}
-
-pub fn drain_pty_backlog(backlog: &mut PtyBacklog, write: impl FnMut(&[u8])) -> DrainStats {
-    drain_pty_backlog_with_limits(
-        backlog,
-        MAX_DRAIN_BYTES_PER_FRAME,
-        MAX_DRAIN_CHUNKS_PER_FRAME,
-        MAX_DRAIN_TIME_US,
-        write,
-    )
-}
-
-fn drain_pty_backlog_with_limits(
-    backlog: &mut PtyBacklog,
-    max_bytes: usize,
-    max_chunks: usize,
-    max_time_us: u128,
-    mut write: impl FnMut(&[u8]),
-) -> DrainStats {
-    let start = Instant::now();
-    let mut stats = DrainStats::default();
-
-    while !backlog.is_empty()
-        && !drain_budget_exhausted_with_limits(stats, max_bytes, max_chunks)
-        && !drain_time_exhausted(start, max_time_us)
-    {
-        let Some(available) = backlog.front_len() else {
-            backlog.clear();
-            break;
-        };
-        let consumed = drain_slice_len_with_limit(stats, max_bytes, available);
-        if consumed == 0 {
-            break;
-        }
-
-        stats.chunks += 1;
-        backlog.consume_front(consumed, |bytes| write(bytes));
-        stats.bytes += consumed;
-    }
-
-    stats.elapsed_us = start.elapsed().as_micros() as u64;
-    stats
 }
 
 fn synchronized_output_state(engine: &TerminalEngine, health: &WorkerHealth) -> bool {
@@ -1443,52 +1295,6 @@ fn write_pty(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8], health: &
     if let Err(error) = writer.flush() {
         health.record(TerminalWorkerOperation::PtyFlush, error);
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DrainStats {
-    pub chunks: usize,
-    pub bytes: usize,
-    pub elapsed_us: u64,
-}
-
-fn drain_bytes_remaining_with_limit(stats: DrainStats, max_bytes: usize) -> usize {
-    max_bytes.saturating_sub(stats.bytes)
-}
-
-fn drain_slice_len_with_limit(stats: DrainStats, max_bytes: usize, available: usize) -> usize {
-    drain_bytes_remaining_with_limit(stats, max_bytes)
-        .min(MAX_DRAIN_SLICE_BYTES)
-        .min(available)
-}
-
-fn drain_time_exhausted(start: Instant, max_time_us: u128) -> bool {
-    start.elapsed().as_micros() >= max_time_us
-}
-
-fn drain_budget_exhausted_with_limits(
-    stats: DrainStats,
-    max_bytes: usize,
-    max_chunks: usize,
-) -> bool {
-    stats.bytes >= max_bytes || stats.chunks >= max_chunks
-}
-
-fn observe_sync_output_start(bytes: &[u8], matched_prefix_len: &mut usize) -> bool {
-    const START: &[u8] = b"\x1b[?2026h";
-    let mut observed = false;
-    for byte in bytes {
-        if *byte == START[*matched_prefix_len] {
-            *matched_prefix_len += 1;
-            if *matched_prefix_len == START.len() {
-                observed = true;
-                *matched_prefix_len = 0;
-            }
-        } else {
-            *matched_prefix_len = usize::from(*byte == START[0]);
-        }
-    }
-    observed
 }
 
 // DEC mode 2026 (synchronized output): applications wrap multi-step redraws

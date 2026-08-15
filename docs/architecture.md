@@ -25,7 +25,7 @@ This file describes the current production structure.
 | --- | --- | --- |
 | Application identity and local namespace | `bootty-identity` | A conflicting process identity fails startup. |
 | The discoverable application process | The control instance lease | One identity publishes one generation endpoint. |
-| Persistent Space and binding metadata | `WorkspaceRepository` | A failed commit leaves the prior state active. |
+| Persistent Space and binding metadata | `bootty-workspace::WorkspaceRepository` | A failed commit leaves the prior state active. |
 | The live workspace | `WorkspaceRuntime` | A replacement appears only after validation and persistence. |
 | Backend processes and native topology | The selected backend binding | Bootty reports backend failure and does not invent success. |
 | The installed remote Space catalog | `bootty-daemon::Catalog` | A journal precedes backend mutation. |
@@ -53,7 +53,7 @@ change remote assets or remote backend namespaces.
 
 ## Workspace and mux
 
-`WorkspaceRepository` owns SQLite access for Spaces and backend bindings.
+`bootty-workspace::WorkspaceRepository` owns SQLite access for Spaces and backend bindings.
 It loads one validated `WorkspaceSnapshot`.
 
 `WorkspaceRuntime` owns the live committed workspace value.
@@ -184,9 +184,11 @@ contents, or transcripts.
 
 ## Crates
 
-- `bootty` owns executable startup, CLI dispatch, and native packaging.
+- `bootty` owns executable composition, CLI dispatch, and native packaging.
 - `bootty-app` owns the desktop host, workspace UI, command resolution,
   execution, policy, and presentation adapters.
+- `bootty-cli` owns CLI grammar, config overrides, release updates, and
+  login-shell environment hydration.
 - `bootty-command` owns command descriptors, invocations, outcomes,
   cancellation, and the bounded app command mailbox.
 - `bootty-control` owns the local transport, read-only control metadata,
@@ -208,24 +210,26 @@ contents, or transcripts.
 - `bootty-terminal` owns terminal semantics and frames.
 - `bootty-ui` owns shared egui theme values and widgets.
 - `bootty-winit` owns native host and input adapters.
+- `bootty-workspace` owns persisted Space and binding values, SQLite migrations,
+  membership journals, session names, and session order.
 - `bootty-write` owns atomic write targets, locking, and commit outcomes.
 - `bootty-site` owns the documentation site.
 
 ## Application modules
 
-- `app/state.rs` owns the window-independent application state machine.
-- `app/host.rs` owns the eframe lifecycle adapter.
-- `app/chrome_runtime.rs` owns product chrome state, projection, layout, and event routing.
-- `app/config_runtime.rs` owns accepted config and derived input policy.
-- `app/dialog_runtime.rs` owns the one modal dialog value.
-- `app/terminal_workspace_view.rs` owns terminal widget and renderer lifecycle.
-- `app/workspace_runtime.rs` owns live Space and binding composition.
-- `workspace.rs` owns workspace values and the `WorkspaceRepository` interface.
-  Its private `workspace/` modules own schema migration, snapshot hydration,
-  and legacy import.
-- `commands.rs` owns app command resolution, execution mapping, and policy.
+- `state.rs` owns the window-independent application state machine.
+- `host.rs` owns the eframe lifecycle adapter.
+- `ui/chrome/runtime.rs` owns product chrome state, projection, layout, and event routing.
+- `config_runtime.rs` owns accepted config and derived input policy.
+- `ui/dialog_runtime.rs` owns the one modal dialog value.
+- `renderer/workspace_view.rs` owns terminal widget and renderer lifecycle.
+- `workspace_runtime.rs` owns live Space and binding composition.
+- `bootty-workspace/src/repository.rs` owns workspace values and the
+  `WorkspaceRepository` interface. Its private `repository/` modules own schema
+  migration, snapshot hydration, and legacy import.
+- `commands.rs` and `commands/runtime.rs` own app command resolution, execution mapping, and policy.
 - `ui/settings/surface.rs` owns settings navigation and editor state.
-  Its private controls module owns the shared settings widget grammar.
+- `bootty-ui/src/settings.rs` owns the shared settings widget grammar.
 
 These files can remain large only while each keeps one cohesive owner and a
 small interface. File size is a signal for review. It is not proof of depth.

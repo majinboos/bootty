@@ -1,9 +1,6 @@
 use std::sync::Arc;
 
-use bootty_app::{
-    app::{AppEffect, AppState},
-    config::load_config_from_path,
-};
+use bootty_app::{AppEffect, AppState, config::load_config_from_path};
 use bootty_font::FontFeature;
 
 mod support;

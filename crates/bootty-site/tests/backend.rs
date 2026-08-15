@@ -111,7 +111,8 @@ fn docs_keyboard_navigation_renders_each_nested_package_surface() {
     site.input_frame("]").expect("switch to Rust docs");
     let rust = scrolling_text(&mut site);
     assert!(rust.contains("TerminalSession::new_with_repaint_wakeup"));
-    assert!(rust.contains("RendererFrame::from_terminal"));
+    assert!(rust.contains("TerminalTextContract::for_terminal_paint_plan"));
+    assert!(rust.contains("planner preserves terminal appearance and placement as paint commands"));
     assert!(!rust.contains("```"));
 }
 

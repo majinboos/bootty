@@ -8,7 +8,7 @@ use std::{
 };
 
 use bootty_app::{
-    app::{AppEffect, AppState, FrameInputs, ViewportSnapshot},
+    AppEffect, AppState, FrameInputs, ViewportSnapshot,
     config::{MultiplexerBackendConfig, load_config_from_path},
     geometry::ViewTransform,
     mux::snapshot::MuxPaneAnchor,

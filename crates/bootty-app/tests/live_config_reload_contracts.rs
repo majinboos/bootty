@@ -3,13 +3,37 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bootty_app::{
-    app::AppState,
+    AppState,
     color::Color,
     config::{CursorStyleConfig, MultiplexerBackendConfig, load_config_from_path},
     mux::snapshot::MuxPaneAnchor,
 };
 
 mod support;
+
+#[test]
+fn a_failed_app_write_keeps_the_error_visible() {
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[chrome]\nsidebar-width = 320\n").expect("write initial config");
+    let mut config = load_config_from_path(&path).expect("load initial config");
+    config.multiplexer.backend = MultiplexerBackendConfig::Rmux;
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
+    std::fs::remove_file(&path).expect("remove config file");
+    std::fs::create_dir(&path).expect("replace config with directory");
+
+    state.set_sidebar_width_live(444.0);
+    state.persist_sidebar_width(444.0);
+
+    assert_eq!(state.config().chrome.sidebar_width, 444.0);
+    assert!(
+        state
+            .last_error()
+            .is_some_and(|error| error.contains("config file"))
+    );
+    assert!(path.is_dir());
+}
 
 #[test]
 fn live_terminal_policy_reload_accepts_one_complete_candidate() {

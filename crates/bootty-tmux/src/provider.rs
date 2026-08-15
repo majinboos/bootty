@@ -91,7 +91,5 @@ impl MuxAppBackendProvider for TmuxProvider {
 }
 
 bootty_mux::register_mux_backend!(TmuxProvider);
-#[cfg(feature = "app")]
-bootty_mux::register_mux_app_backend!(TmuxProvider);
 
 pub fn link() {}
