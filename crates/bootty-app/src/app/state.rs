@@ -3,12 +3,8 @@ use std::{
     hash::Hasher,
     net::{IpAddr, UdpSocket},
     path::PathBuf,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-        mpsc,
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -32,10 +28,11 @@ use diagnostic_actions::{DiagnosticAction, DiagnosticActionDriver, DiagnosticRec
 use recorded_chord::normalize_recorded_chord;
 use selection::{TerminalSelectionAction, TerminalSelectionRouteContext, TerminalSelectionRouter};
 
+use super::command_runtime::CommandRuntime;
 use super::workspace_runtime::{
-    BindingRuntime, NativeTerminalOwner, PendingGeneratedName, RemoteReattach, ScopedPaneId,
-    ScopedWindowId, SpaceRuntime, SpaceTransition, WorkspaceRuntime,
-    binding_runtime_for_multiplexer, terminal_session_config_with_side_effects,
+    BindingRuntime, BindingStateCandidate, PendingGeneratedName, RemoteReattach, ScopedPaneId,
+    ScopedWindowId, SpaceRuntime, WorkspaceRuntime, binding_runtime_for_multiplexer,
+    terminal_session_config_with_side_effects,
 };
 
 use crate::{
@@ -44,11 +41,7 @@ use crate::{
         SidebarKeyBindings, TerminalFindAction, TerminalScrollAction,
         builtin_app_invocation_for_direct_key, split_app_actions_for_bindings_with_modifier_sides,
     },
-    commands::{
-        AppCommandReceiver, AppCommandSender, BoundAppCommandSender, Caller, CommandCancellation,
-        CommandCatalog, CommandInvocation, CommandOutcome, CommandTarget, CoreCommandExecutor,
-        MutationClass, ResourceKind, app_command_channel_with_repaint,
-    },
+    commands::{Caller, CommandInvocation, CommandTarget, ResourceKind},
     config::{
         AppearanceMode, AppearanceVariant, BoottyConfig, ConfigState, WindowConfig,
         load_config_from_path, load_or_create_config_document,
@@ -70,13 +63,10 @@ use crate::{
     modifier_remap::ModifierRemapSet,
     mux::{
         RepaintHandle,
-        capability::{BindingOperation, BindingOperationOutcome},
+        capability::BindingOperation,
         command::{MuxCommand, MuxSplitDirection},
         config::selected_backend,
-        controller::{
-            MuxCommandCompletion, MuxCommandError, MuxCommandResult, MuxController, MuxScope,
-            SpaceId, mux_session_refresh_interval,
-        },
+        controller::{MuxController, MuxScope, SpaceId, mux_session_refresh_interval},
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow, MuxWindowProgress},
         terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
     },
@@ -87,8 +77,6 @@ use crate::{
     },
     renderer::{RendererMetrics, TerminalRenderSource},
     scheduler::{RepaintScheduler, RepaintSignal},
-    session_names::SessionNameStore,
-    session_order::SessionOrderStore,
     terminal::{DrainStats, MouseButton, TerminalSearchDirection},
     terminal_text::TerminalTextConfig,
     theme::theme_from_config,
@@ -104,7 +92,7 @@ use crate::{
         terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
         theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
-    workspace::{SpaceMuxOverride, SpaceRemoteOverride, WorkspaceRepository},
+    workspace::{SpaceMuxOverride, SpaceRemoteOverride},
 };
 use bootty_terminal::terminal_engine::{
     TerminalColorConfig, TerminalCopyModeAction, TerminalCursorConfig, TerminalFeatureConfig,
@@ -113,24 +101,6 @@ use bootty_terminal::terminal_engine::{
 };
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
-static NEXT_WINDOW_COMMAND_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-fn process_command_handle() -> String {
-    static HANDLE: OnceLock<String> = OnceLock::new();
-    HANDLE
-        .get_or_init(|| {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            format!("{}:{nanos:032x}", std::process::id())
-        })
-        .clone()
-}
-
-fn next_window_command_generation() -> u64 {
-    NEXT_WINDOW_COMMAND_GENERATION.fetch_add(1, Ordering::Relaxed)
-}
 /// Session-finder heading for sessions running in a backend that no Space has claimed.
 const UNCLAIMED_SESSIONS_LABEL: &str = "No space";
 
@@ -229,57 +199,6 @@ pub enum AppEffect {
     ConfigureKeybind(String),
 }
 
-fn command_outcome_message(outcome: &CommandOutcome) -> Option<String> {
-    match outcome {
-        CommandOutcome::Success { .. } => None,
-        CommandOutcome::Unsupported { message }
-        | CommandOutcome::Unavailable { message }
-        | CommandOutcome::Denied { message }
-        | CommandOutcome::StaleTarget { message }
-        | CommandOutcome::Failed { message, .. } => Some(message.clone()),
-        CommandOutcome::ConfirmationRequired { .. } => {
-            Some("command requires confirmation".to_owned())
-        }
-    }
-}
-
-fn command_outcome_for_binding_operation(
-    outcome: BindingOperationOutcome<()>,
-) -> Option<CommandOutcome> {
-    match outcome {
-        BindingOperationOutcome::Supported(()) => None,
-        BindingOperationOutcome::Unsupported => Some(CommandOutcome::Unsupported {
-            message: "mux operation is unsupported".to_owned(),
-        }),
-        BindingOperationOutcome::Unavailable => Some(CommandOutcome::Unavailable {
-            message: "mux operation is unavailable".to_owned(),
-        }),
-        BindingOperationOutcome::Stale => Some(CommandOutcome::StaleTarget {
-            message: "mux operation capability is stale".to_owned(),
-        }),
-    }
-}
-
-enum PendingCommandResult {
-    Mux {
-        command: MuxCommand,
-        result: mpsc::Receiver<MuxCommandResult>,
-    },
-    Outcome(mpsc::Receiver<CommandOutcome>),
-}
-
-enum CommandDispatch {
-    Complete(CommandOutcome),
-    Pending(PendingCommandResult),
-}
-
-struct PendingAppCommand {
-    deadline: Instant,
-    cancellation: CommandCancellation,
-    response: mpsc::Sender<CommandOutcome>,
-    result: PendingCommandResult,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalProgressState {
     Normal,
@@ -360,14 +279,12 @@ fn network_signature() -> Option<IpAddr> {
 }
 
 pub struct AppState {
-    window_state_key: String,
-    command_instance_handle: String,
-    command_instance_generation: u64,
-    command_window_generation: u64,
-    workspace: WorkspaceRuntime,
+    pub(super) window_state_key: String,
+    pub(super) commands: CommandRuntime,
+    pub(super) workspace: WorkspaceRuntime,
     repaint_scheduler: RepaintScheduler,
     network_change_detector: NetworkChangeDetector,
-    last_error: Option<String>,
+    pub(super) last_error: Option<String>,
     last_drain: DrainStats,
     last_frame_dt_ms: f32,
     status_metrics: StatusMetrics,
@@ -382,7 +299,7 @@ pub struct AppState {
     app_key_bindings: AppKeyBindings,
     sidebar_key_bindings: SidebarKeyBindings,
     has_new_session_config_changes: bool,
-    repaint: RepaintHandle,
+    pub(super) repaint: RepaintHandle,
     direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
     modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     modifier_sides: ModifierSideState,
@@ -406,7 +323,8 @@ pub struct AppState {
     last_mouse_hover_pos: Option<Pos2>,
     macos_option_as_alt: crate::terminal::MacosOptionAsAlt,
     stability_trace: Option<StabilityTrace>,
-    config_hot_reload: ConfigHotReload,
+    pub(super) config_hot_reload: ConfigHotReload,
+    deferred_profile_binding_rebuilds: HashSet<MuxScope>,
     new_mux_session_dialog: Option<NewMuxSessionDialog>,
     sidebar_hovered_session: Option<ScopedSessionTarget>,
     session_picker_dialog: Option<SessionPickerDialog>,
@@ -423,11 +341,6 @@ pub struct AppState {
     last_terminal_search_direction: TerminalSearchDirection,
     theme_picker_restore_config: Option<BoottyConfig>,
     /// A command-palette choice waiting for the next frame's viewport and effect sink.
-    pending_command: Option<CommandInvocation>,
-    app_command_tx: AppCommandSender,
-    app_command_rx: AppCommandReceiver,
-    command_catalog: Arc<CommandCatalog>,
-    pending_app_commands: Vec<PendingAppCommand>,
     #[cfg(debug_assertions)]
     diagnostic_action_driver: Option<DiagnosticActionDriver>,
     macos_non_native_fullscreen_active: bool,
@@ -513,7 +426,7 @@ fn scoped_terminal_transition_key(
     )
 }
 
-fn mux_split_direction(direction: SplitDirection) -> MuxSplitDirection {
+pub(super) fn mux_split_direction(direction: SplitDirection) -> MuxSplitDirection {
     match direction {
         SplitDirection::Right => MuxSplitDirection::Right,
         SplitDirection::Down => MuxSplitDirection::Down,
@@ -592,7 +505,7 @@ fn terminal_report_variable_response(name: &str, session_name: Option<&str>) -> 
     }
 }
 
-fn new_mux_session_request_with_name(
+pub(super) fn new_mux_session_request_with_name(
     config: &BoottyConfig,
     name: impl Into<String>,
 ) -> crate::ui::new_session_picker::NewMuxSessionRequest {
@@ -615,7 +528,7 @@ fn new_mux_session_request_with_name(
     }
 }
 
-fn terminal_cwd_for_mux_command(
+pub(super) fn terminal_cwd_for_mux_command(
     live_terminal_cwd: Option<String>,
     anchor_cwd: Option<String>,
 ) -> Option<String> {
@@ -710,18 +623,11 @@ impl AppState {
             macos_non_native_fullscreen_active && !macos_non_native_fullscreen_applied;
         #[cfg(debug_assertions)]
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
-        let (app_command_tx, app_command_rx) =
-            app_command_channel_with_repaint(64, repaint.clone());
-        let command_instance_handle = process_command_handle();
-        let command_instance_generation = 1;
-        let command_window_generation = next_window_command_generation();
-        let command_catalog = Arc::new(CommandCatalog::default());
+        let commands = CommandRuntime::new(repaint.clone());
 
         Ok(Self {
             window_state_key,
-            command_instance_handle,
-            command_instance_generation,
-            command_window_generation,
+            commands,
             workspace,
             repaint_scheduler: RepaintScheduler::default(),
             network_change_detector: NetworkChangeDetector::new(Instant::now()),
@@ -757,6 +663,7 @@ impl AppState {
             macos_option_as_alt,
             stability_trace,
             config_hot_reload,
+            deferred_profile_binding_rebuilds: HashSet::new(),
             new_mux_session_dialog: None,
             sidebar_hovered_session: None,
             session_picker_dialog: None,
@@ -770,11 +677,6 @@ impl AppState {
             last_terminal_search: String::new(),
             last_terminal_search_direction: TerminalSearchDirection::Next,
             theme_picker_restore_config: None,
-            pending_command: None,
-            pending_app_commands: Vec::new(),
-            app_command_tx,
-            app_command_rx,
-            command_catalog,
             ditch_session_dialog: None,
             keybind_help_dialog: None,
             #[cfg(debug_assertions)]
@@ -786,46 +688,6 @@ impl AppState {
 
     pub fn config(&self) -> &BoottyConfig {
         self.config_state.current()
-    }
-
-    fn prepare_native_terminal_transition(&mut self, target: &mut BindingRuntime) {
-        let active_is_native = selected_backend(&self.workspace.binding.multiplexer)
-            == MultiplexerBackendConfig::Native;
-        let target_is_native =
-            selected_backend(&target.multiplexer) == MultiplexerBackendConfig::Native;
-
-        match (active_is_native, target_is_native) {
-            (true, true) => {
-                std::mem::swap(&mut self.workspace.binding.terminal, &mut target.terminal);
-                std::mem::swap(
-                    &mut self.workspace.binding.terminal_side_effect_tx,
-                    &mut target.terminal_side_effect_tx,
-                );
-                std::mem::swap(
-                    &mut self.workspace.binding.terminal_side_effect_rx,
-                    &mut target.terminal_side_effect_rx,
-                );
-            }
-            (true, false) => {
-                let mut binding_config = self.config().clone();
-                binding_config.multiplexer = self.workspace.binding.multiplexer.clone();
-                let replacement = NativeTerminalOwner::new(
-                    &binding_config,
-                    self.active_appearance_variant,
-                    self.repaint.clone(),
-                );
-                let native_terminal =
-                    NativeTerminalOwner::replace_binding(&mut self.workspace.binding, replacement);
-                debug_assert!(self.workspace.parked_native_terminal.is_none());
-                self.workspace.parked_native_terminal = Some(native_terminal);
-            }
-            (false, true) => {
-                if let Some(mut native_terminal) = self.workspace.parked_native_terminal.take() {
-                    native_terminal.swap_with_binding(target);
-                }
-            }
-            (false, false) => {}
-        }
     }
 
     /// Apply a dragged sidebar width to the live config without touching disk, so the layout
@@ -978,11 +840,11 @@ impl AppState {
     }
 
     pub fn mux(&self) -> &MuxController {
-        &self.workspace.binding.mux
+        &self.workspace.active.binding.mux
     }
 
     pub fn mux_scope(&self) -> MuxScope {
-        self.workspace.binding.scope
+        self.workspace.active.binding.scope
     }
 
     pub fn binding_count(&self) -> usize {
@@ -1048,15 +910,10 @@ impl AppState {
         mux: SpaceMuxOverride,
     ) -> bool {
         let config = self.config().clone();
-        let mut repository = WorkspaceRepository::for_config_path(&config.config_path);
-        let space = match repository.create_space(
-            name,
-            icon,
-            color,
-            tint_sidebar,
-            mux,
-            &config.multiplexer,
-        ) {
+        let space = match self
+            .workspace
+            .create_space(name, icon, color, tint_sidebar, mux, &config)
+        {
             Ok(Some(space)) => space,
             Ok(None) => return false,
             Err(error) => {
@@ -1081,7 +938,7 @@ impl AppState {
         let Some(index) = spaces.iter().position(|space| space.id == space_id) else {
             return false;
         };
-        if space_id == self.workspace.active_space_id {
+        if space_id == self.workspace.active.id {
             let neighbor = spaces
                 .get(index + 1)
                 .or_else(|| index.checked_sub(1).and_then(|index| spaces.get(index)));
@@ -1089,9 +946,7 @@ impl AppState {
                 return false;
             }
         }
-        let config_path = self.config().config_path.clone();
-        let mut workspace = WorkspaceRepository::for_config_path(&config_path);
-        match workspace.delete_space(space_id) {
+        match self.workspace.delete_space(space_id) {
             Ok(true) => {
                 self.workspace
                     .inactive_spaces
@@ -1119,12 +974,15 @@ impl AppState {
             backend: backend_override,
             remote: remote_override,
         } = mux.clone();
+        let Some(binding_scope) = self.workspace.selected_binding_scope(space_id) else {
+            return false;
+        };
         let Some(previous_override) = self.space_backend_override(space_id) else {
             return false;
         };
         let previous_remote = self.space_remote_override(space_id);
         let resolved_backend = backend_override.unwrap_or(self.config().multiplexer.backend);
-        let app_key_bindings = if space_id == self.workspace.active_space_id {
+        let app_key_bindings = if space_id == self.workspace.active.id {
             let keybinds = self.config().input.keybinds_for_backend(resolved_backend);
             match AppKeyBindings::from_keybinds(&keybinds) {
                 Ok(bindings) => Some(bindings),
@@ -1140,24 +998,33 @@ impl AppState {
         // the same rebuild a backend change does.
         let backend_changed = previous_override != backend_override
             || previous_remote.as_ref() != Some(&remote_override);
-        let config_path = self.config().config_path.clone();
-        let mut workspace = WorkspaceRepository::for_config_path(&config_path);
         let runtime_config = self.config().clone();
         let active_appearance_variant = self.active_appearance_variant;
         let repaint = self.repaint.clone();
-        match workspace.update_space(space_id, name, icon, color, tint_sidebar, mux) {
+        match self
+            .workspace
+            .update_space(binding_scope, name, icon, color, tint_sidebar, mux)
+        {
             Ok(true) => {
-                if space_id == self.workspace.active_space_id {
-                    self.workspace.active_space_name = name.trim().to_owned();
-                    self.workspace.active_space_icon = icon.trim().to_owned();
-                    self.workspace.active_space_color = color;
-                    self.workspace.active_space_tint_sidebar = tint_sidebar;
+                if space_id == self.workspace.active.id {
+                    self.workspace.active.name = name.trim().to_owned();
+                    self.workspace.active.icon = icon.trim().to_owned();
+                    self.workspace.active.color = color;
+                    self.workspace.active.tint_sidebar = tint_sidebar;
                     if backend_changed {
-                        let scope = self.workspace.binding.scope;
-                        let label = self.workspace.binding.label.clone();
-                        self.workspace.binding = binding_runtime_for_multiplexer(
+                        let scope = self.workspace.active.binding.scope;
+                        let label = self.workspace.active.binding.label.clone();
+                        let session_order =
+                            std::mem::take(&mut self.workspace.active.binding.session_order);
+                        let session_names =
+                            std::mem::take(&mut self.workspace.active.binding.session_names);
+                        self.workspace.active.binding = binding_runtime_for_multiplexer(
                             &runtime_config,
-                            scope,
+                            BindingStateCandidate {
+                                scope,
+                                session_order,
+                                session_names,
+                            },
                             label,
                             backend_override,
                             remote_override.clone(),
@@ -1185,9 +1052,15 @@ impl AppState {
                     if backend_changed {
                         let scope = space.binding.scope;
                         let label = space.binding.label.clone();
+                        let session_order = std::mem::take(&mut space.binding.session_order);
+                        let session_names = std::mem::take(&mut space.binding.session_names);
                         space.binding = binding_runtime_for_multiplexer(
                             &runtime_config,
-                            scope,
+                            BindingStateCandidate {
+                                scope,
+                                session_order,
+                                session_names,
+                            },
                             label,
                             backend_override,
                             remote_override.clone(),
@@ -1220,51 +1093,36 @@ impl AppState {
         self.activate_space_from_ui(target.id)
     }
 
-    fn persist_active_binding_restore_state(&mut self) {
-        let selected_session = self
-            .workspace
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned);
-        let selected_window = self
-            .workspace
-            .binding
-            .mux
-            .selected_window()
-            .map(str::to_owned);
-        let mut workspace = WorkspaceRepository::for_config_path(&self.config().config_path);
-        if let Err(error) = workspace.set_binding_restore_state(
-            self.workspace.binding.scope,
-            self.workspace.binding.mux.last_error().is_some(),
-            selected_session.as_deref(),
-            selected_window.as_deref(),
-        ) {
-            self.last_error = Some(error.to_string());
+    fn persist_rmux_selection_before_publish(
+        &mut self,
+        session_id: &str,
+        window_id: Option<&str>,
+    ) -> bool {
+        if selected_backend(&self.workspace.active.binding.multiplexer)
+            != MultiplexerBackendConfig::Rmux
+        {
+            return true;
         }
-    }
-    fn persist_rmux_restore_state(&mut self) {
-        if selected_backend(&self.workspace.binding.multiplexer) == MultiplexerBackendConfig::Rmux {
-            self.persist_active_binding_restore_state();
+        match self.workspace.persist_binding_restore_selection(
+            self.workspace.active.binding.scope,
+            session_id,
+            window_id,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
         }
     }
 
     pub fn activate_space_from_ui(&mut self, space_id: SpaceId) -> bool {
-        if space_id == self.workspace.active_space_id {
+        if space_id == self.workspace.active.id {
             return false;
         }
-        let Some(index) = self
-            .workspace
-            .inactive_spaces
-            .iter()
-            .position(|space| space.id == space_id)
-        else {
+        let Some(backend) = self.workspace.space_backend(space_id) else {
             return false;
         };
-        let backend = self.workspace.inactive_spaces[index]
-            .binding
-            .multiplexer
-            .backend;
         let keybinds = self.config().input.keybinds_for_backend(backend);
         let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
             Ok(bindings) => bindings,
@@ -1274,86 +1132,18 @@ impl AppState {
             }
         };
         let switch_started = crate::diagnostics::latency_start();
-        self.persist_active_binding_restore_state();
-        crate::diagnostics::trace_phase("space.persist_restore_state", switch_started);
-        // Leave the outgoing space's tmux overrides in place. It keeps a live runtime, so its
-        // status bar should stay hidden, and its terminal carries the bookkeeping to restore on
-        // drop. Restoring here cost a tmux fork per pane and session, then the incoming binding
-        // immediately paid to set them again.
-        let phase = crate::diagnostics::latency_start();
-        let mut target = self.workspace.inactive_spaces.remove(index);
-        self.workspace.binding.discard_terminal_side_effects();
-        for binding in &mut self.workspace.inactive_bindings {
-            binding.discard_terminal_side_effects();
-        }
-        for binding in target.bindings_mut() {
-            binding.discard_terminal_side_effects();
-        }
-        if let Some(owner) = &mut self.workspace.parked_native_terminal {
-            owner.discard_side_effects();
-        }
-        self.prepare_native_terminal_transition(&mut target.binding);
-        crate::diagnostics::trace_phase("space.prepare_transition", phase);
-        let phase = crate::diagnostics::latency_start();
-        let current = SpaceRuntime {
-            id: std::mem::replace(&mut self.workspace.active_space_id, target.id),
-            name: std::mem::replace(&mut self.workspace.active_space_name, target.name),
-            icon: std::mem::replace(&mut self.workspace.active_space_icon, target.icon),
-            color: std::mem::replace(&mut self.workspace.active_space_color, target.color),
-            tint_sidebar: std::mem::replace(
-                &mut self.workspace.active_space_tint_sidebar,
-                target.tint_sidebar,
-            ),
-            position: std::mem::replace(&mut self.workspace.active_space_position, target.position),
-            binding: std::mem::replace(&mut self.workspace.binding, target.binding),
-            inactive_bindings: std::mem::replace(
-                &mut self.workspace.inactive_bindings,
-                target.inactive_bindings,
-            ),
-        };
-        if !self
-            .workspace
-            .binding
-            .session_order
-            .session_names()
-            .is_empty()
-        {
-            self.workspace.binding.mux.refresh_on_next_frame();
-            let active_config = self.workspace.binding.multiplexer.clone();
-            let _ = self
-                .workspace
-                .binding
-                .mux
-                .refresh_sessions(&self.repaint, &active_config);
-            crate::diagnostics::trace_phase("space.refresh_sessions", phase);
-            let phase = crate::diagnostics::latency_start();
-            self.sync_session_order();
-            crate::diagnostics::trace_phase("space.sync_session_order", phase);
-            if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
-                self.workspace.binding.persisted_sessions_restored = false;
-                self.workspace
-                    .binding
-                    .restore_persisted_sessions(&self.repaint);
-            }
-        }
-        let previous_space_id = current.id;
-        self.workspace.inactive_spaces.push(current);
-        self.workspace
-            .inactive_spaces
-            .sort_by_key(|space| space.position);
-        self.workspace.space_transition = Some(SpaceTransition {
-            from: previous_space_id,
-            to: self.workspace.active_space_id,
-            started: Instant::now(),
-        });
-        let phase = crate::diagnostics::latency_start();
-        let workspace = WorkspaceRepository::for_config_path(&self.config().config_path);
-        if let Err(error) =
-            workspace.set_selected_space(&self.window_state_key, self.workspace.active_space_id)
-        {
+        let config = self.config().clone();
+        if let Err(error) = self.workspace.activate_space(
+            space_id,
+            &self.window_state_key,
+            &config,
+            self.active_appearance_variant,
+            &self.repaint,
+            Instant::now(),
+        ) {
             self.last_error = Some(error.to_string());
+            return false;
         }
-        crate::diagnostics::trace_phase("space.persist_selected_space", phase);
         self.app_key_bindings = app_key_bindings;
         self.terminal_surface = None;
         self.last_pane_area = None;
@@ -1380,8 +1170,8 @@ impl AppState {
     }
 
     pub fn binding_session_groups(&self) -> Vec<BindingSessionGroup> {
-        let mut bindings = std::iter::once(&self.workspace.binding)
-            .chain(self.workspace.inactive_bindings.iter())
+        let mut bindings = std::iter::once(&self.workspace.active.binding)
+            .chain(self.workspace.active.inactive_bindings.iter())
             .collect::<Vec<_>>();
         bindings.sort_by_key(|binding| binding.scope.binding_id().persistence_value());
         bindings
@@ -1408,7 +1198,7 @@ impl AppState {
                     display_names: binding.session_display_name_map(&sessions),
                     sessions,
                     selected_session: binding.mux.selected_session().map(str::to_owned),
-                    active: binding.scope == self.workspace.binding.scope,
+                    active: binding.scope == self.workspace.active.binding.scope,
                     can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
                 }
             })
@@ -1421,10 +1211,10 @@ impl AppState {
     /// on `binding_session_groups`, which is this Space only.
     pub fn session_finder_groups(&self) -> Vec<BindingSessionGroup> {
         let mut spaces = vec![(
-            self.workspace.active_space_position,
-            self.workspace.active_space_name.as_str(),
-            std::iter::once(&self.workspace.binding)
-                .chain(self.workspace.inactive_bindings.iter())
+            self.workspace.active.position,
+            self.workspace.active.name.as_str(),
+            std::iter::once(&self.workspace.active.binding)
+                .chain(self.workspace.active.inactive_bindings.iter())
                 .collect::<Vec<_>>(),
         )];
         spaces.extend(self.workspace.inactive_spaces.iter().map(|space| {
@@ -1484,7 +1274,7 @@ impl AppState {
                     display_names: binding.session_display_name_map(&sessions),
                     sessions,
                     selected_session: binding.mux.selected_session().map(str::to_owned),
-                    active: binding.scope == self.workspace.binding.scope,
+                    active: binding.scope == self.workspace.active.binding.scope,
                     can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
                 });
             }
@@ -1498,7 +1288,7 @@ impl AppState {
         if !unclaimed.is_empty() {
             groups.push(BindingSessionGroup {
                 // Activating one of these adopts it into the current Space.
-                scope: self.workspace.binding.scope,
+                scope: self.workspace.active.binding.scope,
                 label: UNCLAIMED_SESSIONS_LABEL.to_owned(),
                 sessions: unclaimed,
                 selected_session: None,
@@ -1512,8 +1302,8 @@ impl AppState {
     }
 
     fn binding_runtimes_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
-        std::iter::once(&mut self.workspace.binding)
-            .chain(self.workspace.inactive_bindings.iter_mut())
+        std::iter::once(&mut self.workspace.active.binding)
+            .chain(self.workspace.active.inactive_bindings.iter_mut())
             .chain(
                 self.workspace
                     .inactive_spaces
@@ -1552,22 +1342,23 @@ impl AppState {
         Ok(())
     }
 
-    fn active_multiplexer(&self) -> &crate::config::MultiplexerConfig {
-        &self.workspace.binding.multiplexer
+    pub(super) fn active_multiplexer(&self) -> &crate::config::MultiplexerConfig {
+        &self.workspace.active.binding.multiplexer
     }
 
     pub fn multiplexer_backend(&self) -> crate::config::MultiplexerBackendConfig {
-        self.workspace.binding.multiplexer.backend
+        self.workspace.active.binding.multiplexer.backend
     }
 
     pub fn terminal_transition_key(&self) -> Option<String> {
         self.workspace
+            .active
             .binding
             .mux
             .selected_session_anchor()
             .map(|anchor| {
                 scoped_terminal_transition_key(
-                    self.workspace.binding.scope,
+                    self.workspace.active.binding.scope,
                     selected_backend(self.active_multiplexer()),
                     &anchor.session_id,
                     anchor.pane_id.as_deref(),
@@ -1581,6 +1372,7 @@ impl AppState {
 
     pub fn last_error(&self) -> Option<&str> {
         self.workspace
+            .active
             .binding
             .mux
             .last_error()
@@ -1588,7 +1380,7 @@ impl AppState {
     }
 
     pub fn clear_last_error(&mut self) {
-        self.workspace.binding.mux.set_error(None);
+        self.workspace.active.binding.mux.set_error(None);
         self.last_error = None;
     }
 
@@ -1633,7 +1425,7 @@ impl AppState {
     }
 
     pub fn terminal_mut(&mut self) -> &mut ActiveTerminal {
-        &mut self.workspace.binding.terminal
+        &mut self.workspace.active.binding.terminal
     }
 
     pub fn record_surface(&mut self, surface: TerminalSurface) {
@@ -1661,7 +1453,7 @@ impl AppState {
         )
     }
 
-    fn uses_native_terminal_layout(&self) -> bool {
+    pub(super) fn uses_native_terminal_layout(&self) -> bool {
         matches!(
             self.active_multiplexer().backend,
             crate::config::MultiplexerBackendConfig::Native
@@ -1672,6 +1464,7 @@ impl AppState {
     fn current_window_key(&self) -> ScopedWindowId {
         let session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -1679,12 +1472,14 @@ impl AppState {
             .to_owned();
         let window = self
             .workspace
+            .active
             .binding
             .mux
             .selected_window()
             .map(str::to_owned)
             .or_else(|| {
                 self.workspace
+                    .active
                     .binding
                     .mux
                     .sessions()
@@ -1693,7 +1488,7 @@ impl AppState {
                     .and_then(|candidate| candidate.active_window_id.clone())
             })
             .unwrap_or_default();
-        self.workspace.binding.window_id(session, window)
+        self.workspace.active.binding.window_id(session, window)
     }
     pub fn pane_widget_key(&self, pane_id: &str) -> String {
         let window = self.current_window_key();
@@ -1712,6 +1507,7 @@ impl AppState {
         key: &ScopedWindowId,
     ) -> Option<SplitDirection> {
         self.workspace
+            .active
             .binding
             .pending_pane_split_directions
             .remove(key)
@@ -1719,12 +1515,17 @@ impl AppState {
                 if key.window_id.is_empty() {
                     None
                 } else {
-                    self.workspace.binding.pending_pane_split_directions.remove(
-                        &self
-                            .workspace
-                            .binding
-                            .window_id(key.session_id.clone(), String::new()),
-                    )
+                    self.workspace
+                        .active
+                        .binding
+                        .pending_pane_split_directions
+                        .remove(
+                            &self
+                                .workspace
+                                .active
+                                .binding
+                                .window_id(key.session_id.clone(), String::new()),
+                        )
                 }
             })
     }
@@ -1734,6 +1535,7 @@ impl AppState {
             return None;
         }
         self.workspace
+            .active
             .binding
             .pane_layouts
             .get(&self.current_window_key())
@@ -1743,19 +1545,21 @@ impl AppState {
     /// unbounded as the user creates and destroys native sessions and tabs. Keys are stored by
     /// whatever `current_window_key` recorded (session id, occasionally name), so accept either.
     fn prune_pane_layouts(&mut self) {
-        if self.workspace.binding.pane_layouts.is_empty() {
+        if self.workspace.active.binding.pane_layouts.is_empty() {
             return;
         }
         let mut live = Vec::new();
-        for session in self.workspace.binding.mux.sessions() {
+        for session in self.workspace.active.binding.mux.sessions() {
             for window in &session.windows {
                 live.push(
                     self.workspace
+                        .active
                         .binding
                         .window_id(session.id.clone(), window.id.clone()),
                 );
                 live.push(
                     self.workspace
+                        .active
                         .binding
                         .window_id(session.name.clone(), window.id.clone()),
                 );
@@ -1763,6 +1567,7 @@ impl AppState {
         }
         live.push(self.current_window_key());
         self.workspace
+            .active
             .binding
             .pane_layouts
             .retain(|key, _| live.contains(key));
@@ -1780,45 +1585,69 @@ impl AppState {
         crate::diagnostics::trace_slow("panes.clone_config", phase, 2.0);
         if !self.uses_native_terminal_layout() {
             let phase = crate::diagnostics::latency_start();
-            let result = self.workspace.binding.terminal.sync_scoped_mux_anchor(
-                self.workspace.binding.scope,
-                &config,
-                self.workspace.binding.mux.selected_session_anchor(),
-            );
+            let result = self
+                .workspace
+                .active
+                .binding
+                .terminal
+                .sync_scoped_mux_anchor(
+                    self.workspace.active.binding.scope,
+                    &config,
+                    self.workspace.active.binding.mux.selected_session_anchor(),
+                );
             crate::diagnostics::trace_slow("panes.sync_scoped_mux_anchor", phase, 2.0);
             return result;
         }
-        let panes: Vec<MuxPaneAnchor> = self.workspace.binding.mux.selected_window_panes().to_vec();
+        let panes: Vec<MuxPaneAnchor> = self
+            .workspace
+            .active
+            .binding
+            .mux
+            .selected_window_panes()
+            .to_vec();
         let pane_ids: Vec<String> = panes
             .iter()
             .filter_map(|pane| pane.pane_id.clone())
             .collect();
         if pane_ids.is_empty() {
             // Idle native session (all tabs closed): nothing to render.
-            return self.workspace.binding.terminal.sync_scoped_mux_anchor(
-                self.workspace.binding.scope,
-                &config,
-                self.workspace.binding.mux.selected_session_anchor(),
-            );
+            return self
+                .workspace
+                .active
+                .binding
+                .terminal
+                .sync_scoped_mux_anchor(
+                    self.workspace.active.binding.scope,
+                    &config,
+                    self.workspace.active.binding.mux.selected_session_anchor(),
+                );
         }
         let key = self.current_window_key();
         let window_id = (!key.window_id.is_empty()).then(|| key.window_id.clone());
         let selected_pane = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session_anchor()
             .and_then(|anchor| anchor.pane_id.clone());
         let server_layout = self
             .workspace
+            .active
             .binding
             .mux
             .selected_window_layout()
             .and_then(PaneLayout::from_mux_layout)
             .filter(|layout| pane_sets_match(&layout.panes(), &pane_ids));
-        let layout_missing = !self.workspace.binding.pane_layouts.contains_key(&key);
+        let layout_missing = !self
+            .workspace
+            .active
+            .binding
+            .pane_layouts
+            .contains_key(&key);
         let stale_layout = self
             .workspace
+            .active
             .binding
             .pane_layouts
             .get(&key)
@@ -1828,6 +1657,7 @@ impl AppState {
             && let Some(layout) = server_layout.clone()
         {
             self.workspace
+                .active
                 .binding
                 .pane_layouts
                 .insert(key.clone(), layout);
@@ -1836,6 +1666,7 @@ impl AppState {
 
         let previous_panes = self
             .workspace
+            .active
             .binding
             .pane_layouts
             .get(&key)
@@ -1850,6 +1681,7 @@ impl AppState {
         {
             let layout = self
                 .workspace
+                .active
                 .binding
                 .pane_layouts
                 .entry(key.clone())
@@ -1868,6 +1700,7 @@ impl AppState {
         let pane_set_changed = has_new_pane || !removed_panes.is_empty();
         if pane_set_changed && let Some(layout) = server_layout {
             self.workspace
+                .active
                 .binding
                 .pane_layouts
                 .insert(key.clone(), layout);
@@ -1878,6 +1711,7 @@ impl AppState {
                 .unwrap_or(SplitDirection::Right);
             let layout = self
                 .workspace
+                .active
                 .binding
                 .pane_layouts
                 .get_mut(&key)
@@ -1886,6 +1720,7 @@ impl AppState {
         }
         let layout = self
             .workspace
+            .active
             .binding
             .pane_layouts
             .get_mut(&key)
@@ -1902,14 +1737,18 @@ impl AppState {
             .iter()
             .find(|pane| pane.pane_id.as_deref() == Some(focused_id.as_str()))
             .cloned();
-        self.workspace.binding.terminal.sync_scoped_native_window(
-            self.workspace.binding.scope,
-            &panes,
-            focused_anchor.as_ref(),
-            window_id.as_deref(),
-            selected_backend(&config),
-            config.hide_tmux_status,
-        )
+        self.workspace
+            .active
+            .binding
+            .terminal
+            .sync_scoped_native_window(
+                self.workspace.active.binding.scope,
+                &panes,
+                focused_anchor.as_ref(),
+                window_id.as_deref(),
+                selected_backend(&config),
+                config.hide_tmux_status,
+            )
     }
 
     /// True when the active native window holds more than one pane and should render as a split.
@@ -1927,7 +1766,7 @@ impl AppState {
         let window = self
             .window_key_for_pane(pane_id)
             .unwrap_or_else(|| self.current_window_key());
-        self.workspace.binding.pane_id(window, pane_id)
+        self.workspace.active.binding.pane_id(window, pane_id)
     }
 
     pub(crate) fn current_terminal_progress(&self) -> Option<TerminalProgress> {
@@ -1953,17 +1792,19 @@ impl AppState {
             .and_then(|pane_id| self.pane_progress(pane_id))
             .or_else(|| {
                 self.workspace
+                    .active
                     .binding
                     .mux
                     .selected_session_anchor()
                     .and_then(|anchor| anchor.pane_id.as_deref())
                     .and_then(|pane_id| self.pane_progress(pane_id))
             })
-            .or(self.workspace.binding.unscoped_terminal_progress)
+            .or(self.workspace.active.binding.unscoped_terminal_progress)
     }
 
     pub(crate) fn pane_progress(&self, pane_id: &str) -> Option<TerminalProgress> {
         self.workspace
+            .active
             .binding
             .terminal_progress
             .get(&self.pane_cache_key(pane_id))
@@ -1972,6 +1813,7 @@ impl AppState {
 
     pub(crate) fn pane_ports(&self, pane_id: &str) -> Option<&[u16]> {
         self.workspace
+            .active
             .binding
             .terminal_ports
             .get(&self.pane_cache_key(pane_id))
@@ -1979,10 +1821,14 @@ impl AppState {
     }
 
     pub(crate) fn session_ports(&self, session: &MuxSession) -> Vec<u16> {
-        let selected = self.workspace.binding.mux.selected_session();
+        let selected = self.workspace.active.binding.mux.selected_session();
         let mut ports =
             if selected == Some(session.id.as_str()) || selected == Some(session.name.as_str()) {
-                self.workspace.binding.unscoped_terminal_ports.clone()
+                self.workspace
+                    .active
+                    .binding
+                    .unscoped_terminal_ports
+                    .clone()
             } else {
                 Vec::new()
             };
@@ -2005,22 +1851,39 @@ impl AppState {
 
     pub(crate) fn has_indeterminate_terminal_progress(&self) -> bool {
         self.workspace
+            .active
             .binding
             .terminal_progress
             .values()
-            .chain(self.workspace.binding.unscoped_terminal_progress.iter())
+            .chain(
+                self.workspace
+                    .active
+                    .binding
+                    .unscoped_terminal_progress
+                    .iter(),
+            )
             .any(|progress| progress.state == TerminalProgressState::Indeterminate)
-            || self.workspace.binding.mux.sessions().iter().any(|session| {
-                session
-                    .windows
-                    .iter()
-                    .any(|window| self.window_has_indeterminate_progress(window))
-            })
+            || self
+                .workspace
+                .active
+                .binding
+                .mux
+                .sessions()
+                .iter()
+                .any(|session| {
+                    session
+                        .windows
+                        .iter()
+                        .any(|window| self.window_has_indeterminate_progress(window))
+                })
     }
 
     /// The names the active binding shows for `sessions`, in the same order.
     pub(crate) fn session_display_names(&self, sessions: &[MuxSession]) -> Vec<String> {
-        self.workspace.binding.session_display_names(sessions)
+        self.workspace
+            .active
+            .binding
+            .session_display_names(sessions)
     }
 
     pub(crate) fn window_has_indeterminate_progress(&self, window: &MuxWindow) -> bool {
@@ -2073,7 +1936,7 @@ impl AppState {
 
     pub fn focus_pane(&mut self, pane_id: &str) {
         let key = self.current_window_key();
-        let moved = match self.workspace.binding.pane_layouts.get_mut(&key) {
+        let moved = match self.workspace.active.binding.pane_layouts.get_mut(&key) {
             Some(layout) if layout.focused() != pane_id => layout.set_focus(pane_id),
             _ => false,
         };
@@ -2086,7 +1949,7 @@ impl AppState {
 
     pub fn set_pane_ratio(&mut self, path: &[u8], ratio: f32, min_fraction: f32) {
         let key = self.current_window_key();
-        if let Some(layout) = self.workspace.binding.pane_layouts.get_mut(&key) {
+        if let Some(layout) = self.workspace.active.binding.pane_layouts.get_mut(&key) {
             layout.set_ratio_at(path, ratio, min_fraction, min_fraction);
         }
     }
@@ -2096,6 +1959,7 @@ impl AppState {
         pane_id: &str,
     ) -> Option<&mut (dyn TerminalRuntime + '_)> {
         self.workspace
+            .active
             .binding
             .terminal
             .render_source_for_pane(pane_id)
@@ -2110,12 +1974,13 @@ impl AppState {
 
     pub fn resize_native_layout_window(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.workspace
+            .active
             .binding
             .terminal
             .resize_native_layout_window(cols, rows)
     }
 
-    fn sync_native_layout_terminal_now(&mut self) {
+    pub(super) fn sync_native_layout_terminal_now(&mut self) {
         if !self.uses_native_terminal_layout() {
             return;
         }
@@ -2127,6 +1992,7 @@ impl AppState {
     fn split_focused_pane(&mut self, direction: SplitDirection, target_pane_id: Option<&str>) {
         let session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -2134,7 +2000,7 @@ impl AppState {
             .to_owned();
         let mux_config = self.active_multiplexer().clone();
         if !self.uses_native_terminal_layout() {
-            self.workspace.binding.mux.execute_command(
+            self.workspace.active.binding.mux.execute_command(
                 &self.repaint,
                 &mux_config,
                 MuxCommand::SplitPane {
@@ -2149,19 +2015,21 @@ impl AppState {
         let key = self.current_window_key();
         let focused = target_pane_id.map(str::to_owned).or_else(|| {
             self.workspace
+                .active
                 .binding
                 .pane_layouts
                 .get(&key)
                 .map(|layout| layout.focused().to_owned())
                 .or_else(|| {
                     self.workspace
+                        .active
                         .binding
                         .mux
                         .selected_session_anchor()
                         .and_then(|anchor| anchor.pane_id.clone())
                 })
         });
-        self.workspace.binding.mux.execute_command(
+        self.workspace.active.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
             MuxCommand::SplitPane {
@@ -2182,6 +2050,7 @@ impl AppState {
     ) {
         if backend == MultiplexerBackendConfig::Rmux {
             self.workspace
+                .active
                 .binding
                 .pending_pane_split_directions
                 .insert(key, direction);
@@ -2191,6 +2060,7 @@ impl AppState {
         // The native split synchronously sets the new pane active, so the refreshed anchor names it.
         let new_pane = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session_anchor()
@@ -2198,6 +2068,7 @@ impl AppState {
         if let Some(new_pane) = new_pane {
             let layout = self
                 .workspace
+                .active
                 .binding
                 .pane_layouts
                 .entry(key.clone())
@@ -2209,6 +2080,7 @@ impl AppState {
                 layout.split_focused(new_pane, direction);
             }
             self.workspace
+                .active
                 .binding
                 .pending_pane_split_directions
                 .remove(&key);
@@ -2228,6 +2100,7 @@ impl AppState {
         let gap = self.config().chrome.pane_divider_width;
         let neighbor = self
             .workspace
+            .active
             .binding
             .pane_layouts
             .get(&key)
@@ -2239,7 +2112,7 @@ impl AppState {
 
     fn focus_pane_relative(&mut self, delta: isize) {
         let key = self.current_window_key();
-        let Some(layout) = self.workspace.binding.pane_layouts.get(&key) else {
+        let Some(layout) = self.workspace.active.binding.pane_layouts.get(&key) else {
             return;
         };
         let panes = layout.panes();
@@ -2257,21 +2130,15 @@ impl AppState {
     pub fn activate_scoped_session_from_ui(&mut self, target: &ScopedSessionTarget) -> bool {
         // A session that belongs to another Space is switched to there, not dragged over here: its
         // binding, terminal, and pane layout all live in that Space.
-        if target.scope.space_id() != self.workspace.active_space_id
+        if target.scope.space_id() != self.workspace.active.id
             && !self.activate_space_from_ui(target.scope.space_id())
         {
             return false;
         }
-        if target.scope != self.workspace.binding.scope {
-            let Some(index) = self
-                .workspace
-                .inactive_bindings
-                .iter()
-                .position(|binding| binding.scope == target.scope)
-            else {
+        if target.scope != self.workspace.active.binding.scope {
+            let Some(backend) = self.workspace.binding_backend(target.scope) else {
                 return false;
             };
-            let backend = self.workspace.inactive_bindings[index].multiplexer.backend;
             let keybinds = self.config().input.keybinds_for_backend(backend);
             let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
                 Ok(bindings) => bindings,
@@ -2280,50 +2147,27 @@ impl AppState {
                     return false;
                 }
             };
-            // Same as the space switch: the outgoing binding stays live and restores its own tmux
-            // overrides on drop, so skip the fork-per-option restore the next attach would undo.
-            let mut target_binding = self.workspace.inactive_bindings.remove(index);
-            self.workspace.binding.discard_terminal_side_effects();
-            target_binding.discard_terminal_side_effects();
-            if let Some(owner) = &mut self.workspace.parked_native_terminal {
-                owner.discard_side_effects();
-            }
-            self.prepare_native_terminal_transition(&mut target_binding);
-            let current_binding = std::mem::replace(&mut self.workspace.binding, target_binding);
-            self.workspace
-                .inactive_bindings
-                .insert(index, current_binding);
-            if !self
-                .workspace
-                .binding
-                .session_order
-                .session_names()
-                .is_empty()
-            {
-                self.workspace.binding.mux.refresh_on_next_frame();
-                let active_config = self.workspace.binding.multiplexer.clone();
-                let _ = self
-                    .workspace
-                    .binding
-                    .mux
-                    .refresh_sessions(&self.repaint, &active_config);
-                self.sync_session_order();
-                if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
-                    self.workspace.binding.persisted_sessions_restored = false;
-                    self.workspace
-                        .binding
-                        .restore_persisted_sessions(&self.repaint);
-                }
+            let config = self.config().clone();
+            if !self.workspace.activate_binding(
+                target.scope,
+                &config,
+                self.active_appearance_variant,
+                &self.repaint,
+            ) {
+                return false;
             }
             self.app_key_bindings = app_key_bindings;
             self.terminal_surface = None;
             self.last_pane_area = None;
         }
+        if !self.persist_rmux_selection_before_publish(&target.session_id, None) {
+            return false;
+        }
         self.workspace
+            .active
             .binding
             .mux
             .activate_session(&target.session_id);
-        self.persist_rmux_restore_state();
         self.sync_native_layout_terminal_now();
         self.sidebar_hovered_session = Some(target.clone());
         (self.repaint)();
@@ -2331,12 +2175,12 @@ impl AppState {
     }
 
     pub fn activate_session_from_ui(&mut self, session_id: &str) {
-        let target = ScopedSessionTarget::new(self.workspace.binding.scope, session_id);
+        let target = ScopedSessionTarget::new(self.workspace.active.binding.scope, session_id);
         self.activate_scoped_session_from_ui(&target);
     }
 
     pub fn activate_relative_session_from_ui(&mut self, session_id: &str, delta: isize) -> bool {
-        let sessions = self.workspace.binding.mux.sessions();
+        let sessions = self.workspace.active.binding.mux.sessions();
         let Some(current) = sessions
             .iter()
             .position(|session| session.id == session_id || session.name == session_id)
@@ -2363,6 +2207,7 @@ impl AppState {
     pub fn activate_last_session_from_ui(&mut self) -> bool {
         let Some(session_id) = self
             .workspace
+            .active
             .binding
             .mux
             .previous_selected_session()
@@ -2375,14 +2220,16 @@ impl AppState {
     }
 
     pub fn activate_window_from_ui(&mut self, session_id: &str, window_id: &str) {
+        if !self.persist_rmux_selection_before_publish(session_id, Some(window_id)) {
+            return;
+        }
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.activate_window(
+        self.workspace.active.binding.mux.activate_window(
             session_id,
             window_id,
             &self.repaint,
             &mux_config,
         );
-        self.persist_rmux_restore_state();
         self.sync_native_layout_terminal_now();
     }
 
@@ -2394,6 +2241,7 @@ impl AppState {
     ) -> bool {
         let Some((session_id, window_id)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -2416,6 +2264,7 @@ impl AppState {
     pub fn activate_last_window_from_ui(&mut self, session_id: &str) -> bool {
         let Some(session_id) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -2427,7 +2276,7 @@ impl AppState {
             return false;
         };
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.execute_command(
+        self.workspace.active.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
             MuxCommand::ActivateLastWindow { session_id },
@@ -2439,18 +2288,21 @@ impl AppState {
     pub fn new_tab_for_window_from_ui(&mut self, session_id: &str, window_id: &str) -> bool {
         let selected_session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
             .map(str::to_owned);
         let selected_window = self
             .workspace
+            .active
             .binding
             .mux
             .selected_window()
             .map(str::to_owned);
         let Some((resolved_session_id, anchor_cwd, target_is_current)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -2484,6 +2336,7 @@ impl AppState {
         let live_terminal_cwd = target_is_current
             .then(|| {
                 self.workspace
+                    .active
                     .binding
                     .terminal
                     .current_working_directory()
@@ -2499,7 +2352,7 @@ impl AppState {
 
     fn new_tab_from_ui(&mut self, session_id: String, cwd: Option<String>) -> bool {
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.execute_command(
+        self.workspace.active.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
             MuxCommand::NewWindow { session_id, cwd },
@@ -2511,6 +2364,7 @@ impl AppState {
     pub fn reorder_window_before_from_ui(&mut self, source: &str, before: Option<&str>) -> bool {
         let Some(session_id) = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -2521,7 +2375,7 @@ impl AppState {
         if before == Some(source) {
             return false;
         }
-        let windows = self.workspace.binding.mux.selected_session_windows();
+        let windows = self.workspace.active.binding.mux.selected_session_windows();
         let Some(from) = windows.iter().position(|window| window.id == source) else {
             return false;
         };
@@ -2543,7 +2397,7 @@ impl AppState {
         }
 
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.execute_command(
+        self.workspace.active.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
             MuxCommand::MoveWindow {
@@ -2559,18 +2413,21 @@ impl AppState {
     pub fn move_window_from_ui(&mut self, session_id: &str, window_id: &str, delta: i32) -> bool {
         let selected_session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
             .map(str::to_owned);
         let selected_window = self
             .workspace
+            .active
             .binding
             .mux
             .selected_window()
             .map(str::to_owned);
         let Some((session_id, position, window_count, active_window_id)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -2624,6 +2481,7 @@ impl AppState {
             },
         };
         self.workspace
+            .active
             .binding
             .mux
             .execute_command(&self.repaint, &mux_config, command);
@@ -2634,6 +2492,7 @@ impl AppState {
     pub fn close_pane_for_window_from_ui(&mut self, session_id: &str, window_id: &str) -> bool {
         let Some((session_id, window_id, pane_id)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -2657,6 +2516,7 @@ impl AppState {
         };
         let selected_session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -2665,6 +2525,7 @@ impl AppState {
         let target_is_current = current_window.window_id == window_id
             && self
                 .workspace
+                .active
                 .binding
                 .mux
                 .sessions()
@@ -2676,19 +2537,24 @@ impl AppState {
                         .is_some_and(|selected| selected == session.id || selected == session.name)
                 });
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.close_pane(
+        self.workspace.active.binding.mux.close_pane(
             &session_id,
             Some(&pane_id),
             &self.repaint,
             &mux_config,
         );
-        self.workspace.binding.terminal.discard_pane(&pane_id);
+        self.workspace
+            .active
+            .binding
+            .terminal
+            .discard_pane(&pane_id);
         if self.uses_native_terminal_layout() {
             let key = self
                 .workspace
+                .active
                 .binding
                 .window_id(session_id.clone(), window_id.clone());
-            if let Some(layout) = self.workspace.binding.pane_layouts.get_mut(&key) {
+            if let Some(layout) = self.workspace.active.binding.pane_layouts.get_mut(&key) {
                 layout.remove(&pane_id);
             }
             if target_is_current {
@@ -2699,12 +2565,44 @@ impl AppState {
     }
 
     fn sync_session_order(&mut self) {
-        self.workspace.binding.sync_session_order();
+        if let Err(error) = self.workspace.reconcile_binding_states() {
+            self.last_error = Some(error.to_string());
+        }
     }
-    /// Whether the generated-name reconciler needs to run, updating the stored fingerprint as a
-    /// side effect. Reconciling forks up to four `git` subprocesses per session (a worktree lookup,
-    /// then a suggested name), so this returns `false` while nothing relevant has changed, keeping
-    /// that work off the steady-state frame path.
+
+    pub(super) fn commit_binding_state_candidate(
+        &mut self,
+        candidate: BindingStateCandidate,
+    ) -> bool {
+        match self.workspace.commit_binding_state_candidate(candidate) {
+            Ok(()) => true,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
+    fn begin_active_binding_membership_mutation(
+        &mut self,
+        command: &MuxCommand,
+        naming: Option<&PendingGeneratedName>,
+    ) -> bool {
+        match self
+            .workspace
+            .begin_active_binding_membership_mutation(command, naming)
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+    /// Fingerprint the backend facts used by the generated-name reconciler. Reconciling forks up to
+    /// four `git` subprocesses per session, so an unchanged fingerprint keeps that work off the
+    /// steady-state frame path.
     ///
     /// Fingerprints the whole backend list, which changes only when the backend really did.
     /// `mux.sessions()` cannot be used: it is narrowed to this binding's membership, and it is
@@ -2716,9 +2614,9 @@ impl AppState {
     /// generated name immediately, rather than waiting for the next backend change, but the extra
     /// reconciles it causes reach the cwd-keyed `SessionNameStore` collision between bindings often
     /// enough to fail Space membership tests. Include it once that store is keyed by session id.
-    fn generated_names_need_sync(&mut self) -> bool {
+    fn generated_names_signature(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for session in self.workspace.binding.mux.all_sessions() {
+        for session in self.workspace.active.binding.mux.all_sessions() {
             hasher.write(session.id.as_bytes());
             hasher.write_u8(0);
             hasher.write(session.name.as_bytes());
@@ -2728,54 +2626,51 @@ impl AppState {
             }
             hasher.write_u8(1);
         }
-        let signature = hasher.finish();
-        if self.workspace.binding.generated_names_signature == Some(signature) {
-            return false;
-        }
-        self.workspace.binding.generated_names_signature = Some(signature);
-        true
+        hasher.finish()
     }
 
     fn sync_generated_session_names(&mut self) {
         let remote = self.active_multiplexer().remote.is_some();
-        // Preserve membership before `observe_session` records the backend's new names below.
-        self.workspace.binding.carry_renamed_members();
+        let mut candidate = self.workspace.active_reconciled_binding_state_candidate();
+        let mut pending_generated_names = self
+            .workspace
+            .active
+            .binding
+            .pending_generated_names
+            .clone();
         if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
+            self.commit_binding_state_candidate(candidate);
             return;
         }
-        if !self.generated_names_need_sync() {
+        let signature = self.generated_names_signature();
+        if self.workspace.active.binding.generated_names_signature == Some(signature) {
+            self.commit_binding_state_candidate(candidate);
             return;
         }
         // Reconcile only this binding's sessions. Generating names for the whole backend list
         // renames sessions that belong to other Spaces.
-        let sessions = self.workspace.binding.mux.sessions().to_vec();
+        let sessions = self.workspace.active.binding.mux.sessions().to_vec();
         let mut renames = Vec::new();
-        self.workspace
-            .binding
-            .pending_generated_names
-            .retain(|session_id, pending| {
-                // A pending name the backend already reports has served its purpose: it exists to
-                // keep the name alive for membership and uniqueness until the rename or create lands.
-                // Renames record it under the new name rather than a session id, so the id lookup
-                // below never prunes those and they would otherwise be held forever.
-                if sessions.iter().any(|session| session.name == pending.name) {
-                    return false;
-                }
-                sessions
-                    .iter()
-                    .find(|session| session.id == *session_id)
-                    .is_none_or(|session| {
-                        session
-                            .anchor
-                            .cwd
-                            .as_deref()
-                            .is_some_and(|cwd| Self::session_cwd(cwd, remote) == pending.cwd)
-                    })
-            });
-        let mut planned_names = self
-            .workspace
-            .binding
-            .pending_generated_names
+        pending_generated_names.retain(|session_id, pending| {
+            // A pending name the backend already reports has served its purpose: it exists to
+            // keep the name alive for membership and uniqueness until the rename or create lands.
+            // Renames record it under the new name rather than a session id, so the id lookup
+            // below never prunes those and they would otherwise be held forever.
+            if sessions.iter().any(|session| session.name == pending.name) {
+                return false;
+            }
+            sessions
+                .iter()
+                .find(|session| session.id == *session_id)
+                .is_none_or(|session| {
+                    session
+                        .anchor
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|cwd| Self::session_cwd(cwd, remote) == pending.cwd)
+                })
+        });
+        let mut planned_names = pending_generated_names
             .values()
             .map(|pending| pending.name.clone())
             .collect::<HashSet<_>>();
@@ -2791,11 +2686,10 @@ impl AppState {
                 continue;
             };
             let cwd = Self::session_cwd(raw_cwd, remote);
-            let mut record = if let Some(record) = self
-                .workspace
-                .binding
-                .session_names
-                .observe_session(&session.id, &session.name, &cwd)
+            let mut record = if let Some(record) =
+                candidate
+                    .session_names
+                    .observe_session(&session.id, &session.name, &cwd)
             {
                 record
             } else {
@@ -2805,22 +2699,21 @@ impl AppState {
                     crate::strings::session_name_for_path(&cwd)
                 };
                 if session.name == legacy_name {
-                    self.workspace.binding.session_names.remember_generated(
+                    candidate.session_names.remember_generated(
                         &session.id,
                         &cwd,
                         &session.name,
                         &session.name,
                     );
                 } else {
-                    self.workspace.binding.session_names.mark_explicit(
+                    candidate.session_names.mark_explicit(
                         &session.id,
                         &session.name,
                         &session.name,
                         &cwd,
                     );
                 }
-                self.workspace
-                    .binding
+                candidate
                     .session_names
                     .observe_session(&session.id, &session.name, &cwd)
                     .expect("session name metadata should be observable after recording")
@@ -2838,8 +2731,7 @@ impl AppState {
                 if record.explicit && generated_suffix {
                     // Bootty generated `generated_name`, then asked the backend for that name plus a
                     // uniqueness suffix — which the old reconciler read back as somebody's rename.
-                    self.workspace
-                        .binding
+                    candidate
                         .session_names
                         .reclaim_generated(&session.id, &session.name);
                     record.generated_name = session.name.clone();
@@ -2857,40 +2749,36 @@ impl AppState {
                         session.name.clone()
                     }
                 };
-                self.workspace
-                    .binding
+                candidate
                     .session_names
                     .set_display_name(&session.id, &display_name);
                 record.display_name = display_name;
             }
 
-            if let Some(pending) = self
-                .workspace
-                .binding
-                .pending_generated_names
-                .get(&session.id)
-                .cloned()
-            {
+            if let Some(pending) = pending_generated_names.get(&session.id).cloned() {
                 if pending.cwd == cwd {
                     if session.name == pending.name {
                         planned_names.remove(&pending.name);
-                        self.workspace.binding.session_names.remember_generated(
-                            &session.id,
-                            &cwd,
-                            &pending.name,
-                            &pending.display_name,
-                        );
-                        self.workspace
-                            .binding
-                            .pending_generated_names
-                            .remove(&session.id);
+                        if pending.explicit {
+                            candidate.session_names.mark_explicit(
+                                &session.id,
+                                &pending.name,
+                                &pending.display_name,
+                                &cwd,
+                            );
+                        } else {
+                            candidate.session_names.remember_generated(
+                                &session.id,
+                                &cwd,
+                                &pending.name,
+                                &pending.display_name,
+                            );
+                        }
+                        pending_generated_names.remove(&session.id);
                     } else if session.name != record.generated_name {
                         planned_names.remove(&pending.name);
-                        self.workspace
-                            .binding
-                            .pending_generated_names
-                            .remove(&session.id);
-                        self.workspace.binding.session_names.mark_explicit(
+                        pending_generated_names.remove(&session.id);
+                        candidate.session_names.mark_explicit(
                             &session.id,
                             &session.name,
                             &session.name,
@@ -2899,16 +2787,13 @@ impl AppState {
                     }
                     continue;
                 }
-                self.workspace
-                    .binding
-                    .pending_generated_names
-                    .remove(&session.id);
+                pending_generated_names.remove(&session.id);
             }
             if record.explicit {
                 continue;
             }
             if session.name != record.generated_name {
-                self.workspace.binding.session_names.mark_explicit(
+                candidate.session_names.mark_explicit(
                     &session.id,
                     &session.name,
                     &session.name,
@@ -2928,23 +2813,29 @@ impl AppState {
                 continue;
             }
             planned_names.insert(desired.clone());
-            self.workspace.binding.pending_generated_names.insert(
+            pending_generated_names.insert(
                 session.id.clone(),
                 PendingGeneratedName {
                     cwd,
                     name: desired.clone(),
                     display_name,
+                    explicit: false,
                 },
             );
             renames.push((session.id.clone(), desired));
         }
 
+        if !self.commit_binding_state_candidate(candidate) {
+            return;
+        }
+        self.workspace.active.binding.pending_generated_names = pending_generated_names;
+        self.workspace.active.binding.generated_names_signature = Some(signature);
         if renames.is_empty() {
             return;
         }
         let mux_config = self.active_multiplexer().clone();
         for (session_id, name) in renames {
-            self.workspace.binding.mux.rename_session(
+            self.workspace.active.binding.mux.rename_session(
                 &session_id,
                 name,
                 &self.repaint,
@@ -2956,9 +2847,9 @@ impl AppState {
     /// Every session name the backend already answers to, plus the names bootty has asked it for and
     /// is still waiting on. `keep` is the name of the session being renamed, which must not count as
     /// taken against itself.
-    fn taken_session_names(&self, keep: Option<&str>) -> Vec<String> {
-        std::iter::once(&self.workspace.binding)
-            .chain(self.workspace.inactive_bindings.iter())
+    pub(super) fn taken_session_names(&self, keep: Option<&str>) -> Vec<String> {
+        std::iter::once(&self.workspace.active.binding)
+            .chain(self.workspace.active.inactive_bindings.iter())
             .chain(
                 self.workspace
                     .inactive_spaces
@@ -2989,35 +2880,40 @@ impl AppState {
             &display_name,
             existing_names.iter().map(String::as_str),
         );
-        self.workspace.binding.pending_generated_names.insert(
-            session_id.clone(),
-            PendingGeneratedName {
-                cwd: cwd.clone(),
-                name: session_id.clone(),
-                display_name: display_name.clone(),
-            },
-        );
-        self.workspace.binding.session_names.remember_generated(
-            &session_id,
-            &cwd,
-            &session_id,
-            &display_name,
-        );
+        let command = MuxCommand::CreateProjectSession {
+            session_id: session_id.clone(),
+            cwd: cwd.clone(),
+        };
+        let pending_name = PendingGeneratedName {
+            cwd: cwd.clone(),
+            name: session_id.clone(),
+            display_name: display_name.clone(),
+            explicit: false,
+        };
+        if !self.begin_active_binding_membership_mutation(&command, Some(&pending_name)) {
+            return;
+        }
         self.workspace
+            .active
             .binding
-            .session_order
-            .add_session(&session_id);
+            .pending_generated_names
+            .insert(session_id.clone(), pending_name);
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.create_project_session(
+        self.workspace.active.binding.mux.create_project_session(
             crate::ui::new_session_picker::NewMuxSessionRequest { session_id, cwd },
             &self.repaint,
             &mux_config,
         );
-        self.persist_rmux_restore_state();
+        if selected_backend(&mux_config) == MultiplexerBackendConfig::Native {
+            self.workspace
+                .active
+                .binding
+                .membership_reconciliation_ready = true;
+        }
         self.input_focus = InputFocus::Terminal;
     }
 
-    fn session_cwd(cwd: &str, remote: bool) -> String {
+    pub(super) fn session_cwd(cwd: &str, remote: bool) -> String {
         if remote {
             cwd.to_owned()
         } else {
@@ -3025,7 +2921,7 @@ impl AppState {
         }
     }
 
-    fn suggested_session_name(cwd: &str, remote: bool) -> String {
+    pub(super) fn suggested_session_name(cwd: &str, remote: bool) -> String {
         if remote {
             crate::strings::session_name_for_remote_path(cwd)
         } else {
@@ -3044,6 +2940,7 @@ impl AppState {
     fn move_selected_session(&mut self, delta: i32) -> bool {
         let Some(selected) = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -3057,6 +2954,7 @@ impl AppState {
     pub fn move_session_from_ui(&mut self, session_id: &str, delta: i32) -> bool {
         let Some(session_name) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -3066,39 +2964,47 @@ impl AppState {
         else {
             return false;
         };
-        if !self.workspace.binding.session_order.move_session(
+        let sessions = self
+            .workspace
+            .active
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+        let mut candidate = self.workspace.active_binding_state_candidate();
+        if !candidate.session_order.move_session(
             &session_name,
             delta,
-            self.workspace
-                .binding
-                .mux
-                .sessions()
-                .iter()
-                .map(|session| session.name.as_str()),
+            sessions.iter().map(String::as_str),
         ) {
             return false;
         }
-        self.sync_session_order();
-        true
+        self.commit_binding_state_candidate(candidate)
     }
 
     pub fn reorder_session_before(&mut self, source: &str, target: Option<&str>) -> bool {
         // Per-session anchors: a drag reorders within a group when source and target share one,
         // and moves the whole group across groups.
-        if !self.workspace.binding.session_order.move_session_before(
+        let sessions = self
+            .workspace
+            .active
+            .binding
+            .mux
+            .sessions()
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
+        let mut candidate = self.workspace.active_binding_state_candidate();
+        if !candidate.session_order.move_session_before(
             source,
             target,
-            self.workspace
-                .binding
-                .mux
-                .sessions()
-                .iter()
-                .map(|session| session.name.as_str()),
+            sessions.iter().map(String::as_str),
         ) {
             return false;
         }
-        self.sync_session_order();
-        true
+        self.commit_binding_state_candidate(candidate)
     }
 
     pub fn take_dialog(&mut self) -> Option<NewMuxSessionDialog> {
@@ -3145,10 +3051,7 @@ impl AppState {
     }
 
     pub fn detach_scoped_session_from_space(&mut self, target: &ScopedSessionTarget) -> bool {
-        let Some(binding) = self
-            .binding_runtimes_mut()
-            .find(|binding| binding.scope == target.scope)
-        else {
+        let Some(binding) = self.workspace.binding(target.scope) else {
             return false;
         };
         let Some(name) = binding
@@ -3160,10 +3063,16 @@ impl AppState {
         else {
             return false;
         };
-        if !binding.session_order.remove_session(&name) {
+        let mut candidate = self
+            .workspace
+            .binding_state_candidate(target.scope)
+            .expect("a live binding has committed workspace state");
+        if !candidate.session_order.remove_session(&name) {
             return false;
         }
-        binding.sync_session_order();
+        if !self.commit_binding_state_candidate(candidate) {
+            return false;
+        }
         (self.repaint)();
         true
     }
@@ -3186,9 +3095,7 @@ impl AppState {
             }
             SessionPickerEvent::ActivateSession(target) => {
                 self.input_focus = InputFocus::Terminal;
-                if let Some(binding) = self
-                    .binding_runtimes_mut()
-                    .find(|binding| binding.scope == target.scope)
+                if let Some(binding) = self.workspace.binding(target.scope)
                     && let Some(name) = binding
                         .mux
                         .all_sessions()
@@ -3198,8 +3105,14 @@ impl AppState {
                         })
                         .map(|session| session.name.clone())
                 {
-                    binding.session_order.add_session(&name);
-                    binding.sync_session_order();
+                    let mut candidate = self
+                        .workspace
+                        .binding_state_candidate(target.scope)
+                        .expect("a live binding has committed workspace state");
+                    candidate.session_order.add_session(&name);
+                    if !self.commit_binding_state_candidate(candidate) {
+                        return;
+                    }
                 }
                 self.activate_scoped_session_from_ui(&target);
             }
@@ -3224,8 +3137,14 @@ impl AppState {
             }
             RenameSessionEvent::Rename { session_id, name } => {
                 let name = name.trim().to_owned();
+                if name.is_empty() {
+                    self.last_error = Some("session name cannot be empty".to_owned());
+                    self.rename_session_dialog = Some(dialog);
+                    return;
+                }
                 let session = self
                     .workspace
+                    .active
                     .binding
                     .mux
                     .sessions()
@@ -3246,31 +3165,39 @@ impl AppState {
                         &name,
                         taken.iter().map(String::as_str),
                     );
+                    let command = MuxCommand::RenameSession {
+                        session_id: session.id.clone(),
+                        name: backend_name.clone(),
+                    };
+                    let pending_name = PendingGeneratedName {
+                        cwd: cwd.clone(),
+                        name: backend_name.clone(),
+                        display_name: name.clone(),
+                        explicit: true,
+                    };
+                    if !self.begin_active_binding_membership_mutation(&command, Some(&pending_name))
+                    {
+                        self.rename_session_dialog = Some(dialog);
+                        return;
+                    }
                     self.workspace
+                        .active
                         .binding
-                        .session_order
-                        .rename_session(&session.name, &backend_name);
-                    self.workspace.binding.pending_generated_names.insert(
-                        backend_name.clone(),
-                        PendingGeneratedName {
-                            cwd: cwd.clone(),
-                            name: backend_name.clone(),
-                            display_name: name.clone(),
-                        },
-                    );
-                    self.workspace.binding.session_names.mark_explicit(
-                        &session.id,
-                        &backend_name,
-                        &name,
-                        &cwd,
-                    );
+                        .pending_generated_names
+                        .insert(session.id.clone(), pending_name);
                     let mux_config = self.active_multiplexer().clone();
-                    self.workspace.binding.mux.rename_session(
+                    self.workspace.active.binding.mux.rename_session(
                         &session.id,
                         backend_name,
                         &self.repaint,
                         &mux_config,
                     );
+                    if selected_backend(&mux_config) == MultiplexerBackendConfig::Native {
+                        self.workspace
+                            .active
+                            .binding
+                            .membership_reconciliation_ready = true;
+                    }
                 }
                 self.input_focus = InputFocus::Terminal;
             }
@@ -3297,12 +3224,14 @@ impl AppState {
                 let name = name.trim();
                 let key = self
                     .workspace
+                    .active
                     .binding
                     .window_id(session_id.clone(), window_id.clone());
                 if name.is_empty() {
-                    self.workspace.binding.custom_tab_names.remove(&key);
+                    self.workspace.active.binding.custom_tab_names.remove(&key);
                     if let Some(title) = self
                         .workspace
+                        .active
                         .binding
                         .terminal_tab_titles
                         .get(&key)
@@ -3311,7 +3240,7 @@ impl AppState {
                         self.rename_window_for_terminal_title(&session_id, &window_id, &title);
                     }
                 } else {
-                    self.workspace.binding.custom_tab_names.insert(key);
+                    self.workspace.active.binding.custom_tab_names.insert(key);
                     self.rename_window(&session_id, &window_id, name);
                 }
                 self.input_focus = InputFocus::Terminal;
@@ -3388,10 +3317,24 @@ impl AppState {
                     return;
                 }
                 let mux_config = self.active_multiplexer().clone();
-                self.workspace
-                    .binding
-                    .mux
-                    .ditch_session(&session_id, &self.repaint, &mux_config);
+                let command = MuxCommand::DitchSession {
+                    session_id: session_id.clone(),
+                };
+                if !self.begin_active_binding_membership_mutation(&command, None) {
+                    self.ditch_session_dialog = Some(dialog);
+                    return;
+                }
+                self.workspace.active.binding.mux.ditch_session(
+                    &session_id,
+                    &self.repaint,
+                    &mux_config,
+                );
+                if selected_backend(&mux_config) == MultiplexerBackendConfig::Native {
+                    self.workspace
+                        .active
+                        .binding
+                        .membership_reconciliation_ready = true;
+                }
                 self.input_focus = InputFocus::Terminal;
             }
         }
@@ -3437,19 +3380,20 @@ impl AppState {
                     return;
                 };
                 if let Some(kind) = self
-                    .command_catalog
+                    .commands
+                    .catalog()
                     .describe(&invocation.command)
                     .and_then(|descriptor| descriptor.target)
                 {
                     let Some(target) = self.current_command_target_for(&invocation.command, kind)
                     else {
-                        self.pending_command = None;
+                        self.commands.clear_queue();
                         self.last_error = Some(format!("no current {kind:?} target is available"));
                         return;
                     };
                     invocation.target = Some(target);
                 }
-                self.pending_command = Some(invocation);
+                self.commands.queue(invocation);
             }
         }
     }
@@ -3549,6 +3493,7 @@ impl AppState {
     ) {
         let side_effects = self
             .workspace
+            .active
             .binding
             .terminal_side_effect_rx
             .try_iter()
@@ -3579,7 +3524,7 @@ impl AppState {
         let source_pane_id = match source_pane_id {
             Some(source_pane_id) => {
                 if let Some((scope, pane_id)) = decode_scoped_pane_id(&source_pane_id) {
-                    if scope != self.workspace.binding.scope {
+                    if scope != self.workspace.active.binding.scope {
                         return;
                     }
                     Some(pane_id)
@@ -3600,6 +3545,7 @@ impl AppState {
                 Ok(Some(text)) => {
                     if let Err(error) = self
                         .workspace
+                        .active
                         .binding
                         .terminal
                         .write_input(&encode_osc52_response(&selection, &text))
@@ -3635,15 +3581,26 @@ impl AppState {
                     terminal_cell_height,
                     terminal_scale_factor,
                 );
-                if let Err(error) = self.workspace.binding.terminal.write_input(&response) {
+                if let Err(error) = self
+                    .workspace
+                    .active
+                    .binding
+                    .terminal
+                    .write_input(&response)
+                {
                     self.last_error = Some(error.to_string());
                 }
             }
             TerminalSideEffect::ReportVariable(name) => {
                 if let Some(response) = terminal_report_variable_response(
                     &name,
-                    self.workspace.binding.mux.selected_session(),
-                ) && let Err(error) = self.workspace.binding.terminal.write_input(&response)
+                    self.workspace.active.binding.mux.selected_session(),
+                ) && let Err(error) = self
+                    .workspace
+                    .active
+                    .binding
+                    .terminal
+                    .write_input(&response)
                 {
                     self.last_error = Some(error.to_string());
                 }
@@ -3688,16 +3645,17 @@ impl AppState {
                 match progress {
                     Some(progress) => {
                         self.workspace
+                            .active
                             .binding
                             .terminal_progress
                             .insert(key, progress);
                     }
                     None => {
-                        self.workspace.binding.terminal_progress.remove(&key);
+                        self.workspace.active.binding.terminal_progress.remove(&key);
                     }
                 }
             }
-            None => self.workspace.binding.unscoped_terminal_progress = progress,
+            None => self.workspace.active.binding.unscoped_terminal_progress = progress,
         }
     }
 
@@ -3705,9 +3663,13 @@ impl AppState {
         match source_pane_id {
             Some(pane_id) => {
                 let key = self.pane_cache_key(pane_id);
-                self.workspace.binding.terminal_ports.insert(key, ports);
+                self.workspace
+                    .active
+                    .binding
+                    .terminal_ports
+                    .insert(key, ports);
             }
-            None => self.workspace.binding.unscoped_terminal_ports = ports,
+            None => self.workspace.active.binding.unscoped_terminal_ports = ports,
         }
     }
 
@@ -3723,15 +3685,22 @@ impl AppState {
             .filter(|key| !key.window_id.is_empty());
         if let Some(key) = window_key {
             self.workspace
+                .active
                 .binding
                 .terminal_tab_titles
                 .insert(key.clone(), title.clone());
-            if !self.workspace.binding.custom_tab_names.contains(&key) {
+            if !self
+                .workspace
+                .active
+                .binding
+                .custom_tab_names
+                .contains(&key)
+            {
                 self.rename_window_for_terminal_title(&key.session_id, &key.window_id, &title);
             }
         }
         if source_pane_id.is_none()
-            || self.workspace.binding.terminal.focused_pane_id() == source_pane_id
+            || self.workspace.active.binding.terminal.focused_pane_id() == source_pane_id
         {
             effects.push(AppEffect::SetWindowTitle(title));
         }
@@ -3739,6 +3708,7 @@ impl AppState {
 
     fn window_key_for_pane(&self, pane_id: &str) -> Option<ScopedWindowId> {
         self.workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -3752,6 +3722,7 @@ impl AppState {
                         .any(|pane| pane.pane_id.as_deref() == Some(pane_id));
                     (anchor_matches || pane_matches).then(|| {
                         self.workspace
+                            .active
                             .binding
                             .window_id(session.id.clone(), window.id.clone())
                     })
@@ -3768,7 +3739,7 @@ impl AppState {
 
     fn rename_window(&mut self, session_id: &str, window_id: &str, name: &str) {
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.rename_window(
+        self.workspace.active.binding.mux.rename_window(
             session_id,
             window_id,
             name.to_owned(),
@@ -3779,6 +3750,7 @@ impl AppState {
 
     fn window_name_for_key(&self, session_id: &str, window_id: &str) -> Option<&str> {
         self.workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -3896,17 +3868,25 @@ impl AppState {
     ) {
         let selected_session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
             .map(str::to_owned);
         let selected_window = self
             .workspace
+            .active
             .binding
             .mux
             .selected_window()
             .map(str::to_owned);
-        let pane_count = self.workspace.binding.mux.selected_window_panes().len();
+        let pane_count = self
+            .workspace
+            .active
+            .binding
+            .mux
+            .selected_window_panes()
+            .len();
         let last_error = self.last_error.clone();
         if let Some(driver) = &mut self.diagnostic_action_driver {
             driver.record(DiagnosticRecord {
@@ -3945,15 +3925,15 @@ impl AppState {
 
         // A command-palette choice from the previous frame runs as soon as viewport/effects are
         // available, before mux refresh can retarget selected-window actions back to backend-active.
-        if let Some(invocation) = self.pending_command.take() {
+        if let Some(invocation) = self.commands.take_queued() {
             let _ = self.dispatch_command(invocation, viewport, &mut effects);
         }
 
         self.sync_macos_non_native_fullscreen_presentation();
         // Drain the focused pane plus every live sibling in the active native window so background
         // panes keep processing output. For non-native this is just the single attach surface.
-        self.last_drain = self.workspace.binding.terminal.drain_native_window();
-        for binding in &mut self.workspace.inactive_bindings {
+        self.last_drain = self.workspace.active.binding.terminal.drain_native_window();
+        for binding in &mut self.workspace.active.inactive_bindings {
             binding.terminal.drain_native_window();
             binding.discard_terminal_side_effects();
         }
@@ -3978,11 +3958,11 @@ impl AppState {
         // A shell exiting closes its pane, collapsing the split (or cascading to the tab when it was
         // the last pane). On native, any pane's shell can exit, not just the focused one.
         if self.is_native() {
-            for pane in self.workspace.binding.terminal.native_exited_panes() {
+            for pane in self.workspace.active.binding.terminal.native_exited_panes() {
                 self.close_pane(&pane);
             }
         } else {
-            match self.workspace.binding.terminal.child_exited() {
+            match self.workspace.active.binding.terminal.child_exited() {
                 Ok(true) => self.handle_attach_client_exit(now),
                 Ok(false) => self.note_attach_client_alive(now),
                 Err(error) => self.last_error = Some(error.to_string()),
@@ -3990,60 +3970,112 @@ impl AppState {
             self.start_due_reattach(now, &mut effects);
         }
 
-        if let Some(Err(_)) = self.workspace.binding.mux.poll_command() {
-            self.workspace.binding.pending_generated_names.clear();
+        if let Some(result) = self.workspace.active.binding.mux.poll_command() {
+            if result.is_err() {
+                self.workspace
+                    .active
+                    .binding
+                    .pending_generated_names
+                    .clear();
+                self.workspace
+                    .active
+                    .binding
+                    .membership_reconciliation_waiting_for_refresh = true;
+                self.workspace.active.binding.mux.refresh_on_next_frame();
+            } else {
+                self.workspace
+                    .active
+                    .binding
+                    .membership_reconciliation_ready = true;
+            }
         }
-        for binding in &mut self.workspace.inactive_bindings {
-            if let Some(Err(_)) = binding.mux.poll_command() {
-                binding.pending_generated_names.clear();
+        for binding in &mut self.workspace.active.inactive_bindings {
+            if let Some(result) = binding.mux.poll_command() {
+                if result.is_err() {
+                    binding.pending_generated_names.clear();
+                    binding.membership_reconciliation_waiting_for_refresh = true;
+                    binding.mux.refresh_on_next_frame();
+                } else {
+                    binding.membership_reconciliation_ready = true;
+                }
             }
         }
         for space in &mut self.workspace.inactive_spaces {
             for binding in space.bindings_mut() {
-                if let Some(Err(_)) = binding.mux.poll_command() {
-                    binding.pending_generated_names.clear();
+                if let Some(result) = binding.mux.poll_command() {
+                    if result.is_err() {
+                        binding.pending_generated_names.clear();
+                        binding.membership_reconciliation_waiting_for_refresh = true;
+                        binding.mux.refresh_on_next_frame();
+                    } else {
+                        binding.membership_reconciliation_ready = true;
+                    }
                 }
             }
         }
-        let active_config = self.workspace.binding.multiplexer.clone();
+        let active_config = self.workspace.active.binding.multiplexer.clone();
         self.workspace
+            .active
             .binding
             .mux
             .set_refresh_interval(mux_session_refresh_interval(window_focused));
         let _ = self
             .workspace
+            .active
             .binding
             .mux
             .refresh_sessions(&self.repaint, &active_config);
         self.workspace
+            .active
             .binding
             .restore_persisted_sessions(&self.repaint);
-        let refresh_completed = self.workspace.binding.mux.take_refresh_completed();
+        let refresh_completed = self.workspace.active.binding.mux.take_refresh_completed();
+        if refresh_completed
+            && self
+                .workspace
+                .active
+                .binding
+                .membership_reconciliation_waiting_for_refresh
+        {
+            self.workspace
+                .active
+                .binding
+                .membership_reconciliation_ready = true;
+        }
         self.resolve_remote_attach_exit_after_refresh(refresh_completed);
         let mux_refresh_after = mux_refresh_repaint_after(&active_config, window_focused);
-        for binding in &mut self.workspace.inactive_bindings {
+        for binding in &mut self.workspace.active.inactive_bindings {
             binding.restore_persisted_sessions(&self.repaint);
-            binding.sync_session_order();
         }
         for space in &mut self.workspace.inactive_spaces {
             for binding in space.bindings_mut() {
                 binding.restore_persisted_sessions(&self.repaint);
-                binding.sync_session_order();
             }
         }
         if let Some(after) = mux_refresh_after {
             effects.push(AppEffect::RepaintAfter(after));
+        }
+        if let Err(error) = self.workspace.reconcile_binding_membership_mutations() {
+            self.last_error = Some(error.to_string());
+        }
+        if !self.deferred_profile_binding_rebuilds.is_empty() {
+            let requested_scopes = self.deferred_profile_binding_rebuilds.clone();
+            let config = self.config().clone();
+            if let Err(error) = self.rebuild_profile_bindings(&config, Some(&requested_scopes)) {
+                self.last_error = Some(error.to_string());
+            }
         }
         self.sync_generated_session_names();
         self.sync_session_order();
         let phase = crate::diagnostics::latency_start();
         let waiting_to_reattach = self
             .workspace
+            .active
             .binding
             .reattach
             .is_some_and(|reattach| !reattach.started);
         if !waiting_to_reattach && let Err(error) = self.sync_terminal_panes() {
-            if self.workspace.binding.multiplexer.remote.is_some() {
+            if self.workspace.active.binding.multiplexer.remote.is_some() {
                 self.handle_attach_start_failure(now, &error.to_string());
             } else {
                 self.last_error = Some(error.to_string());
@@ -4066,12 +4098,12 @@ impl AppState {
             + self.drive_diagnostic_actions(now, &mut effects);
         self.last_frame_dt_ms = stable_dt_ms;
 
-        let pending_pty_bytes = self.workspace.binding.terminal.pending_pty_len();
-        let (cols, rows) = self.workspace.binding.terminal.grid_size();
+        let pending_pty_bytes = self.workspace.active.binding.terminal.pending_pty_len();
+        let (cols, rows) = self.workspace.active.binding.terminal.grid_size();
         if let Some(trace) = &mut self.stability_trace {
             trace.record(StabilityTraceSample {
                 elapsed_ms: trace.started_at.elapsed().as_millis(),
-                selected_session: self.workspace.binding.mux.selected_session(),
+                selected_session: self.workspace.active.binding.mux.selected_session(),
                 cols,
                 rows,
                 pending_pty_bytes,
@@ -4230,6 +4262,7 @@ impl AppState {
     fn open_rename_session_dialog(&mut self) {
         let Some(selected) = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -4243,6 +4276,7 @@ impl AppState {
     pub fn open_rename_session_dialog_for(&mut self, session_id: &str) -> bool {
         let Some((session_id, name)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -4253,6 +4287,7 @@ impl AppState {
                 // the user has to delete out of the field.
                 let name = self
                     .workspace
+                    .active
                     .binding
                     .session_names
                     .display_name(&session.id)
@@ -4279,6 +4314,7 @@ impl AppState {
     pub fn open_rename_tab_dialog_for(&mut self, session_id: &str, window_id: &str) -> bool {
         let Some((session_id, window_id, name)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -4301,9 +4337,10 @@ impl AppState {
     }
 
     fn selected_window_for_rename(&self) -> Option<(String, String, String)> {
-        let selected = self.workspace.binding.mux.selected_session()?;
+        let selected = self.workspace.active.binding.mux.selected_session()?;
         let session = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -4311,6 +4348,7 @@ impl AppState {
             .find(|session| session.id == selected || session.name == selected)?;
         let window_id = self
             .workspace
+            .active
             .binding
             .mux
             .selected_window()
@@ -4324,6 +4362,7 @@ impl AppState {
     fn open_ditch_session_dialog(&mut self) {
         let Some(selected) = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -4337,6 +4376,7 @@ impl AppState {
     pub fn open_ditch_session_dialog_for(&mut self, session_id: &str) -> bool {
         let Some((session_id, cwd)) = self
             .workspace
+            .active
             .binding
             .mux
             .sessions()
@@ -4356,7 +4396,7 @@ impl AppState {
         let bindings = self
             .config()
             .input
-            .keybinds_for_backend(self.workspace.binding.multiplexer.backend);
+            .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
         self.close_overlay_dialogs();
         self.keybind_help_dialog = Some(KeybindHelpDialog::open(&bindings));
         self.input_focus = InputFocus::Picker;
@@ -4366,7 +4406,7 @@ impl AppState {
         let bindings = self
             .config()
             .input
-            .keybinds_for_backend(self.workspace.binding.multiplexer.backend);
+            .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
         self.close_overlay_dialogs();
         self.command_palette_dialog = Some(CommandPaletteDialog::open(&bindings));
         self.input_focus = InputFocus::Picker;
@@ -4425,26 +4465,82 @@ impl AppState {
             && !self.settings_open
     }
 
-    fn rebuild_profile_bindings(&mut self, config: &BoottyConfig) {
+    fn rebuild_profile_bindings(
+        &mut self,
+        config: &BoottyConfig,
+        requested_scopes: Option<&HashSet<MuxScope>>,
+    ) -> Result<(), crate::workspace::WorkspacePersistenceError> {
         let repaint = self.repaint.clone();
         let variant = self.active_appearance_variant;
+        let profile_scopes = std::iter::once(&self.workspace.active.binding)
+            .chain(self.workspace.active.inactive_bindings.iter())
+            .chain(
+                self.workspace
+                    .inactive_spaces
+                    .iter()
+                    .flat_map(SpaceRuntime::bindings),
+            )
+            .filter(|binding| matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)))
+            .filter(|binding| requested_scopes.is_none_or(|scopes| scopes.contains(&binding.scope)))
+            .map(|binding| binding.scope)
+            .collect::<Vec<_>>();
+        let mut pending_scopes = HashSet::new();
+        for scope in &profile_scopes {
+            match self
+                .workspace
+                .binding_has_pending_membership_operation(*scope)
+            {
+                Ok(true) => {
+                    pending_scopes.insert(*scope);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    self.deferred_profile_binding_rebuilds
+                        .extend(profile_scopes.iter().copied());
+                    return Err(error);
+                }
+            }
+        }
+        self.deferred_profile_binding_rebuilds
+            .extend(pending_scopes.iter().copied());
+        let mut rebuilt_scopes = Vec::new();
         for binding in self.binding_runtimes_mut() {
             if !matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)) {
                 continue;
             }
-            *binding = binding_runtime_for_multiplexer(
+            if requested_scopes.is_some_and(|scopes| !scopes.contains(&binding.scope)) {
+                continue;
+            }
+            if pending_scopes.contains(&binding.scope) {
+                continue;
+            }
+            let session_order = std::mem::take(&mut binding.session_order);
+            let session_names = std::mem::take(&mut binding.session_names);
+            let pending_generated_names = std::mem::take(&mut binding.pending_generated_names);
+            let mut replacement = binding_runtime_for_multiplexer(
                 config,
-                binding.scope,
+                BindingStateCandidate {
+                    scope: binding.scope,
+                    session_order,
+                    session_names,
+                },
                 binding.label.clone(),
                 binding.backend_override,
                 binding.remote_override.clone(),
                 variant,
                 repaint.clone(),
             );
+            replacement.pending_generated_names = pending_generated_names;
+            *binding = replacement;
+            rebuilt_scopes.push(binding.scope);
         }
+        for scope in rebuilt_scopes {
+            self.deferred_profile_binding_rebuilds.remove(&scope);
+        }
+        Ok(())
     }
 
-    fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
+    pub fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
         let previous = self.config().clone();
         let path = previous.config_path.clone();
         let next = match load_config_from_path(&path) {
@@ -4467,7 +4563,7 @@ impl AppState {
         };
         let keybinds = next
             .input
-            .keybinds_for_backend(self.workspace.binding.multiplexer.backend);
+            .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
         let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
             Ok(bindings) => bindings,
             Err(error) => {
@@ -4531,9 +4627,13 @@ impl AppState {
         self.app_key_bindings = app_key_bindings;
         self.sidebar_key_bindings = sidebar_key_bindings;
         let active_appearance_variant = self.active_appearance_variant;
-        if previous.ssh_profiles != next.ssh_profiles {
-            self.rebuild_profile_bindings(&next);
-        }
+        let profile_reload_error = if previous.ssh_profiles != next.ssh_profiles {
+            self.rebuild_profile_bindings(&next, None)
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
         for binding in self.binding_runtimes_mut() {
             let mut binding_config = next.clone();
             binding_config.multiplexer = binding.multiplexer.clone();
@@ -4558,20 +4658,16 @@ impl AppState {
             || self.has_new_session_config_changes;
         self.config_state.accept(next);
         self.set_mouse_pointer_hidden_while_typing(self.mouse_pointer_hidden_while_typing, effects);
-        let config_path = self.config().config_path.clone();
-        let binding_id = self
-            .workspace
+        self.workspace
+            .active
             .binding
-            .scope
-            .binding_id()
-            .persistence_value();
-        self.workspace.binding.session_names =
-            SessionNameStore::for_binding(&config_path, binding_id);
-        self.workspace.binding.pending_generated_names.clear();
-        self.workspace.binding.session_order =
-            SessionOrderStore::for_binding(&config_path, binding_id);
+            .pending_generated_names
+            .clear();
         self.sync_session_order();
-        self.last_error = match (self.has_new_session_config_changes, compatibility_warning) {
+        self.last_error = profile_reload_error.or_else(|| match (
+            self.has_new_session_config_changes,
+            compatibility_warning,
+        ) {
             (true, Some(warning)) => Some(format!(
                 "config reloaded; session/window settings require a new window or restart; {warning}"
             )),
@@ -4580,7 +4676,7 @@ impl AppState {
                     .to_owned(),
             ),
             (false, warning) => warning,
-        };
+        });
         effects.push(AppEffect::RequestRepaint);
         true
     }
@@ -4657,7 +4753,9 @@ impl AppState {
             return false;
         }
 
-        match TerminalRenderSource::is_mouse_tracking(self.workspace.binding.terminal.as_mut()) {
+        match TerminalRenderSource::is_mouse_tracking(
+            self.workspace.active.binding.terminal.as_mut(),
+        ) {
             Ok(mouse_tracking) => mouse_tracking,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -4677,21 +4775,21 @@ impl AppState {
                 && matches!(&action, TerminalSelectionAction::End(_));
             let result = match action {
                 TerminalSelectionAction::Begin(event) => TerminalRenderSource::begin_selection(
-                    self.workspace.binding.terminal.as_mut(),
+                    self.workspace.active.binding.terminal.as_mut(),
                     event,
                 ),
                 TerminalSelectionAction::Scroll(delta) => {
                     TerminalRenderSource::scroll_viewport_delta(
-                        self.workspace.binding.terminal.as_mut(),
+                        self.workspace.active.binding.terminal.as_mut(),
                         delta,
                     )
                 }
                 TerminalSelectionAction::Update(event) => TerminalRenderSource::update_selection(
-                    self.workspace.binding.terminal.as_mut(),
+                    self.workspace.active.binding.terminal.as_mut(),
                     event,
                 ),
                 TerminalSelectionAction::End(event) => TerminalRenderSource::end_selection(
-                    self.workspace.binding.terminal.as_mut(),
+                    self.workspace.active.binding.terminal.as_mut(),
                     event,
                 ),
             };
@@ -4709,7 +4807,9 @@ impl AppState {
     }
 
     fn terminal_copy_mode_active(&mut self) -> bool {
-        match TerminalRenderSource::copy_mode_active(self.workspace.binding.terminal.as_mut()) {
+        match TerminalRenderSource::copy_mode_active(
+            self.workspace.active.binding.terminal.as_mut(),
+        ) {
             Ok(active) => active,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -4719,7 +4819,8 @@ impl AppState {
     }
 
     fn enter_terminal_copy_mode(&mut self, effects: &mut Vec<AppEffect>) {
-        match TerminalRenderSource::enter_copy_mode(self.workspace.binding.terminal.as_mut()) {
+        match TerminalRenderSource::enter_copy_mode(self.workspace.active.binding.terminal.as_mut())
+        {
             Ok(()) => effects.push(AppEffect::RequestRepaint),
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -4778,7 +4879,7 @@ impl AppState {
             _ => None,
         };
         match TerminalRenderSource::handle_copy_mode_action(
-            self.workspace.binding.terminal.as_mut(),
+            self.workspace.active.binding.terminal.as_mut(),
             action,
         ) {
             Ok(outcome) => {
@@ -4987,7 +5088,7 @@ impl AppState {
         if paths.is_empty() {
             return 0;
         }
-        if self.workspace.binding.multiplexer.remote.is_some() {
+        if self.workspace.active.binding.multiplexer.remote.is_some() {
             self.last_error = Some("File handoff to remote Spaces is not supported.".to_owned());
             return 0;
         }
@@ -4998,7 +5099,7 @@ impl AppState {
                 return 0;
             }
         };
-        if let Err(error) = self.workspace.binding.terminal.write_paste(&text) {
+        if let Err(error) = self.workspace.active.binding.terminal.write_paste(&text) {
             self.last_error = Some(error.to_string());
             return 0;
         }
@@ -5096,835 +5197,7 @@ impl AppState {
         count
     }
 
-    /// Returns a non-blocking sender for producers outside the UI-owner call stack.
-    ///
-    /// UI code dispatches directly and must not synchronously wait on this channel's response.
-    pub fn app_command_sender(&self, caller: Caller) -> BoundAppCommandSender {
-        self.app_command_tx.for_caller(caller)
-    }
-
-    pub fn command_catalog(&self) -> Arc<CommandCatalog> {
-        Arc::clone(&self.command_catalog)
-    }
-
-    fn drain_app_commands(&mut self, viewport: ViewportSnapshot, effects: &mut Vec<AppEffect>) {
-        self.drain_pending_app_commands(Instant::now());
-        let mut drained = 0;
-        for _ in 0..32 {
-            let request = match self.app_command_rx.try_recv() {
-                Ok(request) => request,
-                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
-            };
-            drained += 1;
-            let now = Instant::now();
-            let dispatch = if request.cancellation.is_cancelled() {
-                CommandDispatch::Complete(CommandOutcome::cancelled())
-            } else if now >= request.deadline {
-                request.cancellation.cancel();
-                CommandDispatch::Complete(CommandOutcome::deadline_exceeded())
-            } else {
-                self.dispatch_command_with_execution(
-                    request.invocation,
-                    viewport,
-                    effects,
-                    Some((request.deadline, request.cancellation.clone())),
-                )
-            };
-            match dispatch {
-                CommandDispatch::Complete(outcome) => {
-                    let _ = request.response.send(outcome);
-                }
-                CommandDispatch::Pending(result) => {
-                    self.pending_app_commands.push(PendingAppCommand {
-                        deadline: request.deadline,
-                        cancellation: request.cancellation,
-                        response: request.response,
-                        result,
-                    });
-                }
-            }
-        }
-        if drained == 32 {
-            effects.push(AppEffect::RequestRepaint);
-        }
-    }
-
-    fn drain_pending_app_commands(&mut self, now: Instant) {
-        for pending in std::mem::take(&mut self.pending_app_commands) {
-            let outcome = if pending.cancellation.is_cancelled() {
-                CommandOutcome::cancelled()
-            } else if now >= pending.deadline && pending.cancellation.cancel() {
-                CommandOutcome::deadline_exceeded()
-            } else {
-                match &pending.result {
-                    PendingCommandResult::Mux { command, result } => match result.try_recv() {
-                        Ok(result) => self.command_outcome_for_mux_result(command, result),
-                        Err(mpsc::TryRecvError::Empty) => {
-                            self.pending_app_commands.push(pending);
-                            continue;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => CommandOutcome::Failed {
-                            code: "backend_worker_stopped".to_owned(),
-                            message: "mux command worker stopped".to_owned(),
-                        },
-                    },
-                    PendingCommandResult::Outcome(result) => match result.try_recv() {
-                        Ok(outcome) => outcome,
-                        Err(mpsc::TryRecvError::Empty) => {
-                            self.pending_app_commands.push(pending);
-                            continue;
-                        }
-                        Err(mpsc::TryRecvError::Disconnected) => CommandOutcome::Failed {
-                            code: "command_worker_stopped".to_owned(),
-                            message: "command worker stopped".to_owned(),
-                        },
-                    },
-                }
-            };
-            let _ = pending.response.send(outcome);
-        }
-    }
-
-    fn dispatch_command(
-        &mut self,
-        invocation: CommandInvocation,
-        viewport: ViewportSnapshot,
-        effects: &mut Vec<AppEffect>,
-    ) -> CommandOutcome {
-        match self.dispatch_command_with_execution(invocation, viewport, effects, None) {
-            CommandDispatch::Complete(outcome) => outcome,
-            CommandDispatch::Pending(_) => {
-                unreachable!("UI-owned command dispatch cannot return a pending backend result")
-            }
-        }
-    }
-
-    fn dispatch_command_with_execution(
-        &mut self,
-        invocation: CommandInvocation,
-        viewport: ViewportSnapshot,
-        effects: &mut Vec<AppEffect>,
-        execution: Option<(Instant, CommandCancellation)>,
-    ) -> CommandDispatch {
-        let extension = match self.command_catalog.resolve_extension(invocation.clone()) {
-            Ok(extension) => extension,
-            Err(outcome) => return CommandDispatch::Complete(outcome),
-        };
-        if let Some(mut resolved) = extension {
-            let target = match self.resolve_command_target(
-                &resolved.invocation.command,
-                resolved.descriptor.target,
-                resolved.invocation.target.as_ref(),
-            ) {
-                Ok(target) => target,
-                Err(outcome) => return CommandDispatch::Complete(outcome),
-            };
-            resolved.invocation.target = target;
-            if resolved.descriptor.mutation == MutationClass::Destructive
-                && resolved.invocation.confirmation.as_ref()
-                    != Some(&resolved.invocation.confirmation())
-            {
-                return CommandDispatch::Complete(CommandOutcome::ConfirmationRequired {
-                    confirmation: Box::new(resolved.invocation.confirmation()),
-                });
-            }
-            let (deadline, cancellation) = execution.unwrap_or_else(|| {
-                (
-                    Instant::now() + Duration::from_secs(10),
-                    CommandCancellation::new(),
-                )
-            });
-            let result = (resolved.handler)(resolved.invocation, deadline, cancellation);
-            return CommandDispatch::Pending(PendingCommandResult::Outcome(result));
-        }
-        let mut resolved = match self.command_catalog.resolve(invocation) {
-            Ok(resolved) => resolved,
-            Err(outcome) => {
-                self.last_error = command_outcome_message(&outcome);
-                return CommandDispatch::Complete(outcome);
-            }
-        };
-        let target = match self.resolve_command_target(
-            &resolved.invocation.command,
-            resolved.descriptor.target,
-            resolved.invocation.target.as_ref(),
-        ) {
-            Ok(target) => target,
-            Err(outcome) => {
-                self.last_error = command_outcome_message(&outcome);
-                return CommandDispatch::Complete(outcome);
-            }
-        };
-        resolved.invocation.target = target;
-        if let Some(outcome) = self.preflight_command(&resolved.executor) {
-            self.last_error = command_outcome_message(&outcome);
-            return CommandDispatch::Complete(outcome);
-        }
-        if resolved.descriptor.mutation == MutationClass::Destructive
-            && matches!(
-                resolved.invocation.caller,
-                Caller::Cli | Caller::Socket | Caller::Luau
-            )
-            && resolved.invocation.confirmation.as_ref()
-                != Some(&resolved.invocation.confirmation())
-        {
-            return CommandDispatch::Complete(CommandOutcome::ConfirmationRequired {
-                confirmation: Box::new(resolved.invocation.confirmation()),
-            });
-        }
-        let caller = resolved.invocation.caller;
-        let target = resolved.invocation.target;
-        self.dispatch_resolved_command(
-            resolved.executor,
-            target.as_ref(),
-            caller,
-            viewport,
-            effects,
-            execution,
-        )
-    }
-
-    fn preflight_command(&self, executor: &CoreCommandExecutor) -> Option<CommandOutcome> {
-        let CoreCommandExecutor::Keybind(KeybindAction::Mux(action)) = executor else {
-            return None;
-        };
-        let operation = self.mux_operation_for_action(*action)?;
-        if let Some(message) = self.workspace.binding.mux.unavailable_reason() {
-            return Some(CommandOutcome::Unavailable {
-                message: message.to_owned(),
-            });
-        }
-        command_outcome_for_binding_operation(
-            self.workspace
-                .binding
-                .mux
-                .operation_outcome(&self.workspace.binding.multiplexer, operation),
-        )
-    }
-
-    fn resolve_command_target(
-        &self,
-        command: &str,
-        expected: Option<ResourceKind>,
-        supplied: Option<&CommandTarget>,
-    ) -> Result<Option<CommandTarget>, CommandOutcome> {
-        let Some(expected) = expected else {
-            return if supplied.is_none() {
-                Ok(None)
-            } else {
-                Err(CommandOutcome::Denied {
-                    message: "command does not accept a target".to_owned(),
-                })
-            };
-        };
-        if supplied.is_some_and(|target| target.kind != expected) {
-            return Err(CommandOutcome::Denied {
-                message: format!("command requires a {expected:?} target"),
-            });
-        }
-        let Some(current) = self.current_command_target_for(command, expected) else {
-            return Err(CommandOutcome::Unavailable {
-                message: format!("no current {expected:?} target is available"),
-            });
-        };
-        if supplied.is_some_and(|target| target != &current) {
-            return Err(CommandOutcome::StaleTarget {
-                message: format!("the {expected:?} target is stale"),
-            });
-        }
-        Ok(Some(current))
-    }
-
-    fn current_command_target_for(
-        &self,
-        command: &str,
-        kind: ResourceKind,
-    ) -> Option<CommandTarget> {
-        let target = self.current_command_target(kind);
-        if target.is_some() || command != "new_tab" || kind != ResourceKind::Session {
-            return target;
-        }
-        self.current_command_target(ResourceKind::Binding)
-            .map(|binding| CommandTarget {
-                kind,
-                handle: serde_json::to_string(&("no-session", &binding.handle))
-                    .expect("serialize empty session target"),
-                generation: binding.generation,
-            })
-    }
-
-    fn current_command_target(&self, kind: ResourceKind) -> Option<CommandTarget> {
-        let process = self.command_instance_handle.clone();
-        let window = &self.window_state_key;
-        let scope = self.workspace.binding.scope;
-        let space = scope.space_id().persistence_value().to_string();
-        let binding = scope.binding_id().persistence_value().to_string();
-        let binding_generation = self.workspace.binding.mux.binding_generation();
-        let binding_handle = serde_json::to_string(&(
-            &process,
-            window,
-            self.command_window_generation,
-            &space,
-            &binding,
-            binding_generation,
-        ))
-        .expect("serialize target");
-        let (session, mux_window, pane) = self.selected_mux_resource_path();
-        let target = match kind {
-            ResourceKind::Instance => CommandTarget {
-                kind,
-                handle: process,
-                generation: self.command_instance_generation,
-            },
-            ResourceKind::ApplicationWindow => CommandTarget {
-                kind,
-                handle: serde_json::to_string(&[&process, window]).expect("serialize target"),
-                generation: self.command_window_generation,
-            },
-            ResourceKind::Binding => CommandTarget {
-                kind,
-                handle: binding_handle,
-                generation: binding_generation,
-            },
-            ResourceKind::Session => {
-                let session = session?;
-                CommandTarget {
-                    kind,
-                    handle: serde_json::to_string(&[&binding_handle, &session])
-                        .expect("serialize target"),
-                    generation: self.workspace.binding.mux.session_generation(&session)?,
-                }
-            }
-            ResourceKind::MuxWindow => {
-                let (session, mux_window) = (session?, mux_window?);
-                CommandTarget {
-                    kind,
-                    handle: serde_json::to_string(&[&binding_handle, &session, &mux_window])
-                        .expect("serialize target"),
-                    generation: self
-                        .workspace
-                        .binding
-                        .mux
-                        .window_generation(&session, &mux_window)?,
-                }
-            }
-            ResourceKind::Pane => {
-                let (session, mux_window, pane) = (session?, mux_window?, pane?);
-                CommandTarget {
-                    kind,
-                    handle: serde_json::to_string(&[&binding_handle, &session, &mux_window, &pane])
-                        .expect("serialize target"),
-                    generation: self.workspace.binding.mux.pane_generation(
-                        &session,
-                        &mux_window,
-                        &pane,
-                    )?,
-                }
-            }
-            ResourceKind::Terminal => {
-                let (handle, generation) = match (session, mux_window, pane) {
-                    (Some(session), Some(mux_window), Some(pane)) => (
-                        serde_json::to_string(&(&binding_handle, &session, &mux_window, &pane))
-                            .expect("serialize target"),
-                        self.workspace.binding.mux.terminal_generation(
-                            &session,
-                            &mux_window,
-                            &pane,
-                        )?,
-                    ),
-                    (Some(session), _, _) => (
-                        serde_json::to_string(&(&binding_handle, &session))
-                            .expect("serialize target"),
-                        self.workspace.binding.mux.session_generation(&session)?,
-                    ),
-                    (None, _, _) => (
-                        serde_json::to_string(&(&binding_handle, "active_terminal"))
-                            .expect("serialize target"),
-                        binding_generation,
-                    ),
-                };
-                CommandTarget {
-                    kind,
-                    handle,
-                    generation,
-                }
-            }
-        };
-        Some(target)
-    }
-
-    fn selected_mux_resource_path(&self) -> (Option<String>, Option<String>, Option<String>) {
-        let Some(anchor) = self.workspace.binding.mux.selected_session_anchor() else {
-            return (None, None, None);
-        };
-        let session = anchor.session_id.clone();
-        let mux_window = self
-            .workspace
-            .binding
-            .mux
-            .selected_window()
-            .map(str::to_owned)
-            .or_else(|| {
-                self.workspace
-                    .binding
-                    .mux
-                    .sessions()
-                    .iter()
-                    .find(|candidate| candidate.id == session)
-                    .and_then(|candidate| candidate.active_window_id.clone())
-            });
-        let pane = if self.uses_native_terminal_layout() {
-            self.workspace
-                .binding
-                .terminal
-                .focused_pane_id()
-                .map(|pane_id| {
-                    decode_scoped_pane_id(pane_id).map_or_else(
-                        || pane_id.to_owned(),
-                        |(scope, pane_id)| {
-                            debug_assert_eq!(scope, self.workspace.binding.scope);
-                            pane_id
-                        },
-                    )
-                })
-        } else {
-            anchor.pane_id.clone()
-        };
-        (Some(session), mux_window, pane)
-    }
-
-    fn read_active_terminal(&mut self) -> CommandOutcome {
-        match self.workspace.binding.terminal.extract_frame() {
-            Ok(frame) => CommandOutcome::Success {
-                value: serde_json::json!({
-                    "cols": frame.cols,
-                    "rows": frame.rows,
-                    "text": frame.text_rows().join("\n"),
-                    "cursor": frame.cursor.map(|cursor| serde_json::json!({
-                        "x": cursor.x,
-                        "y": cursor.y,
-                    })),
-                }),
-                warnings: Vec::new(),
-            },
-            Err(error) => CommandOutcome::Failed {
-                code: "terminal_read_failed".to_owned(),
-                message: error.to_string(),
-            },
-        }
-    }
-
-    fn dispatch_resolved_command(
-        &mut self,
-        executor: CoreCommandExecutor,
-        target: Option<&CommandTarget>,
-        caller: Caller,
-        viewport: ViewportSnapshot,
-        effects: &mut Vec<AppEffect>,
-        execution: Option<(Instant, CommandCancellation)>,
-    ) -> CommandDispatch {
-        match executor {
-            CoreCommandExecutor::Keybind(KeybindAction::App(AppAction::ReloadConfig)) => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
-                let reloaded = self.reload_config(effects);
-                let outcome = if reloaded {
-                    let path = self.config().config_path.clone();
-                    self.config_hot_reload.refresh_after_reload(&path);
-                    self.last_error
-                        .clone()
-                        .map_or_else(CommandOutcome::success, |warning| {
-                            CommandOutcome::success_with_warning("configuration_warning", warning)
-                        })
-                } else {
-                    CommandOutcome::Failed {
-                        code: "execution_failed".to_owned(),
-                        message: self
-                            .last_error
-                            .clone()
-                            .unwrap_or_else(|| "configuration reload failed".to_owned()),
-                    }
-                };
-                CommandDispatch::Complete(outcome)
-            }
-            CoreCommandExecutor::Keybind(action) => self.dispatch_resolved_keybind_command(
-                action, target, caller, viewport, effects, execution,
-            ),
-            CoreCommandExecutor::Sidebar(action) => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
-                self.apply_sidebar_action(action);
-                CommandDispatch::Complete(CommandOutcome::success())
-            }
-            CoreCommandExecutor::ReadTerminal => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
-                CommandDispatch::Complete(self.read_active_terminal())
-            }
-        }
-    }
-
-    fn begin_synchronous_command(
-        execution: Option<(Instant, CommandCancellation)>,
-    ) -> Result<(), CommandOutcome> {
-        let Some((deadline, cancellation)) = execution else {
-            return Ok(());
-        };
-        if Instant::now() >= deadline && cancellation.cancel() {
-            return Err(CommandOutcome::deadline_exceeded());
-        }
-        if !cancellation.try_start() {
-            return Err(CommandOutcome::cancelled());
-        }
-        Ok(())
-    }
-
-    fn dispatch_resolved_keybind_command(
-        &mut self,
-        action: KeybindAction,
-        target: Option<&CommandTarget>,
-        caller: Caller,
-        viewport: ViewportSnapshot,
-        effects: &mut Vec<AppEffect>,
-        execution: Option<(Instant, CommandCancellation)>,
-    ) -> CommandDispatch {
-        let mut return_native_mux_focus = false;
-        if matches!(caller, Caller::Cli | Caller::Socket | Caller::Luau)
-            && let KeybindAction::Mux(mux_action) = action
-        {
-            if let Some(operation) = self.mux_operation_for_action(mux_action)
-                && let Some(outcome) = command_outcome_for_binding_operation(
-                    self.workspace
-                        .binding
-                        .mux
-                        .operation_outcome(&self.workspace.binding.multiplexer, operation),
-                )
-            {
-                self.last_error = command_outcome_message(&outcome);
-                return CommandDispatch::Complete(outcome);
-            }
-            let native_local_action = selected_backend(self.active_multiplexer())
-                == MultiplexerBackendConfig::Native
-                && Self::native_mux_action_uses_local_layout(mux_action);
-            if native_local_action {
-                return_native_mux_focus = true;
-            } else if let Some(command) = self.mux_command_for_command(mux_action, target) {
-                let config = self.active_multiplexer().clone();
-                let (deadline, cancellation) = execution.unwrap_or_else(|| {
-                    (
-                        Instant::now() + Duration::from_secs(10),
-                        CommandCancellation::new(),
-                    )
-                });
-                let result = self.workspace.binding.mux.execute_command_authoritatively(
-                    &self.repaint,
-                    &config,
-                    command.clone(),
-                    deadline,
-                    cancellation,
-                );
-                return CommandDispatch::Pending(PendingCommandResult::Mux { command, result });
-            }
-        }
-        if let Err(outcome) = Self::begin_synchronous_command(execution) {
-            return CommandDispatch::Complete(outcome);
-        }
-        let previous_error = self.last_error.take();
-        self.apply_resolved_keybind_action(action, target, viewport, effects);
-        let outcome = match self.last_error.clone() {
-            Some(message) => CommandOutcome::Failed {
-                code: "execution_failed".to_owned(),
-                message,
-            },
-            None => {
-                self.last_error = previous_error;
-                if return_native_mux_focus {
-                    CommandOutcome::Success {
-                        value: self.current_mux_focus_value(),
-                        warnings: Vec::new(),
-                    }
-                } else {
-                    CommandOutcome::success()
-                }
-            }
-        };
-        CommandDispatch::Complete(outcome)
-    }
-    fn native_mux_action_uses_local_layout(action: MuxKeyAction) -> bool {
-        matches!(
-            action,
-            MuxKeyAction::NextSession
-                | MuxKeyAction::PreviousSession
-                | MuxKeyAction::LastSession
-                | MuxKeyAction::SelectSession(_)
-                | MuxKeyAction::MoveSession(_)
-                | MuxKeyAction::SplitPane(_)
-                | MuxKeyAction::SelectPane(_)
-                | MuxKeyAction::NextPane
-                | MuxKeyAction::PreviousPane
-                | MuxKeyAction::KillPane
-                | MuxKeyAction::ClosePane
-        )
-    }
-
-    fn current_mux_focus_value(&self) -> serde_json::Value {
-        let focused = self
-            .current_command_target(ResourceKind::Pane)
-            .or_else(|| self.current_command_target(ResourceKind::MuxWindow))
-            .or_else(|| self.current_command_target(ResourceKind::Session));
-        focused.map_or_else(
-            || serde_json::json!({}),
-            |focused| serde_json::json!({ "focused": focused }),
-        )
-    }
-
-    fn mux_command_for_command(
-        &mut self,
-        action: MuxKeyAction,
-        target: Option<&CommandTarget>,
-    ) -> Option<MuxCommand> {
-        if matches!(
-            action,
-            MuxKeyAction::NextSession
-                | MuxKeyAction::PreviousSession
-                | MuxKeyAction::LastSession
-                | MuxKeyAction::SelectSession(_)
-                | MuxKeyAction::MoveSession(_)
-        ) {
-            return None;
-        }
-
-        let target = target.expect("mux command target was resolved");
-        let path = serde_json::from_str::<Vec<String>>(&target.handle)
-            .expect("resolved mux command target has a resource path");
-        if action == MuxKeyAction::NewTab && path.first().is_some_and(|part| part == "no-session") {
-            let remote = self.active_multiplexer().remote.is_some();
-            let cwd = new_mux_session_request_with_name(self.config(), "").cwd;
-            let cwd = Self::session_cwd(&cwd, remote);
-            let display_name = Self::suggested_session_name(&cwd, remote);
-            let session_id = crate::strings::unique_session_name(
-                &display_name,
-                self.taken_session_names(None).iter().map(String::as_str),
-            );
-            return Some(MuxCommand::CreateProjectSession { session_id, cwd });
-        }
-
-        let session_id = path
-            .get(1)
-            .expect("resolved mux target includes a session")
-            .clone();
-        let window_id = (target.kind == ResourceKind::MuxWindow).then(|| {
-            path.get(2)
-                .expect("mux window target includes a window")
-                .clone()
-        });
-        let pane_id = (target.kind == ResourceKind::Pane)
-            .then(|| path.get(3).expect("pane target includes a pane").clone());
-        let cwd = terminal_cwd_for_mux_command(
-            self.workspace
-                .binding
-                .terminal
-                .current_working_directory()
-                .ok()
-                .flatten(),
-            self.workspace
-                .binding
-                .mux
-                .selected_session_anchor()
-                .and_then(|anchor| anchor.cwd.clone()),
-        );
-        let command = match action {
-            MuxKeyAction::NewTab => MuxCommand::NewWindow { session_id, cwd },
-            MuxKeyAction::NextTab => MuxCommand::ActivateNextWindow { session_id },
-            MuxKeyAction::PreviousTab => MuxCommand::ActivatePreviousWindow { session_id },
-            MuxKeyAction::LastTab => MuxCommand::ActivateLastWindow { session_id },
-            MuxKeyAction::SelectTab(index) => MuxCommand::ActivateWindowIndex { session_id, index },
-            MuxKeyAction::MoveTab(delta) => MuxCommand::MoveWindow {
-                session_id,
-                window_id: self
-                    .workspace
-                    .binding
-                    .mux
-                    .selected_window()
-                    .map(str::to_owned),
-                delta,
-            },
-            MuxKeyAction::SplitPane(direction) => MuxCommand::SplitPane {
-                session_id,
-                pane_id,
-                direction: mux_split_direction(direction),
-            },
-            MuxKeyAction::SelectPane(direction) => MuxCommand::SelectPane {
-                session_id,
-                window_id,
-                direction,
-            },
-            MuxKeyAction::NextPane => MuxCommand::SelectNextPane {
-                session_id,
-                window_id,
-            },
-            MuxKeyAction::PreviousPane => MuxCommand::SelectPreviousPane {
-                session_id,
-                window_id,
-            },
-            MuxKeyAction::KillPane => MuxCommand::KillPane {
-                session_id,
-                pane_id,
-            },
-            MuxKeyAction::ClosePane => MuxCommand::ClosePane {
-                session_id,
-                pane_id,
-            },
-            MuxKeyAction::TogglePaneZoom => MuxCommand::TogglePaneZoom {
-                session_id,
-                pane_id,
-            },
-            MuxKeyAction::NextSession
-            | MuxKeyAction::PreviousSession
-            | MuxKeyAction::LastSession
-            | MuxKeyAction::SelectSession(_)
-            | MuxKeyAction::MoveSession(_) => unreachable!("handled before command construction"),
-        };
-        Some(command)
-    }
-
-    fn command_outcome_for_mux_result(
-        &mut self,
-        command: &MuxCommand,
-        result: MuxCommandResult,
-    ) -> CommandOutcome {
-        let config = self.active_multiplexer().clone();
-        match self
-            .workspace
-            .binding
-            .mux
-            .complete_authoritative_command(result, &config)
-        {
-            Ok(completion) => {
-                self.sync_native_layout_terminal_now();
-                CommandOutcome::Success {
-                    value: self.mux_command_completion_value(command, &completion),
-                    warnings: Vec::new(),
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                let outcome = match error {
-                    MuxCommandError::Cancelled => CommandOutcome::Failed {
-                        code: "cancelled".to_owned(),
-                        message,
-                    },
-                    MuxCommandError::DeadlineExceeded => CommandOutcome::Failed {
-                        code: "deadline_exceeded".to_owned(),
-                        message,
-                    },
-                    MuxCommandError::Unsupported => CommandOutcome::Unsupported { message },
-                    MuxCommandError::Unavailable => CommandOutcome::Unavailable { message },
-                    MuxCommandError::Stale => CommandOutcome::StaleTarget { message },
-                    MuxCommandError::Failed(_) => CommandOutcome::Failed {
-                        code: "execution_failed".to_owned(),
-                        message,
-                    },
-                };
-                self.last_error = command_outcome_message(&outcome);
-                outcome
-            }
-        }
-    }
-
-    fn mux_command_completion_value(
-        &self,
-        command: &MuxCommand,
-        completion: &MuxCommandCompletion,
-    ) -> serde_json::Value {
-        let mut value = serde_json::Map::new();
-        if let Some(session_id) = match command {
-            MuxCommand::CreateProjectSession { session_id, .. }
-            | MuxCommand::CreateWorktreeSession { session_id, .. } => Some(session_id.as_str()),
-            _ => None,
-        } {
-            value.insert(
-                "created".to_owned(),
-                serde_json::to_value(self.mux_resource_target(
-                    ResourceKind::Session,
-                    session_id,
-                    None,
-                ))
-                .expect("serialize command target"),
-            );
-        }
-        if let (Some(session_id), Some(window_id)) = (
-            completion.selected_session.as_deref(),
-            completion.selected_window.as_deref(),
-        ) {
-            value.insert(
-                "focused".to_owned(),
-                serde_json::to_value(self.mux_resource_target(
-                    ResourceKind::MuxWindow,
-                    session_id,
-                    Some(window_id),
-                ))
-                .expect("serialize command target"),
-            );
-        }
-        if !value.contains_key("focused")
-            && let Some(session_id) = completion.selected_session.as_deref()
-        {
-            value.insert(
-                "focused".to_owned(),
-                serde_json::to_value(self.mux_resource_target(
-                    ResourceKind::Session,
-                    session_id,
-                    None,
-                ))
-                .expect("serialize command target"),
-            );
-        }
-        serde_json::Value::Object(value)
-    }
-
-    fn mux_resource_target(
-        &self,
-        kind: ResourceKind,
-        session_id: &str,
-        window_id: Option<&str>,
-    ) -> CommandTarget {
-        let binding = self
-            .current_command_target(ResourceKind::Binding)
-            .expect("mux completion requires a binding target")
-            .handle;
-        match kind {
-            ResourceKind::Session => CommandTarget {
-                kind,
-                handle: serde_json::to_string(&[&binding, session_id]).expect("serialize target"),
-                generation: self
-                    .workspace
-                    .binding
-                    .mux
-                    .session_generation(session_id)
-                    .unwrap_or(1),
-            },
-            ResourceKind::MuxWindow => {
-                let window_id = window_id.expect("mux window target requires a window id");
-                CommandTarget {
-                    kind,
-                    handle: serde_json::to_string(&[&binding, session_id, window_id])
-                        .expect("serialize target"),
-                    generation: self
-                        .workspace
-                        .binding
-                        .mux
-                        .window_generation(session_id, window_id)
-                        .unwrap_or(1),
-                }
-            }
-            _ => unreachable!("mux completion only returns session and window targets"),
-        }
-    }
-    fn apply_resolved_keybind_action(
+    pub(super) fn apply_resolved_keybind_action(
         &mut self,
         action: KeybindAction,
         target: Option<&CommandTarget>,
@@ -5951,7 +5224,7 @@ impl AppState {
         }
     }
 
-    fn apply_sidebar_action(&mut self, action: SidebarAction) -> bool {
+    pub(super) fn apply_sidebar_action(&mut self, action: SidebarAction) -> bool {
         match action {
             SidebarAction::Ignore => {}
             SidebarAction::PreviousSession => self.move_sidebar_hover(-1),
@@ -6008,7 +5281,7 @@ impl AppState {
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::EditSpace) => {
-                self.open_edit_space_dialog_from_ui(self.workspace.active_space_id);
+                self.open_edit_space_dialog_from_ui(self.workspace.active.id);
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::Quit) => {
@@ -6019,7 +5292,7 @@ impl AppState {
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::CloseSpace) => {
-                if !self.close_space_from_ui(self.workspace.active_space_id) {
+                if !self.close_space_from_ui(self.workspace.active.id) {
                     self.last_error = Some("the last space cannot be closed".to_owned());
                 }
                 effects.push(AppEffect::RequestRepaint);
@@ -6087,6 +5360,7 @@ impl AppState {
                     self.input_focus = InputFocus::Sidebar;
                     self.sidebar_hovered_session = self
                         .workspace
+                        .active
                         .binding
                         .mux
                         .selected_session()
@@ -6109,7 +5383,7 @@ impl AppState {
             }
             KeybindAction::Scroll(action) => self.apply_terminal_scroll_action(action),
             KeybindAction::Write(bytes) => {
-                if let Err(error) = self.workspace.binding.terminal.write_input(&bytes) {
+                if let Err(error) = self.workspace.active.binding.terminal.write_input(&bytes) {
                     self.last_error = Some(error.to_string());
                 } else {
                     self.hide_mouse_pointer_for_terminal_typing(effects);
@@ -6125,7 +5399,7 @@ impl AppState {
             }
             KeybindAction::PasteFromClipboard => match read_clipboard_text() {
                 Ok(Some(text)) => {
-                    if let Err(error) = self.workspace.binding.terminal.write_paste(&text) {
+                    if let Err(error) = self.workspace.active.binding.terminal.write_paste(&text) {
                         self.last_error = Some(error.to_string());
                     }
                 }
@@ -6150,7 +5424,13 @@ impl AppState {
     }
 
     fn write_terminal_selection_to_clipboard(&mut self, format: CopyToClipboard) -> Result<bool> {
-        let mut selection = |format| self.workspace.binding.terminal.format_selection(format);
+        let mut selection = |format| {
+            self.workspace
+                .active
+                .binding
+                .terminal
+                .format_selection(format)
+        };
         match format {
             CopyToClipboard::Plain => {
                 let Some(bytes) = selection(TerminalSelectionFormat::PlainText)? else {
@@ -6212,12 +5492,13 @@ impl AppState {
     /// other host and outlive the link; closing on a network blip would kill work the user still
     /// has. A pane that really did end is gone from the next snapshot, which closes it properly.
     fn handle_attach_client_exit(&mut self, now: Instant) {
-        let Some(remote) = self.workspace.binding.multiplexer.remote.clone() else {
+        let Some(remote) = self.workspace.active.binding.multiplexer.remote.clone() else {
             self.close_active_pane();
             return;
         };
         if self
             .workspace
+            .active
             .binding
             .reattach
             .is_some_and(|reattach| !reattach.started)
@@ -6226,43 +5507,51 @@ impl AppState {
         }
         let attached_for = self
             .workspace
+            .active
             .binding
             .remote_attach_started
             .map(|started| now.saturating_duration_since(started));
-        let reattach =
-            RemoteReattach::after_failure(self.workspace.binding.reattach, attached_for, now);
+        let reattach = RemoteReattach::after_failure(
+            self.workspace.active.binding.reattach,
+            attached_for,
+            now,
+        );
         let error = format!(
             "lost the connection to {}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         );
         self.last_error = Some(error.clone());
         self.workspace
+            .active
             .binding
             .mux
             .set_availability_error(Some(error));
-        self.workspace.binding.reattach = Some(reattach);
+        self.workspace.active.binding.reattach = Some(reattach);
     }
 
     fn handle_attach_start_failure(&mut self, now: Instant, detail: &str) {
-        let Some(remote) = self.workspace.binding.multiplexer.remote.clone() else {
+        let Some(remote) = self.workspace.active.binding.multiplexer.remote.clone() else {
             return;
         };
-        let reattach = RemoteReattach::after_failure(self.workspace.binding.reattach, None, now);
+        let reattach =
+            RemoteReattach::after_failure(self.workspace.active.binding.reattach, None, now);
         let error = format!(
             "could not connect to {}: {detail}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         );
         self.last_error = Some(error.clone());
         self.workspace
+            .active
             .binding
             .mux
             .set_availability_error(Some(error));
-        self.workspace.binding.reattach = Some(reattach);
+        self.workspace.active.binding.reattach = Some(reattach);
     }
 
     fn resolve_remote_attach_exit_after_refresh(&mut self, refresh_completed: bool) {
         if self
             .workspace
+            .active
             .binding
             .resolve_empty_remote_after_attach_exit(refresh_completed)
             && self
@@ -6278,6 +5567,7 @@ impl AppState {
     fn note_attach_client_alive(&mut self, now: Instant) {
         let established = self
             .workspace
+            .active
             .binding
             .remote_attach_started
             .is_some_and(|started| {
@@ -6286,19 +5576,24 @@ impl AppState {
         if established
             && self
                 .workspace
+                .active
                 .binding
                 .reattach
                 .is_some_and(|reattach| reattach.started)
         {
-            self.workspace.binding.reattach = None;
-            self.workspace.binding.mux.set_availability_error(None);
+            self.workspace.active.binding.reattach = None;
+            self.workspace
+                .active
+                .binding
+                .mux
+                .set_availability_error(None);
         }
     }
 
     /// Drop the dead attach client once its backoff has passed. Clearing the pane's target is what
     /// asks for a new one: this frame's pane sync starts a fresh client for the same session.
     fn start_due_reattach(&mut self, now: Instant, effects: &mut Vec<AppEffect>) {
-        let Some(mut reattach) = self.workspace.binding.reattach else {
+        let Some(mut reattach) = self.workspace.active.binding.reattach else {
             return;
         };
         if !reattach.due(now) {
@@ -6312,16 +5607,17 @@ impl AppState {
             return;
         }
         reattach.started = true;
-        self.workspace.binding.reattach = Some(reattach);
-        self.workspace.binding.remote_attach_started = Some(now);
-        self.workspace.binding.terminal.discard_active_pane();
+        self.workspace.active.binding.reattach = Some(reattach);
+        self.workspace.active.binding.remote_attach_started = Some(now);
+        self.workspace.active.binding.terminal.discard_active_pane();
     }
 
     pub fn reconnect_space_from_ui(&mut self, space_id: SpaceId) -> bool {
         let now = Instant::now();
-        if space_id == self.workspace.active_space_id {
-            let mut restarted = Self::restart_remote_binding(&mut self.workspace.binding, now);
-            for binding in &mut self.workspace.inactive_bindings {
+        if space_id == self.workspace.active.id {
+            let mut restarted =
+                Self::restart_remote_binding(&mut self.workspace.active.binding, now);
+            for binding in &mut self.workspace.active.inactive_bindings {
                 restarted |= Self::restart_remote_binding(binding, now);
             }
             return restarted;
@@ -6342,9 +5638,10 @@ impl AppState {
     }
 
     fn has_degraded_remote(&self) -> bool {
-        self.workspace.binding.reattach.is_some()
+        self.workspace.active.binding.reattach.is_some()
             || self
                 .workspace
+                .active
                 .inactive_bindings
                 .iter()
                 .any(|binding| binding.reattach.is_some())
@@ -6357,10 +5654,10 @@ impl AppState {
     }
 
     fn reset_remote_reconnects(&mut self, now: Instant) {
-        if self.workspace.binding.reattach.is_some() {
-            Self::restart_remote_binding(&mut self.workspace.binding, now);
+        if self.workspace.active.binding.reattach.is_some() {
+            Self::restart_remote_binding(&mut self.workspace.active.binding, now);
         }
-        for binding in &mut self.workspace.inactive_bindings {
+        for binding in &mut self.workspace.active.inactive_bindings {
             if binding.reattach.is_some() {
                 Self::restart_remote_binding(binding, now);
             }
@@ -6409,13 +5706,14 @@ impl AppState {
         }
         let session_id = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
             .unwrap_or("local")
             .to_owned();
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.execute_command(
+        self.workspace.active.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
             MuxCommand::ClosePane {
@@ -6423,7 +5721,7 @@ impl AppState {
                 pane_id: target_pane_id.map(str::to_owned),
             },
         );
-        self.workspace.binding.terminal.discard_active_pane();
+        self.workspace.active.binding.terminal.discard_active_pane();
     }
 
     /// Close a specific native pane: remove it from the backend window, kill its PTY, collapse the
@@ -6431,13 +5729,14 @@ impl AppState {
     fn close_pane(&mut self, pane_id: &str) {
         let session_id = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
             .unwrap_or("local")
             .to_owned();
         let mux_config = self.active_multiplexer().clone();
-        self.workspace.binding.mux.execute_command(
+        self.workspace.active.binding.mux.execute_command(
             &self.repaint,
             &mux_config,
             MuxCommand::ClosePane {
@@ -6445,17 +5744,28 @@ impl AppState {
                 pane_id: Some(pane_id.to_owned()),
             },
         );
-        self.workspace.binding.terminal.discard_pane(pane_id);
+        self.workspace.active.binding.terminal.discard_pane(pane_id);
         let key = self.current_window_key();
-        if let Some(layout) = self.workspace.binding.pane_layouts.get_mut(&key) {
+        if let Some(layout) = self.workspace.active.binding.pane_layouts.get_mut(&key) {
             layout.remove(pane_id);
         }
         let _ = self.sync_terminal_panes();
     }
 
-    fn mux_operation_for_action(&self, action: MuxKeyAction) -> Option<BindingOperation> {
+    pub(super) fn mux_operation_for_action(
+        &self,
+        action: MuxKeyAction,
+    ) -> Option<BindingOperation> {
         match action {
-            MuxKeyAction::NewTab if self.workspace.binding.mux.selected_session().is_none() => {
+            MuxKeyAction::NewTab
+                if self
+                    .workspace
+                    .active
+                    .binding
+                    .mux
+                    .selected_session()
+                    .is_none() =>
+            {
                 Some(BindingOperation::CreateProjectSession)
             }
             MuxKeyAction::NewTab => Some(BindingOperation::CreateWindow),
@@ -6531,7 +5841,13 @@ impl AppState {
             }
         }
         if matches!(action, MuxKeyAction::NewTab)
-            && self.workspace.binding.mux.selected_session().is_none()
+            && self
+                .workspace
+                .active
+                .binding
+                .mux
+                .selected_session()
+                .is_none()
         {
             let cwd = new_mux_session_request_with_name(self.config(), "").cwd;
             self.create_project_session_for_cwd(cwd);
@@ -6540,6 +5856,7 @@ impl AppState {
         }
         let selected_session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -6547,12 +5864,14 @@ impl AppState {
             .to_owned();
         let selected_cwd = terminal_cwd_for_mux_command(
             self.workspace
+                .active
                 .binding
                 .terminal
                 .current_working_directory()
                 .ok()
                 .flatten(),
             self.workspace
+                .active
                 .binding
                 .mux
                 .selected_session_anchor()
@@ -6580,6 +5899,7 @@ impl AppState {
                 session_id: selected_session,
                 window_id: self
                     .workspace
+                    .active
                     .binding
                     .mux
                     .selected_window()
@@ -6623,6 +5943,7 @@ impl AppState {
         };
         let mux_config = self.active_multiplexer().clone();
         self.workspace
+            .active
             .binding
             .mux
             .execute_command(&self.repaint, &mux_config, command);
@@ -6635,6 +5956,7 @@ impl AppState {
         }
         self.sidebar_hovered_session = self
             .workspace
+            .active
             .binding
             .mux
             .selected_session()
@@ -6683,13 +6005,14 @@ impl AppState {
 
     fn session_target_matching(&self, value: &str) -> Option<ScopedSessionTarget> {
         self.workspace
+            .active
             .binding
             .mux
             .sessions()
             .iter()
             .find(|session| session.id == value || session.name == value)
             .map(|session| {
-                ScopedSessionTarget::new(self.workspace.binding.scope, session.id.clone())
+                ScopedSessionTarget::new(self.workspace.active.binding.scope, session.id.clone())
             })
     }
 
@@ -6697,6 +6020,7 @@ impl AppState {
         let target = match action {
             MuxKeyAction::SelectSession(index) => self
                 .workspace
+                .active
                 .binding
                 .mux
                 .sessions()
@@ -6706,6 +6030,7 @@ impl AppState {
             MuxKeyAction::PreviousSession => self.relative_session(-1),
             MuxKeyAction::LastSession => self
                 .workspace
+                .active
                 .binding
                 .mux
                 .previous_selected_session()
@@ -6717,19 +6042,21 @@ impl AppState {
         // target (e.g. last_session with no prior session) is a no-op here; falling through would
         // reach the command builder's `unreachable!` for these Bootty-owned actions and panic.
         if let Some(target) = target {
-            self.workspace.binding.mux.activate_session(&target);
-            self.persist_rmux_restore_state();
+            if !self.persist_rmux_selection_before_publish(&target, None) {
+                return true;
+            }
+            self.workspace.active.binding.mux.activate_session(&target);
             self.sync_native_layout_terminal_now();
         }
         true
     }
 
     fn relative_session(&self, delta: isize) -> Option<String> {
-        let sessions = self.workspace.binding.mux.sessions();
+        let sessions = self.workspace.active.binding.mux.sessions();
         if sessions.is_empty() {
             return None;
         }
-        let selected = self.workspace.binding.mux.selected_session();
+        let selected = self.workspace.active.binding.mux.selected_session();
         let current = selected
             .and_then(|selected| {
                 sessions
@@ -6791,6 +6118,7 @@ impl AppState {
     fn selected_terminal_text(&mut self) -> Option<String> {
         match self
             .workspace
+            .active
             .binding
             .terminal
             .format_selection(TerminalSelectionFormat::PlainText)
@@ -6808,6 +6136,7 @@ impl AppState {
     fn clear_terminal_search(&mut self) {
         if let Err(error) = self
             .workspace
+            .active
             .binding
             .terminal
             .search_viewport("", TerminalSearchDirection::Current)
@@ -6859,6 +6188,7 @@ impl AppState {
         if let Some(pane_id) = self.focused_pane()
             && let Some(source) = self
                 .workspace
+                .active
                 .binding
                 .terminal
                 .focused_render_source(&pane_id)
@@ -6874,10 +6204,11 @@ impl AppState {
 
         let found = self
             .workspace
+            .active
             .binding
             .terminal
             .search_viewport(query, direction)?;
-        let frame = self.workspace.binding.terminal.extract_frame()?;
+        let frame = self.workspace.active.binding.terminal.extract_frame()?;
         Ok(TerminalFindResult {
             found,
             active_index: frame.active_search_match_index,
@@ -6891,7 +6222,7 @@ impl AppState {
         direction: TerminalSearchDirection,
     ) -> TerminalFindResult {
         match TerminalRenderSource::handle_copy_mode_action(
-            self.workspace.binding.terminal.as_mut(),
+            self.workspace.active.binding.terminal.as_mut(),
             TerminalCopyModeAction::Search {
                 query: query.to_owned(),
                 direction,
@@ -6912,6 +6243,7 @@ impl AppState {
     fn terminal_find_result_from_frame(&mut self, found: bool) -> TerminalFindResult {
         let (active_index, match_count) = self
             .workspace
+            .active
             .binding
             .terminal
             .extract_frame()
@@ -6932,14 +6264,20 @@ impl AppState {
             TerminalScrollAction::Top => -1_000_000,
             TerminalScrollAction::Bottom => 1_000_000,
             TerminalScrollAction::PageUp => {
-                -(self.workspace.binding.terminal.grid_size().1 as isize)
+                -(self.workspace.active.binding.terminal.grid_size().1 as isize)
             }
             TerminalScrollAction::PageDown => {
-                self.workspace.binding.terminal.grid_size().1 as isize
+                self.workspace.active.binding.terminal.grid_size().1 as isize
             }
             TerminalScrollAction::Lines(lines) => isize::from(lines),
         };
-        if let Err(error) = self.workspace.binding.terminal.scroll_viewport_delta(delta) {
+        if let Err(error) = self
+            .workspace
+            .active
+            .binding
+            .terminal
+            .scroll_viewport_delta(delta)
+        {
             self.last_error = Some(error.to_string());
         }
     }
@@ -6951,31 +6289,37 @@ impl AppState {
     ) {
         match command {
             TerminalInputCommand::Text(text) => {
-                if let Err(error) = self.workspace.binding.terminal.write_input(text.as_bytes()) {
+                if let Err(error) = self
+                    .workspace
+                    .active
+                    .binding
+                    .terminal
+                    .write_input(text.as_bytes())
+                {
                     self.last_error = Some(error.to_string());
                 } else {
                     self.hide_mouse_pointer_for_terminal_typing(effects);
                 }
             }
             TerminalInputCommand::Paste(text) => {
-                if let Err(error) = self.workspace.binding.terminal.write_paste(&text) {
+                if let Err(error) = self.workspace.active.binding.terminal.write_paste(&text) {
                     self.last_error = Some(error.to_string());
                 }
             }
             TerminalInputCommand::Focus(focused) => {
-                if let Err(error) = self.workspace.binding.terminal.encode_focus(focused) {
+                if let Err(error) = self.workspace.active.binding.terminal.encode_focus(focused) {
                     self.last_error = Some(error.to_string());
                 }
             }
             TerminalInputCommand::Key(input) => {
-                if let Err(error) = self.workspace.binding.terminal.encode_key(input) {
+                if let Err(error) = self.workspace.active.binding.terminal.encode_key(input) {
                     self.last_error = Some(error.to_string());
                 } else {
                     self.hide_mouse_pointer_for_terminal_typing(effects);
                 }
             }
             TerminalInputCommand::Mouse(input) => {
-                if let Err(error) = self.workspace.binding.terminal.encode_mouse(input) {
+                if let Err(error) = self.workspace.active.binding.terminal.encode_mouse(input) {
                     self.last_error = Some(error.to_string());
                 }
             }
@@ -6985,6 +6329,7 @@ impl AppState {
             } => {
                 if let Err(error) = self
                     .workspace
+                    .active
                     .binding
                     .terminal
                     .handle_mouse_wheel(input, scroll_delta)

@@ -123,8 +123,16 @@ cargo --version
 
 - Project overview: `README.md`
 - Architecture: `docs/architecture.md`
+- Architecture decisions: `docs/decisions/README.md`
 - Egui oracle inventory: `docs/current-egui-behavior.md`
 - Input encoders: `docs/input-encoders.md`
 - Benchmark process and performance guardrails: `docs/benchmarking.md`
 - Benchmark reports: `docs/benchmark-report.md`
 - `libghostty-rs` dependency boundary: `docs/libghostty-rs.md`
+
+Record a durable architecture or product choice before or with its implementation
+when alternatives, invariants, failure behavior, or migration consequences are not
+evident from code. The vault owns product vocabulary. Accepted decision records
+own rationale and rejected alternatives. `docs/architecture.md` owns the current
+production structure and clearly labeled accepted targets. Add a superseding record
+when a decision changes. Do not use accepted records as progress logs.

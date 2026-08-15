@@ -1,20 +1,13 @@
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
-
-use rusqlite::params;
-
-use crate::workspace::open_db;
+use std::collections::HashSet;
 
 fn session_group(name: &str) -> &str {
     name.split_once('/').map_or("", |(group, _)| group)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SessionGroup {
-    name: String,
-    sessions: Vec<String>,
+pub(crate) struct SessionGroup {
+    pub(crate) name: String,
+    pub(crate) sessions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,41 +16,6 @@ struct SessionStore {
 }
 
 impl SessionStore {
-    fn load_sqlite(path: &Path, binding_id: i64) -> rusqlite::Result<Self> {
-        let conn = open_db(path)?;
-        let mut stmt = conn.prepare(
-            "SELECT g.id, g.name, s.name
-             FROM workspace_session_groups g
-             JOIN workspace_sessions s ON s.group_id = g.id
-             WHERE g.binding_id = ?1 AND s.binding_id = ?1
-             ORDER BY g.position, s.position",
-        )?;
-        let rows = stmt.query_map([binding_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-
-        let mut store = Self::default();
-        let mut current_group_id = None;
-        for row in rows {
-            let (group_id, group_name, session_name) = row?;
-            if current_group_id != Some(group_id) {
-                store.entries.push(SessionGroup {
-                    name: group_name,
-                    sessions: Vec::new(),
-                });
-                current_group_id = Some(group_id);
-            }
-            if let Some(group) = store.entries.last_mut() {
-                group.sessions.push(session_name);
-            }
-        }
-        Ok(store)
-    }
-
     fn ordered_names(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -111,7 +69,8 @@ impl SessionStore {
     }
 
     fn rename_session(&mut self, old: &str, new: &str) -> bool {
-        if old == new || self.existing_names().contains(new) {
+        if new.is_empty() || new.contains('\0') || old == new || self.existing_names().contains(new)
+        {
             return false;
         }
         let Some((entry_index, session_index)) = self.find_session(old) else {
@@ -202,7 +161,7 @@ impl SessionStore {
     }
 
     /// Moves `source` to sit before `before` (or to the end when `None`). Within one group this
-    /// reorders the siblings; across groups a session can't leave its group, so the whole source
+    /// reorders the siblings; across groups a session cannot leave its group, so the whole source
     /// group moves before the target's group instead.
     fn move_session_before(&mut self, source: &str, before: Option<&str>) -> bool {
         let Some((src_group, src_idx)) = self.find_session(source) else {
@@ -251,103 +210,43 @@ impl SessionStore {
                     .map(|session_idx| (entry_idx, session_idx))
             })
     }
-
-    fn save_sqlite(&self, path: &Path, binding_id: i64) -> rusqlite::Result<()> {
-        let mut conn = open_db(path)?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM workspace_sessions WHERE binding_id = ?1",
-            [binding_id],
-        )?;
-        tx.execute(
-            "DELETE FROM workspace_session_groups WHERE binding_id = ?1",
-            [binding_id],
-        )?;
-        {
-            let mut insert_group = tx.prepare(
-                "INSERT INTO workspace_session_groups (binding_id, name, position)
-                 VALUES (?1, ?2, ?3)",
-            )?;
-            let mut insert_session = tx.prepare(
-                "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for (group_position, group) in self.entries.iter().enumerate() {
-                insert_group.execute(params![binding_id, group.name, group_position as i64])?;
-                let group_id = tx.last_insert_rowid();
-                for (session_position, session) in group.sessions.iter().enumerate() {
-                    insert_session.execute(params![
-                        binding_id,
-                        session,
-                        group_id,
-                        session_position as i64
-                    ])?;
-                }
-            }
-        }
-        if self.entries.is_empty() {
-            tx.execute(
-                "INSERT INTO workspace_session_groups (binding_id, name, position)
-                 VALUES (?1, '', 0)",
-                [binding_id],
-            )?;
-        }
-        tx.commit()
-    }
 }
 
-#[derive(Debug, Clone)]
+/// Binding-scoped session membership and ordering.
+///
+/// This is a persistence-free value type. `WorkspaceRepository` owns its SQLite representation
+/// and publishes a replacement only after the corresponding transaction commits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionOrderStore {
-    path: PathBuf,
-    binding_id: Option<i64>,
     store: SessionStore,
     membership_initialized: bool,
 }
 
 impl SessionOrderStore {
-    pub(crate) fn for_binding(config_path: &Path, binding_id: i64) -> Self {
-        let path = crate::workspace::sqlite_path(config_path);
-        let (store, membership_initialized) = Self::load_store(&path, Some(binding_id));
+    pub(crate) fn from_groups(groups: Vec<SessionGroup>, membership_initialized: bool) -> Self {
         Self {
-            store,
-            path,
-            binding_id: Some(binding_id),
+            store: SessionStore { entries: groups },
             membership_initialized,
         }
     }
 
-    fn load_store(path: &Path, binding_id: Option<i64>) -> (SessionStore, bool) {
-        let Some(binding_id) = binding_id else {
-            return (SessionStore::default(), false);
-        };
-        (
-            SessionStore::load_sqlite(path, binding_id).unwrap_or_default(),
-            Self::membership_initialized(path, binding_id).unwrap_or(false),
-        )
+    pub(crate) fn groups(&self) -> &[SessionGroup] {
+        &self.store.entries
     }
 
-    fn membership_initialized(path: &Path, binding_id: i64) -> rusqlite::Result<bool> {
-        let conn = open_db(path)?;
-        conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM workspace_session_groups WHERE binding_id = ?1
-             )",
-            [binding_id],
-            |row| row.get(0),
-        )
-    }
-
-    pub fn add_session(&mut self, name: &str) {
-        if self.store.existing_names().insert(name.to_owned()) {
-            self.store.insert_unique(name);
-            self.save();
+    pub fn add_session(&mut self, name: &str) -> bool {
+        if name.is_empty() || self.store.existing_names().contains(name) {
+            return false;
         }
+        self.store.insert_unique(name);
+        self.membership_initialized = true;
+        true
     }
 
     pub fn remove_session(&mut self, name: &str) -> bool {
         let removed = self.store.remove(name);
         if removed {
-            self.save();
+            self.membership_initialized = true;
         }
         removed
     }
@@ -355,7 +254,7 @@ impl SessionOrderStore {
     pub fn rename_session(&mut self, old: &str, new: &str) -> bool {
         let renamed = self.store.rename_session(old, new);
         if renamed {
-            self.save();
+            self.membership_initialized = true;
         }
         renamed
     }
@@ -386,7 +285,7 @@ impl SessionOrderStore {
         }
         changed |= self.store.prune(&alive);
         if changed {
-            self.save();
+            self.membership_initialized = true;
         }
         self.store
             .ordered_names()
@@ -404,7 +303,7 @@ impl SessionOrderStore {
         self.sync_sessions(sessions);
         let moved = self.store.move_session(name, delta);
         if moved {
-            self.save();
+            self.membership_initialized = true;
         }
         moved
     }
@@ -418,16 +317,8 @@ impl SessionOrderStore {
         self.sync_sessions(sessions);
         let moved = self.store.move_session_before(source, before);
         if moved {
-            self.save();
-        }
-        moved
-    }
-
-    fn save(&mut self) {
-        if let Some(binding_id) = self.binding_id
-            && self.store.save_sqlite(&self.path, binding_id).is_ok()
-        {
             self.membership_initialized = true;
         }
+        moved
     }
 }

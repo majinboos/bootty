@@ -12,6 +12,10 @@ not compatibility wrappers. Each owns a seam whose deletion would push state,
 runtime, geometry, renderer, or host-specific complexity back into multiple
 callers.
 
+Unmarked sections describe the current production architecture. Sections labeled
+**Accepted target** describe accepted decisions that production code does not yet
+fully implement. Known violations remain listed until the target lands.
+
 ## Design constraints
 
 - Use `libghostty-vt` for VT parsing, terminal state, colors, cursor state, and
@@ -22,6 +26,98 @@ callers.
   duplicate cell, padding, or pointer-coordinate math.
 - Keep renderer latency observable through lightweight status metrics and
   benchmarkable module seams.
+
+## Authority map
+
+Each durable fact and live mutation has one authority.
+
+| Fact or mutation | Authority | Failure rule |
+| --- | --- | --- |
+| Live terminal processes and backend-native layout | The selected backend binding | Bootty reports the backend failure. It does not invent successful topology. |
+| Persistent Space and backend-binding metadata | `WorkspaceRepository` | A failed load rejects the snapshot. A failed commit preserves the prior committed state. |
+| Validated live workspace state | `WorkspaceRuntime` | A replacement becomes visible only after validation and persistence succeed. |
+| PTY and process lifecycle | `TerminalSession` and `TerminalWorker` | The UI receives typed runtime outcomes. It does not own the process. |
+| VT state | `TerminalEngine` | Render consumers read published frames. They do not mutate VT state. |
+| Application orchestration | `AppState` | The UI boundary converts typed domain failures into user-visible effects. |
+| Command meaning and validation | The command catalog and the UI-owner broker | UI, keybindings, the local CLI, the socket, and Luau use one command path. |
+| Control transport state | The local control plane | The transport carries requests and outcomes. It is not a second state model. |
+| Extension declarations and generations | **Accepted target:** the extension host | A generation publishes atomically. Rust retains topology and UI authority. |
+
+The extension target does not describe the current manifest-package loader. That
+loader does not yet implement local-module identity or atomic generation replacement.
+
+## Workspace persistence
+
+`WorkspaceRepository` is the only SQLite authority for persistent Space and
+backend-binding state. It migrates the schema and loads one validated
+`WorkspaceSnapshot`. The snapshot includes Space metadata, binding configuration,
+restore selection, session ordering, group membership, and session-name metadata.
+It retains persistence access state after load. It does not retain a second mutable
+workspace model.
+
+`WorkspaceRuntime` owns the committed live snapshot. Focused session-order and
+session-name types are in-memory domain values. They do not open SQLite or save
+themselves. `AppState` requests workspace operations. It does not construct
+persistence stores or derive database paths.
+
+The headless remote Space catalog has no GUI runtime. Its focused
+`RemoteSpaceRuntime` loads the same snapshot and commits through the same
+`WorkspaceRepository`. It is a composition path for one binding. It is not a
+second persistence authority.
+
+Every durable mutation uses commit-before-publish ordering:
+
+```text
+workspace intent
+  -> build and validate a candidate snapshot
+  -> commit one private SQLite transaction
+  -> replace the committed WorkspaceRuntime snapshot
+  -> publish the typed outcome
+```
+
+Space appearance is Space-scoped. Backend and remote placement are binding-scoped.
+The Space editor commits placement for the selected binding through its exact
+`MuxScope`. It never guesses the first binding in the Space.
+
+A backend operation cannot share a SQLite transaction. Bootty records a durable,
+binding-scoped membership intent before create, rename, or ditch. It then requires
+backend confirmation. One transaction applies the metadata and clears the intent.
+A create or rename intent includes the backend name, the Bootty display name, and
+whether the user chose that name.
+A metadata failure after backend completion is a typed partial-completion failure.
+The next authoritative backend snapshot applies or discards the retained intent.
+Bootty never invents backend topology. GUI and headless catalog flows use the same
+journal and repository rules.
+
+A binding keeps its backend identity until its pending journal entry resolves.
+The Space editor rejects a backend or remote placement change during recovery.
+SSH profile reload defers the affected binding rebuild and retries it after the
+next authoritative snapshot resolves the journal.
+
+GUI membership commands do not persist speculative metadata. The command worker
+returns an authoritative snapshot for create, rename, and ditch. Bootty commits the
+derived metadata before it publishes an authoritative command success. Generated
+name state used for live reconciliation stays in memory while an asynchronous UI
+command is pending. The durable journal retains the naming intent across a crash.
+
+A corrupt or incomplete database returns a typed persistence failure. It never
+becomes an empty workspace. A failed write leaves the prior committed runtime
+snapshot and database state active. See
+[`0002-workspace-persistence-authority.md`](decisions/0002-workspace-persistence-authority.md).
+
+## Architecture program order
+
+Architecture work follows this dependency order:
+
+1. Establish authoritative ownership, persistence safety, and dependency direction.
+2. Deepen module interfaces and remove shallow or duplicate code.
+3. Implement one semantic command path for the CLI, local socket, and Luau.
+4. Implement the generic extension lifecycle on that command path.
+5. Add agent integrations through the approved local extension boundary.
+
+Tests, deleted lines, file moves, and `AppState` size are evidence only. They are
+not architecture outcomes. See
+[`0001-architecture-program-order.md`](decisions/0001-architecture-program-order.md).
 
 ## Crate boundaries
 
@@ -36,9 +132,9 @@ callers.
   Local macOS installs cross-build every supported daemon target and keep the
   target-named binaries under `Bootty.app/Contents/Resources/daemons`.
 - `bootty-config` owns the Bootty TOML schema, XDG config path resolution,
-  includes, restricted theme color resolution, reload state, and round-trip
-  TOML writeback. It is host-neutral so non-egui hosts can load the same
-  config.
+  includes, restricted theme color resolution, reload state, round-trip TOML
+  writeback, and conversion into terminal, runtime, renderer, and input value
+  types. It is currently a composition schema rather than a low-level leaf.
 - `bootty-mux` owns backend-neutral session snapshots, lifecycle commands,
   Bootty-native mux state, rmux/tmux/zellij adapter command translation, and
   the tmux control-mode protocol parser. It is egui-free: the controller
@@ -99,9 +195,9 @@ render frames.
   current-context targets, safety gates, and the bounded request/response channel.
   Palette, keybinding, and external callers share this contract; `AppState` alone
   resolves targets and executes requests on the UI thread.
-- `app/mod.rs` owns the thin eframe adapter `BoottyApp`: it snapshots egui
-  input into `FrameInputs`, applies returned `AppEffect`s to the context, and
-  renders chrome from `AppState` accessors.
+- `app/mod.rs` owns the eframe adapter `BoottyApp`, egui input snapshots,
+  `AppEffect` application, WGPU callback preparation, and substantial chrome
+  composition and host policy.
 - `bootty-config::config` owns the Bootty TOML schema, XDG config path
   resolution, includes, restricted theme resolution, reload state, and
   round-trip TOML writeback. `bootty-config::config_reload` owns hot-reload
@@ -151,9 +247,10 @@ render frames.
   fills, text, color glyphs, sprites, decorations, images, and cursors.
 - `bootty-winit::bare_host` owns the minimal non-egui window path and its surface
   format selection guardrail so terminal palette colors are not gamma-shifted.
-- `bootty-mux` exposes the mux contract consumed by `app.rs`; the app must not
-  invoke backend command surfaces directly. The crate boundary enforces that
-  mux logic stays free of egui and app types.
+- `bootty-mux` exposes the mux contract consumed by `bootty-app`. The app may
+  submit `MuxCommand` values through `BindingMuxController`. UI code does not
+  call concrete native, rmux, tmux, or zellij adapters. The crate boundary keeps
+  mux logic free of egui and app types.
 
 ## Runtime flow
 

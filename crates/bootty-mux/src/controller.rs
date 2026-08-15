@@ -132,6 +132,12 @@ pub struct MuxCommandCompletion {
 }
 
 impl MuxCommandCompletion {
+    pub fn matches_config(&self, config: &MultiplexerConfig) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_none_or(|(completed_config, _)| completed_config == config)
+    }
+
     fn requested(selected_session: Option<String>, selected_window: Option<String>) -> Self {
         Self {
             selected_session,
@@ -1162,9 +1168,6 @@ impl MuxController {
         // Names change here; ids do not. Pin the selection to its id first so it still resolves once
         // the session answers to the new name, whichever backend applies the rename.
         self.selected_session = self.selected_session_id();
-        if selected_backend(config) != MultiplexerBackendConfig::Native {
-            self.apply_optimistic_session_rename(session_id, &name);
-        }
         let command = MuxCommand::RenameSession {
             session_id: session_id.to_owned(),
             name,
@@ -1495,24 +1498,6 @@ impl MuxController {
             active_window_of(&self.sessions, self.selected_session.as_deref());
     }
 
-    fn apply_optimistic_session_rename(&mut self, session_id: &str, name: &str) {
-        let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id || session.name == session_id)
-        else {
-            return;
-        };
-        let old_name = std::mem::replace(&mut session.name, name.to_owned());
-        if let Some(backend_name) = self
-            .backend_session_names
-            .iter_mut()
-            .find(|backend_name| **backend_name == old_name)
-        {
-            *backend_name = name.to_owned();
-        }
-    }
-
     fn apply_optimistic_command_selection(&mut self, command: &MuxCommand) -> Option<String> {
         let session_id = command_session_id(command).to_owned();
         let window_id = optimistic_window_after_command(
@@ -1558,9 +1543,16 @@ impl MuxController {
                 } else {
                     drop(state);
                     let mut backend = build_backend_with(factory.as_ref(), &job.config);
+                    let reconcile_workspace_membership = matches!(
+                        job.command,
+                        MuxCommand::CreateProjectSession { .. }
+                            | MuxCommand::CreateWorktreeSession { .. }
+                            | MuxCommand::RenameSession { .. }
+                            | MuxCommand::DitchSession { .. }
+                    );
                     execute_backend_command(backend.as_mut(), job.scope, job.command).and_then(
                         |()| {
-                            if job.response.is_some() {
+                            if job.response.is_some() || reconcile_workspace_membership {
                                 backend
                                     .snapshot()
                                     .map(|snapshot| {

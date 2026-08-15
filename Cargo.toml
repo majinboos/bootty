@@ -172,8 +172,12 @@ opt-level = 2
 debug = false
 
 [dev-dependencies]
+anyhow.workspace = true
 bootty-app = { path = "crates/bootty-app" }
+bootty-mux = { path = "crates/bootty-mux" }
 egui.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [dependencies]
