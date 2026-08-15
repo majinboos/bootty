@@ -4,10 +4,7 @@ use bootty_app::{
     geometry::SurfaceRect,
     paint_plan::{PlanColor, TextAttrs},
     terminal_render::TextCommand,
-    terminal_text::{
-        CodepointPresentation, FontResolver, FontStyle, TerminalCodepointResolver,
-        TerminalTextConfig,
-    },
+    terminal_text::{FontResolver, TerminalTextConfig},
     terminal_text_atlas::{GlyphAtlas, TerminalTextShaper, TextAtlasBuilder},
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
@@ -171,30 +168,16 @@ fn bench_font_resolution(c: &mut Criterion) {
     let mut config = TerminalTextConfig::default();
     config.codepoint_overrides.add('🥟'..='🥟', "Emoji Color");
     config.codepoint_overrides.add('界'..='界', "CJK Override");
-    let resolver = FontResolver::new(config.clone());
-    let codepoint_resolver = TerminalCodepointResolver::new(config);
+    let resolver = FontResolver::new(config);
     let attrs = attrs();
 
     c.bench_function("font_resolve_face_ascii_warm", |b| {
-        b.iter(|| black_box(resolver.resolve_face_for_text(black_box(&attrs), "regular text")))
+        b.iter(|| {
+            black_box(resolver.resolve_face_handle_for_text(black_box(&attrs), "regular text"))
+        })
     });
     c.bench_function("font_resolve_face_override_emoji", |b| {
-        b.iter(|| black_box(resolver.resolve_face_for_text(black_box(&attrs), "🥟")))
-    });
-    c.bench_function("font_resolve_codepoint_mixed_batch", |b| {
-        let chars = ['a', '界', '🥟', '─', '\u{F126}', 'Ω'];
-        b.iter(|| {
-            let mut resolved = 0_usize;
-            for ch in chars {
-                if codepoint_resolver
-                    .resolve(ch, FontStyle::Regular, CodepointPresentation::Any)
-                    .is_some()
-                {
-                    resolved += 1;
-                }
-            }
-            black_box(resolved)
-        })
+        b.iter(|| black_box(resolver.resolve_face_handle_for_text(black_box(&attrs), "🥟")))
     });
 }
 

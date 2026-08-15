@@ -67,17 +67,6 @@ pub(super) fn background_quad_vertices(
     ]
 }
 
-#[cfg(test)]
-pub(super) fn text_vertices(
-    surface: SurfaceRect,
-    ppp: f32,
-    quads: &[TexturedGlyphQuad],
-) -> Vec<TextVertex> {
-    let mut vertices = Vec::with_capacity(quads.len() * 6);
-    text_vertices_into(surface, ppp, quads, &mut vertices);
-    vertices
-}
-
 pub(super) fn text_vertices_into(
     surface: SurfaceRect,
     ppp: f32,

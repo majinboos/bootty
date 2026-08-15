@@ -3,8 +3,8 @@ use std::hint::black_box;
 mod paint_plan_fixtures;
 
 use bootty_app::{
+    command_extensions::{ModuleItem, PublishedSurfaceItem},
     config::{BoottyConfig, MultiplexerBackendConfig},
-    extensions::ModuleItem,
     geometry::ViewTransform,
     input_binding::BindingAction,
     input_binding_set::BindingSet,
@@ -706,7 +706,15 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
     let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 900.0));
 
     for name in ["plain_usage_footer", "compact_usage_footer"] {
-        let footer_items = usage_footer_items(name);
+        let footer_items = usage_footer_items(name)
+            .into_iter()
+            .map(|item| PublishedSurfaceItem {
+                module: "benchmark.luau".to_owned(),
+                generation: 1,
+                surface: name.to_owned(),
+                item,
+            })
+            .collect::<Vec<_>>();
         let context = egui::Context::default();
         icons::install_icon_fonts(&context);
         c.bench_function(&format!("sidebar_ui_96_rich_sessions_{name}"), |b| {

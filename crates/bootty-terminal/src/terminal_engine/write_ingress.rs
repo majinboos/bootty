@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use memchr::memchr3_iter;
 
-pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let first = *needle.first()?;
     if needle.len() == 1 {
         return haystack.iter().position(|byte| *byte == first);
@@ -19,7 +19,7 @@ pub(super) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
-pub(super) fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
@@ -29,6 +29,11 @@ pub(super) fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+pub(crate) fn split_osc_payload(payload: &[u8]) -> Option<(&[u8], &[u8])> {
+    let separator = payload.iter().position(|byte| *byte == b';')?;
+    Some((&payload[..separator], &payload[separator + 1..]))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

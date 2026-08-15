@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod logical_search;
-mod write_ingress;
+pub(crate) mod write_ingress;
 
 use logical_search::{
     CopyModeSearchMatch, copy_mode_logical_search_matches, frame_search_matches,
@@ -28,8 +28,8 @@ use logical_search::{
 use write_ingress::{
     CURSOR_HOME, SanitizedKittyGraphics, SgrOptimizer, complete_streaming_control_prefix_len,
     contains_tracked_streaming_control, find_osc_terminator, find_subslice,
-    repeated_cursor_home_prefix_len, sanitize_kitty_graphics_commands, terminal_write_features,
-    unwrap_tmux_passthrough_commands,
+    repeated_cursor_home_prefix_len, sanitize_kitty_graphics_commands, split_osc_payload,
+    terminal_write_features, unwrap_tmux_passthrough_commands,
 };
 
 use crate::terminal_frame::{
@@ -40,6 +40,8 @@ use crate::terminal_input_model::{
     KeyInput, MacosOptionAsAlt, MouseAction, MouseEncoderSize, MouseInput,
 };
 use crate::terminal_palette::generate_256_palette;
+use crate::terminal_side_effect::{TerminalHostAction, TerminalSideEffectCollector};
+pub use crate::terminal_side_effect::{TerminalSideEffect, TerminalSideEffectEvent};
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use libghostty_vt::{
@@ -58,17 +60,11 @@ use libghostty_vt::{
     },
 };
 
-#[cfg(test)]
-use {
-    crate::terminal_input_model::{KeyMods, MouseButton, TerminalKey},
-    libghostty_vt::style::Underline,
-};
-
 pub const DEFAULT_MAX_SCROLLBACK: usize = 0;
 const SELECTION_REPEAT_INTERVAL: Duration = Duration::from_millis(500);
 /// Ceiling on button reports emitted for one wheel event. Well above a full-screen page scroll.
 const MAX_WHEEL_REPORTS: usize = 1024;
-pub const NATIVE_SCROLLBACK_TARGET_ROWS: usize = 1_000_000;
+const NATIVE_SCROLLBACK_TARGET_ROWS: usize = 1_000_000;
 pub const NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE: usize = 320;
 pub const NATIVE_MAX_SCROLLBACK: usize =
     NATIVE_SCROLLBACK_TARGET_ROWS * NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
@@ -169,48 +165,6 @@ pub struct TerminalLiveConfig {
     pub colors: TerminalColorConfig,
     pub cursor: TerminalCursorConfig,
     pub features: TerminalFeatureConfig,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TerminalSideEffect {
-    Bell,
-    ClipboardWrite(String),
-    ClipboardQuery { selection: String },
-    WindowTitle(String),
-    WindowIcon(String),
-    DesktopNotification { title: String, body: String },
-    MouseShape(String),
-    SemanticPrompt(String),
-    KittyTextSizing(String),
-    ConEmuControl(String),
-    ConEmuProgress { state: String, value: Option<u8> },
-    Iterm2UserVarPorts(Vec<u16>),
-    Iterm2Control(String),
-    Iterm2File(String),
-    OpenUrl(String),
-    FocusWindow,
-    ReportCellSize,
-    ReportVariable(String),
-    UnsupportedHostCommand { protocol: String, command: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TerminalSideEffectEvent {
-    pub source_pane_id: Option<String>,
-    pub effect: TerminalSideEffect,
-}
-
-impl TerminalSideEffectEvent {
-    pub fn new(source_pane_id: Option<String>, effect: TerminalSideEffect) -> Self {
-        Self {
-            source_pane_id,
-            effect,
-        }
-    }
-
-    pub fn unscoped(effect: TerminalSideEffect) -> Self {
-        Self::new(None, effect)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -589,14 +543,11 @@ pub struct TerminalEngine {
     geometry: TerminalGeometry,
     size_report_state: Arc<Mutex<SizeReportState>>,
     current_working_directory_state: Arc<Mutex<String>>,
-    osc_side_effect_pending: Vec<u8>,
+    side_effects: TerminalSideEffectCollector,
     terminal_write_pending: Vec<u8>,
     cursor_home_pending_len: usize,
     sgr_optimizer: SgrOptimizer,
     pty_write_callback: PtyWriteCallback,
-    side_effects: Vec<TerminalSideEffect>,
-    callback_side_effects: Arc<Mutex<Vec<TerminalSideEffect>>>,
-    iterm_copy_capture: Option<Vec<u8>>,
     current_working_directory: String,
     colors: TerminalColorConfig,
     xterm_color_overrides: XtermColorOverrides,
@@ -745,44 +696,6 @@ fn default_device_attributes() -> DeviceAttributes {
     }
 }
 
-fn osc52_payload_text(payload: &[u8]) -> Option<Result<String, String>> {
-    let separator = payload.iter().position(|byte| *byte == b';')?;
-    let selection = String::from_utf8_lossy(&payload[..separator]).into_owned();
-    let encoded = &payload[separator + 1..];
-    if encoded == b"?" {
-        return Some(Err(selection));
-    }
-    let bytes = general_purpose::STANDARD
-        .decode(encoded)
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
-        .ok()?;
-    String::from_utf8(bytes).ok().map(Ok)
-}
-
-fn iterm2_user_var_ports(value: &str) -> Option<Vec<u16>> {
-    let (name, encoded) = value.split_once('=')?;
-    if name != "bootty_ports" {
-        return None;
-    }
-    let bytes = general_purpose::STANDARD
-        .decode(encoded)
-        .or_else(|_| general_purpose::STANDARD_NO_PAD.decode(encoded))
-        .ok()?;
-    let csv = std::str::from_utf8(&bytes).ok()?;
-    if csv.is_empty() {
-        return Some(Vec::new());
-    }
-    csv.split(',')
-        .map(|port| port.trim().parse::<u16>())
-        .collect::<Result<_, _>>()
-        .ok()
-}
-
-fn split_osc_payload(payload: &[u8]) -> Option<(&[u8], &[u8])> {
-    let separator = payload.iter().position(|byte| *byte == b';')?;
-    Some((&payload[..separator], &payload[separator + 1..]))
-}
-
 fn parse_palette_index(bytes: &[u8]) -> Option<u8> {
     let text = std::str::from_utf8(bytes).ok()?;
     text.parse().ok()
@@ -836,62 +749,6 @@ fn rgb_spec(color: RgbColor) -> String {
         "rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
         color.r, color.r, color.g, color.g, color.b, color.b
     )
-}
-
-fn conemu_osc9_kind(data: &str) -> Option<&str> {
-    let kind = data.split(';').next().unwrap_or_default();
-    (!kind.is_empty() && kind.bytes().all(|byte| byte.is_ascii_digit())).then_some(kind)
-}
-
-fn conemu_progress_state(state: &str) -> &'static str {
-    match state {
-        "0" | "" => "inactive",
-        "1" => "normal",
-        "2" => "error",
-        "3" => "indeterminate",
-        "4" => "warning",
-        _ => "unknown",
-    }
-}
-
-fn iterm_cursor_shape_sequence(shape: &str) -> Option<&'static [u8]> {
-    match shape {
-        "0" => Some(b"\x1b[2 q"),
-        "1" => Some(b"\x1b[6 q"),
-        "2" => Some(b"\x1b[4 q"),
-        _ => None,
-    }
-}
-
-fn append_plain_text_bytes(out: &mut Vec<u8>, data: &[u8]) {
-    let mut index = 0;
-    while index < data.len() {
-        match data[index] {
-            0x1b => index = skip_escape_sequence(data, index),
-            b'\r' => {
-                out.push(b'\n');
-                index += 1;
-            }
-            byte if byte >= 0x20 || byte == b'\n' || byte == b'\t' => {
-                out.push(byte);
-                index += 1;
-            }
-            _ => index += 1,
-        }
-    }
-}
-
-fn skip_escape_sequence(data: &[u8], start: usize) -> usize {
-    match data.get(start + 1).copied() {
-        Some(b'[') => data[start + 2..]
-            .iter()
-            .position(|byte| (0x40..=0x7e).contains(byte))
-            .map_or(data.len(), |end| start + 3 + end),
-        Some(b']' | b'P' | b'_') => find_osc_terminator(&data[start + 2..])
-            .map_or(data.len(), |(len, term)| start + 2 + len + term),
-        Some(_) => (start + 2).min(data.len()),
-        None => data.len(),
-    }
 }
 
 pub fn encode_iterm2_report_cell_size(cell_width: f32, cell_height: f32, scale: f32) -> Vec<u8> {
@@ -982,46 +839,10 @@ fn placement_rows_overlap_content(
 
 impl TerminalEngine {
     pub fn new(geometry: TerminalGeometry) -> Result<Self> {
-        Self::new_with_colors(geometry, TerminalColorConfig::default())
-    }
-
-    pub fn new_with_colors(
-        geometry: TerminalGeometry,
-        colors: TerminalColorConfig,
-    ) -> Result<Self> {
-        Self::new_with_scrollback(geometry, colors, DEFAULT_MAX_SCROLLBACK)
-    }
-
-    pub fn new_with_options(
-        geometry: TerminalGeometry,
-        colors: TerminalColorConfig,
-        max_scrollback: usize,
-        macos_option_as_alt: MacosOptionAsAlt,
-    ) -> Result<Self> {
-        Self::new_inner(
+        Self::new_with_scrollback(
             geometry,
-            colors,
-            TerminalCursorConfig::default(),
-            TerminalFeatureConfig::default(),
-            max_scrollback,
-            macos_option_as_alt,
-        )
-    }
-
-    pub fn new_with_cursor_options(
-        geometry: TerminalGeometry,
-        colors: TerminalColorConfig,
-        cursor: TerminalCursorConfig,
-        max_scrollback: usize,
-        macos_option_as_alt: MacosOptionAsAlt,
-    ) -> Result<Self> {
-        Self::new_inner(
-            geometry,
-            colors,
-            cursor,
-            TerminalFeatureConfig::default(),
-            max_scrollback,
-            macos_option_as_alt,
+            TerminalColorConfig::default(),
+            DEFAULT_MAX_SCROLLBACK,
         )
     }
 
@@ -1096,7 +917,8 @@ impl TerminalEngine {
         let report_color_scheme = color_scheme.clone();
         terminal.on_color_scheme(move |_terminal| report_color_scheme.lock().ok().map(|s| *s))?;
         terminal.on_xtversion(|_terminal| Some(TERMINAL_XTVERSION))?;
-        let callback_side_effects = Arc::new(Mutex::new(Vec::new()));
+        let side_effects = TerminalSideEffectCollector::new();
+        let callback_side_effects = side_effects.callback_effects();
         let title_side_effects = callback_side_effects.clone();
         terminal.on_title_changed(move |terminal| {
             if let Ok(title) = terminal.title()
@@ -1169,14 +991,11 @@ impl TerminalEngine {
             mouse_encoder_size: None,
             geometry,
             size_report_state,
-            osc_side_effect_pending: Vec::new(),
+            side_effects,
             terminal_write_pending: Vec::new(),
             cursor_home_pending_len: 0,
             sgr_optimizer: SgrOptimizer::default(),
             pty_write_callback,
-            side_effects: Vec::new(),
-            callback_side_effects,
-            iterm_copy_capture: None,
             current_working_directory: String::new(),
             current_working_directory_state: pwd_state,
             color_scheme,
@@ -1276,7 +1095,7 @@ impl TerminalEngine {
         Ok(())
     }
 
-    pub fn clear_selection(&mut self) -> Result<()> {
+    fn clear_selection(&mut self) -> Result<()> {
         self.terminal.set_selection(None)?;
         self.selection_gesture.reset(&self.terminal);
         self.mark_content_changed();
@@ -1294,13 +1113,13 @@ impl TerminalEngine {
             .map(|bytes| bytes.as_ref().to_vec()))
     }
 
-    pub fn set_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
+    fn set_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
         configure_default_cursor(&mut self.terminal, cursor)?;
         self.mark_content_changed();
         Ok(())
     }
 
-    pub fn set_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
+    fn set_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
         configure_terminal_features(&mut self.terminal, features)?;
         self.mark_content_changed();
         Ok(())
@@ -1312,7 +1131,7 @@ impl TerminalEngine {
         self.set_feature_config(config.features)
     }
 
-    pub fn set_kitty_image_storage_limit(&mut self, limit: u64) -> Result<()> {
+    fn set_kitty_image_storage_limit(&mut self, limit: u64) -> Result<()> {
         self.terminal.set_kitty_image_storage_limit(limit)?;
         self.mark_content_changed();
         Ok(())
@@ -1493,17 +1312,7 @@ impl TerminalEngine {
         self.geometry
     }
 
-    pub fn default_color_palette(&self) -> Result<[RgbColor; 256]> {
-        self.terminal.default_color_palette().map_err(Into::into)
-    }
-
-    pub fn set_default_color_palette(&mut self, palette: [RgbColor; 256]) -> Result<()> {
-        self.terminal.set_default_color_palette(Some(palette))?;
-        self.mark_content_changed();
-        Ok(())
-    }
-
-    pub fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
+    fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
         configure_default_colors(&mut self.terminal, &self.base_color_palette, &colors)?;
         *self.color_scheme.lock().expect("color scheme lock") =
             color_scheme_for_background(colors.background);
@@ -1636,7 +1445,7 @@ impl TerminalEngine {
 
     pub fn write_vt(&mut self, bytes: &[u8]) {
         let can_fast_write = self.terminal_write_pending.is_empty()
-            && self.osc_side_effect_pending.is_empty()
+            && !self.side_effects.has_pending_osc()
             && !contains_tracked_streaming_control(bytes);
 
         if can_fast_write && self.try_write_repeated_cursor_home(bytes) {
@@ -1666,7 +1475,7 @@ impl TerminalEngine {
         }
 
         let mut features = terminal_write_features(write_bytes.as_ref());
-        if !self.osc_side_effect_pending.is_empty() {
+        if self.side_effects.has_pending_osc() {
             features.osc_side_effect = true;
         }
         if !features.needs_sanitizing() {
@@ -1681,7 +1490,7 @@ impl TerminalEngine {
         let bytes = if features.tmux_passthrough {
             let unwrapped = unwrap_tmux_passthrough_commands(write_bytes.as_ref());
             features = terminal_write_features(unwrapped.as_ref());
-            if !self.osc_side_effect_pending.is_empty() {
+            if self.side_effects.has_pending_osc() {
                 features.osc_side_effect = true;
             }
             unwrapped
@@ -1708,16 +1517,17 @@ impl TerminalEngine {
         }
         self.sync_current_working_directory();
         if features.osc_side_effect {
-            self.apply_osc_side_effects(sanitized.bytes.as_ref());
+            for action in self.side_effects.collect(sanitized.bytes.as_ref()) {
+                match action {
+                    TerminalHostAction::WriteVt(bytes) => {
+                        self.terminal.vt_write(bytes);
+                        self.mark_content_changed();
+                    }
+                }
+            }
         }
         self.mouse_encoder_options_dirty = true;
         self.mark_content_changed();
-    }
-
-    fn drain_callback_side_effects(&mut self) {
-        if let Ok(mut effects) = self.callback_side_effects.lock() {
-            self.side_effects.extend(effects.drain(..));
-        }
     }
 
     fn sync_current_working_directory(&mut self) {
@@ -1734,273 +1544,7 @@ impl TerminalEngine {
     }
 
     pub fn drain_side_effects(&mut self) -> Vec<TerminalSideEffect> {
-        self.drain_callback_side_effects();
-        std::mem::take(&mut self.side_effects)
-    }
-
-    pub fn drain_clipboard_texts(&mut self) -> Vec<String> {
-        self.drain_callback_side_effects();
-        let mut clipboard_texts = Vec::new();
-        let mut remaining = Vec::new();
-        for effect in std::mem::take(&mut self.side_effects) {
-            match effect {
-                TerminalSideEffect::ClipboardWrite(text) => clipboard_texts.push(text),
-                effect => remaining.push(effect),
-            }
-        }
-        self.side_effects = remaining;
-        clipboard_texts
-    }
-
-    fn apply_osc_side_effects(&mut self, data: &[u8]) {
-        let mut bytes = Vec::with_capacity(self.osc_side_effect_pending.len() + data.len());
-        bytes.extend_from_slice(&self.osc_side_effect_pending);
-        bytes.extend_from_slice(data);
-        self.osc_side_effect_pending.clear();
-
-        let mut search_start = 0;
-        while let Some(relative_start) = find_subslice(&bytes[search_start..], b"\x1b]") {
-            let start = search_start + relative_start;
-            if start > search_start {
-                self.append_iterm_copy_text(&bytes[search_start..start]);
-            }
-            let payload_start = start + 2;
-            match find_osc_terminator(&bytes[payload_start..]) {
-                Some((payload_len, terminator_len)) => {
-                    let payload = &bytes[payload_start..payload_start + payload_len];
-                    self.push_osc_side_effect(payload);
-                    search_start = payload_start + payload_len + terminator_len;
-                }
-                None => {
-                    self.osc_side_effect_pending
-                        .extend_from_slice(&bytes[start..]);
-                    return;
-                }
-            }
-        }
-        if search_start < bytes.len() {
-            self.append_iterm_copy_text(&bytes[search_start..]);
-        }
-    }
-
-    fn push_osc_side_effect(&mut self, payload: &[u8]) {
-        let Some((command, rest)) = split_osc_payload(payload) else {
-            return;
-        };
-        match command {
-            b"1" => {
-                if let Ok(icon) = std::str::from_utf8(rest) {
-                    self.side_effects
-                        .push(TerminalSideEffect::WindowIcon(icon.to_owned()));
-                }
-            }
-            b"9" => {
-                if let Ok(data) = std::str::from_utf8(rest) {
-                    if conemu_osc9_kind(data).is_some() {
-                        self.push_conemu_side_effect(data);
-                    } else {
-                        self.side_effects
-                            .push(TerminalSideEffect::DesktopNotification {
-                                title: String::new(),
-                                body: data.to_owned(),
-                            });
-                    }
-                }
-            }
-            b"22" => {
-                if let Ok(shape) = std::str::from_utf8(rest) {
-                    self.side_effects
-                        .push(TerminalSideEffect::MouseShape(shape.to_owned()));
-                }
-            }
-            b"52" => match osc52_payload_text(rest) {
-                Some(Ok(text)) => self
-                    .side_effects
-                    .push(TerminalSideEffect::ClipboardWrite(text)),
-                Some(Err(selection)) => self
-                    .side_effects
-                    .push(TerminalSideEffect::ClipboardQuery { selection }),
-                None => {}
-            },
-            b"133" => {
-                if let Ok(data) = std::str::from_utf8(rest) {
-                    self.side_effects
-                        .push(TerminalSideEffect::SemanticPrompt(data.to_owned()));
-                }
-            }
-            b"66" => {
-                if let Ok(data) = std::str::from_utf8(rest) {
-                    self.side_effects
-                        .push(TerminalSideEffect::KittyTextSizing(data.to_owned()));
-                }
-            }
-            b"777" => self.push_osc777_side_effect(rest),
-            b"1337" => {
-                if let Ok(data) = std::str::from_utf8(rest) {
-                    self.push_iterm2_side_effect(data);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn append_iterm_copy_text(&mut self, data: &[u8]) {
-        let Some(capture) = self.iterm_copy_capture.as_mut() else {
-            return;
-        };
-        append_plain_text_bytes(capture, data);
-    }
-
-    fn push_conemu_side_effect(&mut self, data: &str) {
-        let mut parts = data.split(';');
-        let kind = parts.next().unwrap_or_default();
-        match kind {
-            "2" => self.side_effects.push(TerminalSideEffect::WindowTitle(
-                parts.collect::<Vec<_>>().join(";"),
-            )),
-            "4" => {
-                let first = parts.next().unwrap_or_default();
-                let second = parts.next();
-                let (state, value) = match second {
-                    Some(value) => (conemu_progress_state(first), value.parse::<u8>().ok()),
-                    None if matches!(first, "0" | "1" | "2" | "3" | "4") => {
-                        (conemu_progress_state(first), None)
-                    }
-                    None => ("normal", first.parse::<u8>().ok()),
-                };
-                self.side_effects.push(TerminalSideEffect::ConEmuProgress {
-                    state: state.to_owned(),
-                    value: value.map(|value| value.min(100)),
-                });
-            }
-            "6" => self.side_effects.push(TerminalSideEffect::SemanticPrompt(
-                "conemu-prompt".to_owned(),
-            )),
-            "0" | "1" | "3" | "5" | "7" => {
-                self.side_effects
-                    .push(TerminalSideEffect::UnsupportedHostCommand {
-                        protocol: "conemu".to_owned(),
-                        command: data.to_owned(),
-                    });
-            }
-            "8" | "9" => self
-                .side_effects
-                .push(TerminalSideEffect::ConEmuControl(data.to_owned())),
-            _ => self
-                .side_effects
-                .push(TerminalSideEffect::ConEmuControl(data.to_owned())),
-        }
-    }
-
-    fn push_iterm2_side_effect(&mut self, data: &str) {
-        match data {
-            "ClearScrollback" => {
-                self.terminal.vt_write(b"\x1b[3J");
-                self.mark_content_changed();
-                self.side_effects
-                    .push(TerminalSideEffect::Iterm2Control(data.to_owned()));
-            }
-            "SetMark" => self.side_effects.push(TerminalSideEffect::SemanticPrompt(
-                "iterm2-set-mark".to_owned(),
-            )),
-            "StealFocus" => self.side_effects.push(TerminalSideEffect::FocusWindow),
-            "ReportCellSize" => self.side_effects.push(TerminalSideEffect::ReportCellSize),
-            "EndCopy" => {
-                if let Some(capture) = self.iterm_copy_capture.take() {
-                    self.side_effects.push(TerminalSideEffect::ClipboardWrite(
-                        String::from_utf8_lossy(&capture).into_owned(),
-                    ));
-                }
-            }
-            _ => self.push_iterm2_assignment_side_effect(data),
-        }
-    }
-
-    fn push_iterm2_assignment_side_effect(&mut self, data: &str) {
-        let Some((key, value)) = data.split_once('=') else {
-            self.side_effects
-                .push(TerminalSideEffect::Iterm2Control(data.to_owned()));
-            return;
-        };
-        match key {
-            "CurrentDir" => self
-                .side_effects
-                .push(TerminalSideEffect::Iterm2Control(data.to_owned())),
-            "CursorShape" => {
-                if let Some(sequence) = iterm_cursor_shape_sequence(value) {
-                    self.terminal.vt_write(sequence);
-                    self.mark_content_changed();
-                }
-                self.side_effects
-                    .push(TerminalSideEffect::Iterm2Control(data.to_owned()));
-            }
-            "Copy" => {
-                if let Ok(bytes) = general_purpose::STANDARD.decode(value) {
-                    self.side_effects.push(TerminalSideEffect::ClipboardWrite(
-                        String::from_utf8_lossy(&bytes).into_owned(),
-                    ));
-                }
-            }
-            "CopyToClipboard" => {
-                self.iterm_copy_capture = Some(Vec::new());
-                self.side_effects
-                    .push(TerminalSideEffect::Iterm2Control(data.to_owned()));
-            }
-            "OpenURL" => match general_purpose::STANDARD.decode(value) {
-                Ok(bytes) => self.side_effects.push(TerminalSideEffect::OpenUrl(
-                    String::from_utf8_lossy(&bytes).into_owned(),
-                )),
-                Err(_) => self
-                    .side_effects
-                    .push(TerminalSideEffect::OpenUrl(value.to_owned())),
-            },
-            "File" => self
-                .side_effects
-                .push(TerminalSideEffect::Iterm2File(data.to_owned())),
-            "ReportVariable" => match general_purpose::STANDARD.decode(value) {
-                Ok(bytes) => self.side_effects.push(TerminalSideEffect::ReportVariable(
-                    String::from_utf8_lossy(&bytes).into_owned(),
-                )),
-                Err(_) => self
-                    .side_effects
-                    .push(TerminalSideEffect::Iterm2Control(data.to_owned())),
-            },
-            "SetUserVar" => {
-                if let Some(ports) = iterm2_user_var_ports(value) {
-                    self.side_effects
-                        .push(TerminalSideEffect::Iterm2UserVarPorts(ports));
-                } else {
-                    self.side_effects
-                        .push(TerminalSideEffect::Iterm2Control(data.to_owned()));
-                }
-            }
-            "SetBadgeFormat"
-            | "SetProfile"
-            | "SetKeyLabel"
-            | "RemoteHost"
-            | "ShellIntegrationVersion"
-            | "SetColors"
-            | "AddAnnotation"
-            | "AddHiddenAnnotation"
-            | "HighlightCursorLine" => self
-                .side_effects
-                .push(TerminalSideEffect::Iterm2Control(data.to_owned())),
-            _ => self
-                .side_effects
-                .push(TerminalSideEffect::Iterm2Control(data.to_owned())),
-        }
-    }
-
-    fn push_osc777_side_effect(&mut self, payload: &[u8]) {
-        let text = String::from_utf8_lossy(payload);
-        let mut parts = text.splitn(3, ';');
-        if parts.next() != Some("notify") {
-            return;
-        }
-        let title = parts.next().unwrap_or_default().to_owned();
-        let body = parts.next().unwrap_or_default().to_owned();
-        self.side_effects
-            .push(TerminalSideEffect::DesktopNotification { title, body });
+        self.side_effects.drain()
     }
 
     pub fn encode_paste_to_vec(&mut self, text: &str, out: &mut Vec<u8>) -> Result<()> {
@@ -3253,7 +2797,3 @@ impl TerminalEngine {
         self.assemble_cached_frame(extract_start, render_state_update_us, row_dirty)
     }
 }
-
-#[cfg(test)]
-#[path = "terminal_engine/tests/mod.rs"]
-mod tests;

@@ -4,7 +4,6 @@ edition.workspace = true
 
 [dependencies]
 ab_glyph.workspace = true
-anyhow.workspace = true
 bootty-font = { path = "../bootty-font" }
 eframe.workspace = true
 fontdb.workspace = true
@@ -14,7 +13,6 @@ bootty-terminal = { path = "../bootty-terminal" }
 png.workspace = true
 rustybuzz.workspace = true
 smallvec.workspace = true
-ttf-parser.workspace = true
 unicode-width.workspace = true
 wgpu.workspace = true
 
@@ -28,7 +26,3 @@ wgpu = { workspace = true, features = ["gles", "vulkan"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"] }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
-
-[dev-dependencies]
-epaint_default_fonts.workspace = true
-proptest.workspace = true

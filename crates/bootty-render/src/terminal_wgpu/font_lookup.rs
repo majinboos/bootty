@@ -3,7 +3,7 @@ use crate::{
     geometry::CellMetrics,
     terminal_text::{FontStyle, ResolvedFontFace},
 };
-use ab_glyph::{Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont};
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
@@ -15,33 +15,6 @@ pub(super) fn terminal_font(face: &ResolvedFontFace) -> Option<FontArc> {
     static FONT_CACHE: OnceLock<Mutex<TerminalFontCache>> = OnceLock::new();
     let cache = FONT_CACHE.get_or_init(|| Mutex::new(TerminalFontCache::new()));
     cache.lock().ok()?.font_for_face(face)
-}
-
-pub(super) fn terminal_font_for_char(face: &ResolvedFontFace, ch: char) -> Option<FontArc> {
-    let font = terminal_font(face)?;
-    if font_supports_char(&font, ch) {
-        return Some(font);
-    }
-
-    for family in terminal_font_family_priority(face) {
-        let candidate = ResolvedFontFace {
-            family,
-            fallback_families: Vec::new(),
-            style: face.style,
-        };
-        let Some(font) = terminal_font(&candidate) else {
-            continue;
-        };
-        if font_supports_char(&font, ch) {
-            return Some(font);
-        }
-    }
-
-    Some(font)
-}
-
-fn font_supports_char(font: &FontArc, ch: char) -> bool {
-    font.glyph_id(ch) != GlyphId(0)
 }
 
 pub(super) fn ghostty_cell_metrics_from_font(font: &FontArc, font_size: f32) -> CellMetrics {

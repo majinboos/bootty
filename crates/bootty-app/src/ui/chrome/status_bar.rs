@@ -4,8 +4,8 @@ use bootty_ui::{ThemePalette, readable_color};
 use eframe::egui::{self, CornerRadius, Pos2, Rect, Stroke, StrokeKind};
 
 use crate::{
+    command_extensions::ModulePrimitive,
     config::SegmentAlign,
-    extensions::ModulePrimitive,
     ui::icons::{has_slug, paint_icon_slug},
 };
 
@@ -82,13 +82,20 @@ pub struct ResolvedItem {
     pub reorder_anchor: Option<String>,
     /// The module that produced this item, so a reorder routes back to its `on_reorder`.
     pub module: String,
+    pub generation: u64,
+    pub surface: String,
 }
 
 /// The outcome of a status-bar frame: an item was clicked, or a draggable item was reordered
 /// (routed to `module`'s `on_reorder`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatusBarEvent {
-    Action(String),
+    Action {
+        module: String,
+        generation: u64,
+        surface: String,
+        action: String,
+    },
     ContextAction {
         session_id: String,
         window_id: String,
@@ -96,6 +103,8 @@ pub enum StatusBarEvent {
     },
     Reorder {
         module: String,
+        generation: u64,
+        surface: String,
         source: String,
         before: Option<String>,
     },
@@ -314,10 +323,25 @@ pub fn show_status_bar(
                 action,
             },
         )
-        .or_else(|| input.clicked.take().map(StatusBarEvent::Action));
+        .or_else(|| {
+            input.clicked.take().map(|action| StatusBarEvent::Action {
+                module: action.module,
+                generation: action.generation,
+                surface: action.surface,
+                action: action.action,
+            })
+        });
     if let Some(drag) = dragging.as_ref() {
-        let drop = pointer_pos
-            .and_then(|pos| status_drop_target(&input.blocks, &drag.module, &drag.anchor, pos));
+        let drop = pointer_pos.and_then(|pos| {
+            status_drop_target(
+                &input.blocks,
+                &drag.module,
+                drag.generation,
+                &drag.surface,
+                &drag.anchor,
+                pos,
+            )
+        });
         if let Some((_, indicator_x)) = drop.as_ref() {
             ui.painter_at(rect).line_segment(
                 [
@@ -333,6 +357,8 @@ pub fn show_status_bar(
         } else {
             event = drop.map(|(before, _)| StatusBarEvent::Reorder {
                 module: drag.module.clone(),
+                generation: drag.generation,
+                surface: drag.surface.clone(),
                 source: drag.anchor.clone(),
                 before,
             });
@@ -347,12 +373,16 @@ pub fn show_status_bar(
 #[derive(Clone)]
 struct StatusDragState {
     module: String,
+    generation: u64,
+    surface: String,
     anchor: String,
 }
 
 /// A contiguous run of items sharing a `reorder_anchor`, with its drawn horizontal extent.
 struct StatusBlock {
     module: String,
+    generation: u64,
+    surface: String,
     anchor: String,
     start_x: f32,
     end_x: f32,
@@ -366,7 +396,7 @@ struct StatusInput {
     rect: Rect,
     palette: ThemePalette,
     font: egui::FontId,
-    clicked: Option<String>,
+    clicked: Option<StatusAction>,
     context_action: Option<(String, String, TabContextAction)>,
     tab_context: Option<TabContext>,
     interaction_id: &'static str,
@@ -377,18 +407,29 @@ struct StatusInput {
     blocks: Vec<StatusBlock>,
 }
 
+struct StatusAction {
+    module: String,
+    generation: u64,
+    surface: String,
+    action: String,
+}
+
 /// Picks the insertion slot for a horizontal drag: scans same-module blocks left to right and
 /// drops before the first whose midpoint is past the pointer (or at the end). Returns the anchor
 /// to insert before (`None` = end) and the indicator x, or `None` when the drop is a no-op.
 fn status_drop_target(
     blocks: &[StatusBlock],
     module: &str,
+    generation: u64,
+    surface: &str,
     anchor: &str,
     pointer: Pos2,
 ) -> Option<(Option<String>, f32)> {
     let module_blocks: Vec<&StatusBlock> = blocks
         .iter()
-        .filter(|block| block.module == module)
+        .filter(|block| {
+            block.module == module && block.generation == generation && block.surface == surface
+        })
         .collect();
     let source_index = module_blocks
         .iter()
@@ -1094,13 +1135,20 @@ fn draw_items(
         }
         if let Some(anchor) = item.reorder_anchor.as_deref() {
             match input.blocks.last_mut() {
-                Some(block) if block.module == item.module && block.anchor == anchor => {
+                Some(block)
+                    if block.module == item.module
+                        && block.generation == item.generation
+                        && block.surface == item.surface
+                        && block.anchor == anchor =>
+                {
                     block.end_x = x + width;
                     block.start_y = block.start_y.min(item_rect.min.y);
                     block.end_y = block.end_y.max(item_rect.max.y);
                 }
                 _ => input.blocks.push(StatusBlock {
                     module: item.module.clone(),
+                    generation: item.generation,
+                    surface: item.surface.clone(),
                     anchor: anchor.to_owned(),
                     start_x: x,
                     end_x: x + width,
@@ -1116,6 +1164,8 @@ fn draw_items(
         {
             input.started = Some(StatusDragState {
                 module: item.module.clone(),
+                generation: item.generation,
+                surface: item.surface.clone(),
                 anchor: anchor.to_owned(),
             });
         }
@@ -1210,7 +1260,12 @@ fn draw_items(
             && resp.clicked_by(egui::PointerButton::Primary)
             && !input.suppress_click
         {
-            input.clicked = Some(action.to_owned());
+            input.clicked = Some(StatusAction {
+                module: item.module.clone(),
+                generation: item.generation,
+                surface: item.surface.clone(),
+                action: action.to_owned(),
+            });
         }
         x += width;
     }

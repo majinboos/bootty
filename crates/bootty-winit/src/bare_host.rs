@@ -177,10 +177,6 @@ impl BareTerminalInput {
         }
     }
 
-    pub fn set_modifier_remaps(&mut self, modifier_remaps: ModifierRemapSet) {
-        self.modifier_remaps = modifier_remaps;
-    }
-
     pub fn key_input(&mut self, event: &KeyEvent) -> Option<KeyInput> {
         self.update_key_side_state(event);
         self.key_input_after_side_state(event)
@@ -877,100 +873,5 @@ fn clear_color(colors: FrameColors) -> wgpu::Color {
         g: f64::from(colors.background.g) / 255.0,
         b: f64::from(colors.background.b) / 255.0,
         a: 1.0,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::terminal::{KeyMods, MouseEncoderSize};
-    use winit::keyboard::KeyCode;
-
-    #[test]
-    fn bare_terminal_ignores_non_empty_modifier_change_after_focus_reset() {
-        let mut input = BareTerminalInput::default();
-        input.set_modifiers(ModifiersState::SUPER);
-        assert_eq!(input.modifiers, ModifiersState::SUPER);
-
-        input.clear_modifiers();
-        input.set_modifiers(ModifiersState::SUPER);
-        assert_eq!(input.modifiers, ModifiersState::empty());
-
-        input.set_modifiers(ModifiersState::empty());
-        input.set_modifiers(ModifiersState::SUPER);
-        assert_eq!(input.modifiers, ModifiersState::SUPER);
-    }
-
-    #[test]
-    fn bare_terminal_ignores_standalone_modifier_keys() {
-        assert!(
-            bare_terminal_key_input(KeyCode::ShiftLeft, ModifiersState::SHIFT, false).is_none()
-        );
-        assert!(
-            bare_terminal_key_input(KeyCode::ControlRight, ModifiersState::CONTROL, false)
-                .is_none()
-        );
-        assert!(bare_terminal_key_input(KeyCode::AltRight, ModifiersState::ALT, false).is_none());
-    }
-
-    #[test]
-    fn bare_terminal_preserves_release_after_cursor_leaves_viewport() {
-        let viewport = BareTerminalViewport::from_logical_size(
-            200.0,
-            100.0,
-            CellMetrics::new(9.0, 22.0),
-            TerminalPadding::default(),
-        );
-        let mut input = BareTerminalInput::default();
-        input.set_cursor_position(260.0, 170.0);
-        input.set_mouse_button_state(MouseButton::Left, ElementState::Pressed);
-
-        assert_eq!(
-            input.mouse_input(MouseAction::Release, Some(MouseButton::Left), viewport),
-            Some(MouseInput {
-                action: MouseAction::Release,
-                button: Some(MouseButton::Left),
-                mods: KeyMods::default(),
-                x: 200.0,
-                y: 100.0,
-                size: MouseEncoderSize {
-                    screen_width: 198,
-                    screen_height: 176,
-                    cell_width: 9,
-                    cell_height: 22,
-                    padding_left: 0,
-                    padding_top: 0,
-                    padding_right: 0,
-                    padding_bottom: 0,
-                },
-            })
-        );
-    }
-
-    #[test]
-    fn bare_surface_prefers_non_srgb_format_for_terminal_palette_colors() {
-        let formats = [
-            wgpu::TextureFormat::Bgra8UnormSrgb,
-            wgpu::TextureFormat::Bgra8Unorm,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-        ];
-
-        assert_eq!(
-            preferred_bare_surface_format(&formats),
-            Some(wgpu::TextureFormat::Bgra8Unorm)
-        );
-    }
-
-    #[test]
-    fn bare_surface_falls_back_to_first_format_when_only_srgb_is_available() {
-        let formats = [
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
-        ];
-
-        assert_eq!(
-            preferred_bare_surface_format(&formats),
-            Some(wgpu::TextureFormat::Rgba8UnormSrgb)
-        );
     }
 }

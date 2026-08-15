@@ -5,27 +5,18 @@ use crate::{
     },
     paint_plan::{DecorationStyle, PlanColor},
     terminal_image::KittyImagePlacement,
-    terminal_render::{
-        CursorCommand, SpriteCommandBatch, TerminalRenderCommand, TerminalRenderFrame, TextCommand,
-    },
-    terminal_sprite::{WgpuSpriteBackend, WgpuSpriteVertex},
+    terminal_render::{CursorCommand, TerminalRenderCommand, TerminalRenderFrame, TextCommand},
     terminal_text_atlas::{GlyphAtlasEntry, GlyphAtlasFormat, TextAtlasBuilder, TexturedGlyphQuad},
 };
 use eframe::{egui, egui_wgpu, wgpu};
 use wgpu::util::DeviceExt;
 
 mod font_lookup;
-mod glyph_draw;
 mod image_upload;
 mod pipelines;
 mod vertices;
 
-#[cfg(test)]
-use font_lookup::{GHOSTTY_FONT_FAMILY_PRIORITY, terminal_font_family_priority};
-use font_lookup::{ghostty_cell_metrics_from_font, terminal_font, terminal_font_for_char};
-use glyph_draw::push_text_glyph_draws;
-#[cfg(test)]
-use image_upload::rgba_image_pixels;
+use font_lookup::{ghostty_cell_metrics_from_font, terminal_font};
 use image_upload::{image_fits_device_limits, rgba_image_texture_pixels};
 use pipelines::{
     background_pipeline, image_bind_group_layout, image_pipeline, text_bind_group_layout,
@@ -36,62 +27,10 @@ use std::sync::{
     Arc, Weak,
     atomic::{AtomicU64, Ordering},
 };
-#[cfg(test)]
-use vertices::color_to_float;
-#[cfg(test)]
-use vertices::text_vertices;
 use vertices::{
     BackgroundVertex, TerminalQuadDraw, TextVertex, background_quad_vertices, image_vertices,
     text_vertices_into, vertex_bytes,
 };
-
-#[cfg(test)]
-pub(crate) use crate::terminal_text::{FontStyle, ResolvedFontFace};
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TerminalBackgroundDraw {
-    pub rect: SurfaceRect,
-    pub color: PlanColor,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TerminalTextDraw {
-    pub ch: char,
-    pub rect: SurfaceRect,
-    pub color: PlanColor,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct TerminalSpriteDraw {
-    pub ch: char,
-    pub vertices: Vec<WgpuSpriteVertex>,
-    pub indices: Vec<u32>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TerminalCursorDraw {
-    pub rect: SurfaceRect,
-    pub color: PlanColor,
-}
-
-pub fn terminal_background_draws(frame: &TerminalRenderFrame) -> Vec<TerminalBackgroundDraw> {
-    frame
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            TerminalRenderCommand::FillRect(fill) => Some(TerminalBackgroundDraw {
-                rect: fill.rect,
-                color: fill.color,
-            }),
-            TerminalRenderCommand::Text(_)
-            | TerminalRenderCommand::Sprite(_)
-            | TerminalRenderCommand::Image(_)
-            | TerminalRenderCommand::KittyVirtualPlacement(_)
-            | TerminalRenderCommand::Decoration(_)
-            | TerminalRenderCommand::Cursor(_) => None,
-        })
-        .collect()
-}
 
 pub fn terminal_text_cell_metrics(
     config: &crate::terminal_text::TerminalTextConfig,
@@ -125,78 +64,6 @@ pub fn terminal_text_cell_metrics(
         cell.height = height.max(1.0);
     }
     cell
-}
-
-pub fn terminal_text_draws(frame: &TerminalRenderFrame) -> Vec<TerminalTextDraw> {
-    frame
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            TerminalRenderCommand::Text(text) => Some(text),
-            TerminalRenderCommand::FillRect(_)
-            | TerminalRenderCommand::Sprite(_)
-            | TerminalRenderCommand::Image(_)
-            | TerminalRenderCommand::KittyVirtualPlacement(_)
-            | TerminalRenderCommand::Decoration(_)
-            | TerminalRenderCommand::Cursor(_) => None,
-        })
-        .flat_map(|text| text_draws(text, 1.0))
-        .collect()
-}
-
-pub fn terminal_sprite_draws(frame: &TerminalRenderFrame) -> Vec<TerminalSpriteDraw> {
-    frame
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            TerminalRenderCommand::Sprite(sprite) => Some(sprite),
-            TerminalRenderCommand::FillRect(_)
-            | TerminalRenderCommand::Text(_)
-            | TerminalRenderCommand::Image(_)
-            | TerminalRenderCommand::KittyVirtualPlacement(_)
-            | TerminalRenderCommand::Decoration(_)
-            | TerminalRenderCommand::Cursor(_) => None,
-        })
-        .map(sprite_draw)
-        .collect()
-}
-
-pub fn terminal_cursor_draws(frame: &TerminalRenderFrame) -> Vec<TerminalCursorDraw> {
-    frame
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            TerminalRenderCommand::Cursor(cursor) => Some(cursor),
-            TerminalRenderCommand::FillRect(_)
-            | TerminalRenderCommand::Text(_)
-            | TerminalRenderCommand::Sprite(_)
-            | TerminalRenderCommand::Image(_)
-            | TerminalRenderCommand::KittyVirtualPlacement(_)
-            | TerminalRenderCommand::Decoration(_) => None,
-        })
-        .flat_map(cursor_draws)
-        .collect()
-}
-
-pub fn terminal_decoration_draws(frame: &TerminalRenderFrame) -> Vec<TerminalBackgroundDraw> {
-    frame
-        .commands
-        .iter()
-        .filter_map(|command| match command {
-            TerminalRenderCommand::Decoration(line) => Some(line),
-            TerminalRenderCommand::FillRect(_)
-            | TerminalRenderCommand::Text(_)
-            | TerminalRenderCommand::Sprite(_)
-            | TerminalRenderCommand::Image(_)
-            | TerminalRenderCommand::KittyVirtualPlacement(_)
-            | TerminalRenderCommand::Cursor(_) => None,
-        })
-        .flat_map(decoration_draws)
-        .map(|draw| TerminalBackgroundDraw {
-            rect: draw.rect,
-            color: draw.color,
-        })
-        .collect()
 }
 
 pub fn terminal_render_callback_for_renderer(
@@ -1392,12 +1259,6 @@ fn decoration_command_vertices_into(
     });
 }
 
-fn decoration_draws(line: &crate::terminal_render::LineCommand) -> Vec<TerminalQuadDraw> {
-    let mut draws = Vec::new();
-    emit_decoration_draws(line, |draw| draws.push(draw));
-    draws
-}
-
 fn emit_decoration_draws(
     line: &crate::terminal_render::LineCommand,
     mut emit: impl FnMut(TerminalQuadDraw),
@@ -1479,30 +1340,6 @@ fn emit_curly_decoration_draws(
     }
 }
 
-fn cursor_draws(cursor: &CursorCommand) -> Vec<TerminalCursorDraw> {
-    // Cursor blink timing and opacity are resolved before this backend; WGPU
-    // only draws the current cursor command color/alpha.
-    match cursor.shape {
-        crate::paint_plan::CursorShape::Bar
-        | crate::paint_plan::CursorShape::Underline
-        | crate::paint_plan::CursorShape::Block => vec![TerminalCursorDraw {
-            rect: cursor.fill_rect,
-            color: cursor.color,
-        }],
-        crate::paint_plan::CursorShape::HollowBlock => hollow_cursor_draws(cursor),
-    }
-}
-
-fn hollow_cursor_draws(cursor: &CursorCommand) -> Vec<TerminalCursorDraw> {
-    hollow_cursor_rects(cursor)
-        .into_iter()
-        .map(|rect| TerminalCursorDraw {
-            rect,
-            color: cursor.color,
-        })
-        .collect()
-}
-
 fn hollow_cursor_rects(cursor: &CursorCommand) -> [SurfaceRect; 4] {
     let rect = cursor.rect;
     let stroke = 1.0_f32.min(rect.width()).min(rect.height());
@@ -1554,98 +1391,9 @@ fn push_cursor_background_quads(
     }
 }
 
-fn sprite_draw(command: &SpriteCommandBatch) -> TerminalSpriteDraw {
-    let primitives = WgpuSpriteBackend::build_primitives(&command.commands, command.color);
-    TerminalSpriteDraw {
-        ch: command.ch,
-        vertices: primitives.vertices,
-        indices: primitives.indices,
-    }
-}
-
-fn ascii_text_draws(command: &TextCommand, pixels_per_point: f32) -> Vec<TerminalTextDraw> {
-    let cell_width = command.rect.width() / command.text.len().max(1) as f32;
-    let font = terminal_font(&command.face);
-    let mut draws = Vec::new();
-
-    for (cell, byte) in command.text.bytes().enumerate() {
-        if byte == b' ' {
-            continue;
-        }
-        let cell_rect = SurfaceRect::from_min_size(
-            command.rect.min_x + cell as f32 * cell_width,
-            command.rect.min_y,
-            cell_width,
-            command.rect.height(),
-        );
-        push_text_glyph_draws(
-            &mut draws,
-            byte as char,
-            cell_rect,
-            command.attrs.fg,
-            command.font_size,
-            pixels_per_point,
-            font.as_ref(),
-        );
-    }
-
-    draws
-}
-
-fn text_draws(command: &TextCommand, pixels_per_point: f32) -> Vec<TerminalTextDraw> {
-    let mut draws = Vec::new();
-    let pixels_per_point = pixels_per_point.max(1.0);
-    if command.text.is_empty() {
-        return draws;
-    }
-    if command.text.is_ascii() {
-        return ascii_text_draws(command, pixels_per_point);
-    }
-
-    let total_cells = command
-        .text
-        .chars()
-        .map(crate::terminal_text::terminal_char_cell_delta)
-        .sum::<u16>()
-        .max(1);
-
-    let cell_width = command.rect.width() / f32::from(total_cells);
-    crate::terminal_text::for_terminal_text_cells(&command.text, |cell, text| {
-        let cells = text
-            .chars()
-            .map(crate::terminal_text::terminal_char_cell_delta)
-            .sum::<u16>()
-            .max(1);
-        let cell_rect = SurfaceRect::from_min_size(
-            command.rect.min_x + f32::from(cell) * cell_width,
-            command.rect.min_y,
-            cell_width * f32::from(cells),
-            command.rect.height(),
-        );
-        for ch in text.chars() {
-            if ch == ' ' {
-                continue;
-            }
-            let font = terminal_font_for_char(&command.face, ch);
-            push_text_glyph_draws(
-                &mut draws,
-                ch,
-                cell_rect,
-                command.attrs.fg,
-                command.font_size,
-                pixels_per_point,
-                font.as_ref(),
-            );
-        }
-    });
-    draws
-}
 fn egui_rect(rect: SurfaceRect) -> egui::Rect {
     egui::Rect::from_min_max(
         egui::Pos2::new(rect.min_x, rect.min_y),
         egui::Pos2::new(rect.max_x, rect.max_y),
     )
 }
-
-#[cfg(test)]
-mod tests;

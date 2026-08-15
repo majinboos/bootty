@@ -22,7 +22,7 @@ use bootty_app::{
     terminal_sprite::SpriteFamily,
     terminal_text::TerminalTextConfig,
 };
-use bootty_terminal::terminal_palette::generate_256_palette;
+use bootty_terminal::terminal_engine::TerminalColorConfig;
 use bootty_winit::bare_host::{
     BareRendererSurfaceConfig, BareTerminalInput, BareTerminalViewport, bare_terminal_key_input,
     bare_terminal_key_input_with_remaps, bare_terminal_key_input_with_sides,
@@ -770,22 +770,26 @@ fn bare_host_preserves_osc_color_operation_rendering() {
 #[test]
 fn bare_host_preserves_generated_256_color_palette() {
     let viewport = bare_viewport(80, 20, 10.0, 20.0);
-    let mut engine = terminal_engine(8, 1, 10, 20);
-    let base = engine.default_color_palette().expect("default palette");
-    let generated = generate_256_palette(
-        &base,
-        &[false; 256],
-        RgbColor { r: 0, g: 0, b: 0 },
-        RgbColor {
-            r: 255,
-            g: 255,
-            b: 255,
+    let mut engine = TerminalEngine::new_with_scrollback(
+        TerminalGeometry {
+            cols: 8,
+            rows: 1,
+            cell_width: 10,
+            cell_height: 20,
         },
-        false,
-    );
-    engine
-        .set_default_color_palette(generated)
-        .expect("set generated palette");
+        TerminalColorConfig {
+            background: RgbColor { r: 0, g: 0, b: 0 },
+            foreground: RgbColor {
+                r: 255,
+                g: 255,
+                b: 255,
+            },
+            palette_generate: true,
+            ..Default::default()
+        },
+        0,
+    )
+    .expect("generated-palette terminal");
 
     engine.write_vt(b"\x1b[38;5;16mB\x1b[38;5;231mW");
     let frame = engine.extract_frame().expect("generated palette frame");

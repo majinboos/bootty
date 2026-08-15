@@ -1187,10 +1187,6 @@ impl Default for BoottyConfig {
 }
 
 impl WindowConfig {
-    pub fn fullscreen_enabled(&self) -> bool {
-        self.fullscreen != WindowFullscreen::Disabled
-    }
-
     pub fn native_fullscreen_enabled(&self) -> bool {
         self.fullscreen == WindowFullscreen::Native
     }
@@ -1881,56 +1877,3 @@ fn user_theme_candidates(theme: &str, config_dir: &Path) -> [PathBuf; 2] {
         theme_dir.join(format!("{theme}.toml")),
     ]
 }
-
-#[derive(Clone, Debug)]
-pub struct ConfigState {
-    current: BoottyConfig,
-    last_error: Option<String>,
-}
-
-impl ConfigState {
-    pub fn new(current: BoottyConfig) -> Self {
-        Self {
-            current,
-            last_error: None,
-        }
-    }
-
-    pub fn current(&self) -> &BoottyConfig {
-        &self.current
-    }
-
-    pub fn current_mut(&mut self) -> &mut BoottyConfig {
-        &mut self.current
-    }
-
-    pub fn last_error(&self) -> Option<&str> {
-        self.last_error.as_deref()
-    }
-
-    pub fn accept(&mut self, config: BoottyConfig) {
-        self.current = config;
-        self.last_error = None;
-    }
-
-    pub fn reject(&mut self, error: impl Into<String>) {
-        self.last_error = Some(error.into());
-    }
-
-    pub fn reload_from_path(&mut self, path: impl AsRef<Path>) -> ConfigResult<()> {
-        match load_config_from_path(path) {
-            Ok(config) => {
-                self.accept(config);
-                Ok(())
-            }
-            Err(error) => {
-                self.reject(error.to_string());
-                Err(error)
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[path = "config_tests.rs"]
-mod tests;

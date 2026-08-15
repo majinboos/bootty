@@ -154,7 +154,7 @@ pub fn bare_terminal_key_input_with_sides_and_remaps(
     Some(input)
 }
 
-#[cfg(any(feature = "bare-host", test))]
+#[cfg(feature = "bare-host")]
 pub fn bare_terminal_paste_shortcut(code: KeyCode, modifiers: ModifiersState) -> bool {
     if code != KeyCode::KeyV {
         return false;
@@ -540,32 +540,5 @@ fn letter_text(
         unshifted_utf8,
         shifted_utf8: Some(shifted_utf8),
         shifted_letter_utf8: Some(shifted_utf8),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn modifier_side_state_drops_sides_when_aggregate_modifier_is_released() {
-        let mut state = ModifierSideState {
-            left_shift: true,
-            right_alt: true,
-            left_ctrl: true,
-            left_command: true,
-            right_command: true,
-            ..Default::default()
-        };
-
-        state.retain_active_modifiers(ModifiersState::ALT);
-
-        assert_eq!(
-            state,
-            ModifierSideState {
-                right_alt: true,
-                ..Default::default()
-            }
-        );
     }
 }

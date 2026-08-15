@@ -1,6 +1,6 @@
 --!strict
 -- Built-in `session` module: the active session name when the sidebar is hidden.
--- Override by creating ~/.config/bootty/status/session.luau.
+-- Override by creating ~/.config/bootty/extensions/session.luau.
 
 return {
 	interval = 0.5,

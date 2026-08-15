@@ -74,6 +74,7 @@ cargo bench -p bootty-app --bench paint_plan -- --noplot
 ## Docs
 
 - Architecture and crate boundaries: `docs/architecture.md`
+- Pi and Codex integration setup: `docs/agent-integrations.md`
 - Configuration path, schema, reload, and writeback: `docs/configuration.md`
 - Egui oracle behavior inventory: `docs/current-egui-behavior.md`
 - Input encoder contracts: `docs/input-encoders.md`

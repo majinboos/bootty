@@ -687,7 +687,6 @@ dependencies = [
  "bootty-mux",
  "bootty-render",
  "bootty-runtime",
- "bootty-surface",
  "bootty-terminal",
  "bootty-ui",
  "bootty-winit",
@@ -695,12 +694,12 @@ dependencies = [
  "clap",
  "criterion",
  "eframe",
+ "egui",
  "egui_code_editor",
  "embed-resource",
  "fontdb",
  "getrandom 0.3.4",
  "iconflow",
- "indoc",
  "keepawake",
  "libghostty-vt",
  "mlua",
@@ -711,10 +710,9 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "png",
  "pollster",
- "proptest",
+ "process-wrap",
  "rmux-ipc",
  "rmux-os",
- "rstest",
  "rusqlite",
  "self_update",
  "serde",
@@ -737,9 +735,7 @@ dependencies = [
  "bootty-font",
  "bootty-identity",
  "bootty-mux-model",
- "bootty-winit",
  "indoc",
- "proptest",
  "rstest",
  "serde",
  "tempfile",
@@ -809,6 +805,7 @@ version = "0.4.0"
 dependencies = [
  "bootty-workspace-hack",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -816,19 +813,15 @@ name = "bootty-render"
 version = "0.0.0"
 dependencies = [
  "ab_glyph",
- "anyhow",
  "bootty-font",
  "bootty-surface",
  "bootty-terminal",
  "eframe",
- "epaint_default_fonts",
  "fontdb",
  "libghostty-vt",
  "png",
- "proptest",
  "rustybuzz",
  "smallvec",
- "ttf-parser",
  "unicode-width 0.2.2",
  "wgpu",
  "windows-sys 0.61.2",
@@ -843,7 +836,6 @@ dependencies = [
  "bootty-terminal",
  "criterion",
  "portable-pty",
- "proptest",
  "tempfile",
 ]
 
@@ -881,7 +873,6 @@ dependencies = [
  "png",
  "proptest",
  "rstest",
- "serde_json",
  "unicode-width 0.2.2",
 ]
 
@@ -892,13 +883,8 @@ dependencies = [
  "anyhow",
  "bootty-app",
  "bootty-config",
- "bootty-font",
  "bootty-mux",
- "bootty-mux-model",
  "bootty-workspace-hack",
- "clap",
- "egui",
- "rusqlite",
  "serde_json",
  "tempfile",
  "toml_edit 0.25.13+spec-1.1.0",
@@ -925,7 +911,6 @@ dependencies = [
  "eframe",
  "libghostty-vt",
  "pollster",
- "proptest",
  "wgpu",
  "winit",
 ]
@@ -986,6 +971,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "rustix 1.1.4",
  "serde",
  "serde_core",
@@ -1005,6 +991,7 @@ dependencies = [
  "toml_writer",
  "tracing",
  "tracing-core",
+ "ttf-parser",
  "typenum",
  "ureq",
  "uuid",
@@ -4926,6 +4913,17 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "version_check",
+]
+
+[[package]]
+name = "process-wrap"
+version = "9.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e842efad9119158434d193c6682e2ebee4b44d6ad801d7b349623b3f57cdf55"
+dependencies = [
+ "indexmap",
+ "nix 0.31.3",
+ "windows",
 ]
 
 [[package]]

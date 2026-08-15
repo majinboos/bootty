@@ -2,7 +2,7 @@ use bootty_ui::readable_color;
 use eframe::egui::{self, Pos2, Rect, Stroke, StrokeKind};
 
 use crate::{
-    extensions::{ModuleCoord, ModulePrimitive},
+    command_extensions::{ModuleCoord, ModulePrimitive},
     ui::icons::paint_icon_slug,
 };
 

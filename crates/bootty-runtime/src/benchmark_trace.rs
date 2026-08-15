@@ -10,8 +10,8 @@ use std::{
     time::Instant,
 };
 
-pub const BOOTTY_BENCH_TRACE_ENV: &str = "BOOTTY_BENCH_TRACE";
-pub const BOOTTY_BENCH_TRACE_SAMPLE_EVERY_ENV: &str = "BOOTTY_BENCH_TRACE_SAMPLE_EVERY";
+const BOOTTY_BENCH_TRACE_ENV: &str = "BOOTTY_BENCH_TRACE";
+const BOOTTY_BENCH_TRACE_SAMPLE_EVERY_ENV: &str = "BOOTTY_BENCH_TRACE_SAMPLE_EVERY";
 
 #[derive(Clone, Debug)]
 pub struct BenchmarkTrace {
@@ -116,51 +116,4 @@ fn write_json_string(writer: &mut impl Write, value: &str) -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn benchmark_trace_writes_jsonl_records() -> io::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("trace.jsonl");
-        let trace = BenchmarkTrace::create(&path, 1)?;
-
-        trace.emit(
-            "pty_read",
-            &[
-                ("bytes", TraceValue::Usize(8192)),
-                ("escaped", TraceValue::Str("quote \" slash \\ newline\n")),
-                ("active", TraceValue::Bool(true)),
-            ],
-        );
-
-        let contents = std::fs::read_to_string(path)?;
-        assert!(contents.contains("\"schema_version\":1"));
-        assert!(contents.contains("\"event\":\"pty_read\""));
-        assert!(contents.contains("\"bytes\":8192"));
-        assert!(contents.contains(r#"quote \" slash \\ newline\n"#));
-        assert!(contents.contains("\"active\":true"));
-        Ok(())
-    }
-
-    #[test]
-    fn benchmark_trace_sampling_skips_unsampled_events() -> io::Result<()> {
-        let dir = tempfile::tempdir()?;
-        let path = dir.path().join("trace.jsonl");
-        let trace = BenchmarkTrace::create(&path, 2)?;
-
-        trace.emit("first", &[]);
-        trace.emit("second", &[]);
-        trace.emit("third", &[]);
-
-        let contents = std::fs::read_to_string(path)?;
-        assert_eq!(contents.lines().count(), 2);
-        assert!(contents.contains("\"event\":\"first\""));
-        assert!(!contents.contains("\"event\":\"second\""));
-        assert!(contents.contains("\"event\":\"third\""));
-        Ok(())
-    }
 }

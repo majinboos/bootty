@@ -267,7 +267,7 @@ pub(crate) fn open_rmux_pane_io(
 
 pub(crate) async fn connect_bootty_rmux() -> Result<Rmux> {
     prepare_local_rmux_daemon(bootty_identity::ApplicationIdentity::for_process())?;
-    let endpoint = crate::bootty_rmux_endpoint_path().context("resolve Bootty rmux endpoint")?;
+    let endpoint = crate::local_rmux::endpoint_path().context("resolve Bootty rmux endpoint")?;
     let endpoint = RmuxEndpoint::UnixSocket(endpoint);
     Rmux::builder()
         .endpoint(endpoint)
@@ -312,7 +312,7 @@ pub fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
     static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     STARTED
         .get_or_init(|| {
-            let socket = crate::bootty_rmux_endpoint_path().map_err(|error| error.to_string())?;
+            let socket = crate::local_rmux::endpoint_path().map_err(|error| error.to_string())?;
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             thread::spawn(move || {
                 let started_tx = ready_tx.clone();
@@ -1182,7 +1182,7 @@ struct RmuxLiveOutput {
 impl RmuxLiveOutput {
     async fn open(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<Self> {
         let pipe_target = pane_pipe_target(rmux, target).await?;
-        let endpoint = crate::bootty_rmux_endpoint_path()?;
+        let endpoint = crate::local_rmux::endpoint_path()?;
         let (path, init_lock_path, reader_lock_path) = rmux_pipe_paths(&endpoint, &pipe_target);
         let init_lock = open_private_file(&init_lock_path)?;
         init_lock

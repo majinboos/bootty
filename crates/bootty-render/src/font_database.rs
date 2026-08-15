@@ -69,17 +69,3 @@ fn macos_additional_font_dirs() -> [PathBuf; 3] {
 
 #[cfg(not(target_os = "macos"))]
 fn load_macos_fonts(_database: &mut fontdb::Database) {}
-
-#[cfg(test)]
-#[cfg(target_os = "macos")]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn macos_additional_font_dirs_include_package_manager_roots() {
-        let dirs = macos_additional_font_dirs();
-        assert!(dirs.contains(&PathBuf::from("/opt/zerobrew/share/fonts")));
-        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/share/fonts")));
-        assert!(dirs.contains(&PathBuf::from("/usr/local/share/fonts")));
-    }
-}

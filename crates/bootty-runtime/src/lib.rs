@@ -3,6 +3,7 @@ pub mod frame_source;
 pub mod latency;
 pub mod perf;
 pub mod scheduler;
+pub mod terminal_launch;
 pub mod terminal_session;
 pub mod terminfo;
 

@@ -1,6 +1,6 @@
 --!strict
 -- Built-in `windows` module: the active session's windows as tmux-style mux
--- cells. Override by creating ~/.config/bootty/status/windows.luau.
+-- cells. Override by creating ~/.config/bootty/extensions/windows.luau.
 
 return {
 	interval = 0.2,

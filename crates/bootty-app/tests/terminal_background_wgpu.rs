@@ -9,9 +9,7 @@ use bootty_app::{
     terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
     terminal_wgpu::{
-        TerminalRendererId, TerminalWgpuRenderer, terminal_background_draws, terminal_cursor_draws,
-        terminal_decoration_draws, terminal_render_callback_for_renderer, terminal_sprite_draws,
-        terminal_text_draws,
+        TerminalRendererId, TerminalWgpuRenderer, terminal_render_callback_for_renderer,
     },
 };
 use bootty_winit::bare_host::{BareTerminalViewport, terminal_render_frame_for_bare_host};
@@ -70,41 +68,6 @@ fn single_text_frame(
         cursor: None,
     };
     render_frame_from_plan(&plan, symbol_policy)
-}
-
-fn background_frame() -> TerminalRenderFrame {
-    let plan = TerminalPaintPlan {
-        surface: SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0),
-        default_background: color(1, 2, 3),
-        backgrounds: vec![BackgroundRect {
-            rect: SurfaceRect::from_min_size(10.0, 0.0, 20.0, 20.0),
-            color: color(4, 5, 6),
-        }],
-        text_runs: Vec::new(),
-        decorations: Vec::new(),
-        cursor: None,
-    };
-    primitive_render_frame(&plan)
-}
-
-fn ascii_text_frame() -> TerminalRenderFrame {
-    single_text_frame(
-        SurfaceRect::from_min_size(0.0, 0.0, 63.0, 21.0),
-        SurfaceRect::from_min_size(0.0, 0.0, 63.0, 21.0),
-        9,
-        "hello 123",
-        NativeSymbolPolicy::terminal_glyph_primitives(),
-    )
-}
-
-fn fallback_text_frame() -> TerminalRenderFrame {
-    single_text_frame(
-        SurfaceRect::from_min_size(0.0, 0.0, 21.0, 21.0),
-        SurfaceRect::from_min_size(0.0, 0.0, 21.0, 21.0),
-        3,
-        "\u{f0e7}",
-        NativeSymbolPolicy::font_only(),
-    )
 }
 
 fn prompt_sprite_frame() -> TerminalRenderFrame {
@@ -478,47 +441,6 @@ fn cursor_frame(shape: CursorShape) -> TerminalRenderFrame {
     primitive_render_frame(&plan)
 }
 
-fn decoration_frame(styles: &[DecorationStyle]) -> TerminalRenderFrame {
-    let decorations = styles
-        .iter()
-        .enumerate()
-        .map(|(index, style)| DecorationLine {
-            start_x: 0.0,
-            start_y: 3.0 + index as f32 * 4.0,
-            end_x: 28.0,
-            end_y: 3.0 + index as f32 * 4.0,
-            color: color(200, 201, 202),
-            style: *style,
-        })
-        .collect();
-    let plan = TerminalPaintPlan {
-        surface: SurfaceRect::from_min_size(0.0, 0.0, 28.0, 28.0),
-        default_background: color(1, 2, 3),
-        backgrounds: Vec::new(),
-        text_runs: Vec::new(),
-        decorations,
-        cursor: None,
-    };
-    primitive_render_frame(&plan)
-}
-
-#[test]
-fn background_callback_input_uses_terminal_render_fill_commands() {
-    let draws = terminal_background_draws(&background_frame());
-
-    assert_eq!(draws.len(), 2);
-    assert_eq!(
-        draws[0].rect,
-        SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0)
-    );
-    assert_eq!(draws[0].color, color(1, 2, 3));
-    assert_eq!(
-        draws[1].rect,
-        SurfaceRect::from_min_size(10.0, 0.0, 20.0, 20.0)
-    );
-    assert_eq!(draws[1].color, color(4, 5, 6));
-}
-
 #[test]
 fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
     for (name, frame) in [
@@ -540,90 +462,6 @@ fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
             "{name} frame should produce a callback shape"
         );
     }
-}
-
-#[test]
-fn ascii_text_draws_are_batched_from_terminal_render_text_commands() {
-    let draws = terminal_text_draws(&ascii_text_frame());
-
-    assert!(
-        !draws.is_empty(),
-        "ASCII text should produce WGPU text quads"
-    );
-    assert!(draws.iter().any(|draw| draw.ch == 'h'));
-    assert!(draws.iter().any(|draw| draw.ch == '1'));
-    assert!(draws.iter().any(|draw| draw.ch == '3'));
-    assert!(!draws.iter().any(|draw| draw.ch == ' '));
-    assert!(draws.iter().all(|draw| {
-        draw.color.r == 220 && draw.color.g == 221 && draw.color.b == 222 && draw.color.a > 0
-    }));
-    assert!(
-        draws
-            .iter()
-            .all(|draw| draw.rect.min_x >= 0.0 && draw.rect.max_x <= 63.0)
-    );
-}
-
-#[test]
-fn ascii_text_rasterization_uses_configured_font_size_without_cell_stretching() {
-    let draws = terminal_text_draws(&ascii_text_frame());
-    let h_draws = draws
-        .iter()
-        .filter(|draw| draw.ch == 'h')
-        .collect::<Vec<_>>();
-    let min_y = h_draws
-        .iter()
-        .map(|draw| draw.rect.min_y)
-        .fold(f32::INFINITY, f32::min);
-    let max_y = h_draws
-        .iter()
-        .map(|draw| draw.rect.max_y)
-        .fold(f32::NEG_INFINITY, f32::max);
-
-    assert!(
-        max_y - min_y >= TerminalTextConfig::default().font_size * 0.45,
-        "ASCII glyphs should be visible at the configured font size; got {}",
-        max_y - min_y
-    );
-    assert!(
-        max_y - min_y <= 21.0 * 0.80,
-        "ASCII glyphs should not be stretched to fill the terminal cell height; got {}",
-        max_y - min_y
-    );
-}
-
-#[test]
-fn non_ascii_text_commands_are_not_dropped_by_wgpu_text_batching() {
-    let draws = terminal_text_draws(&fallback_text_frame());
-
-    assert!(
-        draws.iter().any(|draw| draw.ch == '\u{f0e7}'),
-        "fallback/Nerd Font text commands should reach the WGPU text batcher"
-    );
-}
-
-#[test]
-fn prompt_sprite_draws_are_batched_from_terminal_render_sprite_commands() {
-    let draws = terminal_sprite_draws(&prompt_sprite_frame());
-
-    assert!(
-        draws.iter().any(|draw| draw.ch == '┃'),
-        "prompt bar sprite should produce WGPU sprite triangles"
-    );
-    assert!(
-        draws.iter().any(|draw| draw.ch == '\u{E0B8}'),
-        "Powerline separator sprite should produce WGPU sprite triangles"
-    );
-    assert!(draws.iter().all(|draw| !draw.vertices.is_empty()));
-    assert!(draws.iter().all(|draw| !draw.indices.is_empty()));
-    assert!(draws.iter().all(|draw| {
-        draw.vertices.iter().all(|vertex| {
-            vertex.position[0] >= 0.0
-                && vertex.position[0] <= 28.0
-                && vertex.position[1] >= 0.0
-                && vertex.position[1] <= 21.0
-        })
-    }));
 }
 
 #[test]
@@ -744,54 +582,4 @@ fn reused_renderer_preserves_mixed_layer_order_without_pixel_drift() {
             .any(|rgba| rgba[0] > 200 && rgba[1] < 20 && rgba[2] < 20 && rgba[3] > 200),
         "mixed layer frame should preserve visible image pixels"
     );
-}
-
-#[test]
-fn cursor_draws_are_batched_from_terminal_render_cursor_commands() {
-    let block = terminal_cursor_draws(&cursor_frame(CursorShape::Block));
-    let bar = terminal_cursor_draws(&cursor_frame(CursorShape::Bar));
-    let underline = terminal_cursor_draws(&cursor_frame(CursorShape::Underline));
-    let hollow = terminal_cursor_draws(&cursor_frame(CursorShape::HollowBlock));
-
-    assert_eq!(block.len(), 1);
-    assert_eq!(
-        block[0].rect,
-        SurfaceRect::from_min_size(7.0, 0.0, 7.0, 21.0)
-    );
-    assert_eq!(bar.len(), 1);
-    assert_eq!(bar[0].rect, SurfaceRect::from_min_size(6.0, 0.0, 2.0, 21.0));
-    assert_eq!(underline.len(), 1);
-    assert_eq!(
-        underline[0].rect,
-        SurfaceRect::from_min_size(7.0, 19.0, 7.0, 2.0)
-    );
-    assert_eq!(hollow.len(), 4);
-    assert!(hollow.iter().all(|draw| draw.color == color(200, 201, 202)));
-}
-
-#[test]
-fn decoration_draws_are_batched_from_terminal_render_decoration_commands() {
-    let draws = terminal_decoration_draws(&decoration_frame(&[
-        DecorationStyle::Single,
-        DecorationStyle::Double,
-        DecorationStyle::Dotted,
-        DecorationStyle::Dashed,
-        DecorationStyle::Curly,
-        DecorationStyle::Strikethrough,
-        DecorationStyle::Overline,
-    ]));
-
-    assert!(draws.len() >= 10);
-    assert!(draws.iter().all(|draw| draw.color == color(200, 201, 202)));
-    assert!(
-        draws
-            .iter()
-            .any(|draw| draw.rect == SurfaceRect::from_min_size(0.0, 2.5, 28.0, 1.0))
-    );
-    assert!(
-        draws
-            .iter()
-            .any(|draw| draw.rect == SurfaceRect::from_min_size(0.0, 5.5, 28.0, 1.0))
-    );
-    assert!(draws.iter().any(|draw| draw.rect.width() == 4.0));
 }

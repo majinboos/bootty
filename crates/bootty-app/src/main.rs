@@ -5,7 +5,7 @@ use std::{fmt, io::Read, process::ExitCode};
 use anyhow::{Context, Result};
 use bootty_app::application_identity::ApplicationIdentity;
 use bootty_app::{
-    cli::{Cli, Command, RemoteSpaceCommand},
+    cli::{Cli, Command, EventCommand, RemoteSpaceCommand, TaskCommand},
     commands::{Caller, CommandDescriptor, CommandInvocation, CommandTarget, ValueType},
     control, remote_catalog,
     update::{self, UpdateResult},
@@ -89,10 +89,46 @@ fn run() -> Result<()> {
             name,
             arguments,
             yes,
+            detached,
         }) => {
-            let mut invocation = CommandInvocation::from_action(name, Caller::Cli);
-            invocation.arguments = arguments.clone();
-            print_command_response(invoke_control_command(&cli, invocation, *yes)?, cli.json())?;
+            let invocation = CommandInvocation::new(name, arguments.clone(), Caller::Cli);
+            let response = invoke_control_command(&cli, invocation, *yes, *detached)?;
+            if *detached {
+                print_control_response(response, cli.json())?;
+            } else {
+                print_command_response(response, cli.json())?;
+            }
+            return Ok(());
+        }
+        Some(Command::Task(command)) => {
+            let (method, params) = match command {
+                TaskCommand::Status { task } => ("task.status", serde_json::json!({"task": task})),
+                TaskCommand::Cancel { task } => ("task.cancel", serde_json::json!({"task": task})),
+            };
+            print_control_response(control_request(cli.start(), method, params)?, cli.json())?;
+            return Ok(());
+        }
+        Some(Command::Events(command)) => {
+            let (method, params) = match command {
+                EventCommand::Subscribe { topics } => {
+                    ("event.subscribe", serde_json::json!({"topics": topics}))
+                }
+                EventCommand::Poll {
+                    subscription,
+                    cursor,
+                } => (
+                    "event.subscribe",
+                    serde_json::json!({
+                        "subscription": subscription,
+                        "cursor": cursor,
+                    }),
+                ),
+                EventCommand::Unsubscribe { subscription } => (
+                    "event.unsubscribe",
+                    serde_json::json!({"subscription": subscription}),
+                ),
+            };
+            print_control_response(control_request(cli.start(), method, params)?, cli.json())?;
             return Ok(());
         }
         Some(Command::Dynamic(arguments)) => {
@@ -155,6 +191,9 @@ fn run() -> Result<()> {
         }
         None => {}
     }
+    if control::running_instance()?.is_some() {
+        return Ok(());
+    }
     if matches!(update::automatic_update(), Ok(UpdateResult::Updated)) {
         update::restart_after_update()?;
         return Ok(());
@@ -208,7 +247,8 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
         print_dynamic_help(path, &descriptor);
         return Ok(());
     }
-    let (arguments, target, confirmed) = parse_dynamic_arguments(&descriptor, raw_arguments)?;
+    let (arguments, target, confirmed, detached) =
+        parse_dynamic_arguments(&descriptor, raw_arguments)?;
     let invocation = CommandInvocation {
         command: descriptor.id,
         arguments,
@@ -216,30 +256,37 @@ fn invoke_dynamic_command(cli: &Cli, raw: &[String]) -> Result<()> {
         target,
         confirmation: None,
     };
-    print_command_response(
-        invoke_control_command_on_instance(&instance, invocation, confirmed)?,
-        cli.json(),
-    )
+    let response = invoke_control_command_on_instance(&instance, invocation, confirmed, detached)?;
+    if detached {
+        print_control_response(response, cli.json())
+    } else {
+        print_command_response(response, cli.json())
+    }
 }
 
 fn invoke_control_command(
     cli: &Cli,
     invocation: CommandInvocation,
     confirm: bool,
+    detached: bool,
 ) -> Result<control::RpcResponse> {
     let descriptor = control::select_or_start(cli.start()).map_err(transport_failure)?;
-    invoke_control_command_on_instance(&descriptor, invocation, confirm)
+    invoke_control_command_on_instance(&descriptor, invocation, confirm, detached)
 }
 
 fn invoke_control_command_on_instance(
     descriptor: &control::InstanceDescriptor,
     mut invocation: CommandInvocation,
     confirm: bool,
+    detached: bool,
 ) -> Result<control::RpcResponse> {
     let response = control_instance_request(
         descriptor,
         "command.invoke",
-        serde_json::json!({"invocation": invocation}),
+        serde_json::json!({
+            "invocation": invocation,
+            "detached": detached && !confirm,
+        }),
     )?;
     if !confirm {
         return Ok(response);
@@ -256,7 +303,10 @@ fn invoke_control_command_on_instance(
     control_instance_request(
         descriptor,
         "command.invoke",
-        serde_json::json!({"invocation": invocation}),
+        serde_json::json!({
+            "invocation": invocation,
+            "detached": detached,
+        }),
     )
 }
 
@@ -300,14 +350,16 @@ fn rpc_failure(error: control::RpcError) -> anyhow::Error {
 fn parse_dynamic_arguments(
     descriptor: &CommandDescriptor,
     raw: &[String],
-) -> Result<(Vec<String>, Option<CommandTarget>, bool)> {
+) -> Result<(Vec<String>, Option<CommandTarget>, bool, bool)> {
     let mut arguments = Vec::new();
     let mut target = None;
     let mut confirmed = false;
+    let mut detached = false;
     let mut input = raw.iter();
     while let Some(argument) = input.next() {
         match argument.as_str() {
             "--yes" => confirmed = true,
+            "--detach" => detached = true,
             "--target" => {
                 let value = input
                     .next()
@@ -362,7 +414,7 @@ fn parse_dynamic_arguments(
             arguments.len()
         );
     }
-    Ok((arguments, target, confirmed))
+    Ok((arguments, target, confirmed, detached))
 }
 
 fn json_argument(value: serde_json::Value) -> Result<String> {
@@ -401,6 +453,7 @@ fn print_dynamic_help(path: &str, descriptor: &CommandDescriptor) {
     ) {
         println!("  --yes");
     }
+    println!("  --detach");
 }
 
 fn print_command_response(response: control::RpcResponse, json_output: bool) -> Result<()> {

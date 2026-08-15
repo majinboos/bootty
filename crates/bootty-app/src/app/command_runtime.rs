@@ -639,6 +639,21 @@ impl AppState {
                 self.apply_sidebar_action(action);
                 CommandDispatch::Complete(CommandOutcome::success())
             }
+            CoreCommandExecutor::CurrentResource(kind) => {
+                if let Err(outcome) = Self::begin_synchronous_command(execution) {
+                    return CommandDispatch::Complete(outcome);
+                }
+                let outcome = self.current_command_target(kind).map_or_else(
+                    || CommandOutcome::Unavailable {
+                        message: format!("no current {kind:?} target is available"),
+                    },
+                    |target| CommandOutcome::Success {
+                        value: serde_json::json!({"target": target}),
+                        warnings: Vec::new(),
+                    },
+                );
+                CommandDispatch::Complete(outcome)
+            }
             CoreCommandExecutor::ReadTerminal => {
                 if let Err(outcome) = Self::begin_synchronous_command(execution) {
                     return CommandDispatch::Complete(outcome);

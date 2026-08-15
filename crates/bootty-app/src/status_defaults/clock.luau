@@ -1,6 +1,6 @@
 --!strict
 -- Built-in `clock` module: date and time with lucide icons. Override by creating
--- ~/.config/bootty/status/clock.luau.
+-- ~/.config/bootty/extensions/clock.luau.
 
 return {
 	interval = 1,

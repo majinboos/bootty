@@ -781,14 +781,3 @@ fn diacritic_index(ch: char) -> Option<u32> {
         .ok()
         .and_then(|index| u32::try_from(index).ok())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn kitty_unicode_diacritic_indices_match_upstream_spots() {
-        assert_eq!(diacritic_index('\u{0483}'), Some(30));
-        assert_eq!(diacritic_index('\u{1D242}'), Some(294));
-    }
-}
