@@ -102,15 +102,15 @@ description = "Prepare and auto-merge a release; pass patch or major for a bump 
 run = "./scripts/prepare-release.sh"
 
 [tasks."daemon:build-all"]
-description = "Cross-build daemon assets for every supported remote target"
+description = "Build daemon assets for every target in the daemon target manifest"
 run = "./scripts/build-bootty-daemons.sh"
 
 [tasks.package]
-description = "Package the app bundle with dynamic local linkage; pass --static for distribution or --fast for fast-release"
+description = "Package the app bundle with all daemon targets; pass --static for distribution or --fast for fast-release"
 run = "./scripts/package-bootty-unix.sh"
 
 [tasks."package:windows"]
-description = "Package the Windows zip with dynamic local linkage; pass --static for distribution or --fast for fast-release"
+description = "Package the Windows zip from BOOTTY_DAEMON_OUTPUT_DIR; pass --static or --fast"
 run = "pwsh ./scripts/package-bootty-windows.ps1"
 
 [tasks.install]

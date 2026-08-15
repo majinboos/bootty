@@ -157,9 +157,14 @@ jobs:
           -p bootty-ui
           --target ${{ matrix.target }}
 
+  daemon-artifacts:
+    name: Build daemon matrix
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    uses: ./.github/workflows/daemon-artifacts.yml
+
   native-app-bundles:
     name: Native app bundle (${{ matrix.name }})
-    needs: [rust-format, rust-hakari, rust-validation, rust-cross]
+    needs: [rust-format, rust-hakari, rust-validation, rust-cross, daemon-artifacts]
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -230,15 +235,22 @@ jobs:
       - name: Evict CPU-specific zig artifacts
         run: cargo clean -p libghostty-vt-sys
 
+      - name: Download daemon matrix
+        uses: actions/download-artifact@v5
+        with:
+          pattern: daemon-*
+          path: target/bootty-daemons
+          merge-multiple: true
+
       - name: Package native app on Unix
         if: runner.os != 'Windows'
         shell: bash
-        run: BOOTTY_STRICT_MACOS_ICON=1 mise run package --static
+        run: BOOTTY_STRICT_MACOS_ICON=1 BOOTTY_DAEMON_OUTPUT_DIR=target/bootty-daemons mise run package --static
 
       - name: Package native app on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: mise run package:windows --static
+        run: $env:BOOTTY_DAEMON_OUTPUT_DIR = "target/bootty-daemons"; mise run package:windows --static
 
       - name: Upload native app bundle
         uses: actions/upload-artifact@v4

@@ -4,9 +4,28 @@ $AppName = "Bootty"
 $BinaryName = "bootty.exe"
 $PackageName = "bootty-app"
 $DaemonBinaryName = "bootty-daemon.exe"
-$DaemonPackageName = "bootty-daemon"
 $DistDir = if ($env:BOOTTY_DIST_DIR) { $env:BOOTTY_DIST_DIR } else { "dist" }
 $TargetRoot = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$DaemonManifest = Join-Path $ScriptDir "bootty-daemon-targets.txt"
+$DaemonOutputDir = $env:BOOTTY_DAEMON_OUTPUT_DIR
+if (-not $DaemonOutputDir) {
+    throw "Windows packaging requires BOOTTY_DAEMON_OUTPUT_DIR with all daemon targets staged"
+}
+$DaemonTargets = @(Get-Content -LiteralPath $DaemonManifest | ForEach-Object {
+    $Target = $_.Trim()
+    if ($Target -and -not $Target.StartsWith("#")) { $Target }
+})
+if ($DaemonTargets.Count -eq 0) {
+    throw "Daemon target manifest is empty: $DaemonManifest"
+}
+foreach ($Target in $DaemonTargets) {
+    $DaemonArtifact = Join-Path $DaemonOutputDir "bootty-daemon-$Target"
+    if (-not (Test-Path -LiteralPath $DaemonArtifact -PathType Leaf) -or
+        (Get-Item -LiteralPath $DaemonArtifact).Length -eq 0) {
+        throw "Missing daemon artifact: $DaemonArtifact"
+    }
+}
 $Arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
 $BundleName = "$AppName-windows-$Arch"
 $BundleRoot = Join-Path $DistDir $BundleName
@@ -57,28 +76,23 @@ if (Test-Path $DistDir) {
 }
 New-Item -ItemType Directory -Force -Path $BundleRoot | Out-Null
 
-$AppRustFlags = $env:RUSTFLAGS
 cargo build @CargoProfileArgs -p $PackageName --bin bootty
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build failed with exit code $LASTEXITCODE"
 }
-$env:RUSTFLAGS = $null
-cargo build --profile daemon-release -p $DaemonPackageName --bin bootty-daemon
-if ($LASTEXITCODE -ne 0) {
-    throw "daemon build failed with exit code $LASTEXITCODE"
-}
-$env:RUSTFLAGS = $AppRustFlags
 
 $BinaryPath = Join-Path $ProfileDir $BinaryName
 if (-not (Test-Path -LiteralPath $BinaryPath)) {
     throw "Expected built binary at $BinaryPath"
 }
 Copy-Item -LiteralPath $BinaryPath -Destination (Join-Path $BundleRoot $BinaryName)
-$DaemonPath = Join-Path (Join-Path $TargetRoot "daemon-release") $DaemonBinaryName
-if (-not (Test-Path -LiteralPath $DaemonPath)) {
-    throw "Expected built daemon at $DaemonPath"
+$HostDaemonPath = Join-Path $DaemonOutputDir "bootty-daemon-x86_64-pc-windows-msvc"
+Copy-Item -LiteralPath $HostDaemonPath -Destination (Join-Path $BundleRoot $DaemonBinaryName)
+$DaemonBundleRoot = Join-Path $BundleRoot "daemons"
+New-Item -ItemType Directory -Force -Path $DaemonBundleRoot | Out-Null
+foreach ($Target in $DaemonTargets) {
+    Copy-Item -LiteralPath (Join-Path $DaemonOutputDir "bootty-daemon-$Target") -Destination $DaemonBundleRoot
 }
-Copy-Item -LiteralPath $DaemonPath -Destination (Join-Path $BundleRoot $DaemonBinaryName)
 
 if ($Linkage -eq "dynamic") {
     $DynamicLibraryDirs = @(

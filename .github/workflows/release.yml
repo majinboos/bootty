@@ -25,8 +25,13 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  daemon-artifacts:
+    name: Build daemon matrix
+    uses: ./.github/workflows/daemon-artifacts.yml
+
   package:
     name: Package ${{ matrix.name }}
+    needs: daemon-artifacts
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -37,29 +42,21 @@ jobs:
             artifact: bootty-macos-arm64
             package-asset: Bootty-macos-arm64.app.zip
             release-asset: bootty-aarch64-apple-darwin.zip
-            daemon-path: target/daemon-release/bootty-daemon
-            daemon-asset: bootty-daemon-aarch64-apple-darwin
           - name: macos-x64
             runner: macos-15-intel
             artifact: bootty-macos-x64
             package-asset: Bootty-macos-x86_64.app.zip
             release-asset: bootty-x86_64-apple-darwin.zip
-            daemon-path: target/daemon-release/bootty-daemon
-            daemon-asset: bootty-daemon-x86_64-apple-darwin
           - name: windows-x64
             runner: windows-2025
             artifact: bootty-windows-x64
             package-asset: Bootty-windows-x64.zip
             release-asset: bootty-x86_64-pc-windows-msvc.zip
-            daemon-path: target/daemon-release/bootty-daemon.exe
-            daemon-asset: bootty-daemon-x86_64-pc-windows-msvc
           - name: linux-x64
             runner: ubuntu-24.04
             artifact: bootty-linux-x64
             package-asset: Bootty-linux-x86_64.tar.gz
             release-asset: bootty-x86_64-unknown-linux-gnu.tar.gz
-            daemon-path: target/daemon-release/bootty-daemon
-            daemon-asset: bootty-daemon-x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v5
         with:
@@ -113,21 +110,27 @@ jobs:
       - name: Evict CPU-specific zig artifacts
         run: cargo clean -p libghostty-vt-sys
 
+      - name: Download daemon matrix
+        uses: actions/download-artifact@v5
+        with:
+          pattern: daemon-*
+          path: target/bootty-daemons
+          merge-multiple: true
+
       - name: Package native app on Unix
         if: runner.os != 'Windows'
         shell: bash
-        run: BOOTTY_STRICT_MACOS_ICON=1 mise run package --static
+        run: BOOTTY_STRICT_MACOS_ICON=1 BOOTTY_DAEMON_OUTPUT_DIR=target/bootty-daemons mise run package --static
 
       - name: Package native app on Windows
         if: runner.os == 'Windows'
         shell: pwsh
-        run: mise run package:windows --static
+        run: $env:BOOTTY_DAEMON_OUTPUT_DIR = "target/bootty-daemons"; mise run package:windows --static
 
       - name: Prepare release assets
         shell: bash
         run: |
           mv "dist/${{ matrix.package-asset }}" "dist/${{ matrix.release-asset }}"
-          cp "${{ matrix.daemon-path }}" "dist/${{ matrix.daemon-asset }}"
 
       - name: Upload release asset
         uses: actions/upload-artifact@v4
@@ -136,37 +139,10 @@ jobs:
           if-no-files-found: error
           path: |
             dist/${{ matrix.release-asset }}
-            dist/${{ matrix.daemon-asset }}
-
-  daemon-linux-arm64:
-    name: Package Linux arm64 daemon
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ env.RELEASE_TAG }}
-
-      - name: Set up mise toolchain
-        uses: jdx/mise-action@v4
-
-      - name: Install cross
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cross
-
-      - name: Build daemon
-        run: cross build --profile daemon-release -p bootty-daemon --target aarch64-unknown-linux-gnu
-
-      - name: Upload daemon
-        uses: actions/upload-artifact@v4
-        with:
-          name: bootty-daemon-linux-arm64
-          if-no-files-found: error
-          path: target/aarch64-unknown-linux-gnu/daemon-release/bootty-daemon
 
   publish:
     name: Publish GitHub release
-    needs: [package, daemon-linux-arm64]
+    needs: [package, daemon-artifacts]
     runs-on: ubuntu-24.04
     steps:
       - name: Download release assets
@@ -177,9 +153,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: release
-        run: |
-          mv bootty-daemon bootty-daemon-aarch64-unknown-linux-gnu
-          sha256sum * > SHA256SUMS
+        run: sha256sum * > SHA256SUMS
 
       - name: Create release
         env:
