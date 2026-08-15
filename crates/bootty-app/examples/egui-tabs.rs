@@ -1,12 +1,12 @@
 use bootty_app::{
-    geometry::{TerminalSurface, ViewTransform},
     input::{
         InputSnapshot, TerminalInputCommand, WheelScrollState, pressed_mouse_button_from_egui,
         terminal_input_commands_with_wheel_state,
     },
     renderer::TerminalWidget,
-    scheduler::{RepaintScheduler, RepaintSignal},
 };
+use bootty_render::geometry::{TerminalSurface, ViewTransform};
+use bootty_runtime::scheduler::{RepaintScheduler, RepaintSignal};
 use bootty_runtime::terminal_session::TerminalSession;
 use eframe::{
     egui::{self, RichText},

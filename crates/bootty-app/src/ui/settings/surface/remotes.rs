@@ -7,7 +7,7 @@ use bootty_config::config::{SshAuthenticationConfig, SshHostKeyPolicyConfig, Ssh
 use eframe::egui;
 
 use super::{
-    SettingsWindow, section, settings_button, settings_notice, settings_segmented,
+    SettingsSurface, section, settings_button, settings_notice, settings_segmented,
     settings_text_edit,
 };
 
@@ -120,14 +120,14 @@ enum ConnectionTest {
     Failed(String),
 }
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let mut editor = std::mem::take(&mut win.remote_editor);
     editor.show(win, ui);
     win.remote_editor = editor;
 }
 
 impl EditorState {
-    fn show(&mut self, win: &mut SettingsWindow, ui: &mut egui::Ui) {
+    fn show(&mut self, win: &mut SettingsSurface, ui: &mut egui::Ui) {
         self.poll_test();
         self.ensure_selection(win);
 
@@ -303,7 +303,7 @@ impl EditorState {
         }
     }
 
-    fn ensure_selection(&mut self, win: &SettingsWindow) {
+    fn ensure_selection(&mut self, win: &SettingsSurface) {
         if self
             .selected_id
             .as_ref()
@@ -317,7 +317,7 @@ impl EditorState {
         }
     }
 
-    fn select(&mut self, win: &SettingsWindow, id: String) {
+    fn select(&mut self, win: &SettingsSurface, id: String) {
         self.draft = win
             .config
             .ssh_profiles
@@ -355,13 +355,19 @@ impl EditorState {
     }
 }
 
-fn field(ui: &mut egui::Ui, win: &mut SettingsWindow, label: &str, hint: &str, value: &mut String) {
+fn field(
+    ui: &mut egui::Ui,
+    win: &mut SettingsSurface,
+    label: &str,
+    hint: &str,
+    value: &mut String,
+) {
     super::settings_row(ui, win.palette, label, "", |ui| {
         settings_text_edit(ui, win.palette, value, hint);
     });
 }
 
-fn save_profile(win: &mut SettingsWindow, id: &str, profile: &SshProfileConfig) {
+fn save_profile(win: &mut SettingsSurface, id: &str, profile: &SshProfileConfig) {
     win.config
         .ssh_profiles
         .insert(id.to_owned(), profile.clone());
@@ -371,7 +377,7 @@ fn save_profile(win: &mut SettingsWindow, id: &str, profile: &SshProfileConfig) 
         .mutate(move |document| document.set_ssh_profile(&id, &profile));
 }
 
-fn delete_profile(win: &mut SettingsWindow, id: &str) {
+fn delete_profile(win: &mut SettingsSurface, id: &str) {
     win.config.ssh_profiles.remove(id);
     let id = id.to_owned();
     win.writeback

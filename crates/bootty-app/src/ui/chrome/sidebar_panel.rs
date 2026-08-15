@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use bootty_extension::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem};
+use bootty_mux::controller::{MuxScope, SpaceId};
 use bootty_ui::{ThemePalette, icons::paint_icon_slug, readable_color};
 use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
 use crate::{
     assets,
-    mux::controller::{MuxScope, SpaceId},
     strings::truncate_label,
     theme::module_color32,
     ui::{

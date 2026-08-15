@@ -9,18 +9,16 @@ use std::{
 };
 
 use bootty_app::{
-    AppState, FrameInputs, ViewportSnapshot,
-    commands::CommandCatalog,
-    config::{BoottyConfig, MultiplexerBackendConfig},
-    geometry::ViewTransform,
-    renderer::RendererMetrics,
+    AppState, FrameInputs, ViewportSnapshot, commands::CommandCatalog, renderer::RendererMetrics,
 };
 use bootty_command::{
     AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandOutcome,
     app_command_channel as command_channel,
 };
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
 use bootty_control::{ControlPlane, ControlServer};
 use bootty_extension::ExtensionHost;
+use bootty_render::geometry::ViewTransform;
 use serde_json::{Value, json};
 
 mod support;
@@ -102,9 +100,9 @@ fn cli_control_helper() {
     fs::write(&extension_module, extension_source(1)).expect("write first extension generation");
     let config = BoottyConfig {
         config_path: workspace.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };

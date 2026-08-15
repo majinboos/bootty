@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{
+use bootty_config::{
     color::Color,
     config::{
         BoottyConfig, ConfigDocument, ConfigResult, load_config_document, load_config_from_path,

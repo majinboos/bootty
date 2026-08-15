@@ -1,6 +1,6 @@
 use std::hint::black_box;
 
-use bootty_app::geometry::TerminalGeometry;
+use bootty_render::geometry::TerminalGeometry;
 use bootty_terminal::{
     terminal_engine::TerminalEngine,
     terminal_input_model::{

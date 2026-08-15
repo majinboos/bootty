@@ -1,6 +1,6 @@
 use eframe::egui::{self, Pos2};
 
-use crate::geometry::{SurfacePoint, TerminalSurface, ViewTransform};
+use bootty_render::geometry::{SurfacePoint, TerminalSurface, ViewTransform};
 
 use bootty_terminal::terminal_engine::TerminalSelectionEvent;
 

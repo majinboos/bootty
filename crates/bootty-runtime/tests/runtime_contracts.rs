@@ -1,5 +1,9 @@
-use std::{fs, sync::Arc, thread, time::Duration};
+use std::{fs, time::Duration};
+#[cfg(unix)]
+use std::{sync::Arc, thread, time::Instant};
 
+#[cfg(unix)]
+use bootty_runtime::frame_source::TerminalFrameSource;
 use bootty_runtime::{
     BenchmarkTrace, PtyBacklog, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
     TraceValue, drain_pty_backlog,
@@ -9,7 +13,10 @@ use bootty_runtime::{
 };
 use bootty_terminal::terminal_engine::TerminalEngine;
 #[cfg(unix)]
-use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION};
+use bootty_terminal::terminal_engine::{
+    TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TerminalCopyModeAction, TerminalSearchDirection,
+    TerminalSelectionFormat,
+};
 
 #[test]
 fn scheduler_prioritizes_input_and_backlog_over_idle_chrome() {
@@ -215,6 +222,70 @@ fn resize_updates_grid_size_only_after_worker_result() {
     assert_eq!((frame.cols, frame.rows), (resized.cols, resized.rows));
     assert!(session.resize(invalid).is_err());
     assert_eq!(session.grid_size(), (resized.cols, resized.rows));
+}
+
+#[cfg(unix)]
+#[test]
+fn frame_resize_queues_without_waiting_for_worker_publication() {
+    let initial = TerminalGeometry {
+        cols: 20,
+        rows: 8,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let resized = TerminalGeometry {
+        cols: 24,
+        rows: 10,
+        ..initial
+    };
+    let mut session = TerminalSession::new_with_repaint_wakeup(initial, Arc::new(|| {}))
+        .expect("terminal starts");
+
+    let started = Instant::now();
+    TerminalFrameSource::resize(&mut session, resized).expect("frame resize queues");
+
+    assert_eq!(session.grid_size(), (resized.cols, resized.rows));
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "frame resize waited for worker publication"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_worker_response_operations_preserve_public_results() {
+    let geometry = TerminalGeometry {
+        cols: 20,
+        rows: 8,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let mut session = TerminalSession::new_with_repaint_wakeup(geometry, Arc::new(|| {}))
+        .expect("terminal starts");
+
+    session.enter_copy_mode().expect("copy mode starts");
+    assert!(session.copy_mode_active().expect("copy mode state reads"));
+    let outcome = session
+        .handle_copy_mode_action(TerminalCopyModeAction::Cancel)
+        .expect("copy mode action completes");
+    assert!(!outcome.active);
+    assert_eq!(
+        session
+            .format_selection(TerminalSelectionFormat::PlainText)
+            .expect("selection formatting completes"),
+        None
+    );
+    assert!(
+        !session
+            .search_viewport("", TerminalSearchDirection::Current)
+            .expect("search completes")
+    );
+    session
+        .is_mouse_tracking()
+        .expect("mouse tracking state reads");
+    session
+        .discard_pending_output()
+        .expect("pending output discard completes");
 }
 
 #[cfg(unix)]

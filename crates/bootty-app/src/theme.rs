@@ -1,11 +1,10 @@
-use bootty_extension::ModuleColor;
-use bootty_ui::{Theme, ThemePalette, UiColorConfig};
-use eframe::egui::Color32;
-
-use crate::{
+use bootty_config::{
     color::Color,
     config::{AppearanceVariant, BoottyConfig, ColorConfig},
 };
+use bootty_extension::ModuleColor;
+use bootty_ui::{Theme, ThemePalette, UiColorConfig};
+use eframe::egui::Color32;
 
 pub fn theme_from_config(config: &BoottyConfig, variant: AppearanceVariant) -> Theme {
     Theme::new(theme_palette_from_config(config, variant))

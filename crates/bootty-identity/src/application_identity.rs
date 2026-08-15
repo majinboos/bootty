@@ -1,9 +1,9 @@
 use std::{
-    error::Error,
-    fmt,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
+
+use thiserror::Error;
 
 static PROCESS_IDENTITY: OnceLock<ApplicationIdentity> = OnceLock::new();
 
@@ -15,23 +15,14 @@ pub enum ApplicationIdentity {
     Development,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+#[error(
+    "application identity is already initialized as {active:?}; cannot change it to {requested:?}"
+)]
 pub struct ApplicationIdentityConflict {
     active: ApplicationIdentity,
     requested: ApplicationIdentity,
 }
-
-impl fmt::Display for ApplicationIdentityConflict {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "application identity is already initialized as {:?}; cannot change it to {:?}",
-            self.active, self.requested
-        )
-    }
-}
-
-impl Error for ApplicationIdentityConflict {}
 
 impl ApplicationIdentity {
     pub const fn current() -> Self {

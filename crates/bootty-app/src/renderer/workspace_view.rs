@@ -4,17 +4,16 @@ use std::{
     time::Instant,
 };
 
+use bootty_render::{geometry::ViewTransform, terminal_text::TerminalTextConfig};
 use eframe::{
     egui::{self, Pos2, Rect, Vec2},
     wgpu,
 };
 
 use crate::{
-    geometry::ViewTransform,
     layout::SplitDirection,
     renderer::{RendererMetrics, TerminalWidget},
     state::AppState,
-    terminal_text::TerminalTextConfig,
     workspace_runtime::{TerminalProgress, TerminalProgressState},
 };
 
@@ -261,26 +260,27 @@ impl TerminalWorkspaceView {
             self.focus_pane(focused_widget_key);
         }
 
-        let pane_geometries: Vec<(String, String, crate::geometry::TerminalGeometry)> = rects
-            .iter()
-            .map(|(pane_id, rect)| {
-                let widget_key = state.pane_widget_key(pane_id);
-                let is_focused = focused.as_deref() == Some(pane_id.as_str());
-                let geometry = if is_focused {
-                    self.focused.geometry_for_rect(*rect)
-                } else {
-                    let target_format = self.target_format;
-                    let text_config = self.text_config.clone();
-                    let cursor_icon = self.cursor_icon;
-                    let widget = self
-                        .inactive
-                        .entry(widget_key.clone())
-                        .or_insert_with(|| new_widget(target_format, text_config, cursor_icon));
-                    widget.geometry_for_rect(*rect)
-                };
-                (pane_id.clone(), widget_key, geometry)
-            })
-            .collect();
+        let pane_geometries: Vec<(String, String, bootty_render::geometry::TerminalGeometry)> =
+            rects
+                .iter()
+                .map(|(pane_id, rect)| {
+                    let widget_key = state.pane_widget_key(pane_id);
+                    let is_focused = focused.as_deref() == Some(pane_id.as_str());
+                    let geometry = if is_focused {
+                        self.focused.geometry_for_rect(*rect)
+                    } else {
+                        let target_format = self.target_format;
+                        let text_config = self.text_config.clone();
+                        let cursor_icon = self.cursor_icon;
+                        let widget = self
+                            .inactive
+                            .entry(widget_key.clone())
+                            .or_insert_with(|| new_widget(target_format, text_config, cursor_icon));
+                        widget.geometry_for_rect(*rect)
+                    };
+                    (pane_id.clone(), widget_key, geometry)
+                })
+                .collect();
         if let Some((cols, rows)) = state.pane_terminal_window_size(|pane| {
             pane_geometries
                 .iter()

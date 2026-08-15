@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bootty_runtime::frame_source::TerminalFrameSource;
 use eframe::egui::Pos2;
 use wgpu::CurrentSurfaceTexture;
 use winit::{
@@ -457,7 +458,7 @@ impl BareTerminalState {
         );
         self.gpu.resize(size);
         if self.viewport.is_drawable() {
-            self.terminal.resize(self.viewport.geometry())?;
+            TerminalFrameSource::resize(&mut self.terminal, self.viewport.geometry())?;
             self.window.request_redraw();
         }
         Ok(())

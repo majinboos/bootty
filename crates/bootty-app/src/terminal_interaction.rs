@@ -2,14 +2,14 @@ mod copy_mode;
 mod selection;
 
 use anyhow::Result;
+use bootty_mux::terminal::{ActiveTerminal, TerminalRuntime};
+use bootty_render::geometry::{TerminalSurface, ViewTransform};
+use bootty_winit::input_binding::CopyToClipboard;
 use eframe::egui::{self, Rect};
 
 use super::AppEffect;
 use crate::{
-    geometry::{TerminalSurface, ViewTransform},
     input::focus::InputFocus,
-    input_binding::CopyToClipboard,
-    mux::terminal::{ActiveTerminal, TerminalRuntime},
     platform::{write_clipboard_html, write_clipboard_text},
     ui::terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
 };

@@ -61,7 +61,6 @@ toml_parser = { version = "1" }
 toml_writer = { version = "1" }
 tracing = { version = "0.1" }
 tracing-core = { version = "0.1", default-features = false, features = ["std"] }
-ttf-parser = { version = "0.25", features = ["gvar-alloc", "no-std-float"] }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 ureq = { version = "3", features = ["charset", "json", "socks-proxy"] }
 uuid = { version = "1", default-features = false, features = ["serde"] }

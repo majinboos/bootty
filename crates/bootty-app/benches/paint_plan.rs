@@ -2,27 +2,24 @@ use std::{collections::HashMap, hint::black_box};
 
 mod paint_plan_fixtures;
 
-use bootty_app::{
-    config::{BoottyConfig, MultiplexerBackendConfig},
+use bootty_app::ui::{
+    chrome::{self, SidebarModel},
+    session_navigation::BindingSessionGroup,
+    session_picker::SessionPickerDialog,
+    sidebar::build_binding_sidebar_items,
+};
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_extension::{ModuleItem, PublishedSurfaceItem};
+use bootty_mux::{
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+};
+use bootty_render::{
     geometry::ViewTransform,
-    input_binding::BindingAction,
-    input_binding_set::BindingSet,
-    modifier_remap::ModifierRemapSet,
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
-    },
     paint_plan::PaintPlanner,
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
-    ui::{
-        chrome::{self, SidebarModel},
-        session_navigation::BindingSessionGroup,
-        session_picker::SessionPickerDialog,
-        sidebar::build_binding_sidebar_items,
-    },
 };
-use bootty_extension::{ModuleItem, PublishedSurfaceItem};
 use bootty_terminal::{
     terminal_engine::TerminalEngine,
     terminal_frame::FrameSelection,
@@ -34,6 +31,9 @@ use bootty_terminal::{
 use bootty_ui::icons;
 use bootty_winit::input::{
     InputSnapshot, WheelScrollState, terminal_input_commands_with_wheel_state,
+};
+use bootty_winit::{
+    input_binding::BindingAction, input_binding_set::BindingSet, modifier_remap::ModifierRemapSet,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::egui::{self, Pos2, Rect};

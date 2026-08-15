@@ -3,6 +3,7 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 
+use bootty_config::config::SshRemoteConfig;
 use bootty_extension::display_path;
 use bootty_mux::{
     controller::RepaintHandle,
@@ -17,7 +18,7 @@ use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
-use crate::{config::SshRemoteConfig, strings::home_dir};
+use crate::strings::home_dir;
 
 mod model;
 

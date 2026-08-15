@@ -1,10 +1,8 @@
 use std::{collections::HashSet, hash::Hasher, path::PathBuf};
 
 use super::{BindingRuntime, PendingGeneratedName, SpaceRuntime, WorkspaceRuntime};
-use crate::{
-    mux::{RepaintHandle, command::MuxCommand, provider::GeneratedSessionNamePolicy},
-    ui::new_session_picker::NewMuxSessionRequest,
-};
+use crate::ui::new_session_picker::NewMuxSessionRequest;
+use bootty_mux::{RepaintHandle, command::MuxCommand, provider::GeneratedSessionNamePolicy};
 use bootty_workspace::WorkspacePersistenceError;
 
 pub(crate) enum RenameSessionOutcome {

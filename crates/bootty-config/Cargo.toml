@@ -12,6 +12,7 @@ bootty-write = { path = "../bootty-write" }
 serde.workspace = true
 toml_edit.workspace = true
 bootty-identity = { path = "../bootty-identity" }
+thiserror.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true

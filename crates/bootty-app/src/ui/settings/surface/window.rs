@@ -1,9 +1,9 @@
 use eframe::egui;
 
-use super::SettingsWindow;
-use crate::config::{MacosTitlebarStyle, WindowDecoration, WindowFullscreen};
+use super::SettingsSurface;
+use bootty_config::config::{MacosTitlebarStyle, WindowDecoration, WindowFullscreen};
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
 
     super::section(ui, palette, "WINDOW");
@@ -341,10 +341,10 @@ struct WindowNumberRow {
     help: &'static str,
     path: [&'static str; 2],
     range: std::ops::RangeInclusive<f32>,
-    field: fn(&mut crate::config::WindowConfig) -> &mut f32,
+    field: fn(&mut bootty_config::config::WindowConfig) -> &mut f32,
 }
 
-fn numeric_window_row(win: &mut SettingsWindow, ui: &mut egui::Ui, spec: WindowNumberRow) {
+fn numeric_window_row(win: &mut SettingsSurface, ui: &mut egui::Ui, spec: WindowNumberRow) {
     super::settings_row(ui, win.palette, spec.label, spec.help, |ui| {
         let mut value = *(spec.field)(&mut win.config.window);
         if super::settings_number_edit(
@@ -375,10 +375,10 @@ struct ChromeSliderRow {
     percent: bool,
     /// Decimal places in the chip (these sliders accept fractional px, so 0 reads as misleading).
     precision: usize,
-    field: fn(&mut crate::config::ChromeConfig) -> &mut f32,
+    field: fn(&mut bootty_config::config::ChromeConfig) -> &mut f32,
 }
 
-fn chrome_slider(win: &mut SettingsWindow, ui: &mut egui::Ui, spec: ChromeSliderRow) {
+fn chrome_slider(win: &mut SettingsSurface, ui: &mut egui::Ui, spec: ChromeSliderRow) {
     super::settings_row(ui, win.palette, spec.label, spec.help, |ui| {
         let mut value = *(spec.field)(&mut win.config.chrome);
         let suffix = if spec.percent { "%" } else { spec.suffix };

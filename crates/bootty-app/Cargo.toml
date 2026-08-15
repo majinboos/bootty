@@ -14,7 +14,6 @@ anyhow.workspace = true
 arboard.workspace = true
 eframe.workspace = true
 iconflow.workspace = true
-fontdb.workspace = true
 libghostty-vt.workspace = true
 bootty-winit = { path = "../bootty-winit", default-features = false }
 bootty-font = { path = "../bootty-font" }
@@ -30,10 +29,10 @@ bootty-workspace = { path = "../bootty-workspace" }
 png.workspace = true
 serde_json.workspace = true
 strum.workspace = true
-ttf-parser.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 keepawake.workspace = true
+thiserror.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

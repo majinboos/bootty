@@ -1,6 +1,4 @@
 use bootty_app::{
-    config::{ColorConfig, SegmentAlign},
-    mux::controller::SpaceId,
     theme::theme_palette_from_colors,
     ui::chrome::{
         ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState, SpaceSwitcherEvent,
@@ -9,6 +7,8 @@ use bootty_app::{
         take_sidebar_space_swipe,
     },
 };
+use bootty_config::config::{ColorConfig, SegmentAlign};
+use bootty_mux::controller::SpaceId;
 use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
 

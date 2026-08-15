@@ -4,18 +4,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bootty_app::{
-    direct_input::ModifierSideState,
+use bootty_render::{
     geometry::{CellMetrics, SurfaceRect, TerminalGeometry, TerminalPadding},
-    input_binding::{BindingKey, BindingMods, BindingTrigger},
-    modifier_remap::ModifierRemapSet,
     paint_plan::PlanColor,
-    terminal_image::{
-        KittyImageFrame, KittyImageLayer, KittyImagePlacement, KittyVirtualPlacement,
-    },
     terminal_render::{FillRole, TerminalRenderCommand},
     terminal_sprite::SpriteFamily,
     terminal_text::TerminalTextConfig,
+};
+use bootty_terminal::terminal_image::{
+    KittyImageFrame, KittyImageLayer, KittyImagePlacement, KittyVirtualPlacement,
 };
 use bootty_terminal::{
     terminal_engine::{TerminalColorConfig, TerminalEngine},
@@ -26,6 +23,11 @@ use bootty_winit::bare_host::{
     BareRendererSurfaceConfig, BareTerminalInput, BareTerminalViewport, bare_terminal_key_input,
     bare_terminal_key_input_with_remaps, bare_terminal_key_input_with_sides,
     bare_terminal_mouse_input, bare_terminal_paste_shortcut, terminal_render_frame_for_bare_host,
+};
+use bootty_winit::{
+    direct_input::ModifierSideState,
+    input_binding::{BindingKey, BindingMods, BindingTrigger},
+    modifier_remap::ModifierRemapSet,
 };
 use libghostty_vt::{
     kitty::graphics::SourceRect,
@@ -460,7 +462,7 @@ fn bare_host_routes_cursor_and_decorations_through_structured_commands() {
         terminal_render_frame_for_bare_host(&frame, viewport, &TerminalTextConfig::default());
 
     assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Cursor(cursor) if cursor.shape == bootty_app::paint_plan::CursorShape::Bar)
+        |command| matches!(command, TerminalRenderCommand::Cursor(cursor) if cursor.shape == bootty_render::paint_plan::CursorShape::Bar)
     ));
     assert!(
         render_frame

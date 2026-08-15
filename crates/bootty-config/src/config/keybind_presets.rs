@@ -1,4 +1,4 @@
-use super::{KeybindPreset, MacosOptionAsAltConfig};
+use super::model::{KeybindPreset, MacosOptionAsAltConfig};
 
 pub(super) fn resolve_macos_option_alt_keybinds(
     keybinds: Vec<String>,

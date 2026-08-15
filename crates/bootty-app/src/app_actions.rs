@@ -3,18 +3,18 @@ use std::str::FromStr;
 use anyhow::Result;
 use eframe::egui;
 
-use crate::{
-    config::{InputConfig, split_keybind_entry},
+use crate::input::terminal_key;
+use bootty_command::{Caller, CommandInvocation};
+use bootty_config::config::{InputConfig, split_keybind_entry};
+use bootty_mux::command::MuxDirection;
+use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, TerminalKey};
+use bootty_winit::{
     direct_input::ModifierSideState,
-    input::terminal_key,
     input_binding::{
         AppearanceChoice, BindingAction, BindingElement, BindingKey, BindingTrigger,
         CopyToClipboard, NavigateSearch, PaneDirection, parse_action, parse_binding_elements,
     },
-    mux::command::MuxDirection,
 };
-use bootty_command::{Caller, CommandInvocation};
-use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, TerminalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppAction {
@@ -30,7 +30,7 @@ pub enum AppAction {
     ToggleSidebarFocus,
     ToggleSidebarVisibility,
     OpenSettings,
-    ChangeAppearance(crate::config::AppearanceMode),
+    ChangeAppearance(bootty_config::config::AppearanceMode),
     SwitchTheme,
     RenameSession,
     RenameTab,
@@ -503,11 +503,11 @@ fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
     }
 }
 
-fn appearance_mode(choice: AppearanceChoice) -> crate::config::AppearanceMode {
+fn appearance_mode(choice: AppearanceChoice) -> bootty_config::config::AppearanceMode {
     match choice {
-        AppearanceChoice::System => crate::config::AppearanceMode::System,
-        AppearanceChoice::Light => crate::config::AppearanceMode::Light,
-        AppearanceChoice::Dark => crate::config::AppearanceMode::Dark,
+        AppearanceChoice::System => bootty_config::config::AppearanceMode::System,
+        AppearanceChoice::Light => bootty_config::config::AppearanceMode::Light,
+        AppearanceChoice::Dark => bootty_config::config::AppearanceMode::Dark,
     }
 }
 

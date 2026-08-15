@@ -1,16 +1,16 @@
 use std::path::Path;
 
+use bootty_config::{
+    color::Color,
+    config::{AppearanceBranchConfig, AppearanceMode, AppearanceVariant, ColorConfig},
+};
 use bootty_ui::readable_color;
 use eframe::egui;
 use libghostty_vt::style::RgbColor;
 
-use super::SettingsWindow;
-use crate::{
-    color::Color,
-    config::{AppearanceBranchConfig, AppearanceMode, AppearanceVariant, ColorConfig},
-};
+use super::SettingsSurface;
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
 
     super::section(ui, palette, "APPEARANCE");
@@ -212,7 +212,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
     palette_section(win, ui, variant);
 }
 
-fn mode_row(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+fn mode_row(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let selected = match win.config.appearance.mode {
         AppearanceMode::System => 0,
         AppearanceMode::Light => 1,
@@ -247,7 +247,7 @@ fn mode_row(win: &mut SettingsWindow, ui: &mut egui::Ui) {
     );
 }
 
-fn branch_tabs(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+fn branch_tabs(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let selected = match win.appearance_variant {
         AppearanceVariant::Light => 0,
         AppearanceVariant::Dark => 1,
@@ -279,7 +279,7 @@ fn branch_key(variant: AppearanceVariant) -> &'static str {
 }
 
 fn branch(
-    config: &crate::config::BoottyConfig,
+    config: &bootty_config::config::BoottyConfig,
     variant: AppearanceVariant,
 ) -> &AppearanceBranchConfig {
     match variant {
@@ -289,7 +289,7 @@ fn branch(
 }
 
 fn branch_mut(
-    config: &mut crate::config::BoottyConfig,
+    config: &mut bootty_config::config::BoottyConfig,
     variant: AppearanceVariant,
 ) -> &mut AppearanceBranchConfig {
     match variant {
@@ -304,7 +304,11 @@ fn appearance_config_path<'a>(variant: AppearanceVariant, path: &'a [&'a str]) -
     full
 }
 
-fn remove_branch_config_value(win: &mut SettingsWindow, variant: AppearanceVariant, path: &[&str]) {
+fn remove_branch_config_value(
+    win: &mut SettingsSurface,
+    variant: AppearanceVariant,
+    path: &[&str],
+) {
     let full_path = appearance_config_path(variant, path);
     win.writeback.remove(&full_path);
     if variant == AppearanceVariant::Dark {
@@ -313,7 +317,7 @@ fn remove_branch_config_value(win: &mut SettingsWindow, variant: AppearanceVaria
     super::reload_settings_config(win);
 }
 
-fn theme_row(win: &mut SettingsWindow, ui: &mut egui::Ui, variant: AppearanceVariant) {
+fn theme_row(win: &mut SettingsSurface, ui: &mut egui::Ui, variant: AppearanceVariant) {
     let config_path = win.writeback.path().to_path_buf();
     let themes = win
         .theme_names
@@ -326,8 +330,8 @@ fn theme_row(win: &mut SettingsWindow, ui: &mut egui::Ui, variant: AppearanceVar
         "Built-in or config-directory theme.",
         |ui| {
             let fallback = match variant {
-                AppearanceVariant::Light => crate::config::DEFAULT_LIGHT_THEME,
-                AppearanceVariant::Dark => crate::config::DEFAULT_DARK_THEME,
+                AppearanceVariant::Light => bootty_config::config::DEFAULT_LIGHT_THEME,
+                AppearanceVariant::Dark => bootty_config::config::DEFAULT_DARK_THEME,
             };
             let current = branch(&win.config, variant)
                 .theme
@@ -357,7 +361,7 @@ fn theme_row(win: &mut SettingsWindow, ui: &mut egui::Ui, variant: AppearanceVar
 }
 
 fn terminal_color_row(
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     ui: &mut egui::Ui,
     label: &str,
     help: &str,
@@ -391,7 +395,7 @@ fn terminal_color_row(
     });
 }
 
-fn palette_section(win: &mut SettingsWindow, ui: &mut egui::Ui, variant: AppearanceVariant) {
+fn palette_section(win: &mut SettingsSurface, ui: &mut egui::Ui, variant: AppearanceVariant) {
     let palette = win.palette;
     super::section(ui, palette, "ANSI PALETTE");
     super::settings_toggle_row(
@@ -625,7 +629,7 @@ fn rgb_to_color(color: RgbColor) -> Color {
 }
 
 fn available_themes(config_path: &Path) -> Vec<String> {
-    let mut names: Vec<String> = crate::config::builtin_theme_names()
+    let mut names: Vec<String> = bootty_config::config::builtin_theme_names()
         .map(str::to_owned)
         .collect();
     if let Some(dir) = config_path.parent().map(|parent| parent.join("themes"))

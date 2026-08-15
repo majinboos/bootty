@@ -1,8 +1,8 @@
-use bootty_app::application_identity::{
+use bootty_config::config::default_config_path;
+use bootty_identity::{
     ApplicationIdentity, legacy_config_path_from_env, unix_daemon_state_path,
     windows_daemon_state_path,
 };
-use bootty_app::config::default_config_path;
 use bootty_rmux::{
     endpoint_path_for as bootty_rmux_endpoint_path_for, socket_name as bootty_rmux_socket_name,
 };

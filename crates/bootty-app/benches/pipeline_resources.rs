@@ -20,7 +20,7 @@ use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use bootty_app::{
+use bootty_render::{
     geometry::{CellMetrics, SurfaceRect, TerminalGeometry, TerminalPadding, TerminalSurface},
     paint_plan::PaintPlanner,
     terminal_render::{RenderFramePool, TerminalRenderFrame},

@@ -11,26 +11,6 @@ use std::{
 use anyhow::Result;
 use bootty_app::{
     AppState, FrameInputs, ModalDialog, ViewportSnapshot,
-    config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig},
-    geometry::ViewTransform,
-    mux::{
-        MuxBackendKind, MuxBindingConfig, SshTarget,
-        backend::MuxBackend,
-        capability::{BindingCapabilityDescriptor, BindingOperation},
-        command::MuxCommand,
-        controller::MuxScope,
-        provider::{
-            GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider,
-            MuxBackendProvider, MuxBackendRegistry, MuxCommandDispatch, PaneBehavior, PaneTopology,
-            PersistedSessionPolicy, SelectionPublicationPolicy, TerminalProgressPolicy,
-            TerminalResidency,
-        },
-        snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
-        terminal::{
-            BackendPanePolicy, PaneLayoutResizeRequest, PaneStartRequest, ScopedMuxPaneTarget,
-            TerminalRuntime,
-        },
-    },
     renderer::RendererMetrics,
     ui::{
         ditch::{DitchAction, DitchSessionEvent},
@@ -40,6 +20,25 @@ use bootty_app::{
 use bootty_command::{
     AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome,
 };
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig};
+use bootty_mux::{
+    MuxBackendKind, MuxBindingConfig, SshTarget,
+    backend::MuxBackend,
+    capability::{BindingCapabilityDescriptor, BindingOperation},
+    command::MuxCommand,
+    controller::MuxScope,
+    provider::{
+        GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider, MuxBackendProvider,
+        MuxBackendRegistry, MuxCommandDispatch, PaneBehavior, PaneTopology, PersistedSessionPolicy,
+        SelectionPublicationPolicy, TerminalProgressPolicy, TerminalResidency,
+    },
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
+    terminal::{
+        BackendPanePolicy, PaneLayoutResizeRequest, PaneStartRequest, ScopedMuxPaneTarget,
+        TerminalRuntime,
+    },
+};
+use bootty_render::geometry::ViewTransform;
 use bootty_workspace::{
     BindingMembershipMutation, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
     WorkspaceRepository,
@@ -300,9 +299,9 @@ fn persist_before_publish_blocks_selection_when_restore_write_fails() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Tmux,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -350,9 +349,9 @@ fn native_pane_publication_error_is_preserved_on_successful_command() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path,
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Tmux,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -395,9 +394,9 @@ fn pending_ditch_completes_in_its_original_space() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Tmux,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -546,9 +545,9 @@ fn a_failed_placement_commit_preserves_the_live_and_durable_binding() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -672,9 +671,9 @@ fn an_inactive_placement_update_rebuilds_before_activation() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -771,9 +770,9 @@ fn one_frame_recovers_active_and_inactive_binding_membership() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Tmux,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -939,9 +938,9 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
     let config_path = directory.path().join("config.toml");
     let mut config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };

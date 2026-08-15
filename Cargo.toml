@@ -111,6 +111,7 @@ serde_json = "1"
 smallvec = "1"
 starship-battery = "0.11"
 strum = { version = "0.28", features = ["derive"] }
+thiserror = "2"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 syntect = { version = "5.3", default-features = false, features = [
   "default-fancy",
@@ -181,6 +182,7 @@ debug = false
 bootty-app = { path = "crates/bootty-app" }
 bootty-command = { path = "crates/bootty-command" }
 bootty-config = { path = "crates/bootty-config" }
+bootty-identity = { path = "crates/bootty-identity" }
 bootty-mux = { path = "crates/bootty-mux" }
 bootty-rmux = { path = "crates/bootty-rmux" }
 serde_json.workspace = true

@@ -1,6 +1,6 @@
 use std::{hint::black_box, sync::Arc};
 
-use bootty_app::{
+use bootty_render::{
     geometry::SurfaceRect,
     paint_plan::{PlanColor, TextAttrs},
     terminal_render::TextCommand,

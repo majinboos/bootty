@@ -1,10 +1,9 @@
-use bootty_app::{
+use bootty_render::{
     geometry::{CellMetrics, SurfaceRect, TerminalPadding, ViewTransform},
     paint_plan::{
         BackgroundRect, CursorPlan, CursorShape, CursorTextPlan, DecorationLine, DecorationStyle,
         PlanColor, TerminalPaintPlan, TextAttrs, TextRun,
     },
-    terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement},
     terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
     terminal_wgpu::{
@@ -12,6 +11,7 @@ use bootty_app::{
     },
 };
 use bootty_terminal::terminal_engine::TerminalEngine;
+use bootty_terminal::terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement};
 use bootty_winit::bare_host::{BareTerminalViewport, terminal_render_frame_for_bare_host};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -106,10 +106,10 @@ fn background_then_image_frame() -> TerminalRenderFrame {
     let mut frame = image_only_frame();
     frame.commands.insert(
         0,
-        TerminalRenderCommand::FillRect(bootty_app::terminal_render::FillCommand {
+        TerminalRenderCommand::FillRect(bootty_render::terminal_render::FillCommand {
             rect: SurfaceRect::from_min_size(0.0, 0.0, 10.0, 10.0),
             color: color(226, 230, 249),
-            role: bootty_app::terminal_render::FillRole::SurfaceBackground,
+            role: bootty_render::terminal_render::FillRole::SurfaceBackground,
         }),
     );
     frame

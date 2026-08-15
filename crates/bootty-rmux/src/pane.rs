@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -38,9 +38,16 @@ use bootty_mux::terminal::{
 };
 
 const RMUX_MAX_DRAIN_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
+const RMUX_MAX_PENDING_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const RMUX_MAX_DRAIN_CHUNKS_PER_TICK: usize = 32;
 const RMUX_MAX_DRAIN_SLICE_BYTES: usize = 8 * 1024;
 const RMUX_MAX_DRAIN_TIME_US: u128 = 20_000;
+const RMUX_WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
+const RMUX_WORKER_RESPONSE_COMPLETION_TIMEOUT: Duration = Duration::from_millis(100);
+const RMUX_REQUEST_PENDING: u8 = 0;
+const RMUX_REQUEST_RUNNING: u8 = 1;
+const RMUX_REQUEST_CANCELLED: u8 = 2;
+const RMUX_REQUEST_COMPLETE: u8 = 3;
 const RMUX_INPUT_FAST_PATH_DRAIN_BYTES: usize = 64 * 1024;
 const RMUX_INPUT_FAST_PATH_DRAIN_CHUNKS: usize = 8;
 const RMUX_INPUT_FAST_PATH_DRAIN_TIME_US: u128 = 2_000;
@@ -51,6 +58,86 @@ const RMUX_MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const RMUX_MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
 const RMUX_WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 const RMUX_INITIAL_FRAME_AGE: Duration = Duration::from_millis(16);
+
+struct RmuxWorkerRequest<T> {
+    state: Arc<AtomicU8>,
+    sender: mpsc::Sender<T>,
+}
+
+struct RmuxPendingResponse<T> {
+    state: Arc<AtomicU8>,
+    receiver: mpsc::Receiver<T>,
+}
+
+fn rmux_worker_request<T>() -> (RmuxWorkerRequest<T>, RmuxPendingResponse<T>) {
+    let state = Arc::new(AtomicU8::new(RMUX_REQUEST_PENDING));
+    let (sender, receiver) = mpsc::channel();
+    (
+        RmuxWorkerRequest {
+            state: Arc::clone(&state),
+            sender,
+        },
+        RmuxPendingResponse { state, receiver },
+    )
+}
+
+impl<T> RmuxWorkerRequest<T> {
+    fn try_claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RMUX_REQUEST_PENDING,
+                RMUX_REQUEST_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn send(self, response: T) {
+        if self.state.load(Ordering::Acquire) == RMUX_REQUEST_RUNNING {
+            let _ = self.sender.send(response);
+            self.state.store(RMUX_REQUEST_COMPLETE, Ordering::Release);
+        }
+    }
+}
+
+impl<T> RmuxPendingResponse<T> {
+    fn receive(self, operation: &'static str) -> Result<T> {
+        match self.receiver.recv_timeout(RMUX_WORKER_RESPONSE_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(anyhow::anyhow!("rmux terminal worker stopped"))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if self
+                    .state
+                    .compare_exchange(
+                        RMUX_REQUEST_PENDING,
+                        RMUX_REQUEST_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Err(anyhow::anyhow!("rmux terminal worker response timed out"));
+                }
+
+                match self
+                    .receiver
+                    .recv_timeout(RMUX_WORKER_RESPONSE_COMPLETION_TIMEOUT)
+                {
+                    Ok(response) => Ok(response),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(anyhow::anyhow!("rmux terminal worker stopped"))
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                        "rmux terminal worker completion unknown after {operation}; the request result is ambiguous"
+                    )),
+                }
+            }
+        }
+    }
+}
 
 struct RmuxNativeTerminal {
     command_tx: mpsc::Sender<RmuxTerminalCommand>,
@@ -117,25 +204,25 @@ enum RmuxTerminalCommand {
     SelectionEnd(Option<TerminalSelectionEvent>),
     FormatSelection {
         format: TerminalSelectionFormat,
-        done: mpsc::Sender<std::result::Result<Option<Vec<u8>>, String>>,
+        done: RmuxWorkerRequest<std::result::Result<Option<Vec<u8>>, String>>,
     },
     CopyModeActive {
-        done: mpsc::Sender<std::result::Result<bool, String>>,
+        done: RmuxWorkerRequest<std::result::Result<bool, String>>,
     },
     CopyModeAction {
         action: TerminalCopyModeAction,
-        done: mpsc::Sender<std::result::Result<TerminalCopyModeOutcome, String>>,
+        done: RmuxWorkerRequest<std::result::Result<TerminalCopyModeOutcome, String>>,
     },
     SearchViewport {
         query: String,
         direction: TerminalSearchDirection,
-        done: mpsc::Sender<std::result::Result<bool, String>>,
+        done: RmuxWorkerRequest<std::result::Result<bool, String>>,
     },
     IsMouseTracking {
-        done: mpsc::Sender<std::result::Result<bool, String>>,
+        done: RmuxWorkerRequest<std::result::Result<bool, String>>,
     },
     DiscardPendingOutput {
-        done: mpsc::Sender<std::result::Result<(), String>>,
+        done: RmuxWorkerRequest<std::result::Result<(), String>>,
     },
     Stop,
 }
@@ -329,16 +416,16 @@ impl RmuxNativeTerminal {
 
     fn request<T>(
         &mut self,
-        build: impl FnOnce(mpsc::Sender<std::result::Result<T, String>>) -> RmuxTerminalCommand,
+        operation: &'static str,
+        build: impl FnOnce(RmuxWorkerRequest<std::result::Result<T, String>>) -> RmuxTerminalCommand,
     ) -> Result<T> {
         self.check_worker_error()?;
-        let (done, response_rx) = mpsc::channel();
+        let (done, response) = rmux_worker_request();
         self.command_tx
             .send(build(done))
             .map_err(|_| anyhow::anyhow!("rmux terminal worker stopped"))?;
-        response_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("rmux terminal worker stopped"))?
+        response
+            .receive(operation)?
             .map_err(|error| anyhow::anyhow!(error))
     }
 
@@ -564,7 +651,9 @@ impl TerminalRuntime for RmuxNativeTerminal {
     }
 
     fn discard_pending_output(&mut self) -> Result<()> {
-        self.request(|done| RmuxTerminalCommand::DiscardPendingOutput { done })
+        self.request("discarding output", |done| {
+            RmuxTerminalCommand::DiscardPendingOutput { done }
+        })
     }
 
     fn force_resize(&mut self) -> Result<()> {
@@ -572,7 +661,9 @@ impl TerminalRuntime for RmuxNativeTerminal {
     }
 
     fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
-        self.request(|done| RmuxTerminalCommand::FormatSelection { format, done })
+        self.request("formatting selection", |done| {
+            RmuxTerminalCommand::FormatSelection { format, done }
+        })
     }
 
     fn current_working_directory(&mut self) -> Result<Option<String>> {
@@ -584,7 +675,9 @@ impl TerminalRuntime for RmuxNativeTerminal {
     }
 
     fn is_mouse_tracking(&mut self) -> Result<bool> {
-        self.request(|done| RmuxTerminalCommand::IsMouseTracking { done })
+        self.request("reporting mouse tracking", |done| {
+            RmuxTerminalCommand::IsMouseTracking { done }
+        })
     }
 
     fn scroll_viewport_delta(&mut self, delta: isize) -> Result<()> {
@@ -596,21 +689,27 @@ impl TerminalRuntime for RmuxNativeTerminal {
     }
 
     fn copy_mode_active(&mut self) -> Result<bool> {
-        self.request(|done| RmuxTerminalCommand::CopyModeActive { done })
+        self.request("reporting copy mode", |done| {
+            RmuxTerminalCommand::CopyModeActive { done }
+        })
     }
 
     fn handle_copy_mode_action(
         &mut self,
         action: TerminalCopyModeAction,
     ) -> Result<TerminalCopyModeOutcome> {
-        self.request(|done| RmuxTerminalCommand::CopyModeAction { action, done })
+        self.request("handling copy mode action", |done| {
+            RmuxTerminalCommand::CopyModeAction { action, done }
+        })
     }
 
     fn search_viewport(&mut self, query: &str, direction: TerminalSearchDirection) -> Result<bool> {
-        self.request(|done| RmuxTerminalCommand::SearchViewport {
-            query: query.to_owned(),
-            direction,
-            done,
+        self.request("searching scrollback", |done| {
+            RmuxTerminalCommand::SearchViewport {
+                query: query.to_owned(),
+                direction,
+                done,
+            }
         })
     }
 
@@ -914,50 +1013,67 @@ impl RmuxWorker {
                     }
                 }
                 RmuxTerminalCommand::FormatSelection { format, done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     let response = self
                         .engine
                         .format_selection(format)
                         .map_err(|error| error.to_string());
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 RmuxTerminalCommand::CopyModeActive { done } => {
-                    let _ = done.send(Ok(self.engine.copy_mode_active()));
+                    if done.try_claim() {
+                        done.send(Ok(self.engine.copy_mode_active()));
+                    }
                 }
                 RmuxTerminalCommand::CopyModeAction { action, done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     self.mark_input_fast_path();
                     let response = self
                         .engine
                         .handle_copy_mode_action(action)
                         .map_err(|error| error.to_string());
                     stats.terminal_changed = true;
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 RmuxTerminalCommand::SearchViewport {
                     query,
                     direction,
                     done,
                 } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     self.mark_input_fast_path();
                     let response = self
                         .engine
                         .search_viewport(&query, direction)
                         .map_err(|error| error.to_string());
                     stats.terminal_changed = true;
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 RmuxTerminalCommand::IsMouseTracking { done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     let response = self
                         .engine
                         .is_mouse_tracking()
                         .map_err(|error| error.to_string());
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 RmuxTerminalCommand::DiscardPendingOutput { done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     self.pending_output.clear();
                     self.pending_restore_output.clear();
                     self.pending_output_len.store(0, Ordering::Relaxed);
                     self.has_unpublished_frame = false;
-                    let _ = done.send(Ok(()));
+                    done.send(Ok(()));
                 }
                 RmuxTerminalCommand::Stop => {
                     self.command_disconnected = true;
@@ -974,11 +1090,12 @@ impl RmuxWorker {
         let mut collected_chunks = 0;
         while collected_chunks < RMUX_MAX_COLLECT_CHUNKS_PER_TICK
             && collected_bytes < RMUX_MAX_COLLECT_BYTES_PER_TICK
+            && self.total_pending_output_len() < RMUX_MAX_PENDING_OUTPUT_BYTES
         {
             let event = match self.pane_io.output_rx.try_recv() {
                 Ok(event) => event,
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                     self.output_closed = true;
                     self.closed.store(true, Ordering::Relaxed);
                     break;
@@ -986,29 +1103,27 @@ impl RmuxWorker {
             };
             did_work = true;
             match event {
-                RmuxPaneEvent::Restore {
-                    buffered_chunks,
-                    capture,
-                } => {
-                    for chunk in buffered_chunks {
+                RmuxPaneEvent::RestoreStart => {
+                    self.scroll_bottom_after_output = true;
+                }
+                RmuxPaneEvent::RestoreChunk(capture) => {
+                    if !capture.is_empty() {
                         collected_chunks += 1;
-                        if let Some(bytes) = pane_output_chunk_bytes(chunk) {
-                            collected_bytes += bytes.len();
-                            self.pending_pre_restore_output.push_back(bytes);
-                        }
+                        collected_bytes += capture.len();
+                        self.push_pending_restore_output(capture);
                     }
-                    if capture.is_empty() {
-                        self.waiting_initial_remote_frame = false;
-                        self.force_next_frame_publish = true;
-                    } else {
-                        collected_chunks += 1;
-                        let mut bytes = normalize_capture_newlines(&capture);
+                }
+                RmuxPaneEvent::RestoreEnd { has_capture } => {
+                    if has_capture {
                         // A captured snapshot is complete even when live output was cut mid-redraw.
-                        bytes.extend_from_slice(b"\x1b[?2026l");
+                        let bytes = b"\x1b[?2026l".to_vec();
+                        collected_chunks += 1;
                         collected_bytes += bytes.len();
                         self.push_pending_restore_output(bytes);
+                    } else {
+                        self.waiting_initial_remote_frame = false;
+                        self.force_next_frame_publish = true;
                     }
-                    self.scroll_bottom_after_output = true;
                 }
                 RmuxPaneEvent::Chunks(chunks) => {
                     for chunk in chunks {
@@ -1218,19 +1333,6 @@ impl RmuxWorker {
     fn send_error(&self, error: anyhow::Error) {
         let _ = self.error_tx.send(error.to_string());
     }
-}
-
-fn normalize_capture_newlines(bytes: &[u8]) -> Vec<u8> {
-    let mut normalized = Vec::with_capacity(bytes.len());
-    let mut previous = None;
-    for byte in bytes {
-        if *byte == b'\n' && previous != Some(b'\r') {
-            normalized.push(b'\r');
-        }
-        normalized.push(*byte);
-        previous = Some(*byte);
-    }
-    normalized
 }
 
 fn pane_output_chunk_bytes(chunk: PaneOutputChunk) -> Option<Vec<u8>> {

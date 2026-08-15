@@ -6,10 +6,11 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    fmt, fs,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
+use thiserror::Error;
 
 mod legacy;
 mod schema;
@@ -44,7 +45,8 @@ const DEFAULT_BINDING_NAME: &str = "Default Binding";
 ///
 /// `SQLite` details stay inside this module. Callers can distinguish a persistence failure without
 /// depending on rusqlite's error taxonomy or schema implementation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[error("workspace persistence error: {message}")]
 pub struct WorkspacePersistenceError {
     message: String,
 }
@@ -60,14 +62,6 @@ impl WorkspacePersistenceError {
         Self::new(message)
     }
 }
-
-impl fmt::Display for WorkspacePersistenceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "workspace persistence error: {}", self.message)
-    }
-}
-
-impl std::error::Error for WorkspacePersistenceError {}
 
 pub type WorkspaceResult<T> = Result<T, WorkspacePersistenceError>;
 

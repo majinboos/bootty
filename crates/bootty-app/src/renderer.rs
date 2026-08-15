@@ -4,25 +4,24 @@ use std::{
 };
 
 use anyhow::Result;
-use bootty_terminal::terminal_frame::{CursorSnapshot, FrameScrollbar, RenderCell, RenderFrame};
-use eframe::{
-    egui::{self, Color32, Pos2, Rect, Sense, Vec2},
-    wgpu,
-};
-
-use crate::{
+use bootty_render::{
     geometry::{
         CellMetrics, SurfacePoint, SurfaceRect, TerminalPadding, TerminalSurface, ViewTransform,
         fit_cell_height_to_available_space, fit_cell_width_to_available_space,
     },
     paint_plan::{CursorBlinkPhase, PaintPlanner, TerminalPaintPlan},
-    scheduler::CURSOR_BLINK_REFRESH_INTERVAL,
-    terminal_image::KittyImageFrame,
     terminal_render::{RenderFramePool, TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
     terminal_wgpu::{
         TerminalRendererId, terminal_render_callback_for_renderer, terminal_text_cell_metrics,
     },
+};
+use bootty_runtime::scheduler::CURSOR_BLINK_REFRESH_INTERVAL;
+use bootty_terminal::terminal_frame::{CursorSnapshot, FrameScrollbar, RenderCell, RenderFrame};
+use bootty_terminal::terminal_image::KittyImageFrame;
+use eframe::{
+    egui::{self, Color32, Pos2, Rect, Sense, Vec2},
+    wgpu,
 };
 
 mod workspace_view;
@@ -146,7 +145,7 @@ impl TerminalWidget {
                 .is_some_and(|source| Arc::ptr_eq(source, frame))
     }
 
-    pub fn initial_geometry() -> crate::geometry::TerminalGeometry {
+    pub fn initial_geometry() -> bootty_render::geometry::TerminalGeometry {
         TerminalSurface::for_logical_size(
             1000.0,
             672.0,
@@ -219,7 +218,7 @@ impl TerminalWidget {
         (self.cell.width, self.cell.height)
     }
 
-    pub fn geometry_for_rect(&self, rect: Rect) -> crate::geometry::TerminalGeometry {
+    pub fn geometry_for_rect(&self, rect: Rect) -> bootty_render::geometry::TerminalGeometry {
         TerminalSurface::for_rect(surface_rect(rect), self.cell_metrics_for_rect(rect)).geometry()
     }
     fn cell_metrics_for_rect(&self, rect: Rect) -> CellMetrics {

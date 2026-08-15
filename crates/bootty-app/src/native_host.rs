@@ -5,7 +5,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bootty_config::config::BoottyConfig;
 use bootty_control::{ControlPlane, ControlServer};
+use bootty_identity::ApplicationIdentity;
+use bootty_winit::direct_input::{
+    DirectKeyInput, ModifierSideState, direct_key_input_from_winit_event,
+};
 use eframe::UserEvent;
 use winit::{
     application::ApplicationHandler,
@@ -15,12 +20,7 @@ use winit::{
     window::WindowId,
 };
 
-use crate::{
-    BoottyApp,
-    application_identity::ApplicationIdentity,
-    config::BoottyConfig,
-    direct_input::{DirectKeyInput, ModifierSideState, direct_key_input_from_winit_event},
-};
+use crate::BoottyApp;
 
 pub fn run(
     options: eframe::NativeOptions,

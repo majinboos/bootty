@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 
 use bootty_app::{
-    color::Color,
-    config::BoottyConfig,
     input::{focus::InputFocus, router::route_events},
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession},
-    },
     strings::{csv_field, is_uniquified_session_name, push_truncated_label, unique_session_name},
     theme::theme_palette_from_colors,
     ui::session_navigation::BindingSessionGroup,
+};
+use bootty_config::{color::Color, config::BoottyConfig};
+use bootty_mux::{
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession},
 };
 use egui::{Color32, Event, Key, Modifiers};
 

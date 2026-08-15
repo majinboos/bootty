@@ -1,13 +1,11 @@
 use std::{fs, hint::black_box, path::PathBuf};
 
-use bootty_app::{
-    config::{
-        BoottyConfig, MultiplexerBackendConfig, builtin_theme_names, load_config_from_path,
-        resolve_theme, write_font_size_preference,
-    },
-    input::resolve_modifier_remaps,
-    input_binding_set::BindingSet,
+use bootty_app::input::resolve_modifier_remaps;
+use bootty_config::config::{
+    BoottyConfig, MultiplexerBackendConfig, builtin_theme_names, load_config_from_path,
+    resolve_theme, write_font_size_preference,
 };
+use bootty_winit::input_binding_set::BindingSet;
 use bootty_workspace::{SessionOrderStore, WorkspaceRepository};
 use criterion::{Criterion, criterion_group, criterion_main};
 

@@ -1,9 +1,9 @@
 use eframe::egui;
 
-use super::SettingsWindow;
+use super::SettingsSurface;
 use bootty_font::{FontFeature, parse_font_features};
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     let installed = win
         .font_families
@@ -92,7 +92,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
             path: &["font", "cell-width"],
             range: 1.0..=64.0,
             suffix: "px",
-            default_value: crate::geometry::DEFAULT_CELL_WIDTH,
+            default_value: bootty_render::geometry::DEFAULT_CELL_WIDTH,
             field: |font| &mut font.cell_width,
         },
     );
@@ -105,7 +105,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
             path: &["font", "cell-height"],
             range: 1.0..=128.0,
             suffix: "px",
-            default_value: crate::geometry::DEFAULT_LINE_HEIGHT,
+            default_value: bootty_render::geometry::DEFAULT_LINE_HEIGHT,
             field: |font| &mut font.cell_height,
         },
     );
@@ -347,7 +347,7 @@ fn font_stack_row(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, row: Font
     ui.add_space(8.0);
 }
 
-fn font_feature_picker(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+fn font_feature_picker(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     let mut features = win
         .config
@@ -407,7 +407,7 @@ fn font_feature_picker(win: &mut SettingsWindow, ui: &mut egui::Ui) {
 
 fn feature_option(
     ui: &mut egui::Ui,
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     features: &mut Vec<String>,
     feature: &FontFeatureOption,
     card_width: f32,
@@ -522,7 +522,7 @@ const FONT_FEATURES: &[FontFeatureOption] = &[
     },
 ];
 
-fn write_feature_values(win: &mut SettingsWindow, features: &[String]) {
+fn write_feature_values(win: &mut SettingsSurface, features: &[String]) {
     let mut normalized = Vec::new();
     for feature in features {
         if let Some(value) = normalized_feature(feature)
@@ -534,7 +534,7 @@ fn write_feature_values(win: &mut SettingsWindow, features: &[String]) {
     write_features(win, &normalized.join(", "));
 }
 
-fn write_features(win: &mut SettingsWindow, features: &str) {
+fn write_features(win: &mut SettingsSurface, features: &str) {
     let mut parsed = Vec::new();
     for feature in parse_font_features(features) {
         if !parsed.contains(&feature) {
@@ -554,7 +554,7 @@ fn normalized_feature(value: &str) -> Option<String> {
     FontFeature::parse(value).map(|feature| feature.to_string())
 }
 
-fn slider(ui: &mut egui::Ui, win: &mut SettingsWindow, row: MetricSliderRow<'_>) {
+fn slider(ui: &mut egui::Ui, win: &mut SettingsSurface, row: MetricSliderRow<'_>) {
     super::settings_row(ui, win.palette, row.label, row.help, |ui| {
         let mut value = *(row.field)(&mut win.config.font);
         if super::settings_slider_with_edit(
@@ -581,7 +581,7 @@ struct MetricSliderRow<'a> {
     path: &'a [&'a str],
     range: std::ops::RangeInclusive<f32>,
     suffix: &'a str,
-    field: fn(&mut crate::config::FontConfig) -> &mut f32,
+    field: fn(&mut bootty_config::config::FontConfig) -> &mut f32,
 }
 
 struct MetricOverrideRow<'a> {
@@ -591,10 +591,10 @@ struct MetricOverrideRow<'a> {
     range: std::ops::RangeInclusive<f32>,
     suffix: &'a str,
     default_value: f32,
-    field: fn(&mut crate::config::FontConfig) -> &mut Option<f32>,
+    field: fn(&mut bootty_config::config::FontConfig) -> &mut Option<f32>,
 }
 
-fn optional_slider(ui: &mut egui::Ui, win: &mut SettingsWindow, row: MetricOverrideRow<'_>) {
+fn optional_slider(ui: &mut egui::Ui, win: &mut SettingsSurface, row: MetricOverrideRow<'_>) {
     super::settings_row(ui, win.palette, row.label, row.help, |ui| {
         let current = *(row.field)(&mut win.config.font);
         let mut value = current.unwrap_or(row.default_value);

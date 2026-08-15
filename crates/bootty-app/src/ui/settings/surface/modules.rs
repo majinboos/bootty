@@ -10,7 +10,7 @@ use eframe::egui::{self, RichText};
 
 use crate::theme::module_color32;
 
-use super::SettingsWindow;
+use super::SettingsSurface;
 
 #[derive(Default)]
 pub(super) struct EditorState {
@@ -29,7 +29,7 @@ pub(super) struct EditorState {
     preview: Vec<SurfaceSnapshot>,
 }
 
-pub(super) fn sidebar_ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     let Some(root) = extension_root(win) else {
         return;
@@ -108,10 +108,10 @@ pub(super) fn sidebar_ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
 }
 
 pub(super) fn settings_pane<T>(
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     ui: &mut egui::Ui,
-    selector: impl FnOnce(&mut SettingsWindow, &mut egui::Ui) -> T,
-    content: impl FnOnce(&mut SettingsWindow, &mut egui::Ui, T),
+    selector: impl FnOnce(&mut SettingsSurface, &mut egui::Ui) -> T,
+    content: impl FnOnce(&mut SettingsSurface, &mut egui::Ui, T),
 ) {
     let selector_width = (ui.available_width() * 0.25).clamp(210.0, 280.0);
     ui.horizontal_top(|ui| {
@@ -132,7 +132,7 @@ pub(super) fn settings_pane<T>(
 }
 
 pub(super) fn source_editor_for_surface(
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     ui: &mut egui::Ui,
     surface: &str,
 ) {
@@ -147,7 +147,7 @@ pub(super) fn source_editor_for_surface(
     source_editor(win, ui, &identity);
 }
 
-fn source_editor(win: &mut SettingsWindow, ui: &mut egui::Ui, identity: &ModuleIdentity) {
+fn source_editor(win: &mut SettingsSurface, ui: &mut egui::Ui, identity: &ModuleIdentity) {
     let palette = win.palette;
     let Some(root) = extension_root(win) else {
         return;
@@ -181,7 +181,10 @@ fn source_editor(win: &mut SettingsWindow, ui: &mut egui::Ui, identity: &ModuleI
         });
 }
 
-pub(super) fn new_module_ui(win: &mut SettingsWindow, ui: &mut egui::Ui) -> Option<ModuleIdentity> {
+pub(super) fn new_module_ui(
+    win: &mut SettingsSurface,
+    ui: &mut egui::Ui,
+) -> Option<ModuleIdentity> {
     let palette = win.palette;
     if !win.module_editor.creating {
         if super::settings_button(ui, palette, "+ New module").clicked() {
@@ -429,7 +432,7 @@ fn load_editor(state: &mut EditorState, root: &Path, identity: &ModuleIdentity) 
     state.preview_source.clear();
 }
 
-fn extension_root(win: &SettingsWindow) -> Option<PathBuf> {
+fn extension_root(win: &SettingsSurface) -> Option<PathBuf> {
     win.writeback
         .path()
         .parent()

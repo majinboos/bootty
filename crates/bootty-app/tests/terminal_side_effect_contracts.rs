@@ -7,13 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_app::{
-    AppEffect, AppState, FrameInputs, ViewportSnapshot,
-    config::{MultiplexerBackendConfig, load_config_from_path},
-    geometry::ViewTransform,
-    mux::snapshot::MuxPaneAnchor,
-    renderer::RendererMetrics,
-};
+use bootty_app::{AppEffect, AppState, FrameInputs, ViewportSnapshot, renderer::RendererMetrics};
+use bootty_config::config::{MultiplexerBackendConfig, load_config_from_path};
+use bootty_mux::snapshot::MuxPaneAnchor;
+use bootty_render::geometry::ViewTransform;
 
 mod support;
 

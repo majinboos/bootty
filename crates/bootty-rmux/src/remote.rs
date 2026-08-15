@@ -23,7 +23,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use crate::backend::RmuxBackend;
 use crate::bridge::rmux_execute;
 #[cfg(feature = "app")]
-use crate::pane_io::RmuxPaneIo;
+use crate::pane_io::{RMUX_OUTPUT_CHANNEL_CAPACITY, RmuxPaneIo};
 use crate::pane_io::{RmuxPaneEvent, RmuxPaneTarget, open_rmux_pane_io, resize_rmux_pane};
 use bootty_mux::command::MuxCommand;
 #[cfg(feature = "app")]
@@ -64,10 +64,9 @@ pub enum RemoteRmuxRequest {
 
 #[derive(Debug, Deserialize, Serialize)]
 enum RemotePaneFrame {
-    Restore {
-        capture: String,
-        buffered_chunks: Vec<String>,
-    },
+    RestoreStart,
+    RestoreChunk(String),
+    RestoreEnd { has_capture: bool },
     Chunks(Vec<String>),
     KeyboardProtocol(String),
     Error(String),
@@ -125,7 +124,7 @@ pub(crate) fn open_remote_rmux_pane_io(
     })?;
     remote.ensure_daemon()?;
     let session = target.session_selector().to_owned();
-    let (output_tx, output_rx) = mpsc::channel();
+    let (output_tx, output_rx) = tokio_mpsc::channel(RMUX_OUTPUT_CHANNEL_CAPACITY);
     let (input_tx, input_rx) = tokio_mpsc::unbounded_channel();
     let (resize_tx, resize_rx) = tokio_mpsc::unbounded_channel();
     let (result_tx, result_rx) = mpsc::channel();
@@ -217,9 +216,9 @@ pub fn run_remote_rmux_command(payload: &str) -> Result<i32> {
 }
 
 fn stream_pane(session: String, pane: String, max_scrollback: usize) -> Result<()> {
-    let io = open_rmux_pane_io(RmuxPaneTarget::new(session, Some(pane)), max_scrollback)?;
+    let mut io = open_rmux_pane_io(RmuxPaneTarget::new(session, Some(pane)), max_scrollback)?;
     let mut stdout = BufWriter::new(std::io::stdout().lock());
-    for event in io.output_rx {
+    while let Some(event) = io.output_rx.blocking_recv() {
         let frame = pane_frame(event);
         serde_json::to_writer(&mut stdout, &frame)?;
         stdout.write_all(b"\n")?;
@@ -233,13 +232,11 @@ fn stream_pane(session: String, pane: String, max_scrollback: usize) -> Result<(
 
 fn pane_frame(event: RmuxPaneEvent) -> RemotePaneFrame {
     match event {
-        RmuxPaneEvent::Restore {
-            buffered_chunks,
-            capture,
-        } => RemotePaneFrame::Restore {
-            capture: URL_SAFE_NO_PAD.encode(capture),
-            buffered_chunks: encode_chunks(buffered_chunks),
-        },
+        RmuxPaneEvent::RestoreStart => RemotePaneFrame::RestoreStart,
+        RmuxPaneEvent::RestoreChunk(bytes) => {
+            RemotePaneFrame::RestoreChunk(URL_SAFE_NO_PAD.encode(bytes))
+        }
+        RmuxPaneEvent::RestoreEnd { has_capture } => RemotePaneFrame::RestoreEnd { has_capture },
         RmuxPaneEvent::Chunks(chunks) => RemotePaneFrame::Chunks(encode_chunks(chunks)),
         RmuxPaneEvent::KeyboardProtocol(bytes) => {
             RemotePaneFrame::KeyboardProtocol(URL_SAFE_NO_PAD.encode(bytes))
@@ -278,8 +275,8 @@ fn decode_chunks(chunks: Vec<String>) -> Result<Vec<PaneOutputChunk>> {
 }
 
 fn input_pane(session: String, pane: String) -> Result<()> {
-    let io = open_rmux_pane_io(RmuxPaneTarget::new(session, Some(pane)), 0)?;
-    thread::spawn(move || for _ in io.output_rx {});
+    let mut io = open_rmux_pane_io(RmuxPaneTarget::new(session, Some(pane)), 0)?;
+    thread::spawn(move || while io.output_rx.blocking_recv().is_some() {});
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let bytes = decode_input_line(&line?)?;
@@ -306,7 +303,7 @@ fn spawn_output(
     session: String,
     pane: String,
     max_scrollback: usize,
-    output_tx: mpsc::Sender<RmuxPaneEvent>,
+    output_tx: tokio_mpsc::Sender<RmuxPaneEvent>,
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let request = RemoteRmuxRequest::PaneStream {
@@ -336,7 +333,7 @@ fn spawn_output(
                 .and_then(decode_frame);
             match result {
                 Ok(event) => {
-                    if output_tx.send(event).is_err() {
+                    if output_tx.blocking_send(event).is_err() {
                         return;
                     }
                 }
@@ -354,15 +351,13 @@ fn spawn_output(
 #[cfg(feature = "app")]
 fn decode_frame(frame: RemotePaneFrame) -> Result<RmuxPaneEvent> {
     Ok(match frame {
-        RemotePaneFrame::Restore {
-            capture,
-            buffered_chunks,
-        } => RmuxPaneEvent::Restore {
-            capture: URL_SAFE_NO_PAD
+        RemotePaneFrame::RestoreStart => RmuxPaneEvent::RestoreStart,
+        RemotePaneFrame::RestoreChunk(capture) => RmuxPaneEvent::RestoreChunk(
+            URL_SAFE_NO_PAD
                 .decode(capture)
                 .context("decode remote terminal restore")?,
-            buffered_chunks: decode_chunks(buffered_chunks)?,
-        },
+        ),
+        RemotePaneFrame::RestoreEnd { has_capture } => RmuxPaneEvent::RestoreEnd { has_capture },
         RemotePaneFrame::Chunks(chunks) => RmuxPaneEvent::Chunks(decode_chunks(chunks)?),
         RemotePaneFrame::KeyboardProtocol(bytes) => RmuxPaneEvent::KeyboardProtocol(
             URL_SAFE_NO_PAD

@@ -1,6 +1,7 @@
-use std::{error::Error, fmt, str::FromStr};
+use std::{fmt, str::FromStr};
 
 use crate::terminal::KeyMods;
+use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Modifier {
@@ -33,22 +34,13 @@ pub struct ModifierRemapSet {
     entries: Vec<RemapEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ModifierRemapParseError {
+    #[error("missing modifier remap assignment")]
     MissingAssignment,
+    #[error("invalid modifier remap modifier {0:?}")]
     InvalidModifier(String),
 }
-
-impl fmt::Display for ModifierRemapParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MissingAssignment => write!(f, "missing modifier remap assignment"),
-            Self::InvalidModifier(input) => write!(f, "invalid modifier remap modifier {input:?}"),
-        }
-    }
-}
-
-impl Error for ModifierRemapParseError {}
 
 impl ModifierRemapSet {
     pub fn parse(&mut self, input: &str) -> Result<(), ModifierRemapParseError> {

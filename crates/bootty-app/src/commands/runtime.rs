@@ -10,14 +10,6 @@ use std::{
 use crate::{
     app_actions::{AppAction, KeybindAction, MuxKeyAction},
     commands::{CommandCatalog, CommandExecutor, CoreCommandExecutor},
-    mux::{
-        RepaintHandle,
-        capability::BindingOperationOutcome,
-        command::MuxCommand,
-        controller::{MuxCommandCompletion, MuxCommandError, MuxCommandResult, MuxScope},
-        provider::PaneTopology,
-        terminal::decode_scoped_pane_id,
-    },
     state::{AppEffect, AppState, ViewportSnapshot},
     workspace_runtime::WorkspaceRuntime,
 };
@@ -25,6 +17,14 @@ use bootty_command::{
     AppCommandReceiver, AppCommandRequest, AppCommandSender, BoundAppCommandSender, Caller,
     CommandCancellation, CommandInvocation, CommandOutcome, CommandTarget, MutationClass,
     ResourceKind, app_command_channel,
+};
+use bootty_mux::{
+    RepaintHandle,
+    capability::BindingOperationOutcome,
+    command::MuxCommand,
+    controller::{MuxCommandCompletion, MuxCommandError, MuxCommandResult, MuxScope},
+    provider::PaneTopology,
+    terminal::decode_scoped_pane_id,
 };
 use bootty_workspace::BindingMembershipMutation;
 

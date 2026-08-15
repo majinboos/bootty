@@ -1,9 +1,9 @@
 use crate::{
-    font_database::system_font_database,
+    font_database::{load_matching_font, system_font_database},
     geometry::CellMetrics,
-    terminal_text::{FontStyle, ResolvedFontFace},
+    terminal_text::ResolvedFontFace,
 };
-use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
@@ -58,17 +58,19 @@ impl TerminalFontCache {
 fn load_terminal_font(database: &fontdb::Database, face: &ResolvedFontFace) -> Option<FontArc> {
     for family in terminal_font_family_priority(face) {
         if family == "monospace" {
-            if let Some(font) = load_matching_font(database, &[fontdb::Family::Monospace], face) {
+            if let Some(font) =
+                load_matching_font(database, &[fontdb::Family::Monospace], face.style)
+            {
                 return Some(font);
             }
         } else if let Some(font) =
-            load_matching_font(database, &[fontdb::Family::Name(&family)], face)
+            load_matching_font(database, &[fontdb::Family::Name(&family)], face.style)
         {
             return Some(font);
         }
     }
 
-    load_matching_font(database, &[fontdb::Family::Monospace], face)
+    load_matching_font(database, &[fontdb::Family::Monospace], face.style)
 }
 
 pub(super) fn terminal_font_family_priority(face: &ResolvedFontFace) -> Vec<String> {
@@ -87,41 +89,6 @@ pub(super) fn terminal_font_family_priority(face: &ResolvedFontFace) -> Vec<Stri
 fn push_family(families: &mut Vec<String>, family: &str) {
     if !families.iter().any(|existing| existing == family) {
         families.push(family.to_owned());
-    }
-}
-
-fn load_matching_font(
-    database: &fontdb::Database,
-    families: &[fontdb::Family<'_>],
-    face: &ResolvedFontFace,
-) -> Option<FontArc> {
-    let id = database.query(&fontdb::Query {
-        families,
-        weight: font_weight(face.style),
-        style: font_style(face.style),
-        ..fontdb::Query::default()
-    })?;
-
-    database
-        .with_face_data(id, |data, face_index| {
-            FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                .ok()
-                .map(FontArc::new)
-        })
-        .flatten()
-}
-
-fn font_weight(style: FontStyle) -> fontdb::Weight {
-    match style {
-        FontStyle::Bold | FontStyle::BoldItalic => fontdb::Weight::BOLD,
-        FontStyle::Regular | FontStyle::Italic => fontdb::Weight::NORMAL,
-    }
-}
-
-fn font_style(style: FontStyle) -> fontdb::Style {
-    match style {
-        FontStyle::Italic | FontStyle::BoldItalic => fontdb::Style::Italic,
-        FontStyle::Regular | FontStyle::Bold => fontdb::Style::Normal,
     }
 }
 

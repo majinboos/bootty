@@ -3,13 +3,6 @@ use std::{collections::HashMap, hint::black_box, path::PathBuf, sync::Arc, time:
 use anyhow::Result;
 use bootty_app::{
     AppState, FrameInputs, ModalDialog, ViewportSnapshot,
-    config::{BoottyConfig, MultiplexerBackendConfig},
-    geometry::{TerminalGeometry, ViewTransform},
-    mux::{
-        RepaintHandle,
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
-    },
     renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
@@ -18,6 +11,14 @@ use bootty_app::{
         space::SpaceEditorEvent,
     },
 };
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_mux::{
+    RepaintHandle,
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+};
+use bootty_render::geometry::{TerminalGeometry, ViewTransform};
+use bootty_render::terminal_text::TerminalTextConfig;
 use bootty_terminal::{terminal_engine::TerminalEngine, terminal_frame::RenderFrame};
 use bootty_ui::icons;
 use bootty_workspace::SpaceMuxOverride;
@@ -57,7 +58,10 @@ impl TerminalFrameSource for BenchTerminal {
         Ok(())
     }
 
-    fn set_render_cell_metrics(&mut self, cell: bootty_app::geometry::CellMetrics) -> Result<()> {
+    fn set_render_cell_metrics(
+        &mut self,
+        cell: bootty_render::geometry::CellMetrics,
+    ) -> Result<()> {
         self.engine.set_render_cell_metrics(cell);
         Ok(())
     }
@@ -260,7 +264,7 @@ fn status_ui_frame(ui: &mut egui::Ui, selected: Option<&str>) {
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
             let segments = [chrome::ResolvedSegment {
-                align: bootty_app::config::SegmentAlign::Left,
+                align: bootty_config::config::SegmentAlign::Left,
                 source_slot: 0,
                 items: vec![chrome::ResolvedItem {
                     text: selected.unwrap_or("session").to_owned(),
@@ -429,7 +433,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
 
     let mut terminal = BenchTerminal::new(109, 39);
     let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Rgba8Unorm))
-        .with_text_config(bootty_app::terminal_text::TerminalTextConfig::default());
+        .with_text_config(TerminalTextConfig::default());
     let mut tick = 0_u32;
     c.bench_function("egui_frame_terminal_active_109x39", |b| {
         b.iter(|| {
@@ -472,7 +476,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
 
     let mut combined_terminal = BenchTerminal::new(109, 39);
     let mut combined_widget = TerminalWidget::new(Some(wgpu::TextureFormat::Rgba8Unorm))
-        .with_text_config(bootty_app::terminal_text::TerminalTextConfig::default());
+        .with_text_config(TerminalTextConfig::default());
     let mut combined_tick = 0_u32;
     c.bench_function(
         "egui_frame_terminal_sidebar_status_109x39_384_sessions",

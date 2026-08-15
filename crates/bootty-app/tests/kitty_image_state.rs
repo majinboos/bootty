@@ -1,7 +1,5 @@
-use bootty_app::{
-    geometry::{CellMetrics, TerminalPadding, TerminalSurface},
-    terminal_image::{KittyImageLayer, placement_destination},
-};
+use bootty_render::geometry::{CellMetrics, TerminalPadding, TerminalSurface};
+use bootty_terminal::terminal_image::{KittyImageLayer, placement_destination};
 use libghostty_vt::kitty::graphics::PlacementRenderInfo;
 
 #[test]

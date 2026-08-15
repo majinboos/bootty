@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use super::{BindingRuntime, WorkspaceRuntime};
-use crate::{mux::snapshot::MuxSession, ui::session_navigation::BindingSessionGroup};
+use crate::ui::session_navigation::BindingSessionGroup;
+use bootty_mux::snapshot::MuxSession;
 
 const UNCLAIMED_SESSIONS_LABEL: &str = "No space";
 

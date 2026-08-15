@@ -15,7 +15,45 @@ use bootty_mux::{
     provider::{MuxBackendProvider, MuxBackendRegistry},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, session_matches},
 };
+#[cfg(unix)]
+use bootty_rmux::endpoint_path_for;
 use rusqlite::Connection;
+#[cfg(unix)]
+use std::sync::OnceLock;
+#[cfg(unix)]
+use tokio::runtime::Builder;
+
+#[cfg(unix)]
+fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
+    static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    STARTED
+        .get_or_init(|| {
+            let socket = endpoint_path_for(ApplicationIdentity::Production)
+                .map_err(|error| error.to_string())?;
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let started_tx = ready_tx.clone();
+                let result = (|| -> Result<()> {
+                    let runtime = Builder::new_multi_thread().enable_all().build()?;
+                    runtime.block_on(async {
+                        let daemon =
+                            rmux_server::ServerDaemon::new(rmux_server::DaemonConfig::new(socket))
+                                .bind()
+                                .await?;
+                        let _ = started_tx.send(Ok(()));
+                        daemon.wait().await
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            });
+            ready_rx.recv().map_err(|error| error.to_string())?
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
 
 struct MarkerBackend;
 
@@ -682,7 +720,7 @@ fn real_daemon_recovers_rmux_success_after_catalog_failure_helper() -> Result<()
     if std::env::var_os(REAL_DAEMON_HELPER_ENV).is_none() {
         return Ok(());
     }
-    bootty_rmux::start_embedded_rmux_daemon_for_tests()?;
+    start_embedded_rmux_daemon_for_tests()?;
     let root = std::path::PathBuf::from(
         std::env::var_os("BOOTTY_DAEMON_RECOVERY_ROOT").expect("recovery root"),
     );

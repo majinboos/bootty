@@ -178,7 +178,7 @@ pub(super) fn preview_run_cache() -> Arc<RunCache> {
             .map(str::to_owned)
             .to_vec(),
         ),
-        "12\t3\tcrates/bootty-app/src/ui/settings/modules.rs".to_owned(),
+        "12\t3\tcrates/bootty-app/src/ui/settings/surface.rs".to_owned(),
     )];
     if let Ok(mut entries) = cache.entries.lock() {
         for (command, output) in commands {

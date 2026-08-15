@@ -15,6 +15,10 @@ mod writeback;
 
 use std::path::PathBuf;
 
+use bootty_config::{
+    color::Color,
+    config::{BoottyConfig, MultiplexerBackendConfig, SidebarPosition},
+};
 use bootty_ui::settings::{
     ComboStyle, DragHandle, NumberEditSpec, apply_reorder, described_combo, path_row,
     reorderable_list, searchable_combo, section, settings_button, settings_color_picker,
@@ -23,13 +27,8 @@ use bootty_ui::settings::{
     settings_text_edit, settings_text_edit_width, settings_toggle, settings_toggle_row,
 };
 use bootty_ui::{Theme, ThemePalette, icons, readable_color};
+use bootty_winit::direct_input::ModifierSideState;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, UiBuilder, Vec2};
-
-use crate::{
-    color::Color,
-    config::{BoottyConfig, MultiplexerBackendConfig, SidebarPosition},
-    direct_input::ModifierSideState,
-};
 
 const SEARCH_ID: &str = "bootty::settings::search";
 
@@ -278,7 +277,7 @@ pub struct SettingsSurface {
     search: String,
     font_families: Option<Vec<String>>,
     theme_names: Option<Vec<String>>,
-    appearance_variant: crate::config::AppearanceVariant,
+    appearance_variant: bootty_config::config::AppearanceVariant,
     remote_editor: remotes::EditorState,
     /// Which keybind list is being edited (global, or one of the per-backend lists).
     keybind_scope: keybinds::KeybindScope,
@@ -309,8 +308,6 @@ pub struct SettingsSurface {
     module_editor: modules::EditorState,
 }
 
-pub(super) type SettingsWindow = SettingsSurface;
-
 impl SettingsSurface {
     #[must_use]
     pub fn new(config: BoottyConfig) -> Self {
@@ -323,7 +320,7 @@ impl SettingsSurface {
             search: String::new(),
             font_families: None,
             theme_names: None,
-            appearance_variant: crate::config::AppearanceVariant::Dark,
+            appearance_variant: bootty_config::config::AppearanceVariant::Dark,
             remote_editor: remotes::EditorState::default(),
             keybind_scope: keybinds::KeybindScope::Global,
             keybind_rows: None,
@@ -878,7 +875,7 @@ impl SettingsSurface {
 
 /// Re-resolve `win.config` from the config file so read paths (resolved shortcuts, effective
 /// prefix, theme previews) reflect what was just written.
-fn reload_settings_config(win: &mut SettingsWindow) {
+fn reload_settings_config(win: &mut SettingsSurface) {
     if let Some(config) = win.writeback.reload() {
         win.config = config;
     }
@@ -978,7 +975,7 @@ fn status_preview_bar(
     palette: ThemePalette,
     height: f32,
     status_background: Color32,
-    segments: &[crate::config::StatusSegment],
+    segments: &[bootty_config::config::StatusSegment],
 ) {
     let (bar, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), height),
@@ -991,9 +988,12 @@ fn status_preview_bar(
     );
 
     for (align, x_anchor) in [
-        (crate::config::SegmentAlign::Left, bar.left() + 10.0),
-        (crate::config::SegmentAlign::Center, bar.center().x),
-        (crate::config::SegmentAlign::Right, bar.right() - 10.0),
+        (bootty_config::config::SegmentAlign::Left, bar.left() + 10.0),
+        (bootty_config::config::SegmentAlign::Center, bar.center().x),
+        (
+            bootty_config::config::SegmentAlign::Right,
+            bar.right() - 10.0,
+        ),
     ] {
         let modules: Vec<_> = segments
             .iter()
@@ -1001,9 +1001,9 @@ fn status_preview_bar(
             .collect();
         let width = modules.len() as f32 * 92.0;
         let mut x = match align {
-            crate::config::SegmentAlign::Left => x_anchor,
-            crate::config::SegmentAlign::Center => x_anchor - width * 0.5,
-            crate::config::SegmentAlign::Right => x_anchor - width,
+            bootty_config::config::SegmentAlign::Left => x_anchor,
+            bootty_config::config::SegmentAlign::Center => x_anchor - width * 0.5,
+            bootty_config::config::SegmentAlign::Right => x_anchor - width,
         };
         for segment in modules {
             let bg = segment.bg.map_or(palette.hover, color_to_egui);
@@ -1044,7 +1044,7 @@ fn sidebar_color_row(
     help: &str,
     path: &[&str],
     seed: Color32,
-    field: fn(&mut crate::config::SidebarConfig) -> &mut Option<Color>,
+    field: fn(&mut bootty_config::config::SidebarConfig) -> &mut Option<Color>,
 ) {
     settings_row(ui, win.palette, label, help, |ui| {
         let current = *field(&mut win.config.sidebar);
@@ -1074,7 +1074,7 @@ fn chrome_color_row(
     help: &str,
     path: &[&str],
     seed: Color32,
-    field: fn(&mut crate::config::ChromeConfig) -> &mut Option<Color>,
+    field: fn(&mut bootty_config::config::ChromeConfig) -> &mut Option<Color>,
 ) {
     settings_row(ui, win.palette, label, help, |ui| {
         let current = *field(&mut win.config.chrome);
@@ -1104,7 +1104,7 @@ fn chrome_color_row_with_alpha(
     help: &str,
     path: &[&str],
     seed: Color32,
-    field: fn(&mut crate::config::ChromeConfig) -> &mut Option<Color>,
+    field: fn(&mut bootty_config::config::ChromeConfig) -> &mut Option<Color>,
 ) {
     settings_row(ui, win.palette, label, help, |ui| {
         let current = *field(&mut win.config.chrome);
