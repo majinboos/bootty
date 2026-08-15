@@ -282,38 +282,28 @@ fn replace_file(temporary: &Path, target: &Path, _target_exists: bool) -> io::Re
 
 #[cfg(windows)]
 fn replace_file(temporary: &Path, target: &Path, target_exists: bool) -> io::Result<()> {
-    use std::{os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_WRITE_THROUGH, MoveFileExW, ReplaceFileW,
-    };
-
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>()
-    };
-    let temporary = wide(temporary);
-    let target = wide(target);
-    let result = unsafe {
-        if target_exists {
-            ReplaceFileW(
-                target.as_ptr(),
-                temporary.as_ptr(),
-                ptr::null(),
-                0,
-                ptr::null(),
-                ptr::null(),
-            )
-        } else {
-            MoveFileExW(temporary.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH)
-        }
-    };
-    if result == 0 {
-        Err(io::Error::last_os_error())
+    let temporary = temporary.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows paths must be valid UTF-8",
+        )
+    })?;
+    let target = target.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows paths must be valid UTF-8",
+        )
+    })?;
+    let result = if target_exists {
+        winsafe::ReplaceFile(target, temporary, None, winsafe::co::REPLACEFILE::default())
     } else {
-        Ok(())
-    }
+        winsafe::MoveFileEx(
+            temporary,
+            Some(target),
+            winsafe::co::MOVEFILE::WRITE_THROUGH,
+        )
+    };
+    result.map_err(|error| io::Error::from_raw_os_error(error.raw() as i32))
 }
 
 #[cfg(not(any(unix, windows)))]
