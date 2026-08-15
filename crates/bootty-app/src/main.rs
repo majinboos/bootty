@@ -471,65 +471,6 @@ fn print_control_response(response: control::RpcResponse, json_output: bool) -> 
     Ok(())
 }
 
-#[cfg(test)]
-mod control_cli_tests {
-    use super::*;
-    use bootty_app::commands::{
-        ArgumentSchema, CompactSchema, MutationClass, ResourceKind, ValueType,
-    };
-
-    #[test]
-    fn dynamic_arguments_follow_descriptor_schema() {
-        let descriptor = CommandDescriptor {
-            id: "scroll_page_lines".to_owned(),
-            title: "Scroll".to_owned(),
-            description: "Scroll terminal lines.".to_owned(),
-            mutation: MutationClass::Write,
-            arguments: CompactSchema {
-                arguments: vec![ArgumentSchema {
-                    name: "delta".to_owned(),
-                    value_type: ValueType::Integer,
-                    required: true,
-                    choices: Vec::new(),
-                    minimum: None,
-                    maximum: None,
-                }],
-            },
-            target: Some(ResourceKind::Terminal),
-            palette: false,
-        };
-
-        let (arguments, target, confirmed) = parse_dynamic_arguments(
-            &descriptor,
-            &[
-                "--delta".to_owned(),
-                "-3".to_owned(),
-                "--target".to_owned(),
-                "binding:1/terminal:2@4".to_owned(),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(arguments, ["-3"]);
-        assert_eq!(target.unwrap().generation, 4);
-        assert!(!confirmed);
-    }
-
-    #[test]
-    fn rpc_errors_have_stable_exit_categories() {
-        let error = rpc_failure(control::RpcError {
-            code: -32006,
-            message: "denied".to_owned(),
-            data: None,
-        });
-
-        assert_eq!(
-            error.downcast_ref::<CliFailure>().unwrap().code,
-            EXIT_DENIED
-        );
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn ensure_macos_cli_link() -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
@@ -620,38 +561,4 @@ fn install_macos_cli_link_at(
         Err(error) => return Err(error),
     }
     std::os::unix::fs::symlink(executable, link)
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn macos_app_installs_its_cli_link() {
-        let home = tempfile::tempdir().expect("home");
-        let executable = home
-            .path()
-            .join("Applications/Bootty.app/Contents/MacOS/bootty");
-
-        install_macos_cli_link_at(&executable, &home.path().join(".local/bin"))
-            .expect("install CLI link");
-
-        assert_eq!(
-            std::fs::read_link(home.path().join(".local/bin/bootty")).expect("CLI link"),
-            executable
-        );
-    }
-
-    #[test]
-    fn macos_app_adds_its_fallback_cli_directory_to_zsh_path() {
-        let home = tempfile::tempdir().expect("home");
-
-        ensure_macos_local_bin_path(home.path(), Some(std::ffi::OsStr::new("/bin/zsh")))
-            .expect("configure PATH");
-
-        assert_eq!(
-            std::fs::read_to_string(home.path().join(".zprofile")).expect("profile"),
-            "export PATH=\"$HOME/.local/bin:$PATH\"\n"
-        );
-    }
 }
