@@ -615,126 +615,126 @@ struct IconImage {
     rgba: Vec<u8>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebTerminalFrame {
-    pub(crate) selected: usize,
-    pub(crate) focus: &'static str,
-    pub(crate) cols: u16,
-    pub(crate) rows: u16,
-    pub(crate) cell_width: u32,
-    pub(crate) cell_height: u32,
-    pub(crate) colors: WebFrameColors,
-    pub(crate) cursor: Option<WebCursor>,
-    pub(crate) selection: Option<WebSelection>,
-    pub(crate) cells: Vec<WebCell>,
-    pub(crate) images: Vec<WebImage>,
-    pub(crate) egui: Option<WebEguiFrame>,
+pub struct WebTerminalFrame {
+    pub selected: usize,
+    pub focus: &'static str,
+    pub cols: u16,
+    pub rows: u16,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub colors: WebFrameColors,
+    pub cursor: Option<WebCursor>,
+    pub selection: Option<WebSelection>,
+    pub cells: Vec<WebCell>,
+    pub images: Vec<WebImage>,
+    pub egui: Option<WebEguiFrame>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebFrameColors {
-    pub(crate) background: WebColor,
-    pub(crate) foreground: WebColor,
-    pub(crate) cursor: Option<WebColor>,
+pub struct WebFrameColors {
+    pub background: WebColor,
+    pub foreground: WebColor,
+    pub cursor: Option<WebColor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebColor {
-    pub(crate) r: u8,
-    pub(crate) g: u8,
-    pub(crate) b: u8,
+pub struct WebColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebCell {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) text: String,
-    pub(crate) fg: Option<WebColor>,
-    pub(crate) bg: Option<WebColor>,
-    pub(crate) osc8: Option<String>,
-    pub(crate) style: WebCellStyle,
+pub struct WebCell {
+    pub x: u16,
+    pub y: u16,
+    pub text: String,
+    pub fg: Option<WebColor>,
+    pub bg: Option<WebColor>,
+    pub osc8: Option<String>,
+    pub style: WebCellStyle,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebCellStyle {
-    pub(crate) bold: bool,
-    pub(crate) italic: bool,
-    pub(crate) faint: bool,
-    pub(crate) blink: bool,
-    pub(crate) inverse: bool,
-    pub(crate) invisible: bool,
-    pub(crate) strikethrough: bool,
-    pub(crate) overline: bool,
-    pub(crate) underline: bool,
+pub struct WebCellStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub faint: bool,
+    pub blink: bool,
+    pub inverse: bool,
+    pub invisible: bool,
+    pub strikethrough: bool,
+    pub overline: bool,
+    pub underline: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebSelection {
-    pub(crate) anchor: WebSelectionPoint,
-    pub(crate) focus: WebSelectionPoint,
+pub struct WebSelection {
+    pub anchor: WebSelectionPoint,
+    pub focus: WebSelectionPoint,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebSelectionPoint {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
+pub struct WebSelectionPoint {
+    pub x: u16,
+    pub y: u16,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebCursor {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) color: Option<WebColor>,
+pub struct WebCursor {
+    pub x: u16,
+    pub y: u16,
+    pub color: Option<WebColor>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebImage {
-    pub(crate) key: String,
-    pub(crate) layer: String,
-    pub(crate) image_width: u32,
-    pub(crate) image_height: u32,
-    pub(crate) source: WebRect,
-    pub(crate) destination: WebRect,
-    pub(crate) rgba: Vec<u8>,
+pub struct WebImage {
+    pub key: String,
+    pub layer: String,
+    pub image_width: u32,
+    pub image_height: u32,
+    pub source: WebRect,
+    pub destination: WebRect,
+    pub rgba: Vec<u8>,
 }
 
-#[derive(Debug, Copy, Clone, Serialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebRect {
-    pub(crate) min_x: f32,
-    pub(crate) min_y: f32,
-    pub(crate) max_x: f32,
-    pub(crate) max_y: f32,
+pub struct WebRect {
+    pub min_x: f32,
+    pub min_y: f32,
+    pub max_x: f32,
+    pub max_y: f32,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebEguiFrame {
-    pub(crate) textures: Vec<WebEguiTexture>,
-    pub(crate) meshes: Vec<WebEguiMesh>,
-    pub(crate) labels: Vec<WebEguiLabel>,
-    pub(crate) links: Vec<WebEguiLink>,
+pub struct WebEguiFrame {
+    pub textures: Vec<WebEguiTexture>,
+    pub meshes: Vec<WebEguiMesh>,
+    pub labels: Vec<WebEguiLabel>,
+    pub links: Vec<WebEguiLink>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebEguiLabel {
-    pub(crate) x: f32,
-    pub(crate) y: f32,
-    pub(crate) text: String,
-    pub(crate) size: f32,
-    pub(crate) color: WebColor,
-    pub(crate) align: &'static str,
+pub struct WebEguiLabel {
+    pub x: f32,
+    pub y: f32,
+    pub text: String,
+    pub size: f32,
+    pub color: WebColor,
+    pub align: &'static str,
 }
 
 impl WebEguiLabel {
@@ -761,27 +761,27 @@ impl WebEguiLabel {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebEguiLink {
-    pub(crate) rect: WebRect,
-    pub(crate) url: &'static str,
+pub struct WebEguiLink {
+    pub rect: WebRect,
+    pub url: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebEguiTexture {
-    pub(crate) id: String,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) rgba: Vec<u8>,
+pub struct WebEguiTexture {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct WebEguiMesh {
-    pub(crate) texture_id: String,
-    pub(crate) clip: WebRect,
-    pub(crate) vertices: Vec<f32>,
-    pub(crate) indices: Vec<u32>,
+pub struct WebEguiMesh {
+    pub texture_id: String,
+    pub clip: WebRect,
+    pub vertices: Vec<f32>,
+    pub indices: Vec<u32>,
 }

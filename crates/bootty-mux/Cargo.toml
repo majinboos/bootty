@@ -10,7 +10,6 @@ app = [
   "dep:bootty-surface",
   "dep:bootty-terminal",
   "dep:derive_more",
-  "dep:libghostty-vt",
 ]
 remote-install = ["app", "dep:getrandom", "dep:sha2", "dep:ureq"]
 
@@ -20,7 +19,6 @@ bootty-mux-model = { path = "../bootty-mux-model" }
 anyhow.workspace = true
 base64.workspace = true
 derive_more = { workspace = true, optional = true }
-libghostty-vt = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 rmux-client.workspace = true
 rmux-ipc.workspace = true

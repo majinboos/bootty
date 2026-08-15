@@ -21,6 +21,7 @@ const TMUX_FIELD_SEPARATOR: char = '\x1f';
 const TMUX_SESSION_LINE_TAG: char = 's';
 const TMUX_PANE_LINE_TAG: char = 'p';
 
+#[cfg(feature = "app")]
 pub(crate) fn local_server_args(identity: bootty_identity::ApplicationIdentity) -> Vec<String> {
     match identity {
         bootty_identity::ApplicationIdentity::Production => Vec::new(),

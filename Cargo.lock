@@ -784,7 +784,6 @@ dependencies = [
  "bootty-terminal",
  "derive_more",
  "getrandom 0.3.4",
- "libghostty-vt",
  "rmux-client",
  "rmux-ipc",
  "rmux-proto",

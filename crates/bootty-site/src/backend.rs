@@ -15,7 +15,7 @@ use crate::components::{Detail, Menu, SiteViewState, TabHit, draw_site, page_tab
 use crate::constants::{DEFAULT_COLS, DEFAULT_ROWS};
 use crate::content::{section_leaf_tab_count, sections};
 use crate::input::{Focus, Msg, parse_input, wrap};
-use crate::web_frame::{WebFrameState, new_egui_context, web_frame};
+use crate::web_frame::{WebFrameState, WebTerminalFrame, new_egui_context, web_frame};
 
 impl Default for SiteBackend {
     fn default() -> Self {
@@ -24,26 +24,19 @@ impl Default for SiteBackend {
 }
 
 impl SiteBackend {
-    fn handle_event(&mut self, event: Event<NoUserEvent>) -> Result<(), JsValue> {
+    fn handle_event(&mut self, event: Event<NoUserEvent>) {
         for msg in self.forward_event(&event) {
-            self.update(msg)?;
+            self.update(msg);
         }
-        Ok(())
     }
 
-    pub(crate) fn handle_mouse(
-        &mut self,
-        kind: &str,
-        x: u16,
-        y: u16,
-        button: i16,
-    ) -> Result<(), JsValue> {
+    fn handle_mouse(&mut self, kind: &str, x: u16, y: u16, button: i16) {
         if kind == "leave" {
             self.hovered_menu = None;
             self.hovered_tab = None;
             self.hovered_subtab = None;
             self.hovered_leaf_tab = None;
-            return Ok(());
+            return;
         }
         self.hovered_menu = None;
         match page_tab_hit(
@@ -63,8 +56,8 @@ impl SiteBackend {
                     self.set_active_tab(tab);
                     self.selection.clear();
                     self.detail_scroll = 0;
-                    self.update(Msg::Focus(Focus::Detail))?;
-                    return Ok(());
+                    self.update(Msg::Focus(Focus::Detail));
+                    return;
                 }
             }
             Some(TabHit::Secondary(tab)) => {
@@ -75,8 +68,8 @@ impl SiteBackend {
                     self.set_active_subtab(tab);
                     self.selection.clear();
                     self.detail_scroll = 0;
-                    self.update(Msg::Focus(Focus::Detail))?;
-                    return Ok(());
+                    self.update(Msg::Focus(Focus::Detail));
+                    return;
                 }
             }
             Some(TabHit::Tertiary(tab)) => {
@@ -87,8 +80,8 @@ impl SiteBackend {
                     self.set_active_leaf_tab(tab);
                     self.selection.clear();
                     self.detail_scroll = 0;
-                    self.update(Msg::Focus(Focus::Detail))?;
-                    return Ok(());
+                    self.update(Msg::Focus(Focus::Detail));
+                    return;
                 }
             }
             None => {
@@ -109,16 +102,15 @@ impl SiteBackend {
         }
 
         if kind == "wheel" {
-            self.update(Msg::Focus(Focus::Detail))?;
-            self.update(Msg::Scroll(isize::from(button)))?;
-            return Ok(());
+            self.update(Msg::Focus(Focus::Detail));
+            self.update(Msg::Scroll(isize::from(button)));
+            return;
         }
 
         if kind == "down" {
-            self.update(Msg::Focus(Focus::Detail))?;
+            self.update(Msg::Focus(Focus::Detail));
         }
         self.hovered_menu = None;
-        Ok(())
     }
 
     fn select_line_at(&mut self, y: u16) {
@@ -172,7 +164,7 @@ impl SiteBackend {
         msg.into_iter().collect()
     }
 
-    fn update(&mut self, msg: Msg) -> Result<(), JsValue> {
+    fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Move(delta) => {
                 self.selected = wrap(self.selected as isize + delta, sections().len());
@@ -221,7 +213,7 @@ impl SiteBackend {
                 self.update(Msg::Focus(match self.focus {
                     Focus::Menu => Focus::Detail,
                     Focus::Detail => Focus::Menu,
-                }))?;
+                }));
             }
             Msg::Scroll(delta) => {
                 self.detail_scroll = if delta == isize::MIN {
@@ -233,7 +225,102 @@ impl SiteBackend {
                 };
             }
         }
-        Ok(())
+    }
+
+    pub fn render_frame(&mut self) -> Result<WebTerminalFrame, String> {
+        self.tick = self.tick.wrapping_add(1);
+        let selected = self.selected;
+        let hovered_menu = self.hovered_menu;
+        let focus = self.focus;
+        let detail_scroll = self.detail_scroll;
+        let active_tab = self.current_tab();
+        let active_subtab = self.current_subtab();
+        let active_leaf_tab = self.current_leaf_tab();
+        let hovered_tab = self.hovered_tab;
+        let hovered_subtab = self.hovered_subtab;
+        let hovered_leaf_tab = self.hovered_leaf_tab;
+        let tick = self.tick;
+        let fps = self.fps;
+        let selection = self.selection.selection();
+        let mut terminal = self
+            .terminal
+            .take()
+            .ok_or_else(|| "terminal backend missing".to_owned())?;
+        let completed = match terminal.draw(|ratatui_frame| {
+            draw_site(
+                ratatui_frame,
+                &mut self.menu,
+                &mut self.detail,
+                SiteViewState {
+                    selected,
+                    active_tab,
+                    active_subtab,
+                    hovered_tab,
+                    hovered_subtab,
+                    active_leaf_tab,
+                    focus,
+                    hovered_leaf_tab,
+                    detail_scroll,
+                },
+            );
+        }) {
+            Ok(completed) => completed,
+            Err(error) => {
+                self.terminal = Some(terminal);
+                return Err(format!("{error:?}"));
+            }
+        };
+        let text_rows = text_rows_from_buffer(completed.buffer);
+        let frame = web_frame(
+            &self.egui,
+            completed.buffer,
+            WebFrameState {
+                selected,
+                hovered_menu,
+                tick,
+                focus,
+                fps,
+                selection,
+            },
+        );
+        self.last_rows = text_rows;
+        self.terminal = Some(terminal);
+        Ok(frame)
+    }
+
+    pub fn resize_frame(&mut self, cols: u16, rows: u16) -> Result<WebTerminalFrame, String> {
+        self.cols = cols.max(40);
+        self.rows = rows.max(18);
+        self.selection.clear();
+        self.egui = new_egui_context();
+        self.terminal = Some(
+            TestTerminalAdapter::new(Size::new(self.cols, self.rows))
+                .map_err(|error| format!("{error:?}"))?,
+        );
+        self.render_frame()
+    }
+
+    pub fn input_frame(&mut self, input: &str) -> Result<WebTerminalFrame, String> {
+        for event in parse_input(input) {
+            self.handle_event(event);
+        }
+        self.render_frame()
+    }
+
+    pub fn mouse_frame(
+        &mut self,
+        kind: &str,
+        x: u16,
+        y: u16,
+        button: i16,
+    ) -> Result<WebTerminalFrame, String> {
+        self.handle_mouse(kind, x, y, button);
+        self.render_frame()
+    }
+
+    pub fn fps_frame(&mut self, fps: f64) -> Result<WebTerminalFrame, String> {
+        self.fps = fps;
+        self.render_frame()
     }
 
     fn current_tab(&self) -> usize {
@@ -417,32 +504,19 @@ impl SiteBackend {
         rows: u16,
         _device_pixel_ratio: f32,
     ) -> Result<JsValue, JsValue> {
-        self.cols = cols.max(40);
-        self.rows = rows.max(18);
-        self.selection.clear();
-        self.egui = new_egui_context();
-        self.terminal = Some(
-            TestTerminalAdapter::new(Size::new(self.cols, self.rows))
-                .map_err(|error| JsValue::from_str(&format!("{error:?}")))?,
-        );
-        self.frame()
+        encode_frame(self.resize_frame(cols, rows))
     }
 
     pub fn input(&mut self, input: &str) -> Result<JsValue, JsValue> {
-        for event in parse_input(input) {
-            self.handle_event(event)?;
-        }
-        self.frame()
+        encode_frame(self.input_frame(input))
     }
 
     pub fn mouse(&mut self, kind: &str, x: u16, y: u16, button: i16) -> Result<JsValue, JsValue> {
-        self.handle_mouse(kind, x, y, button)?;
-        self.frame()
+        encode_frame(self.mouse_frame(kind, x, y, button))
     }
 
     pub fn set_fps(&mut self, fps: f64) -> Result<JsValue, JsValue> {
-        self.fps = fps;
-        self.frame()
+        encode_frame(self.fps_frame(fps))
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -455,62 +529,13 @@ impl SiteBackend {
     }
 
     pub fn frame(&mut self) -> Result<JsValue, JsValue> {
-        self.tick = self.tick.wrapping_add(1);
-        let selected = self.selected;
-        let hovered_menu = self.hovered_menu;
-        let focus = self.focus;
-        let detail_scroll = self.detail_scroll;
-        let active_tab = self.current_tab();
-        let active_subtab = self.current_subtab();
-        let active_leaf_tab = self.current_leaf_tab();
-        let hovered_tab = self.hovered_tab;
-        let hovered_subtab = self.hovered_subtab;
-        let hovered_leaf_tab = self.hovered_leaf_tab;
-        let tick = self.tick;
-        let fps = self.fps;
-        let selection = self.selection.selection();
-        let mut terminal = self
-            .terminal
-            .take()
-            .ok_or_else(|| JsValue::from_str("terminal backend missing"))?;
-        let completed = terminal
-            .draw(|ratatui_frame| {
-                draw_site(
-                    ratatui_frame,
-                    &mut self.menu,
-                    &mut self.detail,
-                    SiteViewState {
-                        selected,
-                        active_tab,
-                        active_subtab,
-                        hovered_tab,
-                        hovered_subtab,
-                        active_leaf_tab,
-                        focus,
-                        hovered_leaf_tab,
-                        detail_scroll,
-                    },
-                );
-            })
-            .map_err(|error| JsValue::from_str(&format!("{error:?}")))?;
-        let text_rows = text_rows_from_buffer(completed.buffer);
-        let value = serde_wasm_bindgen::to_value(&web_frame(
-            &self.egui,
-            completed.buffer,
-            WebFrameState {
-                selected,
-                hovered_menu,
-                tick,
-                focus,
-                fps,
-                selection,
-            },
-        ))
-        .map_err(|error| JsValue::from_str(&error.to_string()));
-        self.last_rows = text_rows;
-        self.terminal = Some(terminal);
-        value
+        encode_frame(self.render_frame())
     }
+}
+
+fn encode_frame(frame: Result<WebTerminalFrame, String>) -> Result<JsValue, JsValue> {
+    let frame = frame.map_err(|error| JsValue::from_str(&error))?;
+    serde_wasm_bindgen::to_value(&frame).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -568,45 +593,4 @@ fn selected_text_from_rows(
         selected.push(text.trim_end().to_owned());
     }
     (!selected.is_empty()).then(|| selected.join("\n"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{SelectionPoint, SiteBackend, TerminalSelection};
-
-    #[test]
-    fn double_click_selects_word_boundaries_from_rust_rows() {
-        let mut site = SiteBackend::new();
-        site.cols = 80;
-        site.last_rows = vec!["    mountCanvasTerminal({ page: \"renderer\" })".to_owned()];
-
-        site.handle_mouse("down", 9, 0, 2)
-            .expect("double click handles");
-
-        assert_eq!(
-            site.selection.selection(),
-            Some(TerminalSelection::new(
-                SelectionPoint::new(4, 0),
-                SelectionPoint::new(22, 0),
-            ))
-        );
-    }
-
-    #[test]
-    fn triple_click_selects_visible_line_from_rust_rows() {
-        let mut site = SiteBackend::new();
-        site.cols = 80;
-        site.last_rows = vec!["  cargo run -p bootty-app   ".to_owned()];
-
-        site.handle_mouse("down", 5, 0, 3)
-            .expect("triple click handles");
-
-        assert_eq!(
-            site.selection.selection(),
-            Some(TerminalSelection::new(
-                SelectionPoint::new(0, 0),
-                SelectionPoint::new(24, 0),
-            ))
-        );
-    }
 }
