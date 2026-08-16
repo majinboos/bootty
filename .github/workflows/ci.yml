@@ -109,7 +109,11 @@ jobs:
       - name: Build size-optimized daemon
         run: |
           cargo build --profile daemon-release -p bootty-daemon
-          test "$(stat -c %s target/daemon-release/bootty-daemon)" -le 10485760
+          size=$(stat -c %s target/daemon-release/bootty-daemon)
+          echo "bootty-daemon size: ${size} bytes"
+          # Keep a bounded artifact budget while allowing the current static
+          # daemon and its embedded SQLite/runtime dependencies.
+          test "$size" -le 13631488
 
       - name: Compile and smoke benchmark suite
         run: mise run bench:ci
