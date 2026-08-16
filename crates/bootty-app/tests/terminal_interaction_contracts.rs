@@ -22,6 +22,12 @@ use bootty_app::{
 
 mod support;
 
+/// Wall-clock budget for work that spawns a real pane process.
+///
+/// The budget bounds a genuine hang. It stays far above the scheduler jitter that a fully parallel
+/// test run adds to a pane spawn.
+const PANE_BUDGET: Duration = Duration::from_secs(30);
+
 fn frame(now: Instant, events: Vec<egui::Event>) -> FrameInputs {
     FrameInputs {
         now,
@@ -71,7 +77,7 @@ fn start_two_panes(state: &mut AppState) -> (String, String) {
     commands
         .try_send(AppCommandRequest {
             invocation: CommandInvocation::from_action("new_mux_session", Caller::Socket),
-            deadline: started + Duration::from_secs(2),
+            deadline: started + PANE_BUDGET,
             cancellation: CommandCancellation::new(),
             response,
         })
@@ -101,7 +107,7 @@ fn start_two_panes(state: &mut AppState) -> (String, String) {
     commands
         .try_send(AppCommandRequest {
             invocation: CommandInvocation::from_action("split_right", Caller::Socket),
-            deadline: Instant::now() + Duration::from_secs(2),
+            deadline: Instant::now() + PANE_BUDGET,
             cancellation: CommandCancellation::new(),
             response,
         })
@@ -128,16 +134,21 @@ fn start_two_panes(state: &mut AppState) -> (String, String) {
 }
 
 fn wait_for_pane_text(state: &mut AppState, pane_id: &str, expected: &str) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + PANE_BUDGET;
     while Instant::now() < deadline {
         state.update_frame(frame(Instant::now(), Vec::new()));
-        if state
-            .terminal_mut()
-            .focused_terminal_runtime(pane_id)
-            .and_then(|runtime| runtime.extract_frame().ok())
-            .is_some_and(|frame| frame.text_rows().iter().any(|row| row.contains(expected)))
-        {
-            return;
+        if let Some(runtime) = state.terminal_mut().focused_terminal_runtime(pane_id) {
+            if runtime
+                .extract_frame()
+                .ok()
+                .is_some_and(|frame| frame.text_rows().iter().any(|row| row.contains(expected)))
+            {
+                return;
+            }
+            assert!(
+                !runtime.child_exited().unwrap_or(false),
+                "pane {pane_id} shell exited before it rendered {expected:?}"
+            );
         }
         thread::sleep(Duration::from_millis(5));
     }
@@ -262,7 +273,7 @@ fn opening_another_overlay_clears_terminal_search() {
     commands
         .try_send(AppCommandRequest {
             invocation: CommandInvocation::from_action("start_search", Caller::Socket),
-            deadline: started + Duration::from_secs(2),
+            deadline: started + PANE_BUDGET,
             cancellation: CommandCancellation::new(),
             response,
         })
@@ -294,7 +305,7 @@ fn opening_another_overlay_clears_terminal_search() {
     commands
         .try_send(AppCommandRequest {
             invocation: CommandInvocation::from_action("command_palette", Caller::Socket),
-            deadline: Instant::now() + Duration::from_secs(2),
+            deadline: Instant::now() + PANE_BUDGET,
             cancellation: CommandCancellation::new(),
             response,
         })

@@ -265,7 +265,9 @@ fn a_failed_session_membership_commit_preserves_the_live_runtime_and_database() 
     commands
         .try_send(AppCommandRequest {
             invocation: CommandInvocation::from_action("new_tab", Caller::Socket),
-            deadline: Instant::now() + Duration::from_secs(2),
+            // The budget bounds a genuine hang. It stays far above the scheduler jitter that a
+            // fully parallel test run adds to a pane spawn.
+            deadline: Instant::now() + Duration::from_secs(30),
             cancellation: CommandCancellation::new(),
             response,
         })

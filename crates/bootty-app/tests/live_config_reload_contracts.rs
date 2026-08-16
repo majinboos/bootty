@@ -193,7 +193,9 @@ fn pane(session_id: &str, pane_id: &str) -> MuxPaneAnchor {
 
 #[cfg(unix)]
 fn wait_for_startup_result(state: &mut AppState, pane_id: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // The budget bounds a genuine hang. It stays far above the scheduler jitter that a fully
+    // parallel test run adds to a pane spawn.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let runtime = state
             .terminal_mut()

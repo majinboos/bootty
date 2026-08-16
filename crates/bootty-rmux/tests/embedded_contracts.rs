@@ -190,7 +190,9 @@ fn ditch_session(backend: &mut RmuxBackend, session_id: &str) -> Result<()> {
 }
 
 fn wait_for_terminal_text(terminal: &mut ActiveTerminal, expected: &str) -> Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    // The budget bounds a genuine hang. It stays far above the scheduler jitter that a fully
+    // parallel test run adds to a pane spawn.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         terminal.drain_pty();
         let frame = terminal.extract_frame()?;

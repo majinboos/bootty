@@ -71,7 +71,9 @@ fn native_terminal_progress_updates_active_binding_presentation() {
         )
         .expect("start terminal program");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The budget bounds a genuine hang. It stays far above the scheduler jitter that a fully
+    // parallel test run adds to a pane spawn.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut observed_progress_repaint = false;
     while Instant::now() < deadline && !observed_progress_repaint {
         for effect in state.update_frame(frame(Instant::now())) {
