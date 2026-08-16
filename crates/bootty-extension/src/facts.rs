@@ -283,13 +283,6 @@ impl ExtensionFacts {
         true
     }
 
-    pub(crate) fn metrics(&self) -> Metrics {
-        self.metrics
-            .read()
-            .map(|metrics| *metrics)
-            .unwrap_or_default()
-    }
-
     pub(crate) fn update_metrics(&self, metrics: Metrics) -> bool {
         let Ok(mut current) = self.metrics.write() else {
             return false;

@@ -16,18 +16,15 @@ mod surfaces;
 mod values;
 
 pub use catalog::{ExtensionCatalog, ExtensionGenerationCandidate, ExtensionGenerationToken};
-pub use fact_values::{
-    Metrics, MuxView, SessionProgressView, SessionReorder, SessionView, WindowView,
-};
+pub use fact_values::{MuxView, SessionProgressView, SessionReorder, SessionView, WindowView};
 pub use git_helpers::{display_path, head_branch};
 pub use host::ExtensionHost;
 pub use identity::ModuleIdentity;
-pub use items::{error_item, items_from_value};
+pub use items::error_item;
 pub use module_runtime::preview_module_surfaces;
 pub use module_sources::{
-    EditableModuleSource, LegacyExtensionModule, editable_module_source,
-    import_legacy_extension_module, legacy_extension_modules, module_identities,
-    reset_module_source, save_module_source,
+    editable_module_source, import_legacy_extension_module, legacy_extension_modules,
+    module_identities, reset_module_source, save_module_source,
 };
 pub use queue::{
     EVENT_QUEUE_LIMIT, ExtensionEventReceiver, ExtensionEventRequest, ExtensionEventSender,

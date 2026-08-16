@@ -11,7 +11,7 @@ pub fn error_item(message: &str) -> ModuleItem {
     }
 }
 
-pub fn items_from_value(value: Value) -> Vec<ModuleItem> {
+pub(crate) fn items_from_value(value: Value) -> Vec<ModuleItem> {
     match value {
         Value::String(text) => vec![ModuleItem {
             text: text.to_string_lossy(),

@@ -8,8 +8,9 @@ use std::{
 };
 
 use bootty_command::{
-    AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandDescriptor,
-    CommandOutcome, CompactSchema, MutationClass, app_command_channel as command_channel,
+    AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandCancellation,
+    CommandDescriptor, CommandOutcome, CompactSchema, MutationClass,
+    app_command_channel as command_channel,
 };
 use bootty_control::{
     ControlCatalog, ControlPlane, ControlServer, RpcResponse, invoke_instance, running_instance,
@@ -273,14 +274,18 @@ fn tasks_subscriptions_bounded_events_generations_and_cancellation_are_control_o
         .as_str()
         .expect("extension subscription id")
         .to_owned();
+    let event_sender = plane.extension_event_sender();
+    let cancellation = CommandCancellation::new();
+    let event_deadline = Instant::now() + Duration::from_secs(5);
     for sequence in 0..65 {
-        plane
-            .publish_extension_event(
-                &catalog,
-                "test.luau",
+        event_sender
+            .publish(
+                ModuleIdentity::parse("test.luau").expect("module identity"),
                 1,
-                "test.changed",
-                &json!({"sequence": sequence}),
+                "test.changed".to_owned(),
+                json!({"sequence": sequence}),
+                event_deadline,
+                &cancellation,
             )
             .expect("publish bounded event");
     }
@@ -297,12 +302,13 @@ fn tasks_subscriptions_bounded_events_generations_and_cancellation_are_control_o
         .expect("replace generation");
     assert!(!first_token.is_active());
     assert_eq!(
-        plane.publish_extension_event(
-            &catalog,
-            "test.luau",
+        event_sender.publish(
+            ModuleIdentity::parse("test.luau").expect("module identity"),
             1,
-            "test.changed",
-            &json!({"sequence": "stale"}),
+            "test.changed".to_owned(),
+            json!({"sequence": "stale"}),
+            Instant::now() + Duration::from_secs(5),
+            &cancellation,
         ),
         Err("extension event topic is not active".to_owned())
     );

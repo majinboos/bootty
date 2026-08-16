@@ -8,10 +8,7 @@ use bootty_extension::{
 };
 use serde_json::{Value, json};
 
-use crate::{
-    ControlCatalog,
-    state::{SharedControlState, lock_control_state},
-};
+use crate::state::{SharedControlState, lock_control_state};
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -57,36 +54,21 @@ impl ControlPlane {
             } else if Instant::now() >= request.deadline {
                 Err("extension event deadline expired".to_owned())
             } else {
-                let scope = self
-                    .instance_scope
-                    .lock()
-                    .ok()
-                    .and_then(|scope| scope.clone())
-                    .ok_or_else(|| "control plane is not bound to an instance".to_owned());
-                scope.and_then(|scope| {
-                    catalog.with_active_topic(
-                        request.identity.as_str(),
-                        request.generation,
-                        &request.topic,
-                        || {
-                            lock_control_state(&self.state).publish_event(
-                                &scope,
-                                &request.topic,
-                                &json!({"extension": request.identity.as_str(), "generation": request.generation}),
-                                &Value::Null,
-                                &request.payload,
-                            );
-                        },
-                    )
-                })
+                self.publish_scoped(
+                    catalog,
+                    request.identity.as_str(),
+                    request.generation,
+                    &request.topic,
+                    &request.payload,
+                )
             };
             let _ = request.response.send(result);
         }
     }
 
-    pub fn publish_extension_event(
+    fn publish_scoped(
         &self,
-        catalog: &ControlCatalog,
+        catalog: &ExtensionCatalog,
         module: &str,
         generation: u64,
         topic: &str,
@@ -98,16 +80,14 @@ impl ControlPlane {
             .map_err(|_| "control plane scope is unavailable".to_owned())?
             .clone()
             .ok_or_else(|| "control plane is not bound to an instance".to_owned())?;
-        catalog
-            .extensions()
-            .with_active_topic(module, generation, topic, || {
-                lock_control_state(&self.state).publish_event(
-                    &scope,
-                    topic,
-                    &json!({"extension": module, "generation": generation}),
-                    &Value::Null,
-                    payload,
-                );
-            })
+        catalog.with_active_topic(module, generation, topic, || {
+            lock_control_state(&self.state).publish_event(
+                &scope,
+                topic,
+                &json!({"extension": module, "generation": generation}),
+                &Value::Null,
+                payload,
+            );
+        })
     }
 }

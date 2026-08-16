@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::fact_values::{Metrics, MuxView, SessionReorder};
+use crate::fact_values::{MuxView, SessionReorder};
 use crate::facts::ExtensionFacts;
 use crate::module_runtime::{ActiveModule, prepare_module};
 use crate::module_sources::{discover_modules, legacy_extension_modules};
@@ -154,10 +154,6 @@ impl ExtensionHost {
                     .and_then(|stem| stem.to_str())
                     == Some(name)
         })
-    }
-
-    pub fn metrics(&self) -> Metrics {
-        self.facts.metrics()
     }
 
     pub fn take_session_reorders(&self) -> Vec<SessionReorder> {
