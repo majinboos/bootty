@@ -449,13 +449,6 @@ fn wait_for_task(
 ) -> Value {
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
-        match response_rx.try_recv() {
-            Ok(outcome) => return serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return failed_outcome("-32003", "command response channel closed");
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
         if cancellation.is_cancelled() {
             return match response_rx.try_recv() {
                 Ok(outcome) => serde_json::to_value(outcome).unwrap_or_else(internal_outcome),
@@ -988,10 +981,6 @@ fn internal_error(error: serde_json::Error) -> RpcError {
     RpcError::new(-32603, error.to_string())
 }
 
-pub fn invoke(instance: Option<&str>, method: &str, params: Value) -> Result<RpcResponse> {
-    let descriptor = select_instance(instance)?;
-    invoke_instance(&descriptor, method, params)
-}
 pub fn invoke_or_start(
     instance: Option<&str>,
     start: bool,
@@ -1003,14 +992,8 @@ pub fn invoke_or_start(
 }
 
 pub fn select_or_start(instance: Option<&str>, start: bool) -> Result<InstanceDescriptor> {
-    let selected = instance
-        .map(str::to_owned)
-        .or_else(|| std::env::var("BOOTTY_INSTANCE").ok());
-    if let Some(selected) = selected {
-        return select_instance(Some(&selected));
-    }
-    if !start {
-        return select_instance(None);
+    if !start || instance.is_some() || std::env::var("BOOTTY_INSTANCE").is_ok() {
+        return select_instance(instance);
     }
     let instances = discover_instances()?;
     match instances.as_slice() {

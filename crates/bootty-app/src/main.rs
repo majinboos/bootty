@@ -66,7 +66,7 @@ fn run() -> Result<()> {
     match cli.subcommand() {
         Some(Command::Commands) => {
             print_control_response(
-                control_request(&cli, cli.start(), "command.list", serde_json::Value::Null)?,
+                control_request(&cli, "command.list", serde_json::Value::Null)?,
                 cli.json(),
             )?;
             return Ok(());
@@ -75,7 +75,6 @@ fn run() -> Result<()> {
             print_control_response(
                 control_request(
                     &cli,
-                    cli.start(),
                     "command.describe",
                     serde_json::json!({"command": name}),
                 )?,
@@ -270,11 +269,10 @@ fn control_instance_request(
 
 fn control_request(
     cli: &Cli,
-    start: bool,
     method: &str,
     params: serde_json::Value,
 ) -> Result<control::RpcResponse> {
-    control::invoke_or_start(cli.instance(), start, method, params).map_err(transport_failure)
+    control::invoke_or_start(cli.instance(), cli.start(), method, params).map_err(transport_failure)
 }
 
 fn transport_failure(error: anyhow::Error) -> anyhow::Error {

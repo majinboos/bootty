@@ -107,21 +107,10 @@ pub enum FontSizeAction {
 }
 
 #[derive(Clone, Debug)]
-struct BoundCommand {
-    action_name: String,
-}
-
-impl BoundCommand {
-    fn invocation(&self) -> CommandInvocation {
-        CommandInvocation::from_action(&self.action_name, Caller::Keybinding)
-    }
-}
-
-#[derive(Clone, Debug)]
 struct AppKeyBinding {
     leader: Option<BindingTrigger>,
     trigger: BindingTrigger,
-    command: BoundCommand,
+    action_name: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -199,7 +188,7 @@ impl AppKeyBindings {
                         bindings.push(AppKeyBinding {
                             leader: pending_leader.take(),
                             trigger: binding.trigger,
-                            command: BoundCommand { action_name },
+                            action_name,
                         });
                     }
                     BindingElement::Chain(_) => {
@@ -228,7 +217,7 @@ impl AppKeyBindings {
             modifiers,
             modifier_sides,
         ))
-        .map(|command| command.invocation())
+        .map(|name| CommandInvocation::from_action(&name, Caller::Keybinding))
     }
 
     pub fn invocation_for_scroll_with_modifier_sides(
@@ -242,15 +231,15 @@ impl AppKeyBindings {
             modifiers,
             modifier_sides,
         ))
-        .map(|command| command.invocation())
+        .map(|name| CommandInvocation::from_action(&name, Caller::Keybinding))
     }
 
     pub fn invocation_for_input(&mut self, input: KeyInput) -> Option<CommandInvocation> {
         self.command_for_candidates(binding_triggers_for_key_input(input))
-            .map(|command| command.invocation())
+            .map(|name| CommandInvocation::from_action(&name, Caller::Keybinding))
     }
 
-    fn command_for_candidates(&mut self, candidates: Vec<BindingTrigger>) -> Option<BoundCommand> {
+    fn command_for_candidates(&mut self, candidates: Vec<BindingTrigger>) -> Option<String> {
         if let Some(leader) = self.active_leader.take() {
             return candidates
                 .iter()
@@ -261,13 +250,9 @@ impl AppKeyBindings {
                             binding.leader.as_ref() == Some(&leader)
                                 && binding.trigger == *candidate
                         })
-                        .map(|binding| binding.command.clone())
+                        .map(|binding| binding.action_name.clone())
                 })
-                .or_else(|| {
-                    Some(BoundCommand {
-                        action_name: "ignore".to_owned(),
-                    })
-                });
+                .or_else(|| Some("ignore".to_owned()));
         }
 
         if let Some(leader) = candidates.iter().find_map(|candidate| {
@@ -277,16 +262,14 @@ impl AppKeyBindings {
                 .cloned()
         }) {
             self.active_leader = Some(leader);
-            return Some(BoundCommand {
-                action_name: "ignore".to_owned(),
-            });
+            return Some("ignore".to_owned());
         }
 
         candidates.iter().find_map(|candidate| {
             self.bindings
                 .iter()
                 .find(|binding| binding.leader.is_none() && binding.trigger == *candidate)
-                .map(|binding| binding.command.clone())
+                .map(|binding| binding.action_name.clone())
         })
     }
 }

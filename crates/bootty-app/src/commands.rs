@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU8, Ordering},
@@ -463,77 +463,26 @@ fn validate_arguments(
 
 fn schema_for(id: &str) -> CompactSchema {
     let argument = match id {
-        "select_tab" | "select_session" | "select_space" => Some(ArgumentSchema {
-            name: "index".to_owned(),
-            value_type: ValueType::Integer,
-            required: true,
-            choices: Vec::new(),
-            minimum: Some(1),
-            maximum: Some(i64::from(u32::MAX)),
-        }),
-        "move_tab" | "move_session" => Some(ArgumentSchema {
-            name: "delta".to_owned(),
-            value_type: ValueType::Integer,
-            required: true,
-            choices: Vec::new(),
-            minimum: Some(i64::from(i32::MIN)),
-            maximum: Some(i64::from(i32::MAX)),
-        }),
-        "scroll_page_lines" => Some(ArgumentSchema {
-            name: "delta".to_owned(),
-            value_type: ValueType::Integer,
-            required: true,
-            choices: Vec::new(),
-            minimum: Some(i64::from(i16::MIN)),
-            maximum: Some(i64::from(i16::MAX)),
-        }),
+        "select_tab" | "select_session" | "select_space" => {
+            Some(bounded_integer("index", 1, i64::from(u32::MAX)))
+        }
+        "move_tab" | "move_session" => Some(bounded_integer(
+            "delta",
+            i64::from(i32::MIN),
+            i64::from(i32::MAX),
+        )),
+        "scroll_page_lines" => Some(bounded_integer(
+            "delta",
+            i64::from(i16::MIN),
+            i64::from(i16::MAX),
+        )),
         "increase_font_size" | "decrease_font_size" | "set_font_size" => {
             Some(argument("size", ValueType::Number))
         }
-        "select_pane" => Some(ArgumentSchema {
-            name: "direction".to_owned(),
-            value_type: ValueType::String,
-            required: true,
-            choices: ["left", "right", "up", "down"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            minimum: None,
-            maximum: None,
-        }),
-        "change_appearance" => Some(ArgumentSchema {
-            name: "appearance".to_owned(),
-            value_type: ValueType::String,
-            required: true,
-            choices: ["system", "light", "dark"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            minimum: None,
-            maximum: None,
-        }),
-        "navigate_search" => Some(ArgumentSchema {
-            name: "direction".to_owned(),
-            value_type: ValueType::String,
-            required: true,
-            choices: ["next", "previous"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            minimum: None,
-            maximum: None,
-        }),
-        "copy_to_clipboard" => Some(ArgumentSchema {
-            name: "format".to_owned(),
-            value_type: ValueType::String,
-            required: false,
-            choices: ["plain", "vt", "html", "mixed"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            minimum: None,
-            maximum: None,
-        }),
+        "select_pane" => Some(choice("direction", true, &["left", "right", "up", "down"])),
+        "change_appearance" => Some(choice("appearance", true, &["system", "light", "dark"])),
+        "navigate_search" => Some(choice("direction", true, &["next", "previous"])),
+        "copy_to_clipboard" => Some(choice("format", false, &["plain", "vt", "html", "mixed"])),
         "csi" | "esc" | "text" | "search" => Some(argument("value", ValueType::String)),
         _ => None,
     };
@@ -548,6 +497,25 @@ fn argument(name: &str, value_type: ValueType) -> ArgumentSchema {
         value_type,
         required: true,
         choices: Vec::new(),
+        minimum: None,
+        maximum: None,
+    }
+}
+
+fn bounded_integer(name: &str, minimum: i64, maximum: i64) -> ArgumentSchema {
+    ArgumentSchema {
+        minimum: Some(minimum),
+        maximum: Some(maximum),
+        ..argument(name, ValueType::Integer)
+    }
+}
+
+fn choice(name: &str, required: bool, choices: &[&str]) -> ArgumentSchema {
+    ArgumentSchema {
+        name: name.to_owned(),
+        value_type: ValueType::String,
+        required,
+        choices: choices.iter().map(|choice| (*choice).to_owned()).collect(),
         minimum: None,
         maximum: None,
     }
@@ -767,15 +735,10 @@ impl Drop for AppCommandReceiver {
     }
 }
 
-pub fn core_command_ids() -> BTreeSet<String> {
-    CommandRegistry::core()
-        .list()
-        .map(|descriptor| descriptor.id.clone())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::app_actions::{AppAction, MuxKeyAction, SidebarAction};
     #[test]
@@ -827,7 +790,10 @@ mod tests {
 
     #[test]
     fn registry_has_one_descriptor_per_command_id() {
-        let ids = core_command_ids();
+        let ids = CommandRegistry::core()
+            .list()
+            .map(|descriptor| descriptor.id.clone())
+            .collect::<BTreeSet<String>>();
         assert_eq!(ids.len(), CommandRegistry::core().list().count());
         assert!(ids.contains("toggle_sidebar_visibility"));
         assert!(ids.contains("move_tab"));

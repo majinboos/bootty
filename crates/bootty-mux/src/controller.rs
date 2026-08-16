@@ -332,7 +332,6 @@ enum MuxResourceKey {
     Session(String),
     Window(String, String),
     Pane(String, String, String),
-    Terminal(String, String, String),
 }
 
 impl MuxResourceKey {
@@ -467,12 +466,7 @@ impl BindingMuxController {
         window_id: &str,
         pane_id: &str,
     ) -> Option<u64> {
-        MuxResourceKey::Terminal(
-            session_id.to_owned(),
-            window_id.to_owned(),
-            pane_id.to_owned(),
-        )
-        .generation_in(&self.resource_generations, &self.observed_resources)
+        self.pane_generation(session_id, window_id, pane_id)
     }
 
     fn record_resource_snapshot(&mut self) {
@@ -488,13 +482,14 @@ impl BindingMuxController {
                     let Some(pane_id) = &pane.pane_id else {
                         continue;
                     };
-                    let path = (session.id.clone(), window.id.clone(), pane_id.clone());
-                    let occupant = format!("{:?}:{:?}", pane.pane_pid, pane.process);
                     current.insert(
-                        MuxResourceKey::Pane(path.0.clone(), path.1.clone(), path.2.clone()),
-                        occupant.clone(),
+                        MuxResourceKey::Pane(
+                            session.id.clone(),
+                            window.id.clone(),
+                            pane_id.clone(),
+                        ),
+                        format!("{:?}:{:?}", pane.pane_pid, pane.process),
                     );
-                    current.insert(MuxResourceKey::Terminal(path.0, path.1, path.2), occupant);
                 }
             }
         }
