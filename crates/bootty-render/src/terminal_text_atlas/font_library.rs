@@ -1,6 +1,8 @@
 use super::clusters::{ShapedCluster, is_combining_mark, is_variation_selector};
+#[cfg(target_os = "macos")]
+use super::coretext;
+use super::shaping;
 use super::shaping::font_has_ligature_features;
-use super::{coretext, shaping};
 use ab_glyph::{Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont, point};
 use std::collections::HashMap;
 

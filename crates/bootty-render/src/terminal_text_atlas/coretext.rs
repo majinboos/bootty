@@ -1,4 +1,6 @@
-use super::clusters::{ShapedCluster, is_combining_mark, is_variation_selector};
+use super::clusters::ShapedCluster;
+#[cfg(target_os = "macos")]
+use super::clusters::{is_combining_mark, is_variation_selector};
 use crate::{terminal_font_face::FontFaceMetrics, terminal_text::ResolvedFontFace};
 
 #[cfg(target_os = "macos")]
