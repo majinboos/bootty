@@ -426,14 +426,6 @@ pub type ExtensionCommandHandler = Arc<
 >;
 
 #[derive(Clone)]
-struct ExtensionCommand {
-    package: String,
-    generation: u64,
-    descriptor: CommandDescriptor,
-    handler: ExtensionCommandHandler,
-}
-
-#[derive(Clone)]
 pub struct ResolvedExtensionCommand {
     pub descriptor: CommandDescriptor,
     pub invocation: CommandInvocation,
@@ -443,7 +435,7 @@ pub struct ResolvedExtensionCommand {
 #[derive(Clone)]
 pub struct CommandCatalog {
     core: &'static CommandRegistry,
-    extensions: Arc<RwLock<BTreeMap<String, ExtensionCommand>>>,
+    extensions: Arc<RwLock<BTreeMap<String, (CommandDescriptor, ExtensionCommandHandler)>>>,
 }
 
 impl std::fmt::Debug for CommandCatalog {
@@ -471,7 +463,7 @@ impl CommandCatalog {
             commands.extend(
                 extensions
                     .values()
-                    .map(|command| command.descriptor.clone()),
+                    .map(|(descriptor, _)| descriptor.clone()),
             );
         }
         commands.sort_by(|left, right| left.id.cmp(&right.id));
@@ -483,7 +475,7 @@ impl CommandCatalog {
             self.extensions
                 .read()
                 .ok()
-                .and_then(|commands| commands.get(id).map(|command| command.descriptor.clone()))
+                .and_then(|commands| commands.get(id).map(|(descriptor, _)| descriptor.clone()))
         })
     }
 
@@ -503,28 +495,24 @@ impl CommandCatalog {
             .read()
             .ok()
             .and_then(|commands| commands.get(&invocation.command).cloned());
-        let Some(command) = command else {
+        let Some((descriptor, handler)) = command else {
             return Ok(None);
         };
-        validate_arguments(&command.descriptor, &invocation.arguments)?;
+        validate_arguments(&descriptor, &invocation.arguments)?;
         Ok(Some(ResolvedExtensionCommand {
-            descriptor: command.descriptor,
+            descriptor,
             invocation,
-            handler: command.handler,
+            handler,
         }))
     }
 
     pub fn register_extension(
         &self,
         package: &str,
-        generation: u64,
         descriptor: CommandDescriptor,
         handler: ExtensionCommandHandler,
     ) -> Result<(), String> {
-        if package.is_empty()
-            || !descriptor.id.starts_with(package)
-            || !descriptor.id[package.len()..].starts_with('.')
-        {
+        if package.is_empty() || !is_namespaced(&descriptor.id, package) {
             return Err("extension command must be namespaced by its package".to_owned());
         }
         if self.core.describe(&descriptor.id).is_some() {
@@ -537,25 +525,21 @@ impl CommandCatalog {
         if extensions.contains_key(&descriptor.id) {
             return Err(format!("command {} is already registered", descriptor.id));
         }
-        extensions.insert(
-            descriptor.id.clone(),
-            ExtensionCommand {
-                package: package.to_owned(),
-                generation,
-                descriptor,
-                handler,
-            },
-        );
+        extensions.insert(descriptor.id.clone(), (descriptor, handler));
         Ok(())
     }
 
-    pub fn remove_extension_generation(&self, package: &str, generation: u64) {
+    pub fn clear_extensions(&self) {
         if let Ok(mut extensions) = self.extensions.write() {
-            extensions.retain(|_, command| {
-                command.package != package || command.generation != generation
-            });
+            extensions.clear();
         }
     }
+}
+
+/// Whether `id` is `package` followed by a dot and a leaf, the namespacing every
+/// extension-supplied command id and event topic must satisfy.
+pub fn is_namespaced(id: &str, package: &str) -> bool {
+    id.starts_with(package) && id[package.len()..].starts_with('.')
 }
 
 fn descriptor_metadata(id: &str, command: Command) -> (&str, &str) {

@@ -24,12 +24,6 @@ use serde_json::{Map, Value, json};
 struct PackageManifest {
     id: String,
     entrypoint: PathBuf,
-    #[serde(default = "enabled_by_default")]
-    enabled: bool,
-}
-
-fn enabled_by_default() -> bool {
-    true
 }
 
 struct Invocation {
@@ -40,20 +34,13 @@ struct Invocation {
     response: mpsc::Sender<CommandOutcome>,
 }
 
-struct PackageWorker {
-    id: String,
-    generation: u64,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
 pub struct CommandExtensionHost {
     root: PathBuf,
     catalog: Arc<CommandCatalog>,
     plane: ControlPlane,
-    workers: Vec<PackageWorker>,
+    workers: Vec<thread::JoinHandle<()>>,
     fingerprint: u64,
     next_check: Instant,
-    next_generation: u64,
 }
 
 impl CommandExtensionHost {
@@ -65,7 +52,6 @@ impl CommandExtensionHost {
             workers: Vec::new(),
             fingerprint: 0,
             next_check: Instant::now(),
-            next_generation: 1,
         };
         host.reload();
         host
@@ -107,13 +93,8 @@ impl CommandExtensionHost {
             serde_json::from_slice(&fs::read(&manifest_path).map_err(|error| error.to_string())?)
                 .map_err(|error| error.to_string())?;
         validate_package_id(&manifest.id)?;
-        if !manifest.enabled {
-            return Ok(());
-        }
         let entrypoint = safe_entrypoint(root, &manifest.entrypoint)?;
         let source = fs::read_to_string(&entrypoint).map_err(|error| error.to_string())?;
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.saturating_add(1);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (tx, rx) = mpsc::sync_channel(64);
         let id = manifest.id.clone();
@@ -130,7 +111,6 @@ impl CommandExtensionHost {
             let sender = tx.clone();
             self.catalog.register_extension(
                 &id,
-                generation,
                 descriptor,
                 Arc::new(move |invocation, deadline, cancellation| {
                     let (response, receiver) = mpsc::channel();
@@ -141,37 +121,28 @@ impl CommandExtensionHost {
                         cancellation,
                         response,
                     };
-                    if sender.try_send(work).is_err() {
-                        let (fallback, receiver) = mpsc::channel();
-                        let _ = fallback.send(CommandOutcome::Failed {
+                    if let Err(
+                        mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work),
+                    ) = sender.try_send(work)
+                    {
+                        let _ = work.response.send(CommandOutcome::Failed {
                             code: "extension_busy".to_owned(),
                             message: "extension command queue is unavailable".to_owned(),
                         });
-                        return receiver;
                     }
                     receiver
                 }),
             )?;
         }
-        self.workers.push(PackageWorker {
-            id,
-            generation,
-            thread: Some(thread),
-        });
+        self.workers.push(thread);
         Ok(())
     }
 
     fn clear_workers(&mut self) {
-        for worker in &mut self.workers {
-            self.catalog
-                .remove_extension_generation(&worker.id, worker.generation);
+        self.catalog.clear_extensions();
+        for thread in self.workers.drain(..) {
+            let _ = thread.join();
         }
-        for worker in &mut self.workers {
-            if let Some(thread) = worker.thread.take() {
-                let _ = thread.join();
-            }
-        }
-        self.workers.clear();
     }
 }
 
@@ -239,8 +210,8 @@ fn run_package(
         return;
     }
     while let Ok(work) = rx.recv() {
-        let outcome = invoke_handler(&lua, &handlers, work);
-        let _ = outcome.0.send(outcome.1);
+        let response = work.response.clone();
+        let _ = response.send(invoke_handler(&lua, &handlers, work));
     }
 }
 
@@ -301,8 +272,8 @@ fn invoke_handler(
     lua: &Lua,
     handlers: &std::sync::Mutex<BTreeMap<String, RegistryKey>>,
     work: Invocation,
-) -> (mpsc::Sender<CommandOutcome>, CommandOutcome) {
-    let outcome = if work.cancellation.is_cancelled() {
+) -> CommandOutcome {
+    if work.cancellation.is_cancelled() {
         CommandOutcome::Failed {
             code: "cancelled".to_owned(),
             message: "extension command was cancelled".to_owned(),
@@ -350,13 +321,12 @@ fn invoke_handler(
                 message,
             },
         }
-    };
-    (work.response, outcome)
+    }
 }
 
 fn descriptor_from_table(package: &str, spec: &Table) -> mlua::Result<CommandDescriptor> {
     let id: String = spec.get("id")?;
-    if !id.starts_with(package) || !id[package.len()..].starts_with('.') {
+    if !crate::commands::is_namespaced(&id, package) {
         return Err(mlua::Error::runtime(
             "extension command must be namespaced by its package",
         ));

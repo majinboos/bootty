@@ -42,7 +42,7 @@ pub struct ControlPlane {
 
 impl ControlPlane {
     pub fn register_extension_topic(&self, package: &str, topic: &str) -> Result<(), String> {
-        if !topic.starts_with(package) || !topic[package.len()..].starts_with('.') {
+        if !crate::commands::is_namespaced(topic, package) {
             return Err("extension event topic must be namespaced by its package".to_owned());
         }
         lock_control_state(&self.state)
