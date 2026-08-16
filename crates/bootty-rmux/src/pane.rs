@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -13,7 +13,10 @@ use anyhow::Result;
 use bootty_runtime::{
     DrainStats, TerminalSessionConfig,
     frame_source::TerminalFrameSource,
-    terminal_session::{should_publish_frame_after_work, sync_output_suppresses_publish},
+    terminal_session::{
+        WorkerRequest, should_publish_frame_after_work, sync_output_suppresses_publish,
+        worker_request,
+    },
 };
 use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
 use bootty_terminal::{
@@ -42,12 +45,6 @@ const RMUX_MAX_PENDING_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const RMUX_MAX_DRAIN_CHUNKS_PER_TICK: usize = 32;
 const RMUX_MAX_DRAIN_SLICE_BYTES: usize = 8 * 1024;
 const RMUX_MAX_DRAIN_TIME_US: u128 = 20_000;
-const RMUX_WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
-const RMUX_WORKER_RESPONSE_COMPLETION_TIMEOUT: Duration = Duration::from_millis(100);
-const RMUX_REQUEST_PENDING: u8 = 0;
-const RMUX_REQUEST_RUNNING: u8 = 1;
-const RMUX_REQUEST_CANCELLED: u8 = 2;
-const RMUX_REQUEST_COMPLETE: u8 = 3;
 const RMUX_INPUT_FAST_PATH_DRAIN_BYTES: usize = 64 * 1024;
 const RMUX_INPUT_FAST_PATH_DRAIN_CHUNKS: usize = 8;
 const RMUX_INPUT_FAST_PATH_DRAIN_TIME_US: u128 = 2_000;
@@ -58,86 +55,6 @@ const RMUX_MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const RMUX_MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
 const RMUX_WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 const RMUX_INITIAL_FRAME_AGE: Duration = Duration::from_millis(16);
-
-struct RmuxWorkerRequest<T> {
-    state: Arc<AtomicU8>,
-    sender: mpsc::Sender<T>,
-}
-
-struct RmuxPendingResponse<T> {
-    state: Arc<AtomicU8>,
-    receiver: mpsc::Receiver<T>,
-}
-
-fn rmux_worker_request<T>() -> (RmuxWorkerRequest<T>, RmuxPendingResponse<T>) {
-    let state = Arc::new(AtomicU8::new(RMUX_REQUEST_PENDING));
-    let (sender, receiver) = mpsc::channel();
-    (
-        RmuxWorkerRequest {
-            state: Arc::clone(&state),
-            sender,
-        },
-        RmuxPendingResponse { state, receiver },
-    )
-}
-
-impl<T> RmuxWorkerRequest<T> {
-    fn try_claim(&self) -> bool {
-        self.state
-            .compare_exchange(
-                RMUX_REQUEST_PENDING,
-                RMUX_REQUEST_RUNNING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn send(self, response: T) {
-        if self.state.load(Ordering::Acquire) == RMUX_REQUEST_RUNNING {
-            let _ = self.sender.send(response);
-            self.state.store(RMUX_REQUEST_COMPLETE, Ordering::Release);
-        }
-    }
-}
-
-impl<T> RmuxPendingResponse<T> {
-    fn receive(self, operation: &'static str) -> Result<T> {
-        match self.receiver.recv_timeout(RMUX_WORKER_RESPONSE_TIMEOUT) {
-            Ok(response) => Ok(response),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(anyhow::anyhow!("rmux terminal worker stopped"))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if self
-                    .state
-                    .compare_exchange(
-                        RMUX_REQUEST_PENDING,
-                        RMUX_REQUEST_CANCELLED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    return Err(anyhow::anyhow!("rmux terminal worker response timed out"));
-                }
-
-                match self
-                    .receiver
-                    .recv_timeout(RMUX_WORKER_RESPONSE_COMPLETION_TIMEOUT)
-                {
-                    Ok(response) => Ok(response),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(anyhow::anyhow!("rmux terminal worker stopped"))
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
-                        "rmux terminal worker completion unknown after {operation}; the request result is ambiguous"
-                    )),
-                }
-            }
-        }
-    }
-}
 
 struct RmuxNativeTerminal {
     command_tx: mpsc::Sender<RmuxTerminalCommand>,
@@ -204,25 +121,25 @@ enum RmuxTerminalCommand {
     SelectionEnd(Option<TerminalSelectionEvent>),
     FormatSelection {
         format: TerminalSelectionFormat,
-        done: RmuxWorkerRequest<std::result::Result<Option<Vec<u8>>, String>>,
+        done: WorkerRequest<std::result::Result<Option<Vec<u8>>, String>>,
     },
     CopyModeActive {
-        done: RmuxWorkerRequest<std::result::Result<bool, String>>,
+        done: WorkerRequest<std::result::Result<bool, String>>,
     },
     CopyModeAction {
         action: TerminalCopyModeAction,
-        done: RmuxWorkerRequest<std::result::Result<TerminalCopyModeOutcome, String>>,
+        done: WorkerRequest<std::result::Result<TerminalCopyModeOutcome, String>>,
     },
     SearchViewport {
         query: String,
         direction: TerminalSearchDirection,
-        done: RmuxWorkerRequest<std::result::Result<bool, String>>,
+        done: WorkerRequest<std::result::Result<bool, String>>,
     },
     IsMouseTracking {
-        done: RmuxWorkerRequest<std::result::Result<bool, String>>,
+        done: WorkerRequest<std::result::Result<bool, String>>,
     },
     DiscardPendingOutput {
-        done: RmuxWorkerRequest<std::result::Result<(), String>>,
+        done: WorkerRequest<std::result::Result<(), String>>,
     },
     Stop,
 }
@@ -417,10 +334,10 @@ impl RmuxNativeTerminal {
     fn request<T>(
         &mut self,
         operation: &'static str,
-        build: impl FnOnce(RmuxWorkerRequest<std::result::Result<T, String>>) -> RmuxTerminalCommand,
+        build: impl FnOnce(WorkerRequest<std::result::Result<T, String>>) -> RmuxTerminalCommand,
     ) -> Result<T> {
         self.check_worker_error()?;
-        let (done, response) = rmux_worker_request();
+        let (done, response) = worker_request();
         self.command_tx
             .send(build(done))
             .map_err(|_| anyhow::anyhow!("rmux terminal worker stopped"))?;

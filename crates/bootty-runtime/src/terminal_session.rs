@@ -5,7 +5,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -51,7 +51,6 @@ const WORKER_RESPONSE_COMPLETION_TIMEOUT: Duration = Duration::from_millis(100);
 const REQUEST_PENDING: u8 = 0;
 const REQUEST_RUNNING: u8 = 1;
 const REQUEST_CANCELLED: u8 = 2;
-const REQUEST_COMPLETE: u8 = 3;
 
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSessionConfig {
@@ -241,19 +240,23 @@ type SearchViewportResponse = std::result::Result<bool, String>;
 type CopyModeActiveResponse = std::result::Result<bool, String>;
 type CopyModeActionResponse = std::result::Result<TerminalCopyModeOutcome, String>;
 
-struct WorkerRequest<T> {
+/// Worker-side half of a single-response request, claimed with [`WorkerRequest::try_claim`] before
+/// the work runs so a caller that already timed out is not served.
+pub struct WorkerRequest<T> {
     state: Arc<AtomicU8>,
-    sender: SyncSender<T>,
+    sender: Sender<T>,
 }
 
-struct PendingWorkerResponse<T> {
+/// Caller-side half of a single-response request.
+pub struct PendingWorkerResponse<T> {
     state: Arc<AtomicU8>,
     receiver: Receiver<T>,
 }
 
-fn worker_request<T>() -> (WorkerRequest<T>, PendingWorkerResponse<T>) {
+/// Creates a request/response pair for one worker round trip.
+pub fn worker_request<T>() -> (WorkerRequest<T>, PendingWorkerResponse<T>) {
     let state = Arc::new(AtomicU8::new(REQUEST_PENDING));
-    let (sender, receiver) = mpsc::sync_channel(0);
+    let (sender, receiver) = mpsc::channel();
     (
         WorkerRequest {
             state: Arc::clone(&state),
@@ -264,7 +267,8 @@ fn worker_request<T>() -> (WorkerRequest<T>, PendingWorkerResponse<T>) {
 }
 
 impl<T> WorkerRequest<T> {
-    fn try_claim(&self) -> bool {
+    /// Takes ownership of the request. Returns `false` when the caller already gave up.
+    pub fn try_claim(&self) -> bool {
         self.state
             .compare_exchange(
                 REQUEST_PENDING,
@@ -275,16 +279,17 @@ impl<T> WorkerRequest<T> {
             .is_ok()
     }
 
-    fn send(self, response: T) {
+    /// Delivers the response to the waiting caller.
+    pub fn send(self, response: T) {
         if self.state.load(Ordering::Acquire) == REQUEST_RUNNING {
             let _ = self.sender.send(response);
-            self.state.store(REQUEST_COMPLETE, Ordering::Release);
         }
     }
 }
 
 impl<T> PendingWorkerResponse<T> {
-    fn receive(self, operation: &'static str) -> Result<T> {
+    /// Waits for the worker response, naming `operation` in any error.
+    pub fn receive(self, operation: &'static str) -> Result<T> {
         match self.receiver.recv_timeout(WORKER_RESPONSE_TIMEOUT) {
             Ok(response) => Ok(response),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(

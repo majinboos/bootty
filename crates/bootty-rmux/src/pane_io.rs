@@ -439,9 +439,9 @@ async fn send_next_event(
         Ok(permit) => permit,
         Err(_) => return false,
     };
-    let Some(event) = pending.pop_front() else {
-        return true;
-    };
+    let event = pending
+        .pop_front()
+        .expect("send_next_event runs only while pending output is non-empty");
     *pending_bytes = pending_bytes.saturating_sub(event_bytes(&event));
     permit.send(event);
     true
@@ -452,25 +452,19 @@ struct RestoreOutput {
     capture_offset: usize,
     capture_previous: Option<u8>,
     buffered_chunks: VecDeque<PaneOutputChunk>,
-    buffered_bytes: usize,
     started: bool,
     ended: bool,
     has_capture: bool,
 }
 
 impl RestoreOutput {
-    fn new(
-        capture: Option<Vec<u8>>,
-        buffered_chunks: VecDeque<PaneOutputChunk>,
-        buffered_bytes: usize,
-    ) -> Self {
+    fn new(capture: Option<Vec<u8>>, buffered_chunks: VecDeque<PaneOutputChunk>) -> Self {
         let has_capture = capture.as_ref().is_some_and(|capture| !capture.is_empty());
         Self {
             capture,
             capture_offset: 0,
             capture_previous: None,
             buffered_chunks,
-            buffered_bytes,
             started: false,
             ended: false,
             has_capture,
@@ -517,40 +511,12 @@ impl RestoreOutput {
             return;
         }
 
-        let Some(chunk) = self.buffered_chunks.front_mut() else {
-            return;
-        };
-        let (sequence, bytes) = match chunk {
-            PaneOutputChunk::Bytes { sequence, bytes } => (*sequence, bytes),
-            PaneOutputChunk::Lag(lag) if !lag.recent.bytes.is_empty() => {
-                (lag.resume_sequence, &mut lag.recent.bytes)
-            }
-            _ => {
-                self.buffered_chunks.pop_front();
-                return;
-            }
-        };
-        let length = bytes.len().min(RMUX_OUTPUT_EVENT_MAX_BYTES);
-        if pending_bytes.saturating_add(length) > RMUX_OUTPUT_BACKLOG_MAX_BYTES {
-            return;
-        }
-        let remainder = bytes.split_off(length);
-        let chunk_bytes = std::mem::replace(bytes, remainder);
-        let chunk_len = chunk_bytes.len();
-        if !queue_event(
+        queue_live_chunks(
             pending,
             pending_bytes,
-            RmuxPaneEvent::Chunks(vec![PaneOutputChunk::Bytes {
-                sequence,
-                bytes: chunk_bytes,
-            }]),
-        ) {
-            return;
-        }
-        self.buffered_bytes = self.buffered_bytes.saturating_sub(chunk_len);
-        if pane_output_chunk_bytes(self.buffered_chunks.front().unwrap()) == 0 {
-            self.buffered_chunks.pop_front();
-        }
+            &mut self.buffered_chunks,
+            &mut 0usize,
+        );
     }
 }
 
@@ -713,12 +679,9 @@ async fn run_pane_io_inner(
             && restore_output.is_none()
             && !restore_complete
         {
+            deferred_live_bytes = 0;
             restore_output = restore_result.take().map(|capture| {
-                RestoreOutput::new(
-                    capture,
-                    std::mem::take(&mut deferred_live_chunks),
-                    std::mem::take(&mut deferred_live_bytes),
-                )
+                RestoreOutput::new(capture, std::mem::take(&mut deferred_live_chunks))
             });
         }
         if restore_complete && !deferred_live_chunks.is_empty() {
