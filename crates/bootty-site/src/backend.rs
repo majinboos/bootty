@@ -318,11 +318,6 @@ impl SiteBackend {
         self.render_frame()
     }
 
-    pub fn fps_frame(&mut self, fps: f64) -> Result<WebTerminalFrame, String> {
-        self.fps = fps;
-        self.render_frame()
-    }
-
     fn current_tab(&self) -> usize {
         self.active_tabs
             .get(self.selected)
@@ -516,7 +511,8 @@ impl SiteBackend {
     }
 
     pub fn set_fps(&mut self, fps: f64) -> Result<JsValue, JsValue> {
-        encode_frame(self.fps_frame(fps))
+        self.fps = fps;
+        encode_frame(self.render_frame())
     }
 
     pub fn selected_text(&self) -> Option<String> {

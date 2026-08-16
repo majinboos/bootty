@@ -43,7 +43,7 @@ use crate::{
 const REMOTE_RMUX_SUBCOMMAND: &str = "remote-rmux";
 const MAX_REMOTE_RMUX_PAYLOAD: usize = 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum RemoteRmuxRequest {
     Snapshot,
     Execute {
@@ -66,8 +66,8 @@ pub enum RemoteRmuxRequest {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum RemotePaneFrame {
+#[derive(Debug, Deserialize, Serialize)]
+enum RemotePaneFrame {
     Restore {
         capture: String,
         buffered_chunks: Vec<String>,
@@ -185,10 +185,8 @@ impl RemoteRmuxRequest {
             .context("decode remote terminal request")?;
         serde_json::from_slice(&json).context("parse remote terminal request")
     }
-}
 
-#[cfg(feature = "app")]
-impl RemoteRmuxRequest {
+    #[cfg(feature = "app")]
     pub fn encode(&self) -> Result<String> {
         let json = serde_json::to_vec(self).context("encode remote terminal request")?;
         if json.len() > MAX_REMOTE_RMUX_PAYLOAD {

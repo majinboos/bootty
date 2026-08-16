@@ -33,7 +33,7 @@ pub fn home_dir() -> Option<PathBuf> {
     home_dir_from(|name| env::var_os(name))
 }
 
-fn home_dir_from(mut var: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+pub fn home_dir_from(mut var: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         if let Some(profile) = non_empty_path(var("USERPROFILE")) {

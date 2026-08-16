@@ -1,37 +1,16 @@
-use std::process::Command;
+use std::ffi::OsString;
 
 use bootty_mux::project::{
     WorktreePickerEntry, discover_project_picker_entries, discover_worktree_picker_entries,
-    home_dir, mark_occupied_worktrees, toggle_favorite_project_path,
+    home_dir_from, mark_occupied_worktrees, toggle_favorite_project_path,
 };
 
-const HELPER_ENV: &str = "BOOTTY_MUX_PROJECT_CONTRACT_HELPER";
-
-#[cfg(not(windows))]
 #[test]
 fn an_empty_home_does_not_become_a_project_root() {
-    let output = Command::new(std::env::current_exe().expect("current test executable"))
-        .args(["--exact", "project_contract_helper", "--nocapture"])
-        .env(HELPER_ENV, "empty-home")
-        .env("HOME", "")
-        .output()
-        .expect("run isolated home contract");
-
-    assert!(
-        output.status.success(),
-        "stdout={}; stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    assert_eq!(
+        home_dir_from(|name| (name == "HOME").then(OsString::new)),
+        None
     );
-}
-
-#[test]
-fn project_contract_helper() {
-    match std::env::var(HELPER_ENV).as_deref() {
-        #[cfg(not(windows))]
-        Ok("empty-home") => assert_eq!(home_dir(), None),
-        _ => {}
-    }
 }
 
 #[test]
