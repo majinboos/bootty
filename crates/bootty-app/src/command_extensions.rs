@@ -41,7 +41,6 @@ struct ActiveInvocation {
     cancellation: CommandCancellation,
 }
 
-
 pub struct CommandExtensionHost {
     root: PathBuf,
     catalog: Arc<CommandCatalog>,
