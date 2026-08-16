@@ -1,7 +1,10 @@
 //! Read-only host facts and bounded platform jobs for one extension generation.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
