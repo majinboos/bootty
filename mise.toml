@@ -19,9 +19,10 @@ description = "Build the Cloudflare Pages site from Rust/WASM source"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-rustup target add wasm32-unknown-unknown
+rustup toolchain install nightly --profile minimal
+rustup target add --toolchain nightly wasm32-unknown-unknown
 bun install --frozen-lockfile
-bun run build:web
+RUSTUP_TOOLCHAIN=nightly bun run build:web
 """
 
 [tasks.test]
