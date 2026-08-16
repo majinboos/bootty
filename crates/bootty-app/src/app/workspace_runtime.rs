@@ -1014,7 +1014,8 @@ impl WorkspaceRuntime {
             .binding
             .mux
             .apply_session_order(&self.active.binding.session_order.session_names());
-        if self.active.binding.backend_policy.persisted_sessions == PersistedSessionPolicy::Immediate
+        if self.active.binding.backend_policy.persisted_sessions
+            == PersistedSessionPolicy::Immediate
         {
             self.active.binding.persisted_sessions_restored = false;
             self.active
