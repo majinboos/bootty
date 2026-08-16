@@ -414,9 +414,7 @@ fn push_egui_icon(
 }
 
 fn premultiplied_rgba(rgba: &[u8]) -> Vec<u8> {
-    rgba.as_chunks::<4>()
-        .0
-        .iter()
+    rgba.chunks_exact(4)
         .flat_map(|pixel| {
             let alpha = u16::from(pixel[3]);
             [
@@ -489,9 +487,7 @@ fn rgba_from_png(bytes: &[u8], color_type: png::ColorType) -> Vec<u8> {
     match color_type {
         png::ColorType::Rgba => bytes.to_vec(),
         png::ColorType::Rgb => bytes
-            .as_chunks::<3>()
-            .0
-            .iter()
+            .chunks_exact(3)
             .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
             .collect(),
         png::ColorType::Grayscale => bytes
@@ -499,9 +495,7 @@ fn rgba_from_png(bytes: &[u8], color_type: png::ColorType) -> Vec<u8> {
             .flat_map(|gray| [*gray, *gray, *gray, 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
+            .chunks_exact(2)
             .flat_map(|gray| [gray[0], gray[0], gray[0], gray[1]])
             .collect(),
         png::ColorType::Indexed => panic!("indexed bootty logo png is unsupported"),
