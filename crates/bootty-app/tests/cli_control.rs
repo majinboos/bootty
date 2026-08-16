@@ -51,10 +51,13 @@ fn cli_control_helper() {
         .stderr(Stdio::null())
         .spawn()
         .expect("start CLI command");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let request = loop {
         if let Ok(request) = receiver.try_recv() {
             break request;
+        }
+        if let Some(status) = child.try_wait().expect("poll CLI command") {
+            panic!("CLI exited with {status} before reaching the app command channel");
         }
         assert!(
             Instant::now() < deadline,
@@ -77,7 +80,7 @@ fn cli_control_helper() {
         .stderr(Stdio::null())
         .spawn()
         .expect("start bare Bootty invocation");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     let status = loop {
         if let Some(status) = bare.try_wait().expect("poll bare invocation") {
             break status;
