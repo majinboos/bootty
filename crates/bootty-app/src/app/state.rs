@@ -27,7 +27,7 @@ use super::binding_terminal_facts::TerminalProgress;
 use super::command_runtime::CommandRuntime;
 use super::config_runtime::AppConfigRuntime;
 use super::dialog_runtime::{DialogRuntime, ModalDialog};
-use super::remote_reconnect::{AttachExit, RemoteReconnectRuntime};
+use super::remote_reconnect::AttachExit;
 use super::terminal_config::{
     terminal_live_config, terminal_session_config_with_side_effects, terminal_text_config,
 };
@@ -194,7 +194,6 @@ pub struct AppState {
     pub(super) commands: CommandRuntime,
     pub(super) workspace: WorkspaceRuntime,
     repaint_scheduler: RepaintScheduler,
-    remote_reconnect: RemoteReconnectRuntime,
     pub(super) last_error: Option<String>,
     last_drain: DrainStats,
     terminal_surface: Option<TerminalSurface>,
@@ -476,7 +475,6 @@ impl AppState {
             commands,
             workspace,
             repaint_scheduler: RepaintScheduler::default(),
-            remote_reconnect: RemoteReconnectRuntime::new(Instant::now()),
             last_error: None,
             last_drain: DrainStats::default(),
             terminal_surface: None,
@@ -2167,8 +2165,7 @@ impl AppState {
             terminal_cell_height,
             terminal_scale_factor,
         );
-        self.remote_reconnect
-            .reset_after_network_change(&mut self.workspace, now);
+        self.workspace.reset_after_network_change(now);
         // A shell exiting closes its pane, collapsing the split (or cascading to the tab when it was
         // the last pane). On native, any pane's shell can exit, not just the focused one.
         if self.is_native() {
@@ -3532,8 +3529,7 @@ impl AppState {
     }
 
     pub fn reconnect_space_from_ui(&mut self, space_id: SpaceId) -> bool {
-        self.remote_reconnect
-            .reconnect_space(&mut self.workspace, space_id, Instant::now())
+        self.workspace.reconnect_space(space_id, Instant::now())
     }
     // Close the focused pane (cmd+w or its shell exiting) and let the mux cascade to the tab. The
     // active terminal is dropped here so its PTY is reaped; sync_mux_anchor then attaches whatever

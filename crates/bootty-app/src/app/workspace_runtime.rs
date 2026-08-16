@@ -9,8 +9,10 @@ use bootty_config::config::MultiplexerBackendConfig;
 use bootty_terminal::terminal_engine::TerminalSideEffectEvent;
 
 use super::{
-    binding_terminal_facts::BindingTerminalFacts, mux_config::realize_binding,
-    remote_reconnect::BindingReconnect, state::SpaceSummary,
+    binding_terminal_facts::BindingTerminalFacts,
+    mux_config::realize_binding,
+    remote_reconnect::{BindingReconnect, NetworkChangeDetector},
+    state::SpaceSummary,
     terminal_config::terminal_session_config_with_side_effects,
 };
 
@@ -556,6 +558,7 @@ pub(super) struct WorkspaceRuntime {
     pub(super) inactive_spaces: Vec<SpaceRuntime>,
     pub(super) space_transition: Option<SpaceTransition>,
     pub(super) parked_native_terminal: Option<NativeTerminalOwner>,
+    pub(super) network_change_detector: NetworkChangeDetector,
 }
 
 impl WorkspaceRuntime {
@@ -595,6 +598,7 @@ impl WorkspaceRuntime {
             inactive_spaces: spaces,
             space_transition: None,
             parked_native_terminal: None,
+            network_change_detector: NetworkChangeDetector::new(Instant::now()),
         })
     }
 

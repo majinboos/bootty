@@ -170,7 +170,7 @@ impl BindingRuntime {
     }
 }
 
-struct NetworkChangeDetector {
+pub(super) struct NetworkChangeDetector {
     next_check: Instant,
     signature: Option<IpAddr>,
 }
@@ -178,7 +178,7 @@ struct NetworkChangeDetector {
 impl NetworkChangeDetector {
     const INTERVAL: Duration = Duration::from_secs(2);
 
-    fn new(now: Instant) -> Self {
+    pub(super) fn new(now: Instant) -> Self {
         Self {
             next_check: now + Self::INTERVAL,
             signature: network_signature(),
@@ -203,38 +203,13 @@ fn network_signature() -> Option<IpAddr> {
     socket.local_addr().ok().map(|address| address.ip())
 }
 
-pub(super) struct RemoteReconnectRuntime {
-    network: NetworkChangeDetector,
-}
-
-impl RemoteReconnectRuntime {
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
-            network: NetworkChangeDetector::new(now),
-        }
-    }
-
-    pub(super) fn reset_after_network_change(
-        &mut self,
-        workspace: &mut WorkspaceRuntime,
-        now: Instant,
-    ) {
-        if workspace.has_degraded_remote() && self.network.changed(now) {
-            workspace.reset_remote_reconnects(now);
-        }
-    }
-
-    pub(super) fn reconnect_space(
-        &mut self,
-        workspace: &mut WorkspaceRuntime,
-        space_id: SpaceId,
-        now: Instant,
-    ) -> bool {
-        workspace.reconnect_space(space_id, now)
-    }
-}
-
 impl WorkspaceRuntime {
+    pub(super) fn reset_after_network_change(&mut self, now: Instant) {
+        if self.has_degraded_remote() && self.network_change_detector.changed(now) {
+            self.reset_remote_reconnects(now);
+        }
+    }
+
     fn has_degraded_remote(&self) -> bool {
         self.active
             .bindings()
@@ -258,7 +233,7 @@ impl WorkspaceRuntime {
         }
     }
 
-    fn reconnect_space(&mut self, space_id: SpaceId, now: Instant) -> bool {
+    pub(super) fn reconnect_space(&mut self, space_id: SpaceId, now: Instant) -> bool {
         let Some(space) = std::iter::once(&mut self.active)
             .chain(self.inactive_spaces.iter_mut())
             .find(|space| space.id == space_id)
