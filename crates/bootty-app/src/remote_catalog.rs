@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use crate::{
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
     workspace::{
-        BackendSessionMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR,
-        DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
-        SpaceRemoteOverride, WorkspaceBinding, WorkspaceRepository,
+        BackendMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON,
+        SessionNameStore, SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride,
+        WorkspaceBinding, WorkspaceRepository,
     },
 };
 use anyhow::{Result, bail};
@@ -199,7 +199,7 @@ impl RemoteSpaceRuntime {
         let memberships = snapshot
             .sessions
             .iter()
-            .map(|session| BackendSessionMembership {
+            .map(|session| BackendMembership {
                 id: session.id.clone(),
                 name: session.name.clone(),
             })

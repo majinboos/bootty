@@ -48,16 +48,6 @@ fn save_with_fault(requested_path: &Path, source: &str, fault: WriteFault) -> io
         builder.permissions(fs::Permissions::from_mode(mode));
     }
     let mut temporary = builder.tempfile_in(parent)?;
-    #[cfg(unix)]
-    if let Some(metadata) = existing.as_ref() {
-        use std::os::unix::fs::PermissionsExt;
-
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(
-                metadata.permissions().mode() & 0o7777,
-            ))?;
-    }
 
     temporary.write_all(source.as_bytes())?;
     temporary.flush()?;

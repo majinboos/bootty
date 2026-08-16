@@ -3,7 +3,7 @@ use crate::{
     paint_plan::{TerminalPaintPlan, TextAttrs, TextRun},
     terminal_sprite::{SpriteFamily, SpriteGlyph, SpriteRegistry},
 };
-pub use bootty_font::{FontFeature, parse_font_features};
+pub use bootty_font::FontFeature;
 use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 

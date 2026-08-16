@@ -57,21 +57,6 @@ impl Backend {
             Self::Zellij => MuxBackendKind::Zellij,
         }
     }
-    fn snapshot(self) -> Result<MuxSnapshot> {
-        match self {
-            Self::Rmux => RmuxBackend::new().snapshot(),
-            Self::Tmux => TmuxBackend::new().snapshot(),
-            Self::Zellij => ZellijBackend::new().snapshot(),
-        }
-    }
-
-    fn execute(self, command: MuxCommand) -> Result<()> {
-        match self {
-            Self::Rmux => RmuxBackend::new().execute(command),
-            Self::Tmux => TmuxBackend::new().execute(command),
-            Self::Zellij => ZellijBackend::new().execute(command),
-        }
-    }
 }
 
 struct LegacyCatalog {
@@ -92,11 +77,19 @@ pub trait CatalogBackend {
 
 impl CatalogBackend for Backend {
     fn snapshot(&self) -> Result<MuxSnapshot> {
-        Backend::snapshot(*self)
+        match self {
+            Self::Rmux => RmuxBackend::new().snapshot(),
+            Self::Tmux => TmuxBackend::new().snapshot(),
+            Self::Zellij => ZellijBackend::new().snapshot(),
+        }
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
-        Backend::execute(*self, command)
+        match self {
+            Self::Rmux => RmuxBackend::new().execute(command),
+            Self::Tmux => TmuxBackend::new().execute(command),
+            Self::Zellij => ZellijBackend::new().execute(command),
+        }
     }
 }
 

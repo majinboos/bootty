@@ -25,31 +25,16 @@ pub(super) struct ImportedSpace {
     pub(super) sessions: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum StoredBackend {
-    Inherit,
-    Explicit(MultiplexerBackendConfig),
-}
-
-impl StoredBackend {
-    fn parse(value: &str, binding_id: i64) -> Result<Self> {
-        let backend = match value {
-            "inherit" => Self::Inherit,
-            "native" => Self::Explicit(MultiplexerBackendConfig::Native),
-            "rmux" => Self::Explicit(MultiplexerBackendConfig::Rmux),
-            "tmux" => Self::Explicit(MultiplexerBackendConfig::Tmux),
-            "zellij" => Self::Explicit(MultiplexerBackendConfig::Zellij),
-            _ => bail!("legacy binding {binding_id} has unknown backend {value:?}"),
-        };
-        Ok(backend)
-    }
-
-    fn resolve(self, config: &BoottyConfig) -> MultiplexerBackendConfig {
-        match self {
-            Self::Inherit => config.multiplexer.backend,
-            Self::Explicit(backend) => backend,
-        }
-    }
+fn parse_stored_backend(value: &str, binding_id: i64) -> Result<Option<MultiplexerBackendConfig>> {
+    let backend = match value {
+        "inherit" => None,
+        "native" => Some(MultiplexerBackendConfig::Native),
+        "rmux" => Some(MultiplexerBackendConfig::Rmux),
+        "tmux" => Some(MultiplexerBackendConfig::Tmux),
+        "zellij" => Some(MultiplexerBackendConfig::Zellij),
+        _ => bail!("legacy binding {binding_id} has unknown backend {value:?}"),
+    };
+    Ok(backend)
 }
 
 #[derive(Debug)]
@@ -64,7 +49,7 @@ struct LegacySpace {
 struct LegacyBinding {
     id: i64,
     space_id: i64,
-    backend: StoredBackend,
+    backend: Option<MultiplexerBackendConfig>,
     local: bool,
 }
 
@@ -107,7 +92,6 @@ struct LegacySession {
     binding_id: i64,
     name: String,
     position: i64,
-    group_id: Option<i64>,
 }
 
 pub(super) fn load(config_path: &Path, database_path: &Path) -> Result<ImportPlan> {
@@ -246,7 +230,7 @@ fn load_bindings(
         if !binding_ids.insert(id) {
             bail!("legacy workspace bindings contain duplicate ids")
         }
-        let backend = StoredBackend::parse(&backend, id)?;
+        let backend = parse_stored_backend(&backend, id)?;
         let local = decode_local_placement(remote.as_deref(), config, id)?;
         bindings.push(LegacyBinding {
             id,
@@ -385,17 +369,16 @@ fn load_grouped_sessions(
          ORDER BY binding_id, group_id, position",
     )?;
     for row in statement.query_map([], |row| {
-        Ok(LegacySession {
-            binding_id: row.get(0)?,
-            name: row.get(1)?,
-            group_id: Some(row.get(2)?),
-            position: row.get(3)?,
-        })
+        Ok((
+            row.get::<_, i64>(2)?,
+            LegacySession {
+                binding_id: row.get(0)?,
+                name: row.get(1)?,
+                position: row.get(3)?,
+            },
+        ))
     })? {
-        let session = row?;
-        let Some(group_id) = session.group_id else {
-            bail!("legacy workspace session has no group id")
-        };
+        let (group_id, session) = row?;
         let Some(group) = groups.get(&group_id) else {
             bail!("legacy workspace session references an unknown group")
         };
@@ -448,7 +431,6 @@ fn load_ungrouped_sessions(
             binding_id: row.get(0)?,
             name: row.get(1)?,
             position: row.get(2)?,
-            group_id: None,
         })
     })? {
         let session = row?;
@@ -499,7 +481,7 @@ fn build_plan(
             .into_iter()
             .flatten()
         {
-            let effective = binding.backend.resolve(config);
+            let effective = binding.backend.unwrap_or(config.multiplexer.backend);
             let Some(backend) = destination_backend(effective) else {
                 continue;
             };

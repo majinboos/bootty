@@ -2007,7 +2007,6 @@ mod tests {
 
     struct ColorRecordingRuntime {
         colors: Arc<Mutex<Vec<(u8, u8, u8)>>>,
-        live_config_calls: Arc<Mutex<usize>>,
         fail_live_config: bool,
     }
 
@@ -2115,7 +2114,6 @@ mod tests {
         }
 
         fn apply_live_config(&mut self, config: TerminalLiveConfig) -> Result<()> {
-            *self.live_config_calls.lock().unwrap() += 1;
             self.colors.lock().unwrap().push((
                 config.colors.background.r,
                 config.colors.background.g,
@@ -2260,7 +2258,6 @@ mod tests {
         terminal.active_target = Some(target.clone());
         terminal.terminal = Box::new(ColorRecordingRuntime {
             colors: Arc::new(Mutex::new(Vec::new())),
-            live_config_calls: Arc::new(Mutex::new(0)),
             fail_live_config: false,
         });
 
@@ -2453,8 +2450,8 @@ mod tests {
             cwd: None,
         }
         .into();
-        let active_calls = Arc::new(Mutex::new(Vec::new()));
-        let parked_calls = Arc::new(Mutex::new(Vec::new()));
+        let failing_colors = Arc::new(Mutex::new(Vec::new()));
+        let recovered_colors = Arc::new(Mutex::new(Vec::new()));
         let (tx, _rx) = mpsc::channel::<RmuxWindowResizeRequest>();
         let (result_tx, result_rx) = mpsc::channel::<std::result::Result<(), String>>();
         result_tx.send(Ok(())).unwrap();
@@ -2470,19 +2467,19 @@ mod tests {
         terminal.active_target = Some(active_target.clone());
         terminal.native_window_targets = vec![active_target, parked_target.clone()];
         terminal.terminal = Box::new(ResizeRecordingRuntime {
-            resize_calls: Arc::clone(&active_calls),
+            resize_calls: Arc::clone(&failing_colors),
         });
         terminal.native_terminals.insert(
             parked_target,
             Box::new(ResizeRecordingRuntime {
-                resize_calls: Arc::clone(&parked_calls),
+                resize_calls: Arc::clone(&recovered_colors),
             }),
         );
 
         terminal.resize_native_layout_window(117, 40).unwrap();
 
-        assert_eq!(active_calls.lock().unwrap().len(), 1);
-        assert_eq!(parked_calls.lock().unwrap().len(), 1);
+        assert_eq!(failing_colors.lock().unwrap().len(), 1);
+        assert_eq!(recovered_colors.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -2502,7 +2499,6 @@ mod tests {
         let active_colors = Arc::new(Mutex::new(Vec::new()));
         terminal.terminal = Box::new(ColorRecordingRuntime {
             colors: Arc::clone(&active_colors),
-            live_config_calls: Arc::new(Mutex::new(0)),
             fail_live_config: false,
         });
         let parked_colors = Arc::new(Mutex::new(Vec::new()));
@@ -2515,7 +2511,6 @@ mod tests {
             .into(),
             Box::new(ColorRecordingRuntime {
                 colors: Arc::clone(&parked_colors),
-                live_config_calls: Arc::new(Mutex::new(0)),
                 fail_live_config: false,
             }),
         );
@@ -2549,13 +2544,12 @@ mod tests {
             terminal_config(),
             Arc::new(|| {}),
         );
-        let active_calls = Arc::new(Mutex::new(0));
+        let failing_colors = Arc::new(Mutex::new(Vec::new()));
         terminal.terminal = Box::new(ColorRecordingRuntime {
-            colors: Arc::new(Mutex::new(Vec::new())),
-            live_config_calls: Arc::clone(&active_calls),
+            colors: Arc::clone(&failing_colors),
             fail_live_config: true,
         });
-        let parked_calls = Arc::new(Mutex::new(0));
+        let recovered_colors = Arc::new(Mutex::new(Vec::new()));
         terminal.native_terminals.insert(
             MuxPaneTarget::Pane {
                 session_id: "agents".to_owned(),
@@ -2564,8 +2558,7 @@ mod tests {
             }
             .into(),
             Box::new(ColorRecordingRuntime {
-                colors: Arc::new(Mutex::new(Vec::new())),
-                live_config_calls: Arc::clone(&parked_calls),
+                colors: Arc::clone(&recovered_colors),
                 fail_live_config: false,
             }),
         );
@@ -2573,8 +2566,8 @@ mod tests {
         let result = terminal.apply_live_config(TerminalLiveConfig::default());
 
         assert!(result.is_err());
-        assert_eq!(*active_calls.lock().unwrap(), 1);
-        assert_eq!(*parked_calls.lock().unwrap(), 1);
+        assert_eq!(failing_colors.lock().unwrap().len(), 1);
+        assert_eq!(recovered_colors.lock().unwrap().len(), 1);
     }
 
     #[test]

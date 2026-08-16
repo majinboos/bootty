@@ -199,38 +199,8 @@ pub fn terminal_decoration_draws(frame: &TerminalRenderFrame) -> Vec<TerminalBac
         .collect()
 }
 
-pub fn terminal_render_callback(
-    frame: &TerminalRenderFrame,
-    target_format: wgpu::TextureFormat,
-    view: ViewTransform,
-) -> Option<egui::Shape> {
-    terminal_render_callback_with_identity(
-        TerminalCallbackIdentity::Surface(TerminalSurfaceKey::from(frame.surface)),
-        None,
-        frame,
-        target_format,
-        view,
-    )
-}
-
 pub fn terminal_render_callback_for_renderer(
     renderer_id: TerminalRendererId,
-    frame: &TerminalRenderFrame,
-    target_format: wgpu::TextureFormat,
-    view: ViewTransform,
-) -> Option<egui::Shape> {
-    terminal_render_callback_with_identity(
-        TerminalCallbackIdentity::Widget(renderer_id.value),
-        Some(Arc::clone(&renderer_id.lifetime)),
-        frame,
-        target_format,
-        view,
-    )
-}
-
-fn terminal_render_callback_with_identity(
-    identity: TerminalCallbackIdentity,
-    lifetime: Option<Arc<()>>,
     frame: &TerminalRenderFrame,
     target_format: wgpu::TextureFormat,
     view: ViewTransform,
@@ -244,10 +214,10 @@ fn terminal_render_callback_with_identity(
             egui_rect(frame.surface),
             TerminalRenderCallback {
                 key: TerminalCallbackKey {
-                    identity,
+                    renderer: renderer_id.value,
                     target_format,
                 },
-                lifetime,
+                lifetime: Arc::clone(&renderer_id.lifetime),
                 frame: frame.clone(),
                 view,
             },
@@ -272,7 +242,7 @@ fn has_wgpu_draw_commands(commands: &[TerminalRenderCommand]) -> bool {
 
 struct TerminalRenderCallback {
     key: TerminalCallbackKey,
-    lifetime: Option<Arc<()>>,
+    lifetime: Arc<()>,
     frame: TerminalRenderFrame,
     view: ViewTransform,
 }
@@ -304,7 +274,7 @@ impl egui_wgpu::CallbackTrait for TerminalRenderCallback {
             .entry(self.key)
             .or_insert_with(|| CachedTerminalRenderer {
                 renderer: TerminalWgpuRenderer::new(device, self.key.target_format),
-                lifetime: self.lifetime.as_ref().map(Arc::downgrade),
+                lifetime: Arc::downgrade(&self.lifetime),
             });
         cached.renderer.prepare_terminal_frame_with_text_builder(
             device,
@@ -339,14 +309,12 @@ struct TerminalWgpuRendererCache {
 
 struct CachedTerminalRenderer {
     renderer: TerminalWgpuRenderer,
-    lifetime: Option<Weak<()>>,
+    lifetime: Weak<()>,
 }
 
 impl CachedTerminalRenderer {
     fn is_alive(&self) -> bool {
-        self.lifetime
-            .as_ref()
-            .is_none_or(|lifetime| lifetime.strong_count() > 0)
+        self.lifetime.strong_count() > 0
     }
 }
 
@@ -383,33 +351,8 @@ impl Default for TerminalRendererId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct TerminalCallbackKey {
-    identity: TerminalCallbackIdentity,
+    renderer: u64,
     target_format: wgpu::TextureFormat,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum TerminalCallbackIdentity {
-    Widget(u64),
-    Surface(TerminalSurfaceKey),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TerminalSurfaceKey {
-    min_x: u32,
-    min_y: u32,
-    max_x: u32,
-    max_y: u32,
-}
-
-impl From<SurfaceRect> for TerminalSurfaceKey {
-    fn from(surface: SurfaceRect) -> Self {
-        Self {
-            min_x: surface.min_x.to_bits(),
-            min_y: surface.min_y.to_bits(),
-            max_x: surface.max_x.to_bits(),
-            max_y: surface.max_y.to_bits(),
-        }
-    }
 }
 
 struct TerminalBackgroundFrameResources {

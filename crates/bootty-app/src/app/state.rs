@@ -792,12 +792,7 @@ impl AppState {
         };
         branch.theme = Some(theme.to_owned());
         branch.colors = resolved.colors;
-        let config = self.config().clone();
-        let live_config = terminal_live_config(&config, variant);
-        let warnings = self.publish_terminal_config(&config, variant, Some(&live_config));
-        if !warnings.is_empty() {
-            self.last_error = Some(warnings.join("; "));
-        }
+        self.publish_live_terminal_config(variant);
         effects.push(AppEffect::RequestRepaint);
     }
 
@@ -806,14 +801,17 @@ impl AppState {
             return false;
         };
         self.config_state.accept(config);
+        self.publish_live_terminal_config(self.active_appearance_variant);
+        true
+    }
+
+    fn publish_live_terminal_config(&mut self, variant: AppearanceVariant) {
         let config = self.config().clone();
-        let variant = self.active_appearance_variant;
         let live_config = terminal_live_config(&config, variant);
         let warnings = self.publish_terminal_config(&config, variant, Some(&live_config));
         if !warnings.is_empty() {
             self.last_error = Some(warnings.join("; "));
         }
-        true
     }
 
     pub fn theme_picker_preview_active(&self) -> bool {
@@ -825,12 +823,7 @@ impl AppState {
             return;
         }
         self.active_appearance_variant = variant;
-        let config = self.config().clone();
-        let live_config = terminal_live_config(&config, variant);
-        let warnings = self.publish_terminal_config(&config, variant, Some(&live_config));
-        if !warnings.is_empty() {
-            self.last_error = Some(warnings.join("; "));
-        }
+        self.publish_live_terminal_config(variant);
     }
 
     pub fn active_appearance_variant(&self) -> AppearanceVariant {

@@ -8,6 +8,7 @@ use std::{
 };
 
 pub use crate::{
+    mux::membership::BackendMembership,
     session_names::{SessionNameRecord, SessionNameStore},
     session_order::SessionOrderStore,
 };
@@ -16,7 +17,7 @@ use crate::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig, default_config_path},
     mux::{
         controller::{BindingId, MuxScope, SpaceId},
-        membership::{BackendMembership, MembershipOperation},
+        membership::MembershipOperation,
     },
     session_order::SessionGroup,
 };
@@ -128,8 +129,6 @@ impl PendingBindingMembershipMutation {
         &self.mutation
     }
 }
-
-pub type BackendSessionMembership = BackendMembership;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SpaceMuxOverride {
@@ -662,7 +661,7 @@ impl WorkspaceRepository {
     pub fn reconcile_binding_membership_mutation(
         &mut self,
         scope: MuxScope,
-        memberships: &[BackendSessionMembership],
+        memberships: &[BackendMembership],
         session_order: &mut SessionOrderStore,
         session_names: &mut SessionNameStore,
     ) -> WorkspaceResult<bool> {

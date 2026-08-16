@@ -240,31 +240,19 @@ fn terminal_callback_key_tracks_renderer_identity_not_viewport_geometry() {
     let first_id = TerminalRendererId::unique();
     let second_id = TerminalRendererId::unique();
     let first = TerminalCallbackKey {
-        identity: TerminalCallbackIdentity::Widget(first_id.value),
+        renderer: first_id.value,
         target_format: format,
     };
     let moved = TerminalCallbackKey {
-        identity: TerminalCallbackIdentity::Widget(first_id.value),
+        renderer: first_id.value,
         target_format: format,
     };
     let second = TerminalCallbackKey {
-        identity: TerminalCallbackIdentity::Widget(second_id.value),
+        renderer: second_id.value,
         target_format: format,
     };
 
     assert_eq!(first, moved);
-    assert_ne!(first, second);
-}
-
-#[test]
-fn legacy_callback_identity_preserves_surface_isolation() {
-    let first = TerminalCallbackIdentity::Surface(TerminalSurfaceKey::from(
-        SurfaceRect::from_min_size(0.0, 0.0, 20.0, 10.0),
-    ));
-    let second = TerminalCallbackIdentity::Surface(TerminalSurfaceKey::from(
-        SurfaceRect::from_min_size(20.0, 0.0, 20.0, 10.0),
-    ));
-
     assert_ne!(first, second);
 }
 
@@ -367,7 +355,8 @@ fn virtual_placements_without_drawable_layers_do_not_schedule_wgpu_callback() {
     };
 
     assert!(
-        terminal_render_callback(
+        terminal_render_callback_for_renderer(
+            TerminalRendererId::unique(),
             &frame,
             wgpu::TextureFormat::Rgba8Unorm,
             ViewTransform::IDENTITY

@@ -263,15 +263,11 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
     match runner.run(&program, &args) {
         Ok(output) if output.success => {}
         Ok(output) => {
-            if target.is_unix() {
-                remove_remote_candidate(remote, runner, &temporary);
-            }
+            remove_remote_candidate(target, remote, runner, &temporary);
             bail!("upload Bootty daemon: {}", first_error(&output.stderr))
         }
         Err(error) => {
-            if target.is_unix() {
-                remove_remote_candidate(remote, runner, &temporary);
-            }
+            remove_remote_candidate(target, remote, runner, &temporary);
             return Err(error).context("upload Bootty daemon");
         }
     }
@@ -283,7 +279,7 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
             "make remote daemon executable",
         )
     {
-        remove_remote_candidate(remote, runner, &temporary);
+        remove_remote_candidate(target, remote, runner, &temporary);
         return Err(error);
     }
 
@@ -293,7 +289,7 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
         Ok(())
     };
     if let Err(error) = candidate {
-        remove_remote_candidate(remote, runner, &temporary);
+        remove_remote_candidate(target, remote, runner, &temporary);
         return Err(error);
     }
     let promote = if target.is_unix() {
@@ -309,16 +305,12 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
     let output = match runner.run(&program, &args) {
         Ok(output) => output,
         Err(error) => {
-            if target.is_unix() {
-                remove_remote_candidate(remote, runner, &temporary);
-            }
+            remove_remote_candidate(target, remote, runner, &temporary);
             return Err(error).context("publish Bootty daemon");
         }
     };
     if !output.success {
-        if target.is_unix() {
-            remove_remote_candidate(remote, runner, &temporary);
-        }
+        remove_remote_candidate(target, remote, runner, &temporary);
         let (program, args) = remote.ping_command();
         if !daemon_matches(&runner.run(&program, &args)?) {
             bail!("install Bootty daemon: {}", first_error(&output.stderr))
@@ -362,7 +354,15 @@ fn candidate_ping<R: CommandRunner>(remote: &SshRemote, runner: &R, temporary: &
     )
 }
 
-fn remove_remote_candidate<R: CommandRunner>(remote: &SshRemote, runner: &R, temporary: &str) {
+fn remove_remote_candidate<R: CommandRunner>(
+    target: RemoteTarget,
+    remote: &SshRemote,
+    runner: &R,
+    temporary: &str,
+) {
+    if !target.is_unix() {
+        return;
+    }
     let command = format!("rm -f {}", shell_quote(temporary));
     let (program, args) = remote.raw_command(&command);
     let _ = runner.run(&program, &args);

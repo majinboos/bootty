@@ -29,7 +29,7 @@ use crate::{
     session_names::SessionNameStore,
     session_order::SessionOrderStore,
     workspace::{
-        BackendSessionMembership, BindingMembershipMutation, SpaceMuxOverride, WorkspaceBinding,
+        BackendMembership, BindingMembershipMutation, SpaceMuxOverride, WorkspaceBinding,
         WorkspacePersistenceError, WorkspaceRepository, WorkspaceSpace,
     },
 };
@@ -953,8 +953,7 @@ impl WorkspaceRuntime {
         &mut self,
         space_id: SpaceId,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let deleted = self.repository.delete_space(space_id)?;
-        Ok(deleted)
+        self.repository.delete_space(space_id)
     }
 
     pub(super) fn update_space(
@@ -1209,7 +1208,7 @@ impl WorkspaceRuntime {
                         .mux
                         .all_sessions()
                         .iter()
-                        .map(|session| BackendSessionMembership {
+                        .map(|session| BackendMembership {
                             id: session.id.clone(),
                             name: session.name.clone(),
                         })

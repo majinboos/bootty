@@ -1,9 +1,9 @@
 use bootty_app::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig},
     workspace::{
-        BackendSessionMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR,
-        DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
-        SpaceRemoteOverride, WorkspaceRepository, WorkspaceSnapshot,
+        BackendMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON,
+        SessionNameStore, SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride,
+        WorkspaceRepository, WorkspaceSnapshot,
     },
 };
 use bootty_mux::controller::{BindingId, MuxScope};
@@ -485,7 +485,7 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
         repository
             .reconcile_binding_membership_mutation(
                 scope,
-                &[BackendSessionMembership {
+                &[BackendMembership {
                     id: "created-id".to_owned(),
                     name: "created-name".to_owned(),
                 }],
@@ -582,7 +582,7 @@ fn a_name_keyed_backend_rename_is_recovered_from_its_new_identity() {
         repository
             .reconcile_binding_membership_mutation(
                 scope,
-                &[BackendSessionMembership {
+                &[BackendMembership {
                     id: "new-name".to_owned(),
                     name: "new-name".to_owned(),
                 }],
@@ -648,7 +648,7 @@ fn a_stable_id_backend_rename_is_recovered_from_its_new_name() {
         repository
             .reconcile_binding_membership_mutation(
                 scope,
-                &[BackendSessionMembership {
+                &[BackendMembership {
                     id: "stable-id".to_owned(),
                     name: "new-name".to_owned(),
                 }],
