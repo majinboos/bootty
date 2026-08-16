@@ -44,23 +44,18 @@ pub(super) struct BindingReconnect {
     attach_started: Option<Instant>,
 }
 
-pub(super) enum AttachExit {
-    CloseLocalPane,
-    Reconnecting,
-    AlreadyWaiting,
-}
-
 impl BindingRuntime {
-    pub(super) fn handle_attach_client_exit(&mut self, now: Instant) -> AttachExit {
+    /// Returns `true` when the caller must close the local attach pane.
+    pub(super) fn handle_attach_client_exit(&mut self, now: Instant) -> bool {
         let Some(remote) = self.multiplexer.remote.as_ref() else {
-            return AttachExit::CloseLocalPane;
+            return true;
         };
         if self
             .reconnect
             .pending
             .is_some_and(|reattach| !reattach.started)
         {
-            return AttachExit::AlreadyWaiting;
+            return false;
         }
         let attached_for = self
             .reconnect
@@ -71,9 +66,9 @@ impl BindingRuntime {
             "lost the connection to {}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         );
-        self.mux.set_availability_error(Some(error.clone()));
+        self.mux.set_availability_error(Some(error));
         self.reconnect.pending = Some(reattach);
-        AttachExit::Reconnecting
+        false
     }
 
     pub(super) fn handle_attach_start_failure(&mut self, now: Instant, detail: &str) {
@@ -85,7 +80,7 @@ impl BindingRuntime {
             "could not connect to {}: {detail}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         );
-        self.mux.set_availability_error(Some(error.clone()));
+        self.mux.set_availability_error(Some(error));
         self.reconnect.pending = Some(reattach);
     }
 

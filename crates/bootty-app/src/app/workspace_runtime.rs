@@ -10,10 +10,8 @@ use bootty_config::config::MultiplexerBackendConfig;
 use bootty_terminal::terminal_engine::TerminalSideEffectEvent;
 
 use super::{
-    binding_terminal_facts::BindingTerminalFacts,
-    mux_config::realize_binding,
-    remote_reconnect::{AttachExit, BindingReconnect},
-    state::SpaceSummary,
+    binding_terminal_facts::BindingTerminalFacts, mux_config::realize_binding,
+    remote_reconnect::BindingReconnect, state::SpaceSummary,
     terminal_config::terminal_session_config_with_side_effects,
 };
 
@@ -734,11 +732,11 @@ impl WorkspaceRuntime {
             }
         } else {
             match self.active.binding.terminal.child_exited() {
-                Ok(true) => match self.active.binding.handle_attach_client_exit(now) {
-                    AttachExit::CloseLocalPane => self.close_active_attach_pane(repaint),
-                    AttachExit::Reconnecting => {}
-                    AttachExit::AlreadyWaiting => {}
-                },
+                Ok(true) => {
+                    if self.active.binding.handle_attach_client_exit(now) {
+                        self.close_active_attach_pane(repaint);
+                    }
+                }
                 Ok(false) => self.active.binding.note_attach_client_alive(now),
                 Err(error) => errors.push(error.to_string()),
             }
