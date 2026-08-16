@@ -217,7 +217,7 @@ impl SessionStore {
 
 /// Binding-scoped session membership and ordering.
 ///
-/// This is a persistence-free value type. `WorkspaceRepository` owns its SQLite representation
+/// This is a persistence-free value type. `WorkspaceRepository` owns its `SQLite` representation
 /// and publishes a replacement only after the corresponding transaction commits.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionOrderStore {

@@ -25,11 +25,11 @@ use crate::{
 };
 
 use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig, default_config_path};
+pub use bootty_mux::membership::BackendMembership;
 use bootty_mux::{
     controller::{BindingId, MuxScope, SpaceId},
     membership::MembershipOperation,
 };
-pub use bootty_mux::membership::BackendMembership;
 
 use crate::session_order::SessionGroup;
 
@@ -42,7 +42,7 @@ const DEFAULT_BINDING_NAME: &str = "Default Binding";
 
 /// The one error surface for workspace persistence.
 ///
-/// SQLite details stay inside this module. Callers can distinguish a persistence failure without
+/// `SQLite` details stay inside this module. Callers can distinguish a persistence failure without
 /// depending on rusqlite's error taxonomy or schema implementation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspacePersistenceError {
@@ -638,7 +638,7 @@ impl WorkspaceRepository {
 
     /// Apply a completed remote mutation and clear its journal row in one transaction.
     ///
-    /// The in-memory stores publish only after SQLite commits. A failure therefore leaves both the
+    /// The in-memory stores publish only after `SQLite` commits. A failure therefore leaves both the
     /// old stores and the pending intent available for the next remote catalog operation.
     pub fn commit_binding_membership_mutation(
         &mut self,

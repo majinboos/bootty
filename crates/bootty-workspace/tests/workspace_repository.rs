@@ -1,4 +1,3 @@
-#![allow(clippy::assert_is_empty)]
 #![allow(clippy::redundant_closure_for_method_calls)]
 
 use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig};

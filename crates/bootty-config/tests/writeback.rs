@@ -32,13 +32,11 @@ fn atomic_writeback_preserves_structure_and_unix_mode() {
     assert!(written.contains("include = [\"?local.toml\"]"));
     assert!(written.contains("title = \"Keep\""));
     assert!(written.contains("sidebar = true"));
-    assert_eq!(
-        load_config_from_path(&path)
-            .expect("reopen config")
-            .font
-            .size,
-        15.0
-    );
+    let reopened_size = load_config_from_path(&path)
+        .expect("reopen config")
+        .font
+        .size;
+    assert!((reopened_size - 15.0).abs() < f32::EPSILON);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
