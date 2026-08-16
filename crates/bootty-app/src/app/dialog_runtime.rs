@@ -22,7 +22,6 @@ pub enum ModalDialog {
     ThemePicker(ThemePickerDialog),
 }
 
-
 #[derive(Default)]
 pub(super) struct DialogRuntime {
     modal: Option<Box<ModalDialog>>,

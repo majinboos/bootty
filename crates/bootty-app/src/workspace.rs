@@ -20,6 +20,7 @@ pub use crate::{
     session_order::SessionOrderStore,
 };
 
+pub use crate::mux::membership::BackendMembership;
 use crate::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig, default_config_path},
     mux::{
@@ -28,7 +29,6 @@ use crate::{
     },
     session_order::SessionGroup,
 };
-pub use crate::mux::membership::BackendMembership;
 
 const WORKSPACE_SNAPSHOT_REVISION: i64 = 3;
 const DEFAULT_SPACE_NAME: &str = "Default Space";

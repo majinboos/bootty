@@ -433,4 +433,3 @@ pub(super) fn migrate_workspace_snapshot_state(tx: &Transaction<'_>) -> rusqlite
     }
     Ok(())
 }
-

@@ -36,7 +36,6 @@ fn app_command_channel(
     app_command_channel_with_repaint(capacity, Arc::new(|| {}))
 }
 
-
 #[test]
 fn pi_and_codex_keep_their_native_jsonl_protocols_outside_rust_core() {
     let directory = tempfile::tempdir().expect("temporary agent integration root");
