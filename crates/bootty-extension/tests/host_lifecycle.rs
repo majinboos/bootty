@@ -13,6 +13,13 @@ use bootty_extension::{
     SessionReorder, SurfacePlacement, event_queue,
 };
 
+/// Wall-clock budget for every step that waits on a real extension worker.
+///
+/// A loaded parallel run can starve a Luau worker thread for seconds, so the
+/// budget only has to be generous enough never to expire on a healthy run.
+/// Logical `host.refresh` deadlines are separate and stay short on purpose.
+const EXTENSION_BUDGET: Duration = Duration::from_secs(30);
+
 const MIXED_GENERATION: &str = r#"
 local version = __VERSION__
 bootty.events.register("mixed.changed")
@@ -68,14 +75,14 @@ end)
             event_queue().0,
         );
         assert_eq!(
-            invoke_named(&catalog, "counter.increment", Duration::from_secs(1)),
+            invoke_named(&catalog, "counter.increment", EXTENSION_BUDGET),
             CommandOutcome::Success {
                 value: serde_json::json!({"count": 1}),
                 warnings: Vec::new(),
             }
         );
         assert!(matches!(
-            invoke_named(&catalog, "counter.oversized", Duration::from_secs(1)),
+            invoke_named(&catalog, "counter.oversized", EXTENSION_BUDGET),
             CommandOutcome::Failed { code, message }
                 if code == "extension_failed"
                     && message.contains("extension storage value exceeds 65536 bytes")
@@ -89,7 +96,7 @@ end)
         event_queue().0,
     );
     assert_eq!(
-        invoke_named(&catalog, "counter.increment", Duration::from_secs(1)),
+        invoke_named(&catalog, "counter.increment", EXTENSION_BUDGET),
         CommandOutcome::Success {
             value: serde_json::json!({"count": 2}),
             warnings: Vec::new(),
@@ -117,13 +124,13 @@ end)
         let refresh = scope.spawn(|| host.refresh(Instant::now() + Duration::from_secs(2)));
         std::thread::sleep(Duration::from_millis(10));
         assert_eq!(
-            invoke_named(&catalog, "counter.handoff", Duration::from_secs(1)),
+            invoke_named(&catalog, "counter.handoff", EXTENSION_BUDGET),
             CommandOutcome::success()
         );
         refresh.join().expect("publish handoff generation");
     });
     assert_eq!(
-        invoke_named(&catalog, "counter.increment", Duration::from_secs(1)),
+        invoke_named(&catalog, "counter.increment", EXTENSION_BUDGET),
         CommandOutcome::Success {
             value: serde_json::json!({"count": 3, "handoff": "committed"}),
             warnings: Vec::new(),
@@ -180,7 +187,7 @@ end
         session: Some("active-session".to_owned()),
         ..MuxView::default()
     });
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + EXTENSION_BUDGET;
     loop {
         let refreshed = catalog
             .surfaces()
@@ -219,7 +226,7 @@ fn commands_topics_surfaces_and_actions_switch_as_one_generation() {
         .find(|surface| surface.module == "mixed.luau")
         .expect("first status surface");
     assert_eq!(
-        invoke_named(&catalog, "mixed.version", Duration::from_secs(1)),
+        invoke_named(&catalog, "mixed.version", EXTENSION_BUDGET),
         success_version(1)
     );
     assert!(catalog.topics().contains("mixed.changed"));
@@ -228,7 +235,7 @@ fn commands_topics_surfaces_and_actions_switch_as_one_generation() {
         .expect("second mixed generation");
     host.refresh(started + Duration::from_secs(1));
     assert_eq!(
-        invoke_named(&catalog, "mixed.version", Duration::from_secs(1)),
+        invoke_named(&catalog, "mixed.version", EXTENSION_BUDGET),
         success_version(2)
     );
     let second = catalog
@@ -268,7 +275,7 @@ fn commands_topics_surfaces_and_actions_switch_as_one_generation() {
         })
         .expect("current action");
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + EXTENSION_BUDGET;
     loop {
         let current = catalog
             .surfaces()
@@ -295,7 +302,7 @@ fn commands_topics_surfaces_and_actions_switch_as_one_generation() {
     .expect("invalid third generation");
     host.refresh(started + Duration::from_secs(2));
     assert_eq!(
-        invoke_named(&catalog, "mixed.version", Duration::from_secs(1)),
+        invoke_named(&catalog, "mixed.version", EXTENSION_BUDGET),
         success_version(2)
     );
     assert!(catalog.topics().contains("mixed.changed"));
@@ -343,7 +350,7 @@ end)
     let started = Instant::now();
     host.refresh(started + Duration::from_secs(1));
     assert!(started.elapsed() < Duration::from_millis(300));
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + EXTENSION_BUDGET;
     loop {
         if surface_text(&catalog, "render.luau", "render") == "version 2" {
             break;
@@ -433,7 +440,7 @@ end)
     );
 
     assert_eq!(
-        invoke_named(&catalog, "late.try", Duration::from_secs(1)),
+        invoke_named(&catalog, "late.try", EXTENSION_BUDGET),
         CommandOutcome::Success {
             value: serde_json::json!({
                 "command_ok": false,
@@ -480,10 +487,10 @@ end)
     let old = resolved_handler_named(&catalog, "reorder.defer");
     let old_outcome = old.invoke(
         CommandInvocation::new("reorder.defer", Vec::new(), Caller::Socket),
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + EXTENSION_BUDGET,
         CommandCancellation::new(),
     );
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + EXTENSION_BUDGET;
     let nested = loop {
         match app_receiver.try_recv() {
             Ok(request) => break request,
@@ -510,7 +517,7 @@ end)
         .send(CommandOutcome::success())
         .expect("complete nested request");
     assert!(matches!(
-        old_outcome.recv_timeout(Duration::from_secs(1)).expect("old outcome"),
+        old_outcome.recv_timeout(EXTENSION_BUDGET).expect("old outcome"),
         CommandOutcome::Failed { code, .. }
             if matches!(code.as_str(), "extension_failed" | "stale_extension_generation")
     ));
@@ -518,7 +525,7 @@ end)
     assert_eq!(reorders, Vec::<SessionReorder>::new());
 
     assert_eq!(
-        invoke_named(&catalog, "reorder.current", Duration::from_secs(1)),
+        invoke_named(&catalog, "reorder.current", EXTENSION_BUDGET),
         CommandOutcome::success()
     );
     assert_eq!(
@@ -552,7 +559,7 @@ fn invoke_named(catalog: &ExtensionCatalog, command: &str, limit: Duration) -> C
             Instant::now() + limit,
             CommandCancellation::new(),
         )
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(EXTENSION_BUDGET)
         .expect("extension command outcome")
 }
 
