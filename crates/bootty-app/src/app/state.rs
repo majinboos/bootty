@@ -5579,16 +5579,10 @@ impl AppState {
             drained += 1;
             let now = Instant::now();
             let dispatch = if request.cancellation.is_cancelled() {
-                CommandDispatch::Complete(CommandOutcome::Failed {
-                    code: "cancelled".to_owned(),
-                    message: "command was cancelled".to_owned(),
-                })
+                CommandDispatch::Complete(CommandOutcome::cancelled())
             } else if now >= request.deadline {
                 request.cancellation.cancel();
-                CommandDispatch::Complete(CommandOutcome::Failed {
-                    code: "deadline_exceeded".to_owned(),
-                    message: "command deadline expired".to_owned(),
-                })
+                CommandDispatch::Complete(CommandOutcome::deadline_exceeded())
             } else {
                 self.dispatch_command_with_execution(
                     request.invocation,
@@ -5620,15 +5614,9 @@ impl AppState {
     fn drain_pending_app_commands(&mut self, now: Instant) {
         for pending in std::mem::take(&mut self.pending_app_commands) {
             let outcome = if pending.cancellation.is_cancelled() {
-                CommandOutcome::Failed {
-                    code: "cancelled".to_owned(),
-                    message: "command was cancelled".to_owned(),
-                }
+                CommandOutcome::cancelled()
             } else if now >= pending.deadline && pending.cancellation.cancel() {
-                CommandOutcome::Failed {
-                    code: "deadline_exceeded".to_owned(),
-                    message: "command deadline expired".to_owned(),
-                }
+                CommandOutcome::deadline_exceeded()
             } else {
                 match pending.result.try_recv() {
                     Ok(result) => self.command_outcome_for_mux_result(&pending.command, result),
@@ -5990,16 +5978,10 @@ impl AppState {
             return Ok(());
         };
         if Instant::now() >= deadline && cancellation.cancel() {
-            return Err(CommandOutcome::Failed {
-                code: "deadline_exceeded".to_owned(),
-                message: "command deadline expired".to_owned(),
-            });
+            return Err(CommandOutcome::deadline_exceeded());
         }
         if !cancellation.try_start() {
-            return Err(CommandOutcome::Failed {
-                code: "cancelled".to_owned(),
-                message: "command was cancelled".to_owned(),
-            });
+            return Err(CommandOutcome::cancelled());
         }
         Ok(())
     }
@@ -6033,29 +6015,22 @@ impl AppState {
             if native_local_action {
                 return_native_mux_focus = true;
             } else {
-                match self.mux_command_for_command(mux_action, target) {
-                    Ok(Some(command)) => {
-                        let config = self.active_multiplexer().clone();
-                        let (deadline, cancellation) = execution.unwrap_or_else(|| {
-                            (
-                                Instant::now() + Duration::from_secs(10),
-                                CommandCancellation::new(),
-                            )
-                        });
-                        let result = self.binding.mux.execute_command_authoritatively(
-                            &self.repaint,
-                            &config,
-                            command.clone(),
-                            deadline,
-                            cancellation,
-                        );
-                        return CommandDispatch::Pending { command, result };
-                    }
-                    Ok(None) => {}
-                    Err(outcome) => {
-                        self.last_error = command_outcome_message(&outcome);
-                        return CommandDispatch::Complete(outcome);
-                    }
+                if let Some(command) = self.mux_command_for_command(mux_action, target) {
+                    let config = self.active_multiplexer().clone();
+                    let (deadline, cancellation) = execution.unwrap_or_else(|| {
+                        (
+                            Instant::now() + Duration::from_secs(10),
+                            CommandCancellation::new(),
+                        )
+                    });
+                    let result = self.binding.mux.execute_command_authoritatively(
+                        &self.repaint,
+                        &config,
+                        command.clone(),
+                        deadline,
+                        cancellation,
+                    );
+                    return CommandDispatch::Pending { command, result };
                 }
             }
         }
@@ -6115,7 +6090,7 @@ impl AppState {
         &mut self,
         action: MuxKeyAction,
         target: Option<&CommandTarget>,
-    ) -> Result<Option<MuxCommand>, CommandOutcome> {
+    ) -> Option<MuxCommand> {
         if matches!(
             action,
             MuxKeyAction::NextSession
@@ -6124,7 +6099,7 @@ impl AppState {
                 | MuxKeyAction::SelectSession(_)
                 | MuxKeyAction::MoveSession(_)
         ) {
-            return Ok(None);
+            return None;
         }
 
         let target = target.expect("mux command target was resolved");
@@ -6139,7 +6114,7 @@ impl AppState {
                 &display_name,
                 self.taken_session_names(None).iter().map(String::as_str),
             );
-            return Ok(Some(MuxCommand::CreateProjectSession { session_id, cwd }));
+            return Some(MuxCommand::CreateProjectSession { session_id, cwd });
         }
 
         let session_id = path
@@ -6211,7 +6186,7 @@ impl AppState {
             | MuxKeyAction::SelectSession(_)
             | MuxKeyAction::MoveSession(_) => unreachable!("handled before command construction"),
         };
-        Ok(Some(command))
+        Some(command)
     }
 
     fn command_outcome_for_mux_result(
@@ -6233,25 +6208,20 @@ impl AppState {
                 }
             }
             Err(error) => {
+                let message = error.to_string();
                 let outcome = match error {
                     MuxCommandError::Cancelled => CommandOutcome::Failed {
                         code: "cancelled".to_owned(),
-                        message: "command was cancelled".to_owned(),
+                        message,
                     },
                     MuxCommandError::DeadlineExceeded => CommandOutcome::Failed {
                         code: "deadline_exceeded".to_owned(),
-                        message: "command deadline expired".to_owned(),
+                        message,
                     },
-                    MuxCommandError::Unsupported => CommandOutcome::Unsupported {
-                        message: "mux operation is unsupported".to_owned(),
-                    },
-                    MuxCommandError::Unavailable => CommandOutcome::Unavailable {
-                        message: "mux operation is unavailable".to_owned(),
-                    },
-                    MuxCommandError::Stale => CommandOutcome::StaleTarget {
-                        message: "mux operation capability is stale".to_owned(),
-                    },
-                    MuxCommandError::Failed(message) => CommandOutcome::Failed {
+                    MuxCommandError::Unsupported => CommandOutcome::Unsupported { message },
+                    MuxCommandError::Unavailable => CommandOutcome::Unavailable { message },
+                    MuxCommandError::Stale => CommandOutcome::StaleTarget { message },
+                    MuxCommandError::Failed(_) => CommandOutcome::Failed {
                         code: "execution_failed".to_owned(),
                         message,
                     },

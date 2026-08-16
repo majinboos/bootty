@@ -87,10 +87,6 @@ impl CommandCancellation {
         self.0.load(Ordering::Acquire) == Self::CANCELLED
     }
 
-    pub fn is_started(&self) -> bool {
-        self.0.load(Ordering::Acquire) == Self::STARTED
-    }
-
     pub fn try_start(&self) -> bool {
         self.0
             .compare_exchange(

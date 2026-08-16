@@ -224,6 +224,20 @@ impl CommandOutcome {
         }
     }
 
+    pub fn cancelled() -> Self {
+        Self::Failed {
+            code: "cancelled".to_owned(),
+            message: "command was cancelled".to_owned(),
+        }
+    }
+
+    pub fn deadline_exceeded() -> Self {
+        Self::Failed {
+            code: "deadline_exceeded".to_owned(),
+            message: "command deadline expired".to_owned(),
+        }
+    }
+
     pub fn success_with_warning(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Success {
             value: Value::Null,
