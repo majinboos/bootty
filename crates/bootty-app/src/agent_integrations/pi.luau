@@ -17,15 +17,7 @@ local next_request = 0
 bootty.events.register("agents.pi.event")
 
 local function snapshot()
-	return {
-		provider = state.provider,
-		source = state.source,
-		status = state.status,
-		session_id = state.session_id,
-		session_name = state.session_name,
-		last_event = state.last_event,
-		error = state.error,
-	}
+	return table.clone(state)
 end
 
 local function publish(kind, payload)

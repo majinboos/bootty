@@ -22,6 +22,21 @@ pub(super) enum ModalDialog {
     ThemePicker(ThemePickerDialog),
 }
 
+/// Defines a taker that removes the open modal only when it holds the named dialog variant.
+macro_rules! take_dialog {
+    ($name:ident, $variant:ident, $ty:ty) => {
+        pub(super) fn $name(&mut self) -> Option<$ty> {
+            if !matches!(self.modal.as_deref(), Some(ModalDialog::$variant(_))) {
+                return None;
+            }
+            match *self.modal.take()? {
+                ModalDialog::$variant(dialog) => Some(dialog),
+                _ => unreachable!("modal variant was checked"),
+            }
+        }
+    };
+}
+
 #[derive(Default)]
 pub(super) struct DialogRuntime {
     modal: Option<Box<ModalDialog>>,
@@ -75,93 +90,13 @@ impl DialogRuntime {
         }
     }
 
-    pub(super) fn take_new_session(&mut self) -> Option<NewMuxSessionDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::NewSession(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::NewSession(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_space_editor(&mut self) -> Option<SpaceEditorDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::SpaceEditor(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::SpaceEditor(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_session_picker(&mut self) -> Option<SessionPickerDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::SessionPicker(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::SessionPicker(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_rename_session(&mut self) -> Option<RenameSessionDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::RenameSession(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::RenameSession(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_rename_tab(&mut self) -> Option<RenameTabDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::RenameTab(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::RenameTab(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_ditch_session(&mut self) -> Option<DitchSessionDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::DitchSession(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::DitchSession(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_keybind_help(&mut self) -> Option<KeybindHelpDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::KeybindHelp(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::KeybindHelp(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_command_palette(&mut self) -> Option<CommandPaletteDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::CommandPalette(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::CommandPalette(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
-
-    pub(super) fn take_theme_picker(&mut self) -> Option<ThemePickerDialog> {
-        if !matches!(self.modal.as_deref(), Some(ModalDialog::ThemePicker(_))) {
-            return None;
-        }
-        match *self.modal.take()? {
-            ModalDialog::ThemePicker(dialog) => Some(dialog),
-            _ => unreachable!("modal variant was checked"),
-        }
-    }
+    take_dialog!(take_new_session, NewSession, NewMuxSessionDialog);
+    take_dialog!(take_space_editor, SpaceEditor, SpaceEditorDialog);
+    take_dialog!(take_session_picker, SessionPicker, SessionPickerDialog);
+    take_dialog!(take_rename_session, RenameSession, RenameSessionDialog);
+    take_dialog!(take_rename_tab, RenameTab, RenameTabDialog);
+    take_dialog!(take_ditch_session, DitchSession, DitchSessionDialog);
+    take_dialog!(take_keybind_help, KeybindHelp, KeybindHelpDialog);
+    take_dialog!(take_command_palette, CommandPalette, CommandPaletteDialog);
+    take_dialog!(take_theme_picker, ThemePicker, ThemePickerDialog);
 }

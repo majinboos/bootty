@@ -20,6 +20,7 @@ use crate::{
     command_extensions::{
         ModuleIdentity, WorkerControl,
         processes::{ManagedProcesses, ProcessEvent, ProcessStatus},
+        require_active,
     },
     commands::CommandCatalog,
 };
@@ -656,27 +657,6 @@ fn install_process_interface(
         })?,
     )?;
 
-    let status_processes = processes.clone();
-    let status_generation = generation.clone();
-    process.set(
-        "status",
-        lua.create_function(move |lua, id: String| {
-            let generation = status_generation.as_ref().ok_or_else(|| {
-                mlua::Error::runtime("extension processes are unavailable during preview")
-            })?;
-            let status = generation
-                .catalog
-                .with_active_extension_generation(
-                    generation.identity.as_str(),
-                    generation.generation,
-                    || status_processes.status(&id),
-                )
-                .map_err(mlua::Error::runtime)?
-                .map_err(mlua::Error::runtime)?;
-            process_status_table(lua, status)
-        })?,
-    )?;
-
     let stop_generation = generation;
     process.set(
         "stop",
@@ -704,17 +684,10 @@ fn require_process_mutation(
     let generation = generation.ok_or_else(|| {
         mlua::Error::runtime("extension processes are unavailable during preview")
     })?;
-    let active = generation
-        .control
-        .active
-        .lock()
-        .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?;
-    if active.is_none() {
-        return Err(mlua::Error::runtime(
-            "bootty.process mutation is available only inside a command or action handler",
-        ));
-    }
-    drop(active);
+    require_active(
+        &generation.control,
+        "bootty.process mutation is available only inside a command or action handler",
+    )?;
     Ok(generation)
 }
 

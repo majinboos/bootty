@@ -1136,16 +1136,10 @@ fn install_host_interface(
     commands.set(
         "invoke",
         lua.create_function(move |lua, spec: Table| {
-            let active = active
-                .active
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?
-                .clone()
-                .ok_or_else(|| {
-                    mlua::Error::runtime(
-                        "bootty.commands.invoke is available only inside a command handler",
-                    )
-                })?;
+            let active = require_active(
+                &active,
+                "bootty.commands.invoke is available only inside a command handler",
+            )?;
             let mut value = lua_value(LuaValue::Table(spec), 0)?;
             let object = value.as_object_mut().ok_or_else(|| {
                 mlua::Error::runtime("bootty.commands.invoke needs a command table")
@@ -1186,16 +1180,10 @@ fn install_host_interface(
     events.set(
         "publish",
         lua.create_function(move |_, (topic, payload): (String, LuaValue)| {
-            if publish_control
-                .active
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?
-                .is_none()
-            {
-                return Err(mlua::Error::runtime(
-                    "bootty.events.publish is available only inside a command handler",
-                ));
-            }
+            require_active(
+                &publish_control,
+                "bootty.events.publish is available only inside a command handler",
+            )?;
             let payload = lua_value(payload, 0)?;
             plane
                 .publish_extension_event(
@@ -1237,16 +1225,10 @@ fn install_host_interface(
     storage.set(
         "set",
         lua.create_function(move |_, (key, value): (String, LuaValue)| {
-            if write_control
-                .active
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?
-                .is_none()
-            {
-                return Err(mlua::Error::runtime(
-                    "bootty.storage.set is available only inside a command handler",
-                ));
-            }
+            require_active(
+                &write_control,
+                "bootty.storage.set is available only inside a command handler",
+            )?;
             let value = lua_value(value, 0)?;
             write_catalog
                 .with_active_extension_generation(write_identity.as_str(), write_generation, || {
@@ -1264,16 +1246,10 @@ fn install_host_interface(
     storage.set(
         "remove",
         lua.create_function(move |_, key: String| {
-            if remove_control
-                .active
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?
-                .is_none()
-            {
-                return Err(mlua::Error::runtime(
-                    "bootty.storage.remove is available only inside a command handler",
-                ));
-            }
+            require_active(
+                &remove_control,
+                "bootty.storage.remove is available only inside a command handler",
+            )?;
             remove_catalog
                 .with_active_extension_generation(
                     remove_identity.as_str(),
@@ -1345,6 +1321,16 @@ fn install_surface_interface(
     )?;
     ui.set_readonly(true);
     bootty.set("ui", ui)
+}
+
+/// Returns the invocation an extension host call runs inside, or `message` when there is none.
+fn require_active(control: &WorkerControl, message: &str) -> mlua::Result<ActiveInvocation> {
+    control
+        .active
+        .lock()
+        .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?
+        .clone()
+        .ok_or_else(|| mlua::Error::runtime(message))
 }
 
 fn require_setup_phase(control: &WorkerControl) -> mlua::Result<()> {

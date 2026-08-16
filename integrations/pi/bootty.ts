@@ -88,9 +88,6 @@ export class BoundedEventPublisher {
       }
     } finally {
       this.#active = false;
-      if (this.#queue.length > 0 || this.#dropped > 0) {
-        void this.#drain();
-      }
     }
   }
 

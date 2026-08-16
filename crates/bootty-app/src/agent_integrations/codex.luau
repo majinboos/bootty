@@ -18,15 +18,7 @@ local next_request = 2
 bootty.events.register("agents.codex.event")
 
 local function snapshot()
-	return {
-		provider = state.provider,
-		source = state.source,
-		status = state.status,
-		thread_id = state.thread_id,
-		turn_id = state.turn_id,
-		last_event = state.last_event,
-		error = state.error,
-	}
+	return table.clone(state)
 end
 
 local function publish(kind, payload)

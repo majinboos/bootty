@@ -264,18 +264,6 @@ impl ManagedProcesses {
         Ok(events.drain(limit))
     }
 
-    pub(super) fn status(&self, id: &str) -> Result<ProcessStatus, String> {
-        let processes = self
-            .inner
-            .processes
-            .lock()
-            .map_err(|_| "extension process registry lock poisoned".to_owned())?;
-        processes
-            .get(id)
-            .map(status)
-            .ok_or_else(|| format!("extension process {id:?} does not exist"))
-    }
-
     pub(super) fn stop(&self, id: &str) -> Result<(), String> {
         let processes = self
             .inner
