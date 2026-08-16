@@ -342,38 +342,6 @@ pub struct BoottyApp {
 }
 
 impl BoottyApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
-        Self::new_with_config(cc, BoottyConfig::default())
-    }
-
-    pub fn new_with_config(cc: &eframe::CreationContext<'_>, config: BoottyConfig) -> Result<Self> {
-        Self::new_inner(
-            cc,
-            config,
-            "main".to_owned(),
-            None,
-            None,
-            ControlPlane::default(),
-        )
-    }
-
-    pub fn new_with_direct_input(
-        cc: &eframe::CreationContext<'_>,
-        config: BoottyConfig,
-        window_state_key: String,
-        direct_input_rx: mpsc::Receiver<DirectKeyInput>,
-        modifier_side_rx: mpsc::Receiver<ModifierSideState>,
-    ) -> Result<Self> {
-        Self::new_inner(
-            cc,
-            config,
-            window_state_key,
-            Some(direct_input_rx),
-            Some(modifier_side_rx),
-            ControlPlane::default(),
-        )
-    }
-
     pub(crate) fn new_for_native_host(
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
@@ -382,24 +350,8 @@ impl BoottyApp {
         modifier_side_rx: mpsc::Receiver<ModifierSideState>,
         control_plane: ControlPlane,
     ) -> Result<Self> {
-        Self::new_inner(
-            cc,
-            config,
-            window_state_key,
-            Some(direct_input_rx),
-            Some(modifier_side_rx),
-            control_plane,
-        )
-    }
-
-    fn new_inner(
-        cc: &eframe::CreationContext<'_>,
-        config: BoottyConfig,
-        window_state_key: String,
-        direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
-        modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
-        control_plane: ControlPlane,
-    ) -> Result<Self> {
+        let direct_input_rx = Some(direct_input_rx);
+        let modifier_side_rx = Some(modifier_side_rx);
         if uses_custom_egui_fonts(&config) {
             configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
         } else {

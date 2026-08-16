@@ -5,19 +5,11 @@ pub enum ApplicationIdentity {
 }
 
 impl ApplicationIdentity {
-    pub const fn production() -> Self {
-        Self::Production
-    }
-
-    pub const fn development() -> Self {
-        Self::Development
-    }
-
     pub const fn current() -> Self {
         if cfg!(any(debug_assertions, feature = "bootty-dev")) {
-            Self::development()
+            Self::Development
         } else {
-            Self::production()
+            Self::Production
         }
     }
 
@@ -33,14 +25,6 @@ impl ApplicationIdentity {
             Self::Production => "bootty",
             Self::Development => "bootty-dev",
         }
-    }
-
-    pub const fn endpoint_namespace(self) -> &'static str {
-        self.cli_name()
-    }
-
-    pub const fn state_namespace(self) -> &'static str {
-        self.cli_name()
     }
 
     pub const fn automatic_updates_enabled(self) -> bool {

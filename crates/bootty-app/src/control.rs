@@ -1143,9 +1143,7 @@ fn discover_instance() -> Result<Option<InstanceDescriptor>> {
     };
     let identity = ApplicationIdentity::current();
     let expected_endpoint = control_endpoint()?;
-    if instance.instance_id != identity.endpoint_namespace()
-        || instance.endpoint != expected_endpoint
-    {
+    if instance.instance_id != identity.cli_name() || instance.endpoint != expected_endpoint {
         remove_control_files(&path, &expected_endpoint);
         return Ok(None);
     }
@@ -1171,7 +1169,7 @@ fn new_instance_descriptor(window_state_key: &str) -> Result<InstanceDescriptor>
     let pid = std::process::id();
     let identity = ApplicationIdentity::current();
     Ok(InstanceDescriptor {
-        instance_id: identity.endpoint_namespace().to_owned(),
+        instance_id: identity.cli_name().to_owned(),
         generation: 1,
         pid,
         window_state_key: window_state_key.to_owned(),
@@ -1229,7 +1227,7 @@ fn instance_descriptor_path() -> Result<PathBuf> {
 fn control_endpoint() -> Result<PathBuf> {
     Ok(endpoint_for_label(format!(
         "{}-control",
-        ApplicationIdentity::current().endpoint_namespace()
+        ApplicationIdentity::current().cli_name()
     ))
     .map(LocalEndpoint::into_path)?)
 }
@@ -1245,7 +1243,7 @@ fn instance_directory() -> Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .context("no user-private runtime directory is available")?;
-    Ok(base.join(ApplicationIdentity::current().state_namespace()))
+    Ok(base.join(ApplicationIdentity::current().cli_name()))
 }
 
 fn prepare_endpoint(endpoint: &LocalEndpoint) -> Result<()> {

@@ -24,9 +24,6 @@ while (($#)); do
     --static)
       LINKAGE="static"
       ;;
-    --production)
-      CARGO_FEATURE_ARGS=()
-      ;;
     *)
       echo "unknown build argument: $1" >&2
       exit 2
