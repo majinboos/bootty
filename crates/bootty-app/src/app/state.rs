@@ -3970,26 +3970,7 @@ impl AppState {
             self.start_due_reattach(now, &mut effects);
         }
 
-        if let Some(result) = self.workspace.active.binding.mux.poll_command() {
-            if result.is_err() {
-                self.workspace
-                    .active
-                    .binding
-                    .pending_generated_names
-                    .clear();
-                self.workspace
-                    .active
-                    .binding
-                    .membership_reconciliation_waiting_for_refresh = true;
-                self.workspace.active.binding.mux.refresh_on_next_frame();
-            } else {
-                self.workspace
-                    .active
-                    .binding
-                    .membership_reconciliation_ready = true;
-            }
-        }
-        for binding in &mut self.workspace.active.inactive_bindings {
+        for binding in self.binding_runtimes_mut() {
             if let Some(result) = binding.mux.poll_command() {
                 if result.is_err() {
                     binding.pending_generated_names.clear();
@@ -3997,19 +3978,6 @@ impl AppState {
                     binding.mux.refresh_on_next_frame();
                 } else {
                     binding.membership_reconciliation_ready = true;
-                }
-            }
-        }
-        for space in &mut self.workspace.inactive_spaces {
-            for binding in space.bindings_mut() {
-                if let Some(result) = binding.mux.poll_command() {
-                    if result.is_err() {
-                        binding.pending_generated_names.clear();
-                        binding.membership_reconciliation_waiting_for_refresh = true;
-                        binding.mux.refresh_on_next_frame();
-                    } else {
-                        binding.membership_reconciliation_ready = true;
-                    }
                 }
             }
         }
@@ -4472,14 +4440,9 @@ impl AppState {
     ) -> Result<(), crate::workspace::WorkspacePersistenceError> {
         let repaint = self.repaint.clone();
         let variant = self.active_appearance_variant;
-        let profile_scopes = std::iter::once(&self.workspace.active.binding)
-            .chain(self.workspace.active.inactive_bindings.iter())
-            .chain(
-                self.workspace
-                    .inactive_spaces
-                    .iter()
-                    .flat_map(SpaceRuntime::bindings),
-            )
+        let profile_scopes = self
+            .workspace
+            .all_bindings()
             .filter(|binding| matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)))
             .filter(|binding| requested_scopes.is_none_or(|scopes| scopes.contains(&binding.scope)))
             .map(|binding| binding.scope)

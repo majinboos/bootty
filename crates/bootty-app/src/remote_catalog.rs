@@ -1,4 +1,4 @@
-use std::{collections::HashSet, error::Error, fmt};
+use std::collections::HashSet;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use crate::{
     workspace::{
         BackendSessionMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR,
         DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
-        SpaceRemoteOverride, WorkspaceBinding, WorkspacePersistenceError, WorkspaceRepository,
+        SpaceRemoteOverride, WorkspaceBinding, WorkspaceRepository,
     },
 };
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
@@ -20,45 +20,6 @@ use bootty_mux::{
 };
 
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
-
-#[derive(Debug)]
-pub struct RemoteCatalogPartialCompletionError {
-    operation: BindingMembershipMutation,
-    persistence: WorkspacePersistenceError,
-}
-
-impl RemoteCatalogPartialCompletionError {
-    fn new(operation: BindingMembershipMutation, persistence: WorkspacePersistenceError) -> Self {
-        Self {
-            operation,
-            persistence,
-        }
-    }
-
-    pub fn operation(&self) -> &BindingMembershipMutation {
-        &self.operation
-    }
-
-    pub fn persistence(&self) -> &WorkspacePersistenceError {
-        &self.persistence
-    }
-}
-
-impl fmt::Display for RemoteCatalogPartialCompletionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "remote backend completed {:?}, but workspace persistence failed: {}",
-            self.operation, self.persistence
-        )
-    }
-}
-
-impl Error for RemoteCatalogPartialCompletionError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(&self.persistence)
-    }
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RemoteSpaceSummary {
@@ -206,7 +167,9 @@ pub fn execute(
         &mut runtime.session_order,
         &mut runtime.session_names,
     ) {
-        return Err(RemoteCatalogPartialCompletionError::new(mutation, persistence_error).into());
+        return Err(anyhow::Error::new(persistence_error).context(format!(
+            "remote backend completed {mutation:?}, but workspace persistence failed"
+        )));
     }
     Ok(())
 }

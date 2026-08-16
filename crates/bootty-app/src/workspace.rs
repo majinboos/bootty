@@ -19,8 +19,6 @@ use crate::{
 };
 
 const WORKSPACE_SNAPSHOT_REVISION: i64 = 3;
-const WORKSPACE_SNAPSHOT_REVISION_WITHOUT_BINDING_OPERATION_JOURNAL: i64 = 1;
-const WORKSPACE_SNAPSHOT_REVISION_WITHOUT_BINDING_OPERATION_NAMING: i64 = 2;
 const DEFAULT_SPACE_NAME: &str = "Default Space";
 pub const DEFAULT_SPACE_ICON: &str = "folder";
 pub const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
@@ -87,15 +85,10 @@ pub enum BindingMembershipMutation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingBindingMembershipMutation {
-    scope: MuxScope,
     mutation: BindingMembershipMutation,
 }
 
 impl PendingBindingMembershipMutation {
-    pub fn scope(&self) -> MuxScope {
-        self.scope
-    }
-
     pub fn mutation(&self) -> &BindingMembershipMutation {
         &self.mutation
     }
@@ -105,12 +98,6 @@ impl PendingBindingMembershipMutation {
 pub struct BackendSessionMembership {
     pub id: String,
     pub name: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BindingMembershipResolution {
-    Applied,
-    Discarded,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -295,10 +282,8 @@ impl WorkspaceRepository {
         mux: SpaceMuxOverride,
         config: &MultiplexerConfig,
     ) -> WorkspaceResult<Option<WorkspaceSpace>> {
-        let space = self
-            .create_space_db(name, icon, color, tint_sidebar, mux, config)
-            .map_err(|error| self.database_error("create space", error))?;
-        Ok(space)
+        self.create_space_db(name, icon, color, tint_sidebar, mux, config)
+            .map_err(|error| self.database_error("create space", error))
     }
 
     fn create_space_db(
@@ -405,7 +390,7 @@ impl WorkspaceRepository {
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
     ) -> WorkspaceResult<bool> {
-        self.update_space_and_binding_db(scope, name, icon, color, tint_sidebar, mux.clone())
+        self.update_space_and_binding_db(scope, name, icon, color, tint_sidebar, mux)
             .map_err(|error| self.database_error("update space", error))
     }
 
@@ -491,8 +476,7 @@ impl WorkspaceRepository {
         space_id: SpaceId,
     ) -> WorkspaceResult<()> {
         self.set_selected_space_db(window_key, space_id)
-            .map_err(|error| self.database_error("select space", error))?;
-        Ok(())
+            .map_err(|error| self.database_error("select space", error))
     }
 
     fn set_selected_space_db(&self, window_key: &str, space_id: SpaceId) -> rusqlite::Result<()> {
@@ -650,7 +634,7 @@ impl WorkspaceRepository {
         memberships: &[BackendSessionMembership],
         session_order: &mut SessionOrderStore,
         session_names: &mut SessionNameStore,
-    ) -> WorkspaceResult<Option<BindingMembershipResolution>> {
+    ) -> WorkspaceResult<bool> {
         let mut conn = open_db(&self.path).map_err(|error| {
             self.database_error("open database to reconcile binding membership", error)
         })?;
@@ -658,7 +642,7 @@ impl WorkspaceRepository {
             self.database_error("begin binding membership reconciliation", error)
         })?;
         let Some(pending) = self.load_pending_binding_membership_mutation(&tx, scope)? else {
-            return Ok(None);
+            return Ok(false);
         };
         if binding_membership_effect_occurred(&pending.mutation, memberships) {
             let mut next_order = session_order.clone();
@@ -671,13 +655,13 @@ impl WorkspaceRepository {
             })?;
             *session_order = next_order;
             *session_names = next_names;
-            Ok(Some(BindingMembershipResolution::Applied))
+            Ok(true)
         } else {
             self.delete_pending_binding_membership_mutation(&tx, scope)?;
             tx.commit().map_err(|error| {
                 self.database_error("discard binding membership reconciliation", error)
             })?;
-            Ok(Some(BindingMembershipResolution::Discarded))
+            Ok(true)
         }
     }
 
@@ -735,7 +719,7 @@ impl WorkspaceRepository {
                     explicit,
                     cwd,
                 )
-                .map(|mutation| PendingBindingMembershipMutation { scope, mutation })
+                .map(|mutation| PendingBindingMembershipMutation { mutation })
                 .map_err(|_| rusqlite::Error::InvalidQuery)
             },
         )
@@ -995,12 +979,6 @@ impl WorkspaceRepository {
             migrate_workspace_space_appearance(&tx)?;
             migrate_workspace_session_name_metadata(&tx)?;
             migrate_workspace_snapshot_state(&tx)?;
-            if revision <= WORKSPACE_SNAPSHOT_REVISION_WITHOUT_BINDING_OPERATION_JOURNAL {
-                migrate_workspace_binding_operation_journal(&tx)?;
-            }
-            if revision <= WORKSPACE_SNAPSHOT_REVISION_WITHOUT_BINDING_OPERATION_NAMING {
-                migrate_workspace_binding_operation_naming(&tx)?;
-            }
             let space_count = tx.query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
                 row.get::<_, i64>(0)
             })?;
@@ -1864,47 +1842,6 @@ fn migrate_workspace_snapshot_state(tx: &Transaction<'_>) -> rusqlite::Result<()
     Ok(())
 }
 
-fn migrate_workspace_binding_operation_journal(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS workspace_pending_binding_operations (
-            space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
-            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
-            operation TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            old_name TEXT,
-            new_name TEXT,
-            display_name TEXT,
-            explicit INTEGER,
-            cwd TEXT,
-            PRIMARY KEY(space_id, binding_id)
-        );",
-    )
-}
-
-fn migrate_workspace_binding_operation_naming(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let columns = table_columns(tx, "workspace_pending_binding_operations")?;
-    if !columns.contains("display_name") {
-        tx.execute(
-            "ALTER TABLE workspace_pending_binding_operations ADD COLUMN display_name TEXT",
-            [],
-        )?;
-    }
-    if !columns.contains("explicit") {
-        tx.execute(
-            "ALTER TABLE workspace_pending_binding_operations ADD COLUMN explicit INTEGER",
-            [],
-        )?;
-    }
-    tx.execute(
-        "UPDATE workspace_pending_binding_operations
-         SET display_name = new_name, explicit = 1
-         WHERE operation IN ('create', 'rename')
-           AND (display_name IS NULL OR explicit IS NULL)",
-        [],
-    )?;
-    Ok(())
-}
-
 fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
     let mut statement = tx.prepare(
         "SELECT s.id, s.remote_id, s.name, s.icon, s.color, s.tint_sidebar, s.position,
@@ -2128,15 +2065,14 @@ fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
         }
         for binding in &mut space.bindings {
             let binding_id = binding.scope.binding_id().persistence_value();
-            let entries = groups.remove(&binding_id).unwrap_or_default();
-            let mut entries = entries;
+            let mut entries = groups.remove(&binding_id).unwrap_or_default();
             entries.sort_by_key(|(_, _, position)| *position);
             let order = entries
                 .into_iter()
                 .map(|(_, group, _)| group)
                 .collect::<Vec<_>>();
-            binding.session_order =
-                SessionOrderStore::from_groups(order.clone(), !order.is_empty());
+            let has_groups = !order.is_empty();
+            binding.session_order = SessionOrderStore::from_groups(order, has_groups);
             binding.session_names =
                 SessionNameStore::from_records(names.remove(&binding_id).unwrap_or_default());
         }

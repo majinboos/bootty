@@ -1,9 +1,9 @@
 use bootty_app::{
     config::{MultiplexerBackendConfig, MultiplexerConfig, SshRemoteConfig},
     workspace::{
-        BackendSessionMembership, BindingMembershipMutation, BindingMembershipResolution,
-        DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore,
-        SpaceMuxOverride, SpaceRemoteOverride, WorkspaceRepository, WorkspaceSnapshot,
+        BackendSessionMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR,
+        DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
+        SpaceRemoteOverride, WorkspaceRepository, WorkspaceSnapshot,
     },
 };
 use bootty_mux::controller::{BindingId, MuxScope};
@@ -481,7 +481,7 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
         .execute("DROP TRIGGER fail_remote_metadata_commit", [])
         .expect("remove metadata failure");
     drop(connection);
-    assert_eq!(
+    assert!(
         repository
             .reconcile_binding_membership_mutation(
                 scope,
@@ -493,7 +493,6 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
                 &mut names,
             )
             .expect("reconcile authoritative backend snapshot"),
-        Some(BindingMembershipResolution::Applied)
     );
     assert_eq!(order.session_names(), vec!["created-name"]);
     assert!(
@@ -579,7 +578,7 @@ fn a_name_keyed_backend_rename_is_recovered_from_its_new_identity() {
         .begin_binding_membership_mutation(scope, &rename)
         .expect("journal name-keyed rename");
 
-    assert_eq!(
+    assert!(
         repository
             .reconcile_binding_membership_mutation(
                 scope,
@@ -591,7 +590,6 @@ fn a_name_keyed_backend_rename_is_recovered_from_its_new_identity() {
                 &mut names,
             )
             .expect("reconcile name-keyed backend snapshot"),
-        Some(BindingMembershipResolution::Applied)
     );
     assert_eq!(order.session_names(), vec!["new-name"]);
     assert!(names.record("old-name").is_none());
@@ -646,7 +644,7 @@ fn a_stable_id_backend_rename_is_recovered_from_its_new_name() {
         .begin_binding_membership_mutation(scope, &rename)
         .expect("journal stable-id rename");
 
-    assert_eq!(
+    assert!(
         repository
             .reconcile_binding_membership_mutation(
                 scope,
@@ -658,7 +656,6 @@ fn a_stable_id_backend_rename_is_recovered_from_its_new_name() {
                 &mut names,
             )
             .expect("reconcile stable-id backend snapshot"),
-        Some(BindingMembershipResolution::Applied)
     );
     assert_eq!(order.session_names(), vec!["new-name"]);
 }

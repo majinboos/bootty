@@ -701,14 +701,14 @@ impl WorkspaceRuntime {
         self.active.id
     }
 
-    pub(super) fn selected_binding_scope(&self, space_id: SpaceId) -> Option<MuxScope> {
-        if space_id == self.active.id {
-            return Some(self.active.binding.scope);
-        }
-        self.inactive_spaces
-            .iter()
+    fn space(&self, space_id: SpaceId) -> Option<&SpaceRuntime> {
+        std::iter::once(&self.active)
+            .chain(self.inactive_spaces.iter())
             .find(|space| space.id == space_id)
-            .map(|space| space.binding.scope)
+    }
+
+    pub(super) fn selected_binding_scope(&self, space_id: SpaceId) -> Option<MuxScope> {
+        self.space(space_id).map(|space| space.binding.scope)
     }
 
     pub(super) fn space_summaries(&self) -> Vec<SpaceSummary> {
@@ -746,22 +746,12 @@ impl WorkspaceRuntime {
         &self,
         space_id: SpaceId,
     ) -> Option<Option<MultiplexerBackendConfig>> {
-        if space_id == self.active.id {
-            return Some(self.active.binding.backend_override);
-        }
-        self.inactive_spaces
-            .iter()
-            .find(|space| space.id == space_id)
+        self.space(space_id)
             .map(|space| space.binding.backend_override)
     }
 
     pub(super) fn remote_override(&self, space_id: SpaceId) -> Option<SpaceRemoteOverride> {
-        if space_id == self.active.id {
-            return Some(self.active.binding.remote_override.clone());
-        }
-        self.inactive_spaces
-            .iter()
-            .find(|space| space.id == space_id)
+        self.space(space_id)
             .map(|space| space.binding.remote_override.clone())
     }
 
@@ -772,12 +762,7 @@ impl WorkspaceRuntime {
     }
 
     pub(super) fn space_backend(&self, space_id: SpaceId) -> Option<MultiplexerBackendConfig> {
-        if space_id == self.active.id {
-            return Some(self.active.binding.multiplexer.backend);
-        }
-        self.inactive_spaces
-            .iter()
-            .find(|space| space.id == space_id)
+        self.space(space_id)
             .map(|space| space.binding.multiplexer.backend)
     }
 
@@ -821,24 +806,30 @@ impl WorkspaceRuntime {
         let current = std::mem::replace(&mut self.active.binding, target);
         self.active.inactive_bindings.insert(index, current);
 
-        if !self.active.binding.session_order.session_names().is_empty() {
-            self.active.binding.mux.refresh_on_next_frame();
-            let active_config = self.active.binding.multiplexer.clone();
-            let _ = self
-                .active
-                .binding
-                .mux
-                .refresh_sessions(repaint, &active_config);
-            self.active
-                .binding
-                .mux
-                .apply_session_order(&self.active.binding.session_order.session_names());
-            if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
-                self.active.binding.persisted_sessions_restored = false;
-                self.active.binding.restore_persisted_sessions(repaint);
-            }
-        }
+        self.resume_active_binding(repaint);
         true
+    }
+
+    /// Bring the freshly activated binding's multiplexer back in step with its persisted state.
+    fn resume_active_binding(&mut self, repaint: &RepaintHandle) {
+        if self.active.binding.session_order.session_names().is_empty() {
+            return;
+        }
+        self.active.binding.mux.refresh_on_next_frame();
+        let active_config = self.active.binding.multiplexer.clone();
+        let _ = self
+            .active
+            .binding
+            .mux
+            .refresh_sessions(repaint, &active_config);
+        self.active
+            .binding
+            .mux
+            .apply_session_order(&self.active.binding.session_order.session_names());
+        if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
+            self.active.binding.persisted_sessions_restored = false;
+            self.active.binding.restore_persisted_sessions(repaint);
+        }
     }
 
     pub(super) fn activate_space(
@@ -880,23 +871,7 @@ impl WorkspaceRuntime {
 
         let current = std::mem::replace(&mut self.active, target);
 
-        if !self.active.binding.session_order.session_names().is_empty() {
-            self.active.binding.mux.refresh_on_next_frame();
-            let active_config = self.active.binding.multiplexer.clone();
-            let _ = self
-                .active
-                .binding
-                .mux
-                .refresh_sessions(repaint, &active_config);
-            self.active
-                .binding
-                .mux
-                .apply_session_order(&self.active.binding.session_order.session_names());
-            if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
-                self.active.binding.persisted_sessions_restored = false;
-                self.active.binding.restore_persisted_sessions(repaint);
-            }
-        }
+        self.resume_active_binding(repaint);
 
         let previous_space_id = current.id;
         self.inactive_spaces.push(current);
@@ -1213,17 +1188,16 @@ impl WorkspaceRuntime {
                 &mut candidate.session_order,
                 &mut candidate.session_names,
             )?;
-            if resolution.is_some() {
+            if resolution {
                 self.binding_mut(scope)
                     .expect("the reconciled binding remains live")
                     .publish_session_state(candidate);
             }
-            self.binding_mut(scope)
-                .expect("the checked binding remains live")
-                .membership_reconciliation_ready = false;
-            self.binding_mut(scope)
-                .expect("the checked binding remains live")
-                .membership_reconciliation_waiting_for_refresh = false;
+            let binding = self
+                .binding_mut(scope)
+                .expect("the checked binding remains live");
+            binding.membership_reconciliation_ready = false;
+            binding.membership_reconciliation_waiting_for_refresh = false;
         }
         Ok(())
     }
@@ -1244,18 +1218,18 @@ impl WorkspaceRuntime {
     }
 
     pub(super) fn reconcile_binding_states(&mut self) -> Result<(), WorkspacePersistenceError> {
-        let mut candidates = self
+        let candidates = self
             .all_bindings()
             .map(|binding| {
-                self.binding_state_candidate(binding.scope)
-                    .expect("each live binding has committed workspace state")
+                let mut candidate = BindingStateCandidate {
+                    scope: binding.scope,
+                    session_order: binding.session_order.clone(),
+                    session_names: binding.session_names.clone(),
+                };
+                binding.reconcile_session_state(&mut candidate);
+                candidate
             })
             .collect::<Vec<_>>();
-        for candidate in &mut candidates {
-            self.binding(candidate.scope)
-                .expect("candidate binding remains live")
-                .reconcile_session_state(candidate);
-        }
         self.commit_binding_state_candidates(candidates)
     }
 
@@ -1294,7 +1268,7 @@ impl WorkspaceRuntime {
         Ok(())
     }
 
-    fn all_bindings(&self) -> impl Iterator<Item = &BindingRuntime> {
+    pub(super) fn all_bindings(&self) -> impl Iterator<Item = &BindingRuntime> {
         self.active
             .bindings()
             .chain(self.inactive_spaces.iter().flat_map(SpaceRuntime::bindings))
