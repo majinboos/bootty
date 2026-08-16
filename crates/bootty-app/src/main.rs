@@ -3,7 +3,6 @@
 use std::{fmt, io::Read, process::ExitCode};
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "macos")]
 use bootty_app::application_identity::ApplicationIdentity;
 use bootty_app::{
     cli::{Cli, Command, RemoteSpaceCommand},
