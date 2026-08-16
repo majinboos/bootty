@@ -404,9 +404,9 @@ pub fn settings_icon_button(
     response.on_hover_text(tooltip)
 }
 
-pub fn settings_page_header(ui: &mut egui::Ui, palette: ThemePalette, eyebrow: &str, title: &str) {
+pub fn settings_page_header(ui: &mut egui::Ui, palette: ThemePalette, title: &str) {
     ui.label(
-        RichText::new(eyebrow)
+        RichText::new("Bootty Settings")
             .color(readable_color(palette.base, palette.muted))
             .size(12.0),
     );

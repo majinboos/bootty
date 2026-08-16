@@ -12,8 +12,8 @@ use std::{
 };
 
 use crate::benchmark_trace::{BenchmarkTrace, TraceValue};
-use crate::pty_backlog::drain_pty_backlog_with_limits;
-pub use crate::pty_backlog::{DrainStats, PtyBacklog, drain_pty_backlog};
+pub use crate::pty_backlog::DrainStats;
+use crate::pty_backlog::{PtyBacklog, drain_pty_backlog, drain_pty_backlog_with_limits};
 use anyhow::{Context, Result};
 use portable_pty::{MasterPty, PtySize};
 

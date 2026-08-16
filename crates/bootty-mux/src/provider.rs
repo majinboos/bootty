@@ -134,15 +134,10 @@ impl MuxBackendEntry {
         }
     }
 
-    #[cfg(not(feature = "app"))]
-    pub fn from_core_provider(provider: Arc<dyn MuxBackendProvider>) -> Self {
-        Self { core: provider }
-    }
-
-    #[cfg(feature = "app")]
     pub fn from_core_provider(provider: Arc<dyn MuxBackendProvider>) -> Self {
         Self {
             core: provider,
+            #[cfg(feature = "app")]
             app: None,
         }
     }

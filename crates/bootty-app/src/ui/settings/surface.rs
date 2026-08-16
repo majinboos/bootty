@@ -620,7 +620,7 @@ impl SettingsSurface {
                         })
                         .show(ui, |ui| {
                             let meta = page_meta(self.page);
-                            settings_page_header(ui, self.palette, "Bootty Settings", meta.title);
+                            settings_page_header(ui, self.palette, meta.title);
                             if let Some(error) = self.writeback.last_error().map(str::to_owned) {
                                 settings_notice(
                                     ui,

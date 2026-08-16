@@ -215,10 +215,6 @@ fn download(url: &str) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn ensure<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result<()> {
-    ensure_with(remote, runner)
-}
-
-fn ensure_with<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result<()> {
     let (program, args) = remote.ping_command();
     if daemon_matches(&runner.run(&program, &args)?) {
         return Ok(());

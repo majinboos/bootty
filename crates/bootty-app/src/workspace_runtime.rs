@@ -1664,9 +1664,6 @@ impl WorkspaceRuntime {
             self.binding(scope)
                 .is_some_and(|binding| completion.matches_config(&binding.multiplexer))
         });
-        if self.binding(scope).is_none() {
-            return Ok(());
-        }
         if !committable {
             self.defer_binding_membership_reconciliation(scope);
             return Ok(());
