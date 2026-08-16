@@ -413,7 +413,6 @@ fn push_egui_icon(
     });
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)]
 fn premultiplied_rgba(rgba: &[u8]) -> Vec<u8> {
     rgba.chunks_exact(4)
         .flat_map(|pixel| {
@@ -484,7 +483,6 @@ fn decode_site_icon() -> IconImage {
     IconImage { rgba }
 }
 
-#[allow(clippy::chunks_exact_to_as_chunks)]
 fn rgba_from_png(bytes: &[u8], color_type: png::ColorType) -> Vec<u8> {
     match color_type {
         png::ColorType::Rgba => bytes.to_vec(),

@@ -1,5 +1,5 @@
 [tools]
-rust = "nightly"
+rust = "stable"
 zig = "0.16.0"
 "cargo:cargo-xwin" = "0.23.0"
 "cargo:cargo-zigbuild" = "0.23.0"
@@ -19,10 +19,9 @@ description = "Build the Cloudflare Pages site from Rust/WASM source"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-rustup toolchain install nightly --profile minimal
-rustup target add --toolchain nightly wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown
 bun install --frozen-lockfile
-RUSTUP_TOOLCHAIN=nightly bun run build:web
+bun run build:web
 """
 
 [tasks.test]
@@ -47,11 +46,7 @@ run = "cargo test --workspace"
 
 [tasks.fmt]
 description = "Check formatting"
-run = "mise run rust:components && cargo fmt --all -- --check"
-
-[tasks."rust:components"]
-description = "Install the Rust components used by repository checks"
-run = "toolchain=$(rustup show active-toolchain | awk '{print $1}'); rustup component add rustfmt clippy --toolchain \"$toolchain\""
+run = "cargo fmt --all -- --check"
 
 [tasks."hakari:generate"]
 description = "Regenerate the cargo-hakari workspace hack"
@@ -63,7 +58,7 @@ run = "cargo hakari generate --diff && cargo hakari manage-deps --dry-run"
 
 [tasks.clippy]
 description = "Run clippy on the workspace"
-run = "mise run rust:components && cargo clippy --workspace --all-targets -- -D warnings"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks."bench:build"]
 description = "Compile the fast CPU/egui paint plan benchmark smoke"

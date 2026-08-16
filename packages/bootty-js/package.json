@@ -57,7 +57,7 @@
   "scripts": {
     "clean": "rimraf dist",
     "build": "bun run clean && bun run build:wasm && bun run build:types && bun run build:js && bun run copy:wasm",
-    "build:wasm": "rustup toolchain install nightly --profile minimal && rustup target add --toolchain nightly wasm32-unknown-unknown && RUSTUP_TOOLCHAIN=nightly wasm-pack build ../../crates/bootty-site --target web --out-dir ../../packages/bootty-js/src/site-wasm --no-pack",
+    "build:wasm": "wasm-pack build ../../crates/bootty-site --target web --out-dir ../../packages/bootty-js/src/site-wasm --no-pack",
     "build:types": "tsc -p tsconfig.json --emitDeclarationOnly",
     "build:js": "tsup src/browser.ts src/node.ts --format esm --sourcemap --splitting --out-dir dist",
     "copy:wasm": "node scripts/copy-wasm.mjs"
