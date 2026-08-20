@@ -1,3 +1,4 @@
+mod command_runtime;
 mod state;
 mod workspace_runtime;
 

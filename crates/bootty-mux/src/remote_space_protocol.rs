@@ -22,21 +22,3 @@ pub fn decode_command(payload: &str) -> Result<MuxCommand> {
         .context("decode remote Space command")?;
     serde_json::from_slice(&bytes).context("parse remote Space command")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn command_payload_preserves_arguments() {
-        let command = MuxCommand::RenameSession {
-            session_id: "space ; $HOME".to_owned(),
-            name: "work & play".to_owned(),
-        };
-
-        assert_eq!(
-            decode_command(&encode_command(&command).unwrap()).unwrap(),
-            command
-        );
-    }
-}

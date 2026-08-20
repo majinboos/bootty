@@ -859,9 +859,13 @@ dependencies = [
 name = "bootty-tests"
 version = "0.4.0"
 dependencies = [
+ "anyhow",
  "bootty-app",
+ "bootty-mux",
  "bootty-workspace-hack",
  "egui",
+ "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

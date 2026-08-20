@@ -6,8 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bootty_config::config::{BoottyConfig, default_config_path, load_config_from_path};
+use bootty_config::config::{BoottyConfig, load_config_from_path};
 use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::application_identity::ApplicationIdentity;
 
 mod config_overrides;
 
@@ -149,7 +151,9 @@ impl Cli {
         if self.defaults {
             return isolated_defaults_config_path();
         }
-        self.config.clone().unwrap_or_else(default_config_path)
+        self.config
+            .clone()
+            .unwrap_or_else(|| ApplicationIdentity::current().default_config_path())
     }
 }
 
@@ -158,7 +162,11 @@ fn isolated_defaults_config_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     std::env::temp_dir()
-        .join(format!("bootty-defaults-{}-{nanos}", process::id()))
+        .join(format!(
+            "{}-defaults-{}-{nanos}",
+            ApplicationIdentity::current().cli_name(),
+            process::id()
+        ))
         .join("config.toml")
 }
 

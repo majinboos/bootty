@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApplicationIdentity {
     Production,
@@ -24,6 +26,21 @@ impl ApplicationIdentity {
         match self {
             Self::Production => "bootty",
             Self::Development => "bootty-dev",
+        }
+    }
+
+    pub fn default_config_path(self) -> PathBuf {
+        let production_path = bootty_config::config::default_config_path();
+        match self {
+            Self::Production => production_path,
+            Self::Development => {
+                let config_directory = production_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("bootty"), PathBuf::from);
+                config_directory
+                    .with_file_name(self.cli_name())
+                    .join("config.toml")
+            }
         }
     }
 

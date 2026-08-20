@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
-    session_order::SessionOrderStore,
     workspace::{
-        DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SpaceMuxOverride, SpaceRemoteOverride,
-        WorkspaceBinding, WorkspaceRepository,
+        BackendSessionMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR,
+        DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
+        SpaceRemoteOverride, WorkspaceBinding, WorkspaceRepository,
     },
 };
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
@@ -30,8 +30,8 @@ pub struct RemoteSpaceSummary {
 }
 
 pub fn list(config: &BoottyConfig) -> Result<Vec<RemoteSpaceSummary>> {
-    let workspace = WorkspaceRepository::open(&config.config_path)?;
-    Ok(workspace
+    let (_, snapshot) = WorkspaceRepository::open(&config.config_path)?;
+    Ok(snapshot
         .spaces()
         .iter()
         .filter_map(|space| {
@@ -60,8 +60,8 @@ pub fn create(
     if !backend.supports_remote() {
         bail!("remote Spaces need tmux, zellij, or rmux")
     }
-    let mut workspace = WorkspaceRepository::open(&config.config_path)?;
-    let space = workspace
+    let (mut repository, _) = WorkspaceRepository::open(&config.config_path)?;
+    let space = repository
         .create_space(
             name,
             DEFAULT_SPACE_ICON,
@@ -87,11 +87,16 @@ pub fn snapshot(
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<MuxSnapshot> {
-    let (backend, mut sessions) = remote_space_runtime(config, space_id, expected_backend)?;
-    Ok(filter_snapshot_for_space(
-        backend.snapshot()?,
-        &mut sessions,
-    ))
+    let mut runtime = remote_space_runtime(config, space_id, expected_backend)?;
+    let snapshot = runtime.backend.snapshot()?;
+    runtime.reconcile_pending_membership(&snapshot)?;
+    let snapshot = filter_snapshot_for_space(snapshot, &mut runtime.session_order);
+    runtime.repository.commit_binding_state(
+        runtime.scope,
+        &runtime.session_order,
+        &runtime.session_names,
+    )?;
+    Ok(snapshot)
 }
 
 fn filter_snapshot_for_space(
@@ -123,9 +128,10 @@ pub fn execute(
     payload: &str,
 ) -> Result<()> {
     let command = bootty_mux::remote_space::decode_command(payload)?;
-    let (mut backend, mut sessions) = remote_space_runtime(config, space_id, expected_backend)?;
-    let snapshot = backend.snapshot()?;
-    let owned_names = sessions.session_names();
+    let mut runtime = remote_space_runtime(config, space_id, expected_backend)?;
+    let snapshot = runtime.backend.snapshot()?;
+    runtime.reconcile_pending_membership(&snapshot)?;
+    let owned_names = runtime.session_order.session_names();
     if let Some(session_id) = created_session_id(&command)
         && !owned_names.iter().any(|name| name == session_id)
         && snapshot
@@ -137,23 +143,33 @@ pub fn execute(
     }
     let owned_session_name =
         resolve_owned_session_name(&snapshot, &owned_names, &command, space_id)?;
-    backend.execute(command.clone())?;
-    match command {
-        MuxCommand::CreateProjectSession { session_id, .. }
-        | MuxCommand::CreateWorktreeSession { session_id, .. } => {
-            sessions.add_session(&session_id);
-        }
-        MuxCommand::RenameSession { name, .. } => {
-            if let Some(old_name) = owned_session_name {
-                sessions.rename_session(&old_name, &name);
-            }
-        }
-        MuxCommand::DitchSession { .. } => {
-            if let Some(name) = owned_session_name {
-                sessions.remove_session(&name);
-            }
-        }
-        _ => {}
+    let mutation = binding_membership_mutation(
+        &command,
+        owned_session_name.as_deref(),
+        &runtime.session_names,
+    );
+    let Some(mutation) = mutation else {
+        runtime.backend.execute(command)?;
+        return Ok(());
+    };
+
+    runtime
+        .repository
+        .begin_binding_membership_mutation(runtime.scope, &mutation)?;
+    if let Err(backend_error) = runtime.backend.execute(command) {
+        return Err(anyhow::anyhow!(
+            "remote backend result is ambiguous: {backend_error}; binding membership recovery is pending"
+        ));
+    }
+    if let Err(persistence_error) = runtime.repository.commit_binding_membership_mutation(
+        runtime.scope,
+        &mutation,
+        &mut runtime.session_order,
+        &mut runtime.session_names,
+    ) {
+        return Err(anyhow::Error::new(persistence_error).context(format!(
+            "remote backend completed {mutation:?}, but workspace persistence failed"
+        )));
     }
     Ok(())
 }
@@ -179,13 +195,41 @@ fn resolve_owned_session_name(
     Ok(Some(name))
 }
 
+struct RemoteSpaceRuntime {
+    backend: Box<dyn bootty_mux::backend::MuxBackend>,
+    repository: WorkspaceRepository,
+    scope: bootty_mux::controller::MuxScope,
+    session_order: SessionOrderStore,
+    session_names: SessionNameStore,
+}
+
+impl RemoteSpaceRuntime {
+    fn reconcile_pending_membership(&mut self, snapshot: &MuxSnapshot) -> Result<()> {
+        let memberships = snapshot
+            .sessions
+            .iter()
+            .map(|session| BackendSessionMembership {
+                id: session.id.clone(),
+                name: session.name.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.repository.reconcile_binding_membership_mutation(
+            self.scope,
+            &memberships,
+            &mut self.session_order,
+            &mut self.session_names,
+        )?;
+        Ok(())
+    }
+}
+
 fn remote_space_runtime(
     config: &BoottyConfig,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
-) -> Result<(Box<dyn bootty_mux::backend::MuxBackend>, SessionOrderStore)> {
-    let workspace = WorkspaceRepository::open(&config.config_path)?;
-    let space = workspace
+) -> Result<RemoteSpaceRuntime> {
+    let (repository, snapshot) = WorkspaceRepository::open(&config.config_path)?;
+    let space = snapshot
         .spaces()
         .iter()
         .find(|space| space.remote_id() == space_id)
@@ -212,11 +256,16 @@ fn remote_space_runtime(
     multiplexer.remote_space_id = None;
     let backend =
         bootty_mux::config::build_backend_for_workspace(&multiplexer, Some(&config.config_path));
-    let sessions = SessionOrderStore::for_binding(
-        &config.config_path,
-        binding.mux_scope().binding_id().persistence_value(),
-    );
-    Ok((backend, sessions))
+    let scope = binding.mux_scope();
+    let session_order = binding.session_order().clone();
+    let session_names = binding.session_names().clone();
+    Ok(RemoteSpaceRuntime {
+        backend,
+        repository,
+        scope,
+        session_order,
+        session_names,
+    })
 }
 
 fn command_session_id(command: &MuxCommand) -> Option<&str> {
@@ -240,6 +289,44 @@ fn command_session_id(command: &MuxCommand) -> Option<&str> {
         | MuxCommand::TogglePaneZoom { session_id, .. }
         | MuxCommand::RenameSession { session_id, .. }
         | MuxCommand::DitchSession { session_id } => Some(session_id),
+    }
+}
+
+fn binding_membership_mutation(
+    command: &MuxCommand,
+    owned_session_name: Option<&str>,
+    session_names: &SessionNameStore,
+) -> Option<BindingMembershipMutation> {
+    match command {
+        MuxCommand::CreateProjectSession { session_id, cwd }
+        | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
+            Some(BindingMembershipMutation::Create {
+                session_id: session_id.clone(),
+                session_name: session_id.clone(),
+                display_name: session_id.clone(),
+                explicit: true,
+                cwd: Some(cwd.clone()),
+            })
+        }
+        MuxCommand::RenameSession { session_id, name } => {
+            let old_name = owned_session_name?.to_owned();
+            let cwd = session_names
+                .record(session_id)
+                .map(|record| record.cwd.clone());
+            Some(BindingMembershipMutation::Rename {
+                session_id: session_id.clone(),
+                old_name,
+                new_name: name.clone(),
+                display_name: name.clone(),
+                explicit: true,
+                cwd,
+            })
+        }
+        MuxCommand::DitchSession { session_id } => Some(BindingMembershipMutation::Ditch {
+            session_id: session_id.clone(),
+            old_name: owned_session_name?.to_owned(),
+        }),
+        _ => None,
     }
 }
 

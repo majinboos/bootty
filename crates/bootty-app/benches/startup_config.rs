@@ -154,11 +154,8 @@ fn session_names(count: usize) -> Vec<String> {
 }
 
 fn session_order(config_path: &std::path::Path) -> SessionOrderStore {
-    let repository = WorkspaceRepository::open(config_path).expect("workspace repository");
-    let binding = repository
-        .default_binding_id()
-        .expect("default workspace binding");
-    repository.session_order(binding)
+    let (_, snapshot) = WorkspaceRepository::open(config_path).expect("workspace repository");
+    snapshot.spaces()[0].bindings()[0].session_order().clone()
 }
 
 fn parse_keybinds(config: &BoottyConfig) -> usize {
