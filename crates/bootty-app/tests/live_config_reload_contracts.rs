@@ -2,12 +2,12 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use bootty_app::{
-    AppState,
+use bootty_app::AppState;
+use bootty_config::{
     color::Color,
     config::{CursorStyleConfig, MultiplexerBackendConfig, load_config_from_path},
-    mux::snapshot::MuxPaneAnchor,
 };
+use bootty_mux::snapshot::MuxPaneAnchor;
 
 mod support;
 

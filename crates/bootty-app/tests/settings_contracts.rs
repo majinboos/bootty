@@ -1,10 +1,10 @@
 use bootty_app::{
-    config::{AppearanceVariant, BoottyConfig},
-    direct_input::ModifierSideState,
     theme::theme_from_config,
     ui::settings::{SettingsAction, SettingsSurface},
 };
+use bootty_config::config::{AppearanceVariant, BoottyConfig};
 use bootty_ui::icons::install_icon_fonts;
+use bootty_winit::direct_input::ModifierSideState;
 use egui::{Event, Key, Modifiers, RawInput};
 
 fn key_event(key: Key) -> Event {

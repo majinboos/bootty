@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use bootty_app::mux::provider::MuxBackendRegistry;
+use bootty_mux::provider::MuxBackendRegistry;
 
 pub fn backends() -> Arc<MuxBackendRegistry> {
     bootty_native::link();

@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 serde.workspace = true
 strum.workspace = true
+thiserror.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [dev-dependencies]

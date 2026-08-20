@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::config::{BoottyConfig, MacosTitlebarStyle, WindowConfig};
+use bootty_config::config::{BoottyConfig, MacosTitlebarStyle, WindowConfig};
 
 pub fn read_clipboard_text() -> Result<Option<String>> {
     if let Some(paths) = bootty_winit::file_paths::read_clipboard_file_paths()

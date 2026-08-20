@@ -7,12 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_app::{
-    AppState,
-    config::{BoottyConfig, MultiplexerBackendConfig, load_config_from_path},
-    geometry::TerminalGeometry,
-    platform::native_options_for_config,
-    terminal_session::{SessionLaunchConfig, TerminalSession, TerminalSessionConfig},
+use bootty_app::{AppState, platform::native_options_for_config};
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig, load_config_from_path};
+use bootty_render::geometry::TerminalGeometry;
+use bootty_runtime::terminal_session::{
+    SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
@@ -206,7 +205,7 @@ fn load_to_native_options(path: &Path) -> eframe::NativeOptions {
 }
 
 fn app_state_ready(config: BoottyConfig) -> usize {
-    let repaint: bootty_app::mux::RepaintHandle = Arc::new(|| {});
+    let repaint: bootty_mux::RepaintHandle = Arc::new(|| {});
     let state =
         AppState::new(config, support::backends(), repaint, None, None).expect("create app state");
     black_box(state.config().window.title.len())

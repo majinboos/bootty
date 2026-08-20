@@ -2,18 +2,18 @@ use std::hint::black_box;
 
 mod paint_plan_fixtures;
 
-use bootty_app::{
+use bootty_render::{
     geometry::{SurfaceRect, ViewTransform},
     paint_plan::{
         BackgroundRect, CursorPlan, CursorShape, DecorationLine, DecorationStyle, PaintPlanner,
         PlanColor, TerminalPaintPlan, TextAttrs, TextRun,
     },
-    terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement},
     terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
     terminal_text_atlas::TextAtlasBuilder,
     terminal_wgpu::TerminalWgpuRenderer,
 };
+use bootty_terminal::terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use eframe::wgpu;
 use paint_plan_fixtures::{

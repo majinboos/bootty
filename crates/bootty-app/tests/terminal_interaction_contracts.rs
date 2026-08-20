@@ -9,8 +9,6 @@ use std::{
 
 use bootty_app::{
     AppState, FrameInputs, ModalDialog, ViewportSnapshot,
-    config::{BoottyConfig, MultiplexerBackendConfig},
-    geometry::ViewTransform,
     renderer::RendererMetrics,
     ui::{
         new_session_picker::NewSessionPickerEvent,
@@ -20,6 +18,8 @@ use bootty_app::{
 use bootty_command::{
     AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome,
 };
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_render::geometry::ViewTransform;
 use bootty_terminal::terminal_engine::TerminalSearchDirection;
 
 mod support;
@@ -60,9 +60,9 @@ fn native_state() -> (tempfile::TempDir, AppState) {
         .expect("make terminal program executable");
     let mut config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };

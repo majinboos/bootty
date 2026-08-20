@@ -5,6 +5,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use bootty_config::config::{MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig};
+use bootty_mux::controller::SpaceId;
 use bootty_ui::overlay::{FloatingWindow, TextPrompt};
 use bootty_ui::{
     Theme, ThemePalette,
@@ -14,11 +16,7 @@ use bootty_ui::{
 use eframe::egui;
 use iconflow::{Pack, list};
 
-use crate::{
-    config::{MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
-    mux::controller::SpaceId,
-    remote_catalog::{self, RemoteSpaceSummary},
-};
+use crate::remote_catalog::{self, RemoteSpaceSummary};
 use bootty_workspace::{
     DEFAULT_SPACE_COLOR, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
 };

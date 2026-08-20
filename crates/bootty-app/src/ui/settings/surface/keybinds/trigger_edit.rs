@@ -1,5 +1,5 @@
-use crate::direct_input::ModifierSideState;
-use crate::input_binding::BindingTrigger;
+use bootty_winit::direct_input::ModifierSideState;
+use bootty_winit::input_binding::BindingTrigger;
 use eframe::egui;
 
 /// Trigger flag prefixes from the binding grammar (`performable:`, `global:`, …). Surfaced as

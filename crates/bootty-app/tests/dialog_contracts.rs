@@ -2,11 +2,6 @@ use std::{collections::HashMap, fs};
 
 use bootty_app::{
     AppState, ModalDialog,
-    config::{AppearanceVariant, BoottyConfig},
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession},
-    },
     theme::theme_from_config,
     ui::{
         ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
@@ -16,6 +11,11 @@ use bootty_app::{
         space::{SpaceEditorDialog, SpaceEditorEvent},
         theme_picker::{ThemePickerDialog, ThemePickerEvent, available_themes},
     },
+};
+use bootty_config::config::{AppearanceVariant, BoottyConfig};
+use bootty_mux::{
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession},
 };
 use bootty_ui::icons::install_icon_fonts;
 use bootty_workspace::SpaceMuxOverride;

@@ -214,7 +214,7 @@ pub fn available_themes(config_path: &Path) -> Vec<String> {
 }
 
 fn available_theme_entries(config_path: &Path) -> Vec<ThemeEntry> {
-    let mut names: Vec<String> = crate::config::builtin_theme_names()
+    let mut names: Vec<String> = bootty_config::config::builtin_theme_names()
         .map(str::to_owned)
         .collect();
     if let Some(dir) = config_path.parent().map(|parent| parent.join("themes"))

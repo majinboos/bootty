@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
 use eframe::egui;
 
-use super::SettingsWindow;
+use super::SettingsSurface;
 
 const MAX_SCROLLBACK_ROWS: i64 = 10_000_000;
 
@@ -15,7 +15,7 @@ fn scrollback_bytes(rows: i64) -> usize {
     (rows.max(0) as usize).saturating_mul(NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE)
 }
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
 
     super::section(ui, palette, "SHELL");

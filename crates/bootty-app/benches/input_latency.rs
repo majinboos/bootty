@@ -1,9 +1,6 @@
 use std::hint::black_box;
 
-use bootty_app::{
-    direct_input::{
-        ModifierSideState, direct_key_input_from_winit_code, suppress_egui_events_for_direct_input,
-    },
+use bootty_render::{
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface},
     paint_plan::PaintPlanner,
     terminal_render::TerminalRenderFrame,
@@ -12,6 +9,9 @@ use bootty_app::{
 use bootty_terminal::{
     terminal_engine::TerminalEngine,
     terminal_input_model::{KeyInput, KeyMods, TerminalKey},
+};
+use bootty_winit::direct_input::{
+    ModifierSideState, direct_key_input_from_winit_code, suppress_egui_events_for_direct_input,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use winit::keyboard::{KeyCode, ModifiersState};
@@ -138,7 +138,7 @@ fn key_input(ch: char, repeat: bool) -> KeyInput {
     }
 }
 
-fn direct_input_burst(repeats: usize) -> Vec<bootty_app::direct_input::DirectKeyInput> {
+fn direct_input_burst(repeats: usize) -> Vec<bootty_winit::direct_input::DirectKeyInput> {
     (0..repeats)
         .map(|index| {
             direct_key_input_from_winit_code(

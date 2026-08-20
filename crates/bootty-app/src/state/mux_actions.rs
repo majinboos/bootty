@@ -1,9 +1,9 @@
 use bootty_command::{CommandOutcome, CommandTarget, ResourceKind};
+use bootty_mux::command::MuxCommand;
 
 use super::{AppEffect, AppState, ViewportSnapshot};
 use crate::{
     app_actions::{KeybindAction, MuxKeyAction},
-    mux::command::MuxCommand,
     workspace_runtime::mux_split_direction,
 };
 
@@ -72,7 +72,7 @@ impl AppState {
             ),
             _ => None,
         };
-        let cwd = super::terminal_cwd_for_mux_command(
+        let cwd = crate::workspace_runtime::terminal_cwd_for_mux_command(
             self.workspace
                 .active
                 .binding
@@ -260,7 +260,7 @@ impl AppState {
             .split_focused_pane(&self.repaint, direction, target_pane_id);
     }
 
-    fn focus_pane_neighbor(&mut self, direction: crate::mux::command::MuxDirection) {
+    fn focus_pane_neighbor(&mut self, direction: bootty_mux::command::MuxDirection) {
         let Some(area) = self.last_pane_area else {
             return;
         };

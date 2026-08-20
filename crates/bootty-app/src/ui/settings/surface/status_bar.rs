@@ -1,10 +1,10 @@
-use eframe::egui::{self, RichText};
-
-use super::SettingsWindow;
-use crate::{
+use bootty_config::{
     color::Color,
     config::{ChromeConfig, SegmentAlign, StatusSegment},
 };
+use eframe::egui::{self, RichText};
+
+use super::SettingsSurface;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StatusBarPosition {
@@ -58,7 +58,7 @@ impl StatusBarPosition {
     }
 }
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
 
     super::section(ui, palette, "BARS");
@@ -271,7 +271,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
 }
 
 fn segment_list_row(
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     ui: &mut egui::Ui,
     position: StatusBarPosition,
     ctx: SegmentListContext<'_>,
@@ -301,7 +301,7 @@ fn segment_list_row(
 }
 
 fn segment_detail_panel(
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     ui: &mut egui::Ui,
     position: StatusBarPosition,
     ctx: SegmentDetailContext<'_>,

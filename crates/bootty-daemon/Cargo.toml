@@ -21,7 +21,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+rmux-server.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 
 [lints]
 workspace = true

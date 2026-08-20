@@ -1,8 +1,8 @@
 use bootty_app::{
-    config::{AppearanceVariant, BoottyConfig},
     theme::theme_from_config,
     ui::rename::{RenameSessionDialog, RenameSessionEvent, RenameTabDialog, RenameTabEvent},
 };
+use bootty_config::config::{AppearanceVariant, BoottyConfig};
 use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, Key, Modifiers, RawInput};
 

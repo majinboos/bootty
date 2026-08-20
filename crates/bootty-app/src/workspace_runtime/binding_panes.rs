@@ -1,17 +1,15 @@
 use anyhow::Result;
+use bootty_mux::{
+    RepaintHandle,
+    command::{MuxCommand, MuxDirection, MuxSplitDirection},
+    provider::{PaneTopology, selected_backend},
+    snapshot::MuxPaneAnchor,
+    terminal::TerminalRuntime,
+};
 use eframe::egui::Rect;
 
 use super::{BindingRuntime, ScopedWindowId};
-use crate::{
-    layout::{Direction, Divider, PaneLayout, SplitDirection},
-    mux::{
-        RepaintHandle,
-        command::{MuxCommand, MuxDirection, MuxSplitDirection},
-        provider::{PaneTopology, selected_backend},
-        snapshot::MuxPaneAnchor,
-        terminal::TerminalRuntime,
-    },
-};
+use crate::layout::{Direction, Divider, PaneLayout, SplitDirection};
 
 pub(crate) fn mux_split_direction(direction: SplitDirection) -> MuxSplitDirection {
     match direction {

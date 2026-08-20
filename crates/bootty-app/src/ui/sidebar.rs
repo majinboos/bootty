@@ -1,13 +1,10 @@
 use std::collections::HashMap;
 
 use bootty_extension::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem};
+use bootty_mux::{controller::MuxScope, snapshot::MuxSession};
 use eframe::egui::Color32;
 
-use crate::{
-    mux::{controller::MuxScope, snapshot::MuxSession},
-    theme::module_color32,
-    ui::session_navigation::BindingSessionGroup,
-};
+use crate::{theme::module_color32, ui::session_navigation::BindingSessionGroup};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarState {

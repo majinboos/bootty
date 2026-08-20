@@ -4,32 +4,23 @@ use std::{path::PathBuf, sync::mpsc, time::Instant};
 
 use anyhow::Result;
 use bootty_command::{BoundAppCommandSender, Caller};
+use bootty_config::config::{AppearanceVariant, BoottyConfig};
 use bootty_control::ControlPlane;
 use bootty_extension::{ExtensionHost, ExtensionUiAction, ModuleItem, SurfacePlacement};
-use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
+use bootty_winit::direct_input::{
+    DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input,
+};
+use eframe::egui;
 
 use crate::renderer::{TerminalWorkspaceView, animate_indeterminate_progress};
 use crate::state::{AppEffect, AppState, FrameInputs, ViewportSnapshot};
 use crate::ui::chrome::ChromeRuntime;
 
 use crate::{
-    config::{AppearanceVariant, BoottyConfig},
-    direct_input::{DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input},
     menu::AppMenu,
     theme::theme_tokens,
     ui::settings::{SettingsAction, SettingsSurface},
 };
-
-const EGUI_SYMBOL_FALLBACK_FAMILIES: &[&str] = &[
-    "Apple Symbols",
-    "Segoe UI Symbol",
-    "Noto Sans Symbols 2",
-    "Noto Sans Symbols",
-    "DejaVu Sans",
-    "Symbola",
-    "Arial Unicode MS",
-];
-const EGUI_SYMBOL_FALLBACK_CHARS: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 fn sync_global_egui_style(ctx: &egui::Context, theme: bootty_ui::Theme) {
     let mut style = (*ctx.global_style()).clone();
@@ -64,13 +55,9 @@ impl BoottyApp {
     ) -> Result<Self> {
         let direct_input_rx = Some(direct_input_rx);
         let modifier_side_rx = Some(modifier_side_rx);
-        if uses_custom_egui_fonts(&config) {
-            configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
-        } else {
-            bootty_ui::icons::install_icon_fonts(&cc.egui_ctx);
-        }
+        configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
         let repaint_ctx = cc.egui_ctx.clone();
-        let repaint: crate::mux::RepaintHandle =
+        let repaint: bootty_mux::RepaintHandle =
             std::sync::Arc::new(move || repaint_ctx.request_repaint());
         let text_config = terminal_text_config(&config.font);
         let target_format = cc
@@ -101,7 +88,7 @@ impl BoottyApp {
             state.app_command_sender(Caller::Luau),
             control_plane.extension_event_sender(),
             extension_theme.clone(),
-            crate::config::default_working_directory(),
+            bootty_config::config::default_working_directory(),
         );
         Ok(Self {
             state,
@@ -372,7 +359,7 @@ fn show_extension_surface_items(ui: &mut egui::Ui, items: &[ModuleItem]) -> Opti
 
 fn suppress_settings_recorder_duplicates(
     events: &mut Vec<egui::Event>,
-    direct_inputs: &[crate::direct_input::DirectKeyInput],
+    direct_inputs: &[bootty_winit::direct_input::DirectKeyInput],
     recording: bool,
 ) {
     if recording {
@@ -592,10 +579,6 @@ impl eframe::App for BoottyApp {
     }
 }
 
-fn uses_custom_egui_fonts(config: &BoottyConfig) -> bool {
-    config.chrome.sidebar || config.chrome.top_bar || config.chrome.bottom_bar
-}
-
 fn suppress_terminal_payload_for_settings(
     events: &mut Vec<egui::Event>,
     dropped_file_paths: &mut Vec<PathBuf>,
@@ -605,139 +588,7 @@ fn suppress_terminal_payload_for_settings(
 }
 
 fn configure_egui_fonts(ctx: &egui::Context, families: &[String]) {
-    let db = bootty_render::font_database::system_font_database();
-    let mut fonts = FontDefinitions::default();
-    let mut loaded_text_font = false;
-    for family in families.iter().rev() {
-        loaded_text_font |= add_egui_font_family(&mut fonts, db, family, EguiFontPlacement::First);
-    }
-    if !loaded_text_font {
-        add_egui_default_text_font(&mut fonts, db);
-    }
-    add_egui_symbol_fallback_fonts(&mut fonts, db);
+    let mut fonts = bootty_render::font_database::ui_font_definitions(families);
     bootty_ui::icons::add_icon_fonts(&mut fonts);
     ctx.set_fonts(fonts);
-}
-
-#[derive(Clone, Copy)]
-enum EguiFontPlacement {
-    First,
-    Last,
-}
-
-fn add_egui_default_text_font(fonts: &mut FontDefinitions, db: &fontdb::Database) -> bool {
-    let query_families = [fontdb::Family::Monospace];
-    let query = fontdb::Query {
-        families: &query_families,
-        ..fontdb::Query::default()
-    };
-    let Some(id) = db.query(&query) else {
-        return false;
-    };
-    add_egui_font_face(
-        fonts,
-        db,
-        id,
-        "bootty-ui-default-monospace",
-        EguiFontPlacement::First,
-    )
-}
-
-fn add_egui_symbol_fallback_fonts(fonts: &mut FontDefinitions, db: &fontdb::Database) {
-    for family in EGUI_SYMBOL_FALLBACK_FAMILIES {
-        if add_egui_font_family(fonts, db, family, EguiFontPlacement::Last) {
-            break;
-        }
-    }
-    for ch in EGUI_SYMBOL_FALLBACK_CHARS {
-        add_egui_font_for_char(fonts, db, *ch);
-    }
-}
-
-fn add_egui_font_family(
-    fonts: &mut FontDefinitions,
-    db: &fontdb::Database,
-    family: &str,
-    placement: EguiFontPlacement,
-) -> bool {
-    let name = egui_font_name(family);
-    let query_families = [fontdb::Family::Name(family)];
-    let query = fontdb::Query {
-        families: &query_families,
-        ..fontdb::Query::default()
-    };
-    let Some(id) = db.query(&query) else {
-        return false;
-    };
-    add_egui_font_face(fonts, db, id, &name, placement)
-}
-
-fn add_egui_font_for_char(fonts: &mut FontDefinitions, db: &fontdb::Database, ch: char) -> bool {
-    let Some(face) = egui_symbol_fallback_face(db, ch) else {
-        return false;
-    };
-    let name = format!(
-        "bootty-ui-symbol-U{:04X}-{}",
-        u32::from(ch),
-        face.post_script_name
-    );
-    add_egui_font_face(fonts, db, face.id, &name, EguiFontPlacement::Last)
-}
-
-fn add_egui_font_face(
-    fonts: &mut FontDefinitions,
-    db: &fontdb::Database,
-    id: fontdb::ID,
-    name: &str,
-    placement: EguiFontPlacement,
-) -> bool {
-    let name = db
-        .face(id)
-        .map(|face| format!("bootty-ui-face-{}", face.post_script_name))
-        .unwrap_or_else(|| name.to_owned());
-    if fonts.font_data.contains_key(&name) {
-        return false;
-    }
-    let Some((bytes, index)) = db.with_face_data(id, |data, index| (data.to_vec(), index)) else {
-        return false;
-    };
-
-    let mut font_data = FontData::from_owned(bytes);
-    font_data.index = index;
-    fonts
-        .font_data
-        .insert(name.clone(), std::sync::Arc::new(font_data));
-    for family in [FontFamily::Monospace, FontFamily::Proportional] {
-        let entries = fonts.families.entry(family).or_default();
-        match placement {
-            EguiFontPlacement::First => entries.insert(0, name.clone()),
-            EguiFontPlacement::Last => entries.push(name.clone()),
-        }
-    }
-    true
-}
-
-fn egui_symbol_fallback_face(db: &fontdb::Database, ch: char) -> Option<&fontdb::FaceInfo> {
-    let mut fallback = None;
-    for face in db.faces() {
-        if !font_face_supports_char(db, face.id, ch) {
-            continue;
-        }
-        if face.monospaced {
-            return Some(face);
-        }
-        fallback.get_or_insert(face);
-    }
-    fallback
-}
-
-fn font_face_supports_char(db: &fontdb::Database, id: fontdb::ID, ch: char) -> bool {
-    db.with_face_data(id, |data, index| {
-        ttf_parser::Face::parse(data, index).is_ok_and(|face| face.glyph_index(ch).is_some())
-    })
-    .unwrap_or(false)
-}
-
-fn egui_font_name(family: &str) -> String {
-    format!("bootty-ui-{family}")
 }

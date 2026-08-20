@@ -1,12 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{
-    layout::PaneLayout,
-    mux::{
-        RepaintHandle,
-        provider::{PaneTopology, TerminalProgressPolicy},
-        snapshot::{MuxSession, MuxWindow, MuxWindowProgress},
-    },
+use crate::layout::PaneLayout;
+use bootty_mux::{
+    RepaintHandle,
+    provider::{PaneTopology, TerminalProgressPolicy},
+    snapshot::{MuxSession, MuxWindow, MuxWindowProgress},
 };
 
 use super::{BindingRuntime, ScopedPaneId, ScopedWindowId};

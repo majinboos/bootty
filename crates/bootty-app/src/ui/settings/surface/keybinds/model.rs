@@ -1,8 +1,8 @@
 use super::{
-    SettingsWindow,
+    SettingsSurface,
     trigger_edit::{combo_has_modifier_sides, combo_is_prefixed, parse_trigger_flags},
 };
-use crate::config::split_keybind_entry;
+use bootty_config::config::split_keybind_entry;
 
 /// Which keybind list is being edited: the global list, one of the per-backend lists, or the
 /// sidebar navigation list (which has its own action vocabulary).
@@ -54,13 +54,14 @@ impl KeybindScope {
     pub(super) fn entry_is_valid(self, trigger: &str, action: &str) -> bool {
         if self == Self::Sidebar {
             trigger
-                .parse::<crate::input_binding::BindingTrigger>()
+                .parse::<bootty_winit::input_binding::BindingTrigger>()
                 .is_ok()
                 && SIDEBAR_ACTION_INFO
                     .iter()
                     .any(|(name, _, _)| *name == action)
         } else {
-            crate::input_binding::parse_binding_elements(&format!("{trigger}={action}")).is_ok()
+            bootty_winit::input_binding::parse_binding_elements(&format!("{trigger}={action}"))
+                .is_ok()
         }
     }
 }
@@ -125,7 +126,7 @@ const SIDEBAR_ACTION_INFO: &[(&str, &str, &str)] = &[
 ];
 
 pub(super) fn read_scope_entries(
-    win: &SettingsWindow,
+    win: &SettingsSurface,
     scope: KeybindScope,
 ) -> (bool, Vec<BindingRow>) {
     let prefix = match scope {
@@ -163,7 +164,7 @@ pub(super) fn read_scope_entries(
 }
 
 pub(super) fn write_scope(
-    win: &mut SettingsWindow,
+    win: &mut SettingsSurface,
     scope: KeybindScope,
     clear: bool,
     rows: &[BindingRow],
@@ -190,8 +191,8 @@ pub(super) fn write_scope(
 /// (global rows + the backend's own rows, including prefixed chords), matching what the runtime
 /// resolves for that backend. Global shows the merge for the currently configured backend, since
 /// that's what actually fires while using the app.
-pub(super) fn effective_bindings(win: &SettingsWindow, scope: KeybindScope) -> Vec<String> {
-    use crate::config::MultiplexerBackendConfig;
+pub(super) fn effective_bindings(win: &SettingsSurface, scope: KeybindScope) -> Vec<String> {
+    use bootty_config::config::MultiplexerBackendConfig;
     let input = &win.config.input;
     match scope {
         KeybindScope::Global => input.keybinds_for_backend(win.config.multiplexer.backend),

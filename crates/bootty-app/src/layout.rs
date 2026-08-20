@@ -7,7 +7,7 @@
 //! first/left/top child). "Split the current pane" replaces the focused leaf with a split whose
 //! children are the old pane and the new one.
 
-use crate::mux::snapshot::{MuxPaneLayout, MuxPaneSplitDirection};
+use bootty_mux::snapshot::{MuxPaneLayout, MuxPaneSplitDirection};
 use eframe::egui::{Pos2, Rect, Vec2};
 
 pub type PaneId = String;

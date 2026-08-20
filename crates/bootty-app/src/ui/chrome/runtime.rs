@@ -31,7 +31,7 @@ fn color_hex(color: egui::Color32) -> String {
 }
 
 fn status_bar_background_color(
-    chrome_config: &crate::config::ChromeConfig,
+    chrome_config: &bootty_config::config::ChromeConfig,
     palette: bootty_ui::ThemePalette,
     notch_chrome_color: Option<egui::Color32>,
 ) -> egui::Color32 {
@@ -137,7 +137,7 @@ struct ChromeView<'a> {
 impl ChromeView<'_> {
     fn resolve_status_segments(
         &self,
-        segments: &[crate::config::StatusSegment],
+        segments: &[bootty_config::config::StatusSegment],
     ) -> Vec<chrome::ResolvedSegment> {
         segments
             .iter()
@@ -511,7 +511,8 @@ impl ChromeView<'_> {
             fullscreen_chrome && bootty_winit::window::macos_active_screen_is_notched();
         let black_notch_chrome = notch_context
             && chrome_config.notched_fullscreen_black_chrome
-            && self.state.active_appearance_variant() == crate::config::AppearanceVariant::Dark;
+            && self.state.active_appearance_variant()
+                == bootty_config::config::AppearanceVariant::Dark;
         let notch_chrome_color = black_notch_chrome.then_some(egui::Color32::BLACK);
         // Pixel height for the layout offset: the config override, else the measured macOS band
         // calibrated to the physical notch, else a fallback when the band is unreadable.
@@ -608,7 +609,7 @@ impl ChromeView<'_> {
         };
         let sidebar_on_right = matches!(
             self.state.config().sidebar.position,
-            crate::config::SidebarPosition::Right
+            bootty_config::config::SidebarPosition::Right
         );
         let clamped_sidebar_width = sidebar_width.min(rect.width());
         let (sidebar_rect, right_rect) = if !sidebar {

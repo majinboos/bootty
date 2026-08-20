@@ -103,7 +103,7 @@ impl StartingNativeTerminal {
             }
         };
 
-        terminal.resize(self.geometry)?;
+        terminal.queue_resize(self.geometry)?;
         terminal.set_display_scale(self.display_scale)?;
         terminal.set_render_cell_metrics(self.render_cell)?;
         if let Some(config) = self.pending_live_config.take() {
@@ -185,7 +185,7 @@ impl TerminalFrameSource for StartingNativeTerminal {
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
         self.geometry = geometry;
         if let Some(terminal) = self.ready_terminal()? {
-            terminal.resize(geometry)?;
+            terminal.queue_resize(geometry)?;
         }
         Ok(())
     }

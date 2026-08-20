@@ -1,21 +1,19 @@
 use std::collections::HashMap;
 
-use bootty_app::{
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession},
-    },
-    ui::{
-        session_navigation::BindingSessionGroup,
-        sidebar::{
-            SidebarDisplay, SidebarItemKind, SidebarTree, build_binding_sidebar_items,
-            build_sidebar_items_from_published_items, session_group, session_suffix,
-            sidebar_session_colors,
-        },
+use bootty_app::ui::{
+    session_navigation::BindingSessionGroup,
+    sidebar::{
+        SidebarDisplay, SidebarItemKind, SidebarTree, build_binding_sidebar_items,
+        build_sidebar_items_from_published_items, session_group, session_suffix,
+        sidebar_session_colors,
     },
 };
 use bootty_extension::{
     ModuleColor, ModuleCoord, ModuleItem, ModulePrimitive, PublishedSurfaceItem,
+};
+use bootty_mux::{
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession},
 };
 use egui::Color32;
 

@@ -1,9 +1,11 @@
 use std::{sync::Arc, time::Instant};
 
 use bootty_app::{
-    AppEffect, AppState, FrameInputs, ViewportSnapshot, config::load_config_from_path,
-    geometry::ViewTransform, input::resolve_modifier_remaps, renderer::RendererMetrics,
+    AppEffect, AppState, FrameInputs, ViewportSnapshot, input::resolve_modifier_remaps,
+    renderer::RendererMetrics,
 };
+use bootty_config::config::load_config_from_path;
+use bootty_render::geometry::ViewTransform;
 
 mod support;
 

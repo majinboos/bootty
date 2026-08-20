@@ -17,6 +17,7 @@ bootty-app = { path = "../bootty-app" }
 bootty-cli = { path = "../bootty-cli" }
 bootty-command = { path = "../bootty-command" }
 bootty-control = { path = "../bootty-control" }
+bootty-identity = { path = "../bootty-identity" }
 bootty-mux = { path = "../bootty-mux" }
 bootty-native = { path = "../bootty-native" }
 bootty-remote = { path = "../bootty-remote" }
@@ -25,13 +26,16 @@ bootty-tmux = { path = "../bootty-tmux" }
 bootty-zellij = { path = "../bootty-zellij" }
 serde_json.workspace = true
 clap.workspace = true
+thiserror.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [build-dependencies]
 embed-resource.workspace = true
 
 [dev-dependencies]
+bootty-config = { path = "../bootty-config" }
 bootty-extension = { path = "../bootty-extension" }
+bootty-render = { path = "../bootty-render" }
 egui.workspace = true
 tempfile.workspace = true
 

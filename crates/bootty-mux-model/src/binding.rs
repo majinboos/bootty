@@ -1,7 +1,6 @@
-use std::{error::Error, fmt};
-
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumIter};
+use thiserror::Error;
 
 /// A backend that Bootty can drive for one terminal binding.
 #[derive(
@@ -82,27 +81,13 @@ pub struct MuxBindingConfig {
 }
 
 /// Validation failure for an operational multiplexer binding.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MuxBindingConfigError {
+    #[error("multiplexer.remote.host must name a host")]
     EmptyRemoteHost,
+    #[error("multiplexer.remote needs a backend with a client to run there, got {backend:?}")]
     UnsupportedRemoteBackend { backend: MuxBackendKind },
 }
-
-impl fmt::Display for MuxBindingConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyRemoteHost => {
-                formatter.write_str("multiplexer.remote.host must name a host")
-            }
-            Self::UnsupportedRemoteBackend { backend } => write!(
-                formatter,
-                "multiplexer.remote needs a backend with a client to run there, got {backend:?}"
-            ),
-        }
-    }
-}
-
-impl Error for MuxBindingConfigError {}
 
 impl MuxBindingConfig {
     /// Validate remote placement without changing the binding.

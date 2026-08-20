@@ -1,4 +1,4 @@
-use bootty_app::application_identity::ApplicationIdentity;
+use bootty_identity::ApplicationIdentity;
 
 pub(crate) fn ensure_cli_link() -> std::io::Result<()> {
     let executable = std::env::current_exe()?;

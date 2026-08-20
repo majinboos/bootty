@@ -1,6 +1,6 @@
-use bootty_app::{
+use bootty_app::renderer::{RendererMetrics, TerminalWidget};
+use bootty_render::{
     geometry::{TerminalGeometry, ViewTransform},
-    renderer::{RendererMetrics, TerminalWidget},
     terminal_text::TerminalTextConfig,
 };
 use eframe::egui::{Pos2, Rect, Vec2};

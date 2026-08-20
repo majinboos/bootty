@@ -1,9 +1,9 @@
 use serde::Deserialize;
 
-use super::{
-    ColorConfig, ColorPatch, ConfigLoadError, ConfigResult, ResolvedTheme, ThemeInfo,
-    apply_partial_colors,
-};
+use super::load::{ConfigLoadError, ConfigResult};
+use super::model::{ColorConfig, ResolvedTheme, ThemeInfo};
+use super::raw::ColorPatch;
+use super::resolve::apply_partial_colors;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]

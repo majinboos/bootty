@@ -3,12 +3,14 @@ use super::clusters::{ShapedCluster, is_combining_mark, is_variation_selector};
 use super::coretext;
 use super::shaping;
 use super::shaping::font_has_ligature_features;
-use ab_glyph::{Font, FontArc, FontVec, GlyphId, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use std::collections::HashMap;
 
-use crate::font_database::system_font_database;
+use crate::font_database::{
+    font_style, font_weight, load_font_id, load_matching_font, query_font_id, system_font_database,
+};
 use crate::terminal_font_face::FontFaceMetrics;
-use crate::terminal_text::{FontFeature, FontStyle, ResolvedFontFace};
+use crate::terminal_text::{FontFeature, ResolvedFontFace};
 
 #[derive(Clone, Debug)]
 pub(super) struct FontLibrary {
@@ -297,39 +299,11 @@ fn load_font(database: &fontdb::Database, face: &ResolvedFontFace) -> Option<Fon
         } else {
             fontdb::Family::Name(family)
         };
-        if let Some(font) = load_matching_font(database, &[query_family], face) {
+        if let Some(font) = load_matching_font(database, &[query_family], face.style) {
             return Some(font);
         }
     }
-    load_matching_font(database, &[fontdb::Family::Monospace], face)
-}
-
-fn load_matching_font(
-    database: &fontdb::Database,
-    families: &[fontdb::Family<'_>],
-    face: &ResolvedFontFace,
-) -> Option<FontArc> {
-    let id = query_font_id(database, families, face.style)?;
-    database
-        .with_face_data(id, |data, face_index| {
-            FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                .ok()
-                .map(FontArc::new)
-        })
-        .flatten()
-}
-
-fn query_font_id(
-    database: &fontdb::Database,
-    families: &[fontdb::Family<'_>],
-    style: FontStyle,
-) -> Option<fontdb::ID> {
-    database.query(&fontdb::Query {
-        families,
-        weight: font_weight(style),
-        style: font_style(style),
-        ..fontdb::Query::default()
-    })
+    load_matching_font(database, &[fontdb::Family::Monospace], face.style)
 }
 
 fn font_id_supporting_char(
@@ -424,28 +398,4 @@ fn font_id_for_postscript_or_family(
             })
         })
         .map(|candidate| candidate.id)
-}
-
-fn load_font_id(database: &fontdb::Database, id: fontdb::ID) -> Option<FontArc> {
-    database
-        .with_face_data(id, |data, face_index| {
-            FontVec::try_from_vec_and_index(data.to_vec(), face_index)
-                .ok()
-                .map(FontArc::new)
-        })
-        .flatten()
-}
-
-fn font_weight(style: FontStyle) -> fontdb::Weight {
-    match style {
-        FontStyle::Bold | FontStyle::BoldItalic => fontdb::Weight::BOLD,
-        FontStyle::Regular | FontStyle::Italic => fontdb::Weight::NORMAL,
-    }
-}
-
-fn font_style(style: FontStyle) -> fontdb::Style {
-    match style {
-        FontStyle::Italic | FontStyle::BoldItalic => fontdb::Style::Italic,
-        FontStyle::Regular | FontStyle::Bold => fontdb::Style::Normal,
-    }
 }

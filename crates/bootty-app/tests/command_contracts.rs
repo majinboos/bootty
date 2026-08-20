@@ -9,8 +9,6 @@ use std::{
 use bootty_app::commands::{CommandCatalog, CommandExecutor};
 use bootty_app::{
     AppState, FrameInputs, ModalDialog, ViewportSnapshot,
-    config::{BoottyConfig, MultiplexerBackendConfig},
-    geometry::ViewTransform,
     renderer::RendererMetrics,
     ui::{
         ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
@@ -22,7 +20,9 @@ use bootty_command::{
     CommandInvocation, CommandOutcome, CommandTarget, MutationClass, ResourceKind,
     app_command_channel as command_channel,
 };
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
 use bootty_extension::{ExtensionHost, event_queue};
+use bootty_render::geometry::ViewTransform;
 use bootty_workspace::WorkspaceRepository;
 use rusqlite::Connection;
 
@@ -152,9 +152,9 @@ fn discovered_resource_target_cannot_retarget_a_replacement_binding() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -200,9 +200,9 @@ fn native_split_command_publishes_the_binding_owned_layout() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -295,9 +295,9 @@ fn ditch_session_commits_membership_after_authoritative_command() {
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
         config_path: config_path.clone(),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -376,9 +376,9 @@ fn ditch_submits_after_worktree_removal_when_branch_deletion_fails() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
@@ -529,9 +529,9 @@ fn native_window_actions_use_the_binding_owned_plan() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };

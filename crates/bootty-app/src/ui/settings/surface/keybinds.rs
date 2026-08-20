@@ -4,9 +4,9 @@ use eframe::egui;
 mod model;
 mod trigger_edit;
 
-use super::SettingsWindow;
-use crate::config::{KeybindPreset, split_keybind_entry};
-use crate::direct_input::ModifierSideState;
+use super::SettingsSurface;
+use bootty_config::config::{KeybindPreset, split_keybind_entry};
+use bootty_winit::direct_input::ModifierSideState;
 pub(super) use model::{BindingRow, ChordCapture, KeybindScope};
 use model::{action_options, effective_bindings, read_scope_entries, write_scope};
 use trigger_edit::{
@@ -18,7 +18,7 @@ use trigger_edit::{
 /// Seconds to wait for the next chord step before committing the captured trigger.
 const CHORD_TIMEOUT: f64 = 0.8;
 
-pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     let direct_chords = std::mem::take(&mut win.recorder_chords);
 
@@ -204,7 +204,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
 
 /// Global input settings, laid out at the top of the page with the same row grammar as the rest of
 /// settings so they line up with every other pane.
-fn shortcut_options(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+fn shortcut_options(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     super::section(ui, palette, "SHORTCUT OPTIONS");
 
@@ -231,17 +231,17 @@ fn shortcut_options(win: &mut SettingsWindow, ui: &mut egui::Ui) {
         |ui| {
             let tokens = ["none", "left", "right", "both"];
             let current = match win.config.input.macos_option_as_alt {
-                crate::config::MacosOptionAsAltConfig::None => 0,
-                crate::config::MacosOptionAsAltConfig::Left => 1,
-                crate::config::MacosOptionAsAltConfig::Right => 2,
-                crate::config::MacosOptionAsAltConfig::Both => 3,
+                bootty_config::config::MacosOptionAsAltConfig::None => 0,
+                bootty_config::config::MacosOptionAsAltConfig::Left => 1,
+                bootty_config::config::MacosOptionAsAltConfig::Right => 2,
+                bootty_config::config::MacosOptionAsAltConfig::Both => 3,
             };
             if let Some(index) = super::settings_segmented(ui, palette, &tokens, current) {
                 win.config.input.macos_option_as_alt = match index {
-                    0 => crate::config::MacosOptionAsAltConfig::None,
-                    1 => crate::config::MacosOptionAsAltConfig::Left,
-                    2 => crate::config::MacosOptionAsAltConfig::Right,
-                    _ => crate::config::MacosOptionAsAltConfig::Both,
+                    0 => bootty_config::config::MacosOptionAsAltConfig::None,
+                    1 => bootty_config::config::MacosOptionAsAltConfig::Left,
+                    2 => bootty_config::config::MacosOptionAsAltConfig::Right,
+                    _ => bootty_config::config::MacosOptionAsAltConfig::Both,
                 };
                 win.writeback
                     .set_str(&["input", "macos-option-as-alt"], tokens[index]);
@@ -261,7 +261,7 @@ fn shortcut_options(win: &mut SettingsWindow, ui: &mut egui::Ui) {
 
 /// Preset picker + prefix recorder. Switching preset (or prefix) only swaps which built-in
 /// defaults the user's override rows layer on top of; the rows themselves are never touched.
-fn preset_options(win: &mut SettingsWindow, ui: &mut egui::Ui, direct_chords: &[String]) {
+fn preset_options(win: &mut SettingsSurface, ui: &mut egui::Ui, direct_chords: &[String]) {
     let palette = win.palette;
     super::section(ui, palette, "PRESET");
 
@@ -336,7 +336,7 @@ fn preset_options(win: &mut SettingsWindow, ui: &mut egui::Ui, direct_chords: &[
 
 /// Single-combo capture for the prefix recorder: the first step commits immediately (a prefix is
 /// one combo, never a chord). Escape cancels.
-fn handle_prefix_capture(win: &mut SettingsWindow, ui: &egui::Ui, direct_chords: &[String]) {
+fn handle_prefix_capture(win: &mut SettingsSurface, ui: &egui::Ui, direct_chords: &[String]) {
     ui.ctx().request_repaint();
     let step = if let Some((key, modifiers)) = drain_first_key_press(ui) {
         if key == egui::Key::Escape {
@@ -377,7 +377,7 @@ fn defaults_toggle(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, clear: &
     changed
 }
 
-fn modifier_remaps(win: &mut SettingsWindow, ui: &mut egui::Ui) {
+fn modifier_remaps(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     if win.modifier_rows.is_none() {
         let rows = win
@@ -505,7 +505,7 @@ fn conflict_banner(
     ui.add_space(12.0);
 }
 
-fn effective_bindings_panel(win: &SettingsWindow, ui: &mut egui::Ui, scope: KeybindScope) {
+fn effective_bindings_panel(win: &SettingsSurface, ui: &mut egui::Ui, scope: KeybindScope) {
     let palette = win.palette;
     ui.add_space(10.0);
     egui::CollapsingHeader::new(
@@ -1046,7 +1046,7 @@ fn remap_is_valid(from: &str, to: &str) -> bool {
     if from.is_empty() || to.is_empty() {
         return false;
     }
-    let mut set = crate::modifier_remap::ModifierRemapSet::default();
+    let mut set = bootty_winit::modifier_remap::ModifierRemapSet::default();
     set.parse(&format!("{from}={to}")).is_ok()
 }
 

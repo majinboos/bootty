@@ -1,15 +1,50 @@
 #![cfg(unix)]
 
+use std::sync::{Mutex, OnceLock, mpsc};
+use std::thread;
+
 use anyhow::Result;
 use bootty_identity::ApplicationIdentity;
 use bootty_mux::{command::MuxCommand, provider::MuxBackendRegistry, terminal::ActiveTerminal};
 use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
-use bootty_rmux::{RmuxBackend, endpoint_path_for, start_embedded_rmux_daemon_for_tests};
+use bootty_rmux::{RmuxBackend, endpoint_path_for};
 use bootty_runtime::{frame_source::TerminalFrameSource, terminal_session::TerminalSessionConfig};
 use bootty_surface::geometry::TerminalGeometry;
+use tokio::runtime::Builder;
 
 const HELPER_ENV: &str = "BOOTTY_RMUX_EMBEDDED_CONTRACT_HELPER";
 const ISOLATED_PATH: &str = "/usr/bin:/bin";
+
+fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
+    static STARTED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    STARTED
+        .get_or_init(|| {
+            let socket = endpoint_path_for(ApplicationIdentity::Production)
+                .map_err(|error| error.to_string())?;
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let started_tx = ready_tx.clone();
+                let result = (|| -> Result<()> {
+                    let runtime = Builder::new_multi_thread().enable_all().build()?;
+                    runtime.block_on(async {
+                        let daemon =
+                            rmux_server::ServerDaemon::new(rmux_server::DaemonConfig::new(socket))
+                                .bind()
+                                .await?;
+                        let _ = started_tx.send(Ok(()));
+                        daemon.wait().await
+                    })?;
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            });
+            ready_rx.recv().map_err(|error| error.to_string())?
+        })
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
 
 #[test]
 fn embedded_rmux_owns_session_lifecycle_without_an_external_executable() -> Result<()> {
@@ -103,7 +138,111 @@ fn embedded_rmux_fresh_reader_restore_does_not_block_later_live_output_helper() 
     ditch_session(&mut backend, &session_id)
 }
 
+#[test]
+fn embedded_rmux_terminal_requests_keep_public_results() -> Result<()> {
+    run_embedded_helper("embedded_rmux_terminal_requests_keep_public_results_helper")
+}
+
+#[test]
+fn embedded_rmux_terminal_requests_keep_public_results_helper() -> Result<()> {
+    if std::env::var_os(HELPER_ENV).is_none() {
+        return Ok(());
+    }
+
+    let (mut backend, registry, session_id, window_id, pane) = create_embedded_session()?;
+    let mut terminal = open_terminal(registry, &pane, &window_id)?;
+
+    terminal.enter_copy_mode()?;
+    assert!(terminal.copy_mode_active()?);
+    let outcome = terminal.handle_copy_mode_action(
+        bootty_terminal::terminal_engine::TerminalCopyModeAction::Cancel,
+    )?;
+    assert!(!outcome.active);
+    assert_eq!(
+        terminal.format_selection(
+            bootty_terminal::terminal_engine::TerminalSelectionFormat::PlainText
+        )?,
+        None
+    );
+    assert!(!terminal.search_viewport(
+        "",
+        bootty_terminal::terminal_engine::TerminalSearchDirection::Current,
+    )?);
+    terminal.is_mouse_tracking()?;
+    terminal.discard_pending_output()?;
+
+    ditch_session(&mut backend, &session_id)
+}
+
+#[test]
+fn embedded_rmux_backpressures_live_output_without_reordering_tail() -> Result<()> {
+    run_embedded_helper("embedded_rmux_backpressures_live_output_without_reordering_tail_helper")
+}
+
+#[test]
+fn embedded_rmux_backpressures_live_output_without_reordering_tail_helper() -> Result<()> {
+    if std::env::var_os(HELPER_ENV).is_none() {
+        return Ok(());
+    }
+
+    let (mut backend, registry, session_id, window_id, pane) = create_embedded_session()?;
+    let mut terminal = open_terminal(registry, &pane, &window_id)?;
+
+    terminal.write_input(
+        b"printf 'BOOTTY_RMUX_BOUND_START\\n'; yes X | head -c 2000000; printf '\\nBOOTTY_RMUX_BOUND_END\\n'\r",
+    )?;
+    // Let the producer fill the bounded handoff before the consumer starts draining it.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_BOUND_END")?;
+    let spool_files = std::fs::read_dir(
+        endpoint_path_for(ApplicationIdentity::Production)?
+            .parent()
+            .expect("embedded rmux endpoint parent"),
+    )?
+    .filter_map(Result::ok)
+    .map(|entry| entry.file_name())
+    .filter(|name| name.to_string_lossy().starts_with("bootty-rmux-output-"))
+    .collect::<Vec<_>>();
+    assert!(
+        spool_files.is_empty(),
+        "bounded live output must not create disk spools: {spool_files:?}"
+    );
+
+    ditch_session(&mut backend, &session_id)
+}
+
+#[test]
+fn embedded_rmux_large_restore_keeps_input_and_resize_progress() -> Result<()> {
+    run_embedded_helper("embedded_rmux_large_restore_keeps_input_and_resize_progress_helper")
+}
+
+#[test]
+fn embedded_rmux_large_restore_keeps_input_and_resize_progress_helper() -> Result<()> {
+    if std::env::var_os(HELPER_ENV).is_none() {
+        return Ok(());
+    }
+
+    let (mut backend, registry, session_id, window_id, pane) = create_embedded_session()?;
+    let mut producer = open_terminal(std::sync::Arc::clone(&registry), &pane, &window_id)?;
+    producer.write_input(b"yes RESTORE | head -c 2000000\r")?;
+    wait_for_terminal_text(&mut producer, "RESTORE")?;
+
+    let mut reader = open_terminal(registry, &pane, &window_id)?;
+    reader.resize_native_layout_window(100, 30)?;
+    reader.write_input(b"printf 'BOOTTY_RMUX_RESTORE_INPUT_RESIZE\n'\r")?;
+    wait_for_terminal_text(&mut reader, "BOOTTY_RMUX_RESTORE_INPUT_RESIZE")?;
+
+    ditch_session(&mut backend, &session_id)
+}
+
 fn run_embedded_helper(name: &str) -> Result<()> {
+    static HELPER_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = (std::env::var_os(HELPER_ENV).is_none()).then(|| {
+        HELPER_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("embedded RMUX helper lock")
+    });
     let directory = tempfile::tempdir()?;
     let status = std::process::Command::new(std::env::current_exe()?)
         .args(["--exact", name])

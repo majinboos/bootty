@@ -1,6 +1,6 @@
 use std::{hint::black_box, io::Cursor};
 
-use bootty_app::{
+use bootty_render::{
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface, ViewTransform},
     paint_plan::PaintPlanner,
     terminal_render::TerminalRenderFrame,

@@ -6,7 +6,7 @@ mod unix {
         path::{Path, PathBuf},
     };
 
-    use bootty_app::application_identity::ApplicationIdentity;
+    use bootty_identity::ApplicationIdentity;
     use bootty_mux::{SshTarget, command::MuxCommand, process::CommandRunner};
     use bootty_remote::ssh::SshRemote;
     use bootty_tmux::TmuxControlRunner;

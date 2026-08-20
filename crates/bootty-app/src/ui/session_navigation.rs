@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::mux::{controller::MuxScope, snapshot::MuxSession};
+use bootty_mux::{controller::MuxScope, snapshot::MuxSession};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ScopedSessionTarget {

@@ -2,6 +2,12 @@ use std::time::Instant;
 
 use anyhow::Result;
 use bootty_command::CommandInvocation;
+use bootty_config::{
+    config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig},
+    config_reload::ConfigHotReload,
+};
+use bootty_render::terminal_text::TerminalTextConfig;
+use bootty_winit::{direct_input::ModifierSideState, modifier_remap::ModifierRemapSet};
 use eframe::egui;
 
 use crate::terminal_config::{
@@ -11,16 +17,11 @@ use crate::{
     app_actions::{
         AppKeyBindings, SidebarKeyBindings, split_app_actions_for_bindings_with_modifier_sides,
     },
-    config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig},
-    config_reload::ConfigHotReload,
     diagnostics::{StabilityTrace, StabilityTraceSample},
-    direct_input::ModifierSideState,
     input::{
         InputSnapshot, TerminalInputCommand, WheelScrollState, resolve_modifier_remaps,
         terminal_input_commands_with_wheel_state,
     },
-    modifier_remap::ModifierRemapSet,
-    terminal_text::TerminalTextConfig,
 };
 use bootty_terminal::terminal_engine::TerminalLiveConfig;
 use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, MacosOptionAsAlt};

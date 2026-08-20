@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use crate::config::{BoottyConfig, MultiplexerBackendConfig, MultiplexerConfig, SshProfileConfig};
+use bootty_config::config::{
+    BoottyConfig, MultiplexerBackendConfig, MultiplexerConfig, SshProfileConfig,
+};
 use bootty_workspace::SpaceRemoteOverride;
 
 /// The binding value that the app hands to the mux controller.

@@ -3,9 +3,9 @@ use std::{fs, io, path::Path};
 use bootty_write::{CommitOutcome, NewFileMode, ResolveTargetError, WriteTarget};
 use toml_edit::{Array, DocumentMut, InlineTable, Value};
 
-use super::{
-    ConfigDocument, ConfigLoadError, ConfigResult, SegmentAlign, SshAuthenticationConfig,
-    SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment, load_or_create_config_document,
+use super::load::{ConfigDocument, ConfigLoadError, ConfigResult, load_or_create_config_document};
+use super::model::{
+    SegmentAlign, SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

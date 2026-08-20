@@ -4,17 +4,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_app::{
-    mux::controller::{BindingId, MuxScope, SpaceId},
-    ui::{
-        chrome::{SidebarEvent, SidebarModel, show_sidebar},
-        sidebar::build_sidebar_items_from_published_items,
-    },
+use bootty_app::ui::{
+    chrome::{SidebarEvent, SidebarModel, show_sidebar},
+    sidebar::build_sidebar_items_from_published_items,
 };
 use bootty_command::{
     AppCommandReceiver, AppCommandSender, Caller, app_command_channel as command_channel,
 };
 use bootty_extension::{ExtensionHost, ExtensionUiAction, SurfacePlacement, event_queue};
+use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
 use egui::{Event, PointerButton, Pos2, RawInput, Rect};
 
 fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {

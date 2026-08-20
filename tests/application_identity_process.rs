@@ -1,4 +1,4 @@
-use bootty_app::application_identity::{APPLICATION_IDENTITY_ENV, ApplicationIdentity};
+use bootty_identity::{APPLICATION_IDENTITY_ENV, ApplicationIdentity};
 
 #[test]
 fn development_identity_is_exported_for_local_child_processes() {

@@ -23,7 +23,7 @@ impl TerminalFrameSource for TerminalSession {
     }
 
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
-        Self::resize(self, geometry)
+        Self::queue_resize(self, geometry)
     }
 
     fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {

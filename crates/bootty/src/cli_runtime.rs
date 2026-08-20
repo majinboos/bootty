@@ -1,4 +1,4 @@
-use std::{fmt, io::Read};
+use std::io::Read;
 
 use anyhow::{Context, Result};
 use bootty_cli::Cli;
@@ -7,6 +7,7 @@ use bootty_command::{
     ValueType,
 };
 use bootty_control as control;
+use thiserror::Error;
 
 const EXIT_USAGE: u8 = 2;
 const EXIT_TRANSPORT: u8 = 4;
@@ -16,19 +17,12 @@ const EXIT_UNAVAILABLE: u8 = 7;
 const EXIT_STALE_TARGET: u8 = 8;
 const EXIT_COMMAND_FAILED: u8 = 9;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("{message}")]
 struct CliFailure {
     code: u8,
     message: String,
 }
-
-impl fmt::Display for CliFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CliFailure {}
 
 pub(crate) fn exit_code(error: &anyhow::Error) -> u8 {
     error

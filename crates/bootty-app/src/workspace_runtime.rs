@@ -6,7 +6,22 @@ use std::{
 };
 
 use anyhow::Result;
-use bootty_config::config::MultiplexerBackendConfig;
+use bootty_config::config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig};
+use bootty_mux::{
+    RepaintHandle,
+    command::MuxCommand,
+    controller::{
+        MuxCommandError, MuxCommandResult, MuxController, MuxScope, SpaceId,
+        mux_session_refresh_interval,
+    },
+    membership::BackendMembership,
+    provider::{
+        MuxAppBackendPolicy, MuxBackendRegistry, MuxCommandDispatch, PaneTopology,
+        PersistedSessionPolicy, SelectionPublicationPolicy, TerminalResidency,
+    },
+    snapshot::MuxSession,
+    terminal::ActiveTerminal,
+};
 use bootty_runtime::terminal_session::DrainStats;
 use bootty_terminal::terminal_engine::{TerminalLiveConfig, TerminalSideEffectEvent};
 
@@ -16,6 +31,7 @@ mod binding_terminal_facts;
 mod binding_windows;
 mod mux_config;
 mod remote_reconnect;
+mod space_summary;
 mod workspace_sessions;
 
 use self::{
@@ -26,27 +42,12 @@ use self::{
 pub(crate) use binding_panes::mux_split_direction;
 pub(crate) use binding_session_names::RenameSessionOutcome;
 pub(crate) use binding_terminal_facts::{TerminalProgress, TerminalProgressState};
+pub(crate) use binding_windows::terminal_cwd_for_mux_command;
+pub(crate) use space_summary::SpaceSummary;
 
 use crate::{
-    config::{AppearanceVariant, BoottyConfig},
     layout::{PaneLayout, SplitDirection},
-    mux::{
-        RepaintHandle,
-        command::MuxCommand,
-        controller::{
-            MuxCommandError, MuxCommandResult, MuxController, MuxScope, SpaceId,
-            mux_session_refresh_interval,
-        },
-        membership::BackendMembership,
-        provider::{
-            MuxAppBackendPolicy, MuxBackendRegistry, MuxCommandDispatch, PaneTopology,
-            PersistedSessionPolicy, SelectionPublicationPolicy, TerminalResidency,
-        },
-        snapshot::MuxSession,
-        terminal::ActiveTerminal,
-    },
     renderer::TerminalWidget,
-    state::SpaceSummary,
     terminal_config::terminal_session_config_with_side_effects,
 };
 use bootty_workspace::{
@@ -209,7 +210,7 @@ pub(super) struct BindingRuntime {
     pub(super) label: String,
     placement: SpaceMuxOverride,
     reconnect: BindingReconnect,
-    pub(super) multiplexer: crate::config::MultiplexerConfig,
+    pub(super) multiplexer: bootty_config::config::MultiplexerConfig,
     pub(super) terminal: Box<ActiveTerminal>,
     pub(super) mux: MuxController,
     pub(super) session_order: SessionOrderStore,
@@ -392,7 +393,7 @@ impl BindingRuntime {
             .persisted_sessions(&self.session_order.session_names())
         {
             self.mux.create_project_session(
-                crate::mux::controller::NewMuxSessionRequest {
+                bootty_mux::controller::NewMuxSessionRequest {
                     session_id: session_id.clone(),
                     cwd,
                 },
@@ -608,7 +609,10 @@ impl SpaceTransition {
     }
 }
 
-fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig) -> String {
+fn binding_label(
+    scope: MuxScope,
+    multiplexer: &bootty_config::config::MultiplexerConfig,
+) -> String {
     format!(
         "{} / Binding {}",
         multiplexer.backend,

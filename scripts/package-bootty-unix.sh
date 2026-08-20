@@ -25,7 +25,6 @@ CARGO_PROFILE_ARGS=(--release)
 FAST=0
 LINKAGE="dynamic"
 DEV=0
-CARGO_FEATURE_ARGS=()
 while (($#)); do
   case "$1" in
     --fast)
@@ -48,7 +47,6 @@ if [[ "$DEV" -eq 1 ]]; then
   APP_NAME="BoottyDev"
   CLI_NAME="bootty-dev"
   BUNDLE_IDENTIFIER="dev.bootty.desktop.dev"
-  CARGO_FEATURE_ARGS=(--features bootty-dev)
 fi
 if [[ "$FAST" -eq 1 ]]; then
   PROFILE="fast-release"
@@ -56,6 +54,10 @@ if [[ "$FAST" -eq 1 ]]; then
 elif [[ "$LINKAGE" == "dynamic" ]]; then
   PROFILE="dynamic-release"
   CARGO_PROFILE_ARGS=(--profile dynamic-release)
+fi
+CARGO_BUILD_ARGS=("${CARGO_PROFILE_ARGS[@]}")
+if [[ "$DEV" -eq 1 ]]; then
+  CARGO_BUILD_ARGS+=(--features bootty-dev)
 fi
 
 VERSION="${VERSION:-0.0.0}"
@@ -197,7 +199,7 @@ fi
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-cargo build "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
+cargo build "${CARGO_BUILD_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
 
 case "$(uname -s)" in
   Darwin)

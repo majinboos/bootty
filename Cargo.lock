@@ -678,11 +678,14 @@ dependencies = [
  "bootty-app",
  "bootty-cli",
  "bootty-command",
+ "bootty-config",
  "bootty-control",
  "bootty-extension",
+ "bootty-identity",
  "bootty-mux",
  "bootty-native",
  "bootty-remote",
+ "bootty-render",
  "bootty-rmux",
  "bootty-tmux",
  "bootty-workspace-hack",
@@ -692,6 +695,7 @@ dependencies = [
  "embed-resource",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -722,7 +726,6 @@ dependencies = [
  "criterion",
  "eframe",
  "egui",
- "fontdb",
  "iconflow",
  "keepawake",
  "libghostty-vt",
@@ -733,7 +736,7 @@ dependencies = [
  "serde_json",
  "strum",
  "tempfile",
- "ttf-parser",
+ "thiserror 2.0.20",
  "wgpu",
  "winit",
 ]
@@ -776,6 +779,7 @@ dependencies = [
  "rstest",
  "serde",
  "tempfile",
+ "thiserror 2.0.20",
  "toml_edit 0.25.13+spec-1.1.0",
 ]
 
@@ -810,10 +814,12 @@ dependencies = [
  "bootty-rmux",
  "bootty-tmux",
  "bootty-zellij",
+ "rmux-server",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -845,6 +851,7 @@ name = "bootty-identity"
 version = "0.0.0"
 dependencies = [
  "bootty-workspace-hack",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -864,6 +871,7 @@ dependencies = [
  "serde_json",
  "strum",
  "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -874,6 +882,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1006,6 +1015,7 @@ dependencies = [
  "bootty-app",
  "bootty-command",
  "bootty-config",
+ "bootty-identity",
  "bootty-mux",
  "bootty-rmux",
  "bootty-workspace-hack",
@@ -1052,6 +1062,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "pollster 0.4.0",
+ "thiserror 2.0.20",
  "wgpu",
  "winit",
 ]
@@ -1067,6 +1078,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1147,7 +1159,6 @@ dependencies = [
  "toml_writer",
  "tracing",
  "tracing-core",
- "ttf-parser",
  "typenum",
  "ureq",
  "uuid",

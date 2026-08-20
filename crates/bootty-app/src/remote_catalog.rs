@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
-use crate::config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig};
 use anyhow::{Result, bail};
+use bootty_config::config::{
+    BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig,
+};
 pub use bootty_mux::RemoteSpaceSummary;
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     sync::{OnceLock, mpsc},
     thread,
@@ -19,6 +20,11 @@ use crate::bridge::connect_bootty_rmux;
 
 const RMUX_OUTPUT_POLL_MIN_DELAY: Duration = Duration::from_millis(1);
 const RMUX_OUTPUT_POLL_MAX_DELAY: Duration = Duration::from_millis(16);
+pub(crate) const RMUX_OUTPUT_CHANNEL_CAPACITY: usize = 64;
+const RMUX_OUTPUT_EVENT_MAX_BYTES: usize = 16 * 1024;
+const RMUX_RESTORE_RAW_CHUNK_BYTES: usize = RMUX_OUTPUT_EVENT_MAX_BYTES / 2;
+const RMUX_OUTPUT_BACKLOG_MAX_BYTES: usize =
+    RMUX_OUTPUT_CHANNEL_CAPACITY * RMUX_OUTPUT_EVENT_MAX_BYTES;
 const RMUX_RESTORE_CAPTURE_TIMEOUT: Duration = Duration::from_millis(500);
 const RMUX_KEYBOARD_PROTOCOL_SCAN_TAIL_BYTES: usize = 64;
 const RMUX_KEYBOARD_PROTOCOL_OPTION: &str = "@bootty-keyboard-protocol";
@@ -64,17 +70,16 @@ impl RmuxPaneTarget {
 }
 
 pub(crate) enum RmuxPaneEvent {
-    Restore {
-        buffered_chunks: Vec<PaneOutputChunk>,
-        capture: Vec<u8>,
-    },
+    RestoreStart,
+    RestoreChunk(Vec<u8>),
+    RestoreEnd { has_capture: bool },
     Chunks(Vec<PaneOutputChunk>),
     KeyboardProtocol(Vec<u8>),
     Error(String),
 }
 
 pub(crate) struct RmuxPaneIo {
-    pub(crate) output_rx: mpsc::Receiver<RmuxPaneEvent>,
+    pub(crate) output_rx: tokio_mpsc::Receiver<RmuxPaneEvent>,
     pub(crate) input_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
     pub(crate) resize_tx: tokio_mpsc::UnboundedSender<TerminalSizeSpec>,
     pub(crate) result_rx: mpsc::Receiver<std::result::Result<(), String>>,
@@ -83,7 +88,7 @@ pub(crate) struct RmuxPaneIo {
 struct RmuxOpenPaneRequest {
     target: RmuxPaneTarget,
     max_scrollback: usize,
-    output_tx: mpsc::Sender<RmuxPaneEvent>,
+    output_tx: tokio_mpsc::Sender<RmuxPaneEvent>,
     input_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     resize_rx: tokio_mpsc::UnboundedReceiver<TerminalSizeSpec>,
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
@@ -118,7 +123,9 @@ pub(crate) fn open_rmux_pane_io(
     target: RmuxPaneTarget,
     max_scrollback: usize,
 ) -> Result<RmuxPaneIo> {
-    let (output_tx, output_rx) = mpsc::channel();
+    // One slot carries at most 16 KiB. A full queue makes the producer await
+    // the reader. The rmux stream then applies its own bounded lag policy.
+    let (output_tx, output_rx) = tokio_mpsc::channel(RMUX_OUTPUT_CHANNEL_CAPACITY);
     let (input_tx, input_rx) = tokio_mpsc::unbounded_channel();
     let (resize_tx, resize_rx) = tokio_mpsc::unbounded_channel();
     let (result_tx, result_rx) = mpsc::channel();
@@ -173,7 +180,7 @@ fn run_pane_worker(request_rx: mpsc::Receiver<RmuxOpenPaneRequest>) {
 async fn run_pane_io(
     target: RmuxPaneTarget,
     max_scrollback: usize,
-    output_tx: mpsc::Sender<RmuxPaneEvent>,
+    output_tx: tokio_mpsc::Sender<RmuxPaneEvent>,
     mut input_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     mut resize_rx: tokio_mpsc::UnboundedReceiver<TerminalSizeSpec>,
     result_tx: mpsc::Sender<std::result::Result<(), String>>,
@@ -190,15 +197,11 @@ async fn run_pane_io(
     if let Err(error) = result {
         let text = error.to_string();
         let _ = result_tx.send(Err(text.clone()));
-        let _ = output_tx.send(RmuxPaneEvent::Error(text));
+        let _ = output_tx.send(RmuxPaneEvent::Error(text)).await;
     }
 }
 
-async fn replay_retained_terminal_protocol(
-    pane: &Pane,
-    output_tx: &mpsc::Sender<RmuxPaneEvent>,
-    mouse_modes: &[u16],
-) -> Result<()> {
+async fn replay_retained_terminal_protocol(pane: &Pane, mouse_modes: &[u16]) -> Result<Vec<u8>> {
     let mut output_stream = pane
         .output_stream_starting_at(PaneOutputStart::Oldest)
         .await?;
@@ -242,10 +245,7 @@ async fn replay_retained_terminal_protocol(
         bracketed_paste.unwrap_or(false),
         mouse_modes,
     );
-    if !protocol.is_empty() {
-        let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(protocol));
-    }
-    Ok(())
+    Ok(protocol)
 }
 
 fn kitty_keyboard_protocol_flags(sequence: &[u8]) -> Option<String> {
@@ -397,17 +397,183 @@ fn kitty_keyboard_protocol_query(bytes: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn send_restored_output(
-    capture: Option<Vec<u8>>,
-    output_tx: &mpsc::Sender<RmuxPaneEvent>,
-    buffered_chunks: &mut Vec<PaneOutputChunk>,
+fn pane_output_chunk_bytes(chunk: &PaneOutputChunk) -> usize {
+    match chunk {
+        PaneOutputChunk::Bytes { bytes, .. } => bytes.len(),
+        PaneOutputChunk::Lag(lag) => lag.recent.bytes.len(),
+        _ => 0,
+    }
+}
+
+fn event_bytes(event: &RmuxPaneEvent) -> usize {
+    match event {
+        RmuxPaneEvent::RestoreChunk(bytes) | RmuxPaneEvent::KeyboardProtocol(bytes) => bytes.len(),
+        RmuxPaneEvent::Chunks(chunks) => chunks.iter().map(pane_output_chunk_bytes).sum(),
+        RmuxPaneEvent::Error(error) => error.len(),
+        RmuxPaneEvent::RestoreStart | RmuxPaneEvent::RestoreEnd { .. } => 0,
+    }
+}
+
+fn queue_event(
+    pending: &mut VecDeque<RmuxPaneEvent>,
+    pending_bytes: &mut usize,
+    event: RmuxPaneEvent,
 ) -> bool {
-    output_tx
-        .send(RmuxPaneEvent::Restore {
-            buffered_chunks: std::mem::take(buffered_chunks),
-            capture: capture.unwrap_or_default(),
-        })
-        .is_ok()
+    let bytes = event_bytes(&event);
+    if bytes > RMUX_OUTPUT_EVENT_MAX_BYTES
+        || pending_bytes.saturating_add(bytes) > RMUX_OUTPUT_BACKLOG_MAX_BYTES
+    {
+        return false;
+    }
+    pending.push_back(event);
+    *pending_bytes = pending_bytes.saturating_add(bytes);
+    true
+}
+
+async fn send_next_event(
+    output_tx: &tokio_mpsc::Sender<RmuxPaneEvent>,
+    pending: &mut VecDeque<RmuxPaneEvent>,
+    pending_bytes: &mut usize,
+) -> bool {
+    let permit = match output_tx.reserve().await {
+        Ok(permit) => permit,
+        Err(_) => return false,
+    };
+    let event = pending
+        .pop_front()
+        .expect("send_next_event runs only while pending output is non-empty");
+    *pending_bytes = pending_bytes.saturating_sub(event_bytes(&event));
+    permit.send(event);
+    true
+}
+
+struct RestoreOutput {
+    capture: Option<Vec<u8>>,
+    capture_offset: usize,
+    capture_previous: Option<u8>,
+    buffered_chunks: VecDeque<PaneOutputChunk>,
+    started: bool,
+    ended: bool,
+    has_capture: bool,
+}
+
+impl RestoreOutput {
+    fn new(capture: Option<Vec<u8>>, buffered_chunks: VecDeque<PaneOutputChunk>) -> Self {
+        let has_capture = capture.as_ref().is_some_and(|capture| !capture.is_empty());
+        Self {
+            capture,
+            capture_offset: 0,
+            capture_previous: None,
+            buffered_chunks,
+            started: false,
+            ended: false,
+            has_capture,
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.ended && self.buffered_chunks.is_empty()
+    }
+
+    fn enqueue(&mut self, pending: &mut VecDeque<RmuxPaneEvent>, pending_bytes: &mut usize) {
+        if !self.started {
+            if queue_event(pending, pending_bytes, RmuxPaneEvent::RestoreStart) {
+                self.started = true;
+            }
+            return;
+        }
+
+        if let Some(capture) = self.capture.as_ref() {
+            if self.capture_offset < capture.len() {
+                let end = (self.capture_offset + RMUX_RESTORE_RAW_CHUNK_BYTES).min(capture.len());
+                let mut previous = self.capture_previous;
+                let bytes =
+                    normalize_capture_chunk(&capture[self.capture_offset..end], &mut previous);
+                if queue_event(pending, pending_bytes, RmuxPaneEvent::RestoreChunk(bytes)) {
+                    self.capture_previous = previous;
+                    self.capture_offset = end;
+                }
+                return;
+            }
+            self.capture = None;
+        }
+
+        if !self.ended {
+            if queue_event(
+                pending,
+                pending_bytes,
+                RmuxPaneEvent::RestoreEnd {
+                    has_capture: self.has_capture,
+                },
+            ) {
+                self.ended = true;
+            }
+            return;
+        }
+
+        queue_live_chunks(
+            pending,
+            pending_bytes,
+            &mut self.buffered_chunks,
+            &mut 0usize,
+        );
+    }
+}
+
+fn normalize_capture_chunk(bytes: &[u8], previous: &mut Option<u8>) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        if *byte == b'\n' && *previous != Some(b'\r') {
+            normalized.push(b'\r');
+        }
+        normalized.push(*byte);
+        *previous = Some(*byte);
+    }
+    normalized
+}
+
+fn queue_live_chunks(
+    pending: &mut VecDeque<RmuxPaneEvent>,
+    pending_bytes: &mut usize,
+    chunks: &mut VecDeque<PaneOutputChunk>,
+    deferred_bytes: &mut usize,
+) {
+    loop {
+        let Some(chunk) = chunks.front_mut() else {
+            return;
+        };
+        let (sequence, bytes) = match chunk {
+            PaneOutputChunk::Bytes { sequence, bytes } => (*sequence, bytes),
+            PaneOutputChunk::Lag(lag) if !lag.recent.bytes.is_empty() => {
+                (lag.resume_sequence, &mut lag.recent.bytes)
+            }
+            _ => {
+                chunks.pop_front();
+                continue;
+            }
+        };
+        let length = bytes.len().min(RMUX_OUTPUT_EVENT_MAX_BYTES);
+        if pending_bytes.saturating_add(length) > RMUX_OUTPUT_BACKLOG_MAX_BYTES {
+            return;
+        }
+        let remainder = bytes.split_off(length);
+        let chunk_bytes = std::mem::replace(bytes, remainder);
+        let chunk_len = chunk_bytes.len();
+        if !queue_event(
+            pending,
+            pending_bytes,
+            RmuxPaneEvent::Chunks(vec![PaneOutputChunk::Bytes {
+                sequence,
+                bytes: chunk_bytes,
+            }]),
+        ) {
+            return;
+        }
+        *deferred_bytes = deferred_bytes.saturating_sub(chunk_len);
+        if pane_output_chunk_bytes(chunks.front().unwrap()) == 0 {
+            chunks.pop_front();
+        }
+    }
 }
 
 async fn pane_input_target(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<PaneTarget> {
@@ -436,7 +602,7 @@ async fn pane_input_target(rmux: &Rmux, target: &RmuxPaneTarget) -> Result<PaneT
 async fn run_pane_io_inner(
     target: RmuxPaneTarget,
     max_scrollback: usize,
-    output_tx: &mpsc::Sender<RmuxPaneEvent>,
+    output_tx: &tokio_mpsc::Sender<RmuxPaneEvent>,
     input_rx: &mut tokio_mpsc::UnboundedReceiver<Vec<u8>>,
     resize_rx: &mut tokio_mpsc::UnboundedReceiver<TerminalSizeSpec>,
     result_tx: &mpsc::Sender<std::result::Result<(), String>>,
@@ -450,6 +616,8 @@ async fn run_pane_io_inner(
         .await
         .ok()
         .flatten();
+    let mut pending_output = VecDeque::new();
+    let mut pending_output_bytes = 0;
     if let Some(flags) = &keyboard_protocol {
         let bracketed_paste = pane
             .option(RMUX_BRACKETED_PASTE_OPTION)
@@ -464,32 +632,84 @@ async fn run_pane_io_inner(
             &mouse_modes,
         );
         if !protocol.is_empty() {
-            let _ = output_tx.send(RmuxPaneEvent::KeyboardProtocol(protocol));
+            queue_event(
+                &mut pending_output,
+                &mut pending_output_bytes,
+                RmuxPaneEvent::KeyboardProtocol(protocol),
+            );
         }
     } else {
-        replay_retained_terminal_protocol(&pane, output_tx, &mouse_modes).await?;
+        let protocol = replay_retained_terminal_protocol(&pane, &mouse_modes).await?;
+        if !protocol.is_empty() {
+            queue_event(
+                &mut pending_output,
+                &mut pending_output_bytes,
+                RmuxPaneEvent::KeyboardProtocol(protocol),
+            );
+        }
     }
     let input_target = pane_input_target(&rmux, &target).await?;
     let mut live_output = pane.output_stream().await?;
     let mut restore_rx = start_restore_capture(target.clone(), max_scrollback);
-    let mut restore_pending = true;
-    let mut buffered_chunks = Vec::new();
+    let mut restore_result = None;
+    let mut restore_received = false;
+    let mut restore_output: Option<RestoreOutput> = None;
+    let mut restore_complete = false;
+    let mut deferred_live_chunks = VecDeque::new();
+    let mut deferred_live_bytes = 0;
     let mut output_poll_delay = RMUX_OUTPUT_POLL_MIN_DELAY;
     let mut terminal_protocol_tail = Vec::new();
 
     loop {
-        tokio::select! {
-            restore = &mut restore_rx, if restore_pending => {
-                restore_pending = false;
-                if !send_restored_output(
-                    restore.ok().flatten(),
-                    output_tx,
-                    &mut buffered_chunks,
-                ) {
+        if let Some(restore) = restore_output.as_mut() {
+            while pending_output_bytes < RMUX_OUTPUT_BACKLOG_MAX_BYTES && !restore.is_complete() {
+                let before = pending_output.len();
+                restore.enqueue(&mut pending_output, &mut pending_output_bytes);
+                if pending_output.len() == before {
                     break;
                 }
             }
-            _ = tokio::time::sleep(output_poll_delay) => {
+            if restore.is_complete() {
+                restore_output = None;
+                restore_complete = true;
+            }
+        }
+        if restore_received
+            && restore_result.is_some()
+            && restore_output.is_none()
+            && !restore_complete
+        {
+            deferred_live_bytes = 0;
+            restore_output = restore_result.take().map(|capture| {
+                RestoreOutput::new(capture, std::mem::take(&mut deferred_live_chunks))
+            });
+        }
+        if restore_complete && !deferred_live_chunks.is_empty() {
+            queue_live_chunks(
+                &mut pending_output,
+                &mut pending_output_bytes,
+                &mut deferred_live_chunks,
+                &mut deferred_live_bytes,
+            );
+        }
+        let can_poll_live = pending_output_bytes < RMUX_OUTPUT_BACKLOG_MAX_BYTES
+            && if restore_complete {
+                restore_output.is_none() && deferred_live_chunks.is_empty()
+            } else {
+                deferred_live_bytes < RMUX_OUTPUT_BACKLOG_MAX_BYTES
+            };
+
+        tokio::select! {
+            sent = send_next_event(output_tx, &mut pending_output, &mut pending_output_bytes), if !pending_output.is_empty() => {
+                if !sent {
+                    break;
+                }
+            }
+            restore = &mut restore_rx, if !restore_received => {
+                restore_received = true;
+                restore_result = Some(restore.ok().flatten());
+            }
+            _ = tokio::time::sleep(output_poll_delay), if can_poll_live => {
                 let chunks = live_output.poll_once().await?;
                 if chunks.is_empty() {
                     output_poll_delay = (output_poll_delay * 2).min(RMUX_OUTPUT_POLL_MAX_DELAY);
@@ -523,23 +743,15 @@ async fn run_pane_io_inner(
                             }
                         }
                     }
-                    if restore_pending {
-                        buffered_chunks.extend(chunks);
-                    } else if output_tx.send(RmuxPaneEvent::Chunks(chunks)).is_err() {
-                        break;
-                    }
+                    deferred_live_bytes = deferred_live_bytes.saturating_add(
+                        chunks.iter().map(pane_output_chunk_bytes).sum::<usize>(),
+                    );
+                    deferred_live_chunks.extend(chunks);
                 }
             }
             Some(mut bytes) = input_rx.recv() => {
                 while let Ok(next) = input_rx.try_recv() {
                     bytes.extend_from_slice(&next);
-                }
-                if restore_pending {
-                    restore_pending = false;
-                    let capture = (&mut restore_rx).await.ok().flatten();
-                    if !send_restored_output(capture, output_tx, &mut buffered_chunks) {
-                        break;
-                    }
                 }
                 let result = send_rmux_pane_input(&pane, &input_target, &bytes)
                     .await

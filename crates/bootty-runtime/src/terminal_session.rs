@@ -4,8 +4,8 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, Sender, SyncSender},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -46,6 +46,11 @@ pub(crate) const WORKER_FLOOD_BACKLOG_BYTES: usize = 256 * 1024;
 pub(crate) const WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_SETTLED_FRAME_DELAY: Duration = Duration::from_millis(16);
 pub(crate) const SYNC_OUTPUT_MAX_SUPPRESS: Duration = Duration::from_secs(1);
+const WORKER_RESPONSE_TIMEOUT: Duration = Duration::from_millis(50);
+const WORKER_RESPONSE_COMPLETION_TIMEOUT: Duration = Duration::from_millis(100);
+const REQUEST_PENDING: u8 = 0;
+const REQUEST_RUNNING: u8 = 1;
+const REQUEST_CANCELLED: u8 = 2;
 
 #[derive(Clone, Debug, Default)]
 pub struct TerminalSessionConfig {
@@ -234,13 +239,102 @@ type MouseTrackingResponse = std::result::Result<bool, String>;
 type SearchViewportResponse = std::result::Result<bool, String>;
 type CopyModeActiveResponse = std::result::Result<bool, String>;
 type CopyModeActionResponse = std::result::Result<TerminalCopyModeOutcome, String>;
+
+/// Worker-side half of a single-response request, claimed with [`WorkerRequest::try_claim`] before
+/// the work runs so a caller that already timed out is not served.
+pub struct WorkerRequest<T> {
+    state: Arc<AtomicU8>,
+    sender: Sender<T>,
+}
+
+/// Caller-side half of a single-response request.
+pub struct PendingWorkerResponse<T> {
+    state: Arc<AtomicU8>,
+    receiver: Receiver<T>,
+}
+
+/// Creates a request/response pair for one worker round trip.
+pub fn worker_request<T>() -> (WorkerRequest<T>, PendingWorkerResponse<T>) {
+    let state = Arc::new(AtomicU8::new(REQUEST_PENDING));
+    let (sender, receiver) = mpsc::channel();
+    (
+        WorkerRequest {
+            state: Arc::clone(&state),
+            sender,
+        },
+        PendingWorkerResponse { state, receiver },
+    )
+}
+
+impl<T> WorkerRequest<T> {
+    /// Takes ownership of the request. Returns `false` when the caller already gave up.
+    pub fn try_claim(&self) -> bool {
+        self.state
+            .compare_exchange(
+                REQUEST_PENDING,
+                REQUEST_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Delivers the response to the waiting caller.
+    pub fn send(self, response: T) {
+        if self.state.load(Ordering::Acquire) == REQUEST_RUNNING {
+            let _ = self.sender.send(response);
+        }
+    }
+}
+
+impl<T> PendingWorkerResponse<T> {
+    /// Waits for the worker response, naming `operation` in any error.
+    pub fn receive(self, operation: &'static str) -> Result<T> {
+        match self.receiver.recv_timeout(WORKER_RESPONSE_TIMEOUT) {
+            Ok(response) => Ok(response),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                "terminal worker stopped before {operation}"
+            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if self
+                    .state
+                    .compare_exchange(
+                        REQUEST_PENDING,
+                        REQUEST_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Err(anyhow::anyhow!(
+                        "terminal worker timed out before {operation}"
+                    ));
+                }
+
+                match self
+                    .receiver
+                    .recv_timeout(WORKER_RESPONSE_COMPLETION_TIMEOUT)
+                {
+                    Ok(response) => Ok(response),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
+                        "terminal worker stopped before {operation}"
+                    )),
+                    Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+                        "terminal worker completion unknown after {operation}; the operation may have completed"
+                    )),
+                }
+            }
+        }
+    }
+}
+
 enum TerminalCommand {
     DisplayScale(f32),
     RenderCellMetrics(CellMetrics),
     ApplyLiveConfig(TerminalLiveConfig),
     Resize {
         geometry: TerminalGeometry,
-        done: SyncSender<()>,
+        done: Option<WorkerRequest<()>>,
     },
     Key(KeyInput),
     Focus(bool),
@@ -260,20 +354,20 @@ enum TerminalCommand {
     SelectionEnd(Option<TerminalSelectionEvent>),
     FormatSelection {
         format: TerminalSelectionFormat,
-        done: SyncSender<SelectionFormatResponse>,
+        done: WorkerRequest<SelectionFormatResponse>,
     },
-    CopyModeActive(SyncSender<CopyModeActiveResponse>),
+    CopyModeActive(WorkerRequest<CopyModeActiveResponse>),
     CopyModeAction {
         action: TerminalCopyModeAction,
-        done: SyncSender<CopyModeActionResponse>,
+        done: WorkerRequest<CopyModeActionResponse>,
     },
     SearchViewport {
         query: String,
         direction: TerminalSearchDirection,
-        done: SyncSender<SearchViewportResponse>,
+        done: WorkerRequest<SearchViewportResponse>,
     },
-    IsMouseTracking(SyncSender<MouseTrackingResponse>),
-    DiscardPendingOutput(SyncSender<()>),
+    IsMouseTracking(WorkerRequest<MouseTrackingResponse>),
+    DiscardPendingOutput(WorkerRequest<()>),
 }
 impl TerminalSession {
     pub fn new(geometry: TerminalGeometry) -> Result<Self> {
@@ -361,17 +455,28 @@ impl TerminalSession {
             return Ok(());
         }
 
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let (done, response) = worker_request();
         self.send_command(TerminalCommand::Resize {
             geometry,
-            done: done_tx,
+            done: Some(done),
         })?;
-        done_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("terminal worker stopped before resizing"))?;
+        response.receive("resizing")?;
         self.check_worker_error()?;
         self.geometry = geometry;
 
+        Ok(())
+    }
+
+    /// Queue a resize without waiting for the worker to publish it.
+    pub fn queue_resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        if geometry == self.geometry {
+            return Ok(());
+        }
+        self.send_command(TerminalCommand::Resize {
+            geometry,
+            done: None,
+        })?;
+        self.geometry = geometry;
         Ok(())
     }
 
@@ -461,11 +566,10 @@ impl TerminalSession {
     }
 
     pub fn copy_mode_active(&mut self) -> Result<bool> {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        self.send_command(TerminalCommand::CopyModeActive(done_tx))?;
-        done_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("terminal worker stopped before reporting copy mode"))?
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::CopyModeActive(done))?;
+        response
+            .receive("reporting copy mode")?
             .map_err(anyhow::Error::msg)
     }
 
@@ -473,16 +577,10 @@ impl TerminalSession {
         &mut self,
         action: TerminalCopyModeAction,
     ) -> Result<TerminalCopyModeOutcome> {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        self.send_command(TerminalCommand::CopyModeAction {
-            action,
-            done: done_tx,
-        })?;
-        done_rx
-            .recv()
-            .map_err(|_| {
-                anyhow::anyhow!("terminal worker stopped before handling copy mode action")
-            })?
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::CopyModeAction { action, done })?;
+        response
+            .receive("handling copy mode action")?
             .map_err(anyhow::Error::msg)
     }
 
@@ -499,14 +597,10 @@ impl TerminalSession {
     }
 
     pub fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        self.send_command(TerminalCommand::FormatSelection {
-            format,
-            done: done_tx,
-        })?;
-        done_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("terminal worker stopped before formatting selection"))?
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::FormatSelection { format, done })?;
+        response
+            .receive("formatting selection")?
             .map_err(anyhow::Error::msg)
     }
 
@@ -515,26 +609,22 @@ impl TerminalSession {
         query: &str,
         direction: TerminalSearchDirection,
     ) -> Result<bool> {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let (done, response) = worker_request();
         self.send_command(TerminalCommand::SearchViewport {
             query: query.to_owned(),
             direction,
-            done: done_tx,
+            done,
         })?;
-        done_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("terminal worker stopped before searching scrollback"))?
+        response
+            .receive("searching scrollback")?
             .map_err(anyhow::Error::msg)
     }
 
     pub fn is_mouse_tracking(&mut self) -> Result<bool> {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        self.send_command(TerminalCommand::IsMouseTracking(done_tx))?;
-        done_rx
-            .recv()
-            .map_err(|_| {
-                anyhow::anyhow!("terminal worker stopped before reporting mouse tracking")
-            })?
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::IsMouseTracking(done))?;
+        response
+            .receive("reporting mouse tracking")?
             .map_err(anyhow::Error::msg)
     }
 
@@ -546,11 +636,9 @@ impl TerminalSession {
     }
 
     pub fn discard_pending_output(&mut self) -> Result<()> {
-        let (done_tx, done_rx) = mpsc::sync_channel(0);
-        self.send_command(TerminalCommand::DiscardPendingOutput(done_tx))?;
-        done_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("terminal worker stopped before discarding output"))
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::DiscardPendingOutput(done))?;
+        response.receive("discarding output")
     }
 
     pub fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
@@ -681,7 +769,7 @@ struct TerminalWorker {
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     command_rx: Receiver<TerminalCommand>,
     pending_command: Option<TerminalCommand>,
-    pending_resize_ack: Option<SyncSender<()>>,
+    pending_resize_ack: Option<WorkerRequest<()>>,
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
@@ -822,14 +910,21 @@ impl TerminalWorker {
                     stats.terminal_changed = true;
                 }
                 TerminalCommand::Resize { geometry, done } => {
+                    if let Some(done) = done.as_ref()
+                        && !done.try_claim()
+                    {
+                        continue;
+                    }
                     let result = self.resize(geometry);
                     if let Err(error) = result {
                         self.worker_health
                             .record(TerminalWorkerOperation::Resize, error);
-                        let _ = done.send(());
+                        if let Some(done) = done {
+                            done.send(());
+                        }
                     } else {
                         stats.terminal_changed = true;
-                        self.pending_resize_ack = Some(done);
+                        self.pending_resize_ack = done;
                     }
                 }
                 TerminalCommand::ApplyLiveConfig(config) => {
@@ -911,8 +1006,11 @@ impl TerminalWorker {
                     }
                 }
                 TerminalCommand::DiscardPendingOutput(done) => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     self.discard_pending_output_queue();
-                    let _ = done.send(());
+                    done.send(());
                 }
                 TerminalCommand::RawInput(bytes) => {
                     self.mark_input_fast_path();
@@ -962,29 +1060,40 @@ impl TerminalWorker {
                     }
                 }
                 TerminalCommand::FormatSelection { format, done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     let response = self
                         .engine
                         .format_selection(format)
                         .map_err(|error| error.to_string());
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 TerminalCommand::CopyModeActive(done) => {
-                    let _ = done.send(Ok(self.engine.copy_mode_active()));
+                    if done.try_claim() {
+                        done.send(Ok(self.engine.copy_mode_active()));
+                    }
                 }
                 TerminalCommand::CopyModeAction { action, done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     self.mark_input_fast_path();
                     let response = self
                         .engine
                         .handle_copy_mode_action(action)
                         .map_err(|error| error.to_string());
                     stats.terminal_changed = true;
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 TerminalCommand::SearchViewport {
                     query,
                     direction,
                     done,
                 } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     let response = search_and_publish_frame(
                         &mut self.engine,
                         &self.latest_frame,
@@ -997,14 +1106,17 @@ impl TerminalWorker {
                         self.has_unpublished_frame = false;
                         (self.repaint_wakeup)();
                     }
-                    let _ = done.send(response);
+                    done.send(response);
                 }
                 TerminalCommand::IsMouseTracking(done) => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     let response = self
                         .engine
                         .is_mouse_tracking()
                         .map_err(|error| error.to_string());
-                    let _ = done.send(response);
+                    done.send(response);
                 }
             }
         }
@@ -1250,7 +1362,7 @@ impl TerminalWorker {
 
     fn acknowledge_resize(&mut self) {
         if let Some(done) = self.pending_resize_ack.take() {
-            let _ = done.send(());
+            done.send(());
         }
     }
 

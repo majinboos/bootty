@@ -3,10 +3,11 @@
 use std::{process::ExitCode, sync::Arc};
 
 use anyhow::Result;
-use bootty_app::{application_identity::ApplicationIdentity, remote_catalog};
+use bootty_app::remote_catalog;
 use bootty_cli::{Cli, Command, EventCommand, RemoteSpaceCommand, TaskCommand, UpdateResult};
 use bootty_command::{Caller, CommandInvocation};
 use bootty_control as control;
+use bootty_identity::ApplicationIdentity;
 use clap::Parser;
 
 mod cli_runtime;

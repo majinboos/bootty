@@ -1,7 +1,54 @@
 use super::BindingRuntime;
-use crate::state::terminal_cwd_for_mux_command;
 
-use crate::mux::{RepaintHandle, command::MuxCommand};
+use bootty_mux::{RepaintHandle, command::MuxCommand};
+
+pub(crate) fn terminal_cwd_for_mux_command(
+    live_terminal_cwd: Option<String>,
+    anchor_cwd: Option<String>,
+) -> Option<String> {
+    live_terminal_cwd
+        .and_then(|cwd| normalize_terminal_cwd(&cwd))
+        .or(anchor_cwd)
+}
+
+fn normalize_terminal_cwd(cwd: &str) -> Option<String> {
+    if cwd.is_empty() {
+        return None;
+    }
+    if let Some(path) = cwd.strip_prefix("file://") {
+        let path_start = path.find('/')?;
+        let path = &path[path_start..];
+        return percent_decode(path);
+    }
+    Some(cwd.to_owned())
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hi = hex_value(*bytes.get(index + 1)?)?;
+            let lo = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((hi << 4) | lo);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
 
 impl BindingRuntime {
     pub(crate) fn relative_session_id(&self, session_id: &str, delta: isize) -> Option<String> {

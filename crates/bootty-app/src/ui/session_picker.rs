@@ -3,8 +3,8 @@ use eframe::egui;
 
 use bootty_ui::overlay::{self, FloatingWindow, ListRow, ListView};
 
-use crate::mux::snapshot::MuxSession;
 use crate::ui::session_navigation::{BindingSessionGroup, ScopedSessionTarget};
+use bootty_mux::snapshot::MuxSession;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionPickerDialog {
