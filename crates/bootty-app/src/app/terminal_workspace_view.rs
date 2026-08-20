@@ -9,7 +9,10 @@ use eframe::{
     wgpu,
 };
 
-use super::state::{AppState, TerminalProgress, TerminalProgressState};
+use super::{
+    binding_terminal_facts::{TerminalProgress, TerminalProgressState},
+    state::AppState,
+};
 use crate::{
     config::MultiplexerBackendConfig,
     geometry::ViewTransform,

@@ -1,7 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    hash::Hasher,
-    net::{IpAddr, UdpSocket},
+    collections::HashSet,
     path::PathBuf,
     sync::mpsc,
     time::{Duration, Instant},
@@ -12,8 +10,6 @@ use bootty_config::config::MultiplexerBackendConfig;
 use eframe::egui::{self, Pos2, Rect};
 
 mod copy_mode;
-#[cfg(debug_assertions)]
-mod diagnostic_actions;
 mod recorded_chord;
 mod selection;
 
@@ -23,21 +19,19 @@ use copy_mode::{
     copy_mode_input_should_pass_to_app, copy_mode_key_input_present, copy_shortcut_pressed,
     direct_copy_shortcut_pressed,
 };
-#[cfg(debug_assertions)]
-use diagnostic_actions::{DiagnosticAction, DiagnosticActionDriver, DiagnosticRecord};
 use recorded_chord::normalize_recorded_chord;
 use selection::{TerminalSelectionAction, TerminalSelectionRouteContext, TerminalSelectionRouter};
 
+use super::binding_session_names::RenameSessionOutcome;
+use super::binding_terminal_facts::TerminalProgress;
 use super::command_runtime::CommandRuntime;
 use super::config_runtime::AppConfigRuntime;
 use super::dialog_runtime::{DialogRuntime, ModalDialog};
+use super::remote_reconnect::AttachExit;
 use super::terminal_config::{
     terminal_live_config, terminal_session_config_with_side_effects, terminal_text_config,
 };
-use super::workspace_runtime::{
-    BindingRuntime, BindingStateCandidate, PendingGeneratedName, RemoteReattach, ScopedPaneId,
-    ScopedWindowId, SpaceRuntime, WorkspaceRuntime,
-};
+use super::workspace_runtime::{BindingStateCandidate, WorkspaceRuntime};
 
 use crate::{
     app_actions::{
@@ -50,7 +44,7 @@ use crate::{
         update_config_document,
     },
     config_reload::CONFIG_HOT_RELOAD_INTERVAL,
-    diagnostics::{STATUS_METRICS_SAMPLE_INTERVAL, StabilityTraceSample, StatusMetrics},
+    diagnostics::StabilityTraceSample,
     direct_input::{DirectKeyInput, ModifierSideState},
     geometry::{TerminalSurface, ViewTransform},
     input::{
@@ -59,14 +53,14 @@ use crate::{
         router::{RoutedInput, route_events},
     },
     input_binding::CopyToClipboard,
-    layout::{Direction, Divider, PaneLayout, SplitDirection},
+    layout::{Divider, SplitDirection},
     mux::{
         RepaintHandle,
         capability::BindingOperation,
-        command::{MuxCommand, MuxSplitDirection},
+        command::MuxCommand,
         config::selected_backend,
         controller::{MuxController, MuxScope, SpaceId, mux_session_refresh_interval},
-        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow, MuxWindowProgress},
+        snapshot::{MuxSession, MuxWindow},
         terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
     },
     platform::{
@@ -100,8 +94,6 @@ use bootty_terminal::terminal_engine::{
 };
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
-/// Session-finder heading for sessions running in a backend that no Space has claimed.
-const UNCLAIMED_SESSIONS_LABEL: &str = "No space";
 
 /// How soon to wake up for the next session poll, for backends that only report through polling.
 /// Native sessions live in-process and report themselves, so they schedule nothing.
@@ -117,7 +109,6 @@ fn mux_refresh_repaint_after(
 #[derive(Clone, Debug)]
 pub struct FrameInputs {
     pub now: Instant,
-    pub stable_dt_ms: f32,
     pub events: Vec<egui::Event>,
     pub dropped_file_paths: Vec<PathBuf>,
     pub modifiers: egui::Modifiers,
@@ -198,96 +189,13 @@ pub enum AppEffect {
     ConfigureKeybind(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TerminalProgressState {
-    Normal,
-    Error,
-    Indeterminate,
-    Warning,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TerminalProgress {
-    pub state: TerminalProgressState,
-    pub value: Option<u8>,
-}
-
-impl TerminalProgress {
-    fn from_conemu(state: &str, value: Option<u8>) -> Option<Self> {
-        let state = match state {
-            "normal" => TerminalProgressState::Normal,
-            "error" => TerminalProgressState::Error,
-            "indeterminate" => TerminalProgressState::Indeterminate,
-            "warning" => TerminalProgressState::Warning,
-            "inactive" => return None,
-            _ => return None,
-        };
-        Some(Self { state, value })
-    }
-
-    fn from_mux(progress: &MuxWindowProgress) -> Option<Self> {
-        Self::from_conemu(&progress.state, progress.percent)
-    }
-
-    pub(crate) fn fraction(self) -> Option<f32> {
-        self.value
-            .map(|value| f32::from(value) / 100.0)
-            .or((self.state == TerminalProgressState::Indeterminate).then_some(0.5))
-    }
-
-    fn percent(self) -> Option<u8> {
-        self.value
-            .or((self.state == TerminalProgressState::Indeterminate).then_some(50))
-    }
-}
-
-struct NetworkChangeDetector {
-    next_check: Instant,
-    signature: Option<IpAddr>,
-}
-
-impl NetworkChangeDetector {
-    const INTERVAL: Duration = Duration::from_secs(2);
-
-    fn new(now: Instant) -> Self {
-        Self {
-            next_check: now + Self::INTERVAL,
-            signature: network_signature(),
-        }
-    }
-
-    fn changed(&mut self, now: Instant) -> bool {
-        self.changed_to(now, network_signature())
-    }
-
-    fn changed_to(&mut self, now: Instant, signature: Option<IpAddr>) -> bool {
-        if now < self.next_check {
-            return false;
-        }
-        self.next_check = now + Self::INTERVAL;
-        let changed = signature != self.signature;
-        self.signature = signature;
-        changed
-    }
-}
-
-fn network_signature() -> Option<IpAddr> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("1.1.1.1", 80)).ok()?;
-    socket.local_addr().ok().map(|address| address.ip())
-}
-
 pub struct AppState {
     pub(super) window_state_key: String,
     pub(super) commands: CommandRuntime,
     pub(super) workspace: WorkspaceRuntime,
     repaint_scheduler: RepaintScheduler,
-    network_change_detector: NetworkChangeDetector,
     pub(super) last_error: Option<String>,
     last_drain: DrainStats,
-    last_frame_dt_ms: f32,
-    status_metrics: StatusMetrics,
-    last_status_metrics_sample: Instant,
     terminal_surface: Option<TerminalSurface>,
     /// The full terminal area the panes were last laid out within, for geometric neighbor lookup.
     last_pane_area: Option<Rect>,
@@ -324,9 +232,6 @@ pub struct AppState {
     last_terminal_search: String,
     last_terminal_search_direction: TerminalSearchDirection,
     theme_picker_restore_config: Option<BoottyConfig>,
-    /// A command-palette choice waiting for the next frame's viewport and effect sink.
-    #[cfg(debug_assertions)]
-    diagnostic_action_driver: Option<DiagnosticActionDriver>,
     macos_non_native_fullscreen_active: bool,
     macos_non_native_fullscreen_pending_apply: bool,
 }
@@ -386,16 +291,6 @@ fn event_is_terminal_pointer(event: &egui::Event) -> bool {
     )
 }
 
-fn layout_direction(direction: crate::mux::command::MuxDirection) -> Direction {
-    use crate::mux::command::MuxDirection;
-    match direction {
-        MuxDirection::Left => Direction::Left,
-        MuxDirection::Right => Direction::Right,
-        MuxDirection::Up => Direction::Up,
-        MuxDirection::Down => Direction::Down,
-    }
-}
-
 fn scoped_terminal_transition_key(
     scope: MuxScope,
     backend: MultiplexerBackendConfig,
@@ -408,33 +303,6 @@ fn scoped_terminal_transition_key(
         scope.binding_id().persistence_value(),
         pane_id.unwrap_or_default(),
     )
-}
-
-pub(super) fn mux_split_direction(direction: SplitDirection) -> MuxSplitDirection {
-    match direction {
-        SplitDirection::Right => MuxSplitDirection::Right,
-        SplitDirection::Down => MuxSplitDirection::Down,
-    }
-}
-
-fn pane_sets_match(a: &[String], b: &[String]) -> bool {
-    a.len() == b.len() && a.iter().all(|pane| b.contains(pane))
-}
-
-fn focus_after_native_layout_reconcile(
-    restored_from_server: bool,
-    new_panes: &[String],
-    selected_pane: Option<&str>,
-) -> Option<String> {
-    if restored_from_server {
-        return selected_pane.map(str::to_owned);
-    }
-    if let Some(selected_pane) = selected_pane
-        && new_panes.iter().any(|pane| pane == selected_pane)
-    {
-        return Some(selected_pane.to_owned());
-    }
-    new_panes.first().cloned()
 }
 
 fn terminal_cursor_icon_for_mouse_shape(shape: &str) -> Option<egui::CursorIcon> {
@@ -600,8 +468,6 @@ impl AppState {
         let macos_non_native_fullscreen_pending_apply =
             macos_non_native_fullscreen_active && !macos_non_native_fullscreen_applied;
         config_runtime.publish_backend_keybindings(app_key_bindings);
-        #[cfg(debug_assertions)]
-        let diagnostic_action_driver = DiagnosticActionDriver::from_env();
         let commands = CommandRuntime::new(repaint.clone());
 
         Ok(Self {
@@ -609,12 +475,8 @@ impl AppState {
             commands,
             workspace,
             repaint_scheduler: RepaintScheduler::default(),
-            network_change_detector: NetworkChangeDetector::new(Instant::now()),
             last_error: None,
             last_drain: DrainStats::default(),
-            last_frame_dt_ms: 0.0,
-            status_metrics: StatusMetrics::default(),
-            last_status_metrics_sample: Instant::now() - STATUS_METRICS_SAMPLE_INTERVAL,
             terminal_surface: None,
             last_pane_area: None,
             chrome_handle_rects: Vec::new(),
@@ -643,8 +505,6 @@ impl AppState {
             last_terminal_search: String::new(),
             last_terminal_search_direction: TerminalSearchDirection::Next,
             theme_picker_restore_config: None,
-            #[cfg(debug_assertions)]
-            diagnostic_action_driver,
             macos_non_native_fullscreen_active,
             macos_non_native_fullscreen_pending_apply,
         })
@@ -830,22 +690,6 @@ impl AppState {
             .get(index)
             .is_some_and(|space| self.activate_space_from_ui(space.id))
     }
-    pub fn create_space_from_ui(
-        &mut self,
-        name: &str,
-        icon: &str,
-        color: [u8; 3],
-        tint_sidebar: bool,
-    ) -> bool {
-        self.create_space_with_backend_from_ui(
-            name,
-            icon,
-            color,
-            tint_sidebar,
-            SpaceMuxOverride::default(),
-        )
-    }
-
     fn create_space_with_backend_from_ui(
         &mut self,
         name: &str,
@@ -1049,39 +893,7 @@ impl AppState {
     }
 
     pub fn binding_session_groups(&self) -> Vec<BindingSessionGroup> {
-        let mut bindings = std::iter::once(&self.workspace.active.binding)
-            .chain(self.workspace.active.inactive_bindings.iter())
-            .collect::<Vec<_>>();
-        bindings.sort_by_key(|binding| binding.scope.binding_id().persistence_value());
-        bindings
-            .iter()
-            .map(|binding| {
-                let duplicate_label = bindings
-                    .iter()
-                    .filter(|candidate| candidate.label == binding.label)
-                    .count()
-                    > 1;
-                let label = if duplicate_label {
-                    format!(
-                        "{} / Binding {}",
-                        binding.label,
-                        binding.scope.binding_id().persistence_value()
-                    )
-                } else {
-                    binding.label.clone()
-                };
-                let sessions = binding.mux.sessions().to_vec();
-                BindingSessionGroup {
-                    scope: binding.scope,
-                    label,
-                    display_names: binding.session_display_name_map(&sessions),
-                    sessions,
-                    selected_session: binding.mux.selected_session().map(str::to_owned),
-                    active: binding.scope == self.workspace.active.binding.scope,
-                    can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
-                }
-            })
-            .collect()
+        self.workspace.active_binding_session_groups()
     }
 
     /// Every session the workspace can reach, grouped by the Space that owns it, with a trailing
@@ -1089,95 +901,7 @@ impl AppState {
     /// session means switching Spaces or adopting the session into the current one; the sidebar stays
     /// on `binding_session_groups`, which is this Space only.
     pub fn session_finder_groups(&self) -> Vec<BindingSessionGroup> {
-        let mut spaces = vec![(
-            self.workspace.active.position,
-            self.workspace.active.name.as_str(),
-            std::iter::once(&self.workspace.active.binding)
-                .chain(self.workspace.active.inactive_bindings.iter())
-                .collect::<Vec<_>>(),
-        )];
-        spaces.extend(self.workspace.inactive_spaces.iter().map(|space| {
-            (
-                space.position,
-                space.name.as_str(),
-                space.bindings().collect::<Vec<_>>(),
-            )
-        }));
-        spaces.sort_by_key(|(position, ..)| *position);
-
-        // One entry per session name: only the active binding refreshes, so a Space that has not been
-        // visited this run has no snapshot of its own and has to borrow the shared backend's view of
-        // its members. Names are what membership is keyed by, so names are the identity here.
-        let mut sessions_across_spaces = Vec::<&MuxSession>::new();
-        for binding in spaces.iter().flat_map(|(_, _, bindings)| bindings) {
-            for session in binding.mux.all_sessions() {
-                if !sessions_across_spaces
-                    .iter()
-                    .any(|known| known.name == session.name)
-                {
-                    sessions_across_spaces.push(session);
-                }
-            }
-        }
-
-        let mut claimed = HashSet::new();
-        let mut groups = Vec::new();
-        for (_, space_name, bindings) in &spaces {
-            for binding in bindings {
-                let members = binding.session_order.session_names();
-                let sessions = members
-                    .iter()
-                    .filter_map(|name| {
-                        // The owner's own snapshot first: session ids are per backend, and the id is
-                        // what activation targets.
-                        binding
-                            .mux
-                            .all_sessions()
-                            .iter()
-                            .chain(sessions_across_spaces.iter().copied())
-                            .find(|session| session.name == *name)
-                            .cloned()
-                    })
-                    .collect::<Vec<_>>();
-                claimed.extend(members);
-                if sessions.is_empty() {
-                    continue;
-                }
-                groups.push(BindingSessionGroup {
-                    scope: binding.scope,
-                    label: if bindings.len() > 1 {
-                        format!("{space_name} / {}", binding.label)
-                    } else {
-                        (*space_name).to_owned()
-                    },
-                    display_names: binding.session_display_name_map(&sessions),
-                    sessions,
-                    selected_session: binding.mux.selected_session().map(str::to_owned),
-                    active: binding.scope == self.workspace.active.binding.scope,
-                    can_return_to_last_session: binding.mux.previous_selected_session().is_some(),
-                });
-            }
-        }
-
-        let unclaimed = sessions_across_spaces
-            .into_iter()
-            .filter(|session| !claimed.contains(&session.name))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !unclaimed.is_empty() {
-            groups.push(BindingSessionGroup {
-                // Activating one of these adopts it into the current Space.
-                scope: self.workspace.active.binding.scope,
-                label: UNCLAIMED_SESSIONS_LABEL.to_owned(),
-                sessions: unclaimed,
-                selected_session: None,
-                active: false,
-                can_return_to_last_session: false,
-                // No Space owns these, so bootty has no name of its own for them.
-                display_names: HashMap::new(),
-            });
-        }
-        groups
+        self.workspace.session_finder_groups()
     }
 
     fn publish_terminal_config(
@@ -1250,10 +974,6 @@ impl AppState {
                     anchor.pane_id.as_deref(),
                 )
             })
-    }
-
-    pub fn status_metrics(&self) -> StatusMetrics {
-        self.status_metrics
     }
 
     pub fn last_error(&self) -> Option<&str> {
@@ -1340,428 +1060,42 @@ impl AppState {
     }
 
     pub(super) fn uses_native_terminal_layout(&self) -> bool {
-        matches!(
-            self.active_multiplexer().backend,
-            crate::config::MultiplexerBackendConfig::Native
-                | crate::config::MultiplexerBackendConfig::Rmux
-        )
+        self.workspace.active.binding.uses_native_terminal_layout()
     }
 
-    fn current_window_key(&self) -> ScopedWindowId {
-        let session = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .unwrap_or("local")
-            .to_owned();
-        let window = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window()
-            .map(str::to_owned)
-            .or_else(|| {
-                self.workspace
-                    .active
-                    .binding
-                    .mux
-                    .sessions()
-                    .iter()
-                    .find(|candidate| candidate.id == session || candidate.name == session)
-                    .and_then(|candidate| candidate.active_window_id.clone())
-            })
-            .unwrap_or_default();
-        self.workspace.active.binding.window_id(session, window)
-    }
     pub fn pane_widget_key(&self, pane_id: &str) -> String {
-        let window = self.current_window_key();
-        let backend = selected_backend(self.active_multiplexer());
-        format!(
-            "{}:{}:{backend:?}:{}:{}:{pane_id}",
-            window.scope.space_id().persistence_value(),
-            window.scope.binding_id().persistence_value(),
-            window.session_id,
-            window.window_id,
-        )
+        self.workspace.active.binding.pane_widget_key(pane_id)
     }
 
-    fn take_pending_pane_split_direction(
-        &mut self,
-        key: &ScopedWindowId,
-    ) -> Option<SplitDirection> {
-        self.workspace
-            .active
-            .binding
-            .pending_pane_split_directions
-            .remove(key)
-            .or_else(|| {
-                if key.window_id.is_empty() {
-                    None
-                } else {
-                    self.workspace
-                        .active
-                        .binding
-                        .pending_pane_split_directions
-                        .remove(
-                            &self
-                                .workspace
-                                .active
-                                .binding
-                                .window_id(key.session_id.clone(), String::new()),
-                        )
-                }
-            })
-    }
-
-    fn current_pane_layout(&self) -> Option<&PaneLayout> {
-        if !self.uses_native_terminal_layout() {
-            return None;
-        }
-        self.workspace
-            .active
-            .binding
-            .pane_layouts
-            .get(&self.current_window_key())
-    }
-
-    /// Drop split layouts whose `(session, window)` no longer exists, so the map doesn't grow
-    /// unbounded as the user creates and destroys native sessions and tabs. Keys are stored by
-    /// whatever `current_window_key` recorded (session id, occasionally name), so accept either.
-    fn prune_pane_layouts(&mut self) {
-        if self.workspace.active.binding.pane_layouts.is_empty() {
-            return;
-        }
-        let mut live = Vec::new();
-        for session in self.workspace.active.binding.mux.sessions() {
-            for window in &session.windows {
-                live.push(
-                    self.workspace
-                        .active
-                        .binding
-                        .window_id(session.id.clone(), window.id.clone()),
-                );
-                live.push(
-                    self.workspace
-                        .active
-                        .binding
-                        .window_id(session.name.clone(), window.id.clone()),
-                );
-            }
-        }
-        live.push(self.current_window_key());
-        self.workspace
-            .active
-            .binding
-            .pane_layouts
-            .retain(|key, _| live.contains(key));
-    }
-
-    /// Reconcile the active native window's split layout against the backend's pane list, then make
-    /// the layout's focused pane the input runtime and keep its siblings live. Non-native backends
-    /// fall back to attaching the single selected anchor.
     fn sync_terminal_panes(&mut self) -> Result<()> {
-        let phase = crate::diagnostics::latency_start();
-        self.prune_pane_layouts();
-        crate::diagnostics::trace_slow("panes.prune_pane_layouts", phase, 2.0);
-        let phase = crate::diagnostics::latency_start();
-        let config = self.active_multiplexer().clone();
-        crate::diagnostics::trace_slow("panes.clone_config", phase, 2.0);
-        if !self.uses_native_terminal_layout() {
-            let phase = crate::diagnostics::latency_start();
-            let result = self
-                .workspace
-                .active
-                .binding
-                .terminal
-                .sync_scoped_mux_anchor(
-                    self.workspace.active.binding.scope,
-                    &config,
-                    self.workspace.active.binding.mux.selected_session_anchor(),
-                );
-            crate::diagnostics::trace_slow("panes.sync_scoped_mux_anchor", phase, 2.0);
-            return result;
-        }
-        let panes: Vec<MuxPaneAnchor> = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window_panes()
-            .to_vec();
-        let pane_ids: Vec<String> = panes
-            .iter()
-            .filter_map(|pane| pane.pane_id.clone())
-            .collect();
-        if pane_ids.is_empty() {
-            // Idle native session (all tabs closed): nothing to render.
-            return self
-                .workspace
-                .active
-                .binding
-                .terminal
-                .sync_scoped_mux_anchor(
-                    self.workspace.active.binding.scope,
-                    &config,
-                    self.workspace.active.binding.mux.selected_session_anchor(),
-                );
-        }
-        let key = self.current_window_key();
-        let window_id = (!key.window_id.is_empty()).then(|| key.window_id.clone());
-        let selected_pane = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session_anchor()
-            .and_then(|anchor| anchor.pane_id.clone());
-        let server_layout = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window_layout()
-            .and_then(PaneLayout::from_mux_layout)
-            .filter(|layout| pane_sets_match(&layout.panes(), &pane_ids));
-        let layout_missing = !self
-            .workspace
-            .active
-            .binding
-            .pane_layouts
-            .contains_key(&key);
-        let stale_layout = self
-            .workspace
-            .active
-            .binding
-            .pane_layouts
-            .get(&key)
-            .is_some_and(|layout| layout.panes().iter().all(|pane| !pane_ids.contains(pane)));
-        let mut restored_from_server = false;
-        if (layout_missing || stale_layout)
-            && let Some(layout) = server_layout.clone()
-        {
-            self.workspace
-                .active
-                .binding
-                .pane_layouts
-                .insert(key.clone(), layout);
-            restored_from_server = true;
-        }
-
-        let previous_panes = self
-            .workspace
-            .active
-            .binding
-            .pane_layouts
-            .get(&key)
-            .map(PaneLayout::panes)
-            .unwrap_or_default();
-        let new_panes = pane_ids
-            .iter()
-            .filter(|pane| !previous_panes.contains(pane))
-            .cloned()
-            .collect::<Vec<_>>();
-        let has_new_pane = !new_panes.is_empty();
-        {
-            let layout = self
-                .workspace
-                .active
-                .binding
-                .pane_layouts
-                .entry(key.clone())
-                .or_insert_with(|| PaneLayout::single(pane_ids[0].clone()));
-            // A window id can be reused after its window is closed (native names tabs `tab-N`). If none
-            // of the cached layout's panes still exist, it belongs to the old window -- start fresh.
-            if layout.panes().iter().all(|pane| !pane_ids.contains(pane)) {
-                *layout = PaneLayout::single(pane_ids[0].clone());
-            }
-        }
-        let removed_panes = previous_panes
-            .iter()
-            .filter(|pane| !pane_ids.contains(pane))
-            .cloned()
-            .collect::<Vec<_>>();
-        let pane_set_changed = has_new_pane || !removed_panes.is_empty();
-        if pane_set_changed && let Some(layout) = server_layout {
-            self.workspace
-                .active
-                .binding
-                .pane_layouts
-                .insert(key.clone(), layout);
-            restored_from_server = true;
-        } else if pane_set_changed {
-            let new_pane_direction = self
-                .take_pending_pane_split_direction(&key)
-                .unwrap_or(SplitDirection::Right);
-            let layout = self
-                .workspace
-                .active
-                .binding
-                .pane_layouts
-                .get_mut(&key)
-                .expect("native layout should be initialized");
-            layout.reconcile_with_new_pane_direction(&pane_ids, new_pane_direction);
-        }
-        let layout = self
-            .workspace
-            .active
-            .binding
-            .pane_layouts
-            .get_mut(&key)
-            .expect("native layout should be initialized");
-        if let Some(focus) = focus_after_native_layout_reconcile(
-            restored_from_server,
-            &new_panes,
-            selected_pane.as_deref(),
-        ) {
-            layout.set_focus(&focus);
-        }
-        let focused_id = layout.focused().to_owned();
-        let focused_anchor = panes
-            .iter()
-            .find(|pane| pane.pane_id.as_deref() == Some(focused_id.as_str()))
-            .cloned();
-        self.workspace
-            .active
-            .binding
-            .terminal
-            .sync_scoped_native_window(
-                self.workspace.active.binding.scope,
-                &panes,
-                focused_anchor.as_ref(),
-                window_id.as_deref(),
-                selected_backend(&config),
-                config.hide_tmux_status,
-            )
+        self.workspace.active.binding.sync_terminal_panes()
     }
 
-    /// True when the active native window holds more than one pane and should render as a split.
     pub fn native_multi_pane(&self) -> bool {
-        self.current_pane_layout()
-            .is_some_and(|layout| !layout.is_single())
+        self.workspace.active.binding.native_multi_pane()
     }
 
     pub fn focused_pane(&self) -> Option<String> {
-        self.current_pane_layout()
-            .map(|layout| layout.focused().to_owned())
-    }
-
-    fn pane_cache_key(&self, pane_id: &str) -> ScopedPaneId {
-        let window = self
-            .window_key_for_pane(pane_id)
-            .unwrap_or_else(|| self.current_window_key());
-        self.workspace.active.binding.pane_id(window, pane_id)
+        self.workspace.active.binding.focused_pane()
     }
 
     pub(crate) fn current_terminal_progress(&self) -> Option<TerminalProgress> {
-        self.selected_window_backend_progress()
-            .or_else(|| self.current_terminal_progress_from_panes())
-    }
-
-    fn selected_window_backend_progress(&self) -> Option<TerminalProgress> {
-        let selected = self.mux().selected_window();
-        self.mux()
-            .selected_session_windows()
-            .iter()
-            .find(|window| match selected {
-                Some(selected) => window.id == selected,
-                None => window.active,
-            })
-            .and_then(|window| self.backend_window_progress(window))
-    }
-
-    fn current_terminal_progress_from_panes(&self) -> Option<TerminalProgress> {
-        self.focused_pane()
-            .as_deref()
-            .and_then(|pane_id| self.pane_progress(pane_id))
-            .or_else(|| {
-                self.workspace
-                    .active
-                    .binding
-                    .mux
-                    .selected_session_anchor()
-                    .and_then(|anchor| anchor.pane_id.as_deref())
-                    .and_then(|pane_id| self.pane_progress(pane_id))
-            })
-            .or(self.workspace.active.binding.unscoped_terminal_progress)
+        self.workspace.active.binding.current_terminal_progress()
     }
 
     pub(crate) fn pane_progress(&self, pane_id: &str) -> Option<TerminalProgress> {
-        self.workspace
-            .active
-            .binding
-            .terminal_progress
-            .get(&self.pane_cache_key(pane_id))
-            .copied()
-    }
-
-    pub(crate) fn pane_ports(&self, pane_id: &str) -> Option<&[u16]> {
-        self.workspace
-            .active
-            .binding
-            .terminal_ports
-            .get(&self.pane_cache_key(pane_id))
-            .map(Vec::as_slice)
+        self.workspace.active.binding.pane_progress(pane_id)
     }
 
     pub(crate) fn session_ports(&self, session: &MuxSession) -> Vec<u16> {
-        let selected = self.workspace.active.binding.mux.selected_session();
-        let mut ports =
-            if selected == Some(session.id.as_str()) || selected == Some(session.name.as_str()) {
-                self.workspace
-                    .active
-                    .binding
-                    .unscoped_terminal_ports
-                    .clone()
-            } else {
-                Vec::new()
-            };
-        for pane in session
-            .windows
-            .iter()
-            .flat_map(|window| window.panes.iter().chain(std::iter::once(&window.anchor)))
-            .filter_map(|pane| pane.pane_id.as_deref())
-        {
-            if let Some(reported) = self.pane_ports(pane) {
-                for port in reported {
-                    if !ports.contains(port) {
-                        ports.push(*port);
-                    }
-                }
-            }
-        }
-        ports
+        self.workspace.active.binding.session_ports(session)
     }
 
     pub(crate) fn has_indeterminate_terminal_progress(&self) -> bool {
         self.workspace
             .active
             .binding
-            .terminal_progress
-            .values()
-            .chain(
-                self.workspace
-                    .active
-                    .binding
-                    .unscoped_terminal_progress
-                    .iter(),
-            )
-            .any(|progress| progress.state == TerminalProgressState::Indeterminate)
-            || self
-                .workspace
-                .active
-                .binding
-                .mux
-                .sessions()
-                .iter()
-                .any(|session| {
-                    session
-                        .windows
-                        .iter()
-                        .any(|window| self.window_has_indeterminate_progress(window))
-                })
+            .has_indeterminate_terminal_progress()
     }
 
     /// The names the active binding shows for `sessions`, in the same order.
@@ -1773,71 +1107,33 @@ impl AppState {
     }
 
     pub(crate) fn window_has_indeterminate_progress(&self, window: &MuxWindow) -> bool {
-        if let Some(progress) = self.backend_window_progress(window) {
-            return progress.state == TerminalProgressState::Indeterminate;
-        }
-        window
-            .panes
-            .iter()
-            .chain(std::iter::once(&window.anchor))
-            .filter_map(|pane| pane.pane_id.as_deref())
-            .filter_map(|pane_id| self.pane_progress(pane_id))
-            .any(|progress| progress.state == TerminalProgressState::Indeterminate)
+        self.workspace
+            .active
+            .binding
+            .window_has_indeterminate_progress(window)
     }
 
     pub(crate) fn window_progress(&self, window: &MuxWindow) -> Option<u8> {
-        if let Some(progress) = self.backend_window_progress(window) {
-            return progress.percent();
-        }
-        window
-            .panes
-            .iter()
-            .chain(std::iter::once(&window.anchor))
-            .filter_map(|pane| pane.pane_id.as_deref())
-            .filter_map(|pane_id| self.pane_progress(pane_id))
-            .filter_map(TerminalProgress::percent)
-            .max()
-    }
-
-    /// An attached client forwards OSC 9;4 only for the pane it is currently showing, so its own
-    /// per-window bookkeeping is the only source that can speak for a background window.
-    fn backend_window_progress(&self, window: &MuxWindow) -> Option<TerminalProgress> {
-        window
-            .progress
-            .as_ref()
-            .and_then(TerminalProgress::from_mux)
+        self.workspace.active.binding.window_progress(window)
     }
 
     pub fn pane_rects(&self, area: Rect, gap: f32) -> Vec<(String, Rect)> {
-        self.current_pane_layout()
-            .map(|layout| layout.rects(area, gap))
-            .unwrap_or_default()
+        self.workspace.active.binding.pane_rects(area, gap)
     }
 
     pub fn pane_dividers(&self, area: Rect, gap: f32) -> Vec<Divider> {
-        self.current_pane_layout()
-            .map(|layout| layout.dividers(area, gap))
-            .unwrap_or_default()
+        self.workspace.active.binding.pane_dividers(area, gap)
     }
 
     pub fn focus_pane(&mut self, pane_id: &str) {
-        let key = self.current_window_key();
-        let moved = match self.workspace.active.binding.pane_layouts.get_mut(&key) {
-            Some(layout) if layout.focused() != pane_id => layout.set_focus(pane_id),
-            _ => false,
-        };
-        // Make the new pane the input runtime this frame so its rect doesn't briefly render the
-        // previously focused pane (the deref runtime would otherwise lag until the next frame's sync).
-        if moved {
-            let _ = self.sync_terminal_panes();
-        }
+        self.workspace.active.binding.focus_pane(pane_id);
     }
 
     pub fn set_pane_ratio(&mut self, path: &[u8], ratio: f32, min_fraction: f32) {
-        let key = self.current_window_key();
-        if let Some(layout) = self.workspace.active.binding.pane_layouts.get_mut(&key) {
-            layout.set_ratio_at(path, ratio, min_fraction, min_fraction);
-        }
+        self.workspace
+            .active
+            .binding
+            .set_pane_ratio(path, ratio, min_fraction);
     }
 
     pub fn terminal_runtime_for_pane(
@@ -1847,7 +1143,6 @@ impl AppState {
         self.workspace
             .active
             .binding
-            .terminal
             .terminal_runtime_for_pane(pane_id)
     }
 
@@ -1855,14 +1150,16 @@ impl AppState {
     where
         F: FnMut(&str) -> Option<(u16, u16)>,
     {
-        self.current_pane_layout()?.terminal_window_size(leaf_size)
+        self.workspace
+            .active
+            .binding
+            .pane_terminal_window_size(leaf_size)
     }
 
     pub fn resize_native_layout_window(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.workspace
             .active
             .binding
-            .terminal
             .resize_native_layout_window(cols, rows)
     }
 
@@ -1876,141 +1173,29 @@ impl AppState {
     }
 
     fn split_focused_pane(&mut self, direction: SplitDirection, target_pane_id: Option<&str>) {
-        let session = self
-            .workspace
+        self.workspace
             .active
             .binding
-            .mux
-            .selected_session()
-            .unwrap_or("local")
-            .to_owned();
-        let mux_config = self.active_multiplexer().clone();
-        if !self.uses_native_terminal_layout() {
-            self.workspace.active.binding.mux.execute_command(
-                &self.repaint,
-                &mux_config,
-                MuxCommand::SplitPane {
-                    session_id: session,
-                    pane_id: target_pane_id.map(str::to_owned),
-                    direction: mux_split_direction(direction),
-                },
-            );
-            return;
-        }
-        let backend = selected_backend(&mux_config);
-        let key = self.current_window_key();
-        let focused = target_pane_id.map(str::to_owned).or_else(|| {
-            self.workspace
-                .active
-                .binding
-                .pane_layouts
-                .get(&key)
-                .map(|layout| layout.focused().to_owned())
-                .or_else(|| {
-                    self.workspace
-                        .active
-                        .binding
-                        .mux
-                        .selected_session_anchor()
-                        .and_then(|anchor| anchor.pane_id.clone())
-                })
-        });
-        self.workspace.active.binding.mux.execute_command(
-            &self.repaint,
-            &mux_config,
-            MuxCommand::SplitPane {
-                session_id: session,
-                pane_id: focused.clone(),
-                direction: mux_split_direction(direction),
-            },
-        );
-        self.apply_split_layout_after_command(key, focused, direction, backend);
-    }
-
-    fn apply_split_layout_after_command(
-        &mut self,
-        key: ScopedWindowId,
-        focused: Option<String>,
-        direction: SplitDirection,
-        backend: MultiplexerBackendConfig,
-    ) {
-        if backend == MultiplexerBackendConfig::Rmux {
-            self.workspace
-                .active
-                .binding
-                .pending_pane_split_directions
-                .insert(key, direction);
-            return;
-        }
-
-        // The native split synchronously sets the new pane active, so the refreshed anchor names it.
-        let new_pane = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session_anchor()
-            .and_then(|anchor| anchor.pane_id.clone());
-        if let Some(new_pane) = new_pane {
-            let layout = self
-                .workspace
-                .active
-                .binding
-                .pane_layouts
-                .entry(key.clone())
-                .or_insert_with(|| PaneLayout::single(new_pane.clone()));
-            if let Some(focused) = &focused {
-                layout.set_focus(focused);
-            }
-            if !layout.contains(&new_pane) {
-                layout.split_focused(new_pane, direction);
-            }
-            self.workspace
-                .active
-                .binding
-                .pending_pane_split_directions
-                .remove(&key);
-            let _ = self.sync_terminal_panes();
-        }
+            .split_focused_pane(&self.repaint, direction, target_pane_id);
     }
 
     pub fn record_pane_area(&mut self, area: Rect) {
         self.last_pane_area = Some(area);
     }
 
-    fn focus_pane_neighbor(&mut self, direction: Direction) {
-        let key = self.current_window_key();
+    fn focus_pane_neighbor(&mut self, direction: crate::mux::command::MuxDirection) {
         let Some(area) = self.last_pane_area else {
             return;
         };
         let gap = self.config().chrome.pane_divider_width;
-        let neighbor = self
-            .workspace
+        self.workspace
             .active
             .binding
-            .pane_layouts
-            .get(&key)
-            .and_then(|layout| layout.neighbor(layout.focused(), direction, area, gap));
-        if let Some(neighbor) = neighbor {
-            self.focus_pane(&neighbor);
-        }
+            .focus_pane_neighbor(direction, area, gap);
     }
 
     fn focus_pane_relative(&mut self, delta: isize) {
-        let key = self.current_window_key();
-        let Some(layout) = self.workspace.active.binding.pane_layouts.get(&key) else {
-            return;
-        };
-        let panes = layout.panes();
-        if panes.len() < 2 {
-            return;
-        }
-        let Some(index) = panes.iter().position(|pane| pane == layout.focused()) else {
-            return;
-        };
-        let next = (index as isize + delta).rem_euclid(panes.len() as isize) as usize;
-        let pane = panes[next].clone();
-        self.focus_pane(&pane);
+        self.workspace.active.binding.focus_pane_relative(delta);
     }
 
     pub fn activate_scoped_session_from_ui(&mut self, target: &ScopedSessionTarget) -> bool {
@@ -2060,15 +1245,14 @@ impl AppState {
     }
 
     pub fn activate_relative_session_from_ui(&mut self, session_id: &str, delta: isize) -> bool {
-        let sessions = self.workspace.active.binding.mux.sessions();
-        let Some(current) = sessions
-            .iter()
-            .position(|session| session.id == session_id || session.name == session_id)
+        let Some(session_id) = self
+            .workspace
+            .active
+            .binding
+            .relative_session_id(session_id, delta)
         else {
             return false;
         };
-        let next = (current as isize + delta).rem_euclid(sessions.len() as isize) as usize;
-        let session_id = sessions[next].id.clone();
         self.activate_session_from_ui(&session_id);
         true
     }
@@ -2085,14 +1269,7 @@ impl AppState {
     }
 
     pub fn activate_last_session_from_ui(&mut self) -> bool {
-        let Some(session_id) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .previous_selected_session()
-            .map(str::to_owned)
-        else {
+        let Some(session_id) = self.workspace.active.binding.previous_session_id() else {
             return false;
         };
         self.activate_session_from_ui(&session_id);
@@ -2123,17 +1300,7 @@ impl AppState {
             .workspace
             .active
             .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
-            .and_then(|session| {
-                let mut windows = session.windows.iter().collect::<Vec<_>>();
-                windows.sort_by_key(|window| window.index);
-                let current = windows.iter().position(|window| window.id == window_id)?;
-                let next = (current as isize + delta).rem_euclid(windows.len() as isize) as usize;
-                Some((session.id.clone(), windows[next].id.clone()))
-            })
+            .relative_window_target(session_id, window_id, delta)
         else {
             return false;
         };
@@ -2142,306 +1309,58 @@ impl AppState {
     }
 
     pub fn activate_last_window_from_ui(&mut self, session_id: &str) -> bool {
-        let Some(session_id) = self
+        let changed = self
             .workspace
             .active
             .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
-            .filter(|session| session.windows.len() > 1)
-            .map(|session| session.id.clone())
-        else {
-            return false;
-        };
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.execute_command(
-            &self.repaint,
-            &mux_config,
-            MuxCommand::ActivateLastWindow { session_id },
-        );
-        self.sync_native_layout_terminal_now();
-        true
+            .activate_last_window(&self.repaint, session_id);
+        if changed {
+            self.sync_native_layout_terminal_now();
+        }
+        changed
     }
 
     pub fn new_tab_for_window_from_ui(&mut self, session_id: &str, window_id: &str) -> bool {
-        let selected_session = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned);
-        let selected_window = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window()
-            .map(str::to_owned);
-        let Some((resolved_session_id, anchor_cwd, target_is_current)) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
-            .and_then(|session| {
-                let window = session
-                    .windows
-                    .iter()
-                    .find(|window| window.id == window_id)?;
-                let session_is_current = selected_session
-                    .as_deref()
-                    .is_some_and(|selected| selected == session.id || selected == session.name);
-                let window_is_current = selected_window.as_deref().map_or_else(
-                    || session.active_window_id.as_deref() == Some(window_id),
-                    |selected| selected == window_id,
-                );
-                Some((
-                    session.id.clone(),
-                    window
-                        .anchor
-                        .cwd
-                        .clone()
-                        .or_else(|| session.anchor.cwd.clone()),
-                    session_is_current && window_is_current,
-                ))
-            })
-        else {
-            return false;
-        };
-        let live_terminal_cwd = target_is_current
-            .then(|| {
-                self.workspace
-                    .active
-                    .binding
-                    .terminal
-                    .current_working_directory()
-                    .ok()
-                    .flatten()
-            })
-            .flatten();
-        self.new_tab_from_ui(
-            resolved_session_id,
-            terminal_cwd_for_mux_command(live_terminal_cwd, anchor_cwd),
-        )
-    }
-
-    fn new_tab_from_ui(&mut self, session_id: String, cwd: Option<String>) -> bool {
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.execute_command(
-            &self.repaint,
-            &mux_config,
-            MuxCommand::NewWindow { session_id, cwd },
-        );
-        self.sync_native_layout_terminal_now();
-        true
+        let changed =
+            self.workspace
+                .active
+                .binding
+                .new_tab_for_window(&self.repaint, session_id, window_id);
+        if changed {
+            self.sync_native_layout_terminal_now();
+        }
+        changed
     }
 
     pub fn reorder_window_before_from_ui(&mut self, source: &str, before: Option<&str>) -> bool {
-        let Some(session_id) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned)
-        else {
-            return false;
-        };
-        if before == Some(source) {
-            return false;
+        let changed =
+            self.workspace
+                .active
+                .binding
+                .reorder_window_before(&self.repaint, source, before);
+        if changed {
+            self.sync_native_layout_terminal_now();
         }
-        let windows = self.workspace.active.binding.mux.selected_session_windows();
-        let Some(from) = windows.iter().position(|window| window.id == source) else {
-            return false;
-        };
-        let mut target_ids = windows
-            .iter()
-            .map(|window| window.id.as_str())
-            .filter(|id| *id != source)
-            .collect::<Vec<_>>();
-        let to = before
-            .and_then(|before| target_ids.iter().position(|id| *id == before))
-            .unwrap_or(target_ids.len());
-        target_ids.insert(to, source);
-        let Some(to) = target_ids.iter().position(|id| *id == source) else {
-            return false;
-        };
-        let delta = to as i32 - from as i32;
-        if delta == 0 {
-            return false;
-        }
-
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.execute_command(
-            &self.repaint,
-            &mux_config,
-            MuxCommand::MoveWindow {
-                session_id,
-                window_id: Some(source.to_owned()),
-                delta,
-            },
-        );
-        self.sync_native_layout_terminal_now();
-        true
+        changed
     }
 
     pub fn move_window_from_ui(&mut self, session_id: &str, window_id: &str, delta: i32) -> bool {
-        let selected_session = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned);
-        let selected_window = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window()
-            .map(str::to_owned);
-        let Some((session_id, position, window_count, active_window_id)) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
-            .and_then(|session| {
-                let mut windows = session.windows.iter().collect::<Vec<_>>();
-                windows.sort_by_key(|window| window.index);
-                let active_window_id = (selected_session
-                    .as_deref()
-                    .is_some_and(|selected| selected == session.id || selected == session.name))
-                .then_some(selected_window.as_deref())
-                .flatten()
-                .filter(|selected| windows.iter().any(|window| window.id == *selected))
-                .map(str::to_owned)
-                .or_else(|| session.active_window_id.clone());
-                windows
-                    .iter()
-                    .position(|window| window.id == window_id)
-                    .map(|position| {
-                        (
-                            session.id.clone(),
-                            position,
-                            windows.len(),
-                            active_window_id,
-                        )
-                    })
-            })
-        else {
-            return false;
-        };
-        let target = (position as i32 + delta).clamp(0, window_count as i32 - 1) as usize;
-        if target == position {
-            return false;
+        let changed =
+            self.workspace
+                .active
+                .binding
+                .move_window(&self.repaint, session_id, window_id, delta);
+        if changed {
+            self.sync_native_layout_terminal_now();
         }
-
-        let mux_config = self.active_multiplexer().clone();
-        let command = match active_window_id {
-            Some(selected_window_id) if selected_window_id.as_str() != window_id => {
-                MuxCommand::MoveWindowPreservingSelection {
-                    session_id,
-                    window_id: window_id.to_owned(),
-                    delta,
-                    selected_window_id,
-                }
-            }
-            _ => MuxCommand::MoveWindow {
-                session_id,
-                window_id: Some(window_id.to_owned()),
-                delta,
-            },
-        };
-        self.workspace
-            .active
-            .binding
-            .mux
-            .execute_command(&self.repaint, &mux_config, command);
-        self.sync_native_layout_terminal_now();
-        true
+        changed
     }
 
     pub fn close_pane_for_window_from_ui(&mut self, session_id: &str, window_id: &str) -> bool {
-        let Some((session_id, window_id, pane_id)) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
-            .and_then(|session| {
-                session
-                    .windows
-                    .iter()
-                    .find(|window| window.id == window_id)
-                    .and_then(|window| {
-                        window
-                            .anchor
-                            .pane_id
-                            .clone()
-                            .map(|pane_id| (session.id.clone(), window.id.clone(), pane_id))
-                    })
-            })
-        else {
-            return false;
-        };
-        let selected_session = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned);
-        let current_window = self.current_window_key();
-        let target_is_current = current_window.window_id == window_id
-            && self
-                .workspace
-                .active
-                .binding
-                .mux
-                .sessions()
-                .iter()
-                .find(|session| session.id == session_id)
-                .is_some_and(|session| {
-                    selected_session
-                        .as_deref()
-                        .is_some_and(|selected| selected == session.id || selected == session.name)
-                });
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.close_pane(
-            &session_id,
-            Some(&pane_id),
-            &self.repaint,
-            &mux_config,
-        );
         self.workspace
             .active
             .binding
-            .terminal
-            .discard_pane(&pane_id);
-        if self.uses_native_terminal_layout() {
-            let key = self
-                .workspace
-                .active
-                .binding
-                .window_id(session_id.clone(), window_id.clone());
-            if let Some(layout) = self.workspace.active.binding.pane_layouts.get_mut(&key) {
-                layout.remove(&pane_id);
-            }
-            if target_is_current {
-                let _ = self.sync_terminal_panes();
-            }
-        }
-        true
+            .close_pane_for_window(&self.repaint, session_id, window_id)
     }
 
     fn sync_session_order(&mut self) {
@@ -2463,14 +1382,10 @@ impl AppState {
         }
     }
 
-    fn begin_active_binding_membership_mutation(
-        &mut self,
-        command: &MuxCommand,
-        naming: Option<&PendingGeneratedName>,
-    ) -> bool {
+    fn begin_active_binding_membership_mutation(&mut self, command: &MuxCommand) -> bool {
         match self
             .workspace
-            .begin_active_binding_membership_mutation(command, naming)
+            .begin_active_binding_membership_mutation(command, None)
         {
             Ok(Some(_)) => true,
             Ok(None) => false,
@@ -2480,247 +1395,12 @@ impl AppState {
             }
         }
     }
-    /// Fingerprint the backend facts used by the generated-name reconciler. Reconciling forks up to
-    /// four `git` subprocesses per session, so an unchanged fingerprint keeps that work off the
-    /// steady-state frame path.
-    ///
-    /// Fingerprints the whole backend list, which changes only when the backend really did.
-    /// `mux.sessions()` cannot be used: it is narrowed to this binding's membership, and it is
-    /// unstable *within* a frame, because `apply_snapshot` resets it to the full backend list on
-    /// every refresh and `sync_session_order` narrows it again later in the same frame. Hashing it
-    /// reconciled several times a second forever, which is a `git` fork per session per refresh.
-    ///
-    /// Membership is left out on purpose. Including it would let a newly attached session take its
-    /// generated name immediately, rather than waiting for the next backend change, but the extra
-    /// reconciles it causes reach the cwd-keyed `SessionNameStore` collision between bindings often
-    /// enough to fail Space membership tests. Include it once that store is keyed by session id.
-    fn generated_names_signature(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for session in self.workspace.active.binding.mux.all_sessions() {
-            hasher.write(session.id.as_bytes());
-            hasher.write_u8(0);
-            hasher.write(session.name.as_bytes());
-            hasher.write_u8(0);
-            if let Some(cwd) = session.anchor.cwd.as_deref() {
-                hasher.write(cwd.as_bytes());
-            }
-            hasher.write_u8(1);
-        }
-        hasher.finish()
-    }
-
     fn sync_generated_session_names(&mut self) {
-        let remote = self.active_multiplexer().remote.is_some();
-        let mut candidate = self.workspace.active_reconciled_binding_state_candidate();
-        let mut pending_generated_names = self
+        if let Err(error) = self
             .workspace
-            .active
-            .binding
-            .pending_generated_names
-            .clone();
-        if selected_backend(self.active_multiplexer()) == MultiplexerBackendConfig::Rmux {
-            self.commit_binding_state_candidate(candidate);
-            return;
-        }
-        let signature = self.generated_names_signature();
-        if self.workspace.active.binding.generated_names_signature == Some(signature) {
-            self.commit_binding_state_candidate(candidate);
-            return;
-        }
-        // Reconcile only this binding's sessions. Generating names for the whole backend list
-        // renames sessions that belong to other Spaces.
-        let sessions = self.workspace.active.binding.mux.sessions().to_vec();
-        let mut renames = Vec::new();
-        pending_generated_names.retain(|session_id, pending| {
-            // A pending name the backend already reports has served its purpose: it exists to
-            // keep the name alive for membership and uniqueness until the rename or create lands.
-            // Renames record it under the new name rather than a session id, so the id lookup
-            // below never prunes those and they would otherwise be held forever.
-            if sessions.iter().any(|session| session.name == pending.name) {
-                return false;
-            }
-            sessions
-                .iter()
-                .find(|session| session.id == *session_id)
-                .is_none_or(|session| {
-                    session
-                        .anchor
-                        .cwd
-                        .as_deref()
-                        .is_some_and(|cwd| Self::session_cwd(cwd, remote) == pending.cwd)
-                })
-        });
-        let mut planned_names = pending_generated_names
-            .values()
-            .map(|pending| pending.name.clone())
-            .collect::<HashSet<_>>();
-        let rename_supported =
-            selected_backend(self.active_multiplexer()) != MultiplexerBackendConfig::Rmux;
-        // A generated name has to clear every session on the server, not just this binding's members:
-        // asking for one another Space or a hand-made session already holds is a rename the backend
-        // rejects, leaving bootty asking for it again on every change.
-        let taken_names = self.taken_session_names(None);
-
-        for session in &sessions {
-            let Some(raw_cwd) = session.anchor.cwd.as_deref() else {
-                continue;
-            };
-            let cwd = Self::session_cwd(raw_cwd, remote);
-            let mut record = if let Some(record) =
-                candidate
-                    .session_names
-                    .observe_session(&session.id, &session.name, &cwd)
-            {
-                record
-            } else {
-                let legacy_name = if remote {
-                    crate::strings::session_name_for_remote_path(&cwd)
-                } else {
-                    crate::strings::session_name_for_path(&cwd)
-                };
-                if session.name == legacy_name {
-                    candidate.session_names.remember_generated(
-                        &session.id,
-                        &cwd,
-                        &session.name,
-                        &session.name,
-                    );
-                } else {
-                    candidate.session_names.mark_explicit(
-                        &session.id,
-                        &session.name,
-                        &session.name,
-                        &cwd,
-                    );
-                }
-                candidate
-                    .session_names
-                    .observe_session(&session.id, &session.name, &cwd)
-                    .expect("session name metadata should be observable after recording")
-            };
-
-            // Records written before display names existed have none, and only those need one worked
-            // out: from here on, creating and renaming both record what bootty means to show, so a
-            // name someone typed is never something to second-guess.
-            if record.display_name.is_empty() {
-                let generated_suffix = session.name != record.generated_name
-                    && crate::strings::is_uniquified_session_name(
-                        &session.name,
-                        &record.generated_name,
-                    );
-                if record.explicit && generated_suffix {
-                    // Bootty generated `generated_name`, then asked the backend for that name plus a
-                    // uniqueness suffix — which the old reconciler read back as somebody's rename.
-                    candidate
-                        .session_names
-                        .reclaim_generated(&session.id, &session.name);
-                    record.generated_name = session.name.clone();
-                    record.explicit = false;
-                }
-                let display_name = if record.explicit {
-                    session.name.clone()
-                } else {
-                    // The name bootty means for this worktree, whenever the backend name is that name
-                    // or that name plus the suffix it needed to clear the server.
-                    let suggested = Self::suggested_session_name(&cwd, remote);
-                    if crate::strings::is_uniquified_session_name(&session.name, &suggested) {
-                        suggested
-                    } else {
-                        session.name.clone()
-                    }
-                };
-                candidate
-                    .session_names
-                    .set_display_name(&session.id, &display_name);
-                record.display_name = display_name;
-            }
-
-            if let Some(pending) = pending_generated_names.get(&session.id).cloned() {
-                if pending.cwd == cwd {
-                    if session.name == pending.name {
-                        planned_names.remove(&pending.name);
-                        if pending.explicit {
-                            candidate.session_names.mark_explicit(
-                                &session.id,
-                                &pending.name,
-                                &pending.display_name,
-                                &cwd,
-                            );
-                        } else {
-                            candidate.session_names.remember_generated(
-                                &session.id,
-                                &cwd,
-                                &pending.name,
-                                &pending.display_name,
-                            );
-                        }
-                        pending_generated_names.remove(&session.id);
-                    } else if session.name != record.generated_name {
-                        planned_names.remove(&pending.name);
-                        pending_generated_names.remove(&session.id);
-                        candidate.session_names.mark_explicit(
-                            &session.id,
-                            &session.name,
-                            &session.name,
-                            &cwd,
-                        );
-                    }
-                    continue;
-                }
-                pending_generated_names.remove(&session.id);
-            }
-            if record.explicit {
-                continue;
-            }
-            if session.name != record.generated_name {
-                candidate.session_names.mark_explicit(
-                    &session.id,
-                    &session.name,
-                    &session.name,
-                    &cwd,
-                );
-                continue;
-            }
-
-            let existing_names = taken_names
-                .iter()
-                .map(String::as_str)
-                .filter(|name| *name != session.name)
-                .chain(planned_names.iter().map(String::as_str));
-            let display_name = Self::suggested_session_name(&cwd, remote);
-            let desired = crate::strings::unique_session_name(&display_name, existing_names);
-            if desired == session.name || !rename_supported {
-                continue;
-            }
-            planned_names.insert(desired.clone());
-            pending_generated_names.insert(
-                session.id.clone(),
-                PendingGeneratedName {
-                    cwd,
-                    name: desired.clone(),
-                    display_name,
-                    explicit: false,
-                },
-            );
-            renames.push((session.id.clone(), desired));
-        }
-
-        if !self.commit_binding_state_candidate(candidate) {
-            return;
-        }
-        self.workspace.active.binding.pending_generated_names = pending_generated_names;
-        self.workspace.active.binding.generated_names_signature = Some(signature);
-        if renames.is_empty() {
-            return;
-        }
-        let mux_config = self.active_multiplexer().clone();
-        for (session_id, name) in renames {
-            self.workspace.active.binding.mux.rename_session(
-                &session_id,
-                name,
-                &self.repaint,
-                &mux_config,
-            );
+            .reconcile_generated_session_names(&self.repaint)
+        {
+            self.last_error = Some(error.to_string());
         }
     }
 
@@ -2728,93 +1408,15 @@ impl AppState {
     /// is still waiting on. `keep` is the name of the session being renamed, which must not count as
     /// taken against itself.
     pub(super) fn taken_session_names(&self, keep: Option<&str>) -> Vec<String> {
-        std::iter::once(&self.workspace.active.binding)
-            .chain(self.workspace.active.inactive_bindings.iter())
-            .chain(
-                self.workspace
-                    .inactive_spaces
-                    .iter()
-                    .flat_map(SpaceRuntime::bindings),
-            )
-            .flat_map(|binding| {
-                binding.mux.backend_session_names().iter().cloned().chain(
-                    binding
-                        .pending_generated_names
-                        .values()
-                        .map(|pending| pending.name.clone()),
-                )
-            })
-            .filter(|name| Some(name.as_str()) != keep)
-            .collect()
+        self.workspace.taken_session_names(keep)
     }
 
     fn create_project_session_for_cwd(&mut self, cwd: String) {
-        let remote = self.active_multiplexer().remote.is_some();
-        let cwd = Self::session_cwd(&cwd, remote);
-
-        let existing_names = self.taken_session_names(None);
-        // The backend name has to clear every session on the server, including sessions bootty does
-        // not own; the display name is the one bootty meant, before that uniqueness pass.
-        let display_name = Self::suggested_session_name(&cwd, remote);
-        let session_id = crate::strings::unique_session_name(
-            &display_name,
-            existing_names.iter().map(String::as_str),
-        );
-        let command = MuxCommand::CreateProjectSession {
-            session_id: session_id.clone(),
-            cwd: cwd.clone(),
-        };
-        let pending_name = PendingGeneratedName {
-            cwd: cwd.clone(),
-            name: session_id.clone(),
-            display_name: display_name.clone(),
-            explicit: false,
-        };
-        if !self.begin_active_binding_membership_mutation(&command, Some(&pending_name)) {
-            return;
+        match self.workspace.create_project_session(cwd, &self.repaint) {
+            Ok(true) => self.input_focus = InputFocus::Terminal,
+            Ok(false) => {}
+            Err(error) => self.last_error = Some(error.to_string()),
         }
-        self.workspace
-            .active
-            .binding
-            .pending_generated_names
-            .insert(session_id.clone(), pending_name);
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.create_project_session(
-            crate::ui::new_session_picker::NewMuxSessionRequest { session_id, cwd },
-            &self.repaint,
-            &mux_config,
-        );
-        if selected_backend(&mux_config) == MultiplexerBackendConfig::Native {
-            self.workspace
-                .active
-                .binding
-                .membership_reconciliation_ready = true;
-        }
-        self.input_focus = InputFocus::Terminal;
-    }
-
-    pub(super) fn session_cwd(cwd: &str, remote: bool) -> String {
-        if remote {
-            cwd.to_owned()
-        } else {
-            Self::session_root(cwd)
-        }
-    }
-
-    pub(super) fn suggested_session_name(cwd: &str, remote: bool) -> String {
-        if remote {
-            crate::strings::session_name_for_remote_path(cwd)
-        } else {
-            crate::git::suggested_session_name(cwd)
-        }
-    }
-
-    fn session_root(cwd: &str) -> String {
-        let cwd = crate::git::worktree_root(cwd).unwrap_or_else(|| cwd.to_owned());
-        std::fs::canonicalize(&cwd)
-            .unwrap_or_else(|_| PathBuf::from(cwd))
-            .to_string_lossy()
-            .into_owned()
     }
 
     fn move_selected_session(&mut self, delta: i32) -> bool {
@@ -2887,11 +1489,8 @@ impl AppState {
         self.commit_binding_state_candidate(candidate)
     }
 
-    pub fn take_dialog(&mut self) -> Option<NewMuxSessionDialog> {
-        self.dialogs.take_new_session()
-    }
-    pub fn take_space_editor_dialog(&mut self) -> Option<SpaceEditorDialog> {
-        self.dialogs.take_space_editor()
+    pub fn take_modal_dialog(&mut self) -> Option<ModalDialog> {
+        self.dialogs.take()
     }
 
     pub fn apply_space_editor_event(&mut self, dialog: SpaceEditorDialog, event: SpaceEditorEvent) {
@@ -2957,10 +1556,6 @@ impl AppState {
         true
     }
 
-    pub fn take_session_picker_dialog(&mut self) -> Option<SessionPickerDialog> {
-        self.dialogs.take_session_picker()
-    }
-
     pub fn apply_session_picker_event(
         &mut self,
         dialog: SessionPickerDialog,
@@ -2999,10 +1594,6 @@ impl AppState {
         }
     }
 
-    pub fn take_rename_session_dialog(&mut self) -> Option<RenameSessionDialog> {
-        self.dialogs.take_rename_session()
-    }
-
     pub fn apply_rename_session_event(
         &mut self,
         dialog: RenameSessionDialog,
@@ -3022,70 +1613,24 @@ impl AppState {
                     self.dialogs.open(ModalDialog::RenameSession(dialog));
                     return;
                 }
-                let session = self
+                match self
                     .workspace
-                    .active
-                    .binding
-                    .mux
-                    .sessions()
-                    .iter()
-                    .find(|session| session.id == session_id || session.name == session_id)
-                    .cloned();
-                if let Some(session) = session {
-                    let cwd = session
-                        .anchor
-                        .cwd
-                        .as_deref()
-                        .map(Self::session_root)
-                        .unwrap_or_default();
-                    // The typed name is what bootty shows. The backend still needs a name no other
-                    // session on the server holds, so it may carry a suffix the sidebar never shows.
-                    let taken = self.taken_session_names(Some(session.name.as_str()));
-                    let backend_name = crate::strings::unique_session_name(
-                        &name,
-                        taken.iter().map(String::as_str),
-                    );
-                    let command = MuxCommand::RenameSession {
-                        session_id: session.id.clone(),
-                        name: backend_name.clone(),
-                    };
-                    let pending_name = PendingGeneratedName {
-                        cwd: cwd.clone(),
-                        name: backend_name.clone(),
-                        display_name: name.clone(),
-                        explicit: true,
-                    };
-                    if !self.begin_active_binding_membership_mutation(&command, Some(&pending_name))
-                    {
+                    .rename_active_session(&session_id, &name, &self.repaint)
+                {
+                    Ok(RenameSessionOutcome::Missing | RenameSessionOutcome::Started) => {}
+                    Ok(RenameSessionOutcome::Pending) => {
                         self.dialogs.open(ModalDialog::RenameSession(dialog));
                         return;
                     }
-                    self.workspace
-                        .active
-                        .binding
-                        .pending_generated_names
-                        .insert(session.id.clone(), pending_name);
-                    let mux_config = self.active_multiplexer().clone();
-                    self.workspace.active.binding.mux.rename_session(
-                        &session.id,
-                        backend_name,
-                        &self.repaint,
-                        &mux_config,
-                    );
-                    if selected_backend(&mux_config) == MultiplexerBackendConfig::Native {
-                        self.workspace
-                            .active
-                            .binding
-                            .membership_reconciliation_ready = true;
+                    Err(error) => {
+                        self.last_error = Some(error.to_string());
+                        self.dialogs.open(ModalDialog::RenameSession(dialog));
+                        return;
                     }
                 }
                 self.input_focus = InputFocus::Terminal;
             }
         }
-    }
-
-    pub fn take_rename_tab_dialog(&mut self) -> Option<RenameTabDialog> {
-        self.dialogs.take_rename_tab()
     }
 
     pub fn apply_rename_tab_event(&mut self, dialog: RenameTabDialog, event: RenameTabEvent) {
@@ -3102,27 +1647,12 @@ impl AppState {
                 name,
             } => {
                 let name = name.trim();
-                let key = self
-                    .workspace
-                    .active
-                    .binding
-                    .window_id(session_id.clone(), window_id.clone());
-                if name.is_empty() {
-                    self.workspace.active.binding.custom_tab_names.remove(&key);
-                    if let Some(title) = self
-                        .workspace
-                        .active
-                        .binding
-                        .terminal_tab_titles
-                        .get(&key)
-                        .cloned()
-                    {
-                        self.rename_window_for_terminal_title(&session_id, &window_id, &title);
-                    }
-                } else {
-                    self.workspace.active.binding.custom_tab_names.insert(key);
-                    self.rename_window(&session_id, &window_id, name);
-                }
+                self.workspace.active.binding.set_custom_window_name(
+                    &session_id,
+                    &window_id,
+                    name,
+                    &self.repaint,
+                );
                 self.input_focus = InputFocus::Terminal;
             }
         }
@@ -3167,10 +1697,6 @@ impl AppState {
         }
     }
 
-    pub fn take_ditch_session_dialog(&mut self) -> Option<DitchSessionDialog> {
-        self.dialogs.take_ditch_session()
-    }
-
     pub fn apply_ditch_session_event(
         &mut self,
         dialog: DitchSessionDialog,
@@ -3200,7 +1726,7 @@ impl AppState {
                 let command = MuxCommand::DitchSession {
                     session_id: session_id.clone(),
                 };
-                if !self.begin_active_binding_membership_mutation(&command, None) {
+                if !self.begin_active_binding_membership_mutation(&command) {
                     self.dialogs.open(ModalDialog::DitchSession(dialog));
                     return;
                 }
@@ -3220,10 +1746,6 @@ impl AppState {
         }
     }
 
-    pub fn take_keybind_help_dialog(&mut self) -> Option<KeybindHelpDialog> {
-        self.dialogs.take_keybind_help()
-    }
-
     pub fn apply_keybind_help_event(&mut self, dialog: KeybindHelpDialog, event: KeybindHelpEvent) {
         match event {
             KeybindHelpEvent::None => {
@@ -3233,10 +1755,6 @@ impl AppState {
                 self.input_focus = InputFocus::Terminal;
             }
         }
-    }
-
-    pub fn take_command_palette_dialog(&mut self) -> Option<CommandPaletteDialog> {
-        self.dialogs.take_command_palette()
     }
 
     pub fn apply_command_palette_event(
@@ -3276,10 +1794,6 @@ impl AppState {
                 self.commands.queue(invocation);
             }
         }
-    }
-
-    pub fn take_theme_picker_dialog(&mut self) -> Option<ThemePickerDialog> {
-        self.dialogs.take_theme_picker()
     }
 
     pub fn apply_theme_picker_event(
@@ -3486,11 +2000,18 @@ impl AppState {
                 }
             }
             TerminalSideEffect::ConEmuProgress { state, value } => {
-                self.apply_terminal_progress(source_pane_id.as_deref(), state, value);
+                self.workspace.active.binding.record_terminal_progress(
+                    source_pane_id.as_deref(),
+                    &state,
+                    value,
+                );
                 effects.push(AppEffect::RequestRepaint);
             }
             TerminalSideEffect::Iterm2UserVarPorts(ports) => {
-                self.apply_terminal_ports(source_pane_id.as_deref(), ports);
+                self.workspace
+                    .active
+                    .binding
+                    .record_terminal_ports(source_pane_id.as_deref(), ports);
                 effects.push(AppEffect::RequestRepaint);
             }
             TerminalSideEffect::SemanticPrompt(_)
@@ -3502,144 +2023,22 @@ impl AppState {
         }
     }
 
-    fn apply_terminal_progress(
-        &mut self,
-        source_pane_id: Option<&str>,
-        state: String,
-        value: Option<u8>,
-    ) {
-        if state == "unknown" {
-            return;
-        }
-        // A tmux client reports progress for every window through its own bookkeeping, and
-        // forwards OSC 9;4 only for the pane it currently shows. Recording the forwarded copy
-        // would credit it to whichever pane the attach started on, painting a bar on the wrong
-        // window and never clearing it.
-        if selected_backend(&self.config().multiplexer) == MultiplexerBackendConfig::Tmux {
-            return;
-        }
-        let progress = TerminalProgress::from_conemu(&state, value);
-        match source_pane_id {
-            Some(pane_id) => {
-                let key = self.pane_cache_key(pane_id);
-                match progress {
-                    Some(progress) => {
-                        self.workspace
-                            .active
-                            .binding
-                            .terminal_progress
-                            .insert(key, progress);
-                    }
-                    None => {
-                        self.workspace.active.binding.terminal_progress.remove(&key);
-                    }
-                }
-            }
-            None => self.workspace.active.binding.unscoped_terminal_progress = progress,
-        }
-    }
-
-    fn apply_terminal_ports(&mut self, source_pane_id: Option<&str>, ports: Vec<u16>) {
-        match source_pane_id {
-            Some(pane_id) => {
-                let key = self.pane_cache_key(pane_id);
-                self.workspace
-                    .active
-                    .binding
-                    .terminal_ports
-                    .insert(key, ports);
-            }
-            None => self.workspace.active.binding.unscoped_terminal_ports = ports,
-        }
-    }
-
     fn apply_terminal_window_title(
         &mut self,
         source_pane_id: Option<&str>,
         title: String,
         effects: &mut Vec<AppEffect>,
     ) {
-        let window_key = source_pane_id
-            .and_then(|pane_id| self.window_key_for_pane(pane_id))
-            .or_else(|| source_pane_id.is_none().then(|| self.current_window_key()))
-            .filter(|key| !key.window_id.is_empty());
-        if let Some(key) = window_key {
-            self.workspace
-                .active
-                .binding
-                .terminal_tab_titles
-                .insert(key.clone(), title.clone());
-            if !self
-                .workspace
-                .active
-                .binding
-                .custom_tab_names
-                .contains(&key)
-            {
-                self.rename_window_for_terminal_title(&key.session_id, &key.window_id, &title);
-            }
-        }
+        self.workspace.active.binding.apply_window_title(
+            source_pane_id,
+            title.clone(),
+            &self.repaint,
+        );
         if source_pane_id.is_none()
             || self.workspace.active.binding.terminal.focused_pane_id() == source_pane_id
         {
             effects.push(AppEffect::SetWindowTitle(title));
         }
-    }
-
-    fn window_key_for_pane(&self, pane_id: &str) -> Option<ScopedWindowId> {
-        self.workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .find_map(|session| {
-                session.windows.iter().find_map(|window| {
-                    let anchor_matches = window.anchor.pane_id.as_deref() == Some(pane_id);
-                    let pane_matches = window
-                        .panes
-                        .iter()
-                        .any(|pane| pane.pane_id.as_deref() == Some(pane_id));
-                    (anchor_matches || pane_matches).then(|| {
-                        self.workspace
-                            .active
-                            .binding
-                            .window_id(session.id.clone(), window.id.clone())
-                    })
-                })
-            })
-    }
-
-    fn rename_window_for_terminal_title(&mut self, session_id: &str, window_id: &str, title: &str) {
-        if self.window_name_for_key(session_id, window_id) == Some(title) {
-            return;
-        }
-        self.rename_window(session_id, window_id, title);
-    }
-
-    fn rename_window(&mut self, session_id: &str, window_id: &str, name: &str) {
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.rename_window(
-            session_id,
-            window_id,
-            name.to_owned(),
-            &self.repaint,
-            &mux_config,
-        );
-    }
-
-    fn window_name_for_key(&self, session_id: &str, window_id: &str) -> Option<&str> {
-        self.workspace
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)?
-            .windows
-            .iter()
-            .find(|window| window.id == window_id)
-            .map(|window| window.name.as_str())
     }
 
     fn effective_terminal_cursor_icon(&self) -> egui::CursorIcon {
@@ -3716,76 +2115,10 @@ impl AppState {
             .collect()
     }
 
-    #[cfg(debug_assertions)]
-    fn drive_diagnostic_actions(&mut self, now: Instant, effects: &mut Vec<AppEffect>) -> usize {
-        let actions = self
-            .diagnostic_action_driver
-            .as_mut()
-            .map(|driver| driver.due_actions(now))
-            .unwrap_or_default();
-        let action_count = actions.len();
-        for action in actions {
-            self.record_diagnostic_action("start", action, 0);
-            let start = Instant::now();
-            self.apply_mux_key_action(action.mux_action());
-            self.record_diagnostic_action("done", action, start.elapsed().as_micros());
-            effects.push(AppEffect::RequestRepaint);
-        }
-        action_count
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn drive_diagnostic_actions(&mut self, _now: Instant, _effects: &mut Vec<AppEffect>) -> usize {
-        0
-    }
-
-    #[cfg(debug_assertions)]
-    fn record_diagnostic_action(
-        &mut self,
-        phase: &str,
-        action: DiagnosticAction,
-        action_elapsed_us: u128,
-    ) {
-        let selected_session = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned);
-        let selected_window = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window()
-            .map(str::to_owned);
-        let pane_count = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_window_panes()
-            .len();
-        let last_error = self.last_error.clone();
-        if let Some(driver) = &mut self.diagnostic_action_driver {
-            driver.record(DiagnosticRecord {
-                phase,
-                action,
-                action_elapsed_us,
-                selected_session: selected_session.as_deref(),
-                selected_window: selected_window.as_deref(),
-                pane_count,
-                last_error: last_error.as_deref(),
-            });
-        }
-    }
-
     pub fn update_frame(&mut self, inputs: FrameInputs) -> Vec<AppEffect> {
         let frame_started = crate::diagnostics::latency_start();
         let FrameInputs {
             now,
-            stable_dt_ms,
             events,
             dropped_file_paths,
             modifiers,
@@ -3832,9 +2165,7 @@ impl AppState {
             terminal_cell_height,
             terminal_scale_factor,
         );
-        if self.has_degraded_remote() && self.network_change_detector.changed(now) {
-            self.reset_remote_reconnects(now);
-        }
+        self.workspace.reset_after_network_change(now);
         // A shell exiting closes its pane, collapsing the split (or cascading to the tab when it was
         // the last pane). On native, any pane's shell can exit, not just the focused one.
         if self.is_native() {
@@ -3843,23 +2174,21 @@ impl AppState {
             }
         } else {
             match self.workspace.active.binding.terminal.child_exited() {
-                Ok(true) => self.handle_attach_client_exit(now),
-                Ok(false) => self.note_attach_client_alive(now),
+                Ok(true) => match self.workspace.active.binding.handle_attach_client_exit(now) {
+                    AttachExit::CloseLocalPane => self.close_active_pane(),
+                    AttachExit::Reconnecting(error) => self.last_error = Some(error),
+                    AttachExit::AlreadyWaiting => {}
+                },
+                Ok(false) => self.workspace.active.binding.note_attach_client_alive(now),
                 Err(error) => self.last_error = Some(error.to_string()),
             }
-            self.start_due_reattach(now, &mut effects);
+            if let Some(wait) = self.workspace.active.binding.reattach_wait(now) {
+                effects.push(AppEffect::RepaintAfter(wait));
+            }
         }
 
         for binding in self.workspace.bindings_mut() {
-            if let Some(result) = binding.mux.poll_command() {
-                if result.is_err() {
-                    binding.pending_generated_names.clear();
-                    binding.membership_reconciliation_waiting_for_refresh = true;
-                    binding.mux.refresh_on_next_frame();
-                } else {
-                    binding.membership_reconciliation_ready = true;
-                }
-            }
+            binding.poll_membership_command();
         }
         let active_config = self.workspace.active.binding.multiplexer.clone();
         self.workspace
@@ -3890,7 +2219,18 @@ impl AppState {
                 .binding
                 .membership_reconciliation_ready = true;
         }
-        self.resolve_remote_attach_exit_after_refresh(refresh_completed);
+        if self
+            .workspace
+            .active
+            .binding
+            .resolve_attach_exit_after_refresh(refresh_completed)
+            && self
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("lost the connection to "))
+        {
+            self.last_error = None;
+        }
         let mux_refresh_after = mux_refresh_repaint_after(&active_config, window_focused);
         for binding in &mut self.workspace.active.inactive_bindings {
             binding.restore_persisted_sessions(&self.repaint);
@@ -3916,15 +2256,14 @@ impl AppState {
         self.sync_generated_session_names();
         self.sync_session_order();
         let phase = crate::diagnostics::latency_start();
-        let waiting_to_reattach = self
-            .workspace
-            .active
-            .binding
-            .reattach
-            .is_some_and(|reattach| !reattach.started);
+        let waiting_to_reattach = self.workspace.active.binding.waiting_to_reattach();
         if !waiting_to_reattach && let Err(error) = self.sync_terminal_panes() {
             if self.workspace.active.binding.multiplexer.remote.is_some() {
-                self.handle_attach_start_failure(now, &error.to_string());
+                self.last_error = self
+                    .workspace
+                    .active
+                    .binding
+                    .handle_attach_start_failure(now, &error.to_string());
             } else {
                 self.last_error = Some(error.to_string());
             }
@@ -3942,10 +2281,7 @@ impl AppState {
                 viewport,
                 &mut effects,
             )
-            + self.handle_dropped_file_paths(dropped_file_paths)
-            + self.drive_diagnostic_actions(now, &mut effects);
-        self.last_frame_dt_ms = stable_dt_ms;
-
+            + self.handle_dropped_file_paths(dropped_file_paths);
         let pending_pty_bytes = self.workspace.active.binding.terminal.pending_pty_len();
         let (cols, rows) = self.workspace.active.binding.terminal.grid_size();
         self.config_runtime.record_stability(StabilityTraceSample {
@@ -3958,15 +2294,6 @@ impl AppState {
             text_runs: renderer_metrics.text_runs,
             last_error: self.last_error.as_deref(),
         });
-        if now.duration_since(self.last_status_metrics_sample) >= STATUS_METRICS_SAMPLE_INTERVAL {
-            self.status_metrics = StatusMetrics {
-                drain: self.last_drain,
-                renderer: renderer_metrics,
-                cols,
-                rows,
-            };
-            self.last_status_metrics_sample = now;
-        }
         let repaint = self.repaint_scheduler.recommend(RepaintSignal {
             drained_bytes: self.last_drain.bytes,
             drain_elapsed_us: self.last_drain.elapsed_us,
@@ -4402,8 +2729,7 @@ impl AppState {
         self.workspace
             .active
             .binding
-            .pending_generated_names
-            .clear();
+            .clear_pending_generated_names();
         self.sync_session_order();
         if self.config_runtime.has_new_session_config_changes() {
             warnings.push(
@@ -5202,206 +3528,8 @@ impl AppState {
         }
     }
 
-    /// The attach client exited. For a local binding that means the pane it was showing ended, so
-    /// the pane closes. For a remote one it means either that or a dropped connection, and the two
-    /// look identical from here — so bootty reconnects instead of closing. The sessions live on the
-    /// other host and outlive the link; closing on a network blip would kill work the user still
-    /// has. A pane that really did end is gone from the next snapshot, which closes it properly.
-    fn handle_attach_client_exit(&mut self, now: Instant) {
-        let Some(remote) = self.workspace.active.binding.multiplexer.remote.clone() else {
-            self.close_active_pane();
-            return;
-        };
-        if self
-            .workspace
-            .active
-            .binding
-            .reattach
-            .is_some_and(|reattach| !reattach.started)
-        {
-            return;
-        }
-        let attached_for = self
-            .workspace
-            .active
-            .binding
-            .remote_attach_started
-            .map(|started| now.saturating_duration_since(started));
-        let reattach = RemoteReattach::after_failure(
-            self.workspace.active.binding.reattach,
-            attached_for,
-            now,
-        );
-        let error = format!(
-            "lost the connection to {}; reconnecting (attempt {})",
-            remote.host, reattach.attempts
-        );
-        self.last_error = Some(error.clone());
-        self.workspace
-            .active
-            .binding
-            .mux
-            .set_availability_error(Some(error));
-        self.workspace.active.binding.reattach = Some(reattach);
-    }
-
-    fn handle_attach_start_failure(&mut self, now: Instant, detail: &str) {
-        let Some(remote) = self.workspace.active.binding.multiplexer.remote.clone() else {
-            return;
-        };
-        let reattach =
-            RemoteReattach::after_failure(self.workspace.active.binding.reattach, None, now);
-        let error = format!(
-            "could not connect to {}: {detail}; reconnecting (attempt {})",
-            remote.host, reattach.attempts
-        );
-        self.last_error = Some(error.clone());
-        self.workspace
-            .active
-            .binding
-            .mux
-            .set_availability_error(Some(error));
-        self.workspace.active.binding.reattach = Some(reattach);
-    }
-
-    fn resolve_remote_attach_exit_after_refresh(&mut self, refresh_completed: bool) {
-        if self
-            .workspace
-            .active
-            .binding
-            .resolve_empty_remote_after_attach_exit(refresh_completed)
-            && self
-                .last_error
-                .as_deref()
-                .is_some_and(|error| error.starts_with("lost the connection to "))
-        {
-            self.last_error = None;
-        }
-    }
-    /// A remote attach client that has been alive long enough proves the connection is back, so the
-    /// next outage starts its backoff from the beginning rather than from where this one left off.
-    fn note_attach_client_alive(&mut self, now: Instant) {
-        let established = self
-            .workspace
-            .active
-            .binding
-            .remote_attach_started
-            .is_some_and(|started| {
-                now.saturating_duration_since(started) >= RemoteReattach::STABLE_AFTER
-            });
-        if established
-            && self
-                .workspace
-                .active
-                .binding
-                .reattach
-                .is_some_and(|reattach| reattach.started)
-        {
-            self.workspace.active.binding.reattach = None;
-            self.workspace
-                .active
-                .binding
-                .mux
-                .set_availability_error(None);
-        }
-    }
-
-    /// Drop the dead attach client once its backoff has passed. Clearing the pane's target is what
-    /// asks for a new one: this frame's pane sync starts a fresh client for the same session.
-    fn start_due_reattach(&mut self, now: Instant, effects: &mut Vec<AppEffect>) {
-        let Some(mut reattach) = self.workspace.active.binding.reattach else {
-            return;
-        };
-        if !reattach.due(now) {
-            // Nothing else is guaranteed to wake the frame loop while a pane sits disconnected, so
-            // the wait itself asks for the frame that ends it.
-            if !reattach.started {
-                effects.push(AppEffect::RepaintAfter(
-                    reattach.retry_at.saturating_duration_since(now),
-                ));
-            }
-            return;
-        }
-        reattach.started = true;
-        self.workspace.active.binding.reattach = Some(reattach);
-        self.workspace.active.binding.remote_attach_started = Some(now);
-        self.workspace.active.binding.terminal.discard_active_pane();
-    }
-
     pub fn reconnect_space_from_ui(&mut self, space_id: SpaceId) -> bool {
-        let now = Instant::now();
-        if space_id == self.workspace.active.id {
-            let mut restarted =
-                Self::restart_remote_binding(&mut self.workspace.active.binding, now);
-            for binding in &mut self.workspace.active.inactive_bindings {
-                restarted |= Self::restart_remote_binding(binding, now);
-            }
-            return restarted;
-        }
-        let Some(space) = self
-            .workspace
-            .inactive_spaces
-            .iter_mut()
-            .find(|space| space.id == space_id)
-        else {
-            return false;
-        };
-        let mut restarted = false;
-        for binding in space.bindings_mut() {
-            restarted |= Self::restart_remote_binding(binding, now);
-        }
-        restarted
-    }
-
-    fn has_degraded_remote(&self) -> bool {
-        self.workspace.active.binding.reattach.is_some()
-            || self
-                .workspace
-                .active
-                .inactive_bindings
-                .iter()
-                .any(|binding| binding.reattach.is_some())
-            || self
-                .workspace
-                .inactive_spaces
-                .iter()
-                .flat_map(SpaceRuntime::bindings)
-                .any(|binding| binding.reattach.is_some())
-    }
-
-    fn reset_remote_reconnects(&mut self, now: Instant) {
-        if self.workspace.active.binding.reattach.is_some() {
-            Self::restart_remote_binding(&mut self.workspace.active.binding, now);
-        }
-        for binding in &mut self.workspace.active.inactive_bindings {
-            if binding.reattach.is_some() {
-                Self::restart_remote_binding(binding, now);
-            }
-        }
-        for space in &mut self.workspace.inactive_spaces {
-            for binding in space.bindings_mut() {
-                if binding.reattach.is_some() {
-                    Self::restart_remote_binding(binding, now);
-                }
-            }
-        }
-    }
-
-    fn restart_remote_binding(binding: &mut BindingRuntime, now: Instant) -> bool {
-        let Some(remote) = binding.multiplexer.remote.as_ref() else {
-            return false;
-        };
-        binding.reattach = Some(RemoteReattach {
-            retry_at: now,
-            attempts: 1,
-            started: true,
-        });
-        binding.remote_attach_started = Some(now);
-        binding
-            .mux
-            .set_availability_error(Some(format!("reconnecting to {}", remote.host)));
-        binding.terminal.discard_active_pane();
-        true
+        self.workspace.reconnect_space(space_id, Instant::now())
     }
     // Close the focused pane (cmd+w or its shell exiting) and let the mux cascade to the tab. The
     // active terminal is dropped here so its PTY is reaped; sync_mux_anchor then attaches whatever
@@ -5443,29 +3571,10 @@ impl AppState {
     /// Close a specific native pane: remove it from the backend window, kill its PTY, collapse the
     /// split layout, and re-activate the surviving focused pane this frame so it doesn't flash idle.
     fn close_pane(&mut self, pane_id: &str) {
-        let session_id = self
-            .workspace
+        self.workspace
             .active
             .binding
-            .mux
-            .selected_session()
-            .unwrap_or("local")
-            .to_owned();
-        let mux_config = self.active_multiplexer().clone();
-        self.workspace.active.binding.mux.execute_command(
-            &self.repaint,
-            &mux_config,
-            MuxCommand::ClosePane {
-                session_id,
-                pane_id: Some(pane_id.to_owned()),
-            },
-        );
-        self.workspace.active.binding.terminal.discard_pane(pane_id);
-        let key = self.current_window_key();
-        if let Some(layout) = self.workspace.active.binding.pane_layouts.get_mut(&key) {
-            layout.remove(pane_id);
-        }
-        let _ = self.sync_terminal_panes();
+            .close_focused_pane(&self.repaint, pane_id);
     }
 
     pub(super) fn mux_operation_for_action(
@@ -5540,7 +3649,7 @@ impl AppState {
         if let MuxKeyAction::SelectPane(direction) = action
             && self.uses_native_terminal_layout()
         {
-            self.focus_pane_neighbor(layout_direction(direction));
+            self.focus_pane_neighbor(direction);
             return;
         }
         // Likewise next/previous pane cycle focus across the split layout's leaves; the mux-state

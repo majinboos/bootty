@@ -14,7 +14,7 @@ use bootty_app::{
     command_extensions::ExtensionHost,
     commands::{
         Caller, CommandCancellation, CommandCatalog, CommandExecutor, CommandInvocation,
-        CommandOutcome, app_command_channel,
+        CommandOutcome, app_command_channel_with_repaint,
     },
     control::ControlPlane,
 };
@@ -26,6 +26,15 @@ use serde_json::{Value, json};
 /// has to be generous enough to never expire on a healthy run. A dead fixture
 /// is caught by the `stopped` status instead of by the clock.
 const AGENT_BUDGET: Duration = Duration::from_secs(30);
+
+fn app_command_channel(
+    capacity: usize,
+) -> (
+    bootty_app::commands::AppCommandSender,
+    bootty_app::commands::AppCommandReceiver,
+) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
 
 #[test]
 fn pi_and_codex_keep_their_native_jsonl_protocols_outside_rust_core() {

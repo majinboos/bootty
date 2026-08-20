@@ -158,7 +158,6 @@ fn invalid_keybind_reload_keeps_the_last_good_derived_binding() {
 
     let effects = state.update_frame(FrameInputs {
         now: Instant::now(),
-        stable_dt_ms: 1.0,
         events: vec![egui::Event::Key {
             key: egui::Key::K,
             physical_key: None,

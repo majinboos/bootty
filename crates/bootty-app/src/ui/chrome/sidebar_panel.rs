@@ -6,11 +6,7 @@ use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 use crate::{
     assets,
     command_extensions::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem},
-    config::ChromeConfig,
-    mux::{
-        controller::{MuxScope, SpaceId},
-        snapshot::MuxSession,
-    },
+    mux::controller::{MuxScope, SpaceId},
     strings::truncate_label,
     ui::{
         icons::paint_icon_slug,
@@ -1006,29 +1002,6 @@ fn sidebar_title_layout(rect: Rect, reserve_titlebar_buttons: bool) -> SidebarTi
         icon_rect,
         title_pos: Pos2::new(icon_rect.max.x + 10.0, center_y),
     }
-}
-
-pub fn sidebar_rect(rect: Rect, chrome: &ChromeConfig) -> Rect {
-    let width = if chrome.sidebar {
-        chrome.sidebar_width
-    } else {
-        0.0
-    };
-    Rect::from_min_max(
-        rect.min,
-        Pos2::new((rect.min.x + width).min(rect.max.x), rect.max.y),
-    )
-}
-
-pub fn selected_session_name<'a>(
-    sessions: &'a [MuxSession],
-    selected_session: Option<&str>,
-) -> Option<&'a str> {
-    let selected = selected_session?;
-    sessions
-        .iter()
-        .find(|session| session.id == selected || session.name == selected)
-        .map(|session| session.name.as_str())
 }
 
 fn sidebar_item_row(

@@ -55,12 +55,6 @@ pub fn home_dir() -> Option<PathBuf> {
     crate::config::default_working_directory()
 }
 
-pub fn is_hidden_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with('.') && name != ".config")
-}
-
 pub fn truncate_label(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
     push_truncated_label(&mut out, text, max_chars);

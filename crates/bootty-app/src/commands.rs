@@ -1025,17 +1025,6 @@ fn schema_for(id: &str) -> CompactSchema {
     }
 }
 
-fn argument(name: &str, value_type: ValueType) -> ArgumentSchema {
-    ArgumentSchema {
-        name: name.to_owned(),
-        value_type,
-        required: true,
-        choices: Vec::new(),
-        minimum: None,
-        maximum: None,
-    }
-}
-
 fn bounded_integer(name: &str, minimum: i64, maximum: i64) -> ArgumentSchema {
     ArgumentSchema {
         minimum: Some(minimum),
@@ -1055,6 +1044,16 @@ fn choice(name: &str, required: bool, choices: &[&str]) -> ArgumentSchema {
     }
 }
 
+fn argument(name: &str, value_type: ValueType) -> ArgumentSchema {
+    ArgumentSchema {
+        name: name.to_owned(),
+        value_type,
+        required: true,
+        choices: Vec::new(),
+        minimum: None,
+        maximum: None,
+    }
+}
 fn resource_kind(value: &str) -> Option<ResourceKind> {
     match value {
         "instance" => Some(ResourceKind::Instance),
@@ -1173,10 +1172,6 @@ pub struct AppCommandReceiver {
 pub enum AppCommandSendError {
     Overloaded,
     Shutdown,
-}
-
-pub fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
-    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
 }
 
 pub fn app_command_channel_with_repaint(

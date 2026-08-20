@@ -9,9 +9,13 @@ use std::{
 
 use bootty_config::config::MultiplexerBackendConfig;
 
-use super::state::{
-    AppEffect, AppState, ViewportSnapshot, mux_split_direction, new_mux_session_request_with_name,
-    terminal_cwd_for_mux_command,
+use super::{
+    binding_panes::mux_split_direction,
+    binding_session_names::{session_cwd, suggested_session_name},
+    state::{
+        AppEffect, AppState, ViewportSnapshot, new_mux_session_request_with_name,
+        terminal_cwd_for_mux_command,
+    },
 };
 use crate::{
     app_actions::{AppAction, KeybindAction, MuxKeyAction},
@@ -823,8 +827,8 @@ impl AppState {
         if action == MuxKeyAction::NewTab && path.first().is_some_and(|part| part == "no-session") {
             let remote = self.active_multiplexer().remote.is_some();
             let cwd = new_mux_session_request_with_name(self.config(), "").cwd;
-            let cwd = Self::session_cwd(&cwd, remote);
-            let display_name = Self::suggested_session_name(&cwd, remote);
+            let cwd = session_cwd(&cwd, remote);
+            let display_name = suggested_session_name(&cwd, remote);
             let session_id = crate::strings::unique_session_name(
                 &display_name,
                 self.taken_session_names(None).iter().map(String::as_str),

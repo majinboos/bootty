@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use bootty_app::{
-    command_extensions::{ModuleCoord, ModuleItem, ModulePrimitive},
+    command_extensions::{ModuleCoord, ModuleItem, ModulePrimitive, PublishedSurfaceItem},
     mux::{
         controller::{BindingId, MuxScope, SpaceId},
         snapshot::{MuxPaneAnchor, MuxSession},
@@ -12,8 +12,8 @@ use bootty_app::{
         session_navigation::BindingSessionGroup,
         sidebar::{
             SidebarDisplay, SidebarItemKind, SidebarTree, build_binding_sidebar_items,
-            build_sidebar_items, build_sidebar_items_from_module_items,
-            build_visible_sidebar_items, session_group, session_suffix, sidebar_session_colors,
+            build_sidebar_items_from_published_items, session_group, session_suffix,
+            sidebar_session_colors,
         },
     },
 };
@@ -150,7 +150,16 @@ fn extension_session_rows_keep_identity_style_and_selection() {
         },
     ];
 
-    let rows = build_sidebar_items_from_module_items(&items, scope(0), Some("$1"), true);
+    let published = items
+        .into_iter()
+        .map(|item| PublishedSurfaceItem {
+            module: "test.luau".to_owned(),
+            generation: 1,
+            surface: "sidebar".to_owned(),
+            item,
+        })
+        .collect::<Vec<_>>();
+    let rows = build_sidebar_items_from_published_items(&published, scope(0), Some("$1"), true);
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].session_id, Some("$1"));
@@ -213,27 +222,43 @@ fn native_sessions_project_to_grouped_sidebar_rows() {
         session("$1", "work/api", "zsh"),
         session("$2", "work/ui", "nvim"),
     ];
+    let groups = [BindingSessionGroup {
+        scope: scope(0),
+        label: "Native".to_owned(),
+        sessions,
+        selected_session: Some("$1".to_owned()),
+        active: true,
+        can_return_to_last_session: false,
+        display_names: HashMap::new(),
+    }];
+    let items = build_binding_sidebar_items(&groups);
 
-    let items = build_sidebar_items(&sessions, Some("$1"));
-
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 4);
     assert_eq!(
-        items[1].display,
+        items[2].display,
         SidebarDisplay::Numbered {
             number: 1,
             label: "api"
         }
     );
-    assert_eq!(items[1].tree, SidebarTree::Middle);
-    assert_eq!(items[2].tree, SidebarTree::Last);
+    assert_eq!(items[2].tree, SidebarTree::Middle);
+    assert_eq!(items[3].tree, SidebarTree::Last);
 }
 
 #[test]
 fn selected_session_is_the_only_current_sidebar_row() {
     let mut sessions = vec![session("$1", "one", "zsh"), session("$2", "two", "fish")];
     sessions[0].active = true;
-
-    let items = build_sidebar_items(&sessions, Some("$2"));
+    let groups = [BindingSessionGroup {
+        scope: scope(0),
+        label: "Native".to_owned(),
+        sessions,
+        selected_session: Some("$2".to_owned()),
+        active: true,
+        can_return_to_last_session: false,
+        display_names: HashMap::new(),
+    }];
+    let items = build_binding_sidebar_items(&groups);
     let current = items
         .iter()
         .filter(|item| matches!(item.kind, SidebarItemKind::Session { .. }) && item.current)
@@ -255,23 +280,6 @@ fn ungrouped_sessions_receive_distinct_accent_colors() {
     assert_eq!(colors.len(), 2);
     assert_ne!(colors[0].color, colors[1].color);
     assert_ne!(colors[0].dim_color, colors[1].dim_color);
-}
-
-#[test]
-fn visible_sidebar_projection_is_a_prefix_of_the_full_projection() {
-    let sessions = (0..40)
-        .map(|index| {
-            session(
-                &format!("${index}"),
-                &format!("group-{index}/session"),
-                "zsh",
-            )
-        })
-        .collect::<Vec<_>>();
-    let full = build_sidebar_items(&sessions, Some("$2"));
-    let visible = build_visible_sidebar_items(&sessions, Some("$2"), 17);
-
-    assert_eq!(visible.as_slice(), &full[..17]);
 }
 
 #[test]

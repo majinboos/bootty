@@ -1,12 +1,13 @@
-use std::{hint::black_box, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, hint::black_box, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use bootty_app::{
-    app::{AppState, FrameInputs, ViewportSnapshot},
+    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::{TerminalGeometry, ViewTransform},
     mux::{
         RepaintHandle,
+        controller::{BindingId, MuxScope, SpaceId},
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
     renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
@@ -14,8 +15,11 @@ use bootty_app::{
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
         icons,
-        sidebar::build_sidebar_items,
+        session_navigation::BindingSessionGroup,
+        sidebar::build_binding_sidebar_items,
+        space::SpaceEditorEvent,
     },
+    workspace::SpaceMuxOverride,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::{egui, wgpu};
@@ -93,12 +97,23 @@ fn app_state(sidebar: bool) -> AppState {
 fn app_state_with_spaces(count: usize) -> AppState {
     let mut state = app_state(false);
     for index in 1..count {
-        assert!(state.create_space_from_ui(
-            &format!("Benchmark Space {index}"),
-            "folder",
-            [0x7a, 0xa2, 0xf7],
-            false,
-        ));
+        assert!(state.open_create_space_dialog_from_ui());
+        let ModalDialog::SpaceEditor(dialog) =
+            state.take_modal_dialog().expect("create Space dialog")
+        else {
+            panic!("expected Space editor dialog");
+        };
+        state.apply_space_editor_event(
+            dialog,
+            SpaceEditorEvent::Save {
+                space_id: None,
+                name: format!("Benchmark Space {index}"),
+                icon: "folder".to_owned(),
+                color: [0x7a, 0xa2, 0xf7],
+                tint_sidebar: false,
+                mux: SpaceMuxOverride::default(),
+            },
+        );
     }
     state
 }
@@ -110,7 +125,6 @@ fn frame_inputs_at(
 ) -> FrameInputs {
     FrameInputs {
         now,
-        stable_dt_ms: 16.0,
         events,
         dropped_file_paths: Vec::<PathBuf>::new(),
         modifiers: egui::Modifiers::default(),
@@ -196,7 +210,7 @@ fn sidebar_sessions(count: usize) -> Vec<MuxSession> {
         .collect()
 }
 
-fn sidebar_ui_frame(ui: &mut egui::Ui, sessions: &[MuxSession], selected: Option<&str>) {
+fn sidebar_ui_frame(ui: &mut egui::Ui, group: &BindingSessionGroup) {
     let palette = bootty_ui::ThemePalette::default();
     let sidebar_rect = egui::Rect::from_min_size(FRAME_RECT.min, egui::vec2(280.0, 900.0));
     ui.scope_builder(
@@ -204,7 +218,7 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, sessions: &[MuxSession], selected: Option
             .max_rect(sidebar_rect)
             .layout(egui::Layout::top_down(egui::Align::Min)),
         |ui| {
-            let items = build_sidebar_items(sessions, selected);
+            let items = build_binding_sidebar_items(std::slice::from_ref(group));
             black_box(chrome::show_sidebar(
                 ui,
                 palette,
@@ -212,8 +226,8 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, sessions: &[MuxSession], selected: Option
                 SidebarModel {
                     items: &items,
                     footer_items: &[],
-                    session_count: sessions.len(),
-                    has_sessions: !sessions.is_empty(),
+                    session_count: group.sessions.len(),
+                    has_sessions: !group.sessions.is_empty(),
                     title_visible: true,
                     reserve_titlebar_buttons: true,
                     title_icon: None,
@@ -399,7 +413,16 @@ fn bench_egui_app_frames(c: &mut Criterion) {
     let sessions = sidebar_sessions(SIDEBAR_FRAME_SESSIONS);
     let selected = sessions
         .get(SIDEBAR_FRAME_SESSIONS / 2)
-        .map(|session| session.id.as_str());
+        .map(|session| session.id.clone());
+    let group = BindingSessionGroup {
+        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
+        label: "Native".to_owned(),
+        sessions,
+        selected_session: selected.clone(),
+        active: true,
+        can_return_to_last_session: false,
+        display_names: HashMap::new(),
+    };
     let context = egui::Context::default();
     icons::install_icon_fonts(&context);
 
@@ -437,8 +460,8 @@ fn bench_egui_app_frames(c: &mut Criterion) {
                 },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        sidebar_ui_frame(ui, black_box(&sessions), selected);
-                        status_ui_frame(ui, selected);
+                        sidebar_ui_frame(ui, black_box(&group));
+                        status_ui_frame(ui, selected.as_deref());
                     });
                 },
             );
@@ -464,8 +487,8 @@ fn bench_egui_app_frames(c: &mut Criterion) {
                     },
                     |ui| {
                         egui::CentralPanel::default().show(ui, |ui| {
-                            sidebar_ui_frame(ui, black_box(&sessions), selected);
-                            status_ui_frame(ui, selected);
+                            sidebar_ui_frame(ui, black_box(&group));
+                            status_ui_frame(ui, selected.as_deref());
                             terminal_widget_frame(ui, &mut combined_terminal, &mut combined_widget);
                         });
                     },

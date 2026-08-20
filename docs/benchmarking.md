@@ -2,8 +2,8 @@
 
 Bootty keeps routine validation fast while preserving benchmark seams for deeper
 performance work. This document is the stable process guide for benchmark use,
-claim hygiene, result schemas, and host-specific evidence collection. Benchmark
-numbers and hillclimb findings belong in `docs/benchmark-report.md`, not here.
+claim hygiene, result schemas, and host-specific evidence collection. Local
+measurements and hillclimb findings are vault research artifacts.
 
 ## Runtime guardrails
 

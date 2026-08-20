@@ -4,10 +4,7 @@ use eframe::egui::Color32;
 
 use crate::{
     command_extensions::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem},
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::MuxSession,
-    },
+    mux::{controller::MuxScope, snapshot::MuxSession},
     ui::session_navigation::BindingSessionGroup,
 };
 
@@ -66,37 +63,6 @@ pub struct SidebarItem<'a> {
     pub extension_action: Option<ExtensionUiAction>,
 }
 
-pub fn build_sidebar_items<'a>(
-    sessions: &'a [MuxSession],
-    selected_session: Option<&str>,
-) -> Vec<SidebarItem<'a>> {
-    build_sidebar_items_inner(
-        default_scope(),
-        sessions,
-        &[],
-        selected_session,
-        true,
-        false,
-        None,
-    )
-}
-
-pub fn build_visible_sidebar_items<'a>(
-    sessions: &'a [MuxSession],
-    selected_session: Option<&str>,
-    max_rows: usize,
-) -> Vec<SidebarItem<'a>> {
-    build_sidebar_items_inner(
-        default_scope(),
-        sessions,
-        &[],
-        selected_session,
-        true,
-        false,
-        Some(max_rows),
-    )
-}
-
 pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec<SidebarItem<'a>> {
     let mut items = Vec::new();
     for group in groups {
@@ -130,7 +96,6 @@ pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec
             group.selected_session.as_deref(),
             group.active,
             group.can_return_to_last_session,
-            None,
         );
         for item in &mut binding_items {
             item.indent = item.indent.saturating_add(2);
@@ -139,10 +104,6 @@ pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec
         items.extend(binding_items);
     }
     items
-}
-
-fn default_scope() -> MuxScope {
-    MuxScope::new(SpaceId::from_persistence(0), BindingId::from_persistence(0))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,26 +141,6 @@ pub fn sidebar_session_colors<'a>(
                 color,
                 dim_color,
             })
-        })
-        .collect()
-}
-
-pub fn build_sidebar_items_from_module_items<'a>(
-    items: &'a [ModuleItem],
-    scope: MuxScope,
-    selected_session: Option<&str>,
-    can_return_to_last_session: bool,
-) -> Vec<SidebarItem<'a>> {
-    items
-        .iter()
-        .filter_map(|item| {
-            sidebar_item_from_module_item(
-                item,
-                None,
-                scope,
-                selected_session,
-                can_return_to_last_session,
-            )
         })
         .collect()
 }
@@ -319,14 +260,10 @@ fn build_sidebar_items_inner<'a>(
     selected_session: Option<&str>,
     binding_active: bool,
     can_return_to_last_session: bool,
-    max_rows: Option<usize>,
 ) -> Vec<SidebarItem<'a>> {
-    if max_rows == Some(0) {
-        return Vec::new();
-    }
     let mut group_meta = GroupMeta::new(sessions, display_names);
     let full_capacity = sessions.len().saturating_mul(6);
-    let mut items = Vec::with_capacity(max_rows.unwrap_or(full_capacity).min(full_capacity));
+    let mut items = Vec::with_capacity(full_capacity);
     let mut ordinal = 0usize;
     let mut last_group = "";
 
@@ -392,9 +329,6 @@ fn build_sidebar_items_inner<'a>(
                     primitives: &[],
                     extension_action: None,
                 });
-                if max_rows.is_some_and(|limit| items.len() >= limit) {
-                    break;
-                }
             }
             let suffix = session_suffix(display_name);
             let label = if suffix.is_empty() { group } else { suffix };
@@ -439,10 +373,6 @@ fn build_sidebar_items_inner<'a>(
             primitives: &[],
             extension_action: None,
         });
-        if max_rows.is_some_and(|limit| items.len() >= limit) {
-            break;
-        }
-
         last_group = group;
     }
 
@@ -480,8 +410,6 @@ struct GroupMeta<'a> {
     dynamic_total: usize,
 }
 
-const HASHED_GROUP_LOOKUP_THRESHOLD: usize = 32;
-
 impl<'a> GroupMeta<'a> {
     /// Groups sessions by the name bootty shows, so a backend-only uniqueness suffix cannot split a
     /// project into two groups. `display_names` pairs with `sessions` by position and may be short,
@@ -490,7 +418,7 @@ impl<'a> GroupMeta<'a> {
     fn new(sessions: &'a [MuxSession], display_names: &[&'a str]) -> Self {
         let mut groups = Vec::<GroupSummary<'a>>::new();
         let mut session_groups = Vec::with_capacity(sessions.len());
-        let mut lookup = None::<HashMap<&'a str, usize>>;
+        let mut lookup = HashMap::<&'a str, usize>::new();
         for (index, session) in sessions.iter().enumerate() {
             let group = session_group(
                 display_names
@@ -498,21 +426,8 @@ impl<'a> GroupMeta<'a> {
                     .copied()
                     .unwrap_or(session.name.as_str()),
             );
-            if let Some(index) = lookup
-                .as_ref()
-                .and_then(|lookup| lookup.get(group).copied())
-            {
+            if let Some(index) = lookup.get(group).copied() {
                 groups[index].count += 1;
-                session_groups.push(index);
-                continue;
-            }
-            if lookup.is_none()
-                && let Some((index, existing)) = groups
-                    .iter_mut()
-                    .enumerate()
-                    .find(|(_, summary)| summary.name == group)
-            {
-                existing.count += 1;
                 session_groups.push(index);
                 continue;
             }
@@ -525,17 +440,7 @@ impl<'a> GroupMeta<'a> {
                 position: 0,
             });
             session_groups.push(index);
-            if let Some(lookup) = &mut lookup {
-                lookup.insert(group, index);
-            } else if groups.len() > HASHED_GROUP_LOOKUP_THRESHOLD {
-                lookup = Some(
-                    groups
-                        .iter()
-                        .enumerate()
-                        .map(|(index, summary)| (summary.name, index))
-                        .collect(),
-                );
-            }
+            lookup.insert(group, index);
         }
         let dynamic_total = groups.len();
         Self {

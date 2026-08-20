@@ -1,24 +1,8 @@
-use std::{
-    fs::File,
-    io::Write,
-    time::{Duration, Instant},
-};
+use std::{fs::File, io::Write, time::Instant};
 
-use crate::{
-    config::BoottyConfig, renderer::RendererMetrics, strings::csv_field, terminal::DrainStats,
-};
-
-pub const STATUS_METRICS_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+use crate::{config::BoottyConfig, strings::csv_field};
 
 pub use bootty_runtime::latency::{start as latency_start, trace_phase, trace_slow};
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StatusMetrics {
-    pub drain: DrainStats,
-    pub renderer: RendererMetrics,
-    pub cols: u16,
-    pub rows: u16,
-}
 
 pub struct StabilityTrace {
     pub started_at: Instant,
@@ -70,12 +54,4 @@ pub struct StabilityTraceSample<'a> {
     pub drain_elapsed_us: u64,
     pub text_runs: usize,
     pub last_error: Option<&'a str>,
-}
-
-pub fn should_sample_status_metrics(elapsed: Duration) -> bool {
-    elapsed >= STATUS_METRICS_SAMPLE_INTERVAL
-}
-
-pub fn us_to_ms(us: u64) -> f32 {
-    us as f32 / 1000.0
 }
