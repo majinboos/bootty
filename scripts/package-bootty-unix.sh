@@ -7,6 +7,7 @@ CLI_NAME="bootty"
 BUNDLE_IDENTIFIER="dev.bootty.desktop"
 PACKAGE_NAME="bootty"
 DAEMON_BINARY_NAME="bootty-daemon"
+DAEMON_PACKAGE_NAME="bootty-daemon"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
 TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
 DAEMON_OUTPUT_DIR="${BOOTTY_DAEMON_OUTPUT_DIR:-$TARGET_ROOT/bootty-daemons}"
@@ -22,9 +23,12 @@ VERSION="${BOOTTY_VERSION:-$(awk '
 
 PROFILE="release"
 CARGO_PROFILE_ARGS=(--release)
+DAEMON_PROFILE="daemon-release"
+DAEMON_PROFILE_ARGS=(--profile daemon-release)
 FAST=0
 LINKAGE="dynamic"
 DEV=0
+ALL_DAEMONS=0
 while (($#)); do
   case "$1" in
     --fast)
@@ -35,6 +39,9 @@ while (($#)); do
       ;;
     --dev)
       DEV=1
+      ;;
+    --all-daemons)
+      ALL_DAEMONS=1
       ;;
     *)
       echo "unknown package argument: $1" >&2
@@ -51,6 +58,8 @@ fi
 if [[ "$FAST" -eq 1 ]]; then
   PROFILE="fast-release"
   CARGO_PROFILE_ARGS=(--profile fast-release)
+  DAEMON_PROFILE="fast-release"
+  DAEMON_PROFILE_ARGS=(--profile fast-release)
 elif [[ "$LINKAGE" == "dynamic" ]]; then
   PROFILE="dynamic-release"
   CARGO_PROFILE_ARGS=(--profile dynamic-release)
@@ -58,6 +67,9 @@ fi
 CARGO_BUILD_ARGS=("${CARGO_PROFILE_ARGS[@]}")
 if [[ "$DEV" -eq 1 ]]; then
   CARGO_BUILD_ARGS+=(--features bootty-dev)
+fi
+if [[ -n "${BOOTTY_DAEMON_OUTPUT_DIR+x}" ]]; then
+  ALL_DAEMONS=1
 fi
 
 VERSION="${VERSION:-0.0.0}"
@@ -191,8 +203,15 @@ copy_dynamic_libraries() {
 }
 
 ensure_project_zig
-RUSTFLAGS= "$SCRIPT_DIR/build-bootty-daemons.sh"
-verify_daemons
+if [[ "$ALL_DAEMONS" -eq 1 ]]; then
+  RUSTFLAGS= "$SCRIPT_DIR/build-bootty-daemons.sh"
+  verify_daemons
+  HOST_DAEMON_TARGET="$(host_daemon_target)"
+  HOST_DAEMON_PATH="$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET"
+else
+  RUSTFLAGS= cargo build "${DAEMON_PROFILE_ARGS[@]}" -p "$DAEMON_PACKAGE_NAME" --bin "$DAEMON_BINARY_NAME"
+  HOST_DAEMON_PATH="$TARGET_ROOT/$DAEMON_PROFILE/$DAEMON_BINARY_NAME"
+fi
 if [[ "$LINKAGE" == "dynamic" ]]; then
   enable_dynamic_linkage
 fi
@@ -211,13 +230,14 @@ case "$(uname -s)" in
 
     mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$MACOS_DIR/$BINARY_NAME"
-    HOST_DAEMON_TARGET="$(host_daemon_target)"
-    cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$MACOS_DIR/$DAEMON_BINARY_NAME"
-    mkdir -p "$RESOURCES_DIR/daemons"
-    for target in "${daemon_targets[@]}"; do
-      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$RESOURCES_DIR/daemons/"
-      chmod +x "$RESOURCES_DIR/daemons/bootty-daemon-$target"
-    done
+    cp "$HOST_DAEMON_PATH" "$MACOS_DIR/$DAEMON_BINARY_NAME"
+    if [[ "$ALL_DAEMONS" -eq 1 ]]; then
+      mkdir -p "$RESOURCES_DIR/daemons"
+      for target in "${daemon_targets[@]}"; do
+        cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$RESOURCES_DIR/daemons/"
+        chmod +x "$RESOURCES_DIR/daemons/bootty-daemon-$target"
+      done
+    fi
     chmod +x "$MACOS_DIR/$DAEMON_BINARY_NAME"
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$MACOS_DIR/$BINARY_NAME" "$CONTENTS_DIR/Frameworks"
@@ -308,13 +328,14 @@ PLIST
       "$ROOT_DIR/share/icons/hicolor/scalable/apps"
 
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$ROOT_DIR/bin/$CLI_NAME"
-    HOST_DAEMON_TARGET="$(host_daemon_target)"
-    cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
-    mkdir -p "$ROOT_DIR/share/bootty/daemons"
-    for target in "${daemon_targets[@]}"; do
-      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$ROOT_DIR/share/bootty/daemons/"
-      chmod +x "$ROOT_DIR/share/bootty/daemons/bootty-daemon-$target"
-    done
+    cp "$HOST_DAEMON_PATH" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
+    if [[ "$ALL_DAEMONS" -eq 1 ]]; then
+      mkdir -p "$ROOT_DIR/share/bootty/daemons"
+      for target in "${daemon_targets[@]}"; do
+        cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$ROOT_DIR/share/bootty/daemons/"
+        chmod +x "$ROOT_DIR/share/bootty/daemons/bootty-daemon-$target"
+      done
+    fi
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$ROOT_DIR/bin/$CLI_NAME" "$ROOT_DIR/lib"
     fi

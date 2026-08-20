@@ -105,7 +105,7 @@ description = "Build daemon assets for every target in the daemon target manifes
 run = "./scripts/build-bootty-daemons.sh"
 
 [tasks.package]
-description = "Package the app bundle with all daemon targets; pass --static for distribution or --fast for fast-release"
+description = "Package with the host daemon; pass --all-daemons for every remote target, --static for distribution, or --fast for fast-release"
 run = "./scripts/package-bootty-unix.sh"
 
 [tasks."package:dev"]
@@ -117,7 +117,7 @@ description = "Package the Windows zip from BOOTTY_DAEMON_OUTPUT_DIR; pass --sta
 run = "pwsh ./scripts/package-bootty-windows.ps1"
 
 [tasks.install]
-description = "Package and install Bootty with dynamic local linkage; pass --static for distribution or --fast for fast-release"
+description = "Package and install Bootty with the host daemon; pass --fast for fast-release"
 run = "./scripts/install-bootty-unix.sh"
 run_windows = "pwsh ./scripts/install-bootty-windows.ps1"
 
