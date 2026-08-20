@@ -3,7 +3,9 @@ use bootty_app::application_identity::{
     windows_daemon_state_path,
 };
 use bootty_app::config::default_config_path;
-use bootty_mux::{bootty_rmux_endpoint_path_for, bootty_rmux_socket_name};
+use bootty_rmux::{
+    endpoint_path_for as bootty_rmux_endpoint_path_for, socket_name as bootty_rmux_socket_name,
+};
 
 #[test]
 fn production_and_development_are_distinct_application_singletons() {

@@ -15,7 +15,7 @@
 
 ## Run Modes
 
-- Full app: `cargo run -p bootty-app --bin bootty`
+- Full app: `cargo run -p bootty --bin bootty`
 - Bare WGPU host: `cargo run -p bootty-app --example bare`
 - eframe tabs example: `cargo run -p bootty-app --example egui-tabs`
 
@@ -101,7 +101,7 @@ The pre-commit hook runs `cargo fmt --check` and
 
 ## Manual Verification
 
-- `cargo run -p bootty-app --bin bootty` must open the full Bootty window with tmux
+- `cargo run -p bootty --bin bootty` must open the full Bootty window with tmux
   chrome, status metrics, and visible terminal glyphs.
 - `cargo run -p bootty-app --example bare` must open a native bare terminal window;
   shell output in the launching terminal is not sufficient.

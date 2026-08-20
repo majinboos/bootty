@@ -11,6 +11,7 @@ mod mux_config;
 mod remote_reconnect;
 mod state;
 mod terminal_config;
+mod terminal_interaction;
 mod terminal_workspace_view;
 mod workspace_runtime;
 mod workspace_sessions;

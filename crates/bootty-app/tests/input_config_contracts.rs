@@ -8,6 +8,8 @@ use bootty_app::{
     renderer::RendererMetrics,
 };
 
+mod support;
+
 fn entries(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
@@ -75,7 +77,7 @@ fn invalid_modifier_remap_startup_fails_before_the_workspace_opens() {
         .expect("write structurally valid config");
     let config = load_config_from_path(&config_path).expect("load structurally valid config");
 
-    let error = match AppState::new(config, Arc::new(|| {}), None, None) {
+    let error = match AppState::new(config, support::backends(), Arc::new(|| {}), None, None) {
         Ok(_) => panic!("invalid modifier remap must stop startup"),
         Err(error) => error,
     };
@@ -94,7 +96,7 @@ fn invalid_app_keybind_startup_fails_before_the_workspace_opens() {
         .expect("write structurally valid config");
     let config = load_config_from_path(&config_path).expect("load structurally valid config");
 
-    let error = match AppState::new(config, Arc::new(|| {}), None, None) {
+    let error = match AppState::new(config, support::backends(), Arc::new(|| {}), None, None) {
         Ok(_) => panic!("invalid app keybind must stop startup"),
         Err(error) => error,
     };
@@ -113,7 +115,7 @@ fn invalid_inactive_backend_keybind_fails_before_the_workspace_opens() {
     .expect("write structurally valid config");
     let config = load_config_from_path(&config_path).expect("load structurally valid config");
 
-    let error = match AppState::new(config, Arc::new(|| {}), None, None) {
+    let error = match AppState::new(config, support::backends(), Arc::new(|| {}), None, None) {
         Ok(_) => panic!("invalid inactive backend keybind must stop startup"),
         Err(error) => error,
     };
@@ -128,7 +130,8 @@ fn invalid_modifier_remap_reload_keeps_the_last_good_config() {
     std::fs::write(&config_path, "[input]\nmodifier-remap = [\"alt=ctrl\"]\n")
         .expect("write valid config");
     let config = load_config_from_path(&config_path).expect("load valid config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
 
     std::fs::write(&config_path, "[input]\nmodifier-remap = [\"alt\"]\n")
         .expect("write invalid modifier remap");
@@ -150,7 +153,8 @@ fn invalid_keybind_reload_keeps_the_last_good_derived_binding() {
     )
     .expect("write valid config");
     let config = load_config_from_path(&config_path).expect("load valid config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
 
     std::fs::write(&config_path, "[input]\nkeybind = [\"clear\", \"broken\"]\n")
         .expect("write invalid keybind");

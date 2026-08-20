@@ -133,14 +133,18 @@ fn tmux_wrap(payload: &[u8]) -> Vec<u8> {
 
 fn raw_kitty_terminal() -> libghostty_vt::ffi::Terminal {
     let mut terminal: libghostty_vt::ffi::Terminal = std::ptr::null_mut();
-    let options = libghostty_vt::ffi::TerminalOptions {
-        cols: 10,
-        rows: 4,
-        max_scrollback: 0,
-    };
     unsafe {
         assert_eq!(
-            libghostty_vt::ffi::ghostty_terminal_new(std::ptr::null(), &mut terminal, options),
+            libghostty_vt::ffi::ghostty_terminal_new(std::ptr::null(), &mut terminal, 10, 4),
+            libghostty_vt::ffi::Result::SUCCESS,
+        );
+        let scrollback_limit = 0_usize;
+        assert_eq!(
+            libghostty_vt::ffi::ghostty_terminal_set(
+                terminal,
+                libghostty_vt::ffi::TerminalOption::SCROLLBACK_MAX_BYTES,
+                (&scrollback_limit as *const usize).cast(),
+            ),
             libghostty_vt::ffi::Result::SUCCESS,
         );
         assert_eq!(
@@ -185,6 +189,10 @@ fn write_temp_fixture(name: &str, bytes: &[u8]) -> Result<TempFixture> {
         .unwrap_or("test")
         .replace("::", "-");
     let path = std::env::temp_dir().join(format!("bootty-{name}-{}-{thread}", std::process::id()));
+    write_fixture_at(path, bytes)
+}
+
+fn write_fixture_at(path: PathBuf, bytes: &[u8]) -> Result<TempFixture> {
     std::fs::write(&path, bytes)?;
     // Ghostty's kitty temp-dir check prefix-matches against the TMP/TEMP env
     // value, so keep the env-form path on Windows; canonicalize would turn it
@@ -196,6 +204,18 @@ fn write_temp_fixture(name: &str, bytes: &[u8]) -> Result<TempFixture> {
         path.canonicalize()?
     };
     Ok(TempFixture { path })
+}
+
+fn write_kitty_temporary_fixture(bytes: &[u8]) -> Result<TempFixture> {
+    let thread = std::thread::current()
+        .name()
+        .unwrap_or("test")
+        .replace("::", "-");
+    let path = std::env::temp_dir().join(format!(
+        "tty-graphics-protocol-bootty-{}-{thread}.png",
+        std::process::id()
+    ));
+    write_fixture_at(path, bytes)
 }
 
 fn file_payload(path: impl AsRef<std::path::Path>) -> Result<String> {
@@ -437,6 +457,21 @@ fn terminal_engine_loads_kitty_png_from_regular_file() -> Result<()> {
     assert_eq!(frame.images.placements.len(), 1);
     assert_eq!(frame.images.placements[0].image_width, 1);
     assert_eq!(frame.images.placements[0].image_height, 1);
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_loads_kitty_png_from_temporary_file() -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    let path = write_kitty_temporary_fixture(&base64_decode_ascii(ONE_PIXEL_PNG_BASE64)?)?;
+    let command = format!("\x1b_Ga=T,f=100,t=t,q=1;{}\x1b\\", file_payload(&path)?);
+
+    engine.write_vt(command.as_bytes());
+    let frame = engine.extract_frame()?;
+    assert_eq!(frame.images.placements.len(), 1);
+    assert_eq!(frame.images.placements[0].image_width, 1);
+    assert_eq!(frame.images.placements[0].image_height, 1);
+    assert!(!path.as_ref().exists());
     Ok(())
 }
 

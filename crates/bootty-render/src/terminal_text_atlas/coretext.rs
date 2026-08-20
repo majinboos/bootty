@@ -427,7 +427,9 @@ pub(super) fn rasterize_color_with_family(
             }
         }
 
-        rgba.chunks_exact(4)
+        rgba.as_chunks::<4>()
+            .0
+            .iter()
             .any(|pixel| pixel[3] > 0)
             .then_some(rgba)
     }

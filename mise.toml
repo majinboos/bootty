@@ -1,7 +1,6 @@
 [tools]
 rust = "stable"
-# macOS must use Homebrew/system Zig for libghostty; mise manages Zig elsewhere.
-zig = { version = "0.15.2", os = ["linux", "windows"] }
+zig = "0.16.0"
 "cargo:cargo-xwin" = "0.23.0"
 "cargo:cargo-zigbuild" = "0.23.0"
 

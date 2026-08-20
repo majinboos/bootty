@@ -4,7 +4,7 @@ Bootty uses `libghostty-rs` as an external binding crate for Ghostty terminal
 state and parsing.
 
 - Source: `https://github.com/Uzaaft/libghostty-rs.git`
-- Ref: `c1fe97a6bed015209d59e8772e4e9e49311d8bc5`
+- Ref: `e025ef03e8a3f10603c7a3253e63c49b36f1ff0d`
 - Dependency: workspace `libghostty-vt` Git dependency in `Cargo.toml`
 - License: see the upstream repository
 

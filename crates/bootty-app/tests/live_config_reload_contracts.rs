@@ -9,13 +9,16 @@ use bootty_app::{
     mux::snapshot::MuxPaneAnchor,
 };
 
+mod support;
+
 #[test]
 fn live_terminal_policy_reload_accepts_one_complete_candidate() {
     let directory = tempfile::tempdir().expect("temporary config directory");
     let config_path = directory.path().join("config.toml");
     std::fs::write(&config_path, "[appearance]\nmode = \"dark\"\n").expect("write initial config");
     let config = load_config_from_path(&config_path).expect("load initial config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
 
     std::fs::write(
         &config_path,
@@ -60,7 +63,8 @@ fn reload_marks_only_new_session_policy_as_restart_required() {
     let config_path = directory.path().join("config.toml");
     std::fs::write(&config_path, "[chrome]\nsidebar = true\n").expect("write initial config");
     let config = load_config_from_path(&config_path).expect("load initial config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
 
     std::fs::write(&config_path, "[chrome]\nsidebar = false\n").expect("write live chrome change");
     assert!(state.reload_config(&mut Vec::new()));
@@ -90,8 +94,8 @@ fn every_new_window_policy_reports_the_restart_requirement() {
         let config_path = directory.path().join("config.toml");
         std::fs::write(&config_path, "").expect("write initial config");
         let config = load_config_from_path(&config_path).expect("load initial config");
-        let mut state =
-            AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+        let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+            .expect("start app state");
 
         std::fs::write(&config_path, source).expect("write new-window change");
         assert!(state.reload_config(&mut Vec::new()), "{name}");
@@ -114,7 +118,8 @@ fn a_dead_terminal_warns_after_acceptance_and_new_panes_use_the_accepted_config(
     )
     .expect("write initial config");
     let config = load_config_from_path(&config_path).expect("load initial config");
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
     let failed = pane("failed", "%1");
     state
         .terminal_mut()
@@ -188,7 +193,9 @@ fn pane(session_id: &str, pane_id: &str) -> MuxPaneAnchor {
 
 #[cfg(unix)]
 fn wait_for_startup_result(state: &mut AppState, pane_id: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // The budget bounds a genuine hang. It stays far above the scheduler jitter that a fully
+    // parallel test run adds to a pane spawn.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let runtime = state
             .terminal_mut()

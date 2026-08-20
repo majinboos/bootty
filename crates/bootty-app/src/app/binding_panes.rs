@@ -1,5 +1,4 @@
 use anyhow::Result;
-use bootty_config::config::MultiplexerBackendConfig;
 use eframe::egui::Rect;
 
 use super::workspace_runtime::{BindingRuntime, ScopedWindowId};
@@ -8,7 +7,7 @@ use crate::{
     mux::{
         RepaintHandle,
         command::{MuxCommand, MuxDirection, MuxSplitDirection},
-        config::selected_backend,
+        provider::{PaneTopology, selected_backend},
         snapshot::MuxPaneAnchor,
         terminal::TerminalRuntime,
     },
@@ -52,10 +51,7 @@ fn focus_after_reconcile(
 
 impl BindingRuntime {
     pub(super) fn uses_native_terminal_layout(&self) -> bool {
-        matches!(
-            self.multiplexer.backend,
-            MultiplexerBackendConfig::Native | MultiplexerBackendConfig::Rmux
-        )
+        self.backend_policy.panes.topology != PaneTopology::Attach
     }
 
     pub(super) fn pane_widget_key(&self, pane_id: &str) -> String {
@@ -97,6 +93,9 @@ impl BindingRuntime {
     }
 
     pub(super) fn sync_terminal_panes(&mut self) -> Result<()> {
+        if self.mux.unavailable_reason().is_some() {
+            return Ok(());
+        }
         let phase = crate::diagnostics::latency_start();
         self.prune_pane_layouts();
         crate::diagnostics::trace_slow("panes.prune_pane_layouts", phase, 2.0);
@@ -289,7 +288,6 @@ impl BindingRuntime {
             );
             return;
         }
-        let backend = selected_backend(&config);
         let key = self.current_window_id();
         let focused = target_pane_id.map(str::to_owned).or_else(|| {
             self.pane_layouts
@@ -310,7 +308,7 @@ impl BindingRuntime {
                 direction: mux_split_direction(direction),
             },
         );
-        self.apply_split_layout_after_command(key, focused, direction, backend);
+        self.apply_split_layout_after_command(key, focused, direction);
     }
 
     fn apply_split_layout_after_command(
@@ -318,11 +316,16 @@ impl BindingRuntime {
         key: ScopedWindowId,
         focused: Option<String>,
         direction: SplitDirection,
-        backend: MultiplexerBackendConfig,
     ) {
-        if backend == MultiplexerBackendConfig::Rmux {
-            self.pending_pane_split_directions.insert(key, direction);
-            return;
+        match self.backend_policy.panes.topology {
+            PaneTopology::BackendReconciled => {
+                self.pending_pane_split_directions.insert(key, direction);
+                return;
+            }
+            PaneTopology::ProcessLocal => {}
+            PaneTopology::Attach => {
+                unreachable!("attach topology cannot publish a process-local split")
+            }
         }
         let new_pane = self
             .mux

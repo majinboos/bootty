@@ -30,13 +30,15 @@ fn show_list(
     input: RawInput,
 ) -> ListOutcome {
     let mut outcome = None;
-    let _ = context.run_ui(input, |ui| {
-        outcome = Some(
-            ListView::new("ui-value-contracts", rows, selected)
-                .max_height(240.0)
-                .show(ui, theme_palette_from_colors(&ColorConfig::default())),
-        );
-    });
+    context
+        .run_ui(input, |ui| {
+            outcome = Some(
+                ListView::new("ui-value-contracts", rows, selected)
+                    .max_height(240.0)
+                    .show(ui, theme_palette_from_colors(&ColorConfig::default())),
+            );
+        })
+        .drop_without_applying_deltas();
     outcome.expect("the list renders")
 }
 
@@ -101,12 +103,14 @@ fn public_keycap_layout_normalizes_named_and_single_character_keys() {
     let mut labels = Vec::new();
     let palette = theme_palette_from_colors(&ColorConfig::default());
 
-    let _ = context.run_ui(RawInput::default(), |ui| {
-        for trigger in ["p", "space", "escape", "esc", "enter"] {
-            let galley = trigger_galley(ui, palette, trigger, Color32::WHITE, 320.0);
-            labels.push(galley.job.text.clone());
-        }
-    });
+    context
+        .run_ui(RawInput::default(), |ui| {
+            for trigger in ["p", "space", "escape", "esc", "enter"] {
+                let galley = trigger_galley(ui, palette, trigger, Color32::WHITE, 320.0);
+                labels.push(galley.job.text.clone());
+            }
+        })
+        .drop_without_applying_deltas();
 
     assert_eq!(labels, ["P", "Space", "Esc", "Esc", "Enter"]);
 }
@@ -117,24 +121,28 @@ fn session_rename_trims_the_submitted_name_and_rejects_blank_names() {
     install_icon_fonts(&context);
     let mut dialog = RenameSessionDialog::open("session-1".to_owned(), "  review  ".to_owned());
     let mut event = RenameSessionEvent::None;
-    let _ = context.run_ui(RawInput::default(), |ui| {
-        event = dialog.show(
-            ui.ctx(),
-            theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-        );
-    });
-    let _ = context.run_ui(
-        RawInput {
-            events: vec![key_event(Key::Enter)],
-            ..RawInput::default()
-        },
-        |ui| {
+    context
+        .run_ui(RawInput::default(), |ui| {
             event = dialog.show(
                 ui.ctx(),
                 theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
             );
-        },
-    );
+        })
+        .drop_without_applying_deltas();
+    context
+        .run_ui(
+            RawInput {
+                events: vec![key_event(Key::Enter)],
+                ..RawInput::default()
+            },
+            |ui| {
+                event = dialog.show(
+                    ui.ctx(),
+                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
     assert_eq!(
         event,
         RenameSessionEvent::Rename {
@@ -144,24 +152,28 @@ fn session_rename_trims_the_submitted_name_and_rejects_blank_names() {
     );
 
     let mut blank = RenameSessionDialog::open("session-2".to_owned(), "   ".to_owned());
-    let _ = context.run_ui(RawInput::default(), |ui| {
-        event = blank.show(
-            ui.ctx(),
-            theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-        );
-    });
-    let _ = context.run_ui(
-        RawInput {
-            events: vec![key_event(Key::Enter)],
-            ..RawInput::default()
-        },
-        |ui| {
+    context
+        .run_ui(RawInput::default(), |ui| {
             event = blank.show(
                 ui.ctx(),
                 theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
             );
-        },
-    );
+        })
+        .drop_without_applying_deltas();
+    context
+        .run_ui(
+            RawInput {
+                events: vec![key_event(Key::Enter)],
+                ..RawInput::default()
+            },
+            |ui| {
+                event = blank.show(
+                    ui.ctx(),
+                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
     assert_eq!(event, RenameSessionEvent::None);
 }
 
@@ -175,24 +187,28 @@ fn blank_tab_rename_restores_terminal_managed_titles() {
         "   ".to_owned(),
     );
     let mut event = RenameTabEvent::None;
-    let _ = context.run_ui(RawInput::default(), |ui| {
-        event = dialog.show(
-            ui.ctx(),
-            theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-        );
-    });
-    let _ = context.run_ui(
-        RawInput {
-            events: vec![key_event(Key::Enter)],
-            ..RawInput::default()
-        },
-        |ui| {
+    context
+        .run_ui(RawInput::default(), |ui| {
             event = dialog.show(
                 ui.ctx(),
                 theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
             );
-        },
-    );
+        })
+        .drop_without_applying_deltas();
+    context
+        .run_ui(
+            RawInput {
+                events: vec![key_event(Key::Enter)],
+                ..RawInput::default()
+            },
+            |ui| {
+                event = dialog.show(
+                    ui.ctx(),
+                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
 
     assert_eq!(
         event,

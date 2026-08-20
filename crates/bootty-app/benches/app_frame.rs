@@ -24,6 +24,8 @@ use bootty_app::{
 use criterion::{Criterion, criterion_group, criterion_main};
 use eframe::{egui, wgpu};
 
+mod support;
+
 const SIDEBAR_FRAME_SESSIONS: usize = 384;
 const FRAME_RECT: egui::Rect = egui::Rect {
     min: egui::Pos2 { x: 0.0, y: 0.0 },
@@ -91,7 +93,7 @@ fn app_state(sidebar: bool) -> AppState {
     };
     config.multiplexer.backend = MultiplexerBackendConfig::Native;
     config.chrome.sidebar = sidebar;
-    AppState::new(config, repaint, None, None).expect("app state")
+    AppState::new(config, support::backends(), repaint, None, None).expect("app state")
 }
 
 fn app_state_with_spaces(count: usize) -> AppState {

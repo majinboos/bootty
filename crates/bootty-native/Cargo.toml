@@ -1,0 +1,14 @@
+[package]
+name = "bootty-native"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bootty-mux = { path = "../bootty-mux" }
+bootty-mux-model = { path = "../bootty-mux-model" }
+inventory.workspace = true
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[lints]
+workspace = true

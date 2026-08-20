@@ -128,12 +128,16 @@ fn egui_shell_frame(
         paint_egui_shell(ui.ctx(), rects, state.selected, state.hovered_menu);
     });
     let primitives = egui.tessellate(output.shapes, output.pixels_per_point);
-    let mut textures = output
-        .textures_delta
-        .set
+    let mut textures_delta = output.textures_delta;
+    let mut textures = std::mem::take(&mut textures_delta.set)
         .into_iter()
-        .map(|(id, delta)| egui_texture(id, delta.image))
+        .flat_map(|(id, deltas)| {
+            deltas
+                .into_iter()
+                .map(move |delta| egui_texture(id, delta.image))
+        })
         .collect::<Vec<_>>();
+    textures_delta.clear();
     let mut meshes = primitives
         .into_iter()
         .filter_map(|primitive| match primitive.primitive {

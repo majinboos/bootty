@@ -3,7 +3,7 @@ use std::hint::black_box;
 use bootty_app::{geometry::TerminalGeometry, terminal::TerminalEngine};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use libghostty_vt::{
-    Terminal, TerminalOptions,
+    Terminal,
     render::RenderState,
     terminal::{Mode, Point, PointCoordinate},
 };
@@ -393,12 +393,11 @@ fn workloads() -> Vec<ParserWorkload> {
 }
 
 fn state_terminal() -> Terminal<'static, 'static> {
-    Terminal::new(TerminalOptions {
-        cols: GEOMETRY.cols,
-        rows: GEOMETRY.rows,
-        max_scrollback: 0,
-    })
-    .expect("terminal")
+    let mut terminal = Terminal::new(GEOMETRY.cols, GEOMETRY.rows).expect("terminal");
+    terminal
+        .set_scrollback_max_bytes(Some(0))
+        .expect("scrollback limit");
+    terminal
 }
 
 fn run_parse_state(workload: &ParserWorkload) -> u64 {

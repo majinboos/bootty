@@ -1,0 +1,38 @@
+[package]
+name = "bootty-rmux"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["app"]
+app = [
+  "bootty-mux/app",
+  "bootty-remote/app",
+  "dep:bootty-runtime",
+  "dep:bootty-surface",
+  "dep:bootty-terminal",
+]
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+bootty-identity = { path = "../bootty-identity" }
+bootty-mux = { path = "../bootty-mux", default-features = false }
+bootty-mux-model = { path = "../bootty-mux-model" }
+bootty-remote = { path = "../bootty-remote", default-features = false }
+bootty-runtime = { path = "../bootty-runtime", optional = true }
+bootty-surface = { path = "../bootty-surface", optional = true }
+bootty-terminal = { path = "../bootty-terminal", optional = true }
+inventory.workspace = true
+rmux-client.workspace = true
+rmux-ipc.workspace = true
+rmux-proto.workspace = true
+rmux-sdk.workspace = true
+rmux-server.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[dev-dependencies]
+tempfile.workspace = true

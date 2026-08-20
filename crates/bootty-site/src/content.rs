@@ -55,7 +55,6 @@ PTY / demo backend
 
 ## Public seams
 
-- `bootty`: facade for embedders using the native runtime or renderer
 - `bootty-runtime`: shell process, PTY drain, resize, repaint wakeups
 - `bootty-terminal`: VT state, cell grid, styles, links, images, selection
 - `bootty-render`: paint plans, glyph atlas inputs, sprite/image data
@@ -91,7 +90,7 @@ when a smoke test needs to force a specific shell.
 ## Native app
 
 ```sh
-cargo run -p bootty-app --bin bootty
+cargo run -p bootty --bin bootty
 ```
 
 Expected: a native Bootty window opens with terminal glyphs, tmux-oriented chrome,
@@ -110,7 +109,7 @@ emoji, box drawing, renderer frame conversion, or canvas sizing.
 ## Explicit shell smoke
 
 ```sh
-BOOTTY_SHELL=/bin/zsh cargo run -p bootty-app --bin bootty
+BOOTTY_SHELL=/bin/zsh cargo run -p bootty --bin bootty
 ```
 
 Use this only to isolate shell discovery from renderer/runtime behavior.
@@ -272,13 +271,11 @@ pretend that `canvas`, `document`, WebGL, selection, or clipboard APIs exist.
 
 const DOCS_RUST: &str = r#"# Rust crates
 
-Use Rust when you are embedding the native terminal runtime or renderer. Use
-`bootty` as the public facade; reach into narrower crates only when you own that
-layer.
+Use the crate that owns the terminal behavior that your Rust application needs.
+Bootty has no umbrella library crate.
 
 ## Crate map
 
-- `bootty`: facade for embedders
 - `bootty-runtime`: PTY process, worker thread, frame publication
 - `bootty-terminal`: VT state and terminal snapshots
 - `bootty-render`: renderer frame conversion, paint planning, WGPU data
@@ -293,8 +290,8 @@ published frame.
 ```rust
 use std::sync::Arc;
 
-use bootty::geometry::TerminalGeometry;
-use bootty::runtime::TerminalSession;
+use bootty_runtime::TerminalSession;
+use bootty_surface::geometry::TerminalGeometry;
 
 let geometry = TerminalGeometry {
     cols: 80,
@@ -321,11 +318,11 @@ conversion preserves cells, colors, cursor, links, images, dirty rows, and
 selection data as structured renderer input.
 
 ```rust
-use bootty::geometry::{CellMetrics, TerminalPadding, TerminalSurface};
-use bootty::renderer_frame::RendererFrame;
-use bootty::terminal::RenderFrame;
-use bootty::terminal_render::TerminalRenderFrame;
-use bootty::terminal_text::TerminalTextConfig;
+use bootty_render::renderer_frame::RendererFrame;
+use bootty_render::terminal_render::TerminalRenderFrame;
+use bootty_render::terminal_text::TerminalTextConfig;
+use bootty_surface::geometry::{CellMetrics, TerminalPadding, TerminalSurface};
+use bootty_terminal::terminal::RenderFrame;
 
 fn build_render_frame(frame: &RenderFrame) -> TerminalRenderFrame {
     let surface = TerminalSurface::for_logical_size(

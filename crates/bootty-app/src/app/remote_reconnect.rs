@@ -1,11 +1,6 @@
-use std::{
-    net::{IpAddr, UdpSocket},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use crate::mux::controller::SpaceId;
-
-use super::workspace_runtime::{BindingRuntime, WorkspaceRuntime};
+use super::workspace_runtime::BindingRuntime;
 
 #[derive(Clone, Copy, Debug)]
 struct RemoteReattach {
@@ -49,23 +44,18 @@ pub(super) struct BindingReconnect {
     attach_started: Option<Instant>,
 }
 
-pub(super) enum AttachExit {
-    CloseLocalPane,
-    Reconnecting(String),
-    AlreadyWaiting,
-}
-
 impl BindingRuntime {
-    pub(super) fn handle_attach_client_exit(&mut self, now: Instant) -> AttachExit {
+    /// Returns `true` when the caller must close the local attach pane.
+    pub(super) fn handle_attach_client_exit(&mut self, now: Instant) -> bool {
         let Some(remote) = self.multiplexer.remote.as_ref() else {
-            return AttachExit::CloseLocalPane;
+            return true;
         };
         if self
             .reconnect
             .pending
             .is_some_and(|reattach| !reattach.started)
         {
-            return AttachExit::AlreadyWaiting;
+            return false;
         }
         let attached_for = self
             .reconnect
@@ -76,36 +66,31 @@ impl BindingRuntime {
             "lost the connection to {}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         );
-        self.mux.set_availability_error(Some(error.clone()));
+        self.mux.set_availability_error(Some(error));
         self.reconnect.pending = Some(reattach);
-        AttachExit::Reconnecting(error)
+        false
     }
 
-    pub(super) fn handle_attach_start_failure(
-        &mut self,
-        now: Instant,
-        detail: &str,
-    ) -> Option<String> {
-        let remote = self.multiplexer.remote.as_ref()?;
+    pub(super) fn handle_attach_start_failure(&mut self, now: Instant, detail: &str) {
+        let Some(remote) = self.multiplexer.remote.as_ref() else {
+            return;
+        };
         let reattach = RemoteReattach::after_failure(self.reconnect.pending, None, now);
         let error = format!(
             "could not connect to {}: {detail}; reconnecting (attempt {})",
             remote.host, reattach.attempts
         );
-        self.mux.set_availability_error(Some(error.clone()));
+        self.mux.set_availability_error(Some(error));
         self.reconnect.pending = Some(reattach);
-        Some(error)
     }
 
-    pub(super) fn resolve_attach_exit_after_refresh(&mut self, refresh_completed: bool) -> bool {
-        if !refresh_completed || self.reconnect.pending.is_none() || !self.mux.sessions().is_empty()
-        {
-            return false;
+    pub(super) fn resolve_attach_exit_after_refresh(&mut self, refresh_applied: bool) {
+        if !refresh_applied || self.reconnect.pending.is_none() || !self.mux.sessions().is_empty() {
+            return;
         }
         self.reconnect.pending = None;
         self.reconnect.attach_started = None;
         self.mux.set_availability_error(None);
-        true
     }
 
     pub(super) fn note_attach_client_alive(&mut self, now: Instant) {
@@ -141,11 +126,11 @@ impl BindingRuntime {
             .is_some_and(|reattach| !reattach.started)
     }
 
-    fn is_degraded_remote(&self) -> bool {
+    pub(super) fn is_degraded_remote(&self) -> bool {
         self.reconnect.pending.is_some()
     }
 
-    fn restart_remote(&mut self, now: Instant) -> bool {
+    pub(super) fn restart_remote(&mut self, now: Instant) -> bool {
         let Some(remote) = self.multiplexer.remote.as_ref() else {
             return false;
         };
@@ -167,83 +152,5 @@ impl BindingRuntime {
                 .pending
                 .map(|reattach| format!("reconnecting (attempt {})", reattach.attempts))
         })
-    }
-}
-
-pub(super) struct NetworkChangeDetector {
-    next_check: Instant,
-    signature: Option<IpAddr>,
-}
-
-impl NetworkChangeDetector {
-    const INTERVAL: Duration = Duration::from_secs(2);
-
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
-            next_check: now + Self::INTERVAL,
-            signature: network_signature(),
-        }
-    }
-
-    fn changed(&mut self, now: Instant) -> bool {
-        if now < self.next_check {
-            return false;
-        }
-        self.next_check = now + Self::INTERVAL;
-        let signature = network_signature();
-        let changed = signature != self.signature;
-        self.signature = signature;
-        changed
-    }
-}
-
-fn network_signature() -> Option<IpAddr> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("1.1.1.1", 80)).ok()?;
-    socket.local_addr().ok().map(|address| address.ip())
-}
-
-impl WorkspaceRuntime {
-    pub(super) fn reset_after_network_change(&mut self, now: Instant) {
-        if self.has_degraded_remote() && self.network_change_detector.changed(now) {
-            self.reset_remote_reconnects(now);
-        }
-    }
-
-    fn has_degraded_remote(&self) -> bool {
-        self.active
-            .bindings()
-            .chain(
-                self.inactive_spaces
-                    .iter()
-                    .flat_map(|space| space.bindings()),
-            )
-            .any(BindingRuntime::is_degraded_remote)
-    }
-
-    fn reset_remote_reconnects(&mut self, now: Instant) {
-        for binding in self.active.bindings_mut().chain(
-            self.inactive_spaces
-                .iter_mut()
-                .flat_map(|space| space.bindings_mut()),
-        ) {
-            if binding.is_degraded_remote() {
-                binding.restart_remote(now);
-            }
-        }
-    }
-
-    pub(super) fn reconnect_space(&mut self, space_id: SpaceId, now: Instant) -> bool {
-        let Some(space) = std::iter::once(&mut self.active)
-            .chain(self.inactive_spaces.iter_mut())
-            .find(|space| space.id == space_id)
-        else {
-            return false;
-        };
-        let mut restarted = false;
-        for binding in space.bindings_mut() {
-            restarted |= binding.restart_remote(now);
-        }
-        restarted
     }
 }

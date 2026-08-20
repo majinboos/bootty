@@ -6,15 +6,15 @@ use bootty_identity::{APPLICATION_IDENTITY_ENV, ApplicationIdentity};
 
 fn main() -> Result<()> {
     let (identity, args) = parse_application_identity(std::env::args().skip(1).collect())?;
-    bootty_mux::prepare_local_rmux_daemon(identity)?;
-    if let Some(code) = bootty_mux::run_embedded_rmux_daemon()? {
+    bootty_rmux::prepare_local_rmux_daemon(identity)?;
+    if let Some(code) = bootty_rmux::run_embedded_rmux_daemon()? {
         std::process::exit(code);
     }
     match args.first().map(String::as_str) {
         Some("remote-ping") => {
             println!(
                 "{}:{}",
-                bootty_mux::REMOTE_DAEMON_PROTOCOL_VERSION,
+                bootty_remote::REMOTE_DAEMON_PROTOCOL_VERSION,
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -22,12 +22,12 @@ fn main() -> Result<()> {
         Some("remote-exec") => {
             let payload = args.get(1).context("remote-exec requires a payload")?;
             reject_extra(args.iter().skip(2))?;
-            std::process::exit(bootty_mux::run_remote_command(payload)?);
+            std::process::exit(bootty_remote::run_remote_command(payload)?);
         }
         Some("remote-rmux") => {
             let payload = args.get(1).context("remote-rmux requires a payload")?;
             reject_extra(args.iter().skip(2))?;
-            std::process::exit(bootty_mux::run_remote_rmux_command(payload)?);
+            std::process::exit(bootty_rmux::run_remote_rmux_command(payload)?);
         }
         Some("remote-space") => run_remote_space(&args[1..], identity),
         Some("remote-project") => run_remote_project(&args[1..]),
@@ -41,7 +41,15 @@ fn run_remote_space(args: &[String], identity: ApplicationIdentity) -> Result<()
     let Some((command, arguments)) = args.split_first() else {
         bail!("remote-space requires a command")
     };
-    let mut catalog = Catalog::open(&state_path(identity)?, identity)?;
+    bootty_rmux::link();
+    bootty_tmux::link();
+    bootty_zellij::link();
+    let backends = std::sync::Arc::new(bootty_mux::provider::MuxBackendRegistry::collect([
+        bootty_mux::MuxBackendKind::Rmux,
+        bootty_mux::MuxBackendKind::Tmux,
+        bootty_mux::MuxBackendKind::Zellij,
+    ])?);
+    let mut catalog = Catalog::open(&state_path(identity)?, identity, backends)?;
     match command.as_str() {
         "list" => {
             if !arguments.is_empty() {
@@ -69,7 +77,7 @@ fn run_remote_space(args: &[String], identity: ApplicationIdentity) -> Result<()
             let id = required_option(arguments, "--id")?;
             let backend = Backend::parse(&required_option(arguments, "--backend")?)?;
             let payload = required_option(arguments, "--payload")?;
-            let command = bootty_mux::decode_remote_space_command(&payload)?;
+            let command = bootty_remote::space_protocol::decode_command(&payload)?;
             catalog.execute(&id, backend, command)?;
         }
         _ => bail!("unknown remote-space command {command:?}"),
@@ -139,26 +147,26 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn required_option(args: &[String], name: &str) -> Result<String> {
-    let mut chunks = args.chunks_exact(2);
+    let (chunks, remainder) = args.as_chunks::<2>();
     let mut value = None;
-    for chunk in &mut chunks {
+    for chunk in chunks {
         if chunk[0] == name && value.replace(chunk[1].clone()).is_some() {
             bail!("duplicate option {name}")
         }
     }
-    if !chunks.remainder().is_empty() {
+    if !remainder.is_empty() {
         bail!("options require values")
     }
     value.with_context(|| format!("missing option {name}"))
 }
 fn option_values(args: &[String], name: &str) -> Result<Vec<String>> {
-    let mut chunks = args.chunks_exact(2);
+    let (chunks, remainder) = args.as_chunks::<2>();
     let values = chunks
-        .by_ref()
+        .iter()
         .filter(|chunk| chunk[0] == name)
         .map(|chunk| chunk[1].clone())
         .collect();
-    if !chunks.remainder().is_empty() {
+    if !remainder.is_empty() {
         bail!("options require values")
     }
     Ok(values)
@@ -194,7 +202,7 @@ fn parse_application_identity_with_inherited(
         Ok((identity, args))
     } else if args
         .first()
-        .is_some_and(|argument| argument == bootty_mux::INTERNAL_RMUX_DAEMON_FLAG)
+        .is_some_and(|argument| argument == bootty_rmux::INTERNAL_DAEMON_FLAG)
     {
         Ok((inherited_application_identity(inherited)?, args))
     } else {

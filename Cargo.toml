@@ -46,17 +46,16 @@ derive_more = { version = "2.1.1", default-features = false, features = [
   "deref",
   "deref_mut",
 ] }
-eframe = { version = "0.35", default-features = false, features = [
+eframe = { version = "0.36", default-features = false, features = [
   "accesskit",
   "default_fonts",
   "inspection",
   "wgpu_no_default_features",
 ] }
-egui = "0.35"
-egui_code_editor = "0.3.7"
-epaint_default_fonts = "0.35"
+egui = "0.36"
+epaint_default_fonts = "0.36"
 fontdb = "0.23"
-getrandom = "0.3"
+getrandom = "0.4"
 iconflow = { version = "1", features = [
   "pack-bootstrap",
   "pack-lucide",
@@ -64,7 +63,8 @@ iconflow = { version = "1", features = [
   "pack-tabler",
 ] }
 indoc = "2"
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "c1fe97a6bed015209d59e8772e4e9e49311d8bc5", features = [
+inventory = "0.3"
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "10e8f5608bc3f9ced83c6fa51f44fd8031fa8ee0", features = [
   "png",
   "log",
 ] }
@@ -93,7 +93,7 @@ process-wrap = { version = "9.1", default-features = false, features = [
   "process-group",
   "std",
 ] }
-portable-pty = "0.9"
+portable-pty = { git = "https://github.com/wezterm/wezterm.git", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
 proptest = "1"
 rmux-client = "0.10"
 rmux-sdk = "0.10"
@@ -103,7 +103,7 @@ rmux-os = "0.10"
 rmux-proto = "0.10"
 rmux-server = { version = "0.10", default-features = false }
 rstest = "0.26"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.10"
 rustybuzz = "0.20"
 serde = { version = "1", features = ["derive"] }
@@ -117,7 +117,7 @@ syntect = { version = "5.3", default-features = false, features = [
   "default-fancy",
 ] }
 tempfile = "3"
-tokio = "1.48.0"
+tokio = "1.53.1"
 toml_edit = { version = "0.25", features = ["serde"] }
 ttf-parser = "0.25"
 tuirealm = { version = "4.1.0", default-features = false, features = [
@@ -126,13 +126,13 @@ tuirealm = { version = "4.1.0", default-features = false, features = [
 unicode-width = "0.2"
 ureq = "3"
 wasm-bindgen = "0.2"
-wgpu = { version = "29", default-features = false, features = [
+wgpu = { version = "30", default-features = false, features = [
   "parking_lot",
   "std",
   "wgsl",
 ] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
-embed-resource = "3.0.9"
+embed-resource = "3.0.11"
 windows-sys = "0.61"
 winsafe = { version = "0.0.28", default-features = false, features = ["kernel"] }
 
@@ -179,10 +179,10 @@ opt-level = 2
 debug = false
 
 [dev-dependencies]
-anyhow.workspace = true
 bootty-app = { path = "crates/bootty-app" }
 bootty-config = { path = "crates/bootty-config" }
 bootty-mux = { path = "crates/bootty-mux" }
+bootty-rmux = { path = "crates/bootty-rmux" }
 serde_json.workspace = true
 tempfile.workspace = true
 toml_edit.workspace = true

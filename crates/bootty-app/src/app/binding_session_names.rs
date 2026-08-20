@@ -1,12 +1,10 @@
 use std::{collections::HashSet, hash::Hasher, path::PathBuf};
 
-use bootty_config::config::MultiplexerBackendConfig;
-
 use super::workspace_runtime::{
     BindingRuntime, PendingGeneratedName, SpaceRuntime, WorkspaceRuntime,
 };
 use crate::{
-    mux::{RepaintHandle, command::MuxCommand, config::selected_backend},
+    mux::{RepaintHandle, command::MuxCommand, provider::GeneratedSessionNamePolicy},
     ui::new_session_picker::NewMuxSessionRequest,
     workspace::WorkspacePersistenceError,
 };
@@ -83,7 +81,9 @@ impl WorkspaceRuntime {
         let remote = self.active.binding.multiplexer.remote.is_some();
         let mut candidate = self.active_reconciled_binding_state_candidate();
         let mut pending_generated_names = self.active.binding.pending_generated_names.clone();
-        if selected_backend(&self.active.binding.multiplexer) == MultiplexerBackendConfig::Rmux {
+        if self.active.binding.backend_policy.generated_session_names
+            == GeneratedSessionNamePolicy::PreserveBackend
+        {
             return self.commit_binding_state_candidate(candidate);
         }
         let signature = self.generated_names_signature();
@@ -111,8 +111,6 @@ impl WorkspaceRuntime {
             .values()
             .map(|pending| pending.name.clone())
             .collect::<HashSet<_>>();
-        let rename_supported =
-            selected_backend(&self.active.binding.multiplexer) != MultiplexerBackendConfig::Rmux;
         let taken_names = self.taken_session_names(None);
 
         for session in &sessions {
@@ -236,7 +234,7 @@ impl WorkspaceRuntime {
                 .chain(planned_names.iter().map(String::as_str));
             let display_name = suggested_session_name(&cwd, remote);
             let desired = crate::strings::unique_session_name(&display_name, existing_names);
-            if desired == session.name || !rename_supported {
+            if desired == session.name {
                 continue;
             }
             planned_names.insert(desired.clone());
@@ -323,7 +321,7 @@ impl WorkspaceRuntime {
             repaint,
             &config,
         );
-        if selected_backend(&config) == MultiplexerBackendConfig::Native {
+        if self.active.binding.membership_completion_is_immediate() {
             self.active.binding.membership_reconciliation_ready = true;
         }
         Ok(true)
@@ -380,7 +378,7 @@ impl WorkspaceRuntime {
             .binding
             .mux
             .rename_session(&session.id, backend_name, repaint, &config);
-        if selected_backend(&config) == MultiplexerBackendConfig::Native {
+        if self.active.binding.membership_completion_is_immediate() {
             self.active.binding.membership_reconciliation_ready = true;
         }
         Ok(RenameSessionOutcome::Started)

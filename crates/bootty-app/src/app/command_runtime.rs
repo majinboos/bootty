@@ -7,8 +7,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use bootty_config::config::MultiplexerBackendConfig;
-
 use super::{
     binding_panes::mux_split_direction,
     binding_session_names::{session_cwd, suggested_session_name},
@@ -29,8 +27,8 @@ use crate::{
         RepaintHandle,
         capability::BindingOperationOutcome,
         command::MuxCommand,
-        config::selected_backend,
         controller::{MuxCommandCompletion, MuxCommandError, MuxCommandResult},
+        provider::PaneTopology,
         terminal::decode_scoped_pane_id,
     },
     workspace::BindingMembershipMutation,
@@ -707,10 +705,10 @@ impl AppState {
                 self.last_error = command_outcome_message(&outcome);
                 return CommandDispatch::Complete(outcome);
             }
-            let native_local_action = selected_backend(self.active_multiplexer())
-                == MultiplexerBackendConfig::Native
-                && Self::native_mux_action_uses_local_layout(mux_action);
-            if native_local_action {
+            let process_local_action = self.workspace.active.binding.backend_policy.panes.topology
+                == PaneTopology::ProcessLocal
+                && Self::process_local_mux_action_uses_local_layout(mux_action);
+            if process_local_action {
                 return_native_mux_focus = true;
             } else if let Some(command) = self.mux_command_for_command(mux_action, target) {
                 let membership = match self
@@ -777,7 +775,7 @@ impl AppState {
         };
         CommandDispatch::Complete(outcome)
     }
-    fn native_mux_action_uses_local_layout(action: MuxKeyAction) -> bool {
+    fn process_local_mux_action_uses_local_layout(action: MuxKeyAction) -> bool {
         matches!(
             action,
             MuxKeyAction::NextSession

@@ -5,7 +5,7 @@ APP_NAME="Bootty"
 BINARY_NAME="bootty"
 CLI_NAME="bootty"
 BUNDLE_IDENTIFIER="dev.bootty.desktop"
-PACKAGE_NAME="bootty-app"
+PACKAGE_NAME="bootty"
 DAEMON_BINARY_NAME="bootty-daemon"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
 TARGET_ROOT="${CARGO_TARGET_DIR:-target}"
@@ -13,7 +13,7 @@ DAEMON_OUTPUT_DIR="${BOOTTY_DAEMON_OUTPUT_DIR:-$TARGET_ROOT/bootty-daemons}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DAEMON_TARGET_MANIFEST="$SCRIPT_DIR/bootty-daemon-targets.txt"
 MACOS_ICON_NAME="bootty"
-MACOS_ICON_SOURCE="crates/bootty-app/assets/$MACOS_ICON_NAME.icon"
+MACOS_ICON_SOURCE="crates/bootty/assets/$MACOS_ICON_NAME.icon"
 VERSION="${BOOTTY_VERSION:-$(awk '
   $0 == "[workspace.package]" { in_workspace_package = 1; next }
   /^\[/ { in_workspace_package = 0 }

@@ -127,6 +127,7 @@ impl BareRendererSurfaceConfig {
         wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: self.format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: self.width,
             height: self.height,
             present_mode,
@@ -731,6 +732,7 @@ impl BareTerminalGpu {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .context("request bare terminal WGPU adapter")?;
@@ -838,7 +840,7 @@ impl BareTerminalGpu {
             self.renderer.paint(&mut pass);
         }
         self.queue.submit([encoder.finish()]);
-        texture.present();
+        self.queue.present(texture);
 
         Ok(())
     }

@@ -1,0 +1,23 @@
+[package]
+name = "bootty-tmux"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["app"]
+app = ["bootty-mux/app", "bootty-remote/app"]
+
+[dependencies]
+anyhow.workspace = true
+bootty-identity = { path = "../bootty-identity" }
+bootty-mux = { path = "../bootty-mux", default-features = false }
+bootty-mux-model = { path = "../bootty-mux-model" }
+bootty-remote = { path = "../bootty-remote", default-features = false }
+inventory.workspace = true
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

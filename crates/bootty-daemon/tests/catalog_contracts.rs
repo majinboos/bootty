@@ -6,13 +6,48 @@ use std::{
 };
 
 use anyhow::{Result, bail};
-use bootty_daemon::catalog::{Backend, CATALOG_VERSION, Catalog, CatalogBackend};
+use bootty_daemon::catalog::{Backend, CATALOG_VERSION, Catalog};
 use bootty_identity::ApplicationIdentity;
 use bootty_mux::{
+    MuxBackendKind, MuxBindingConfig,
+    backend::MuxBackend,
     command::MuxCommand,
+    provider::{MuxBackendProvider, MuxBackendRegistry},
     snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, session_matches},
 };
 use rusqlite::Connection;
+
+struct MarkerBackend;
+
+impl MuxBackend for MarkerBackend {
+    fn snapshot(&self) -> Result<MuxSnapshot> {
+        Ok(MuxSnapshot::default())
+    }
+
+    fn execute(&mut self, _command: MuxCommand) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct MarkerProvider;
+
+impl MuxBackendProvider for MarkerProvider {
+    fn command_dispatch(&self) -> bootty_mux::provider::MuxCommandDispatch {
+        bootty_mux::provider::MuxCommandDispatch::WorkerThread
+    }
+
+    fn kind(&self) -> MuxBackendKind {
+        MuxBackendKind::Tmux
+    }
+
+    fn build_backend(
+        &self,
+        _config: &MuxBindingConfig,
+        _workspace: Option<&Path>,
+    ) -> Box<dyn MuxBackend> {
+        Box::new(MarkerBackend)
+    }
+}
 
 #[cfg(unix)]
 const REAL_DAEMON_HELPER_ENV: &str = "BOOTTY_DAEMON_CATALOG_RECOVERY_HELPER";
@@ -31,7 +66,7 @@ struct PausingBackend {
     resume: mpsc::Receiver<()>,
 }
 
-impl CatalogBackend for PausingBackend {
+impl MuxBackend for PausingBackend {
     fn snapshot(&self) -> Result<MuxSnapshot> {
         Ok(self.snapshot.lock().expect("snapshot lock").clone())
     }
@@ -53,7 +88,7 @@ impl CatalogBackend for PausingBackend {
 
 struct SharedSnapshotBackend(Arc<Mutex<MuxSnapshot>>);
 
-impl CatalogBackend for SharedSnapshotBackend {
+impl MuxBackend for SharedSnapshotBackend {
     fn snapshot(&self) -> Result<MuxSnapshot> {
         Ok(self.0.lock().expect("snapshot lock").clone())
     }
@@ -63,7 +98,7 @@ impl CatalogBackend for SharedSnapshotBackend {
     }
 }
 
-impl CatalogBackend for ScriptedBackend {
+impl MuxBackend for ScriptedBackend {
     fn snapshot(&self) -> Result<MuxSnapshot> {
         Ok(self.snapshot.clone())
     }
@@ -114,7 +149,41 @@ fn session(id: &str, name: &str) -> MuxSession {
 }
 
 fn open_catalog(path: &Path) -> Result<Catalog> {
-    Catalog::open(path, ApplicationIdentity::Development)
+    bootty_rmux::link();
+    bootty_tmux::link();
+    bootty_zellij::link();
+    let backends = bootty_mux::provider::MuxBackendRegistry::collect([
+        bootty_mux::MuxBackendKind::Rmux,
+        bootty_mux::MuxBackendKind::Tmux,
+        bootty_mux::MuxBackendKind::Zellij,
+    ])?;
+    Catalog::open(
+        path,
+        ApplicationIdentity::Development,
+        std::sync::Arc::new(backends),
+    )
+}
+
+#[test]
+fn daemon_uses_the_stored_backend_provider_without_desktop_fallback() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let provider: Arc<dyn MuxBackendProvider> = Arc::new(MarkerProvider);
+    let backends = Arc::new(MuxBackendRegistry::from_providers(
+        [provider],
+        [MuxBackendKind::Tmux],
+    )?);
+    let mut catalog = Catalog::open(
+        &directory.path().join("catalog.sqlite"),
+        ApplicationIdentity::Development,
+        backends,
+    )?;
+    let space = catalog.create("Stored tmux", Backend::Tmux)?;
+
+    assert_eq!(
+        catalog.snapshot(&space.id, Backend::Tmux)?,
+        MuxSnapshot::default()
+    );
+    Ok(())
 }
 
 fn create_space(catalog: &mut Catalog, name: &str) -> Result<String> {
@@ -212,7 +281,7 @@ fn a_completed_create_recovers_after_the_catalog_commit_fails() -> Result<()> {
         "remote Space membership completed but catalog commit failed: forced membership failure; recovery is pending"
     );
     assert_eq!(pending_count(&path, &space_id), 1);
-    assert!(stored_sessions(&path, &space_id).is_empty());
+    assert_eq!(stored_sessions(&path, &space_id), Vec::new());
 
     connection(&path).execute("DROP TRIGGER fail_session_insert", [])?;
     drop(catalog);
@@ -399,7 +468,7 @@ fn two_spaces_cannot_claim_the_same_backend_session_concurrently() -> Result<()>
         stored_sessions(&path, &first_space),
         vec![("shared-name".to_owned(), 0)]
     );
-    assert!(stored_sessions(&path, &second_space).is_empty());
+    assert_eq!(stored_sessions(&path, &second_space), Vec::new());
     assert_eq!(pending_count(&path, &first_space), 0);
     assert_eq!(pending_count(&path, &second_space), 0);
     Ok(())
@@ -497,7 +566,7 @@ fn ditch_recovery_waits_for_authoritative_absence() -> Result<()> {
     drop(catalog);
     let mut reopened = open_catalog(&path)?;
     reopened.snapshot_with_backend(&space_id, Backend::Rmux, &mut backend)?;
-    assert!(stored_sessions(&path, &space_id).is_empty());
+    assert_eq!(stored_sessions(&path, &space_id), Vec::new());
     assert_eq!(pending_count(&path, &space_id), 0);
     Ok(())
 }
@@ -613,7 +682,7 @@ fn real_daemon_recovers_rmux_success_after_catalog_failure_helper() -> Result<()
     if std::env::var_os(REAL_DAEMON_HELPER_ENV).is_none() {
         return Ok(());
     }
-    bootty_mux::start_embedded_rmux_daemon_for_tests()?;
+    bootty_rmux::start_embedded_rmux_daemon_for_tests()?;
     let root = std::path::PathBuf::from(
         std::env::var_os("BOOTTY_DAEMON_RECOVERY_ROOT").expect("recovery root"),
     );
@@ -652,10 +721,11 @@ fn real_daemon_recovers_rmux_success_after_catalog_failure_helper() -> Result<()
          BEGIN SELECT RAISE(FAIL, 'forced real membership failure'); END;",
     )?;
     let session_id = format!("bootty-recovery-{}", std::process::id());
-    let payload = bootty_mux::encode_remote_space_command(&MuxCommand::CreateProjectSession {
-        session_id: session_id.clone(),
-        cwd: root.to_string_lossy().into_owned(),
-    })?;
+    let payload =
+        bootty_remote::space_protocol::encode_command(&MuxCommand::CreateProjectSession {
+            session_id: session_id.clone(),
+            cwd: root.to_string_lossy().into_owned(),
+        })?;
 
     let executed = run(&[
         "remote-space".to_owned(),
@@ -697,7 +767,7 @@ fn real_daemon_recovers_rmux_success_after_catalog_failure_helper() -> Result<()
     );
     assert_eq!(pending_count(&state, space_id), 0);
 
-    let ditch = bootty_mux::encode_remote_space_command(&MuxCommand::DitchSession {
+    let ditch = bootty_remote::space_protocol::encode_command(&MuxCommand::DitchSession {
         session_id: session_id.clone(),
     })?;
     let cleaned = run(&[

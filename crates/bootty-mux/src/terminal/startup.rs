@@ -37,7 +37,7 @@ enum QueuedStartupCommand {
     SelectionEnd(Option<TerminalSelectionEvent>),
 }
 
-pub(super) struct StartingNativeTerminal {
+pub struct StartingNativeTerminal {
     rx: mpsc::Receiver<std::result::Result<TerminalSession, String>>,
     terminal: Option<TerminalSession>,
     geometry: TerminalGeometry,
@@ -49,7 +49,7 @@ pub(super) struct StartingNativeTerminal {
 }
 
 impl StartingNativeTerminal {
-    pub(super) fn spawn(
+    pub fn spawn(
         geometry: TerminalGeometry,
         config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,

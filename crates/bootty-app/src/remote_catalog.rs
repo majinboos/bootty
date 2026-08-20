@@ -14,9 +14,10 @@ use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
     command::MuxCommand,
     process::{CommandRunner, SystemCommandRunner},
+    provider::MuxAppBackendRegistry,
     snapshot::{MuxSnapshot, session_matches},
-    ssh::{SshRemote, remote_daemon_failure},
 };
+use bootty_remote::ssh::{SshRemote, remote_daemon_failure};
 
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
 
@@ -75,10 +76,11 @@ pub fn create(
 
 pub fn snapshot(
     config: &BoottyConfig,
+    backends: &MuxAppBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<MuxSnapshot> {
-    let mut runtime = remote_space_runtime(config, space_id, expected_backend)?;
+    let mut runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
     let snapshot = runtime.backend.snapshot()?;
     runtime.reconcile_pending_membership(&snapshot)?;
     let snapshot = filter_snapshot_for_space(snapshot, &mut runtime.session_order);
@@ -114,12 +116,13 @@ fn filter_snapshot_for_space(
 
 pub fn execute(
     config: &BoottyConfig,
+    backends: &MuxAppBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
     payload: &str,
 ) -> Result<()> {
-    let command = bootty_mux::remote_space::decode_command(payload)?;
-    let mut runtime = remote_space_runtime(config, space_id, expected_backend)?;
+    let command = bootty_remote::space_protocol::decode_command(payload)?;
+    let mut runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
     let snapshot = runtime.backend.snapshot()?;
     runtime.reconcile_pending_membership(&snapshot)?;
     let owned_names = runtime.session_order.session_names();
@@ -216,6 +219,7 @@ impl RemoteSpaceRuntime {
 
 fn remote_space_runtime(
     config: &BoottyConfig,
+    backends: &MuxAppBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<RemoteSpaceRuntime> {
@@ -245,8 +249,7 @@ fn remote_space_runtime(
     }
     multiplexer.remote = None;
     multiplexer.remote_space_id = None;
-    let backend =
-        bootty_mux::config::build_backend_for_workspace(&multiplexer, Some(&config.config_path));
+    let backend = backends.build_backend(&multiplexer, Some(&config.config_path));
     let scope = binding.mux_scope();
     let session_order = binding.session_order().clone();
     let session_names = binding.session_names().clone();
@@ -483,7 +486,7 @@ fn run_remote_config_owned<R: CommandRunner>(
     let remote = SshRemote::new(remote.clone());
     remote.ensure_daemon_with(runner)?;
     let host = remote.host().to_owned();
-    let (program, args) = remote.proxy_command(bootty_mux::ssh::REMOTE_DAEMON_PROGRAM, args)?;
+    let (program, args) = remote.proxy_command(bootty_remote::REMOTE_DAEMON_PROGRAM, args)?;
     let output = runner.run(&program, &args)?;
     if output.success {
         return Ok(output.stdout);

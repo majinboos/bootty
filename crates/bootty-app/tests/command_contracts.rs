@@ -19,6 +19,8 @@ use bootty_app::{
     ui::new_session_picker::NewSessionPickerEvent,
 };
 
+mod support;
+
 fn app_command_channel(
     capacity: usize,
 ) -> (
@@ -93,8 +95,14 @@ fn discovered_resource_target_cannot_retarget_a_replacement_binding() {
         ..BoottyConfig::default()
     };
     let started = Instant::now();
-    let mut first =
-        AppState::new(config.clone(), Arc::new(|| {}), None, None).expect("first app state");
+    let mut first = AppState::new(
+        config.clone(),
+        support::backends(),
+        Arc::new(|| {}),
+        None,
+        None,
+    )
+    .expect("first app state");
     let current = submit_command(
         &mut first,
         CommandInvocation::new(
@@ -111,8 +119,8 @@ fn discovered_resource_target_cannot_retarget_a_replacement_binding() {
         serde_json::from_value(value["target"].clone()).expect("current binding target");
     drop(first);
 
-    let mut replacement =
-        AppState::new(config, Arc::new(|| {}), None, None).expect("replacement app state");
+    let mut replacement = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("replacement app state");
     let mut invocation = CommandInvocation::new("edit_space", Vec::new(), Caller::Socket);
     invocation.target = Some(target);
     let outcome = submit_command(
@@ -135,7 +143,8 @@ fn native_split_command_publishes_the_binding_owned_layout() {
         ..BoottyConfig::default()
     };
     let started = Instant::now();
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
     let open = submit_command(
         &mut state,
         CommandInvocation::from_action("new_mux_session", Caller::Socket),
@@ -191,7 +200,8 @@ fn native_window_actions_use_the_binding_owned_plan() {
         ..BoottyConfig::default()
     };
     let started = Instant::now();
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
     let open = submit_command(
         &mut state,
         CommandInvocation::from_action("new_mux_session", Caller::Socket),
@@ -300,7 +310,8 @@ fn destructive_policy_is_identical_for_core_and_extension_commands() {
         config_path: directory.path().join("config.toml"),
         ..BoottyConfig::default()
     };
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
     let descriptor = CommandDescriptor {
         id: "test.destroy".to_owned(),
         title: "Destroy Test".to_owned(),
