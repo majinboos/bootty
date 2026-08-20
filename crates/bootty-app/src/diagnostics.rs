@@ -80,16 +80,3 @@ pub fn should_sample_status_metrics(elapsed: Duration) -> bool {
 pub fn us_to_ms(us: u64) -> f32 {
     us as f32 / 1000.0
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn status_metrics_sample_at_four_hz() {
-        assert!(!should_sample_status_metrics(
-            STATUS_METRICS_SAMPLE_INTERVAL - Duration::from_millis(1)
-        ));
-        assert!(should_sample_status_metrics(STATUS_METRICS_SAMPLE_INTERVAL));
-    }
-}

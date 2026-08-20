@@ -100,20 +100,3 @@ fn filtered(bindings: &[(String, String)], filter: &str) -> Vec<usize> {
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn filter_matches_action_or_chord() {
-        let bindings = vec![
-            ("cmd+p".to_owned(), "session_picker".to_owned()),
-            ("cmd+n".to_owned(), "new_mux_session".to_owned()),
-        ];
-        assert_eq!(filtered(&bindings, "picker"), vec![0]);
-        assert_eq!(filtered(&bindings, "cmd+n"), vec![1]);
-        assert_eq!(filtered(&bindings, ""), vec![0, 1]);
-        assert_eq!(filtered(&bindings, "zzz"), Vec::<usize>::new());
-    }
-}

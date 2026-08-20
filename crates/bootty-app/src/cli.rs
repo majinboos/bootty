@@ -103,10 +103,6 @@ pub struct Cli {
     #[arg(long, default_value = "main", hide = true)]
     window_state_key: String,
 
-    /// Select a running Bootty process by instance ID.
-    #[arg(long, global = true)]
-    instance: Option<String>,
-
     /// Print the exact JSON-RPC response.
     #[arg(long, global = true)]
     json: bool,
@@ -139,10 +135,6 @@ impl Cli {
 
     pub fn subcommand(&self) -> Option<&Command> {
         self.command.as_ref()
-    }
-
-    pub fn instance(&self) -> Option<&str> {
-        self.instance.as_deref()
     }
 
     pub fn json(&self) -> bool {

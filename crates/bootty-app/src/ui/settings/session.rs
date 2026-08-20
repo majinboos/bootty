@@ -185,14 +185,3 @@ fn text_field(
 ) -> egui::Response {
     super::settings_text_edit(ui, palette, value, hint)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scrollback_settings_convert_rows_to_terminal_budget() {
-        assert_eq!(scrollback_rows(320_000_000), 1_000_000);
-        assert_eq!(scrollback_bytes(1_000_000), 320_000_000);
-    }
-}

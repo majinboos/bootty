@@ -1,4 +1,5 @@
 mod state;
+mod workspace_runtime;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,7 +20,9 @@ pub use state::{AppEffect, AppState, FrameInputs, ViewportSnapshot};
 use state::{TerminalProgress, TerminalProgressState};
 
 use crate::{
+    commands::{BoundAppCommandSender, Caller, CommandCatalog},
     config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig},
+    control::ControlPlane,
     direct_input::{DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input},
     layout::SplitDirection,
     menu::AppMenu,
@@ -325,11 +328,9 @@ pub struct BoottyApp {
     error_details_open: bool,
     // Held for the process lifetime so the native menu stays installed.
     _menu: Option<AppMenu>,
-    _control_server: Option<crate::control::ControlServer>,
-    _control_plane: crate::control::ControlPlane,
-    status_extensions: crate::extensions::ExtensionHost,
+    status_extensions: crate::extensions::ExtensionRuntime,
     _command_extensions: crate::command_extensions::CommandExtensionHost,
-    sidebar_extensions: crate::extensions::ExtensionHost,
+    sidebar_extensions: crate::extensions::ExtensionRuntime,
     extension_theme: Vec<(String, String)>,
     lua_window: Option<(LuaWindowOwner, crate::ui::lua_window::LuaWindowDialog)>,
     keep_awake: Option<keepawake::KeepAwake>,
@@ -341,61 +342,16 @@ pub struct BoottyApp {
 }
 
 impl BoottyApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
-        Self::new_with_config(cc, BoottyConfig::default())
-    }
-
-    pub fn new_with_config(cc: &eframe::CreationContext<'_>, config: BoottyConfig) -> Result<Self> {
-        Self::new_inner(cc, config, "main".to_owned(), None, None)
-    }
-
-    pub fn new_with_direct_input(
+    pub(crate) fn new_for_native_host(
         cc: &eframe::CreationContext<'_>,
         config: BoottyConfig,
         window_state_key: String,
         direct_input_rx: mpsc::Receiver<DirectKeyInput>,
         modifier_side_rx: mpsc::Receiver<ModifierSideState>,
+        control_plane: ControlPlane,
     ) -> Result<Self> {
-        Self::new_inner(
-            cc,
-            config,
-            window_state_key,
-            Some(direct_input_rx),
-            Some(modifier_side_rx),
-        )
-    }
-
-    pub fn new_with_control(
-        cc: &eframe::CreationContext<'_>,
-        config: BoottyConfig,
-        window_state_key: String,
-        direct_input_rx: mpsc::Receiver<DirectKeyInput>,
-        modifier_side_rx: mpsc::Receiver<ModifierSideState>,
-    ) -> Result<Self> {
-        let mut app = Self::new_inner(
-            cc,
-            config,
-            window_state_key.clone(),
-            Some(direct_input_rx),
-            Some(modifier_side_rx),
-        )?;
-        app._control_server = Some(crate::control::ControlServer::spawn(
-            window_state_key,
-            app.state
-                .app_command_sender(crate::commands::Caller::Socket),
-            app.state.command_catalog(),
-            app._control_plane.clone(),
-        )?);
-        Ok(app)
-    }
-
-    fn new_inner(
-        cc: &eframe::CreationContext<'_>,
-        config: BoottyConfig,
-        window_state_key: String,
-        direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
-        modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
-    ) -> Result<Self> {
+        let direct_input_rx = Some(direct_input_rx);
+        let modifier_side_rx = Some(modifier_side_rx);
         if uses_custom_egui_fonts(&config) {
             configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
         } else {
@@ -420,12 +376,12 @@ impl BoottyApp {
             .config_path
             .parent()
             .unwrap_or(std::path::Path::new("."));
-        let status_extensions = crate::extensions::ExtensionHost::spawn_status(
+        let status_extensions = crate::extensions::ExtensionRuntime::spawn_status(
             config_dir.join("status"),
             cc.egui_ctx.clone(),
             extension_theme.clone(),
         );
-        let sidebar_extensions = crate::extensions::ExtensionHost::spawn_sidebar(
+        let sidebar_extensions = crate::extensions::ExtensionRuntime::spawn_sidebar(
             config_dir.join("sidebar"),
             cc.egui_ctx.clone(),
             extension_theme.clone(),
@@ -438,7 +394,6 @@ impl BoottyApp {
             direct_input_rx,
             modifier_side_rx,
         )?;
-        let control_plane = crate::control::ControlPlane::default();
         let command_extensions = crate::command_extensions::CommandExtensionHost::load(
             &config_dir.join("extensions"),
             state.command_catalog(),
@@ -456,9 +411,7 @@ impl BoottyApp {
             settings: SettingsSurface::new(config.clone()),
             error_details_open: false,
             _menu: crate::menu::install(),
-            _control_server: None,
             _command_extensions: command_extensions,
-            _control_plane: control_plane,
             status_extensions,
             sidebar_extensions,
             extension_theme,
@@ -468,6 +421,15 @@ impl BoottyApp {
             sidebar_space_swipe: chrome::SidebarSpaceSwipeState::default(),
             window_focused: true,
         })
+    }
+
+    pub(crate) fn control_binding(
+        &self,
+    ) -> (BoundAppCommandSender, std::sync::Arc<CommandCatalog>) {
+        (
+            self.state.app_command_sender(Caller::Socket),
+            self.state.command_catalog(),
+        )
     }
 
     fn sync_extension_theme(&mut self, ctx: &egui::Context) {
@@ -487,12 +449,12 @@ impl BoottyApp {
             .parent()
             .unwrap_or(std::path::Path::new("."))
             .to_path_buf();
-        self.status_extensions = crate::extensions::ExtensionHost::spawn_status(
+        self.status_extensions = crate::extensions::ExtensionRuntime::spawn_status(
             config_dir.join("status"),
             ctx.clone(),
             next.clone(),
         );
-        self.sidebar_extensions = crate::extensions::ExtensionHost::spawn_sidebar(
+        self.sidebar_extensions = crate::extensions::ExtensionRuntime::spawn_sidebar(
             config_dir.join("sidebar"),
             ctx.clone(),
             next,
@@ -2130,7 +2092,7 @@ impl BoottyApp {
         }
     }
 
-    fn lua_host(&self, owner: LuaWindowOwner) -> &crate::extensions::ExtensionHost {
+    fn lua_host(&self, owner: LuaWindowOwner) -> &crate::extensions::ExtensionRuntime {
         match owner {
             LuaWindowOwner::Sidebar => &self.sidebar_extensions,
             LuaWindowOwner::Status => &self.status_extensions,

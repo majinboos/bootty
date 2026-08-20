@@ -3,6 +3,8 @@ set -euo pipefail
 
 APP_NAME="Bootty"
 BINARY_NAME="bootty"
+CLI_NAME="bootty"
+BUNDLE_IDENTIFIER="dev.bootty.desktop"
 PACKAGE_NAME="bootty-app"
 DAEMON_BINARY_NAME="bootty-daemon"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
@@ -22,6 +24,8 @@ PROFILE="release"
 CARGO_PROFILE_ARGS=(--release)
 FAST=0
 LINKAGE="dynamic"
+DEV=0
+CARGO_FEATURE_ARGS=()
 while (($#)); do
   case "$1" in
     --fast)
@@ -30,6 +34,9 @@ while (($#)); do
     --static)
       LINKAGE="static"
       ;;
+    --dev)
+      DEV=1
+      ;;
     *)
       echo "unknown package argument: $1" >&2
       exit 2
@@ -37,6 +44,12 @@ while (($#)); do
   esac
   shift
 done
+if [[ "$DEV" -eq 1 ]]; then
+  APP_NAME="BoottyDev"
+  CLI_NAME="bootty-dev"
+  BUNDLE_IDENTIFIER="dev.bootty.desktop.dev"
+  CARGO_FEATURE_ARGS=(--features bootty-dev)
+fi
 if [[ "$FAST" -eq 1 ]]; then
   PROFILE="fast-release"
   CARGO_PROFILE_ARGS=(--profile fast-release)
@@ -184,7 +197,7 @@ fi
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-cargo build "${CARGO_PROFILE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
+cargo build "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
 
 case "$(uname -s)" in
   Darwin)
@@ -251,7 +264,7 @@ case "$(uname -s)" in
   <key>CFBundleIconName</key>
   <string>$MACOS_ICON_NAME</string>
   <key>CFBundleIdentifier</key>
-  <string>dev.bootty.desktop</string>
+  <string>$BUNDLE_IDENTIFIER</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -276,7 +289,7 @@ PLIST
       fi
       codesign --force --sign - "$MACOS_DIR/$DAEMON_BINARY_NAME"
       codesign --force --sign - \
-        --requirements '=designated => identifier "dev.bootty.desktop"' \
+        --requirements "=designated => identifier \"$BUNDLE_IDENTIFIER\"" \
         "$BUNDLE_DIR"
     fi
 
@@ -292,7 +305,7 @@ PLIST
       "$ROOT_DIR/share/icons/hicolor/256x256/apps" \
       "$ROOT_DIR/share/icons/hicolor/scalable/apps"
 
-    cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$ROOT_DIR/bin/$BINARY_NAME"
+    cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$ROOT_DIR/bin/$CLI_NAME"
     HOST_DAEMON_TARGET="$(host_daemon_target)"
     cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
     mkdir -p "$ROOT_DIR/share/bootty/daemons"
@@ -301,19 +314,19 @@ PLIST
       chmod +x "$ROOT_DIR/share/bootty/daemons/bootty-daemon-$target"
     done
     if [[ "$LINKAGE" == "dynamic" ]]; then
-      copy_dynamic_libraries "$ROOT_DIR/bin/$BINARY_NAME" "$ROOT_DIR/lib"
+      copy_dynamic_libraries "$ROOT_DIR/bin/$CLI_NAME" "$ROOT_DIR/lib"
     fi
     cp "crates/bootty-app/assets/bootty-mascot.png" "$ROOT_DIR/share/icons/hicolor/256x256/apps/bootty.png"
     cp "crates/bootty-app/assets/bootty-mascot.svg" "$ROOT_DIR/share/icons/hicolor/scalable/apps/bootty.svg"
-    chmod +x "$ROOT_DIR/bin/$BINARY_NAME"
+    chmod +x "$ROOT_DIR/bin/$CLI_NAME"
     chmod +x "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
 
-    cat > "$ROOT_DIR/share/applications/dev.bootty.desktop" <<DESKTOP
+    cat > "$ROOT_DIR/share/applications/$BUNDLE_IDENTIFIER.desktop" <<DESKTOP
 [Desktop Entry]
 Type=Application
 Name=$APP_NAME
 Comment=Native GPU-rendered terminal
-Exec=$BINARY_NAME
+Exec=$CLI_NAME
 Icon=bootty
 Terminal=false
 Categories=System;TerminalEmulator;

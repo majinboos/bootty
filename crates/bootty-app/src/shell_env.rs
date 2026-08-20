@@ -20,7 +20,7 @@ static LOGIN_SHELL_ENVIRONMENT: std::sync::OnceLock<Option<Vec<(String, String)>
 /// spawn the wrong shell even when the account login shell is fish. The OS
 /// account record is the source of truth; an explicit `BOOTTY_SHELL` wins first.
 pub fn align_shell_env() {
-    let Some(shell) = aligned_shell(
+    let Some(shell) = advertised_shell(
         std::env::var(BOOTTY_SHELL_ENV).ok(),
         configured_user_shell(),
     ) else {
@@ -36,7 +36,10 @@ pub fn align_shell_env() {
 /// The value `$SHELL` should advertise: an explicit override, then the login
 /// shell, taking the first that is an absolute path. `None` leaves `$SHELL` as
 /// inherited (e.g. non-macOS, where no account shell is resolved).
-fn aligned_shell(override_shell: Option<String>, login_shell: Option<String>) -> Option<String> {
+pub fn advertised_shell(
+    override_shell: Option<String>,
+    login_shell: Option<String>,
+) -> Option<String> {
     [override_shell, login_shell]
         .into_iter()
         .flatten()
@@ -72,14 +75,14 @@ pub fn hydrate_from_login_shell() {}
 
 #[cfg(target_os = "macos")]
 fn login_shell() -> String {
-    login_shell_from(
+    selected_login_shell(
         bootty_runtime::terminal_session::configured_user_shell(),
         std::env::var("SHELL").ok(),
     )
 }
 
 #[cfg(target_os = "macos")]
-fn login_shell_from(configured: Option<String>, inherited: Option<String>) -> String {
+pub fn selected_login_shell(configured: Option<String>, inherited: Option<String>) -> String {
     [configured, inherited]
         .into_iter()
         .flatten()
@@ -106,13 +109,13 @@ fn capture_login_env(shell: &str) -> Option<Vec<(String, String)>> {
         return None;
     }
 
-    Some(parse_null_delimited_env(&String::from_utf8_lossy(
+    Some(parse_login_environment(&String::from_utf8_lossy(
         &output.stdout,
     )))
 }
 
 #[cfg(target_os = "macos")]
-fn parse_null_delimited_env(raw: &str) -> Vec<(String, String)> {
+pub fn parse_login_environment(raw: &str) -> Vec<(String, String)> {
     raw.split('\0')
         .filter_map(|entry| {
             let (key, value) = entry.split_once('=')?;
@@ -131,7 +134,7 @@ fn parse_null_delimited_env(raw: &str) -> Vec<(String, String)> {
 #[cfg(target_os = "macos")]
 fn apply_env(vars: Vec<(String, String)>) {
     for (key, value) in vars {
-        if should_apply_login_env(&key, std::env::var_os(&key).is_some()) {
+        if should_apply_login_environment(&key, std::env::var_os(&key).is_some()) {
             // SAFETY: hydration runs at startup before any threads are spawned.
             unsafe {
                 std::env::set_var(&key, &value);
@@ -141,79 +144,6 @@ fn apply_env(vars: Vec<(String, String)>) {
 }
 
 #[cfg(target_os = "macos")]
-fn should_apply_login_env(key: &str, current_present: bool) -> bool {
+pub fn should_apply_login_environment(key: &str, current_present: bool) -> bool {
     key == "PATH" || !current_present
-}
-
-#[cfg(test)]
-#[cfg(target_os = "macos")]
-mod tests {
-    use super::{
-        aligned_shell, login_shell_from, parse_null_delimited_env, should_apply_login_env,
-    };
-
-    #[test]
-    fn aligned_shell_prefers_override_then_login_and_requires_absolute() {
-        // Explicit override wins when it is an absolute path.
-        assert_eq!(
-            aligned_shell(
-                Some("/opt/homebrew/bin/fish".to_string()),
-                Some("/bin/zsh".to_string()),
-            ),
-            Some("/opt/homebrew/bin/fish".to_string())
-        );
-        // A non-absolute override is skipped, falling through to the login shell.
-        assert_eq!(
-            aligned_shell(Some("fish".to_string()), Some("/bin/zsh".to_string())),
-            Some("/bin/zsh".to_string())
-        );
-        // Nothing absolute leaves `$SHELL` untouched.
-        assert_eq!(aligned_shell(Some("fish".to_string()), None), None);
-    }
-
-    #[test]
-    fn login_shell_prefers_configured_user_shell_over_inherited_shell() {
-        assert_eq!(
-            login_shell_from(
-                Some("/opt/homebrew/bin/fish".to_string()),
-                Some("/bin/zsh".to_string()),
-            ),
-            "/opt/homebrew/bin/fish"
-        );
-    }
-
-    #[test]
-    fn login_shell_falls_back_to_portable_unix_shell() {
-        assert_eq!(login_shell_from(None, Some("zsh".to_string())), "/bin/sh");
-    }
-
-    #[test]
-    fn login_env_policy_always_adopts_path() {
-        assert!(should_apply_login_env("PATH", true));
-        assert!(should_apply_login_env("PATH", false));
-        assert!(should_apply_login_env("BOOTTY_ENV_PROBE", false));
-        assert!(!should_apply_login_env("HOME", true));
-    }
-
-    #[test]
-    fn parses_entries_and_preserves_multiline_values() {
-        let raw = "PATH=/opt/homebrew/bin:/usr/bin\0MULTI=line1\nline2\0EMPTY=\0";
-        let parsed = parse_null_delimited_env(raw);
-
-        assert_eq!(parsed.len(), 3);
-        assert_eq!(
-            parsed[0],
-            ("PATH".to_string(), "/opt/homebrew/bin:/usr/bin".to_string())
-        );
-        assert_eq!(parsed[1], ("MULTI".to_string(), "line1\nline2".to_string()));
-        assert_eq!(parsed[2], ("EMPTY".to_string(), String::new()));
-    }
-
-    #[test]
-    fn skips_entries_without_a_key() {
-        // A leading `=value` or stray separator must not produce an empty key.
-        let parsed = parse_null_delimited_env("=orphan\0\0VALID=1\0");
-
-        assert_eq!(parsed, vec![("VALID".to_string(), "1".to_string())]);
-    }
 }

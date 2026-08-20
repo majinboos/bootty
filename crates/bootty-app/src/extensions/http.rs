@@ -18,17 +18,7 @@ pub(super) fn get_local(port: u16, path: &str, timeout: Duration) -> std::io::Re
     response_body(&response)
 }
 
-#[cfg(test)]
-pub(super) fn response_body(response: &[u8]) -> std::io::Result<String> {
-    response_body_inner(response)
-}
-
-#[cfg(not(test))]
 fn response_body(response: &[u8]) -> std::io::Result<String> {
-    response_body_inner(response)
-}
-
-fn response_body_inner(response: &[u8]) -> std::io::Result<String> {
     let header_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")

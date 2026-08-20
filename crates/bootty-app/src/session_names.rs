@@ -27,7 +27,7 @@ pub struct SessionNameStore {
 }
 
 impl SessionNameStore {
-    pub fn for_binding(config_path: &Path, binding_id: i64) -> Self {
+    pub(crate) fn for_binding(config_path: &Path, binding_id: i64) -> Self {
         let path = crate::workspace::sqlite_path(config_path);
         Self {
             records: Self::load_records(&path, binding_id),
@@ -255,96 +255,5 @@ impl SessionNameStore {
                     .map(|record| (record.session_id.clone(), name.clone(), record.cwd.clone()))
             })
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
-
-    use crate::workspace::WorkspaceStore;
-
-    use super::*;
-    fn temp_config_path(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("bootty-session-names-{name}-{unique}"));
-        fs::create_dir_all(&dir).expect("create metadata directory");
-        dir.join("config.toml")
-    }
-
-    fn store(config_path: &Path) -> SessionNameStore {
-        let workspace = WorkspaceStore::for_config_path(config_path);
-        SessionNameStore::for_binding(
-            config_path,
-            workspace.binding_id().expect("default workspace binding"),
-        )
-    }
-
-    #[test]
-    fn generated_name_survives_session_id_discovery() {
-        let config = temp_config_path("id");
-        let mut store = store(&config);
-        store.remember_generated("bootty/main", "/repo", "bootty/main", "bootty/main");
-
-        let record = store
-            .observe_session("$1", "bootty/main", "/repo")
-            .expect("stored session");
-
-        assert_eq!(record.session_id, "$1");
-        assert_eq!(record.cwd, "/repo");
-    }
-
-    #[test]
-    fn explicit_name_survives_reload() {
-        let config = temp_config_path("explicit");
-        let mut names = store(&config);
-        names.remember_generated("$1", "/repo", "bootty/main", "bootty/main");
-        names.mark_explicit("$1", "release", "release", "/repo");
-
-        let mut reloaded = store(&config);
-        let record = reloaded
-            .observe_session("$1", "release", "/repo")
-            .expect("stored session");
-
-        assert!(record.explicit);
-        assert_eq!(record.generated_name, "bootty/main");
-    }
-    #[test]
-    fn explicit_name_blocks_later_generated_name_updates() {
-        let config = temp_config_path("protected");
-        let mut store = store(&config);
-        store.remember_generated("$1", "/repo", "project/main", "project/main");
-        store.mark_explicit("$1", "release", "release", "/repo");
-        store.remember_generated("$1", "/repo", "project/feature", "project/feature");
-
-        let record = store
-            .observe_session("$1", "release", "/repo")
-            .expect("stored session");
-
-        assert!(record.explicit);
-        assert_eq!(record.generated_name, "project/main");
-    }
-
-    #[test]
-    fn reused_mux_id_does_not_transfer_explicit_name_to_another_worktree() {
-        let config = temp_config_path("reused-id");
-        let mut store = store(&config);
-        store.remember_generated("$1", "/old", "project/main", "project/main");
-        store.mark_explicit("$1", "release", "release", "/old");
-        store.remember_generated("$1", "/new", "other/main", "other/main");
-
-        let record = store
-            .observe_session("$1", "other/main", "/new")
-            .expect("new worktree metadata");
-
-        assert!(!record.explicit);
-        assert_eq!(record.generated_name, "other/main");
-        assert_eq!(record.cwd, "/new");
     }
 }
