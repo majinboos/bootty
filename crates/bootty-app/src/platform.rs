@@ -84,6 +84,12 @@ pub fn write_clipboard_text(text: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn write_clipboard_html(html: &str, plain_text: Option<&str>) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_html(html.to_owned(), plain_text.map(str::to_owned))?;
+    Ok(())
+}
+
 pub fn show_desktop_notification(title: &str, body: &str) -> Result<()> {
     platform_show_desktop_notification(title, body)
 }

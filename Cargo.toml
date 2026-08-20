@@ -83,6 +83,7 @@ rmux-client = "0.10"
 rmux-sdk = "0.10"
 keepawake = "0.6"
 rmux-ipc = "0.10"
+rmux-os = "0.10"
 rmux-proto = "0.10"
 rmux-server = { version = "0.10", default-features = false }
 rstest = "0.26"

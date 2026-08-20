@@ -17,6 +17,19 @@ use config_overrides::ConfigOverrides;
 pub enum Command {
     /// Download and install the latest Bootty release.
     Update,
+    /// List commands exposed by a running Bootty instance.
+    Commands,
+    /// Describe one command exposed by a running Bootty instance.
+    Describe { name: String },
+    /// Invoke a command through the owner-local control plane.
+    #[command(name = "command")]
+    Invoke {
+        name: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
+        #[arg(long)]
+        yes: bool,
+    },
     /// Legacy remote Space protocol retained while daemon installations roll out.
     #[command(name = "remote-space", hide = true, subcommand)]
     RemoteSpace(RemoteSpaceCommand),
@@ -29,6 +42,9 @@ pub enum Command {
     /// Legacy remote terminal protocol retained while daemon installations roll out.
     #[command(name = "remote-rmux", hide = true)]
     RemoteRmux { payload: String },
+    /// Invoke a command discovered from a running Bootty instance.
+    #[command(external_subcommand)]
+    Dynamic(Vec<String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
@@ -87,6 +103,18 @@ pub struct Cli {
     #[arg(long, default_value = "main", hide = true)]
     window_state_key: String,
 
+    /// Select a running Bootty process by instance ID.
+    #[arg(long, global = true)]
+    instance: Option<String>,
+
+    /// Print the exact JSON-RPC response.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Start a Bootty instance when none is running.
+    #[arg(long, global = true)]
+    start: bool,
+
     #[command(flatten)]
     overrides: ConfigOverrides,
 
@@ -111,6 +139,18 @@ impl Cli {
 
     pub fn subcommand(&self) -> Option<&Command> {
         self.command.as_ref()
+    }
+
+    pub fn instance(&self) -> Option<&str> {
+        self.instance.as_deref()
+    }
+
+    pub fn json(&self) -> bool {
+        self.json
+    }
+
+    pub fn start(&self) -> bool {
+        self.start
     }
 
     fn selected_config_path(&self) -> PathBuf {
@@ -169,6 +209,36 @@ mod tests {
         let cli = Cli::try_parse_from(["bootty", "update"]).unwrap();
 
         assert_eq!(cli.subcommand(), Some(&Command::Update));
+    }
+
+    #[test]
+    fn dynamic_control_commands_are_parsed() {
+        let list = Cli::try_parse_from(["bootty", "commands"]).unwrap();
+        assert_eq!(list.subcommand(), Some(&Command::Commands));
+
+        let invoke =
+            Cli::try_parse_from(["bootty", "--instance", "42", "command", "move_tab", "-1"])
+                .unwrap();
+        assert_eq!(invoke.instance(), Some("42"));
+        assert_eq!(
+            invoke.subcommand(),
+            Some(&Command::Invoke {
+                name: "move_tab".to_owned(),
+                arguments: vec!["-1".to_owned()],
+                yes: false,
+            })
+        );
+
+        let dynamic =
+            Cli::try_parse_from(["bootty", "terminal.scroll-page-lines", "--delta", "-3"]).unwrap();
+        assert_eq!(
+            dynamic.subcommand(),
+            Some(&Command::Dynamic(vec![
+                "terminal.scroll-page-lines".to_owned(),
+                "--delta".to_owned(),
+                "-3".to_owned(),
+            ]))
+        );
     }
 
     #[test]

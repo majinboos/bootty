@@ -95,6 +95,10 @@ render frames.
   machine: per-frame orchestration (`update_frame(FrameInputs) -> Vec<AppEffect>`),
   status metrics, input application, config reload, and terminal command
   application. It is unit-testable without a window.
+- `commands.rs` owns the typed core command registry, argument schemas, exact
+  current-context targets, safety gates, and the bounded request/response channel.
+  Palette, keybinding, and external callers share this contract; `AppState` alone
+  resolves targets and executes requests on the UI thread.
 - `app/mod.rs` owns the thin eframe adapter `BoottyApp`: it snapshots egui
   input into `FrameInputs`, applies returned `AppEffect`s to the context, and
   renders chrome from `AppState` accessors.
@@ -177,6 +181,16 @@ TerminalWidget
 
 `TerminalSession::drain_pty` returns worker-published drain statistics for the
 status bar; it does not itself write PTY bytes into the terminal engine.
+
+Application commands preserve the same ownership boundary:
+
+```text
+palette / keybinding -> direct UI-owner dispatch ┐
+                                                 ├-> CommandRegistry validation
+bound external sender -> bounded channel --------┘
+  -> AppState target, capability, and confirmation gates
+  -> typed CommandOutcome
+```
 
 ## Input flow
 

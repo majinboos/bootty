@@ -33,7 +33,7 @@ pub fn run(
     let (direct_input_tx, direct_input_rx) = mpsc::channel();
     let (modifier_side_tx, modifier_side_rx) = mpsc::channel();
     let app_creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
-        Ok(Box::new(BoottyApp::new_with_direct_input(
+        Ok(Box::new(BoottyApp::new_with_control(
             cc,
             config,
             window_state_key,
