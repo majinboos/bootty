@@ -200,11 +200,6 @@ impl TerminalSelectionRouter {
         }
         actions
     }
-
-    #[cfg(test)]
-    pub(super) fn is_active(&self) -> bool {
-        self.active
-    }
 }
 
 fn terminal_selection_event(

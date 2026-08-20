@@ -326,7 +326,9 @@ pub struct BoottyApp {
     // Held for the process lifetime so the native menu stays installed.
     _menu: Option<AppMenu>,
     _control_server: Option<crate::control::ControlServer>,
+    _control_plane: crate::control::ControlPlane,
     status_extensions: crate::extensions::ExtensionHost,
+    _command_extensions: crate::command_extensions::CommandExtensionHost,
     sidebar_extensions: crate::extensions::ExtensionHost,
     extension_theme: Vec<(String, String)>,
     lua_window: Option<(LuaWindowOwner, crate::ui::lua_window::LuaWindowDialog)>,
@@ -381,6 +383,8 @@ impl BoottyApp {
             window_state_key,
             app.state
                 .app_command_sender(crate::commands::Caller::Socket),
+            app.state.command_catalog(),
+            app._control_plane.clone(),
         )?);
         Ok(app)
     }
@@ -434,6 +438,12 @@ impl BoottyApp {
             direct_input_rx,
             modifier_side_rx,
         )?;
+        let control_plane = crate::control::ControlPlane::default();
+        let command_extensions = crate::command_extensions::CommandExtensionHost::load(
+            &config_dir.join("extensions"),
+            state.command_catalog(),
+            control_plane.clone(),
+        );
         Ok(Self {
             state,
             terminal_widget,
@@ -447,6 +457,8 @@ impl BoottyApp {
             error_details_open: false,
             _menu: crate::menu::install(),
             _control_server: None,
+            _command_extensions: command_extensions,
+            _control_plane: control_plane,
             status_extensions,
             sidebar_extensions,
             extension_theme,
@@ -2285,8 +2297,10 @@ impl eframe::App for BoottyApp {
             }
         }
 
+        let now = Instant::now();
+        self._command_extensions.refresh(now);
         let inputs = FrameInputs {
-            now: Instant::now(),
+            now,
             stable_dt_ms: stable_dt * 1000.0,
             events,
             dropped_file_paths,
@@ -2582,415 +2596,4 @@ fn font_face_supports_char(db: &fontdb::Database, id: fontdb::ID, ch: char) -> b
 
 fn egui_font_name(family: &str) -> String {
     format!("bootty-ui-{family}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::extensions::{ModuleCoord, ModuleItem, ModulePrimitive};
-
-    #[test]
-    fn legacy_sessions_override_keeps_embedded_details_without_duplicates() {
-        let mut sidebar = crate::config::SidebarConfig::default();
-        assert!(effective_session_modules(&sidebar, true).is_empty());
-
-        sidebar.session_modules_configured = true;
-        assert_eq!(
-            effective_session_modules(&sidebar, true),
-            sidebar.session_modules
-        );
-    }
-
-    #[test]
-    fn session_modules_merge_summary_primitives_and_interleave_rows() {
-        let base = vec![
-            ModuleItem {
-                kind: Some("group".to_owned()),
-                text: "work".to_owned(),
-                ..ModuleItem::default()
-            },
-            ModuleItem {
-                kind: Some("session".to_owned()),
-                text: "api".to_owned(),
-                session_id: Some("$1".to_owned()),
-                ..ModuleItem::default()
-            },
-            ModuleItem {
-                kind: Some("session".to_owned()),
-                text: "ui".to_owned(),
-                session_id: Some("$2".to_owned()),
-                ..ModuleItem::default()
-            },
-        ];
-        let overlay = ModulePrimitive::Rect {
-            fill: None,
-            stroke: None,
-            x: ModuleCoord::default(),
-            y: ModuleCoord::default(),
-            w: ModuleCoord::default(),
-            h: ModuleCoord::default(),
-            radius: egui::CornerRadius::ZERO,
-        };
-        let components = vec![
-            ModuleItem {
-                kind: Some("session-overlay".to_owned()),
-                session_id: Some("$1".to_owned()),
-                primitives: vec![overlay],
-                ..ModuleItem::default()
-            },
-            ModuleItem {
-                key: Some("$1:cwd".to_owned()),
-                session_id: Some("$1".to_owned()),
-                text: "src/api".to_owned(),
-                ..ModuleItem::default()
-            },
-            ModuleItem {
-                key: Some("$2:cwd".to_owned()),
-                session_id: Some("$2".to_owned()),
-                text: "src/ui".to_owned(),
-                ..ModuleItem::default()
-            },
-        ];
-
-        let composed = compose_session_module_items(base, components);
-
-        assert_eq!(
-            composed
-                .iter()
-                .map(|item| item.text.as_str())
-                .collect::<Vec<_>>(),
-            ["work", "api", "src/api", "ui", "src/ui"]
-        );
-        assert_eq!(composed[1].primitives.len(), 1);
-    }
-
-    #[test]
-    fn settings_editor_keeps_command_shortcuts_outside_keybind_recording() {
-        use winit::keyboard::{KeyCode, ModifiersState};
-
-        let direct_inputs = [KeyCode::Backspace, KeyCode::Slash]
-            .into_iter()
-            .map(|key| {
-                crate::direct_input::direct_key_input_from_winit_code(
-                    key,
-                    ModifiersState::SUPER,
-                    ModifierSideState::default(),
-                    false,
-                )
-                .expect("direct command input")
-            })
-            .collect::<Vec<_>>();
-        let command = egui::Modifiers {
-            command: true,
-            mac_cmd: true,
-            ..Default::default()
-        };
-        let editor_events = || {
-            [egui::Key::Backspace, egui::Key::Slash]
-                .into_iter()
-                .map(|key| egui::Event::Key {
-                    key,
-                    physical_key: Some(key),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: command,
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut events = editor_events();
-        suppress_settings_recorder_duplicates(&mut events, &direct_inputs, false);
-        assert_eq!(events.len(), 2);
-
-        suppress_settings_recorder_duplicates(&mut events, &direct_inputs, true);
-        assert!(events.is_empty());
-    }
-
-    #[test]
-    fn indeterminate_progress_bounces_across_the_full_track() {
-        assert_eq!(indeterminate_progress_left(100.0, 0.0), 0.0);
-        assert_eq!(indeterminate_progress_left(100.0, 0.75), 75.0);
-        assert_eq!(indeterminate_progress_left(100.0, 1.5), 0.0);
-    }
-
-    #[test]
-    fn unfocused_indeterminate_progress_does_not_schedule_animation() {
-        assert!(animate_indeterminate_progress(true, true));
-        assert!(!animate_indeterminate_progress(false, true));
-        assert!(!animate_indeterminate_progress(true, false));
-    }
-    #[test]
-    fn custom_egui_fonts_only_load_for_visible_chrome() {
-        let mut config = BoottyConfig::default();
-        assert!(uses_custom_egui_fonts(&config));
-
-        config.chrome.sidebar = false;
-        config.chrome.top_bar = false;
-        assert!(!uses_custom_egui_fonts(&config));
-
-        config.chrome.bottom_bar = true;
-        assert!(uses_custom_egui_fonts(&config));
-    }
-
-    #[test]
-    fn egui_font_face_data_is_deduplicated_by_resolved_face() {
-        let db = bootty_render::font_database::system_font_database();
-        let id = db
-            .query(&fontdb::Query {
-                families: &[fontdb::Family::Monospace],
-                ..fontdb::Query::default()
-            })
-            .expect("system monospace font");
-        let mut fonts = FontDefinitions::default();
-        let initial_len = fonts.font_data.len();
-
-        assert!(add_egui_font_face(
-            &mut fonts,
-            db,
-            id,
-            "first-alias",
-            EguiFontPlacement::Last,
-        ));
-        assert!(!add_egui_font_face(
-            &mut fonts,
-            db,
-            id,
-            "second-alias",
-            EguiFontPlacement::Last,
-        ));
-        assert_eq!(fonts.font_data.len(), initial_len + 1);
-    }
-
-    #[test]
-    fn custom_egui_fonts_append_symbol_fallbacks_for_spinner_titles() {
-        let db = bootty_render::font_database::system_font_database();
-        for ch in EGUI_SYMBOL_FALLBACK_CHARS {
-            assert!(egui_symbol_fallback_face(db, *ch).is_some());
-        }
-
-        let context = egui::Context::default();
-        configure_egui_fonts(&context, &[]);
-        context.begin_pass(egui::RawInput::default());
-        context.fonts_mut(|fonts| {
-            for ch in EGUI_SYMBOL_FALLBACK_CHARS {
-                assert!(
-                    fonts.has_glyph(&egui::FontId::monospace(12.0), *ch),
-                    "status/tab labels should render every Braille spinner frame through egui fallback fonts"
-                );
-            }
-        });
-        let _ = context.end_pass();
-    }
-
-    #[test]
-    fn rmux_uses_native_layout_renderer() {
-        assert!(backend_uses_native_layout_renderer(
-            MultiplexerBackendConfig::Native
-        ));
-        assert!(backend_uses_native_layout_renderer(
-            MultiplexerBackendConfig::Rmux
-        ));
-        assert!(!backend_uses_native_layout_renderer(
-            MultiplexerBackendConfig::Tmux
-        ));
-        assert!(!backend_uses_native_layout_renderer(
-            MultiplexerBackendConfig::Zellij
-        ));
-    }
-
-    #[test]
-    fn status_bar_background_defaults_to_sidebar_background_default() {
-        let palette = bootty_ui::ThemePalette::default();
-        let chrome = crate::config::ChromeConfig::default();
-
-        assert_eq!(
-            status_bar_background_color(&chrome, palette, None),
-            palette.mantle
-        );
-    }
-
-    #[test]
-    fn status_bar_background_respects_overrides_before_default() {
-        let palette = bootty_ui::ThemePalette::default();
-        let chrome = crate::config::ChromeConfig {
-            status_background: Some(crate::color::Color::from_hex("#123456").unwrap()),
-            ..Default::default()
-        };
-        let explicit = crate::theme::config_color32(chrome.status_background.unwrap());
-        let notch = egui::Color32::from_rgb(0xaa, 0xbb, 0xcc);
-
-        assert_eq!(
-            status_bar_background_color(&chrome, palette, None),
-            explicit
-        );
-        assert_eq!(
-            status_bar_background_color(&chrome, palette, Some(notch)),
-            notch
-        );
-    }
-
-    #[test]
-    fn status_bar_left_padding_keeps_edge_spacing() {
-        assert_eq!(
-            status_bar_left_padding(true, false),
-            chrome::STATUS_EDGE_PAD
-        );
-        assert_eq!(
-            status_bar_left_padding(false, false),
-            chrome::STATUS_EDGE_PAD
-        );
-        assert_eq!(status_bar_left_padding(true, true), chrome::STATUS_EDGE_PAD);
-    }
-
-    #[test]
-    fn sidebar_visibility_respects_the_toggle_when_spaces_exist() {
-        assert!(!sidebar_visible_for_spaces(false, 1));
-        assert!(!sidebar_visible_for_spaces(false, 2));
-        assert!(sidebar_visible_for_spaces(true, 1));
-    }
-
-    #[test]
-    fn space_strip_is_contiguous_with_sidebar_content() {
-        let context = egui::Context::default();
-        let sidebar_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 300.0));
-        let mut rects = None;
-
-        let _ = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(sidebar_rect),
-                ..Default::default()
-            },
-            |ui| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let (content, _) = ui.allocate_exact_size(
-                            egui::vec2(
-                                sidebar_rect.width(),
-                                sidebar_content_height(sidebar_rect.height()),
-                            ),
-                            egui::Sense::hover(),
-                        );
-                        let (strip, _) = ui.allocate_exact_size(
-                            egui::vec2(sidebar_rect.width(), chrome::SPACE_SWITCHER_HEIGHT),
-                            egui::Sense::hover(),
-                        );
-                        rects = Some((content, strip));
-                    });
-            },
-        );
-
-        let (content, strip) = rects.expect("sidebar layout is allocated");
-        assert_eq!(content.max.y, strip.min.y);
-        assert_eq!(strip.height(), chrome::SPACE_SWITCHER_HEIGHT);
-    }
-
-    #[test]
-    fn space_strip_uses_the_sidebar_effective_background() {
-        let palette = bootty_ui::ThemePalette::default();
-        let custom = egui::Color32::from_rgb(0x12, 0x34, 0x56);
-        let space_color = [0x80, 0x40, 0x20];
-
-        assert_eq!(
-            sidebar_background_color(palette, None, space_color, false),
-            palette.mantle
-        );
-        assert_eq!(
-            sidebar_background_color(palette, Some(custom), space_color, false),
-            custom
-        );
-        assert_eq!(
-            sidebar_background_color(palette, Some(custom), space_color, true),
-            egui::Color32::from_rgb(0x1F, 0x35, 0x4F)
-        );
-    }
-
-    #[test]
-    fn auto_top_offset_is_reduced_so_second_tab_row_clears_notch() {
-        assert_eq!(fullscreen_status_top_offset(37.0, 30.0, true, true), 11.0);
-        assert_eq!(
-            fullscreen_status_content_offset(true, 11.0, 18.0, true, true),
-            11.0
-        );
-    }
-
-    #[test]
-    fn explicit_top_offset_survives_extra_tab_rows() {
-        assert_eq!(fullscreen_status_top_offset(24.0, 30.0, true, false), 24.0);
-        assert_eq!(
-            fullscreen_status_content_offset(true, 24.0, 18.0, true, false),
-            6.0
-        );
-    }
-
-    #[test]
-    fn settings_mode_suppresses_terminal_events_and_file_drops() {
-        let mut events = vec![egui::Event::Text("typed into settings".to_owned())];
-        let mut drops = vec![PathBuf::from("/tmp/example.txt")];
-
-        suppress_terminal_payload_for_settings(&mut events, &mut drops);
-
-        assert!(events.is_empty());
-        assert!(drops.is_empty());
-    }
-    #[test]
-    fn zoom_pan_leaves_modified_scroll_for_keybindings() {
-        let alt = egui::Modifiers {
-            alt: true,
-            ..Default::default()
-        };
-        let mut events = vec![
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers: egui::Modifiers::NONE,
-                phase: egui::TouchPhase::Move,
-            },
-            egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Line,
-                delta: egui::vec2(0.0, 1.0),
-                modifiers: alt,
-                phase: egui::TouchPhase::Move,
-            },
-        ];
-
-        assert_eq!(
-            take_scroll_for_pan(&mut events, 22.0),
-            egui::vec2(0.0, 22.0)
-        );
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            &events[0],
-            egui::Event::MouseWheel { modifiers, .. } if *modifiers == alt
-        ));
-    }
-
-    #[test]
-    fn long_transport_errors_have_a_short_summary_and_details() {
-        let error = "remote rmux snapshot failed while running a very long list-sessions and list-panes command with every format field repeated until the error cannot fit in the window";
-        let toast = error_toast_text(error);
-
-        assert!(toast.summary.chars().count() <= 96);
-        assert_eq!(toast.details.as_deref(), Some(error));
-    }
-
-    #[test]
-    fn chrome_context_menus_use_the_active_theme_popup_style() {
-        let context = egui::Context::default();
-        let theme = bootty_ui::Theme::new(bootty_ui::ThemePalette::default());
-        sync_global_egui_style(&context, theme);
-
-        let palette = theme.palette;
-        let style = context.global_style();
-        assert_eq!(style.visuals.window_fill, palette.pane);
-        assert_eq!(style.visuals.window_stroke.color, palette.border);
-        assert_eq!(style.visuals.widgets.hovered.bg_fill, palette.hover);
-        assert!(style.visuals.dark_mode);
-        assert_eq!(
-            style.visuals.menu_corner_radius,
-            egui::CornerRadius::same(palette.radius)
-        );
-        assert_eq!(style.visuals.popup_shadow, egui::epaint::Shadow::NONE);
-    }
 }

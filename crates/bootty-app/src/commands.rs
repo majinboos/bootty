@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock,
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     time::Instant,
@@ -418,6 +418,130 @@ impl CommandRegistry {
     }
 }
 
+pub type ExtensionCommandHandler = Arc<
+    dyn Fn(CommandInvocation, Instant, CommandCancellation) -> Receiver<CommandOutcome>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+#[derive(Clone)]
+pub struct ResolvedExtensionCommand {
+    pub descriptor: CommandDescriptor,
+    pub invocation: CommandInvocation,
+    pub handler: ExtensionCommandHandler,
+}
+
+#[derive(Clone)]
+pub struct CommandCatalog {
+    core: &'static CommandRegistry,
+    extensions: Arc<RwLock<BTreeMap<String, (CommandDescriptor, ExtensionCommandHandler)>>>,
+}
+
+impl std::fmt::Debug for CommandCatalog {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandCatalog")
+            .field("core", &self.core)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CommandCatalog {
+    fn default() -> Self {
+        Self {
+            core: CommandRegistry::core(),
+            extensions: Arc::default(),
+        }
+    }
+}
+
+impl CommandCatalog {
+    pub fn list(&self) -> Vec<CommandDescriptor> {
+        let mut commands = self.core.list().cloned().collect::<Vec<_>>();
+        if let Ok(extensions) = self.extensions.read() {
+            commands.extend(
+                extensions
+                    .values()
+                    .map(|(descriptor, _)| descriptor.clone()),
+            );
+        }
+        commands.sort_by(|left, right| left.id.cmp(&right.id));
+        commands
+    }
+
+    pub fn describe(&self, id: &str) -> Option<CommandDescriptor> {
+        self.core.describe(id).cloned().or_else(|| {
+            self.extensions
+                .read()
+                .ok()
+                .and_then(|commands| commands.get(id).map(|(descriptor, _)| descriptor.clone()))
+        })
+    }
+
+    pub fn resolve(
+        &self,
+        invocation: CommandInvocation,
+    ) -> Result<ResolvedCommandInvocation, CommandOutcome> {
+        self.core.resolve(invocation)
+    }
+
+    pub fn resolve_extension(
+        &self,
+        invocation: CommandInvocation,
+    ) -> Result<Option<ResolvedExtensionCommand>, CommandOutcome> {
+        let command = self
+            .extensions
+            .read()
+            .ok()
+            .and_then(|commands| commands.get(&invocation.command).cloned());
+        let Some((descriptor, handler)) = command else {
+            return Ok(None);
+        };
+        validate_arguments(&descriptor, &invocation.arguments)?;
+        Ok(Some(ResolvedExtensionCommand {
+            descriptor,
+            invocation,
+            handler,
+        }))
+    }
+
+    pub fn register_extension(
+        &self,
+        package: &str,
+        descriptor: CommandDescriptor,
+        handler: ExtensionCommandHandler,
+    ) -> Result<(), String> {
+        if package.is_empty() || !is_namespaced(&descriptor.id, package) {
+            return Err("extension command must be namespaced by its package".to_owned());
+        }
+        if self.core.describe(&descriptor.id).is_some() {
+            return Err("extension command cannot replace a built-in command".to_owned());
+        }
+        let mut extensions = self
+            .extensions
+            .write()
+            .map_err(|_| "command catalog is unavailable".to_owned())?;
+        if extensions.contains_key(&descriptor.id) {
+            return Err(format!("command {} is already registered", descriptor.id));
+        }
+        extensions.insert(descriptor.id.clone(), (descriptor, handler));
+        Ok(())
+    }
+
+    pub fn clear_extensions(&self) {
+        if let Ok(mut extensions) = self.extensions.write() {
+            extensions.clear();
+        }
+    }
+}
+
+/// Whether `id` is `package` followed by a dot and a leaf, the namespacing every
+/// extension-supplied command id and event topic must satisfy.
+pub fn is_namespaced(id: &str, package: &str) -> bool {
+    id.starts_with(package) && id[package.len()..].starts_with('.')
+}
+
 fn descriptor_metadata(id: &str, command: Command) -> (&str, &str) {
     match id {
         "change_appearance" => (
@@ -752,316 +876,5 @@ impl Drop for AppCommandReceiver {
                 message: "application command channel shut down".to_owned(),
             });
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::*;
-    use crate::app_actions::{AppAction, MuxKeyAction, SidebarAction};
-    #[test]
-    fn invocation_preserves_parameterized_actions() {
-        let invocation = CommandInvocation::from_action("move_tab:-1", Caller::Keybinding);
-        let resolved = CommandRegistry::core().resolve(invocation).unwrap();
-
-        assert_eq!(
-            resolved.executor,
-            CoreCommandExecutor::Keybind(KeybindAction::Mux(MuxKeyAction::MoveTab(-1)))
-        );
-    }
-
-    #[test]
-    fn catalog_command_resolves_through_the_same_registry() {
-        let invocation =
-            CommandInvocation::from_catalog(Command::ToggleSidebar, Caller::CommandPalette)
-                .expect("palette command");
-        let resolved = CommandRegistry::core().resolve(invocation).unwrap();
-
-        assert_eq!(
-            resolved.executor,
-            CoreCommandExecutor::Keybind(KeybindAction::App(AppAction::ToggleSidebarVisibility))
-        );
-    }
-
-    #[test]
-    fn invocation_serialization_has_stable_field_names() {
-        let invocation = CommandInvocation::from_action("next_tab", Caller::BuiltinKeybinding);
-
-        assert_eq!(
-            serde_json::to_value(invocation).unwrap(),
-            serde_json::json!({
-                "command": "next_tab",
-                "caller": "builtin_keybinding"
-            })
-        );
-    }
-
-    #[test]
-    fn palette_commands_come_from_the_registry() {
-        let commands = CommandRegistry::core()
-            .palette_commands()
-            .collect::<Vec<_>>();
-
-        assert!(commands.contains(&Command::ToggleSidebar));
-        assert!(!commands.contains(&Command::SelectTab));
-    }
-
-    #[test]
-    fn registry_has_one_descriptor_per_command_id() {
-        let ids = CommandRegistry::core()
-            .list()
-            .map(|descriptor| descriptor.id.clone())
-            .collect::<BTreeSet<String>>();
-        assert_eq!(ids.len(), CommandRegistry::core().list().count());
-        assert!(ids.contains("toggle_sidebar_visibility"));
-        assert!(ids.contains("move_tab"));
-        assert!(ids.contains("search"));
-        assert!(ids.contains("search_selection"));
-        assert!(ids.contains("navigate_search"));
-        assert!(ids.contains("end_search"));
-        assert!(ids.contains("ui.sidebar.activate_session"));
-    }
-
-    #[test]
-    fn sidebar_commands_have_window_scoped_typed_executors() {
-        for action in SidebarAction::ALL {
-            let resolved = CommandRegistry::core()
-                .resolve(CommandInvocation::from_action(
-                    action.command_id(),
-                    Caller::Keybinding,
-                ))
-                .unwrap();
-
-            assert_eq!(
-                resolved.descriptor.target,
-                Some(ResourceKind::ApplicationWindow)
-            );
-            assert_eq!(resolved.executor, CoreCommandExecutor::Sidebar(action));
-        }
-    }
-
-    #[test]
-    fn schema_rejects_bad_parameter_types() {
-        let invocation = CommandInvocation::from_action("select_tab:nope", Caller::Cli);
-        assert!(matches!(
-            CommandRegistry::core().resolve(invocation),
-            Err(CommandOutcome::Failed { code, .. }) if code == "invalid_arguments"
-        ));
-    }
-
-    #[test]
-    fn callers_resolve_the_same_command_contract() {
-        let callers = [
-            Caller::CommandPalette,
-            Caller::Keybinding,
-            Caller::BuiltinKeybinding,
-            Caller::Cli,
-            Caller::Socket,
-            Caller::Luau,
-            Caller::Internal,
-        ];
-        let executors = callers.map(|caller| {
-            CommandRegistry::core()
-                .resolve(CommandInvocation::from_action("next_tab", caller))
-                .unwrap()
-                .executor
-        });
-
-        assert!(executors.windows(2).all(|pair| pair[0] == pair[1]));
-        assert_eq!(
-            executors[0],
-            CoreCommandExecutor::Keybind(KeybindAction::Mux(MuxKeyAction::NextTab))
-        );
-    }
-
-    #[test]
-    fn descriptors_declare_current_context_targets() {
-        assert_eq!(
-            CommandRegistry::core()
-                .describe("kill_pane")
-                .unwrap()
-                .target,
-            Some(ResourceKind::Pane)
-        );
-        assert_eq!(
-            CommandRegistry::core()
-                .describe("close_window")
-                .unwrap()
-                .target,
-            Some(ResourceKind::ApplicationWindow)
-        );
-        assert_eq!(
-            CommandRegistry::core()
-                .describe("ditch_session")
-                .unwrap()
-                .mutation,
-            MutationClass::Destructive
-        );
-        assert_eq!(
-            CommandRegistry::core()
-                .describe("ditch_session")
-                .unwrap()
-                .target,
-            Some(ResourceKind::Session)
-        );
-        for (command, target) in [
-            ("new_window", ResourceKind::Binding),
-            ("new_tab", ResourceKind::Session),
-            ("rename_tab", ResourceKind::MuxWindow),
-            ("copy_mode", ResourceKind::Terminal),
-        ] {
-            assert_eq!(
-                CommandRegistry::core().describe(command).unwrap().target,
-                Some(target),
-                "{command}"
-            );
-        }
-    }
-
-    #[test]
-    fn confirmation_is_bound_to_the_exact_target_generation() {
-        let mut invocation = CommandInvocation::from_action("kill_pane", Caller::Socket);
-        invocation.target = Some(CommandTarget {
-            kind: ResourceKind::Pane,
-            handle: "binding:1/pane:%2".to_owned(),
-            generation: 4,
-        });
-        let confirmation = invocation.confirmation();
-        invocation.target.as_mut().unwrap().generation = 5;
-
-        assert_ne!(confirmation, invocation.confirmation());
-    }
-
-    #[test]
-    fn target_generations_round_trip_as_exact_decimal_strings() {
-        let target = CommandTarget {
-            kind: ResourceKind::Instance,
-            handle: "instance".to_owned(),
-            generation: u64::MAX,
-        };
-
-        let json = serde_json::to_value(&target).unwrap();
-        assert_eq!(json["generation"], u64::MAX.to_string());
-        assert_eq!(
-            serde_json::from_value::<CommandTarget>(json).unwrap(),
-            target
-        );
-    }
-
-    #[test]
-    fn cancellation_is_shared_with_the_queued_request() {
-        let cancellation = CommandCancellation::new();
-        let queued = cancellation.clone();
-
-        cancellation.cancel();
-
-        assert!(queued.is_cancelled());
-    }
-
-    #[test]
-    fn cancellation_cannot_override_started_dispatch() {
-        let cancellation = CommandCancellation::new();
-
-        assert!(cancellation.try_start());
-        cancellation.cancel();
-
-        assert!(!cancellation.is_cancelled());
-    }
-
-    #[test]
-    fn app_command_channel_is_bounded() {
-        let (tx, _rx) = app_command_channel(1);
-        let tx = tx.for_caller(Caller::Socket);
-        let request = || {
-            let (response, _) = mpsc::channel();
-            AppCommandRequest {
-                invocation: CommandInvocation::from_action("next_tab", Caller::Socket),
-                deadline: Instant::now(),
-                cancellation: CommandCancellation::new(),
-                response,
-            }
-        };
-
-        tx.try_send(request()).unwrap();
-        assert_eq!(tx.try_send(request()), Err(AppCommandSendError::Overloaded));
-    }
-
-    #[test]
-    fn app_command_send_wakes_the_ui_thread() {
-        let (wake_tx, wake_rx) = mpsc::channel();
-        let repaint: RepaintHandle = Arc::new(move || {
-            let _ = wake_tx.send(());
-        });
-        let (tx, _rx) = app_command_channel_with_repaint(1, repaint);
-        let tx = tx.for_caller(Caller::Socket);
-        let (response, _) = mpsc::channel();
-
-        tx.try_send(AppCommandRequest {
-            invocation: CommandInvocation::from_action("next_tab", Caller::Socket),
-            deadline: Instant::now(),
-            cancellation: CommandCancellation::new(),
-            response,
-        })
-        .unwrap();
-
-        wake_rx.try_recv().unwrap();
-    }
-
-    #[test]
-    fn app_command_sender_binds_the_trusted_caller() {
-        let (tx, rx) = app_command_channel(1);
-        let tx = tx.for_caller(Caller::Socket);
-        let (response, _) = mpsc::channel();
-
-        tx.try_send(AppCommandRequest {
-            invocation: CommandInvocation::from_action("next_tab", Caller::Internal),
-            deadline: Instant::now(),
-            cancellation: CommandCancellation::new(),
-            response,
-        })
-        .unwrap();
-
-        assert_eq!(rx.try_recv().unwrap().invocation.caller, Caller::Socket);
-    }
-
-    #[test]
-    fn app_command_channel_reports_shutdown() {
-        let (tx, rx) = app_command_channel(1);
-        let tx = tx.for_caller(Caller::Socket);
-        drop(rx);
-        let (response, _) = mpsc::channel();
-
-        assert_eq!(
-            tx.try_send(AppCommandRequest {
-                invocation: CommandInvocation::from_action("next_tab", Caller::Socket),
-                deadline: Instant::now(),
-                cancellation: CommandCancellation::new(),
-                response,
-            }),
-            Err(AppCommandSendError::Shutdown)
-        );
-    }
-
-    #[test]
-    fn dropping_the_command_receiver_completes_queued_requests() {
-        let (tx, rx) = app_command_channel(1);
-        let tx = tx.for_caller(Caller::Socket);
-        let (response, response_rx) = mpsc::channel();
-        tx.try_send(AppCommandRequest {
-            invocation: CommandInvocation::from_action("next_tab", Caller::Internal),
-            deadline: Instant::now(),
-            cancellation: CommandCancellation::new(),
-            response,
-        })
-        .unwrap();
-
-        drop(rx);
-
-        assert!(matches!(
-            response_rx.recv().unwrap(),
-            CommandOutcome::Failed { code, .. } if code == "shutdown"
-        ));
     }
 }

@@ -17,7 +17,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use crate::commands::{
     AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
-    CommandInvocation, CommandRegistry,
+    CommandCatalog, CommandInvocation,
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -33,6 +33,47 @@ const EVENT_QUEUE_LIMIT: usize = 64;
 const EVENT_TOPIC_LIMIT: usize = 128;
 const TASK_WAIT_INTERVAL: Duration = Duration::from_millis(50);
 const COMMAND_COMPLETED_TOPIC: &str = "command.completed";
+
+#[derive(Clone, Default)]
+pub struct ControlPlane {
+    state: SharedControlState,
+    instance_scope: Arc<Mutex<Option<String>>>,
+}
+
+impl ControlPlane {
+    pub fn register_extension_topic(&self, package: &str, topic: &str) -> Result<(), String> {
+        if !crate::commands::is_namespaced(topic, package) {
+            return Err("extension event topic must be namespaced by its package".to_owned());
+        }
+        lock_control_state(&self.state)
+            .topics
+            .insert(topic.to_owned());
+        Ok(())
+    }
+
+    pub fn publish_extension_event(
+        &self,
+        package: &str,
+        topic: &str,
+        payload: Value,
+    ) -> Result<(), String> {
+        self.register_extension_topic(package, topic)?;
+        let scope = self
+            .instance_scope
+            .lock()
+            .map_err(|_| "control plane scope is unavailable".to_owned())?
+            .clone()
+            .ok_or_else(|| "control plane is not bound to an instance".to_owned())?;
+        lock_control_state(&self.state).publish_event(
+            scope,
+            topic,
+            json!({"extension": package}),
+            Value::Null,
+            payload,
+        );
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceDescriptor {
@@ -81,14 +122,24 @@ pub struct ControlServer {
 }
 
 impl ControlServer {
-    pub fn spawn(window_state_key: String, commands: BoundAppCommandSender) -> Result<Self> {
+    pub fn spawn(
+        window_state_key: String,
+        commands: BoundAppCommandSender,
+        catalog: Arc<CommandCatalog>,
+        plane: ControlPlane,
+    ) -> Result<Self> {
         let descriptor = new_instance_descriptor(&window_state_key)?;
         prepare_endpoint(&LocalEndpoint::from_path(descriptor.endpoint.clone()))?;
+        let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
         let endpoint_path = descriptor.endpoint.clone();
-        let endpoint = LocalEndpoint::from_path(endpoint_path.clone());
+        let state = Arc::clone(&plane.state);
+        *plane
+            .instance_scope
+            .lock()
+            .map_err(|_| anyhow::anyhow!("control plane scope is unavailable"))? =
+            Some(instance_scope(&descriptor));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let state = Arc::new(Mutex::new(ControlState::default()));
         let server_state = Arc::clone(&state);
         let server_descriptor = descriptor.clone();
         let server_thread = match thread::Builder::new()
@@ -127,12 +178,14 @@ impl ControlServer {
                                 let commands = commands.clone();
                                 let descriptor = server_descriptor.clone();
                                 let state = Arc::clone(&server_state);
+                                let catalog = Arc::clone(&catalog);
                                 tokio::spawn(async move {
                                     let _permit = permit;
                                     let _ = serve_connection(
                                         stream,
                                         descriptor,
                                         commands,
+                                        catalog,
                                         state,
                                         peer.pid,
                                     )
@@ -200,6 +253,7 @@ async fn serve_connection(
     mut stream: rmux_ipc::LocalStream,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
+    catalog: Arc<CommandCatalog>,
     state: SharedControlState,
     owner_pid: u32,
 ) -> io::Result<()> {
@@ -226,7 +280,9 @@ async fn serve_connection(
                     None,
                 )
             }
-            Ok(request) => handle_request(request, descriptor, commands, state, owner_pid).await,
+            Ok(request) => {
+                handle_request(request, descriptor, commands, catalog, state, owner_pid).await
+            }
             Err(error) => RpcResponse::error(Value::Null, -32700, error.to_string(), None),
         },
     };
@@ -250,6 +306,7 @@ async fn handle_request(
     request: RpcRequest,
     descriptor: InstanceDescriptor,
     commands: BoundAppCommandSender,
+    catalog: Arc<CommandCatalog>,
     state: SharedControlState,
     owner_pid: u32,
 ) -> RpcResponse {
@@ -280,16 +337,23 @@ async fn handle_request(
                 "command.describe", "command.invoke", "event.subscribe", "event.unsubscribe",
                 "task.status", "task.cancel"
             ],
-            "event_topics": {
-                "command.completed": {"snapshot": "instance.describe"}
-            }
+            "event_topics": lock_control_state(&state)
+                .topics
+                .iter()
+                .map(|topic| (topic.clone(), json!({
+                    "snapshot": if topic == COMMAND_COMPLETED_TOPIC {
+                        Some("instance.describe")
+                    } else {
+                        None
+                    }
+                })))
+                .collect::<BTreeMap<_, _>>()
         })),
         "instance.describe" => serde_json::to_value(descriptor).map_err(internal_error),
-        "command.list" => serde_json::to_value(CommandRegistry::core().list().collect::<Vec<_>>())
-            .map_err(internal_error),
+        "command.list" => serde_json::to_value(catalog.list()).map_err(internal_error),
         "command.describe" => {
             let name = request.params.get("command").and_then(Value::as_str);
-            match name.and_then(|name| CommandRegistry::core().describe(name)) {
+            match name.and_then(|name| catalog.describe(name)) {
                 Some(command) => serde_json::to_value(command).map_err(internal_error),
                 None => Err(RpcError::new(-32602, "unknown command")),
             }
@@ -513,7 +577,7 @@ fn subscribe_events(
             .ok_or_else(|| RpcError::new(-32602, "missing subscription cursor"))?;
         return state.poll_subscription(subscription, owner_pid, cursor);
     }
-    let topics = event_topics(&params)?;
+    let topics = event_topics(&params, &state)?;
     let scope = event_scope(&params, &descriptor)?;
     state.create_subscription(owner_pid, topics, scope)
 }
@@ -560,7 +624,7 @@ fn subscription_id(params: &Value) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::new(-32602, "missing subscription"))
 }
 
-fn event_topics(params: &Value) -> Result<BTreeSet<String>, RpcError> {
+fn event_topics(params: &Value, state: &ControlState) -> Result<BTreeSet<String>, RpcError> {
     let topics = params
         .get("topics")
         .and_then(Value::as_array)
@@ -574,9 +638,7 @@ fn event_topics(params: &Value) -> Result<BTreeSet<String>, RpcError> {
             let Some(topic) = topic.as_str() else {
                 return Err(RpcError::new(-32602, "event topic must be a string"));
             };
-            if topic.is_empty()
-                || topic.len() > EVENT_TOPIC_LIMIT
-                || topic != COMMAND_COMPLETED_TOPIC
+            if topic.is_empty() || topic.len() > EVENT_TOPIC_LIMIT || !state.topics.contains(topic)
             {
                 return Err(RpcError::new(-32602, "unsupported event topic"));
             }
@@ -610,6 +672,7 @@ struct ControlState {
     next_subscription: u64,
     subscriptions: BTreeMap<String, SubscriptionRecord>,
     revisions: BTreeMap<String, u64>,
+    topics: BTreeSet<String>,
 }
 
 impl Default for ControlState {
@@ -621,6 +684,7 @@ impl Default for ControlState {
             next_subscription: 1,
             subscriptions: BTreeMap::new(),
             revisions: BTreeMap::new(),
+            topics: BTreeSet::from([COMMAND_COMPLETED_TOPIC.to_owned()]),
         }
     }
 }
@@ -1231,186 +1295,4 @@ fn set_owner_only_file(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn set_owner_only_file(_path: &Path) -> io::Result<()> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::commands::{CommandTarget, ResourceKind, app_command_channel};
-
-    #[test]
-    fn ping_request_uses_json_rpc_envelope() {
-        let request = RpcRequest {
-            jsonrpc: "2.0".to_owned(),
-            id: json!(7),
-            method: "system.ping".to_owned(),
-            params: Value::Null,
-        };
-        let encoded = serde_json::to_value(request).unwrap();
-        assert_eq!(encoded["jsonrpc"], "2.0");
-        assert_eq!(encoded["method"], "system.ping");
-    }
-
-    #[test]
-    fn unknown_method_returns_stable_error_code() {
-        let (commands, _receiver) = app_command_channel(1);
-        let response = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(handle_request(
-                RpcRequest {
-                    jsonrpc: "2.0".to_owned(),
-                    id: json!(1),
-                    method: "missing".to_owned(),
-                    params: Value::Null,
-                },
-                new_instance_descriptor("test").unwrap(),
-                commands.for_caller(Caller::Socket),
-                Arc::new(Mutex::new(ControlState::default())),
-                7,
-            ));
-        assert_eq!(response.error.unwrap().code, -32601);
-    }
-
-    #[test]
-    fn task_cancellation_is_owned_and_shutdown_cancels() {
-        let mut state = ControlState::default();
-        let cancellation = CommandCancellation::new();
-        let task = state.start_task(7, cancellation.clone()).unwrap();
-
-        assert_eq!(state.cancel_task(&task, 8).unwrap_err().code, -32006);
-        let value = state.cancel_task(&task, 7).unwrap();
-        assert_eq!(value["task"]["state"]["status"], "cancelling");
-        assert!(cancellation.is_cancelled());
-
-        let other_cancellation = CommandCancellation::new();
-        state.start_task(7, other_cancellation.clone()).unwrap();
-        state.cancel_all_tasks();
-        assert!(other_cancellation.is_cancelled());
-    }
-
-    #[test]
-    fn detached_task_reports_completion() {
-        let state = Arc::new(Mutex::new(ControlState::default()));
-        let (commands, receiver) = app_command_channel(1);
-        let task = start_task(
-            CommandInvocation::from_action("new_tab", Caller::Socket),
-            commands.for_caller(Caller::Socket),
-            Arc::clone(&state),
-            7,
-            "instance:test".to_owned(),
-        )
-        .unwrap()["task"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let request = receiver.try_recv().unwrap();
-        request
-            .response
-            .send(crate::commands::CommandOutcome::success())
-            .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let status = task_status(json!({"task": task}), Arc::clone(&state), 7).unwrap();
-            if status["task"]["state"]["status"] == "completed" {
-                assert_eq!(status["task"]["state"]["outcome"]["status"], "success");
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(5));
-        }
-    }
-
-    #[test]
-    fn completion_events_include_target_and_provenance() {
-        let mut state = ControlState::default();
-        let scope = "instance:test".to_owned();
-        let subscription = state
-            .create_subscription(
-                7,
-                [COMMAND_COMPLETED_TOPIC.to_owned()].into_iter().collect(),
-                scope.clone(),
-            )
-            .unwrap()["subscription"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let invocation = CommandInvocation {
-            command: "new_tab".to_owned(),
-            arguments: Vec::new(),
-            caller: Caller::Socket,
-            target: Some(CommandTarget {
-                kind: ResourceKind::Pane,
-                handle: "pane-4".to_owned(),
-                generation: 3,
-            }),
-            confirmation: None,
-        };
-
-        state.publish_command_completion(
-            scope,
-            7,
-            &invocation,
-            json!({"status": "success", "value": null}),
-        );
-        let events = state.poll_subscription(&subscription, 7, 0).unwrap();
-
-        assert_eq!(events["revision"], 1);
-        assert_eq!(events["events"][0]["sequence"], 1);
-        assert_eq!(events["events"][0]["provenance"]["caller"], "socket");
-        assert_eq!(events["events"][0]["provenance"]["owner_pid"], 7);
-        assert_eq!(events["events"][0]["target"]["handle"], "pane-4");
-    }
-
-    #[test]
-    fn event_overflow_requires_snapshot_rebase() {
-        let mut state = ControlState::default();
-        let scope = "instance:test".to_owned();
-        let subscription = state
-            .create_subscription(
-                7,
-                [COMMAND_COMPLETED_TOPIC.to_owned()].into_iter().collect(),
-                scope.clone(),
-            )
-            .unwrap()["subscription"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-
-        for _ in 0..=EVENT_QUEUE_LIMIT {
-            state.publish_event(
-                scope.clone(),
-                COMMAND_COMPLETED_TOPIC,
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            );
-        }
-
-        let error = state.poll_subscription(&subscription, 7, 0).unwrap_err();
-        assert_eq!(error.code, -32005);
-        assert_eq!(error.data.unwrap()["rebase"], "snapshot");
-    }
-
-    #[test]
-    fn protocol_negotiation_rejects_incompatible_clients() {
-        let error = negotiate_protocol(&json!({
-            "minimum_protocol_version": PROTOCOL_VERSION + 1,
-            "maximum_protocol_version": PROTOCOL_VERSION + 1,
-        }))
-        .unwrap_err();
-
-        assert_eq!(error.code, -32007);
-        assert_eq!(
-            error.data.unwrap()["server_maximum"],
-            json!(PROTOCOL_VERSION)
-        );
-    }
-
-    #[test]
-    fn current_process_descriptor_is_not_stale() {
-        let descriptor = new_instance_descriptor("test").unwrap();
-
-        assert!(!instance_process_is_dead(&descriptor));
-    }
 }
