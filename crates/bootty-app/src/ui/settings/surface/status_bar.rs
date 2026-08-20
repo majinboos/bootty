@@ -93,7 +93,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
             palette,
             &mut height,
             super::NumberEditSpec {
-                path: &["chrome", "status-height"],
+                id_salt: &["chrome", "status-height"],
                 range: 20.0..=80.0,
                 suffix: " px",
                 precision: 1,

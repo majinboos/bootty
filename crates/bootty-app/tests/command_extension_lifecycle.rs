@@ -157,7 +157,6 @@ fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction
                                     separator_visible: false,
                                     focused: false,
                                     hovered_session: None,
-                                    unfocused_dim: 0.0,
                                     fullscreen: false,
                                     hover_override: None,
                                     current_override: None,

@@ -12,7 +12,6 @@ bootty-control = { path = "../bootty-control" }
 bootty-extension = { path = "../bootty-extension" }
 anyhow.workspace = true
 arboard.workspace = true
-clap.workspace = true
 eframe.workspace = true
 iconflow.workspace = true
 fontdb.workspace = true
@@ -27,11 +26,9 @@ bootty-ui = { path = "../bootty-ui" }
 bootty-render = { path = "../bootty-render" }
 bootty-runtime = { path = "../bootty-runtime" }
 bootty-terminal = { path = "../bootty-terminal" }
+bootty-workspace = { path = "../bootty-workspace" }
 png.workspace = true
-rusqlite.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "checksums", "compression-tar-gz", "compression-zip-deflate", "github", "rustls", "ureq"] }
 strum.workspace = true
 ttf-parser.workspace = true
 wgpu.workspace = true
@@ -41,9 +38,6 @@ bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda.workspace = true
-objc2.workspace = true
-objc2-app-kit.workspace = true
-objc2-foundation.workspace = true
 wgpu = { workspace = true, features = ["metal"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -63,6 +57,7 @@ bootty-winit = { path = "../bootty-winit", features = ["bare-host"] }
 criterion.workspace = true
 egui.workspace = true
 pollster.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [[bench]]

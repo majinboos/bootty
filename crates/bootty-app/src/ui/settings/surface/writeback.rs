@@ -4,7 +4,7 @@ use crate::{
     color::Color,
     config::{
         BoottyConfig, ConfigDocument, ConfigResult, load_config_document, load_config_from_path,
-        load_or_create_config_document, update_config_document,
+        update_config_document,
     },
 };
 
@@ -54,37 +54,23 @@ impl SettingsWriteback {
     }
 
     pub(super) fn set_f32(&mut self, path: &[&str], value: f32) {
-        self.mutate(|document| {
-            document.set_item(path, bootty_config::toml_edit::value(f64::from(value)))
-        });
+        self.mutate(|document| document.set_f32(path, value));
     }
 
     pub(super) fn set_bool(&mut self, path: &[&str], value: bool) {
-        self.mutate(|document| document.set_item(path, bootty_config::toml_edit::value(value)));
+        self.mutate(|document| document.set_bool(path, value));
     }
 
     pub(super) fn set_str(&mut self, path: &[&str], value: &str) {
-        self.mutate(|document| document.set_item(path, bootty_config::toml_edit::value(value)));
+        self.mutate(|document| document.set_str(path, value));
     }
 
     pub(super) fn set_i64(&mut self, path: &[&str], value: i64) {
-        self.mutate(|document| document.set_item(path, bootty_config::toml_edit::value(value)));
+        self.mutate(|document| document.set_i64(path, value));
     }
 
     pub(super) fn set_env(&mut self, path: &[&str], entries: &[(String, String)]) {
-        let mut array = bootty_config::toml_edit::Array::new();
-        for (name, value) in entries {
-            let mut table = bootty_config::toml_edit::InlineTable::new();
-            table.insert("name", bootty_config::toml_edit::Value::from(name.as_str()));
-            table.insert(
-                "value",
-                bootty_config::toml_edit::Value::from(value.as_str()),
-            );
-            array.push(table);
-        }
-        self.mutate(move |document| {
-            document.set_item(path, bootty_config::toml_edit::value(array))
-        });
+        self.mutate(move |document| document.set_env(path, entries));
     }
 
     pub(super) fn set_color(&mut self, path: &[&str], rgb: [u8; 3]) {
@@ -101,45 +87,29 @@ impl SettingsWriteback {
 
     pub(super) fn set_color_value(&mut self, path: &[&str], color: Color) {
         let hex = color_hex(color);
-        self.mutate(move |document| document.set_item(path, bootty_config::toml_edit::value(hex)));
+        self.mutate(move |document| document.set_str(path, &hex));
     }
 
     pub(super) fn set_strings(&mut self, path: &[&str], values: &[String]) {
-        let mut array = bootty_config::toml_edit::Array::new();
-        for value in values {
-            array.push(value.as_str());
-        }
-        self.mutate(move |document| {
-            document.set_item(path, bootty_config::toml_edit::value(array))
-        });
+        self.mutate(|document| document.set_strings(path, values));
     }
 
     pub(super) fn contains(&self, path: &[&str]) -> bool {
         let Ok(Some(document)) = load_config_document(&self.path) else {
             return false;
         };
-        let Some((leaf, parents)) = path.split_last() else {
-            return false;
-        };
-        let mut table = document.document().as_table();
-        for key in parents {
-            let Some(next) = table
-                .get(key)
-                .and_then(bootty_config::toml_edit::Item::as_table)
-            else {
-                return false;
-            };
-            table = next;
-        }
-        table.contains_key(leaf)
+        document.contains(path)
     }
 
-    pub(super) fn document(&self) -> Option<ConfigDocument> {
-        load_or_create_config_document(&self.path).ok()
+    pub(super) fn string_array(&self, path: &[&str]) -> Option<Vec<String>> {
+        let Ok(Some(document)) = load_config_document(&self.path) else {
+            return None;
+        };
+        document.string_array(path)
     }
 
     pub(super) fn remove(&mut self, path: &[&str]) {
-        self.mutate(|document| document.remove_item(path));
+        self.mutate(|document| document.remove(path));
     }
 }
 

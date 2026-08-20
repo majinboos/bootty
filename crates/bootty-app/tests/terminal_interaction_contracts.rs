@@ -8,7 +8,7 @@ use std::{
 };
 
 use bootty_app::{
-    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
+    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::ViewTransform,
     renderer::RendererMetrics,

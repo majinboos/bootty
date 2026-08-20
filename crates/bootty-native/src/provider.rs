@@ -64,6 +64,5 @@ impl MuxAppBackendProvider for NativeProvider {
 }
 
 bootty_mux::register_mux_backend!(NativeProvider);
-bootty_mux::register_mux_app_backend!(NativeProvider);
 
 pub fn link() {}

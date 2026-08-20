@@ -1,3 +1,4 @@
+use bootty_extension::ModuleColor;
 use bootty_ui::{Theme, ThemePalette, UiColorConfig};
 use eframe::egui::Color32;
 
@@ -34,6 +35,10 @@ fn ui_color_config_from_colors(colors: &ColorConfig) -> UiColorConfig {
 }
 
 pub(crate) fn config_color32(color: Color) -> Color32 {
+    Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+}
+
+pub(crate) fn module_color32(color: ModuleColor) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
 }
 

@@ -25,6 +25,10 @@ use crate::{
     },
 };
 
+mod workspace_view;
+
+pub(crate) use workspace_view::{TerminalWorkspaceView, animate_indeterminate_progress};
+
 fn surface_rect(rect: Rect) -> SurfaceRect {
     SurfaceRect {
         min_x: rect.min.x,

@@ -18,7 +18,9 @@ use crate::{
     config::{MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
     mux::controller::SpaceId,
     remote_catalog::{self, RemoteSpaceSummary},
-    workspace::{DEFAULT_SPACE_COLOR, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride},
+};
+use bootty_workspace::{
+    DEFAULT_SPACE_COLOR, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
 };
 
 #[derive(Debug)]

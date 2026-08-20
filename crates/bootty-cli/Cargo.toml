@@ -1,0 +1,22 @@
+[package]
+name = "bootty-cli"
+version.workspace = true
+edition.workspace = true
+
+[features]
+bootty-dev = ["bootty-identity/bootty-dev"]
+
+[dependencies]
+anyhow.workspace = true
+bootty-config = { path = "../bootty-config" }
+bootty-font = { path = "../bootty-font" }
+bootty-identity = { path = "../bootty-identity" }
+bootty-mux-model = { path = "../bootty-mux-model" }
+bootty-runtime = { path = "../bootty-runtime" }
+bootty-terminal = { path = "../bootty-terminal" }
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+clap.workspace = true
+self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "checksums", "compression-tar-gz", "compression-zip-deflate", "github", "rustls", "ureq"] }
+
+[dev-dependencies]
+tempfile.workspace = true

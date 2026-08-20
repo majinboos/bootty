@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Result;
 use bootty_app::{
-    app::{AppState, FrameInputs, ViewportSnapshot},
+    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig},
     geometry::ViewTransform,
     mux::{
@@ -21,25 +21,28 @@ use bootty_app::{
         controller::MuxScope,
         provider::{
             GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider,
-            MuxAppBackendRegistry, MuxBackendProvider, MuxCommandDispatch, PaneBehavior,
-            PaneTopology, PersistedSessionPolicy, SelectionPublicationPolicy,
-            TerminalProgressPolicy, TerminalResidency,
+            MuxBackendProvider, MuxBackendRegistry, MuxCommandDispatch, PaneBehavior, PaneTopology,
+            PersistedSessionPolicy, SelectionPublicationPolicy, TerminalProgressPolicy,
+            TerminalResidency,
         },
-        snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot},
+        snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
         terminal::{
             BackendPanePolicy, PaneLayoutResizeRequest, PaneStartRequest, ScopedMuxPaneTarget,
             TerminalRuntime,
         },
     },
     renderer::RendererMetrics,
-    ui::new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
-    workspace::{
-        BindingMembershipMutation, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
-        WorkspaceRepository,
+    ui::{
+        ditch::{DitchAction, DitchSessionEvent},
+        new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
     },
 };
 use bootty_command::{
     AppCommandRequest, Caller, CommandCancellation, CommandInvocation, CommandOutcome,
+};
+use bootty_workspace::{
+    BindingMembershipMutation, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
+    WorkspaceRepository,
 };
 use rusqlite::Connection;
 
@@ -48,6 +51,7 @@ mod support;
 struct RestoreBackend {
     sessions: Arc<Mutex<Vec<MuxSession>>>,
     create_calls: Arc<AtomicUsize>,
+    release: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
 }
 
 impl MuxBackend for RestoreBackend {
@@ -65,57 +69,59 @@ impl MuxBackend for RestoreBackend {
     }
 
     fn execute(&mut self, command: MuxCommand) -> Result<()> {
-        if let MuxCommand::CreateProjectSession { session_id, cwd } = command {
-            self.create_calls.fetch_add(1, Ordering::SeqCst);
-            self.sessions
-                .lock()
-                .expect("restore backend sessions lock")
-                .push(MuxSession {
-                    anchor: MuxPaneAnchor {
-                        session_id: session_id.clone(),
-                        cwd: Some(cwd),
-                        ..MuxPaneAnchor::default()
-                    },
-                    id: session_id.clone(),
-                    name: session_id,
-                    active: true,
-                    active_window_id: None,
-                    windows: Vec::new(),
-                });
+        match command {
+            MuxCommand::CreateProjectSession { session_id, cwd } => {
+                self.create_calls.fetch_add(1, Ordering::SeqCst);
+                self.sessions
+                    .lock()
+                    .expect("restore backend sessions lock")
+                    .push(MuxSession {
+                        anchor: MuxPaneAnchor {
+                            session_id: session_id.clone(),
+                            cwd: Some(cwd),
+                            ..MuxPaneAnchor::default()
+                        },
+                        id: session_id.clone(),
+                        name: session_id,
+                        active: true,
+                        active_window_id: None,
+                        windows: Vec::new(),
+                    });
+            }
+            MuxCommand::DitchSession { session_id } => {
+                if let Some(release) = &self.release {
+                    release
+                        .lock()
+                        .expect("restore backend release lock")
+                        .recv()
+                        .expect("release delayed ditch");
+                }
+                self.sessions
+                    .lock()
+                    .expect("restore backend sessions lock")
+                    .retain(|session| session.id != session_id);
+            }
+            _ => {}
         }
         Ok(())
     }
 }
 
 struct RestoreProvider {
+    kind: MuxBackendKind,
+    dispatch: MuxCommandDispatch,
     sessions: Arc<Mutex<Vec<MuxSession>>>,
     create_calls: Arc<AtomicUsize>,
+    release: Option<Arc<Mutex<mpsc::Receiver<()>>>>,
+    native_panes: bool,
+    selection_publication: SelectionPublicationPolicy,
 }
 
-impl MuxBackendProvider for RestoreProvider {
-    fn kind(&self) -> MuxBackendKind {
-        MuxBackendKind::Tmux
-    }
-
-    fn command_dispatch(&self) -> MuxCommandDispatch {
-        MuxCommandDispatch::CallerThread
-    }
-
-    fn build_backend(
-        &self,
-        _config: &MuxBindingConfig,
-        _workspace: Option<&Path>,
-    ) -> Box<dyn MuxBackend> {
-        Box::new(RestoreBackend {
-            sessions: Arc::clone(&self.sessions),
-            create_calls: Arc::clone(&self.create_calls),
-        })
-    }
+struct TestPanePolicy {
+    fail_start: bool,
 }
 
-struct NoTerminalPanePolicy;
-
-impl BackendPanePolicy for NoTerminalPanePolicy {
+impl BackendPanePolicy for TestPanePolicy {
     fn remote_target(&self) -> Option<&SshTarget> {
         None
     }
@@ -124,7 +130,11 @@ impl BackendPanePolicy for NoTerminalPanePolicy {
         &mut self,
         _request: PaneStartRequest<'_>,
     ) -> Result<Option<Box<dyn TerminalRuntime>>> {
-        Ok(None)
+        if self.fail_start {
+            anyhow::bail!("native pane publication failed")
+        } else {
+            Ok(None)
+        }
     }
 
     fn sync_target(&mut self, _target: Option<&ScopedMuxPaneTarget>, _hide_tmux_status: bool) {}
@@ -138,15 +148,43 @@ impl BackendPanePolicy for NoTerminalPanePolicy {
     fn deactivate(&mut self) {}
 }
 
+impl MuxBackendProvider for RestoreProvider {
+    fn kind(&self) -> MuxBackendKind {
+        self.kind
+    }
+
+    fn command_dispatch(&self) -> MuxCommandDispatch {
+        self.dispatch
+    }
+
+    fn build_backend(
+        &self,
+        _config: &MuxBindingConfig,
+        _workspace: Option<&Path>,
+    ) -> Box<dyn MuxBackend> {
+        Box::new(RestoreBackend {
+            sessions: Arc::clone(&self.sessions),
+            create_calls: Arc::clone(&self.create_calls),
+            release: self.release.clone(),
+        })
+    }
+}
+
 impl MuxAppBackendProvider for RestoreProvider {
     fn build_pane_policy(&self, _config: &MuxBindingConfig) -> Box<dyn BackendPanePolicy> {
-        Box::new(NoTerminalPanePolicy)
+        Box::new(TestPanePolicy {
+            fail_start: self.native_panes,
+        })
     }
 
     fn app_policy(&self) -> MuxAppBackendPolicy {
         MuxAppBackendPolicy {
             panes: PaneBehavior {
-                topology: PaneTopology::Attach,
+                topology: if self.native_panes {
+                    PaneTopology::ProcessLocal
+                } else {
+                    PaneTopology::Attach
+                },
                 cache_terminals: false,
                 resize_cached_terminals: false,
             },
@@ -154,7 +192,7 @@ impl MuxAppBackendProvider for RestoreProvider {
             persisted_sessions: PersistedSessionPolicy::AfterEmptyInitialSnapshot,
             generated_session_names: GeneratedSessionNamePolicy::PreserveBackend,
             terminal_residency: TerminalResidency::BindingScoped,
-            selection_publication: SelectionPublicationPolicy::Direct,
+            selection_publication: self.selection_publication,
         }
     }
 
@@ -163,26 +201,29 @@ impl MuxAppBackendProvider for RestoreProvider {
             scope,
             [
                 BindingOperation::CreateProjectSession,
+                BindingOperation::CreateWindow,
                 BindingOperation::RenameSession,
+                BindingOperation::DitchSession,
             ],
         )
     }
 }
 
-fn backends_after_empty_restore() -> (Arc<MuxAppBackendRegistry>, Arc<AtomicUsize>) {
+fn backends_after_empty_restore() -> (Arc<MuxBackendRegistry>, Arc<AtomicUsize>) {
     let sessions = Arc::new(Mutex::new(Vec::new()));
     let create_calls = Arc::new(AtomicUsize::new(0));
     let provider = || RestoreProvider {
+        kind: MuxBackendKind::Tmux,
+        dispatch: MuxCommandDispatch::CallerThread,
         sessions: Arc::clone(&sessions),
         create_calls: Arc::clone(&create_calls),
+        release: None,
+        native_panes: false,
+        selection_publication: SelectionPublicationPolicy::Direct,
     };
     let registry = Arc::new(
-        MuxAppBackendRegistry::from_providers(
-            [Arc::new(provider()) as Arc<dyn MuxBackendProvider>],
-            [Arc::new(provider()) as Arc<dyn MuxAppBackendProvider>],
-            [MuxBackendKind::Tmux],
-        )
-        .expect("restore test backend registry"),
+        MuxBackendRegistry::from_app_providers([Arc::new(provider())], [MuxBackendKind::Tmux])
+            .expect("restore test backend registry"),
     );
     (registry, create_calls)
 }
@@ -203,6 +244,300 @@ fn frame(now: Instant) -> FrameInputs {
         terminal_scale_factor: 1.0,
         terminal_view_transform: ViewTransform::IDENTITY,
     }
+}
+
+fn session_with_pane(id: &str) -> MuxSession {
+    let pane = MuxPaneAnchor {
+        session_id: id.to_owned(),
+        pane_id: Some(format!("{id}-pane")),
+        ..MuxPaneAnchor::default()
+    };
+    MuxSession {
+        id: id.to_owned(),
+        name: id.to_owned(),
+        active: id == "first",
+        anchor: pane.clone(),
+        active_window_id: Some(format!("{id}-window")),
+        windows: vec![MuxWindow {
+            id: format!("{id}-window"),
+            index: 0,
+            name: "window".to_owned(),
+            active: true,
+            anchor: pane.clone(),
+            panes: vec![pane],
+            layout: None,
+            progress: None,
+        }],
+    }
+}
+
+fn submit_command(
+    state: &mut AppState,
+    invocation: CommandInvocation,
+    started: Instant,
+) -> CommandOutcome {
+    let commands = state.app_command_sender(Caller::Socket);
+    let (response, outcomes) = mpsc::channel();
+    commands
+        .try_send(AppCommandRequest {
+            invocation,
+            deadline: started + Duration::from_secs(1),
+            cancellation: CommandCancellation::new(),
+            response,
+        })
+        .expect("submit command");
+    (0..250)
+        .find_map(|tick| {
+            state.update_frame(frame(started + Duration::from_millis(tick)));
+            outcomes.try_recv().ok()
+        })
+        .expect("command completes")
+}
+
+#[test]
+fn persist_before_publish_blocks_selection_when_restore_write_fails() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let sessions = Arc::new(Mutex::new(vec![
+        session_with_pane("first"),
+        session_with_pane("second"),
+    ]));
+    let backends = Arc::new(
+        MuxBackendRegistry::from_app_providers(
+            [Arc::new(RestoreProvider {
+                kind: MuxBackendKind::Tmux,
+                dispatch: MuxCommandDispatch::CallerThread,
+                sessions,
+                create_calls: Arc::new(AtomicUsize::new(0)),
+                release: None,
+                native_panes: false,
+                selection_publication: SelectionPublicationPolicy::PersistBeforePublish,
+            })],
+            [MuxBackendKind::Tmux],
+        )
+        .expect("selection test backend registry"),
+    );
+    let mut state =
+        AppState::new(config, backends, Arc::new(|| {}), None, None).expect("app state");
+    state.update_frame(frame(Instant::now()));
+    assert_eq!(state.mux().selected_session(), Some("first"));
+
+    let database = directory.path().join("session-order.sqlite3");
+    let lock = Connection::open(&database).expect("open lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold workspace write lock");
+    state.activate_session_from_ui("second");
+
+    assert_eq!(state.mux().selected_session(), Some("first"));
+    assert!(
+        state
+            .last_error()
+            .is_some_and(|error| error.contains("save binding restore state"))
+    );
+}
+
+#[test]
+fn native_pane_publication_error_is_preserved_on_successful_command() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path,
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let backends = Arc::new(
+        MuxBackendRegistry::from_app_providers(
+            [Arc::new(RestoreProvider {
+                kind: MuxBackendKind::Tmux,
+                dispatch: MuxCommandDispatch::CallerThread,
+                sessions: Arc::new(Mutex::new(vec![session_with_pane("first")])),
+                create_calls: Arc::new(AtomicUsize::new(0)),
+                release: None,
+                native_panes: true,
+                selection_publication: SelectionPublicationPolicy::Direct,
+            })],
+            [MuxBackendKind::Tmux],
+        )
+        .expect("native pane test backend registry"),
+    );
+    let mut state =
+        AppState::new(config, backends, Arc::new(|| {}), None, None).expect("app state");
+    state.update_frame(frame(Instant::now()));
+    state.clear_last_error();
+
+    let outcome = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_tab", Caller::Socket),
+        Instant::now(),
+    );
+
+    assert!(
+        matches!(outcome, CommandOutcome::Success { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(state.last_error(), Some("native pane publication failed"));
+}
+
+#[test]
+fn pending_ditch_completes_in_its_original_space() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let cwd = directory.path().to_string_lossy().into_owned();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release = Arc::new(Mutex::new(release_rx));
+    let first_sessions = Arc::new(Mutex::new(vec![MuxSession {
+        anchor: MuxPaneAnchor {
+            session_id: "delayed".to_owned(),
+            cwd: Some(cwd.clone()),
+            ..MuxPaneAnchor::default()
+        },
+        id: "delayed".to_owned(),
+        name: "delayed".to_owned(),
+        active: true,
+        active_window_id: None,
+        windows: Vec::new(),
+    }]));
+    let second_sessions = Arc::new(Mutex::new(Vec::new()));
+    let create_calls = Arc::new(AtomicUsize::new(0));
+    let backends = Arc::new(
+        MuxBackendRegistry::from_app_providers(
+            [
+                Arc::new(RestoreProvider {
+                    kind: MuxBackendKind::Tmux,
+                    dispatch: MuxCommandDispatch::WorkerThread,
+                    sessions: Arc::clone(&first_sessions),
+                    create_calls: Arc::clone(&create_calls),
+                    release: Some(Arc::clone(&release)),
+                    native_panes: false,
+                    selection_publication: SelectionPublicationPolicy::Direct,
+                }),
+                Arc::new(RestoreProvider {
+                    kind: MuxBackendKind::Zellij,
+                    dispatch: MuxCommandDispatch::CallerThread,
+                    sessions: Arc::clone(&second_sessions),
+                    create_calls: Arc::clone(&create_calls),
+                    release: None,
+                    native_panes: false,
+                    selection_publication: SelectionPublicationPolicy::Direct,
+                }),
+            ],
+            [MuxBackendKind::Tmux, MuxBackendKind::Zellij],
+        )
+        .expect("delayed test backend registry"),
+    );
+
+    let (mut repository, snapshot) = WorkspaceRepository::open(&config_path).expect("workspace");
+    let first_space = snapshot.spaces()[0].clone();
+    let first_scope = first_space.bindings()[0].mux_scope();
+    let mut order = first_space.bindings()[0].session_order().clone();
+    assert!(order.add_session("delayed"));
+    let mut names = first_space.bindings()[0].session_names().clone();
+    assert!(names.remember_generated("delayed", &cwd, "delayed", "delayed"));
+    repository
+        .commit_binding_state(first_scope, &order, &names)
+        .expect("persist delayed session");
+    let second_space = repository
+        .create_space(
+            "Second",
+            "2",
+            [0x22, 0x44, 0x66],
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Zellij),
+                remote: SpaceRemoteOverride::Local,
+            },
+            config.multiplexer.hide_tmux_status,
+        )
+        .expect("create second Space")
+        .expect("valid second Space");
+    let second_id = second_space.id();
+    let second_scope = second_space.bindings()[0].mux_scope();
+    drop(repository);
+
+    let mut state =
+        AppState::new(config, backends, Arc::new(|| {}), None, None).expect("app state");
+    assert!((0..250).any(|tick| {
+        state.update_frame(frame(Instant::now() + Duration::from_millis(tick)));
+        std::thread::sleep(Duration::from_millis(1));
+        state
+            .binding_session_groups()
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .any(|session| session.id == "delayed")
+    }));
+    assert!(state.open_ditch_session_dialog_for("delayed"));
+    let ModalDialog::DitchSession(dialog) = state.take_modal_dialog().expect("ditch dialog") else {
+        panic!("expected ditch dialog");
+    };
+    state.clear_last_error();
+    state.apply_ditch_session_event(
+        dialog,
+        DitchSessionEvent::Ditch {
+            session_id: "delayed".to_owned(),
+            cwd: None,
+            action: DitchAction::KillOnly,
+        },
+    );
+    assert!(state.activate_space_from_ui(second_id));
+    assert!(state.binding_session_groups()[0].sessions.is_empty());
+    release_tx.send(()).expect("release delayed ditch");
+
+    for tick in 0..250 {
+        state.update_frame(frame(Instant::now() + Duration::from_millis(tick)));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(state.last_error().is_none(), "{:#?}", state.last_error());
+    assert!(state.activate_space_from_ui(first_scope.space_id()));
+    let removed = (0..250).any(|tick| {
+        state.update_frame(frame(Instant::now() + Duration::from_millis(tick)));
+        std::thread::sleep(Duration::from_millis(1));
+        state.binding_session_groups()[0].sessions.is_empty()
+    });
+    assert!(removed, "original Space must publish the ditch completion");
+
+    drop(state);
+    let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
+    let first = reopened
+        .spaces()
+        .iter()
+        .find(|space| space.id() == first_scope.space_id())
+        .expect("first Space");
+    let second = reopened
+        .spaces()
+        .iter()
+        .find(|space| space.id() == second_scope.space_id())
+        .expect("second Space");
+    assert!(
+        first.bindings()[0]
+            .session_order()
+            .session_names()
+            .is_empty()
+    );
+    assert!(
+        second.bindings()[0]
+            .session_order()
+            .session_names()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -332,7 +667,106 @@ fn a_failed_session_membership_commit_preserves_the_live_runtime_and_database() 
 }
 
 #[test]
-fn one_frame_recovers_active_binding_without_publishing_inactive_recovery() {
+fn an_inactive_placement_update_rebuilds_before_activation() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let (mut repository, _) = WorkspaceRepository::open(&config_path).expect("workspace");
+    let second_space = repository
+        .create_space(
+            "Second",
+            "2",
+            [0x22, 0x44, 0x66],
+            false,
+            SpaceMuxOverride::default(),
+            config.multiplexer.hide_tmux_status,
+        )
+        .expect("create second Space")
+        .expect("valid second Space");
+    let second_id = second_space.id();
+    drop(repository);
+
+    let repaint = Arc::new(|| {});
+    let mut state =
+        AppState::new(config, support::backends(), repaint, None, None).expect("app state");
+    let second = state
+        .space_summaries()
+        .into_iter()
+        .find(|space| space.id == second_id)
+        .expect("inactive second Space");
+    assert!(state.update_space_from_ui(
+        second.id,
+        &second.name,
+        &second.icon,
+        second.color,
+        second.tint_sidebar,
+        SpaceMuxOverride {
+            backend: Some(MultiplexerBackendConfig::Tmux),
+            remote: SpaceRemoteOverride::Local,
+        },
+    ));
+    assert_eq!(
+        state.multiplexer_backend(),
+        MultiplexerBackendConfig::Native
+    );
+    assert!(state.activate_space_from_ui(second_id));
+    assert_eq!(state.multiplexer_backend(), MultiplexerBackendConfig::Tmux);
+}
+
+#[test]
+fn deleting_an_inactive_space_removes_live_and_durable_state() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        ..BoottyConfig::default()
+    };
+    let (mut repository, _) = WorkspaceRepository::open(&config_path).expect("workspace");
+    let second_space = repository
+        .create_space(
+            "Second",
+            "2",
+            [0x22, 0x44, 0x66],
+            false,
+            SpaceMuxOverride::default(),
+            config.multiplexer.hide_tmux_status,
+        )
+        .expect("create second Space")
+        .expect("valid second Space");
+    let second_id = second_space.id();
+    drop(repository);
+
+    let repaint = Arc::new(|| {});
+    let mut state =
+        AppState::new(config.clone(), support::backends(), repaint, None, None).expect("app state");
+    assert_eq!(state.space_summaries().len(), 2);
+    assert!(state.close_space_from_ui(second_id));
+    assert!(
+        state
+            .space_summaries()
+            .into_iter()
+            .all(|space| space.id != second_id)
+    );
+
+    let (_, snapshot) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
+    assert_eq!(snapshot.spaces().len(), 1);
+    assert!(
+        snapshot
+            .spaces()
+            .iter()
+            .all(|space| space.id() != second_id)
+    );
+}
+
+#[test]
+fn one_frame_recovers_active_and_inactive_binding_membership() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
     let config = BoottyConfig {
@@ -366,7 +800,7 @@ fn one_frame_recovers_active_binding_without_publishing_inactive_recovery() {
             [0x22, 0x44, 0x66],
             false,
             SpaceMuxOverride::default(),
-            &config.multiplexer,
+            config.multiplexer.hide_tmux_status,
         )
         .expect("create second Space")
         .expect("valid second Space");
@@ -443,8 +877,8 @@ fn one_frame_recovers_active_binding_without_publishing_inactive_recovery() {
         repository
             .pending_binding_membership_mutation(second_scope)
             .expect("read second pending operation")
-            .is_some(),
-        "the inactive binding must keep its own recovery"
+            .is_none(),
+        "one frame must resolve the inactive binding journal"
     );
     let active_groups = state.binding_session_groups();
     assert_eq!(active_groups.len(), 1);
@@ -459,7 +893,7 @@ fn one_frame_recovers_active_binding_without_publishing_inactive_recovery() {
         first_space.tint_sidebar,
         local_override.clone(),
     ));
-    assert!(!state.update_space_from_ui(
+    assert!(state.update_space_from_ui(
         second_space.id,
         &second_space.name,
         &second_space.icon,

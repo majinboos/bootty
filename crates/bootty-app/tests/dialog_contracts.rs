@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fs};
 
 use bootty_app::{
-    app::{AppState, ModalDialog},
+    AppState, ModalDialog,
     config::{AppearanceVariant, BoottyConfig},
     mux::{
         controller::{BindingId, MuxScope, SpaceId},
@@ -16,9 +16,9 @@ use bootty_app::{
         space::{SpaceEditorDialog, SpaceEditorEvent},
         theme_picker::{ThemePickerDialog, ThemePickerEvent, available_themes},
     },
-    workspace::SpaceMuxOverride,
 };
 use bootty_ui::icons::install_icon_fonts;
+use bootty_workspace::SpaceMuxOverride;
 use egui::{Context, Event, Key, RawInput, Rect, Vec2};
 
 mod support;

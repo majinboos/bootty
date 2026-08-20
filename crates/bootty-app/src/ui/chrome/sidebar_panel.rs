@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
-use bootty_extension::{ExtensionUiAction, ModuleColor, ModuleItem, PublishedSurfaceItem};
+use bootty_extension::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem};
 use bootty_ui::{ThemePalette, icons::paint_icon_slug, readable_color};
-use eframe::egui::{self, Color32, Pos2, Rect, Stroke, TextureHandle};
+use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
 use crate::{
     assets,
     mux::controller::{MuxScope, SpaceId},
     strings::truncate_label,
+    theme::module_color32,
     ui::{
         session_navigation::ScopedSessionTarget,
         sidebar::{SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree},
@@ -15,10 +16,6 @@ use crate::{
 };
 
 use super::{item_primitives::paint_item_primitives, start_window_drag_on_primary_press};
-
-fn module_color(value: ModuleColor) -> Color32 {
-    Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
-}
 
 #[derive(Clone)]
 pub struct SidebarModel<'a> {
@@ -35,8 +32,6 @@ pub struct SidebarModel<'a> {
     pub separator_visible: bool,
     pub focused: bool,
     pub hovered_session: Option<&'a ScopedSessionTarget>,
-    /// Retained for callers that construct the model; `BoottyApp` dims after the Space strip.
-    pub unfocused_dim: f32,
     /// Explicit color overrides from `[sidebar]`; each falls back to a theme-derived tint.
     pub fullscreen: bool,
     pub hover_override: Option<egui::Color32>,
@@ -1296,7 +1291,7 @@ fn paint_sidebar_footer(
         }
         let color = readable_color(
             palette.base,
-            item.fg.map(module_color).unwrap_or(palette.subtext),
+            item.fg.map(module_color32).unwrap_or(palette.subtext),
         );
         paint_item_primitives(
             &painter,

@@ -168,7 +168,7 @@ fn open_catalog(path: &Path) -> Result<Catalog> {
 fn daemon_uses_the_stored_backend_provider_without_desktop_fallback() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let provider: Arc<dyn MuxBackendProvider> = Arc::new(MarkerProvider);
-    let backends = Arc::new(MuxBackendRegistry::from_providers(
+    let backends = Arc::new(MuxBackendRegistry::from_core_providers(
         [provider],
         [MuxBackendKind::Tmux],
     )?);

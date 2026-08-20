@@ -756,9 +756,12 @@ fn config_document_preserves_comments_and_order_for_writeback() {
     "#});
     let source = fs::read_to_string(&sandbox.path).unwrap();
 
-    let document = load_config_document(&sandbox.path).unwrap().unwrap();
+    update_config_document(&sandbox.path, |document| {
+        document.set_str(&["window", "title"], "Bootty")
+    })
+    .unwrap();
 
-    assert_eq!(document.document().to_string(), source);
+    assert_eq!(fs::read_to_string(&sandbox.path).unwrap(), source);
 }
 
 #[test]
@@ -775,7 +778,7 @@ fn config_document_writeback_preserves_unrelated_comments_and_order() {
         sidebar = true
     "#});
     update_config_document(&sandbox.path, |document| {
-        document.set_item(&["font", "size"], toml_edit::value(15.0))
+        document.set_f32(&["font", "size"], 15.0)
     })
     .unwrap();
 

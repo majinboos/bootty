@@ -1,17 +1,16 @@
 use std::path::{Path, PathBuf};
 
 use bootty_extension::{
-    ModuleColor, ModuleIdentity, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot,
-    editable_module_source, error_item, import_legacy_extension_module, legacy_extension_modules,
-    module_identities, preview_module_surfaces, reset_module_source, save_module_source,
+    ModuleIdentity, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot, editable_module_source,
+    error_item, import_legacy_extension_module, legacy_extension_modules, module_identities,
+    preview_module_surfaces, reset_module_source, save_module_source,
 };
 use bootty_ui::icons;
 use eframe::egui::{self, RichText};
 
+use crate::theme::module_color32;
+
 use super::SettingsWindow;
-fn module_color(value: ModuleColor) -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
-}
 
 #[derive(Default)]
 pub(super) struct EditorState {
@@ -330,12 +329,12 @@ fn module_preview(
                 if let Some(icon) = &item.icon {
                     ui.label(
                         RichText::new(icon)
-                            .color(item.fg.map(module_color).unwrap_or(palette.text)),
+                            .color(item.fg.map(module_color32).unwrap_or(palette.text)),
                     );
                 }
                 ui.label(
                     RichText::new(&item.text)
-                        .color(item.fg.map(module_color).unwrap_or(palette.text)),
+                        .color(item.fg.map(module_color32).unwrap_or(palette.text)),
                 );
             });
         }

@@ -7,6 +7,7 @@ use bootty_runtime::{
     perf::{guard_frame_path, record_subprocess},
     scheduler::{RepaintScheduler, RepaintSignal},
 };
+use bootty_terminal::terminal_engine::TerminalEngine;
 #[cfg(unix)]
 use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION};
 
@@ -76,6 +77,72 @@ fn pty_backlog_drains_complete_chunks_in_order() {
     assert!(backlog.is_empty());
 }
 
+#[test]
+fn bounded_pty_drain_preserves_split_synchronized_output_control() {
+    let geometry = TerminalGeometry {
+        cols: 80,
+        rows: 24,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let mut engine = TerminalEngine::new(geometry).expect("terminal engine");
+    let mut backlog = PtyBacklog::new();
+    let mut bytes = vec![b'x'; 8191];
+    bytes.extend_from_slice(b"\x1b[?2026h");
+    backlog.push_back(bytes);
+    let mut slices = Vec::new();
+
+    let stats = drain_pty_backlog(&mut backlog, |slice| {
+        slices.push(slice.to_vec());
+        engine.write_vt(slice);
+    });
+
+    assert_eq!(stats.bytes, 8199);
+    assert_eq!(slices.len(), 2);
+    assert_eq!(slices[0].len(), 8192);
+    assert_eq!(slices[0].last(), Some(&0x1b));
+    assert_eq!(slices[1], b"[?2026h");
+    assert!(
+        engine
+            .is_synchronized_output()
+            .expect("query synchronized output mode")
+    );
+}
+
+#[test]
+fn completed_synchronized_output_batch_suppresses_intermediate_publish() {
+    let geometry = TerminalGeometry {
+        cols: 80,
+        rows: 24,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let mut engine = TerminalEngine::new(geometry).expect("terminal engine");
+    let mut backlog = PtyBacklog::new();
+    backlog.push_back(b"\x1b[?2026hredraw\x1b[?2026l".to_vec());
+    let mut observed = false;
+
+    let stats = drain_pty_backlog(&mut backlog, |slice| {
+        engine.write_vt(slice);
+        observed |= engine.take_synchronized_output_observed();
+    });
+
+    assert_eq!(stats.bytes, 22);
+    assert!(observed);
+    assert!(
+        !engine
+            .is_synchronized_output()
+            .expect("query synchronized output mode")
+    );
+    assert!(
+        bootty_runtime::terminal_session::sync_output_suppresses_publish(
+            false,
+            observed,
+            Duration::ZERO,
+        )
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn dropping_a_terminal_session_kills_its_owned_child() {
@@ -118,6 +185,36 @@ fn dropping_a_terminal_session_kills_its_owned_child() {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("terminal child {pid} survived session drop");
+}
+
+#[cfg(unix)]
+#[test]
+fn resize_updates_grid_size_only_after_worker_result() {
+    let initial = TerminalGeometry {
+        cols: 20,
+        rows: 8,
+        cell_width: 8,
+        cell_height: 16,
+    };
+    let resized = TerminalGeometry {
+        cols: 24,
+        rows: 10,
+        ..initial
+    };
+    let invalid = TerminalGeometry {
+        cols: initial.cols,
+        rows: 0,
+        ..initial
+    };
+    let mut session = TerminalSession::new_with_repaint_wakeup(initial, Arc::new(|| {}))
+        .expect("terminal starts");
+
+    session.resize(resized).expect("terminal resizes");
+    assert_eq!(session.grid_size(), (resized.cols, resized.rows));
+    let frame = session.extract_frame().expect("resized frame");
+    assert_eq!((frame.cols, frame.rows), (resized.cols, resized.rows));
+    assert!(session.resize(invalid).is_err());
+    assert_eq!(session.grid_size(), (resized.cols, resized.rows));
 }
 
 #[cfg(unix)]

@@ -2,10 +2,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use eframe::egui::Pos2;
-use libghostty_vt::{
-    render::{CursorVisualStyle, Dirty},
-    style::{RgbColor, Underline},
-};
 use wgpu::CurrentSurfaceTexture;
 use winit::{
     application::ApplicationHandler,
@@ -36,14 +32,12 @@ use crate::{
         mouse_wheel_button_from_delta_y,
     },
     modifier_remap::ModifierRemapSet,
-    renderer_frame::RendererFrame,
+    paint_plan::PaintPlanner,
     terminal::{
-        CellStyle, CursorSnapshot, FrameColors, FrameStats, KeyInput, MouseAction, MouseButton,
-        MouseInput, RenderCell, RenderFrame, TerminalSession,
+        FrameColors, KeyInput, MouseAction, MouseButton, MouseInput, RenderFrame, TerminalSession,
     },
-    terminal_image::{KittyImageFrame, KittyImageLayer, KittyImagePlacement},
     terminal_render::TerminalRenderFrame,
-    terminal_text::TerminalTextConfig,
+    terminal_text::{TerminalTextConfig, TerminalTextContract},
     terminal_wgpu::{TerminalWgpuRenderer, terminal_text_cell_metrics},
 };
 
@@ -305,105 +299,14 @@ pub fn terminal_render_frame_for_bare_host(
     viewport: BareTerminalViewport,
     text_config: &TerminalTextConfig,
 ) -> TerminalRenderFrame {
-    renderer_frame_for_bare_host(frame, viewport, text_config).to_terminal_render_frame(text_config)
-}
-
-pub fn renderer_frame_for_bare_host(
-    frame: &RenderFrame,
-    viewport: BareTerminalViewport,
-    text_config: &TerminalTextConfig,
-) -> RendererFrame {
-    RendererFrame::from_terminal(frame, viewport.terminal_surface(), text_config)
-}
-
-pub fn renderer_parity_gallery_frame() -> RendererFrame {
-    let cell = CellMetrics::new(10.0, 20.0);
-    let viewport = BareTerminalViewport::new(60, 20, cell, TerminalPadding::default());
-    let text_config = TerminalTextConfig::with_cell_metrics(cell);
-    let frame = RenderFrame {
-        cols: 6,
-        rows: 1,
-        dirty: Dirty::Full,
-        colors: FrameColors {
-            background: rgb(1, 2, 3),
-            foreground: rgb(220, 221, 222),
-            cursor: Some(rgb(255, 255, 255)),
-            ..Default::default()
-        },
-        cursor: Some(CursorSnapshot {
-            x: 4,
-            y: 0,
-            at_wide_tail: false,
-            style: CursorVisualStyle::Block,
-            blinking: true,
-            color: None,
-        }),
-        row_dirty: vec![true],
-        row_wraps: vec![false],
-        search_matches: Vec::new(),
-        active_search_match: None,
-        active_search_match_index: None,
-        search_match_count: 0,
-        search_pulse: 0,
-        copy_mode: None,
-        selections: Vec::new(),
-        cells: vec![
-            gallery_cell(0, 0, 0, 1, CellStyle::default()),
-            gallery_cell(1, 0, 1, 1, CellStyle::default()),
-            gallery_cell(
-                2,
-                0,
-                2,
-                1,
-                CellStyle {
-                    underline: Underline::Double,
-                    ..Default::default()
-                },
-            ),
-            gallery_cell(
-                3,
-                0,
-                3,
-                1,
-                CellStyle {
-                    strikethrough: true,
-                    ..Default::default()
-                },
-            ),
-            gallery_cell(
-                4,
-                0,
-                4,
-                1,
-                CellStyle {
-                    overline: true,
-                    ..Default::default()
-                },
-            ),
-            RenderCell {
-                x: 5,
-                y: 0,
-                text_start: 5,
-                text_len: 1,
-                fg: Some(rgb(10, 10, 10)),
-                bg: Some(rgb(12, 12, 12)),
-                style: CellStyle::default(),
-                hyperlink: None,
-            },
-        ],
-        text: vec!['A', '█', 'B', 'C', 'D', 'E'],
-        images: gallery_images(),
-        scrollbar: None,
-        stats: FrameStats {
-            cells: 6,
-            chars: 6,
-            dirty_rows: 1,
-            ..Default::default()
-        },
-    };
-    let mut renderer_frame = renderer_frame_for_bare_host(&frame, viewport, &text_config);
-    renderer_frame.select_cells(0, 0..1);
-    renderer_frame
+    let mut planner = PaintPlanner::default();
+    let plan = planner.plan_with_minimum_contrast(
+        viewport.terminal_surface(),
+        frame,
+        text_config.font_size,
+    );
+    let text_contract = TerminalTextContract::for_terminal_paint_plan(plan, text_config);
+    TerminalRenderFrame::from_plan_and_images(plan, &text_contract, &frame.images)
 }
 
 pub fn run() -> Result<()> {
@@ -657,59 +560,6 @@ fn read_clipboard_text() -> Result<Option<String>> {
         Ok(_) => Ok(None),
         Err(arboard::Error::ContentNotAvailable) => Ok(None),
         Err(error) => Err(error).context("read system clipboard text"),
-    }
-}
-
-fn gallery_cell(
-    x: u16,
-    y: u16,
-    text_start: usize,
-    text_len: usize,
-    style: CellStyle,
-) -> RenderCell {
-    RenderCell {
-        x,
-        y,
-        text_start,
-        text_len,
-        fg: None,
-        bg: None,
-        style,
-        hyperlink: None,
-    }
-}
-
-fn rgb(r: u8, g: u8, b: u8) -> RgbColor {
-    RgbColor { r, g, b }
-}
-
-fn gallery_images() -> KittyImageFrame {
-    KittyImageFrame {
-        placements: vec![
-            gallery_image(1, KittyImageLayer::BelowBackground, 0.0),
-            gallery_image(2, KittyImageLayer::BelowText, 10.0),
-            gallery_image(3, KittyImageLayer::AboveText, 20.0),
-        ],
-        ..Default::default()
-    }
-}
-
-fn gallery_image(image_id: u32, layer: KittyImageLayer, x: f32) -> KittyImagePlacement {
-    KittyImagePlacement {
-        image_id,
-        placement_id: image_id,
-        layer,
-        image_width: 1,
-        image_height: 1,
-        image_format: libghostty_vt::kitty::graphics::ImageFormat::Rgba,
-        source: libghostty_vt::kitty::graphics::SourceRect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-        },
-        destination: SurfaceRect::from_min_size(x, 0.0, 10.0, 20.0),
-        data: Arc::new(vec![255, 0, 255, 96]),
     }
 }
 

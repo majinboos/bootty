@@ -200,7 +200,7 @@ pub(super) fn ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
                     palette,
                     &mut offset,
                     super::NumberEditSpec {
-                        path: &["window", "fullscreen-top-offset"],
+                        id_salt: &["window", "fullscreen-top-offset"],
                         range: 0.0..=160.0,
                         suffix: " px",
                         precision: 1,
@@ -352,7 +352,7 @@ fn numeric_window_row(win: &mut SettingsWindow, ui: &mut egui::Ui, spec: WindowN
             win.palette,
             &mut value,
             super::NumberEditSpec {
-                path: &spec.path,
+                id_salt: &spec.path,
                 range: spec.range,
                 suffix: " px",
                 precision: 1,
@@ -388,7 +388,7 @@ fn chrome_slider(win: &mut SettingsWindow, ui: &mut egui::Ui, spec: ChromeSlider
             win.palette,
             &mut value,
             super::NumberEditSpec {
-                path: &spec.path,
+                id_salt: &spec.path,
                 range: spec.range,
                 suffix,
                 precision: spec.precision,

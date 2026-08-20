@@ -1,22 +1,17 @@
 use std::collections::HashMap;
 
-use bootty_extension::{
-    ExtensionUiAction, ModuleColor, ModuleItem, ModulePrimitive, PublishedSurfaceItem,
-};
+use bootty_extension::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem};
 use eframe::egui::Color32;
 
 use crate::{
     mux::{controller::MuxScope, snapshot::MuxSession},
+    theme::module_color32,
     ui::session_navigation::BindingSessionGroup,
 };
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarState {
     pub focused: bool,
-}
-
-fn module_color(value: ModuleColor) -> Color32 {
-    Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -213,7 +208,7 @@ fn sidebar_item_from_module_item<'a>(
         },
         _ => SidebarItemKind::Row,
     };
-    let color = item.fg.map(module_color).unwrap_or(Color32::WHITE);
+    let color = item.fg.map(module_color32).unwrap_or(Color32::WHITE);
     Some(SidebarItem {
         id: sidebar_item_id(kind, scope, row_key, item.text.as_str()),
         display,
@@ -224,7 +219,7 @@ fn sidebar_item_from_module_item<'a>(
         session_scope: item.session_id.as_ref().map(|_| scope),
         reorder_anchor: item.reorder_anchor.as_deref(),
         color,
-        dim_color: item.dim_fg.map(module_color).unwrap_or(color),
+        dim_color: item.dim_fg.map(module_color32).unwrap_or(color),
         kind: sidebar_kind,
         current,
         // Every row a session owns offers the same context menu, so the flag follows the session

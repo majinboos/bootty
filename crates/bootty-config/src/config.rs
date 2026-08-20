@@ -1106,11 +1106,7 @@ pub struct ConfigDocument {
 }
 
 impl ConfigDocument {
-    pub fn document(&self) -> &DocumentMut {
-        &self.document
-    }
-
-    pub fn set_item(&mut self, path: &[&str], item: Item) -> ConfigResult<()> {
+    fn set_item(&mut self, path: &[&str], item: Item) -> ConfigResult<()> {
         let Some((leaf, parents)) = path.split_last() else {
             return Err(ConfigLoadError::new(
                 "config writeback path cannot be empty",
@@ -1134,7 +1130,7 @@ impl ConfigDocument {
     }
 
     /// Remove a key, restoring its built-in default on the next load. Missing keys are a no-op.
-    pub fn remove_item(&mut self, path: &[&str]) -> ConfigResult<()> {
+    pub fn remove(&mut self, path: &[&str]) -> ConfigResult<()> {
         let Some((leaf, parents)) = path.split_last() else {
             return Err(ConfigLoadError::new(
                 "config writeback path cannot be empty",
@@ -1149,6 +1145,35 @@ impl ConfigDocument {
         }
         table.remove(leaf);
         Ok(())
+    }
+
+    pub fn contains(&self, path: &[&str]) -> bool {
+        let Some((leaf, parents)) = path.split_last() else {
+            return false;
+        };
+        let mut table = self.document.as_table();
+        for key in parents {
+            let Some(next) = table.get(key).and_then(Item::as_table) else {
+                return false;
+            };
+            table = next;
+        }
+        table.contains_key(leaf)
+    }
+
+    pub fn string_array(&self, path: &[&str]) -> Option<Vec<String>> {
+        let (leaf, parents) = path.split_last()?;
+        let mut table: &dyn TableLike = self.document.as_table();
+        for key in parents {
+            table = table.get(key).and_then(Item::as_table_like)?;
+        }
+        table.get(leaf).and_then(Item::as_array).map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::to_owned)
+                .collect()
+        })
     }
 }
 

@@ -17,6 +17,7 @@ use bootty_app::{
 use bootty_extension::{
     ModuleColor, ModuleCoord, ModuleItem, ModulePrimitive, PublishedSurfaceItem,
 };
+use egui::Color32;
 
 fn scope(binding: i64) -> MuxScope {
     MuxScope::new(
@@ -102,6 +103,14 @@ fn extension_session_rows_keep_identity_style_and_selection() {
         rows[0].kind,
         SidebarItemKind::Session { active: true }
     ));
+    assert_eq!(
+        rows[0].color,
+        Color32::from_rgba_unmultiplied(0x89, 0xb4, 0xfa, 0xff)
+    );
+    assert_eq!(
+        rows[0].dim_color,
+        Color32::from_rgba_unmultiplied(0x45, 0x5a, 0x7d, 0xff)
+    );
     assert_eq!(rows[0].primitives.len(), 1);
 }
 

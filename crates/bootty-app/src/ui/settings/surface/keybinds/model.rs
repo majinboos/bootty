@@ -134,31 +134,18 @@ pub(super) fn read_scope_entries(
         }
         _ => None,
     };
-    let Some(document) = win.writeback.document() else {
-        return (false, Vec::new());
-    };
-    let path = scope.path();
-    let mut current = document.document().get(path[0]);
-    for key in &path[1..] {
-        current = current
-            .and_then(|item| item.as_table_like())
-            .and_then(|table| table.get(key));
-    }
-    let Some(array) = current.and_then(|item| item.as_array()) else {
+    let Some(entries) = win.writeback.string_array(scope.path()) else {
         return (false, Vec::new());
     };
 
     let mut clear = false;
     let mut rows = Vec::new();
-    for value in array.iter() {
-        let Some(entry) = value.as_str() else {
-            continue;
-        };
+    for entry in entries {
         if entry == "clear" {
             clear = true;
             continue;
         }
-        let (trigger, action) = split_keybind_entry(entry).map_or_else(
+        let (trigger, action) = split_keybind_entry(&entry).map_or_else(
             || (entry.to_owned(), String::new()),
             |(trigger, action)| (trigger.to_owned(), action.to_owned()),
         );

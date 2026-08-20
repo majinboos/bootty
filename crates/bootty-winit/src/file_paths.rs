@@ -1,4 +1,44 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[cfg(target_os = "macos")]
+use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{NSString, NSURL};
+
+/// Read file URLs from the native pasteboard.
+pub fn read_clipboard_file_paths() -> Option<Vec<PathBuf>> {
+    platform_read_clipboard_file_paths()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_read_clipboard_file_paths() -> Option<Vec<PathBuf>> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let items = pasteboard.pasteboardItems()?;
+    let mut paths = Vec::new();
+    for index in 0..items.count() {
+        let item = items.objectAtIndex(index);
+        if let Some(url) = item.stringForType(unsafe { NSPasteboardTypeFileURL })
+            && let Some(path) = path_from_file_url(&url.to_string())
+        {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() { None } else { Some(paths) }
+}
+
+#[cfg(target_os = "macos")]
+fn path_from_file_url(url: &str) -> Option<PathBuf> {
+    let url = NSURL::URLWithString(&NSString::from_str(url))?;
+    if !url.isFileURL() {
+        return None;
+    }
+    url.filePathURL()?.to_file_path()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_read_clipboard_file_paths() -> Option<Vec<PathBuf>> {
+    None
+}
 
 pub fn format_file_paths_for_paste<'a>(
     paths: impl IntoIterator<Item = &'a Path>,

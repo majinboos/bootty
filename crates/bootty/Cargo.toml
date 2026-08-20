@@ -5,7 +5,7 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-bootty-dev = ["bootty-app/bootty-dev", "bootty-control/bootty-dev"]
+bootty-dev = ["bootty-app/bootty-dev", "bootty-cli/bootty-dev", "bootty-control/bootty-dev"]
 
 [[bin]]
 name = "bootty"
@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 bootty-app = { path = "../bootty-app" }
+bootty-cli = { path = "../bootty-cli" }
 bootty-command = { path = "../bootty-command" }
 bootty-control = { path = "../bootty-control" }
 bootty-mux = { path = "../bootty-mux" }
@@ -22,8 +23,8 @@ bootty-remote = { path = "../bootty-remote" }
 bootty-rmux = { path = "../bootty-rmux" }
 bootty-tmux = { path = "../bootty-tmux" }
 bootty-zellij = { path = "../bootty-zellij" }
-clap.workspace = true
 serde_json.workspace = true
+clap.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [build-dependencies]

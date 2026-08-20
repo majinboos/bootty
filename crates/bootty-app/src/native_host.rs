@@ -16,23 +16,22 @@ use winit::{
 };
 
 use crate::{
-    app::BoottyApp,
+    BoottyApp,
     application_identity::ApplicationIdentity,
     config::BoottyConfig,
     direct_input::{DirectKeyInput, ModifierSideState, direct_key_input_from_winit_event},
-    platform::disable_automatic_window_tabbing,
 };
 
 pub fn run(
     options: eframe::NativeOptions,
     config: BoottyConfig,
     window_state_key: String,
-    backends: Arc<bootty_mux::provider::MuxAppBackendRegistry>,
+    backends: Arc<bootty_mux::provider::MuxBackendRegistry>,
 ) -> Result<()> {
     // Must run before any window is created (the flag is read at window-creation time), otherwise
     // macOS automatic window tabbing keeps the Cmd+T key equivalent and the keypress never reaches
     // the app.
-    disable_automatic_window_tabbing();
+    bootty_winit::window::disable_automatic_window_tabbing();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("create bootty event loop")?;
@@ -192,7 +191,7 @@ impl ApplicationHandler<UserEvent> for BoottyNativeHost<'_> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.inner.about_to_wait(event_loop);
         if std::mem::take(&mut self.cursor_needs_reapply) {
-            crate::platform::reapply_macos_cursor_icon();
+            bootty_winit::window::reapply_macos_cursor_icon();
         }
     }
 

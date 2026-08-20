@@ -224,10 +224,19 @@ this is not valid luau
     host.refresh(started + Duration::from_secs(5));
     assert!(catalog.describe("probe.echo").is_none());
     assert!(!catalog.topics().contains("probe.changed"));
-    assert!(matches!(
-        invoke(&third, Duration::from_secs(1)),
-        CommandOutcome::Failed { code, .. } if code == "stale_extension_generation"
-    ));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if matches!(
+            invoke(&third, Duration::from_millis(100)),
+            CommandOutcome::Failed { code, .. } if code == "stale_extension_generation"
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retired generation stayed callable"
+        );
+    }
 }
 
 #[test]

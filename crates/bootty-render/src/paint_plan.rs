@@ -206,19 +206,19 @@ impl PaintPlanner {
         )
     }
 
-    pub fn plan_with_cursor_blink_phase(
+    pub fn plan_with_minimum_contrast(
         &mut self,
         surface: TerminalSurface,
         frame: &RenderFrame,
         font_size: f32,
-        cursor_blink_phase: CursorBlinkPhase,
     ) -> &TerminalPaintPlan {
-        self.plan_with_cursor_blink_phase_and_text_cell_height(
+        self.plan_with_options(
             surface,
             frame,
             font_size,
             surface.cell.height,
-            cursor_blink_phase,
+            CursorBlinkPhase::visible(),
+            true,
         )
     }
 
@@ -229,6 +229,25 @@ impl PaintPlanner {
         font_size: f32,
         text_cell_height: f32,
         cursor_blink_phase: CursorBlinkPhase,
+    ) -> &TerminalPaintPlan {
+        self.plan_with_options(
+            surface,
+            frame,
+            font_size,
+            text_cell_height,
+            cursor_blink_phase,
+            false,
+        )
+    }
+
+    fn plan_with_options(
+        &mut self,
+        surface: TerminalSurface,
+        frame: &RenderFrame,
+        font_size: f32,
+        text_cell_height: f32,
+        cursor_blink_phase: CursorBlinkPhase,
+        minimum_contrast: bool,
     ) -> &TerminalPaintPlan {
         let default_bg = PlanColor::opaque(frame.colors.background);
         let default_fg = PlanColor::opaque(frame.colors.foreground);
@@ -255,6 +274,7 @@ impl PaintPlanner {
                 default_bg,
                 font_size,
                 text_cell_height,
+                minimum_contrast,
             },
         );
         plan_cursor(
@@ -327,6 +347,7 @@ struct TextPlanContext {
     default_bg: PlanColor,
     font_size: f32,
     text_cell_height: f32,
+    minimum_contrast: bool,
 }
 
 fn prepare_overlay_mask(mask: &mut Vec<u8>, frame: &RenderFrame) {
@@ -411,10 +432,12 @@ fn plan_text_runs(
 
         let attrs = paint_attrs(
             first,
+            first_text,
             cell_overlay(overlay_mask, frame.cols, first),
             context.default_fg,
             context.default_bg,
             colors,
+            context.minimum_contrast,
         );
         let mut run_text = pool.pop().unwrap_or_default();
         run_text.clear();
@@ -425,26 +448,30 @@ fn plan_text_runs(
         let mut end_x = first.x + cell_text_width(first_text);
         let mut next_index = cell_index + 1;
 
-        while let Some(next) = frame.cells.get(next_index) {
-            let next_text = frame.cell_text(next);
-            if next.y != start_y
-                || next.x != end_x
-                || next.style.invisible
-                || next_text.is_empty()
-                || paint_attrs(
-                    next,
-                    cell_overlay(overlay_mask, frame.cols, next),
-                    context.default_fg,
-                    context.default_bg,
-                    colors,
-                ) != attrs
-            {
-                break;
-            }
+        if !context.minimum_contrast {
+            while let Some(next) = frame.cells.get(next_index) {
+                let next_text = frame.cell_text(next);
+                if next.y != start_y
+                    || next.x != end_x
+                    || next.style.invisible
+                    || next_text.is_empty()
+                    || paint_attrs(
+                        next,
+                        next_text,
+                        cell_overlay(overlay_mask, frame.cols, next),
+                        context.default_fg,
+                        context.default_bg,
+                        colors,
+                        context.minimum_contrast,
+                    ) != attrs
+                {
+                    break;
+                }
 
-            run_text.extend(next_text);
-            end_x += cell_text_width(next_text);
-            next_index += 1;
+                run_text.extend(next_text);
+                end_x += cell_text_width(next_text);
+                next_index += 1;
+            }
         }
 
         let row_rect = surface.run_rect(start_x, start_y, end_x - start_x);
@@ -766,12 +793,17 @@ struct OverlayTextColors {
 
 fn paint_attrs(
     cell: &RenderCell,
+    text: &[char],
     overlay: u8,
     default_fg: PlanColor,
     default_bg: PlanColor,
     colors: OverlayTextColors,
+    minimum_contrast: bool,
 ) -> TextAttrs {
-    let (mut fg, _) = cell_colors(cell, default_fg, default_bg);
+    let (mut fg, bg) = cell_colors(cell, default_fg, default_bg);
+    if minimum_contrast && overlay == 0 {
+        fg = adjust_text_contrast(text, fg, bg);
+    }
     if overlay == OVERLAY_SELECTION {
         fg = colors.selection;
     } else if overlay == OVERLAY_ACTIVE_SEARCH {
@@ -787,6 +819,57 @@ fn paint_attrs(
         strikethrough: cell.style.strikethrough,
         overline: cell.style.overline,
     }
+}
+
+fn adjust_text_contrast(text: &[char], foreground: PlanColor, background: PlanColor) -> PlanColor {
+    if (text.len() == 1 && is_old_graphics_character(text[0]))
+        || contrast_distance(foreground, background) >= 96
+    {
+        return foreground;
+    }
+
+    let light = PlanColor {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: foreground.a,
+    };
+    let dark = PlanColor {
+        r: 0,
+        g: 0,
+        b: 0,
+        a: foreground.a,
+    };
+    if contrast_distance(light, background) >= contrast_distance(dark, background) {
+        light
+    } else {
+        dark
+    }
+}
+
+fn is_old_graphics_character(ch: char) -> bool {
+    matches!(
+        ch,
+        '▀'..='▐'
+            | '▔'
+            | '▕'
+            | '░'
+            | '▒'
+            | '▓'
+            | '▖'..='▟'
+            | '─'..='╿'
+            | '\u{E0B0}'..='\u{E0BF}'
+            | '\u{2800}'..='\u{28FF}'
+            | '\u{25A0}'..='\u{25FF}'
+            | '\u{1FB00}'..='\u{1FBFF}'
+    )
+}
+
+fn contrast_distance(left: PlanColor, right: PlanColor) -> u16 {
+    let dr = i16::from(left.r) - i16::from(right.r);
+    let dg = i16::from(left.g) - i16::from(right.g);
+    let db = i16::from(left.b) - i16::from(right.b);
+    dr.unsigned_abs() + dg.unsigned_abs() + db.unsigned_abs()
 }
 
 fn cell_text_width(text: &[char]) -> u16 {
