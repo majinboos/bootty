@@ -1,4 +1,5 @@
 use super::*;
+use bootty_ui::icons;
 
 /// A combo box whose dropdown has a search filter at the top. Returns the chosen option index.
 pub(super) fn searchable_combo(
@@ -232,7 +233,7 @@ fn settings_button_galley(
     };
 
     let mut job = egui::text::LayoutJob::default();
-    if let Some((glyph, family)) = crate::ui::icons::icon_glyph("plus") {
+    if let Some((glyph, family)) = icons::icon_glyph("plus") {
         job.append(
             &glyph.to_string(),
             0.0,
@@ -290,7 +291,7 @@ impl DragHandle {
         if response.hovered() || response.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
         }
-        crate::ui::icons::paint_icon_slug(
+        icons::paint_icon_slug(
             ui.painter(),
             "grip-vertical",
             rect.center(),
@@ -395,7 +396,7 @@ pub(super) fn settings_icon_button(
         egui::Stroke::new(1.0, palette.border),
         egui::StrokeKind::Inside,
     );
-    crate::ui::icons::paint_icon_slug(
+    icons::paint_icon_slug(
         ui.painter(),
         slug,
         rect.center(),

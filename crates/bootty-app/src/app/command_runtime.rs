@@ -7,22 +7,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use super::{
-    binding_panes::mux_split_direction,
-    binding_session_names::{session_cwd, suggested_session_name},
-    state::{
-        AppEffect, AppState, ViewportSnapshot, new_mux_session_request_with_name,
-        terminal_cwd_for_mux_command,
-    },
-};
+use super::state::{AppEffect, AppState, ViewportSnapshot};
 use crate::{
     app_actions::{AppAction, KeybindAction, MuxKeyAction},
-    commands::{
-        AppCommandReceiver, AppCommandRequest, AppCommandSender, BoundAppCommandSender, Caller,
-        CommandCancellation, CommandCatalog, CommandExecutor, CommandInvocation, CommandOutcome,
-        CommandTarget, CoreCommandExecutor, MutationClass, ResourceKind,
-        app_command_channel_with_repaint,
-    },
+    commands::{CommandCatalog, CommandExecutor, CoreCommandExecutor},
     mux::{
         RepaintHandle,
         capability::BindingOperationOutcome,
@@ -32,6 +20,11 @@ use crate::{
         terminal::decode_scoped_pane_id,
     },
     workspace::BindingMembershipMutation,
+};
+use bootty_command::{
+    AppCommandReceiver, AppCommandRequest, AppCommandSender, BoundAppCommandSender, Caller,
+    CommandCancellation, CommandInvocation, CommandOutcome, CommandTarget, MutationClass,
+    ResourceKind, app_command_channel,
 };
 
 fn command_outcome_message(outcome: &CommandOutcome) -> Option<String> {
@@ -114,7 +107,7 @@ pub(super) struct CommandRuntime {
 
 impl CommandRuntime {
     pub(super) fn new(repaint: RepaintHandle) -> Self {
-        let (sender, receiver) = app_command_channel_with_repaint(64, repaint);
+        let (sender, receiver) = app_command_channel(64, repaint);
         Self {
             instance_handle: process_handle(),
             instance_generation: 1,
@@ -322,22 +315,34 @@ impl AppState {
                 confirmation: Box::new(resolved.invocation.confirmation()),
             });
         }
+        let planned_mux_command = match &resolved.executor {
+            CommandExecutor::Core(CoreCommandExecutor::Keybind(KeybindAction::Mux(action))) => {
+                match self.mux_command_for_action(*action, resolved.invocation.target.as_ref()) {
+                    Ok(command) => command,
+                    Err(outcome) => {
+                        self.last_error = command_outcome_message(&outcome);
+                        return CommandDispatch::Complete(outcome);
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(command) = planned_mux_command.as_ref()
+            && let Some(outcome) = self.preflight_mux_command(command)
+        {
+            self.last_error = command_outcome_message(&outcome);
+            return CommandDispatch::Complete(outcome);
+        }
         let caller = resolved.invocation.caller;
         match resolved.executor {
-            CommandExecutor::Core(executor) => {
-                if let Some(outcome) = self.preflight_command(&executor) {
-                    self.last_error = command_outcome_message(&outcome);
-                    return CommandDispatch::Complete(outcome);
-                }
-                self.dispatch_resolved_command(
-                    executor,
-                    resolved.invocation.target.as_ref(),
-                    caller,
-                    viewport,
-                    effects,
-                    execution,
-                )
-            }
+            CommandExecutor::Core(executor) => self.dispatch_resolved_command(
+                executor,
+                planned_mux_command,
+                caller,
+                viewport,
+                effects,
+                execution,
+            ),
             CommandExecutor::Extension(handler) => {
                 let (deadline, cancellation) = execution.unwrap_or_else(|| {
                     (
@@ -345,7 +350,7 @@ impl AppState {
                         CommandCancellation::new(),
                     )
                 });
-                CommandDispatch::Pending(PendingCommandResult::Outcome(handler(
+                CommandDispatch::Pending(PendingCommandResult::Outcome(handler.invoke(
                     resolved.invocation,
                     deadline,
                     cancellation,
@@ -354,23 +359,16 @@ impl AppState {
         }
     }
 
-    fn preflight_command(&self, executor: &CoreCommandExecutor) -> Option<CommandOutcome> {
-        let CoreCommandExecutor::Keybind(KeybindAction::Mux(action)) = executor else {
-            return None;
-        };
-        let operation = self.mux_operation_for_action(*action)?;
+    fn preflight_mux_command(&self, command: &MuxCommand) -> Option<CommandOutcome> {
         if let Some(message) = self.workspace.active.binding.mux.unavailable_reason() {
             return Some(CommandOutcome::Unavailable {
                 message: message.to_owned(),
             });
         }
-        command_outcome_for_binding_operation(
-            self.workspace
-                .active
-                .binding
-                .mux
-                .operation_outcome(&self.workspace.active.binding.multiplexer, operation),
-        )
+        command_outcome_for_binding_operation(self.workspace.active.binding.mux.operation_outcome(
+            &self.workspace.active.binding.multiplexer,
+            command.operation(),
+        ))
     }
 
     fn resolve_command_target(
@@ -602,7 +600,7 @@ impl AppState {
     fn dispatch_resolved_command(
         &mut self,
         executor: CoreCommandExecutor,
-        target: Option<&CommandTarget>,
+        planned_mux_command: Option<MuxCommand>,
         caller: Caller,
         viewport: ViewportSnapshot,
         effects: &mut Vec<AppEffect>,
@@ -632,7 +630,12 @@ impl AppState {
                 CommandDispatch::Complete(outcome)
             }
             CoreCommandExecutor::Keybind(action) => self.dispatch_resolved_keybind_command(
-                action, target, caller, viewport, effects, execution,
+                action,
+                planned_mux_command,
+                caller,
+                viewport,
+                effects,
+                execution,
             ),
             CoreCommandExecutor::Sidebar(action) => {
                 if let Err(outcome) = Self::begin_synchronous_command(execution) {
@@ -683,7 +686,7 @@ impl AppState {
     fn dispatch_resolved_keybind_command(
         &mut self,
         action: KeybindAction,
-        target: Option<&CommandTarget>,
+        planned_mux_command: Option<MuxCommand>,
         caller: Caller,
         viewport: ViewportSnapshot,
         effects: &mut Vec<AppEffect>,
@@ -693,24 +696,12 @@ impl AppState {
         if matches!(caller, Caller::Cli | Caller::Socket | Caller::Luau)
             && let KeybindAction::Mux(mux_action) = action
         {
-            if let Some(operation) = self.mux_operation_for_action(mux_action)
-                && let Some(outcome) = command_outcome_for_binding_operation(
-                    self.workspace
-                        .active
-                        .binding
-                        .mux
-                        .operation_outcome(&self.workspace.active.binding.multiplexer, operation),
-                )
-            {
-                self.last_error = command_outcome_message(&outcome);
-                return CommandDispatch::Complete(outcome);
-            }
             let process_local_action = self.workspace.active.binding.backend_policy.panes.topology
                 == PaneTopology::ProcessLocal
                 && Self::process_local_mux_action_uses_local_layout(mux_action);
             if process_local_action {
                 return_native_mux_focus = true;
-            } else if let Some(command) = self.mux_command_for_command(mux_action, target) {
+            } else if let Some(command) = planned_mux_command.clone() {
                 let membership = match self
                     .workspace
                     .begin_active_binding_membership_mutation(&command, None)
@@ -755,7 +746,7 @@ impl AppState {
             return CommandDispatch::Complete(outcome);
         }
         let previous_error = self.last_error.take();
-        self.apply_resolved_keybind_action(action, target, viewport, effects);
+        self.apply_resolved_keybind_action(action, planned_mux_command, viewport, effects);
         let outcome = match self.last_error.clone() {
             Some(message) => CommandOutcome::Failed {
                 code: "execution_failed".to_owned(),
@@ -801,119 +792,6 @@ impl AppState {
             || serde_json::json!({}),
             |focused| serde_json::json!({ "focused": focused }),
         )
-    }
-
-    fn mux_command_for_command(
-        &mut self,
-        action: MuxKeyAction,
-        target: Option<&CommandTarget>,
-    ) -> Option<MuxCommand> {
-        if matches!(
-            action,
-            MuxKeyAction::NextSession
-                | MuxKeyAction::PreviousSession
-                | MuxKeyAction::LastSession
-                | MuxKeyAction::SelectSession(_)
-                | MuxKeyAction::MoveSession(_)
-        ) {
-            return None;
-        }
-
-        let target = target.expect("mux command target was resolved");
-        let path = serde_json::from_str::<Vec<String>>(&target.handle)
-            .expect("resolved mux command target has a resource path");
-        if action == MuxKeyAction::NewTab && path.first().is_some_and(|part| part == "no-session") {
-            let remote = self.active_multiplexer().remote.is_some();
-            let cwd = new_mux_session_request_with_name(self.config(), "").cwd;
-            let cwd = session_cwd(&cwd, remote);
-            let display_name = suggested_session_name(&cwd, remote);
-            let session_id = crate::strings::unique_session_name(
-                &display_name,
-                self.taken_session_names(None).iter().map(String::as_str),
-            );
-            return Some(MuxCommand::CreateProjectSession { session_id, cwd });
-        }
-
-        let session_id = path
-            .get(1)
-            .expect("resolved mux target includes a session")
-            .clone();
-        let window_id = (target.kind == ResourceKind::MuxWindow).then(|| {
-            path.get(2)
-                .expect("mux window target includes a window")
-                .clone()
-        });
-        let pane_id = (target.kind == ResourceKind::Pane)
-            .then(|| path.get(3).expect("pane target includes a pane").clone());
-        let cwd = terminal_cwd_for_mux_command(
-            self.workspace
-                .active
-                .binding
-                .terminal
-                .current_working_directory()
-                .ok()
-                .flatten(),
-            self.workspace
-                .active
-                .binding
-                .mux
-                .selected_session_anchor()
-                .and_then(|anchor| anchor.cwd.clone()),
-        );
-        let command = match action {
-            MuxKeyAction::NewTab => MuxCommand::NewWindow { session_id, cwd },
-            MuxKeyAction::NextTab => MuxCommand::ActivateNextWindow { session_id },
-            MuxKeyAction::PreviousTab => MuxCommand::ActivatePreviousWindow { session_id },
-            MuxKeyAction::LastTab => MuxCommand::ActivateLastWindow { session_id },
-            MuxKeyAction::SelectTab(index) => MuxCommand::ActivateWindowIndex { session_id, index },
-            MuxKeyAction::MoveTab(delta) => MuxCommand::MoveWindow {
-                session_id,
-                window_id: self
-                    .workspace
-                    .active
-                    .binding
-                    .mux
-                    .selected_window()
-                    .map(str::to_owned),
-                delta,
-            },
-            MuxKeyAction::SplitPane(direction) => MuxCommand::SplitPane {
-                session_id,
-                pane_id,
-                direction: mux_split_direction(direction),
-            },
-            MuxKeyAction::SelectPane(direction) => MuxCommand::SelectPane {
-                session_id,
-                window_id,
-                direction,
-            },
-            MuxKeyAction::NextPane => MuxCommand::SelectNextPane {
-                session_id,
-                window_id,
-            },
-            MuxKeyAction::PreviousPane => MuxCommand::SelectPreviousPane {
-                session_id,
-                window_id,
-            },
-            MuxKeyAction::KillPane => MuxCommand::KillPane {
-                session_id,
-                pane_id,
-            },
-            MuxKeyAction::ClosePane => MuxCommand::ClosePane {
-                session_id,
-                pane_id,
-            },
-            MuxKeyAction::TogglePaneZoom => MuxCommand::TogglePaneZoom {
-                session_id,
-                pane_id,
-            },
-            MuxKeyAction::NextSession
-            | MuxKeyAction::PreviousSession
-            | MuxKeyAction::LastSession
-            | MuxKeyAction::SelectSession(_)
-            | MuxKeyAction::MoveSession(_) => unreachable!("handled before command construction"),
-        };
-        Some(command)
     }
 
     fn command_outcome_for_mux_result(

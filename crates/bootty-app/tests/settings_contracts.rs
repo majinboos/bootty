@@ -2,11 +2,9 @@ use bootty_app::{
     config::{AppearanceVariant, BoottyConfig},
     direct_input::ModifierSideState,
     theme::theme_from_config,
-    ui::{
-        icons::install_icon_fonts,
-        settings::{SettingsAction, SettingsSurface},
-    },
+    ui::settings::{SettingsAction, SettingsSurface},
 };
+use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, Key, Modifiers, RawInput};
 
 fn key_event(key: Key) -> Event {

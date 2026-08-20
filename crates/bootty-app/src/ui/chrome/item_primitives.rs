@@ -1,10 +1,6 @@
-use bootty_ui::readable_color;
+use bootty_extension::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModulePrimitive};
+use bootty_ui::{icons::paint_icon_slug, readable_color};
 use eframe::egui::{self, Pos2, Rect, Stroke, StrokeKind};
-
-use crate::{
-    command_extensions::{ModuleCoord, ModulePrimitive},
-    ui::icons::paint_icon_slug,
-};
 
 fn coord_x(rect: Rect, coord: ModuleCoord) -> f32 {
     rect.min.x + rect.width() * coord.frac + coord.px
@@ -20,6 +16,19 @@ fn coord_w(rect: Rect, coord: ModuleCoord) -> f32 {
 
 fn coord_h(rect: Rect, coord: ModuleCoord) -> f32 {
     rect.height() * coord.frac + coord.px
+}
+
+fn color(value: ModuleColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
+}
+
+fn corner_radius(value: ModuleCornerRadius) -> egui::CornerRadius {
+    egui::CornerRadius {
+        nw: value.nw,
+        ne: value.ne,
+        sw: value.sw,
+        se: value.se,
+    }
 }
 
 fn blend_toward(color: egui::Color32, background: egui::Color32, keep: f32) -> egui::Color32 {
@@ -52,8 +61,8 @@ pub(super) fn paint_item_primitives(
     keep: f32,
 ) {
     let dim = |color: egui::Color32| blend_toward(color, background, keep);
-    let resolve = |color: &Option<egui::Color32>| {
-        let value = color.unwrap_or(default_color);
+    let resolve = |value: &Option<ModuleColor>| {
+        let value = value.map_or(default_color, color);
         let value = if respect_color {
             value
         } else {
@@ -77,13 +86,13 @@ pub(super) fn paint_item_primitives(
                     egui::vec2(coord_w(item_rect, *w), coord_h(item_rect, *h)),
                 );
                 if let Some(fill) = fill {
-                    painter.rect_filled(rect, *radius, dim(*fill));
+                    painter.rect_filled(rect, corner_radius(*radius), dim(color(*fill)));
                 }
                 if let Some(stroke) = stroke {
                     painter.rect_stroke(
                         rect,
-                        *radius,
-                        Stroke::new(1.0, dim(*stroke)),
+                        corner_radius(*radius),
+                        Stroke::new(1.0, dim(color(*stroke))),
                         StrokeKind::Inside,
                     );
                 }
@@ -101,14 +110,14 @@ pub(super) fn paint_item_primitives(
                     if let Some(fill) = fill {
                         painter.add(egui::Shape::convex_polygon(
                             points.clone(),
-                            dim(*fill),
+                            dim(color(*fill)),
                             Stroke::new(0.0, egui::Color32::TRANSPARENT),
                         ));
                     }
                     if let Some(stroke) = stroke {
                         painter.add(egui::Shape::closed_line(
                             points,
-                            Stroke::new(1.0, dim(*stroke)),
+                            Stroke::new(1.0, dim(color(*stroke))),
                         ));
                     }
                 }
@@ -177,7 +186,7 @@ pub(super) fn paint_item_hover_overlay(
                     Pos2::new(coord_x(item_rect, *x), coord_y(item_rect, *y)),
                     egui::vec2(coord_w(item_rect, *w), coord_h(item_rect, *h)),
                 );
-                painter.rect_filled(rect, *radius, color);
+                painter.rect_filled(rect, corner_radius(*radius), color);
             }
             ModulePrimitive::Polygon {
                 fill: Some(_),
@@ -240,7 +249,7 @@ pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egu
                 && h.frac == 1.0
                 && h.px == 0.0 =>
             {
-                Some(*fill)
+                Some(color(*fill))
             }
             ModulePrimitive::Rect { .. }
             | ModulePrimitive::Polygon { .. }
@@ -252,7 +261,7 @@ pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egu
                 .iter()
                 .rev()
                 .find_map(|primitive| match primitive {
-                    ModulePrimitive::Rect { fill, .. } => *fill,
+                    ModulePrimitive::Rect { fill, .. } => fill.map(color),
                     ModulePrimitive::Polygon { .. }
                     | ModulePrimitive::Text { .. }
                     | ModulePrimitive::Icon { .. } => None,
@@ -263,7 +272,7 @@ pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egu
                 .iter()
                 .rev()
                 .find_map(|primitive| match primitive {
-                    ModulePrimitive::Polygon { fill, .. } => *fill,
+                    ModulePrimitive::Polygon { fill, .. } => fill.map(color),
                     ModulePrimitive::Rect { .. }
                     | ModulePrimitive::Text { .. }
                     | ModulePrimitive::Icon { .. } => None,

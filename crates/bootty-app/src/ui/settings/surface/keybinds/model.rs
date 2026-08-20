@@ -2,6 +2,7 @@ use super::{
     SettingsWindow,
     trigger_edit::{combo_has_modifier_sides, combo_is_prefixed, parse_trigger_flags},
 };
+use crate::config::split_keybind_entry;
 
 /// Which keybind list is being edited: the global list, one of the per-backend lists, or the
 /// sidebar navigation list (which has its own action vocabulary).
@@ -157,7 +158,10 @@ pub(super) fn read_scope_entries(
             clear = true;
             continue;
         }
-        let (trigger, action) = split_entry(entry);
+        let (trigger, action) = split_keybind_entry(entry).map_or_else(
+            || (entry.to_owned(), String::new()),
+            |(trigger, action)| (trigger.to_owned(), action.to_owned()),
+        );
         let (_, combo) = parse_trigger_flags(&trigger);
         rows.push(BindingRow {
             side_sensitive: combo_has_modifier_sides(&combo),
@@ -193,22 +197,6 @@ pub(super) fn write_scope(
         }
     }
     win.writeback.set_strings(scope.path(), &entries);
-}
-
-/// Split an entry into trigger and action at the action `=`, mirroring the binding parser so
-/// triggers that contain `=` (like `cmd+=`) stay intact.
-pub(super) fn split_entry(entry: &str) -> (String, String) {
-    let bytes = entry.as_bytes();
-    let mut offset = 0;
-    while let Some(rel) = entry[offset..].find('=') {
-        let index = offset + rel;
-        if index + 1 < entry.len() && matches!(bytes[index + 1], b'+' | b'=') {
-            offset = index + 1;
-            continue;
-        }
-        return (entry[..index].to_owned(), entry[index + 1..].to_owned());
-    }
-    (entry.to_owned(), String::new())
 }
 
 /// The shortcuts that actually apply for `scope`: backend scopes show the fully merged view

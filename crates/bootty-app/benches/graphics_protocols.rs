@@ -3,10 +3,10 @@ use std::{hint::black_box, io::Cursor};
 use bootty_app::{
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface},
     paint_plan::PaintPlanner,
-    terminal::TerminalEngine,
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
+use bootty_terminal::terminal_engine::TerminalEngine;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const GEOMETRY: TerminalGeometry = TerminalGeometry {

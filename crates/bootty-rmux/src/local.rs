@@ -2,10 +2,6 @@ use std::path::PathBuf;
 
 use bootty_identity::ApplicationIdentity;
 
-pub fn prepare_local_rmux_daemon(identity: ApplicationIdentity) -> anyhow::Result<()> {
-    crate::bridge::prepare_local_rmux_daemon(identity)
-}
-
 pub(crate) fn endpoint_path() -> anyhow::Result<PathBuf> {
     endpoint_path_for(ApplicationIdentity::for_process())
 }

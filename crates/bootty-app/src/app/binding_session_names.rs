@@ -27,7 +27,7 @@ pub(super) fn suggested_session_name(cwd: &str, remote: bool) -> String {
     if remote {
         crate::strings::session_name_for_remote_path(cwd)
     } else {
-        crate::git::suggested_session_name(cwd)
+        bootty_mux::project::suggested_session_name(cwd)
     }
 }
 
@@ -51,7 +51,7 @@ impl BindingRuntime {
 }
 
 pub(super) fn session_root(cwd: &str) -> String {
-    let cwd = crate::git::worktree_root(cwd).unwrap_or_else(|| cwd.to_owned());
+    let cwd = bootty_mux::project::worktree_root(cwd).unwrap_or_else(|| cwd.to_owned());
     std::fs::canonicalize(&cwd)
         .unwrap_or_else(|_| PathBuf::from(cwd))
         .to_string_lossy()
@@ -282,23 +282,29 @@ impl WorkspaceRuntime {
             .collect()
     }
 
-    pub(super) fn create_project_session(
-        &mut self,
-        cwd: String,
-        repaint: &RepaintHandle,
-    ) -> Result<bool, WorkspacePersistenceError> {
+    pub(super) fn project_session_command(&self, cwd: &str) -> MuxCommand {
         let remote = self.active.binding.multiplexer.remote.is_some();
-        let cwd = session_cwd(&cwd, remote);
-        let existing_names = self.taken_session_names(None);
+        let cwd = session_cwd(cwd, remote);
         let display_name = suggested_session_name(&cwd, remote);
         let session_id = crate::strings::unique_session_name(
             &display_name,
-            existing_names.iter().map(String::as_str),
+            self.taken_session_names(None).iter().map(String::as_str),
         );
-        let command = MuxCommand::CreateProjectSession {
-            session_id: session_id.clone(),
-            cwd: cwd.clone(),
+        MuxCommand::CreateProjectSession { session_id, cwd }
+    }
+
+    pub(super) fn create_project_session(
+        &mut self,
+        command: MuxCommand,
+        repaint: &RepaintHandle,
+    ) -> Result<bool, WorkspacePersistenceError> {
+        let remote = self.active.binding.multiplexer.remote.is_some();
+        let MuxCommand::CreateProjectSession { session_id, cwd } = &command else {
+            return Err(WorkspacePersistenceError::operation(
+                "project session creation received a non-project command",
+            ));
         };
+        let display_name = suggested_session_name(cwd, remote);
         let pending_name = PendingGeneratedName {
             cwd: cwd.clone(),
             name: session_id.clone(),
@@ -317,7 +323,10 @@ impl WorkspaceRuntime {
             .insert(session_id.clone(), pending_name);
         let config = self.active.binding.multiplexer.clone();
         self.active.binding.mux.create_project_session(
-            NewMuxSessionRequest { session_id, cwd },
+            NewMuxSessionRequest {
+                session_id: session_id.clone(),
+                cwd: cwd.clone(),
+            },
             repaint,
             &config,
         );
@@ -337,9 +346,7 @@ impl WorkspaceRuntime {
             .active
             .binding
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .cloned()
         else {
             return Ok(RenameSessionOutcome::Missing);

@@ -159,9 +159,7 @@ impl BindingRuntime {
     ) {
         let current = self
             .mux
-            .sessions()
-            .iter()
-            .find(|session| session.id == session_id || session.name == session_id)
+            .session_by_id_or_name(session_id)
             .and_then(|session| session.windows.iter().find(|window| window.id == window_id))
             .map(|window| window.name.as_str());
         if current == Some(name) {

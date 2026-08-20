@@ -11,10 +11,12 @@ use crate::{
     input_binding::CopyToClipboard,
     mux::terminal::{ActiveTerminal, TerminalRuntime},
     platform::{write_clipboard_html, write_clipboard_text},
-    terminal::{MouseButton, TerminalSearchDirection},
     ui::terminal_find::{TerminalFindDialog, TerminalFindEvent, TerminalFindResult},
 };
-use bootty_terminal::terminal_engine::{TerminalCopyModeAction, TerminalSelectionFormat};
+use bootty_terminal::{
+    terminal_engine::{TerminalCopyModeAction, TerminalSearchDirection, TerminalSelectionFormat},
+    terminal_input_model::{KeyInput, MouseButton},
+};
 
 use copy_mode::{
     CopyModeKeyAction, copy_mode_action_for_egui_event, copy_mode_action_for_input,
@@ -293,7 +295,7 @@ impl TerminalInteractionRuntime {
     pub(super) fn handle_direct_input(
         &mut self,
         terminal: &mut ActiveTerminal,
-        input: crate::terminal::KeyInput,
+        input: KeyInput,
         copy_mode_active: bool,
     ) -> TerminalDirectInputOutcome {
         self.begin_operation();

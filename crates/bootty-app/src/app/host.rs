@@ -3,6 +3,9 @@ use super::terminal_config::terminal_text_config;
 use std::{path::PathBuf, sync::mpsc, time::Instant};
 
 use anyhow::Result;
+use bootty_command::{BoundAppCommandSender, Caller};
+use bootty_control::ControlPlane;
+use bootty_extension::{ExtensionHost, ExtensionUiAction, ModuleItem, SurfacePlacement};
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
 use super::chrome_runtime::ChromeRuntime;
@@ -10,9 +13,7 @@ use super::state::{AppEffect, AppState, FrameInputs, ViewportSnapshot};
 use super::terminal_workspace_view::{TerminalWorkspaceView, animate_indeterminate_progress};
 
 use crate::{
-    commands::{BoundAppCommandSender, Caller, CommandCatalog},
     config::{AppearanceVariant, BoottyConfig},
-    control::ControlPlane,
     direct_input::{DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input},
     menu::AppMenu,
     theme::theme_tokens,
@@ -40,12 +41,11 @@ pub struct BoottyApp {
     state: AppState,
     terminal_view: TerminalWorkspaceView,
     chrome: ChromeRuntime,
-    settings_open: bool,
     settings: SettingsSurface,
     error_details_open: bool,
     // Held for the process lifetime so the native menu stays installed.
     _menu: Option<AppMenu>,
-    extensions: crate::command_extensions::ExtensionHost,
+    extensions: ExtensionHost,
     extension_theme: Vec<(String, String)>,
     /// Whether the window had keyboard focus this frame. Extension hosts throttle themselves while
     /// it is false, so an unfocused window stops animating (and repainting) its chrome.
@@ -67,7 +67,7 @@ impl BoottyApp {
         if uses_custom_egui_fonts(&config) {
             configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
         } else {
-            crate::ui::icons::install_icon_fonts(&cc.egui_ctx);
+            bootty_ui::icons::install_icon_fonts(&cc.egui_ctx);
         }
         let repaint_ctx = cc.egui_ctx.clone();
         let repaint: crate::mux::RepaintHandle =
@@ -95,18 +95,18 @@ impl BoottyApp {
             direct_input_rx,
             modifier_side_rx,
         )?;
-        let extensions = crate::command_extensions::ExtensionHost::load_with_ui(
+        let extensions = ExtensionHost::load_with_ui(
             &config_dir.join("extensions"),
-            state.command_catalog(),
+            state.command_catalog().extensions_arc(),
             state.app_command_sender(Caller::Luau),
-            control_plane.clone(),
+            control_plane.extension_event_sender(),
             extension_theme.clone(),
+            crate::config::default_working_directory(),
         );
         Ok(Self {
             state,
             terminal_view,
             chrome: ChromeRuntime::default(),
-            settings_open: false,
             settings: SettingsSurface::new(config.clone()),
             error_details_open: false,
             _menu: crate::menu::install(),
@@ -118,10 +118,14 @@ impl BoottyApp {
 
     pub(crate) fn control_binding(
         &self,
-    ) -> (BoundAppCommandSender, std::sync::Arc<CommandCatalog>) {
+    ) -> (
+        BoundAppCommandSender,
+        std::sync::Arc<bootty_control::ControlCatalog>,
+    ) {
+        let catalog = self.state.command_catalog();
         (
             self.state.app_command_sender(Caller::Socket),
-            self.state.command_catalog(),
+            catalog.control_catalog(),
         )
     }
 
@@ -139,13 +143,12 @@ impl BoottyApp {
     }
 
     fn open_settings(&mut self, ctx: &egui::Context) {
-        self.settings_open = true;
         self.state.set_settings_open(true);
         ctx.request_repaint();
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
-        if !self.settings_open {
+        if !self.state.settings_open() {
             // Covers closes that bypass the Close return below (e.g. a toggle
             // keybind); idempotent once the style is already restored.
             self.settings.restore_global_style(ui.ctx());
@@ -159,7 +162,6 @@ impl BoottyApp {
             .show(ui, theme, captured_chords, modifier_sides)
             == SettingsAction::Close
         {
-            self.settings_open = false;
             self.state.set_settings_open(false);
             self.settings.restore_global_style(ui.ctx());
             ui.ctx().request_repaint();
@@ -303,8 +305,6 @@ impl BoottyApp {
     }
 
     fn show_extension_surfaces(&mut self, ctx: &egui::Context) {
-        use crate::command_extensions::SurfacePlacement;
-
         let mut actions = Vec::new();
         for surface in self.extensions.surfaces(SurfacePlacement::Floating) {
             let mut action = None;
@@ -342,23 +342,18 @@ impl BoottyApp {
             }
         }
         for (surface, action) in actions {
-            let _ =
-                self.extensions
-                    .submit_ui_action(crate::command_extensions::ExtensionUiAction {
-                        module: surface.module,
-                        generation: surface.generation,
-                        surface: surface.snapshot.declaration.id,
-                        action,
-                        payload: serde_json::Value::Null,
-                    });
+            let _ = self.extensions.submit_ui_action(ExtensionUiAction {
+                module: surface.module,
+                generation: surface.generation,
+                surface: surface.snapshot.declaration.id,
+                action,
+                payload: serde_json::Value::Null,
+            });
         }
     }
 }
 
-fn show_extension_surface_items(
-    ui: &mut egui::Ui,
-    items: &[crate::extension_ui::ModuleItem],
-) -> Option<String> {
+fn show_extension_surface_items(ui: &mut egui::Ui, items: &[ModuleItem]) -> Option<String> {
     let mut selected = None;
     for item in items {
         match item.action.as_ref() {
@@ -416,10 +411,10 @@ impl eframe::App for BoottyApp {
         self.state.set_extension_overlay_open(
             !self
                 .extensions
-                .surfaces(crate::command_extensions::SurfacePlacement::Floating)
+                .surfaces(SurfacePlacement::Floating)
                 .is_empty(),
         );
-        if self.settings_open {
+        if self.state.settings_open() {
             suppress_settings_recorder_duplicates(
                 &mut raw_input.events,
                 self.state.pending_direct_input(),
@@ -465,12 +460,12 @@ impl eframe::App for BoottyApp {
                 input.zoom_delta(),
             )
         });
-        if self.settings_open {
+        if self.state.settings_open() {
             suppress_terminal_payload_for_settings(&mut events, &mut dropped_file_paths);
         }
 
         let terminal_view = self.terminal_view.update_input(
-            !self.settings_open,
+            !self.state.settings_open(),
             zoom_delta,
             hover_pos,
             &mut events,
@@ -519,7 +514,7 @@ impl eframe::App for BoottyApp {
         sync_global_egui_style(ui.ctx(), theme);
         let palette = theme.palette;
         egui::Frame::NONE.fill(palette.mantle).show(ui, |ui| {
-            if self.settings_open {
+            if self.state.settings_open() {
                 self.show_settings(ui);
             } else {
                 self.chrome.show(
@@ -587,7 +582,7 @@ impl eframe::App for BoottyApp {
                 self.state.clear_last_error();
             }
         }
-        if !self.settings_open {
+        if !self.state.settings_open() {
             self.show_modal_dialog(ui.ctx());
             self.show_terminal_find_dialog(ui.ctx());
             self.show_extension_surfaces(ui.ctx());
@@ -620,7 +615,7 @@ fn configure_egui_fonts(ctx: &egui::Context, families: &[String]) {
         add_egui_default_text_font(&mut fonts, db);
     }
     add_egui_symbol_fallback_fonts(&mut fonts, db);
-    crate::ui::icons::add_icon_fonts(&mut fonts);
+    bootty_ui::icons::add_icon_fonts(&mut fonts);
     ctx.set_fonts(fonts);
 }
 

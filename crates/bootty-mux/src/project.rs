@@ -29,6 +29,140 @@ pub struct WorktreePickerEntry {
     pub occupied: bool,
 }
 
+/// Git state of a session's working directory, used to decide which ditch
+/// cleanup actions are safe to offer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    /// The cwd is inside a git work tree.
+    pub in_repo: bool,
+    /// The cwd is a *linked* worktree (not the repo's main working tree), so it
+    /// can be removed without destroying the primary checkout.
+    pub is_linked_worktree: bool,
+    /// Current branch, or `None` when detached.
+    pub branch: Option<String>,
+    /// Has uncommitted changes (tracked edits or untracked files).
+    pub dirty: bool,
+    /// Commits on HEAD not present on its upstream (0 when no upstream).
+    pub unpushed: u32,
+    /// HEAD has a configured upstream branch.
+    pub has_upstream: bool,
+}
+
+/// Inspect the git state of `cwd`. Any git failure yields a safe, empty status
+/// (`in_repo == false`), so callers only ever offer "kill session".
+pub fn status(cwd: &str) -> WorktreeStatus {
+    let mut status = WorktreeStatus::default();
+    if read(cwd, &["rev-parse", "--is-inside-work-tree"]).as_deref() != Some("true") {
+        return status;
+    }
+    status.in_repo = true;
+    // A linked worktree's own git dir differs from the shared common dir.
+    if let (Some(git_dir), Some(common)) = (
+        read(cwd, &["rev-parse", "--absolute-git-dir"]),
+        read(
+            cwd,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        ),
+    ) {
+        status.is_linked_worktree = git_dir != common;
+    }
+    status.branch = read(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    status.dirty = read(cwd, &["status", "--porcelain"]).is_some_and(|out| !out.is_empty());
+    if let Some(count) =
+        read(cwd, &["rev-list", "--count", "@{u}..HEAD"]).and_then(|out| out.parse().ok())
+    {
+        status.has_upstream = true;
+        status.unpushed = count;
+    }
+    status
+}
+
+/// Detach HEAD in `worktree_path`, freeing its branch while keeping the
+/// worktree directory and every commit. Fully non-destructive — the ditch
+/// "detach" action runs this before killing the session.
+pub fn detach_head(worktree_path: &str) -> Result<(), String> {
+    run(worktree_path, &["checkout", "--detach"])
+}
+
+/// Number of worktrees attached to the repo containing `cwd` — the main working
+/// tree plus every linked worktree. `0` when `cwd` is not in a git repo. Used to
+/// gate the detach action, which only earns its keep in a multi-worktree repo.
+pub fn worktree_count(cwd: &str) -> usize {
+    read(cwd, &["worktree", "list", "--porcelain"])
+        .map(|out| {
+            out.lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The repo's trunk branch — the one ditch must never offer to delete. Resolved
+/// from the remote's default (`origin/HEAD`); for repos without a remote it
+/// falls back to the branch checked out in the main worktree. `None` when
+/// neither is known, in which case no branch is treated as the trunk.
+pub fn trunk_branch(cwd: &str) -> Option<String> {
+    read(
+        cwd,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .and_then(|head| head.strip_prefix("refs/remotes/origin/").map(str::to_owned))
+    .or_else(|| {
+        let main = main_worktree(cwd)?;
+        read(&main, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    })
+}
+
+/// Remove the linked worktree rooted at `worktree_path`. Runs from the main
+/// working tree so git doesn't refuse to remove the tree you're standing in;
+/// `force` is required when the worktree is dirty.
+pub fn remove_worktree(worktree_path: &str, force: bool) -> Result<(), String> {
+    let main = main_worktree(worktree_path)
+        .ok_or_else(|| "could not locate the main worktree".to_owned())?;
+    let mut args = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(worktree_path);
+    run(&main, &args)
+}
+
+/// Delete `branch`, running git in `repo_dir` — any live working tree of the
+/// repo. Pass the main worktree, since a just-removed linked worktree is gone.
+/// `force` maps to `git branch -D` (drops unmerged commits) vs the safe `-d`.
+pub fn delete_branch(repo_dir: &str, branch: &str, force: bool) -> Result<(), String> {
+    run(
+        repo_dir,
+        &["branch", if force { "-D" } else { "-d" }, branch],
+    )
+}
+
+/// The root directory of the Git worktree containing `cwd`.
+pub fn worktree_root(cwd: &str) -> Option<String> {
+    read(cwd, &["rev-parse", "--show-toplevel"])
+}
+
+/// Suggest a grouped session name for a worktree, or a basename for a plain directory.
+pub fn suggested_session_name(cwd: &str) -> String {
+    let Some(worktree) = worktree_root(cwd) else {
+        return session_name_for_path(cwd).to_owned();
+    };
+    let status = status(&worktree);
+
+    let group = main_worktree(&worktree)
+        .as_deref()
+        .map(|path| session_name_for_path(path).to_owned())
+        .unwrap_or_else(|| session_name_for_path(&worktree).to_owned());
+    let leaf = status
+        .branch
+        .as_deref()
+        .and_then(|branch| branch.rsplit('/').next())
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| session_name_for_path(&worktree).to_owned());
+    format!("{group}/{leaf}")
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     home_dir_from(|name| env::var_os(name))
 }
@@ -85,10 +219,8 @@ pub fn discover_worktree_picker_entries(project_path: &str) -> Vec<WorktreePicke
         is_new: true,
         occupied: false,
     };
-    let mut command = Command::new("git");
-    command.args(["-C", project_path, "worktree", "list", "--porcelain"]);
-    hide_command_window(&mut command);
-    let Ok(output) = command.output() else {
+    let Ok(output) = git_command(project_path, &["worktree", "list", "--porcelain"]).output()
+    else {
         return vec![main_worktree_entry(project_path)];
     };
     if !output.status.success() {
@@ -124,10 +256,7 @@ fn path_identity(path: &str) -> Option<String> {
 
 pub fn add_worktree(repo_dir: &str, branch: &str) -> Result<String, String> {
     let path = new_worktree_path(repo_dir, branch)?;
-    let mut command = Command::new("git");
-    command.args(["-C", repo_dir, "worktree", "add", "-b", branch, &path]);
-    hide_command_window(&mut command);
-    let output = command
+    let output = git_command(repo_dir, &["worktree", "add", "-b", branch, &path])
         .output()
         .map_err(|error| format!("run git: {error}"))?;
     if !output.status.success() {
@@ -255,21 +384,12 @@ fn new_worktree_path(repo_dir: &str, branch: &str) -> Result<String, String> {
         .into_owned())
 }
 
-fn main_worktree(cwd: &str) -> Option<String> {
-    let mut command = Command::new("git");
-    command.args([
-        "-C",
+pub fn main_worktree(cwd: &str) -> Option<String> {
+    let common = read(
         cwd,
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-common-dir",
-    ]);
-    hide_command_window(&mut command);
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Path::new(String::from_utf8_lossy(&output.stdout).trim())
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    Path::new(&common)
         .parent()
         .map(|parent| parent.to_string_lossy().into_owned())
 }
@@ -281,6 +401,42 @@ fn session_name_for_path(path: &str) -> &str {
         .unwrap_or("bootty")
         .trim_end_matches(".git")
 }
+
+fn read(cwd: &str, args: &[&str]) -> Option<String> {
+    record_subprocess("git read");
+    let output = git_command(cwd, args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn run(cwd: &str, args: &[&str]) -> Result<(), String> {
+    record_subprocess("git run");
+    let output = git_command(cwd, args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+fn git_command(cwd: &str, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(cwd).args(args);
+    hide_command_window(&mut command);
+    command
+}
+
+#[cfg(feature = "app")]
+fn record_subprocess(what: &str) {
+    bootty_runtime::perf::record_subprocess(what);
+}
+
+#[cfg(not(feature = "app"))]
+fn record_subprocess(_what: &str) {}
 
 #[cfg(windows)]
 fn hide_command_window(command: &mut Command) {

@@ -1,15 +1,5 @@
 use std::path::{Path, PathBuf};
 
-pub fn display_path(path: &str) -> String {
-    let path = Path::new(path);
-    if let Some(home) = home_dir()
-        && let Ok(relative) = path.strip_prefix(home)
-    {
-        return Path::new("~").join(relative).display().to_string();
-    }
-    path.display().to_string()
-}
-
 pub fn session_name_for_path(path: &str) -> String {
     Path::new(path)
         .file_name()

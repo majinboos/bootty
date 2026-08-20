@@ -10,7 +10,7 @@ use bootty_app::{
     theme::theme_from_config,
     ui::{
         ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
-        icons::install_icon_fonts,
+        keybind_help::KeybindHelpDialog,
         session_navigation::BindingSessionGroup,
         session_picker::{SessionPickerDialog, SessionPickerEvent},
         space::{SpaceEditorDialog, SpaceEditorEvent},
@@ -18,6 +18,7 @@ use bootty_app::{
     },
     workspace::SpaceMuxOverride,
 };
+use bootty_ui::icons::install_icon_fonts;
 use egui::{Context, Event, Key, RawInput, Rect, Vec2};
 
 mod support;
@@ -84,6 +85,15 @@ fn theme_picker_closes_on_escape() {
         .drop_without_applying_deltas();
 
     assert_eq!(event, ThemePickerEvent::Close);
+}
+
+#[test]
+fn keybind_help_accepts_prefixed_bindings_for_display() {
+    let dialog = KeybindHelpDialog::open(&["performable:cmd+==increase_font_size:1".to_owned()]);
+    let debug = format!("{dialog:?}");
+
+    assert!(debug.contains("cmd+="));
+    assert!(debug.contains("increase_font_size:1"));
 }
 
 #[test]

@@ -908,6 +908,23 @@ fn keybind_clear_directive_replaces_existing_bindings() {
 }
 
 #[test]
+fn split_keybind_entry_preserves_equals_key_semantics() {
+    assert_eq!(
+        split_keybind_entry("cmd+b=new_tab"),
+        Some(("cmd+b", "new_tab"))
+    );
+    assert_eq!(
+        split_keybind_entry("cmd+=increase_font_size:1"),
+        Some(("cmd+", "increase_font_size:1"))
+    );
+    assert_eq!(
+        split_keybind_entry("cmd+==increase_font_size:1"),
+        Some(("cmd+=", "increase_font_size:1"))
+    );
+    assert_eq!(split_keybind_entry("cmd+v"), None);
+}
+
+#[test]
 fn keybind_entries_without_clear_layer_on_defaults() {
     let config = load_config_source(indoc! {r#"
         version = 1

@@ -11,7 +11,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::ShapedCluster;
+use super::clusters::ShapedCluster;
 use crate::terminal_text::FontStyle;
 
 pub(super) fn rasterize_text_cluster(

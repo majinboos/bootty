@@ -1,21 +1,24 @@
 use std::collections::HashMap;
 
-use bootty_ui::{ThemePalette, readable_color};
-use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
+use bootty_extension::{ExtensionUiAction, ModuleColor, ModuleItem, PublishedSurfaceItem};
+use bootty_ui::{ThemePalette, icons::paint_icon_slug, readable_color};
+use eframe::egui::{self, Color32, Pos2, Rect, Stroke, TextureHandle};
 
 use crate::{
     assets,
-    command_extensions::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem},
     mux::controller::{MuxScope, SpaceId},
     strings::truncate_label,
     ui::{
-        icons::paint_icon_slug,
         session_navigation::ScopedSessionTarget,
         sidebar::{SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree},
     },
 };
 
 use super::{item_primitives::paint_item_primitives, start_window_drag_on_primary_press};
+
+fn module_color(value: ModuleColor) -> Color32 {
+    Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
+}
 
 #[derive(Clone)]
 pub struct SidebarModel<'a> {
@@ -1291,7 +1294,10 @@ fn paint_sidebar_footer(
         if action.is_none() && response.clicked_by(egui::PointerButton::Primary) {
             action = published.action();
         }
-        let color = readable_color(palette.base, item.fg.unwrap_or(palette.subtext));
+        let color = readable_color(
+            palette.base,
+            item.fg.map(module_color).unwrap_or(palette.subtext),
+        );
         paint_item_primitives(
             &painter,
             item_rect,

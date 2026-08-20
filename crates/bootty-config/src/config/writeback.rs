@@ -1,9 +1,12 @@
 use std::{fs, io, path::Path};
 
 use bootty_write::{CommitOutcome, NewFileMode, ResolveTargetError, WriteTarget};
-use toml_edit::DocumentMut;
+use toml_edit::{Array, DocumentMut, InlineTable, Value};
 
-use super::{ConfigDocument, ConfigLoadError, ConfigResult, load_or_create_config_document};
+use super::{
+    ConfigDocument, ConfigLoadError, ConfigResult, SegmentAlign, SshAuthenticationConfig,
+    SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment, load_or_create_config_document,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigWriteOutcome {
@@ -18,6 +21,123 @@ impl ConfigWriteOutcome {
             Self::CommittedWithDurabilityWarning(warning) => Some(warning),
         }
     }
+}
+
+impl ConfigDocument {
+    pub fn set_top_bar_enabled(&mut self, enabled: bool) -> ConfigResult<()> {
+        self.remove_item(&["chrome", "status-bar"])?;
+        self.set_item(&["chrome", "top-bar"], toml_edit::value(enabled))
+    }
+
+    pub fn set_top_status_segments(&mut self, segments: &[StatusSegment]) -> ConfigResult<()> {
+        self.remove_item(&["chrome", "status-segment"])?;
+        self.set_item(
+            &["chrome", "top-segment"],
+            toml_edit::value(serialize_status_segments(segments)),
+        )
+    }
+
+    pub fn set_bottom_status_segments(&mut self, segments: &[StatusSegment]) -> ConfigResult<()> {
+        self.set_item(
+            &["chrome", "bottom-segment"],
+            toml_edit::value(serialize_status_segments(segments)),
+        )
+    }
+
+    pub fn set_ssh_profile(&mut self, id: &str, profile: &SshProfileConfig) -> ConfigResult<()> {
+        self.remove_ssh_profile(id)?;
+        let root = ["ssh-profiles", id];
+        self.set_item(&[root[0], root[1], "name"], toml_edit::value(&profile.name))?;
+        self.set_item(&[root[0], root[1], "host"], toml_edit::value(&profile.host))?;
+        if let Some(user) = &profile.user {
+            self.set_item(&[root[0], root[1], "user"], toml_edit::value(user))?;
+        }
+        if let Some(port) = profile.port {
+            self.set_item(
+                &[root[0], root[1], "port"],
+                toml_edit::value(i64::from(port)),
+            )?;
+        }
+        let authentication = match profile.authentication {
+            SshAuthenticationConfig::Auto => "auto",
+            SshAuthenticationConfig::Agent => "agent",
+            SshAuthenticationConfig::KeyFile => "key-file",
+        };
+        self.set_item(
+            &[root[0], root[1], "authentication"],
+            toml_edit::value(authentication),
+        )?;
+        let host_key_policy = match profile.host_key_policy {
+            SshHostKeyPolicyConfig::Strict => "strict",
+            SshHostKeyPolicyConfig::AcceptNew => "accept-new",
+        };
+        self.set_item(
+            &[root[0], root[1], "host-key-policy"],
+            toml_edit::value(host_key_policy),
+        )?;
+        if let Some(identity_file) = &profile.identity_file {
+            self.set_item(
+                &[root[0], root[1], "identity-file"],
+                toml_edit::value(identity_file.display().to_string()),
+            )?;
+        }
+        if let Some(proxy_jump) = &profile.proxy_jump {
+            self.set_item(
+                &[root[0], root[1], "proxy-jump"],
+                toml_edit::value(proxy_jump),
+            )?;
+        }
+        self.set_item(
+            &[root[0], root[1], "program"],
+            toml_edit::value(&profile.program),
+        )?;
+        if !profile.args.is_empty() {
+            let mut args = Array::new();
+            for arg in &profile.args {
+                args.push(arg.as_str());
+            }
+            self.set_item(&[root[0], root[1], "args"], toml_edit::value(args))?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_ssh_profile(&mut self, id: &str) -> ConfigResult<()> {
+        self.remove_item(&["ssh-profiles", id])
+    }
+}
+
+fn serialize_status_segments(segments: &[StatusSegment]) -> Array {
+    let mut array = Array::new();
+    for segment in segments {
+        let mut table = InlineTable::new();
+        let align = match segment.align {
+            SegmentAlign::Left => "left",
+            SegmentAlign::Center => "center",
+            SegmentAlign::Right => "right",
+        };
+        table.insert("align", Value::from(align));
+        table.insert("module", Value::from(segment.module.as_str()));
+        for (key, color) in [("fg", segment.fg), ("bg", segment.bg)] {
+            if let Some(color) = color {
+                let hex = if color.a == 0xff {
+                    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+                } else {
+                    format!(
+                        "#{:02x}{:02x}{:02x}{:02x}",
+                        color.r, color.g, color.b, color.a
+                    )
+                };
+                table.insert(key, Value::from(hex));
+            }
+        }
+        if let Some(icon) = &segment.icon
+            && !icon.is_empty()
+        {
+            table.insert("icon", Value::from(icon.as_str()));
+        }
+        array.push(table);
+    }
+    array
 }
 
 pub fn update_config_document(
@@ -60,6 +180,15 @@ pub fn update_config_document(
                 requested_path.display()
             ))
         }
+    })
+}
+
+pub fn write_font_size_preference(
+    path: impl AsRef<Path>,
+    size: f32,
+) -> ConfigResult<ConfigWriteOutcome> {
+    update_config_document(path, |document| {
+        document.set_item(&["font", "size"], toml_edit::value(f64::from(size)))
     })
 }
 

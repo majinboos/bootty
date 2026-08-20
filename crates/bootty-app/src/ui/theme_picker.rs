@@ -1,9 +1,9 @@
 use std::path::Path;
 
-use bootty_ui::Theme;
+use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
-use crate::ui::overlay::{self, FloatingWindow, ListRow, ListView, list};
+use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 
 #[derive(Clone, Debug)]
 pub struct ThemePickerDialog {
@@ -100,7 +100,7 @@ impl ThemePickerDialog {
             self.current.as_deref(),
             &self.branch_label,
         );
-        self.selected = list::clamp_selection(self.selected, rows.len());
+        self.selected = overlay::clamp_selection(self.selected, rows.len());
         if self.focus_filter
             && let Some(current) = self.current.as_deref()
             && let Some(index) = row_entries.iter().position(|entry| {

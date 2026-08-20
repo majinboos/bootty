@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::Result;
+use bootty_terminal::terminal_frame::{CursorSnapshot, FrameScrollbar, RenderCell, RenderFrame};
 use eframe::{
     egui::{self, Color32, Pos2, Rect, Sense, Vec2},
     wgpu,
@@ -16,7 +17,6 @@ use crate::{
     },
     paint_plan::{CursorBlinkPhase, PaintPlanner, TerminalPaintPlan},
     scheduler::CURSOR_BLINK_REFRESH_INTERVAL,
-    terminal::{CursorSnapshot, RenderCell, RenderFrame},
     terminal_image::KittyImageFrame,
     terminal_render::{RenderFramePool, TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
@@ -276,7 +276,7 @@ impl TerminalWidget {
         &mut self,
         ui: &mut egui::Ui,
         surface: TerminalSurface,
-        frame: &Arc<crate::terminal::RenderFrame>,
+        frame: &Arc<RenderFrame>,
     ) -> Result<()> {
         let paint_start = Instant::now();
         anyhow::ensure!(
@@ -343,7 +343,7 @@ impl TerminalWidget {
         &mut self,
         ui: &mut egui::Ui,
         surface: TerminalSurface,
-        frame: &crate::terminal::RenderFrame,
+        frame: &RenderFrame,
     ) {
         let Some(scrollbar) = frame.scrollbar else {
             return;
@@ -368,7 +368,7 @@ impl TerminalWidget {
         ui: &mut egui::Ui,
         widget_id: egui::Id,
         surface: TerminalSurface,
-        frame: &crate::terminal::RenderFrame,
+        frame: &RenderFrame,
     ) -> isize {
         let Some(scrollbar) = frame.scrollbar else {
             self.scrollbar.thumb_hovered = false;
@@ -757,11 +757,7 @@ struct ScrollbarVisibility {
     thumb_hovered: bool,
 }
 impl ScrollbarVisibility {
-    fn update_activity(
-        &mut self,
-        scrollbar: crate::terminal::FrameScrollbar,
-        now: Instant,
-    ) -> bool {
+    fn update_activity(&mut self, scrollbar: FrameScrollbar, now: Instant) -> bool {
         if self
             .last_offset
             .is_some_and(|offset| offset != scrollbar.offset)
@@ -897,8 +893,8 @@ impl CursorBlinkClock {
 fn paint_scrollbar(
     ui: &mut egui::Ui,
     surface: TerminalSurface,
-    frame: &crate::terminal::RenderFrame,
-    scrollbar: crate::terminal::FrameScrollbar,
+    frame: &RenderFrame,
+    scrollbar: FrameScrollbar,
     hovered: bool,
 ) {
     let thumb = scrollbar_thumb_rect(surface, scrollbar, hovered);
@@ -918,13 +914,13 @@ pub(crate) fn scrollbar_hit_rect(surface: TerminalSurface) -> Rect {
     )
 }
 
-fn is_scrollbar_scrollable(scrollbar: crate::terminal::FrameScrollbar) -> bool {
+fn is_scrollbar_scrollable(scrollbar: FrameScrollbar) -> bool {
     scrollbar.total > scrollbar.len && scrollbar.len > 0
 }
 
 fn scrollbar_thumb_rect(
     surface: TerminalSurface,
-    scrollbar: crate::terminal::FrameScrollbar,
+    scrollbar: FrameScrollbar,
     hovered: bool,
 ) -> Rect {
     let track = surface.rect;
@@ -948,7 +944,7 @@ fn scrollbar_thumb_rect(
 
 fn scrollbar_drag_delta_rows(
     surface: TerminalSurface,
-    scrollbar: crate::terminal::FrameScrollbar,
+    scrollbar: FrameScrollbar,
     delta_y: f32,
 ) -> isize {
     let thumb = scrollbar_thumb_rect(surface, scrollbar, false);

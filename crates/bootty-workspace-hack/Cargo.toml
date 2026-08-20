@@ -100,6 +100,7 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 naga = { version = "30", features = ["msl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+objc2 = { version = "0.6" }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSControl", "NSCursor", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics", "std"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSException", "NSFileWrapper", "NSFormatter", "NSGeometry", "NSItemProvider", "NSKeyValueObserving", "NSLocale", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSSet", "NSString", "NSThread", "NSURL", "NSUndoManager", "NSUserActivity", "NSValue", "NSZone", "block2", "objc2-core-foundation", "std"] }
@@ -124,6 +125,8 @@ mio = { version = "1", features = ["net", "os-ext"] }
 naga = { version = "30", features = ["glsl-out", "spv-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1" }
+quote = { version = "1" }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
@@ -170,6 +173,7 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 naga = { version = "30", features = ["msl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+objc2 = { version = "0.6" }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSBitmapImageRep", "NSButton", "NSCell", "NSControl", "NSCursor", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation", "objc2-core-graphics", "std"] }
 objc2-core-foundation = { version = "0.3", features = ["CFBase"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSAttributedString", "NSBundle", "NSCoder", "NSData", "NSDate", "NSDictionary", "NSEnumerator", "NSError", "NSException", "NSFileWrapper", "NSFormatter", "NSGeometry", "NSItemProvider", "NSKeyValueObserving", "NSLocale", "NSNotification", "NSNull", "NSObjCRuntime", "NSObject", "NSProcessInfo", "NSRange", "NSSet", "NSString", "NSThread", "NSURL", "NSUndoManager", "NSUserActivity", "NSValue", "NSZone", "block2", "objc2-core-foundation", "std"] }
@@ -237,6 +241,8 @@ mio = { version = "1", features = ["net", "os-ext"] }
 naga = { version = "30", features = ["glsl-out", "spv-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1" }
+quote = { version = "1" }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["union"] }

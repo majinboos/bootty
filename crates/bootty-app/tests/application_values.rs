@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 use bootty_app::{
     color::Color,
@@ -8,14 +8,14 @@ use bootty_app::{
         controller::{BindingId, MuxScope, SpaceId},
         snapshot::{MuxPaneAnchor, MuxSession},
     },
-    strings::{
-        csv_field, display_path, home_dir, is_uniquified_session_name, push_truncated_label,
-        unique_session_name,
-    },
+    strings::{csv_field, is_uniquified_session_name, push_truncated_label, unique_session_name},
     theme::theme_palette_from_colors,
     ui::session_navigation::BindingSessionGroup,
 };
 use egui::{Color32, Event, Key, Modifiers};
+
+#[cfg(windows)]
+use bootty_app::strings::home_dir;
 
 fn key_event(key: Key) -> Event {
     Event::Key {
@@ -103,24 +103,6 @@ fn generated_session_names_require_a_numeric_suffix_on_the_same_leaf() {
         "bootty/mainline-2",
         "bootty/main"
     ));
-}
-
-#[test]
-fn display_paths_contract_home_without_contracting_lookalikes() {
-    let Some(home) = home_dir() else {
-        return;
-    };
-    let child = home.join("src");
-    let lookalike = std::path::PathBuf::from(format!("{}-backup", home.display()));
-
-    assert_eq!(
-        display_path(&child.to_string_lossy()),
-        Path::new("~").join("src").display().to_string()
-    );
-    assert_eq!(
-        display_path(&lookalike.to_string_lossy()),
-        lookalike.display().to_string()
-    );
 }
 
 #[cfg(windows)]

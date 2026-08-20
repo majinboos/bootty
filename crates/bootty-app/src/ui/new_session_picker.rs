@@ -3,26 +3,27 @@ use std::sync::{
     mpsc::{self, Receiver, TryRecvError},
 };
 
-use bootty_mux::process::{CancellableCommandRunner, CommandCancellation};
-use bootty_ui::Theme;
+use bootty_extension::display_path;
+use bootty_mux::{
+    controller::RepaintHandle,
+    process::{CancellableCommandRunner, CommandCancellation},
+    project::{
+        ProjectPickerEntry, WorktreePickerEntry, discover_project_picker_entries,
+        discover_worktree_picker_entries, home_dir as project_home_dir,
+        toggle_favorite_project_path,
+    },
+};
+use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
+use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
-use crate::{
-    config::SshRemoteConfig,
-    mux::RepaintHandle,
-    project_catalog::{
-        ProjectPickerEntry, discover_project_picker_entries, toggle_favorite_project_path,
-    },
-    strings::display_path,
-    ui::overlay::{self, FloatingWindow, ListRow, ListView, list},
-    worktree_catalog::{WorktreePickerEntry, discover_worktree_picker_entries},
-};
+use crate::{config::SshRemoteConfig, strings::home_dir};
 
 mod model;
 
 use model::{NewMuxSessionStep, filtered_worktree_entries, project_entries_for_filter};
 
-pub use crate::mux::controller::NewMuxSessionRequest;
+pub use bootty_mux::controller::NewMuxSessionRequest;
 
 pub struct NewMuxSessionDialog {
     step: NewMuxSessionStep,
@@ -89,7 +90,7 @@ impl NewMuxSessionDialog {
             step: NewMuxSessionStep::Project,
             filter: String::new(),
             selected: 0,
-            projects: discover_project_picker_entries(),
+            projects: discover_project_picker_entries(project_home_dir().as_deref()),
             worktrees: Vec::new(),
             selected_project: None,
             focus_filter: true,
@@ -146,7 +147,7 @@ impl NewMuxSessionDialog {
         open_cwds: &[String],
     ) -> NewSessionPickerEvent {
         let entries = project_entries_for_filter(&self.projects, &self.filter);
-        self.selected = list::clamp_selection(self.selected, entries.len());
+        self.selected = overlay::clamp_selection(self.selected, entries.len());
         let busy = self.remote_task.is_some();
         let favorite = (!busy && favorite_shortcut_pressed(ctx))
             .then(|| entries.get(self.selected).cloned())
@@ -186,7 +187,7 @@ impl NewMuxSessionDialog {
 
     fn show_worktree_step(&mut self, ctx: &egui::Context, theme: Theme) -> NewSessionPickerEvent {
         let entries = filtered_worktree_entries(&self.worktrees, &self.filter);
-        self.selected = list::clamp_selection(self.selected, entries.len());
+        self.selected = overlay::clamp_selection(self.selected, entries.len());
         let rows = worktree_rows(&entries, theme);
 
         let empty_text = if self.remote_task.is_some() {
@@ -315,7 +316,7 @@ impl NewMuxSessionDialog {
             });
             return NewSessionPickerEvent::None;
         }
-        match toggle_favorite_project_path(&project.path) {
+        match toggle_favorite_project_path(project_home_dir().as_deref(), &project.path) {
             Ok(favorite) => {
                 self.set_project_favorite(&project.path, favorite);
                 NewSessionPickerEvent::None
@@ -570,7 +571,7 @@ fn picker_display_path(path: &str, remote: bool) -> String {
     if remote {
         path.to_owned()
     } else {
-        display_path(path)
+        display_path(path, home_dir().as_deref())
     }
 }
 

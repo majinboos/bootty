@@ -53,7 +53,6 @@ eframe = { version = "0.36", default-features = false, features = [
   "wgpu_no_default_features",
 ] }
 egui = "0.36"
-epaint_default_fonts = "0.36"
 fontdb = "0.23"
 getrandom = "0.4"
 iconflow = { version = "1", features = [
@@ -180,6 +179,7 @@ debug = false
 
 [dev-dependencies]
 bootty-app = { path = "crates/bootty-app" }
+bootty-command = { path = "crates/bootty-command" }
 bootty-config = { path = "crates/bootty-config" }
 bootty-mux = { path = "crates/bootty-mux" }
 bootty-rmux = { path = "crates/bootty-rmux" }

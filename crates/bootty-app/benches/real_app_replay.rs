@@ -3,10 +3,10 @@ use std::hint::black_box;
 use bootty_app::{
     geometry::{TerminalGeometry, TerminalSurface},
     paint_plan::PaintPlanner,
-    terminal::TerminalEngine,
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
+use bootty_terminal::terminal_engine::TerminalEngine;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 #[derive(Clone)]

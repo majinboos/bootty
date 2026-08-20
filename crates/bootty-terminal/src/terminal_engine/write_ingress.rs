@@ -1,23 +1,6 @@
 use std::borrow::Cow;
 
-use memchr::memchr3_iter;
-
-pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    let first = *needle.first()?;
-    if needle.len() == 1 {
-        return haystack.iter().position(|byte| *byte == first);
-    }
-
-    let mut offset = 0;
-    while let Some(relative_start) = haystack[offset..].iter().position(|byte| *byte == first) {
-        let start = offset + relative_start;
-        if haystack[start..].starts_with(needle) {
-            return Some(start);
-        }
-        offset = start + 1;
-    }
-    None
-}
+use memchr::{memchr3_iter, memmem::find};
 
 pub(crate) fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut index = 0;
@@ -385,7 +368,7 @@ pub(super) fn terminal_write_features(data: &[u8]) -> TerminalWriteFeatures {
 pub(super) fn unwrap_tmux_passthrough_commands(data: &[u8]) -> Cow<'_, [u8]> {
     let mut out: Option<Vec<u8>> = None;
     let mut read_start = 0;
-    while let Some(relative_start) = find_subslice(&data[read_start..], b"\x1bPtmux;") {
+    while let Some(relative_start) = find(&data[read_start..], b"\x1bPtmux;") {
         let start = read_start + relative_start;
         let payload_start = start + 7;
         let mut cursor = payload_start;
@@ -447,7 +430,7 @@ pub(super) fn sanitize_kitty_graphics_commands(data: &[u8]) -> SanitizedKittyGra
     let mut out: Option<Vec<u8>> = None;
     let mut read_start = 0;
     let mut touched = false;
-    while let Some(relative_start) = find_subslice(&data[read_start..], b"\x1b_G") {
+    while let Some(relative_start) = find(&data[read_start..], b"\x1b_G") {
         touched = true;
         let start = read_start + relative_start;
         let payload_start = start + 3;

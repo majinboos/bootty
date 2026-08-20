@@ -18,7 +18,7 @@ use controls::*;
 
 use std::path::PathBuf;
 
-use bootty_ui::{Theme, ThemePalette, contrast_ratio, readable_color};
+use bootty_ui::{Theme, ThemePalette, contrast_ratio, icons, readable_color};
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, UiBuilder, Vec2};
 
 use crate::{
@@ -471,7 +471,7 @@ impl SettingsSurface {
                 // icon font and fall back to text-only if the slug is ever missing.
                 let mut back = egui::text::LayoutJob::default();
                 let back_color = readable_color(self.palette.mantle, self.palette.subtext);
-                if let Some((glyph, family)) = crate::ui::icons::icon_glyph("arrow-left") {
+                if let Some((glyph, family)) = icons::icon_glyph("arrow-left") {
                     back.append(
                         &glyph.to_string(),
                         0.0,
@@ -586,7 +586,7 @@ impl SettingsSurface {
             },
         );
         let icon_center = Pos2::new(rect.min.x + 17.0, rect.center().y);
-        crate::ui::icons::paint_icon_slug(ui.painter(), meta.icon, icon_center, 15.0, tint);
+        icons::paint_icon_slug(ui.painter(), meta.icon, icon_center, 15.0, tint);
         ui.painter().text(
             Pos2::new(rect.min.x + 40.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -858,46 +858,16 @@ impl SettingsSurface {
     // --- config writeback -------------------------------------------------------------------
 
     fn set_top_bar(&mut self, enabled: bool) {
-        self.writeback.mutate(move |document| {
-            document.remove_item(&["chrome", "status-bar"])?;
-            document.set_item(
-                &["chrome", "top-bar"],
-                bootty_config::toml_edit::value(enabled),
-            )
-        });
+        self.writeback
+            .mutate(move |document| document.set_top_bar_enabled(enabled));
     }
 
     /// Write one bar's ordered module segments from the working copy.
     fn set_status_segments(&mut self, position: status_bar::StatusBarPosition) {
-        use bootty_config::toml_edit;
-        let mut array = toml_edit::Array::new();
-        for segment in position.segments(&self.config.chrome) {
-            let mut table = toml_edit::InlineTable::new();
-            let align = match segment.align {
-                crate::config::SegmentAlign::Left => "left",
-                crate::config::SegmentAlign::Center => "center",
-                crate::config::SegmentAlign::Right => "right",
-            };
-            table.insert("align", toml_edit::Value::from(align));
-            table.insert("module", toml_edit::Value::from(segment.module.as_str()));
-            if let Some(color) = segment.fg {
-                table.insert("fg", toml_edit::Value::from(color_hex(color)));
-            }
-            if let Some(color) = segment.bg {
-                table.insert("bg", toml_edit::Value::from(color_hex(color)));
-            }
-            if let Some(icon) = &segment.icon
-                && !icon.is_empty()
-            {
-                table.insert("icon", toml_edit::Value::from(icon.as_str()));
-            }
-            array.push(table);
-        }
-        self.writeback.mutate(move |document| {
-            if position == status_bar::StatusBarPosition::Top {
-                document.remove_item(&["chrome", "status-segment"])?;
-            }
-            document.set_item(&["chrome", position.segment_key()], toml_edit::value(array))
+        let segments = position.segments(&self.config.chrome).to_owned();
+        self.writeback.mutate(move |document| match position {
+            status_bar::StatusBarPosition::Top => document.set_top_status_segments(&segments),
+            status_bar::StatusBarPosition::Bottom => document.set_bottom_status_segments(&segments),
         });
     }
 }
@@ -926,17 +896,6 @@ fn page_matches(meta: PageMeta, query: &str) -> bool {
             .terms
             .iter()
             .any(|term| term.to_ascii_lowercase().contains(query))
-}
-
-fn color_hex(color: Color) -> String {
-    if color.a == 0xff {
-        format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
-    } else {
-        format!(
-            "#{:02x}{:02x}{:02x}{:02x}",
-            color.r, color.g, color.b, color.a
-        )
-    }
 }
 
 #[cfg(windows)]

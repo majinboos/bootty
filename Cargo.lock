@@ -676,6 +676,9 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bootty-app",
+ "bootty-command",
+ "bootty-control",
+ "bootty-extension",
  "bootty-mux",
  "bootty-native",
  "bootty-remote",
@@ -696,7 +699,10 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "bootty-command",
  "bootty-config",
+ "bootty-control",
+ "bootty-extension",
  "bootty-font",
  "bootty-identity",
  "bootty-mux",
@@ -710,40 +716,39 @@ dependencies = [
  "bootty-ui",
  "bootty-winit",
  "bootty-workspace-hack",
- "bootty-write",
  "bootty-zellij",
  "clap",
  "criterion",
  "eframe",
  "egui",
  "fontdb",
- "getrandom 0.4.3",
  "iconflow",
  "keepawake",
  "libghostty-vt",
- "mlua",
  "muda",
- "notify",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "png",
  "pollster 0.4.0",
- "process-wrap",
- "rmux-ipc",
- "rmux-os",
  "rusqlite",
  "self_update",
  "serde",
  "serde_json",
- "starship-battery",
  "strum",
- "sysinfo",
  "tempfile",
- "tokio",
  "ttf-parser",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "bootty-command"
+version = "0.4.0"
+dependencies = [
+ "bootty-workspace-hack",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -762,6 +767,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bootty-control"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "bootty-command",
+ "bootty-extension",
+ "bootty-identity",
+ "bootty-workspace-hack",
+ "getrandom 0.4.3",
+ "rmux-ipc",
+ "rmux-os",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bootty-daemon"
 version = "0.4.0"
 dependencies = [
@@ -776,6 +800,23 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "bootty-extension"
+version = "0.4.0"
+dependencies = [
+ "bootty-command",
+ "bootty-workspace-hack",
+ "bootty-write",
+ "mlua",
+ "notify",
+ "process-wrap",
+ "serde",
+ "serde_json",
+ "starship-battery",
+ "sysinfo",
  "tempfile",
 ]
 
@@ -798,6 +839,7 @@ name = "bootty-mux"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "bootty-command",
  "bootty-mux-model",
  "bootty-runtime",
  "bootty-surface",
@@ -949,6 +991,7 @@ name = "bootty-tests"
 version = "0.4.0"
 dependencies = [
  "bootty-app",
+ "bootty-command",
  "bootty-config",
  "bootty-mux",
  "bootty-rmux",
@@ -978,6 +1021,7 @@ version = "0.0.0"
 dependencies = [
  "bootty-workspace-hack",
  "eframe",
+ "iconflow",
 ]
 
 [[package]]
@@ -1041,6 +1085,7 @@ dependencies = [
  "mio",
  "naga",
  "num-traits",
+ "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
  "objc2-foundation 0.3.2",

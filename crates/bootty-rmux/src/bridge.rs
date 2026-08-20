@@ -220,9 +220,7 @@ pub fn start_embedded_rmux_daemon_for_tests() -> Result<()> {
 
 const BOOTTY_DAEMON_BINARY_ENV: &str = "BOOTTY_DAEMON_BINARY";
 
-pub(crate) fn prepare_local_rmux_daemon(
-    identity: bootty_identity::ApplicationIdentity,
-) -> Result<()> {
+pub fn prepare_local_rmux_daemon(identity: bootty_identity::ApplicationIdentity) -> Result<()> {
     identity.initialize_process()?;
     static RESOLVED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     RESOLVED

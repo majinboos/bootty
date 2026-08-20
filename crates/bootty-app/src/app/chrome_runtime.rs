@@ -7,10 +7,17 @@ use super::{
     terminal_workspace_view::TerminalWorkspaceView,
 };
 use crate::{
-    command_extensions::ExtensionHost,
     theme::theme_palette_from_config,
     ui::chrome::{self, SidebarModel, StatusBarModel},
 };
+use bootty_extension::{
+    ExtensionHost, ExtensionUiAction, ModuleColor, ModulePrimitive, MuxView, PublishedSurfaceItem,
+    PublishedSurfaceSnapshot, SessionProgressView, SessionView, SurfacePlacement, WindowView,
+};
+
+fn module_color(value: ModuleColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
+}
 
 /// Fallback layout offset in points when the active screen has a notch but macOS does not report
 /// its band.
@@ -142,10 +149,9 @@ impl ChromeView<'_> {
             .filter_map(|(source_slot, segment)| {
                 let seg_fg = segment.fg.map(crate::theme::config_color32);
                 let seg_bg = segment.bg.map(crate::theme::config_color32);
-                let surface = self.extensions.surface(
-                    crate::command_extensions::SurfacePlacement::Status,
-                    &segment.module,
-                );
+                let surface = self
+                    .extensions
+                    .surface(SurfacePlacement::Status, &segment.module);
                 let items =
                     surface
                         .into_iter()
@@ -160,9 +166,9 @@ impl ChromeView<'_> {
                         .map(|(item, module, generation, surface)| chrome::ResolvedItem {
                             text: item.text,
                             icon: item.icon.or_else(|| segment.icon.clone()),
-                            stroke: item.stroke,
-                            fg: item.fg.or(seg_fg),
-                            bg: item.bg.or(seg_bg),
+                            stroke: item.stroke.map(module_color),
+                            fg: item.fg.map(module_color).or(seg_fg),
+                            bg: item.bg.map(module_color).or(seg_bg),
                             gauge: item.gauge,
                             primitives: item.primitives,
                             pad_left: item.pad_left,
@@ -185,10 +191,7 @@ impl ChromeView<'_> {
             .collect()
     }
 
-    fn current_extension_mux_view(
-        &self,
-        sidebar_visible: bool,
-    ) -> crate::command_extensions::MuxView {
+    fn current_extension_mux_view(&self, sidebar_visible: bool) -> MuxView {
         let selected = self.state.mux().selected_window();
         let mut windows = self
             .state
@@ -201,7 +204,7 @@ impl ChromeView<'_> {
                 let progress = (!active)
                     .then(|| self.state.window_progress(window))
                     .flatten();
-                crate::command_extensions::WindowView {
+                WindowView {
                     id: window.id.clone(),
                     index: window.index,
                     name: window.name.clone(),
@@ -235,7 +238,7 @@ impl ChromeView<'_> {
             .and_then(|session| session.color.clone())
             .or_else(|| Some(color_hex(self.state.ui_theme().palette.accent)));
         let scope = self.state.mux_scope();
-        crate::command_extensions::MuxView {
+        MuxView {
             windows,
             sessions,
             scope_key: format!(
@@ -253,10 +256,7 @@ impl ChromeView<'_> {
 
     fn current_status_tab_context(&self) -> Option<chrome::TabContext> {
         let selected_session = self.state.mux().selected_session()?;
-        let session =
-            self.state.mux().sessions().iter().find(|session| {
-                session.id == selected_session || session.name == selected_session
-            })?;
+        let session = self.state.mux().session_by_id_or_name(selected_session)?;
         let mut windows = session.windows.iter().collect::<Vec<_>>();
         windows.sort_by_key(|window| window.index);
         let active_window = self
@@ -277,7 +277,7 @@ impl ChromeView<'_> {
         })
     }
 
-    fn current_extension_sessions(&self) -> Vec<crate::command_extensions::SessionView> {
+    fn current_extension_sessions(&self) -> Vec<SessionView> {
         let palette = self.state.ui_theme().palette;
         let fallback_color = color_hex(palette.accent);
         let fallback_dim_color = color_hex(palette.muted);
@@ -328,7 +328,7 @@ impl ChromeView<'_> {
                             && reported_panes.insert(pane_id)
                             && let Some(progress) = self.state.pane_progress(pane_id)
                         {
-                            progresses.push(crate::command_extensions::SessionProgressView {
+                            progresses.push(SessionProgressView {
                                 process: pane
                                     .process
                                     .clone()
@@ -340,7 +340,7 @@ impl ChromeView<'_> {
                         }
                     }
                 }
-                crate::command_extensions::SessionView {
+                SessionView {
                     id: session.id.clone(),
                     name: session.name.clone(),
                     display_name,
@@ -406,15 +406,13 @@ impl ChromeView<'_> {
                     {
                         self.state.activate_window_from_ui(&session_id, window_id);
                     } else {
-                        let _ = self.extensions.submit_ui_action(
-                            crate::command_extensions::ExtensionUiAction {
-                                module,
-                                generation,
-                                surface,
-                                action: other.to_owned(),
-                                payload: serde_json::Value::Null,
-                            },
-                        );
+                        let _ = self.extensions.submit_ui_action(ExtensionUiAction {
+                            module,
+                            generation,
+                            surface,
+                            action: other.to_owned(),
+                            payload: serde_json::Value::Null,
+                        });
                     }
                 }
             },
@@ -471,15 +469,13 @@ impl ChromeView<'_> {
                 {
                     ctx.request_repaint();
                 } else {
-                    let _ = self.extensions.submit_ui_action(
-                        crate::command_extensions::ExtensionUiAction {
-                            module,
-                            generation,
-                            surface,
-                            action: "reorder".to_owned(),
-                            payload: serde_json::json!({ "source": source, "before": before }),
-                        },
-                    );
+                    let _ = self.extensions.submit_ui_action(ExtensionUiAction {
+                        module,
+                        generation,
+                        surface,
+                        action: "reorder".to_owned(),
+                        payload: serde_json::json!({ "source": source, "before": before }),
+                    });
                 }
             }
             None => {}
@@ -558,9 +554,9 @@ impl ChromeView<'_> {
             for name in &self.state.config().sidebar.modules {
                 for item in self
                     .extensions
-                    .surface(crate::command_extensions::SurfacePlacement::Sidebar, name)
+                    .surface(SurfacePlacement::Sidebar, name)
                     .into_iter()
-                    .flat_map(crate::command_extensions::PublishedSurfaceSnapshot::into_items)
+                    .flat_map(PublishedSurfaceSnapshot::into_items)
                 {
                     if item.item.kind.as_deref() == Some("footer") {
                         footer.push(item);
@@ -574,9 +570,9 @@ impl ChromeView<'_> {
                 body,
                 session_modules.iter().flat_map(|name| {
                     self.extensions
-                        .surface(crate::command_extensions::SurfacePlacement::Session, name)
+                        .surface(SurfacePlacement::Session, name)
                         .into_iter()
-                        .flat_map(crate::command_extensions::PublishedSurfaceSnapshot::into_items)
+                        .flat_map(PublishedSurfaceSnapshot::into_items)
                 }),
             );
             (body, footer)
@@ -1119,11 +1115,11 @@ impl ChromeView<'_> {
 }
 
 fn compose_session_module_items(
-    base: Vec<crate::command_extensions::PublishedSurfaceItem>,
-    components: impl IntoIterator<Item = crate::command_extensions::PublishedSurfaceItem>,
-) -> Vec<crate::command_extensions::PublishedSurfaceItem> {
-    let mut overlays = HashMap::<String, Vec<crate::command_extensions::ModulePrimitive>>::new();
-    let mut rows = HashMap::<String, Vec<crate::command_extensions::PublishedSurfaceItem>>::new();
+    base: Vec<PublishedSurfaceItem>,
+    components: impl IntoIterator<Item = PublishedSurfaceItem>,
+) -> Vec<PublishedSurfaceItem> {
+    let mut overlays = HashMap::<String, Vec<ModulePrimitive>>::new();
+    let mut rows = HashMap::<String, Vec<PublishedSurfaceItem>>::new();
     let mut unscoped = Vec::new();
     for item in components {
         let Some(session_id) = item.item.session_id.clone() else {

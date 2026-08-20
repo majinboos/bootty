@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use bootty_control::{ControlPlane, ControlServer};
 use eframe::UserEvent;
 use winit::{
     application::ApplicationHandler,
@@ -18,7 +19,6 @@ use crate::{
     app::BoottyApp,
     application_identity::ApplicationIdentity,
     config::BoottyConfig,
-    control::{ControlPlane, ControlServer},
     direct_input::{DirectKeyInput, ModifierSideState, direct_key_input_from_winit_event},
     platform::disable_automatic_window_tabbing,
 };
@@ -54,10 +54,10 @@ pub fn run(
         )?;
         let (commands, catalog) = app.control_binding();
         app_control_server.replace(Some(ControlServer::spawn(
-            window_state_key,
+            &window_state_key,
             commands,
             catalog,
-            control_plane,
+            &control_plane,
         )?));
         Ok(Box::new(app) as Box<dyn eframe::App>)
     });

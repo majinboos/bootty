@@ -1,9 +1,10 @@
-use bootty_ui::{Theme, ThemePalette};
+use bootty_extension::display_path;
+use bootty_mux::project::{self, WorktreeStatus};
+use bootty_ui::overlay::{ActionItem, ActionMenu, ActionRisk, FloatingWindow, StatusLine};
+use bootty_ui::{Theme, ThemePalette, overlay};
 use eframe::egui;
 
-use crate::git::{self, WorktreeStatus};
-use crate::strings::display_path;
-use crate::ui::overlay::{self, ActionItem, ActionMenu, ActionRisk, FloatingWindow, StatusLine};
+use crate::strings::home_dir;
 
 /// A cleanup action chosen in the ditch window, executed by the app layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,10 +48,10 @@ pub enum DitchSessionEvent {
 
 impl DitchSessionDialog {
     pub fn open(session_id: String, cwd: Option<String>) -> Self {
-        let status = cwd.as_deref().map(git::status).unwrap_or_default();
-        let main = cwd.as_deref().and_then(git::main_worktree);
-        let trunk = cwd.as_deref().and_then(git::trunk_branch);
-        let multi_worktree = cwd.as_deref().map(git::worktree_count).unwrap_or(0) > 1;
+        let status = cwd.as_deref().map(project::status).unwrap_or_default();
+        let main = cwd.as_deref().and_then(project::main_worktree);
+        let trunk = cwd.as_deref().and_then(project::trunk_branch);
+        let multi_worktree = cwd.as_deref().map(project::worktree_count).unwrap_or(0) > 1;
         let actions = actions_for(&status, main.as_deref(), trunk.as_deref(), multi_worktree);
         Self {
             session_id,
@@ -183,7 +184,10 @@ fn status_lines(
 ) -> Vec<StatusLine> {
     let mut lines = vec![StatusLine {
         label: "path".to_owned(),
-        value: cwd.map_or_else(|| "(unknown)".to_owned(), display_path),
+        value: cwd.map_or_else(
+            || "(unknown)".to_owned(),
+            |cwd| display_path(cwd, home_dir().as_deref()),
+        ),
         tint: None,
     }];
     if !status.in_repo {

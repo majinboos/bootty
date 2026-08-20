@@ -1,11 +1,9 @@
 pub mod chrome;
 pub mod command_palette;
 pub mod ditch;
-pub mod icons;
 pub mod keybind_help;
-pub mod keycaps;
+mod keybind_source;
 pub mod new_session_picker;
-pub mod overlay;
 pub mod rename;
 pub mod session_navigation;
 pub mod session_picker;

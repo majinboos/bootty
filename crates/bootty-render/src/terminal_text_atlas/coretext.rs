@@ -1,13 +1,26 @@
-use super::ShapedCluster;
+use super::clusters::ShapedCluster;
+#[cfg(target_os = "macos")]
+use super::clusters::{is_combining_mark, is_variation_selector};
 use crate::{terminal_font_face::FontFaceMetrics, terminal_text::ResolvedFontFace};
 
-#[cfg(target_os = "macos")]
-use super::{is_combining_mark, is_variation_selector, unpremultiply_rgba};
 #[cfg(target_os = "macos")]
 use crate::terminal_font_face::{GlyphConstraintSize, GlyphSize, terminal_glyph_constraint};
 
 #[cfg(target_os = "macos")]
 use std::ffi::{CStr, CString, c_char, c_void};
+
+#[cfg(target_os = "macos")]
+fn unpremultiply_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 0 {
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 255) / alpha).min(255) as u8;
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[repr(C)]

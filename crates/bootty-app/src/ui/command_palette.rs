@@ -5,14 +5,13 @@
 
 use std::collections::HashMap;
 
-use bootty_ui::Theme;
+use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
 use crate::{
-    action_catalog::Command,
-    commands::CommandRegistry,
-    ui::overlay::{self, FloatingWindow, ListRow, ListView, list},
+    action_catalog::Command, commands::CommandRegistry, ui::keybind_source::parse_keybind,
 };
+use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 
 #[derive(Clone, Debug)]
 pub struct CommandPaletteDialog {
@@ -38,7 +37,7 @@ impl CommandPaletteDialog {
     pub fn open(keybinds: &[String]) -> Self {
         let mut bindings = HashMap::new();
         for raw in keybinds {
-            if let Some((chord, action)) = overlay::parse_keybind(raw) {
+            if let Some((chord, action)) = parse_keybind(raw) {
                 bindings.entry(action).or_insert(chord);
             }
         }
@@ -63,7 +62,7 @@ impl CommandPaletteDialog {
 
     pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> CommandPaletteEvent {
         let matches = filtered(&self.commands, &self.filter);
-        self.selected = list::clamp_selection(self.selected, matches.len());
+        self.selected = overlay::clamp_selection(self.selected, matches.len());
         let rows: Vec<ListRow> = matches
             .iter()
             .filter_map(|matched| {

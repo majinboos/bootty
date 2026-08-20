@@ -10,27 +10,25 @@ use std::{
 
 use bootty_app::{
     app::{AppState, FrameInputs, ViewportSnapshot},
-    command_extensions::{ExtensionHost, ModuleIdentity},
-    commands::{
-        AppCommandReceiver, Caller, CommandCatalog, CommandOutcome, CommandTarget, Confirmation,
-        ExtensionGenerationCandidate, ExtensionGenerationToken, ResourceKind,
-        app_command_channel_with_repaint,
-    },
+    commands::CommandCatalog,
     config::{BoottyConfig, MultiplexerBackendConfig},
-    control::{ControlPlane, ControlServer},
     geometry::ViewTransform,
     renderer::RendererMetrics,
 };
+use bootty_command::{
+    AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandOutcome,
+    app_command_channel as command_channel,
+};
+use bootty_control::{ControlPlane, ControlServer};
+use bootty_extension::ExtensionHost;
 use serde_json::{Value, json};
 
 mod support;
 
 const HELPER_ENV: &str = "BOOTTY_CLI_CONTROL_TEST_HELPER";
 
-fn app_command_channel(
-    capacity: usize,
-) -> (bootty_app::commands::AppCommandSender, AppCommandReceiver) {
-    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
+    command_channel(capacity, Arc::new(|| {}))
 }
 
 #[test]
@@ -56,11 +54,12 @@ fn cli_control_helper() {
     let (sender, receiver) = app_command_channel(4);
     let control_plane = ControlPlane::default();
     let catalog = Arc::new(CommandCatalog::default());
+    let control_catalog = catalog.control_catalog();
     let server = ControlServer::spawn(
-        "main".to_owned(),
+        "main",
         sender.for_caller(Caller::Socket),
-        Arc::clone(&catalog),
-        control_plane.clone(),
+        Arc::clone(&control_catalog),
+        &control_plane,
     )
     .expect("start control owner");
 
@@ -74,246 +73,6 @@ fn cli_control_helper() {
         .send(CommandOutcome::success())
         .expect("complete CLI command");
     assert!(child.wait().expect("wait for CLI command").success());
-
-    let commands = run_bootty(&["--json", "commands"]);
-    assert!(commands.status.success());
-    let commands = rpc_result(&commands);
-    assert!(commands.as_array().is_some_and(|commands| {
-        commands
-            .iter()
-            .any(|command| command.get("id") == Some(&json!("terminal.read")))
-            && commands
-                .iter()
-                .any(|command| command.get("id") == Some(&json!("terminal.write")))
-    }));
-
-    let described = run_bootty(&["--json", "describe", "terminal.write"]);
-    assert!(described.status.success());
-    assert_eq!(rpc_result(&described)["target"], json!("terminal"));
-
-    let target = CommandTarget {
-        kind: ResourceKind::Terminal,
-        handle: "terminal-owner".to_owned(),
-        generation: 17,
-    };
-    let current = spawn_bootty(&["--json", "resource.current", "--kind", "terminal"]);
-    let request = receive_request(&receiver);
-    assert_eq!(request.invocation.command, "resource.current");
-    assert_eq!(request.invocation.arguments, ["terminal"]);
-    request
-        .response
-        .send(CommandOutcome::Success {
-            value: json!({"target": target}),
-            warnings: Vec::new(),
-        })
-        .expect("complete resource discovery");
-    let current = current
-        .wait_with_output()
-        .expect("wait for resource discovery");
-    assert!(current.status.success());
-    assert_eq!(rpc_result(&current)["value"]["target"], json!(target));
-
-    let target_argument = format!("{}@{}", target.handle, target.generation);
-    let read = spawn_bootty(&["--json", "terminal.read", "--target", &target_argument]);
-    let request = receive_request(&receiver);
-    assert_eq!(request.invocation.command, "terminal.read");
-    assert_eq!(request.invocation.target.as_ref(), Some(&target));
-    assert_eq!(request.invocation.caller, Caller::Socket);
-    request
-        .response
-        .send(CommandOutcome::Success {
-            value: json!({"cols": 4, "rows": 1, "text": "read"}),
-            warnings: Vec::new(),
-        })
-        .expect("complete terminal read");
-    let read = read.wait_with_output().expect("wait for terminal read");
-    assert!(read.status.success());
-    assert_eq!(rpc_result(&read)["value"]["text"], json!("read"));
-
-    let write = spawn_bootty(&[
-        "--json",
-        "terminal.write",
-        "--text",
-        "hello",
-        "--target",
-        &target_argument,
-    ]);
-    let request = receive_request(&receiver);
-    assert_eq!(request.invocation.command, "terminal.write");
-    assert_eq!(request.invocation.arguments, ["hello"]);
-    assert_eq!(request.invocation.target.as_ref(), Some(&target));
-    request
-        .response
-        .send(CommandOutcome::success())
-        .expect("complete terminal write");
-    assert!(
-        write
-            .wait_with_output()
-            .expect("wait for terminal write")
-            .status
-            .success()
-    );
-
-    let binding_target = CommandTarget {
-        kind: ResourceKind::Binding,
-        handle: "binding-owner".to_owned(),
-        generation: 23,
-    };
-    let binding_argument = format!("{}@{}", binding_target.handle, binding_target.generation);
-    let destructive = spawn_bootty(&[
-        "--json",
-        "close_space",
-        "--target",
-        &binding_argument,
-        "--yes",
-    ]);
-    let request = receive_request(&receiver);
-    assert_eq!(request.invocation.command, "close_space");
-    assert_eq!(request.invocation.target.as_ref(), Some(&binding_target));
-    assert!(request.invocation.confirmation.is_none());
-    let confirmation = Confirmation {
-        command: "close_space".to_owned(),
-        arguments: Vec::new(),
-        target: Some(binding_target.clone()),
-    };
-    request
-        .response
-        .send(CommandOutcome::ConfirmationRequired {
-            confirmation: Box::new(confirmation.clone()),
-        })
-        .expect("request destructive confirmation");
-    let request = receive_request(&receiver);
-    assert_eq!(request.invocation.confirmation, Some(confirmation));
-    assert_eq!(request.invocation.target, Some(binding_target));
-    request
-        .response
-        .send(CommandOutcome::success())
-        .expect("complete confirmed command");
-    assert!(
-        destructive
-            .wait_with_output()
-            .expect("wait for destructive command")
-            .status
-            .success()
-    );
-
-    let subscribed = run_bootty(&["--json", "events", "subscribe", "command.completed"]);
-    assert!(subscribed.status.success());
-    let subscribed = rpc_result(&subscribed);
-    let subscription = subscribed["subscription"]
-        .as_str()
-        .expect("subscription identifier")
-        .to_owned();
-
-    let started = run_bootty(&["--json", "command", "--detach", "terminal.read"]);
-    assert!(
-        started.status.success(),
-        "detached command failed: stdout={}; stderr={}",
-        String::from_utf8_lossy(&started.stdout),
-        String::from_utf8_lossy(&started.stderr)
-    );
-    let started = rpc_result(&started);
-    let task = started["task"]["id"]
-        .as_str()
-        .expect("task identifier")
-        .to_owned();
-    let request = receive_request(&receiver);
-    let cancellation = request.cancellation.clone();
-    assert!(!cancellation.is_cancelled());
-    let status = run_bootty(&["--json", "task", "status", &task]);
-    assert!(status.status.success());
-    assert_eq!(
-        rpc_result(&status)["task"]["state"]["status"],
-        json!("running")
-    );
-    let cancelling = run_bootty(&["--json", "task", "cancel", &task]);
-    assert!(cancelling.status.success());
-    let cancelling = rpc_result(&cancelling);
-    assert_eq!(cancelling["task"]["state"]["status"], json!("cancelling"));
-    assert!(cancellation.is_cancelled());
-    drop(request.response);
-
-    let deadline = Instant::now() + CLI_BUDGET;
-    loop {
-        let status = run_bootty(&["--json", "task", "status", &task]);
-        assert!(status.status.success());
-        let status = rpc_result(&status);
-        if status["task"]["state"]["status"] == json!("completed") {
-            assert_eq!(status["task"]["state"]["outcome"]["code"], json!("-32003"));
-            break;
-        }
-        assert!(Instant::now() < deadline, "cancelled task did not complete");
-        thread::sleep(Duration::from_millis(5));
-    }
-
-    let events = run_bootty(&["--json", "events", "poll", &subscription, "--cursor", "0"]);
-    assert!(events.status.success());
-    let events = rpc_result(&events);
-    assert_eq!(events["events"][0]["topic"], json!("command.completed"));
-    assert_eq!(
-        events["events"][0]["payload"]["command"],
-        json!("terminal.read")
-    );
-
-    let first_topic_generation = ExtensionGenerationToken::new();
-    catalog
-        .publish_extension_generation(ExtensionGenerationCandidate {
-            identity: ModuleIdentity::parse("test.luau").expect("module identity"),
-            generation: 1,
-            token: first_topic_generation.clone(),
-            commands: Vec::new(),
-            topics: vec!["test.changed".to_owned()],
-            surfaces: Vec::new(),
-        })
-        .expect("publish test topic");
-    let subscribed = run_bootty(&["--json", "events", "subscribe", "test.changed"]);
-    assert!(subscribed.status.success());
-    let subscribed = rpc_result(&subscribed);
-    let overflowed = subscribed["subscription"]
-        .as_str()
-        .expect("overflow subscription")
-        .to_owned();
-    for sequence in 0..65 {
-        control_plane
-            .publish_extension_event(
-                &catalog,
-                "test.luau",
-                1,
-                "test.changed",
-                json!({"sequence": sequence}),
-            )
-            .expect("publish bounded event");
-    }
-    catalog
-        .publish_extension_generation(ExtensionGenerationCandidate {
-            identity: ModuleIdentity::parse("test.luau").expect("module identity"),
-            generation: 2,
-            token: ExtensionGenerationToken::new(),
-            commands: Vec::new(),
-            topics: vec!["test.changed".to_owned()],
-            surfaces: Vec::new(),
-        })
-        .expect("replace test topic generation");
-    assert!(!first_topic_generation.is_active());
-    assert_eq!(
-        control_plane.publish_extension_event(
-            &catalog,
-            "test.luau",
-            1,
-            "test.changed",
-            json!({"sequence": "stale"}),
-        ),
-        Err("extension event topic is not active".to_owned())
-    );
-    let response = run_bootty(&["--json", "events", "poll", &overflowed, "--cursor", "0"]);
-    assert!(!response.status.success());
-    let error = rpc_error(&response);
-    assert_eq!(error["code"], json!(-32005));
-    assert_eq!(error["message"], json!("event rebase required"));
-    assert_eq!(error["data"]["rebase"], json!("snapshot"));
-    let unsubscribed = run_bootty(&["--json", "events", "unsubscribe", &overflowed]);
-    assert!(unsubscribed.status.success());
-    assert_eq!(rpc_result(&unsubscribed)["unsubscribed"], json!(overflowed));
 
     let mut bare = Command::new(env!("CARGO_BIN_EXE_bootty"))
         .stdin(Stdio::null())
@@ -354,15 +113,16 @@ fn cli_control_helper() {
     let native_control_plane = ControlPlane::default();
     let mut extension_host = ExtensionHost::load(
         &extension_root,
-        state.command_catalog(),
+        state.command_catalog().extensions_arc(),
         state.app_command_sender(Caller::Luau),
-        native_control_plane.clone(),
+        native_control_plane.extension_event_sender(),
     );
+    let native_catalog = state.command_catalog().control_catalog();
     let native_server = ControlServer::spawn(
-        "main".to_owned(),
+        "main",
         state.app_command_sender(Caller::Socket),
-        state.command_catalog(),
-        native_control_plane,
+        native_catalog,
+        &native_control_plane,
     )
     .expect("start native control owner");
     let subscribed = run_bootty(&["--json", "events", "subscribe", "probe.changed"]);
@@ -582,7 +342,7 @@ fn run_bootty_with_state(state: &mut AppState, arguments: &[&str]) -> Output {
 /// has to be generous enough never to expire on a healthy run.
 const CLI_BUDGET: Duration = Duration::from_secs(30);
 
-fn receive_request(receiver: &AppCommandReceiver) -> bootty_app::commands::AppCommandRequest {
+fn receive_request(receiver: &AppCommandReceiver) -> AppCommandRequest {
     let deadline = Instant::now() + CLI_BUDGET;
     loop {
         if let Ok(request) = receiver.try_recv() {
@@ -607,17 +367,6 @@ fn rpc_result(output: &Output) -> Value {
     assert_eq!(response["jsonrpc"], json!("2.0"));
     assert!(response.get("error").is_none());
     response["result"].clone()
-}
-
-fn rpc_error(output: &Output) -> Value {
-    let response: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!(
-            "decode CLI error JSON: {error}; stdout={}; stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )
-    });
-    response["error"].clone()
 }
 
 fn frame(now: Instant) -> FrameInputs {

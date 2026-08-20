@@ -32,9 +32,11 @@ This file describes the current production structure.
 | PTY and child lifecycle | `TerminalSession` and `TerminalWorker` | Runtime health reports asynchronous core failure. |
 | VT state | `TerminalEngine` | Consumers read published frames. |
 | Accepted product configuration | `AppConfigRuntime` | Invalid candidates do not replace the accepted policy. |
-| Command meaning and confirmation | `CommandCatalog` and `AppState` | All callers use one typed invocation path. |
-| Local extension generations | `ExtensionHost` and `CommandCatalog` | A complete candidate replaces one complete generation. |
-| Agent protocol state | The Pi and Codex extension modules | Rust provides bounded transport and no inferred agent state. |
+| Command values and transport | `bootty-command` | All callers use one typed invocation path. |
+| Command resolution, execution, and policy | `bootty-app` | The app owns target resolution and destructive confirmation. |
+| Local control transport and instance ownership | `bootty-control` | The singleton lease publishes one owner-local endpoint. |
+| Local extension generations | `bootty-extension` | A complete candidate replaces one complete generation. |
+| Agent integration state and assets | `bootty-extension` | Rust provides bounded transport and no inferred agent state. |
 
 ## Process composition
 
@@ -141,14 +143,19 @@ It does not roll back the accepted config.
 
 ## Commands and control
 
-`CommandCatalog` resolves core and extension commands.
-`AppState` applies target resolution and destructive confirmation.
+`bootty-command` owns command descriptors, invocations, outcomes, cancellation,
+and the bounded app command mailbox.
+
+`bootty-app` resolves core and extension commands.
+It owns target resolution, execution, destructive confirmation, and command
+policy.
 
 The command palette, keybindings, CLI, local socket, and Luau host submit the
 same `CommandInvocation`.
 
-The control layer transports requests and outcomes.
-It does not own command policy or workspace state.
+`bootty-control` owns the local transport, read-only `ControlCatalog` metadata,
+detached task and subscription state, and the singleton lease.
+The app keeps command resolution, execution, and policy.
 
 Detached tasks and event subscriptions use opaque owner-local capability IDs.
 
@@ -156,6 +163,9 @@ Detached tasks and event subscriptions use opaque owner-local capability IDs.
 
 A local extension module is one canonical relative `.lua` or `.luau` path
 under `<config>/extensions`.
+
+`bootty-extension` owns extension lifecycle, generation publication, bundled and
+user assets, facts, storage, managed processes, and agent integrations.
 
 One generation contains its token, worker, commands, topics, surfaces, storage,
 actions, managed processes, and cancellation state.
@@ -175,10 +185,16 @@ contents, or transcripts.
 ## Crates
 
 - `bootty` owns executable startup, CLI dispatch, and native packaging.
-- `bootty-app` owns the desktop host, workspace UI, commands, control,
-  extensions, and agent integration assets.
+- `bootty-app` owns the desktop host, workspace UI, command resolution,
+  execution, policy, and presentation adapters.
+- `bootty-command` owns command descriptors, invocations, outcomes,
+  cancellation, and the bounded app command mailbox.
+- `bootty-control` owns the local transport, read-only control metadata,
+  detached task and subscription state, and the singleton lease.
 - `bootty-config` owns product configuration.
 - `bootty-daemon` owns the installed headless catalog and remote commands.
+- `bootty-extension` owns extension lifecycle, assets, facts, storage,
+  managed processes, and agent integrations.
 - `bootty-font` owns the shared OpenType feature value and grammar.
 - `bootty-identity` owns the closed application identity.
 - `bootty-mux-model` owns dependency-neutral mux values.
@@ -192,6 +208,7 @@ contents, or transcripts.
 - `bootty-terminal` owns terminal semantics and frames.
 - `bootty-ui` owns shared egui theme values and widgets.
 - `bootty-winit` owns native host and input adapters.
+- `bootty-write` owns atomic write targets, locking, and commit outcomes.
 - `bootty-site` owns the documentation site.
 
 ## Application modules
@@ -206,9 +223,7 @@ contents, or transcripts.
 - `workspace.rs` owns workspace values and the `WorkspaceRepository` interface.
   Its private `workspace/` modules own schema migration, snapshot hydration,
   and legacy import.
-- `command_extensions.rs` and its child modules own extension generations.
-- `commands.rs` owns typed command descriptions and submission.
-- `control.rs` owns local transport and instance publication.
+- `commands.rs` owns app command resolution, execution mapping, and policy.
 - `ui/settings/surface.rs` owns settings navigation and editor state.
   Its private controls module owns the shared settings widget grammar.
 

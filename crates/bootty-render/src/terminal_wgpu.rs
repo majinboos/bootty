@@ -19,8 +19,8 @@ mod vertices;
 use font_lookup::{ghostty_cell_metrics_from_font, terminal_font};
 use image_upload::{image_fits_device_limits, rgba_image_texture_pixels};
 use pipelines::{
-    background_pipeline, image_bind_group_layout, image_pipeline, text_bind_group_layout,
-    text_pipeline, text_texture_format,
+    background_pipeline, image_pipeline, text_pipeline, text_texture_format,
+    texture_bind_group_layout,
 };
 use std::collections::HashMap;
 use std::sync::{
@@ -323,8 +323,7 @@ pub struct TerminalWgpuRenderer {
     pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
-    text_bind_group_layout: wgpu::BindGroupLayout,
-    image_bind_group_layout: wgpu::BindGroupLayout,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
     text_sampler: wgpu::Sampler,
     text_sampler_linear: wgpu::Sampler,
     image_sampler: wgpu::Sampler,
@@ -346,12 +345,11 @@ pub struct TerminalWgpuRenderer {
 
 impl TerminalWgpuRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
-        let text_bind_group_layout = text_bind_group_layout(device);
-        let image_bind_group_layout = image_bind_group_layout(device);
+        let texture_bind_group_layout = texture_bind_group_layout(device);
         Self {
             pipeline: background_pipeline(device, target_format),
-            text_pipeline: text_pipeline(device, target_format, &text_bind_group_layout),
-            image_pipeline: image_pipeline(device, target_format, &image_bind_group_layout),
+            text_pipeline: text_pipeline(device, target_format, &texture_bind_group_layout),
+            image_pipeline: image_pipeline(device, target_format, &texture_bind_group_layout),
             text_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("bootty_terminal_text_sampler"),
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -376,8 +374,7 @@ impl TerminalWgpuRenderer {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }),
-            text_bind_group_layout,
-            image_bind_group_layout,
+            texture_bind_group_layout,
             text_texture: None,
             local_text_builder: None,
             layers: Vec::new(),
@@ -535,7 +532,7 @@ impl TerminalWgpuRenderer {
                                 pixels_per_point,
                             },
                             image,
-                            &self.image_bind_group_layout,
+                            &self.texture_bind_group_layout,
                             &self.image_sampler,
                             previous,
                         );
@@ -752,7 +749,7 @@ impl TerminalWgpuRenderer {
         if needs_texture {
             self.text_texture = Some(TerminalTextAtlasTexture::new(
                 device,
-                &self.text_bind_group_layout,
+                &self.texture_bind_group_layout,
                 (&self.text_sampler, &self.text_sampler_linear),
                 width,
                 height,

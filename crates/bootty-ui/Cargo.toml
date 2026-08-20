@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 eframe.workspace = true
+iconflow.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]

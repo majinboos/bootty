@@ -1,13 +1,17 @@
 use std::path::{Path, PathBuf};
 
+use bootty_extension::{
+    ModuleColor, ModuleIdentity, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot,
+    editable_module_source, error_item, import_legacy_extension_module, legacy_extension_modules,
+    module_identities, preview_module_surfaces, reset_module_source, save_module_source,
+};
+use bootty_ui::icons;
 use eframe::egui::{self, RichText};
 
 use super::SettingsWindow;
-use crate::command_extensions::{
-    ModuleIdentity, SurfacePlacement, editable_module_source, import_legacy_extension_module,
-    legacy_extension_modules, module_identities, preview_module_surfaces, reset_module_source,
-    save_module_source,
-};
+fn module_color(value: ModuleColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(value.r, value.g, value.b, value.a)
+}
 
 #[derive(Default)]
 pub(super) struct EditorState {
@@ -23,7 +27,7 @@ pub(super) struct EditorState {
     error: Option<String>,
     preview_source: String,
     preview_theme: Vec<(String, String)>,
-    preview: Vec<crate::command_extensions::SurfaceSnapshot>,
+    preview: Vec<SurfaceSnapshot>,
 }
 
 pub(super) fn sidebar_ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
@@ -286,7 +290,7 @@ pub(super) fn module_selector_row(
     if let Some(handle) = handle {
         handle.paint_in(ui, palette, gutter);
     } else {
-        crate::ui::icons::paint_icon_slug(
+        icons::paint_icon_slug(
             ui.painter(),
             "file-code",
             gutter.center(),
@@ -304,7 +308,7 @@ pub(super) fn module_selector_row(
 fn module_preview(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
-    surfaces: &[crate::command_extensions::SurfaceSnapshot],
+    surfaces: &[SurfaceSnapshot],
 ) {
     ui.label(
         RichText::new("PREVIEW · EXAMPLE DATA")
@@ -324,9 +328,15 @@ fn module_preview(
         for item in &surface.items {
             ui.horizontal_wrapped(|ui| {
                 if let Some(icon) = &item.icon {
-                    ui.label(RichText::new(icon).color(item.fg.unwrap_or(palette.text)));
+                    ui.label(
+                        RichText::new(icon)
+                            .color(item.fg.map(module_color).unwrap_or(palette.text)),
+                    );
                 }
-                ui.label(RichText::new(&item.text).color(item.fg.unwrap_or(palette.text)));
+                ui.label(
+                    RichText::new(&item.text)
+                        .color(item.fg.map(module_color).unwrap_or(palette.text)),
+                );
             });
         }
     }
@@ -438,14 +448,14 @@ fn module_template(identity: &ModuleIdentity) -> String {
     )
 }
 
-fn error_surface(error: String) -> crate::command_extensions::SurfaceSnapshot {
-    crate::command_extensions::SurfaceSnapshot {
-        declaration: crate::command_extensions::SurfaceDeclaration {
+fn error_surface(error: String) -> SurfaceSnapshot {
+    SurfaceSnapshot {
+        declaration: SurfaceDeclaration {
             id: "preview-error".to_owned(),
             placement: SurfacePlacement::Floating,
             order: 0,
             interval: std::time::Duration::from_secs(1),
         },
-        items: vec![crate::extension_ui::error_item(&error)],
+        items: vec![error_item(&error)],
     }
 }

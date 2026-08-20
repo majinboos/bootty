@@ -6,9 +6,12 @@ use bootty_app::{
     },
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface},
     paint_plan::PaintPlanner,
-    terminal::{KeyInput, KeyMods, TerminalEngine, TerminalKey},
     terminal_render::TerminalRenderFrame,
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
+};
+use bootty_terminal::{
+    terminal_engine::TerminalEngine,
+    terminal_input_model::{KeyInput, KeyMods, TerminalKey},
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use winit::keyboard::{KeyCode, ModifiersState};

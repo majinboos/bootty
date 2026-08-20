@@ -33,8 +33,9 @@ mod keybind_presets;
 mod theme_catalog;
 mod writeback;
 
+pub use keybind_presets::split_keybind_entry;
 pub use theme_catalog::{DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, builtin_theme_names};
-pub use writeback::{ConfigWriteOutcome, update_config_document};
+pub use writeback::{ConfigWriteOutcome, update_config_document, write_font_size_preference};
 
 use keybind_presets::{
     owned_keybinds, preset_global_keybinds, preset_layout_keybinds, preset_tmux_backend_keybinds,
@@ -1321,15 +1322,6 @@ pub fn load_or_create_config_document(path: impl AsRef<Path>) -> ConfigResult<Co
         document.unwrap_or_else(|| ConfigDocument {
             document: DocumentMut::new(),
         })
-    })
-}
-
-pub fn write_font_size_preference(
-    path: impl AsRef<Path>,
-    size: f32,
-) -> ConfigResult<ConfigWriteOutcome> {
-    update_config_document(path, |document| {
-        document.set_item(&["font", "size"], toml_edit::value(f64::from(size)))
     })
 }
 

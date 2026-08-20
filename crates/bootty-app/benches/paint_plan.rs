@@ -3,7 +3,6 @@ use std::{collections::HashMap, hint::black_box};
 mod paint_plan_fixtures;
 
 use bootty_app::{
-    command_extensions::{ModuleItem, PublishedSurfaceItem},
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::ViewTransform,
     input_binding::BindingAction,
@@ -14,22 +13,26 @@ use bootty_app::{
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
     paint_plan::PaintPlanner,
-    renderer_frame::{RendererFrame, RendererLinkHighlight, RendererLinkMods, RendererLinkPattern},
-    terminal::{
-        KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
-        MouseInput, TerminalKey,
-    },
+    renderer_frame::RendererFrame,
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
     ui::{
         chrome::{self, SidebarModel},
-        icons,
         session_navigation::BindingSessionGroup,
         session_picker::SessionPickerDialog,
         sidebar::build_binding_sidebar_items,
     },
 };
-use bootty_terminal::terminal_frame::FrameSelection;
+use bootty_extension::{ModuleItem, PublishedSurfaceItem};
+use bootty_terminal::{
+    terminal_engine::TerminalEngine,
+    terminal_frame::FrameSelection,
+    terminal_input_model::{
+        KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
+        MouseInput, TerminalKey,
+    },
+};
+use bootty_ui::icons;
 use bootty_winit::input::{
     InputSnapshot, WheelScrollState, terminal_input_commands_with_wheel_state,
 };
@@ -332,28 +335,6 @@ fn bench_renderer_frame_scaling(c: &mut Criterion) {
             })
         });
     }
-
-    let renderer = RendererFrame::from_terminal(&scenario.frame, scenario.surface, &text_config);
-    for patterns in [1, 32, 256] {
-        let links = (0..patterns)
-            .map(|index| RendererLinkPattern {
-                pattern: format!("missing-link-pattern-{index}"),
-                highlight: RendererLinkHighlight::Always,
-            })
-            .collect::<Vec<_>>();
-        c.bench_function(
-            &format!("renderer_link_cell_map_patterns_{patterns}"),
-            |b| {
-                b.iter(|| {
-                    black_box(renderer.link_cell_map(
-                        black_box(&links),
-                        None,
-                        RendererLinkMods::default(),
-                    ))
-                })
-            },
-        );
-    }
 }
 
 /// NOTE: bootty currently reports `Dirty::Full` with every row dirty for any
@@ -421,7 +402,7 @@ fn bench_extract_frame_one_row_mutate(c: &mut Criterion) {
 
 // Rewrite the entire screen, forcing a Dirty::Full extraction (which clears the row
 // cache). Used to set up the cold-cache state the next localized edit must extract from.
-fn full_repaint(engine: &mut bootty_app::terminal::TerminalEngine, tick: u32) {
+fn full_repaint(engine: &mut TerminalEngine, tick: u32) {
     let rows = engine.grid_size().1;
     engine.write_vt(b"\x1b[2J");
     for row in 1..=rows {

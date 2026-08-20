@@ -4,8 +4,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::{
-    commands::{Caller, CommandInvocation},
-    config::InputConfig,
+    config::{InputConfig, split_keybind_entry},
     direct_input::ModifierSideState,
     input::terminal_key,
     input_binding::{
@@ -13,8 +12,9 @@ use crate::{
         CopyToClipboard, NavigateSearch, PaneDirection, parse_action, parse_binding_elements,
     },
     mux::command::MuxDirection,
-    terminal::{KeyInput, KeyMods, TerminalKey},
 };
+use bootty_command::{Caller, CommandInvocation};
+use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, TerminalKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppAction {
@@ -278,7 +278,7 @@ impl SidebarKeyBindings {
     pub fn from_keybinds(keybinds: &[String]) -> Result<Self> {
         let mut bindings = Vec::new();
         for entry in keybinds {
-            let (trigger, action) = split_sidebar_binding(entry)
+            let (trigger, action) = split_keybind_entry(entry)
                 .ok_or_else(|| anyhow::anyhow!("invalid sidebar keybind {entry:?}"))?;
             let action = sidebar_action(action).map_err(|error| {
                 anyhow::anyhow!("unsupported sidebar keybind {entry:?}: {error}")
@@ -306,19 +306,6 @@ impl SidebarKeyBindings {
                 .then(|| CommandInvocation::from_action(binding.command, Caller::Keybinding))
         })
     }
-}
-
-fn split_sidebar_binding(input: &str) -> Option<(&str, &str)> {
-    let mut offset = 0;
-    while let Some(index) = input[offset..].find('=') {
-        let index = offset + index;
-        if index + 1 < input.len() && matches!(input.as_bytes()[index + 1], b'+' | b'=') {
-            offset = index + 1;
-            continue;
-        }
-        return Some((&input[..index], &input[index + 1..]));
-    }
-    None
 }
 
 fn sidebar_action(input: &str) -> Result<SidebarAction> {

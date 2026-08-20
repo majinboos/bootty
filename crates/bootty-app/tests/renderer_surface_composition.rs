@@ -4,9 +4,11 @@ use bootty_app::{
     renderer_frame::{
         MinimumContrastPolicy, RendererFrame, RendererRepaintDecision, RendererSelectionIntent,
     },
-    terminal::{CellStyle, CursorSnapshot, FrameColors, FrameStats, RenderCell, RenderFrame},
     terminal_render::{FillRole, TerminalRenderCommand},
     terminal_text::TerminalTextConfig,
+};
+use bootty_terminal::terminal_frame::{
+    CellStyle, CursorSnapshot, FrameColors, FrameStats, RenderCell, RenderFrame,
 };
 use bootty_winit::bare_host::renderer_parity_gallery_frame;
 use libghostty_vt::{
