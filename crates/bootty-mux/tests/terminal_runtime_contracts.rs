@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bootty_app::{
-    geometry::{CellMetrics, SurfacePoint, SurfaceRect, TerminalGeometry, TerminalSurface},
-    mux::terminal::TerminalRuntime,
-    renderer::TerminalFrameSource,
+use bootty_mux::terminal::TerminalRuntime;
+use bootty_runtime::{frame_source::TerminalFrameSource, terminal_session::DrainStats};
+use bootty_surface::geometry::{
+    CellMetrics, SurfacePoint, SurfaceRect, TerminalGeometry, TerminalSurface,
+};
+use bootty_terminal::{
     terminal_engine::{
         TerminalCopyModeAction, TerminalCopyModeOutcome, TerminalCursorConfig,
         TerminalFeatureConfig, TerminalLiveConfig, TerminalSearchDirection, TerminalSelectionEvent,
@@ -12,7 +14,6 @@ use bootty_app::{
     },
     terminal_frame::RenderFrame,
     terminal_input_model::{KeyInput, MouseInput},
-    terminal_session::DrainStats,
 };
 
 #[derive(Debug, PartialEq)]
@@ -219,4 +220,29 @@ fn pane_interactions_reach_the_mux_runtime_boundary() -> Result<()> {
         ]
     );
     Ok(())
+}
+
+#[test]
+fn scoped_pane_ids_round_trip_without_cross_binding_collisions() {
+    use bootty_mux::{
+        controller::{BindingId, MuxScope, SpaceId},
+        terminal::{decode_scoped_pane_id, encode_scoped_pane_id},
+    };
+
+    let first = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+    let second = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(3));
+
+    let first_id = encode_scoped_pane_id(first, "%7");
+    let second_id = encode_scoped_pane_id(second, "%7");
+
+    assert_ne!(first_id, second_id);
+    assert_eq!(
+        decode_scoped_pane_id(&first_id),
+        Some((first, "%7".to_owned()))
+    );
+    assert_eq!(
+        decode_scoped_pane_id(&second_id),
+        Some((second, "%7".to_owned()))
+    );
+    assert_eq!(decode_scoped_pane_id("%7"), None);
 }

@@ -33,7 +33,7 @@ pub fn home_dir() -> Option<PathBuf> {
     home_dir_from(|name| env::var_os(name))
 }
 
-fn home_dir_from(mut var: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
+pub fn home_dir_from(mut var: impl FnMut(&str) -> Option<OsString>) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         if let Some(profile) = non_empty_path(var("USERPROFILE")) {
@@ -289,95 +289,3 @@ fn hide_command_window(command: &mut Command) {
 
 #[cfg(not(windows))]
 fn hide_command_window(_command: &mut Command) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(not(windows))]
-    #[test]
-    fn home_directory_ignores_an_empty_home() {
-        assert_eq!(
-            home_dir_from(|name| (name == "HOME").then(OsString::new)),
-            None
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn home_directory_prefers_a_non_empty_user_profile() {
-        let home = home_dir_from(|name| match name {
-            "USERPROFILE" => Some(OsString::from(r"C:\Users\dev")),
-            "HOMEDRIVE" => Some(OsString::from("D:")),
-            "HOMEPATH" => Some(OsString::from(r"\fallback")),
-            _ => None,
-        });
-
-        assert_eq!(home, Some(PathBuf::from(r"C:\Users\dev")));
-    }
-
-    #[test]
-    fn discovers_projects_with_the_local_picker_heuristics() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let home = directory.path();
-        fs::create_dir_all(home.join("src/project")).expect("project");
-        fs::create_dir_all(home.join("src/.hidden")).expect("hidden");
-        fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
-
-        let entries = discover_project_picker_entries(Some(home));
-
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry.path.ends_with("src/project"))
-        );
-        assert!(entries.iter().any(|entry| entry.path.ends_with("dotfiles")));
-        assert!(!entries.iter().any(|entry| entry.path.ends_with(".hidden")));
-    }
-
-    #[test]
-    fn favorite_paths_are_shared_by_local_and_remote_discovery() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let home = directory.path();
-        let project = home.join("projects/bootty");
-        fs::create_dir_all(&project).expect("project");
-        let project = project.to_string_lossy().into_owned();
-
-        assert!(toggle_favorite_project_path(Some(home), &project).expect("favorite"));
-        assert!(
-            discover_project_picker_entries(Some(home))
-                .iter()
-                .any(|entry| entry.path == project && entry.favorite)
-        );
-        assert!(!toggle_favorite_project_path(Some(home), &project).expect("unfavorite"));
-    }
-
-    #[test]
-    fn marks_canonical_worktree_aliases_as_occupied() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let project = directory.path().join("project");
-        fs::create_dir(&project).expect("project");
-        let path = project.to_string_lossy().into_owned();
-        let alias = project
-            .join("..")
-            .join("project")
-            .to_string_lossy()
-            .into_owned();
-        let mut entries = vec![main_worktree_entry(&path)];
-
-        mark_occupied_worktrees(&mut entries, &[alias]);
-
-        assert!(entries[0].occupied);
-    }
-
-    #[test]
-    fn non_git_directory_does_not_offer_new_worktree() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().to_string_lossy().into_owned();
-
-        assert_eq!(
-            discover_worktree_picker_entries(&path),
-            vec![main_worktree_entry(&path)]
-        );
-    }
-}

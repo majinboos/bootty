@@ -80,18 +80,3 @@ pub fn run_remote_command(payload: &str) -> Result<i32> {
         .with_context(|| format!("run remote command {}", command.program))?;
     Ok(status.code().unwrap_or(1))
 }
-
-#[cfg(all(feature = "app", test))]
-pub(crate) fn decode_proxy_command_line(line: &str) -> Result<RemoteCommand> {
-    let mut tokens = line.split_whitespace();
-    if tokens.next() != Some(REMOTE_EXEC_PROGRAM) || tokens.next() != Some(REMOTE_EXEC_SUBCOMMAND) {
-        bail!("not a Bootty remote proxy command")
-    }
-    let payload = tokens
-        .next()
-        .context("remote proxy command has no payload")?;
-    if tokens.next().is_some() {
-        bail!("remote proxy command has extra tokens")
-    }
-    decode_remote_command(payload)
-}

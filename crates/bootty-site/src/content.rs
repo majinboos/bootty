@@ -727,16 +727,6 @@ pub(crate) fn section_leaf_tab_label(
     subtab.subtabs[leaf_tab.min(subtab.subtabs.len().saturating_sub(1))].label
 }
 
-#[cfg(test)]
-pub(crate) fn section_text(
-    section: Section,
-    tab: usize,
-    subtab: usize,
-    leaf_tab: usize,
-) -> Text<'static> {
-    section_text_for_width(section, tab, subtab, leaf_tab, 120)
-}
-
 pub(crate) fn section_text_for_width(
     section: Section,
     tab: usize,
@@ -796,19 +786,6 @@ pub(crate) fn section_nested_texts_for_width(
         render_markdown(subtab.markdown, section.accent, usize::from(code_width)),
         render_markdown(leaf_markdown, section.accent, usize::from(code_width)),
     ))
-}
-
-#[cfg(test)]
-pub(crate) fn getting_started_text() -> Text<'static> {
-    section_text(sections()[1], 0, 0, 0)
-}
-
-#[cfg(test)]
-pub(crate) fn line_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
 }
 
 fn render_markdown(markdown: &'static str, accent: Color, code_width: usize) -> Text<'static> {

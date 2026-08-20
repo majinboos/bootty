@@ -13,13 +13,14 @@ use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    RepaintHandle,
     backend::MuxBackend,
     capability::{BindingOperation, BindingOperationOutcome},
     command::MuxCommand,
     config::{BackendFactory, build_backend_with, selected_backend},
     snapshot::{MuxSession, MuxSnapshot, selection_after_refresh, session_matches},
 };
+
+pub type RepaintHandle = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// How often a focused window polls the backend for session structure. Nothing pushes these
 /// changes to us: a session created from a shell, or a pane whose foreground command changed, only
@@ -626,10 +627,6 @@ impl BindingMuxController {
             }
         }
         self.observed_resources = current;
-    }
-
-    pub fn synchronize_resource_generations(&mut self) {
-        self.record_resource_snapshot();
     }
 
     pub fn create_project_session(

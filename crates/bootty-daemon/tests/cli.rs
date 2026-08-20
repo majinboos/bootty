@@ -129,6 +129,60 @@ fn ping_reports_the_compatible_protocol_and_release() {
 }
 
 #[test]
+fn cli_rejects_malformed_options_and_application_identities() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("config");
+    let state = directory.path().join("state");
+    let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
+
+    for (arguments, expected) in [
+        (
+            vec!["remote-space", "create", "--backend", "tmux"],
+            "Error: missing option --name\n",
+        ),
+        (
+            vec![
+                "remote-space",
+                "create",
+                "--name",
+                "Lab",
+                "--name",
+                "Prod",
+                "--backend",
+                "tmux",
+            ],
+            "Error: duplicate option --name\n",
+        ),
+        (
+            vec!["remote-space", "create", "--name"],
+            "Error: options require values\n",
+        ),
+    ] {
+        let output = run_daemon(daemon, &config, &state, None, &arguments);
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8(output.stderr).expect("UTF-8"), expected);
+    }
+
+    for (arguments, expected) in [
+        (
+            vec!["--application-identity"],
+            "Error: --application-identity requires a value\n",
+        ),
+        (
+            vec!["--application-identity", "other", "remote-ping"],
+            "Error: unknown application identity \"other\"\n",
+        ),
+    ] {
+        let output = Command::new(daemon)
+            .args(arguments)
+            .output()
+            .expect("run daemon");
+        assert!(!output.status.success());
+        assert_eq!(String::from_utf8(output.stderr).expect("UTF-8"), expected);
+    }
+}
+
+#[test]
 fn daemon_owns_a_persistent_remote_space_catalog() {
     let directory = tempfile::tempdir().expect("tempdir");
     let state = directory.path().join("daemon.sqlite");
