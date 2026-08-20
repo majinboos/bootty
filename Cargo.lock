@@ -682,6 +682,8 @@ dependencies = [
  "anyhow",
  "arboard",
  "bootty-config",
+ "bootty-font",
+ "bootty-identity",
  "bootty-mux",
  "bootty-render",
  "bootty-runtime",
@@ -696,6 +698,7 @@ dependencies = [
  "egui_code_editor",
  "embed-resource",
  "fontdb",
+ "getrandom 0.3.4",
  "iconflow",
  "indoc",
  "keepawake",
@@ -723,6 +726,7 @@ dependencies = [
  "tokio",
  "ttf-parser",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
@@ -730,17 +734,17 @@ dependencies = [
 name = "bootty-config"
 version = "0.0.0"
 dependencies = [
- "bootty-render",
- "bootty-runtime",
- "bootty-terminal",
+ "bootty-font",
+ "bootty-identity",
+ "bootty-mux-model",
  "bootty-winit",
  "indoc",
- "libghostty-vt",
  "proptest",
  "rstest",
  "serde",
  "tempfile",
  "toml_edit 0.25.13+spec-1.1.0",
+ "winsafe",
 ]
 
 [[package]]
@@ -748,12 +752,27 @@ name = "bootty-daemon"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "bootty-config",
+ "bootty-identity",
  "bootty-mux",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
- "toml_edit 0.25.13+spec-1.1.0",
+]
+
+[[package]]
+name = "bootty-font"
+version = "0.0.0"
+dependencies = [
+ "bootty-workspace-hack",
+]
+
+[[package]]
+name = "bootty-identity"
+version = "0.0.0"
+dependencies = [
+ "bootty-workspace-hack",
 ]
 
 [[package]]
@@ -762,11 +781,13 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
- "bootty-config",
+ "bootty-identity",
+ "bootty-mux-model",
  "bootty-runtime",
  "bootty-surface",
  "bootty-terminal",
  "derive_more",
+ "getrandom 0.3.4",
  "libghostty-vt",
  "rmux-client",
  "rmux-ipc",
@@ -779,6 +800,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "ureq",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bootty-mux-model"
+version = "0.4.0"
+dependencies = [
+ "bootty-workspace-hack",
+ "serde",
 ]
 
 [[package]]
@@ -787,6 +817,7 @@ version = "0.0.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bootty-font",
  "bootty-surface",
  "bootty-terminal",
  "eframe",
@@ -834,7 +865,6 @@ dependencies = [
 name = "bootty-surface"
 version = "0.0.0"
 dependencies = [
- "eframe",
  "proptest",
 ]
 
@@ -861,12 +891,17 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bootty-app",
+ "bootty-config",
+ "bootty-font",
  "bootty-mux",
+ "bootty-mux-model",
  "bootty-workspace-hack",
+ "clap",
  "egui",
  "rusqlite",
  "serde_json",
  "tempfile",
+ "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -920,8 +955,10 @@ dependencies = [
  "fastrand",
  "flate2",
  "font-types",
+ "futures-core",
  "futures-util",
  "getrandom 0.3.4",
+ "half",
  "hashbrown 0.16.1",
  "hashbrown 0.17.1",
  "http",
@@ -931,6 +968,7 @@ dependencies = [
  "libc",
  "linux-raw-sys 0.12.1",
  "lock_api",
+ "log",
  "memchr",
  "miniz_oxide",
  "mio",
@@ -954,6 +992,7 @@ dependencies = [
  "serde_json",
  "serde_spanned 1.1.1",
  "simd-adler32",
+ "slab",
  "smallvec",
  "strum",
  "syn 2.0.119",
@@ -2146,6 +2185,17 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+
+[[package]]
+name = "erased-serde"
+version = "0.4.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2add8a07dd6a8d93ff627029c51de145e12686fbc36ecb298ac22e74cf02dec"
+dependencies = [
+ "serde",
+ "serde_core",
+ "typeid",
+]
 
 [[package]]
 name = "errno"
@@ -3807,11 +3857,14 @@ checksum = "ad72ffa037cf5970c9860674f32f703fda25d86cf217475fe7a79c5f9961bcaa"
 dependencies = [
  "bstr",
  "either",
+ "erased-serde",
  "libc",
  "mlua-sys",
  "num-traits",
  "parking_lot",
  "rustc-hash 2.1.3",
+ "serde",
+ "serde-value",
 ]
 
 [[package]]
@@ -4404,6 +4457,15 @@ checksum = "5df339f526ea9a60e371768d50efc2f2508c7203290731565d1f7a6f71d21747"
 dependencies = [
  "libc",
  "libredox",
+]
+
+[[package]]
+name = "ordered-float"
+version = "2.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68f19d67e5a2795c94e73e0bb1cc1a7edeb2e28efd39e2e1c9b7a40c1108b11c"
+dependencies = [
+ "num-traits",
 ]
 
 [[package]]
@@ -5792,6 +5854,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-value"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3a1a3341211875ef120e117ea7fd5228530ae7e7036a779fdc9117be6b3282c"
+dependencies = [
+ "ordered-float 2.10.1",
+ "serde",
+]
+
+[[package]]
 name = "serde-wasm-bindgen"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6744,6 +6816,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
+name = "typeid"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7409,7 +7487,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "once_cell",
- "ordered-float",
+ "ordered-float 5.3.0",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
@@ -7847,6 +7925,12 @@ dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "winsafe"
+version = "0.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d3922ac07e168376bc6799e7896fc737ddb9538be7533ca44bc3463091db1ad"
 
 [[package]]
 name = "wit-bindgen"

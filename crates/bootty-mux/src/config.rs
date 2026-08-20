@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use bootty_config::config::{MultiplexerBackendConfig, MultiplexerConfig};
+use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 
 use super::{
     backend::MuxBackend,
@@ -18,7 +18,7 @@ use super::{
 /// Builds the backend a controller talks to. Held per controller rather than in a global so a test
 /// can drive one app against a scripted backend without leaking into every other test in the
 /// process. Shared because the refresh and command workers build their own backend off-thread.
-pub type BackendFactory = Arc<dyn Fn(&MultiplexerConfig) -> Box<dyn MuxBackend> + Send + Sync>;
+pub type BackendFactory = Arc<dyn Fn(&MuxBindingConfig) -> Box<dyn MuxBackend> + Send + Sync>;
 
 struct UnavailableBackend {
     message: String,
@@ -40,20 +40,16 @@ pub fn unavailable_backend(message: impl Into<String>) -> Box<dyn MuxBackend> {
     })
 }
 
-pub fn selected_backend(config: &MultiplexerConfig) -> MultiplexerBackendConfig {
+pub fn selected_backend(config: &MuxBindingConfig) -> MuxBackendKind {
     resolve_backend(config.backend, config.remote.is_some(), cfg!(windows))
 }
 
 /// Windows has no tmux to fall back from, so a local tmux binding renders natively there. A remote
 /// one still resolves to tmux: its client runs on the other host, and this side only runs `ssh`,
 /// which Windows does ship.
-fn resolve_backend(
-    backend: MultiplexerBackendConfig,
-    remote: bool,
-    windows: bool,
-) -> MultiplexerBackendConfig {
-    if windows && backend == MultiplexerBackendConfig::Tmux && !remote {
-        return MultiplexerBackendConfig::Native;
+fn resolve_backend(backend: MuxBackendKind, remote: bool, windows: bool) -> MuxBackendKind {
+    if windows && backend == MuxBackendKind::Tmux && !remote {
+        return MuxBackendKind::Native;
     }
     backend
 }
@@ -61,11 +57,11 @@ fn resolve_backend(
 /// The SSH transport a binding's backend client runs over, or `None` when the multiplexer is this
 /// machine's. Remote configs that name a backend without a client are rejected when the config is
 /// loaded, so anything reaching here is a backend that can be driven from another host.
-pub fn remote_transport(config: &MultiplexerConfig) -> Option<SshRemote> {
+pub fn remote_transport(config: &MuxBindingConfig) -> Option<SshRemote> {
     config.remote.clone().map(SshRemote::new)
 }
 
-pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
+pub fn build_backend(config: &MuxBindingConfig) -> Box<dyn MuxBackend> {
     build_backend_for_workspace(config, None)
 }
 
@@ -73,7 +69,7 @@ pub fn build_backend(config: &MultiplexerConfig) -> Box<dyn MuxBackend> {
 /// `workspace`. Only the native backend keeps its sessions in this process, so it is the only one a
 /// workspace can scope; the others reach a server that is already shared.
 pub fn build_backend_for_workspace(
-    config: &MultiplexerConfig,
+    config: &MuxBindingConfig,
     workspace: Option<&Path>,
 ) -> Box<dyn MuxBackend> {
     let remote = remote_transport(config);
@@ -85,19 +81,19 @@ pub fn build_backend_for_workspace(
         ));
     }
     match selected_backend(config) {
-        MultiplexerBackendConfig::Rmux => match remote {
+        MuxBackendKind::Rmux => match remote {
             Some(remote) => Box::new(RemoteRmuxBackend::new(remote)),
             None => Box::new(RmuxBackend::new()),
         },
-        MultiplexerBackendConfig::Native => Box::new(match workspace {
+        MuxBackendKind::Native => Box::new(match workspace {
             Some(workspace) => NativeBackend::for_workspace(workspace),
             None => NativeBackend::new(),
         }),
-        MultiplexerBackendConfig::Tmux => Box::new(match remote {
+        MuxBackendKind::Tmux => Box::new(match remote {
             Some(remote) => TmuxBackend::with_runner("tmux", TmuxControlRunner::for_remote(remote)),
             None => TmuxBackend::new(),
         }),
-        MultiplexerBackendConfig::Zellij => match remote {
+        MuxBackendKind::Zellij => match remote {
             Some(remote) => Box::new(ZellijBackend::with_runner(SshCommandRunner::new(
                 remote,
                 SystemCommandRunner,
@@ -109,7 +105,7 @@ pub fn build_backend_for_workspace(
 
 pub fn build_backend_with(
     factory: Option<&BackendFactory>,
-    config: &MultiplexerConfig,
+    config: &MuxBindingConfig,
 ) -> Box<dyn MuxBackend> {
     match factory {
         Some(factory) => factory(config),
@@ -124,33 +120,24 @@ mod tests {
         capability::BindingOperation,
         controller::{BindingId, MuxScope, SpaceId},
     };
-    use bootty_config::config::MultiplexerConfig;
+    use bootty_mux_model::MuxBindingConfig;
 
     #[test]
     fn selected_backend_resolves_configured_backend() {
         for (backend, expected) in [
+            (MuxBackendKind::Rmux, MuxBackendKind::Rmux),
+            (MuxBackendKind::Native, MuxBackendKind::Native),
             (
-                MultiplexerBackendConfig::Rmux,
-                MultiplexerBackendConfig::Rmux,
-            ),
-            (
-                MultiplexerBackendConfig::Native,
-                MultiplexerBackendConfig::Native,
-            ),
-            (
-                MultiplexerBackendConfig::Tmux,
+                MuxBackendKind::Tmux,
                 if cfg!(windows) {
-                    MultiplexerBackendConfig::Native
+                    MuxBackendKind::Native
                 } else {
-                    MultiplexerBackendConfig::Tmux
+                    MuxBackendKind::Tmux
                 },
             ),
-            (
-                MultiplexerBackendConfig::Zellij,
-                MultiplexerBackendConfig::Zellij,
-            ),
+            (MuxBackendKind::Zellij, MuxBackendKind::Zellij),
         ] {
-            let config = MultiplexerConfig {
+            let config = MuxBindingConfig {
                 backend,
                 ..Default::default()
             };
@@ -166,18 +153,18 @@ mod tests {
     fn windows_keeps_a_remote_tmux_binding_and_replaces_only_a_local_one() {
         for windows in [true, false] {
             assert_eq!(
-                resolve_backend(MultiplexerBackendConfig::Tmux, true, windows),
-                MultiplexerBackendConfig::Tmux
+                resolve_backend(MuxBackendKind::Tmux, true, windows),
+                MuxBackendKind::Tmux
             );
         }
 
         assert_eq!(
-            resolve_backend(MultiplexerBackendConfig::Tmux, false, true),
-            MultiplexerBackendConfig::Native
+            resolve_backend(MuxBackendKind::Tmux, false, true),
+            MuxBackendKind::Native
         );
         assert_eq!(
-            resolve_backend(MultiplexerBackendConfig::Tmux, false, false),
-            MultiplexerBackendConfig::Tmux
+            resolve_backend(MuxBackendKind::Tmux, false, false),
+            MuxBackendKind::Tmux
         );
     }
 
@@ -185,13 +172,13 @@ mod tests {
     fn adapters_publish_exact_backend_neutral_capability_matrix() {
         let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
         for backend in [
-            MultiplexerBackendConfig::Native,
-            MultiplexerBackendConfig::Rmux,
-            MultiplexerBackendConfig::Tmux,
-            MultiplexerBackendConfig::Zellij,
+            MuxBackendKind::Native,
+            MuxBackendKind::Rmux,
+            MuxBackendKind::Tmux,
+            MuxBackendKind::Zellij,
         ] {
             let expected = match backend {
-                MultiplexerBackendConfig::Native => vec![
+                MuxBackendKind::Native => vec![
                     BindingOperation::ActivateWindow,
                     BindingOperation::CreateWindow,
                     BindingOperation::RenameWindow,
@@ -205,7 +192,7 @@ mod tests {
                     BindingOperation::RenameSession,
                     BindingOperation::DitchSession,
                 ],
-                MultiplexerBackendConfig::Rmux => vec![
+                MuxBackendKind::Rmux => vec![
                     BindingOperation::ActivateWindow,
                     BindingOperation::CreateWindow,
                     BindingOperation::RenameWindow,
@@ -218,7 +205,7 @@ mod tests {
                     BindingOperation::RenameSession,
                     BindingOperation::DitchSession,
                 ],
-                MultiplexerBackendConfig::Tmux => vec![
+                MuxBackendKind::Tmux => vec![
                     BindingOperation::ActivateWindow,
                     BindingOperation::CreateWindow,
                     BindingOperation::RenameWindow,
@@ -233,14 +220,14 @@ mod tests {
                     BindingOperation::RenameSession,
                     BindingOperation::DitchSession,
                 ],
-                MultiplexerBackendConfig::Zellij => vec![
+                MuxBackendKind::Zellij => vec![
                     BindingOperation::CreateProjectSession,
                     BindingOperation::CreateWorktreeSession,
                     BindingOperation::RenameSession,
                     BindingOperation::DitchSession,
                 ],
             };
-            let config = MultiplexerConfig {
+            let config = MuxBindingConfig {
                 backend,
                 ..Default::default()
             };

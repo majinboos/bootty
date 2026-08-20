@@ -264,12 +264,18 @@ and Dock so they reappear when the pointer reaches the screen edge;
 
 Bootty has a round-trip TOML editing path for preference writeback. It edits the
 user's `config.toml` rather than writing a generated full config, preserving
-unrelated comments, ordering, includes, and tables. Current code exposes a
-focused font-size writeback helper for future settings UI; no UI writes config
-preferences yet.
+unrelated comments, ordering, includes, and tables. The settings UI, sidebar
+width, appearance mode, active theme, and font-size actions use this path.
+
+Bootty writes a complete temporary file beside the config. It synchronizes the
+file before it atomically replaces the config. Existing symlinks remain links.
+Existing Unix permission bits remain unchanged. A new Unix config uses mode
+`0600` because it can contain SSH connection metadata.
 
 If a writeback target file does not exist, Bootty creates it. If an existing
 file cannot be parsed as TOML, writeback fails rather than replacing the file.
+Bootty writers for one config path are serialized. External editors do not use
+the Bootty writer lease, so writeback is not a cross-program compare-and-swap.
 
 ## Compatibility notes
 

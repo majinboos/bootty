@@ -207,11 +207,26 @@ impl eframe::App for TabsExample {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
             ui.separator();
-            if let Some(tab) = self.active_tab_mut() {
+            let error = if let Some(tab) = self.active_tab_mut() {
                 match tab.widget.show(ui, &mut tab.terminal) {
-                    Ok(surface) => tab.surface = Some(surface),
-                    Err(error) => self.last_error = Some(error.to_string()),
+                    Ok(output) => {
+                        let error = if output.viewport_scroll_delta != 0 {
+                            tab.terminal
+                                .scroll_viewport_delta(output.viewport_scroll_delta)
+                                .err()
+                        } else {
+                            None
+                        };
+                        tab.surface = Some(output.surface);
+                        error
+                    }
+                    Err(error) => Some(error),
                 }
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                self.last_error = Some(error.to_string());
             }
         });
     }

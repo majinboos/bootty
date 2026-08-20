@@ -256,13 +256,6 @@ pub enum CoreCommandExecutor {
     ReadTerminal,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedCommandInvocation {
-    pub descriptor: CommandDescriptor,
-    pub executor: CoreCommandExecutor,
-    pub invocation: CommandInvocation,
-}
-
 #[derive(Clone, Debug)]
 struct RegisteredCommand {
     descriptor: CommandDescriptor,
@@ -338,7 +331,7 @@ impl CommandRegistry {
         };
         Ok(ResolvedCommandInvocation {
             descriptor,
-            executor,
+            executor: CommandExecutor::Core(executor),
             invocation,
         })
     }
@@ -426,10 +419,16 @@ pub type ExtensionCommandHandler = Arc<
 >;
 
 #[derive(Clone)]
-pub struct ResolvedExtensionCommand {
+pub enum CommandExecutor {
+    Core(CoreCommandExecutor),
+    Extension(ExtensionCommandHandler),
+}
+
+#[derive(Clone)]
+pub struct ResolvedCommandInvocation {
     pub descriptor: CommandDescriptor,
     pub invocation: CommandInvocation,
-    pub handler: ExtensionCommandHandler,
+    pub executor: CommandExecutor,
 }
 
 #[derive(Clone)]
@@ -483,27 +482,20 @@ impl CommandCatalog {
         &self,
         invocation: CommandInvocation,
     ) -> Result<ResolvedCommandInvocation, CommandOutcome> {
-        self.core.resolve(invocation)
-    }
-
-    pub fn resolve_extension(
-        &self,
-        invocation: CommandInvocation,
-    ) -> Result<Option<ResolvedExtensionCommand>, CommandOutcome> {
         let command = self
             .extensions
             .read()
             .ok()
             .and_then(|commands| commands.get(&invocation.command).cloned());
-        let Some((descriptor, handler)) = command else {
-            return Ok(None);
-        };
-        validate_arguments(&descriptor, &invocation.arguments)?;
-        Ok(Some(ResolvedExtensionCommand {
-            descriptor,
-            invocation,
-            handler,
-        }))
+        if let Some((descriptor, handler)) = command {
+            validate_arguments(&descriptor, &invocation.arguments)?;
+            return Ok(ResolvedCommandInvocation {
+                descriptor,
+                invocation,
+                executor: CommandExecutor::Extension(handler),
+            });
+        }
+        self.core.resolve(invocation)
     }
 
     pub fn register_extension(
@@ -845,6 +837,22 @@ impl AppCommandSender {
 }
 
 impl BoundAppCommandSender {
+    pub fn submit(
+        &self,
+        invocation: CommandInvocation,
+        deadline: Instant,
+        cancellation: CommandCancellation,
+    ) -> Result<Receiver<CommandOutcome>, AppCommandSendError> {
+        let (response, receiver) = mpsc::channel();
+        self.try_send(AppCommandRequest {
+            invocation,
+            deadline,
+            cancellation,
+            response,
+        })?;
+        Ok(receiver)
+    }
+
     pub fn try_send(&self, mut request: AppCommandRequest) -> Result<(), AppCommandSendError> {
         let open = self.open.lock().unwrap_or_else(|error| error.into_inner());
         if !*open {

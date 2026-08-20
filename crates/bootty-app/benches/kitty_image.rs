@@ -9,7 +9,7 @@ use bootty_app::{
     terminal_wgpu::TerminalWgpuRenderer,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use eframe::{egui::Vec2, wgpu};
+use eframe::wgpu;
 
 struct WgpuBenchContext {
     device: wgpu::Device,
@@ -28,8 +28,9 @@ fn terminal_engine(cols: u16, rows: u16) -> TerminalEngine {
 }
 
 fn surface_for(cols: u16, rows: u16) -> TerminalSurface {
-    TerminalSurface::for_size(
-        Vec2::new(f32::from(cols) * 9.0 + 20.0, f32::from(rows) * 22.0 + 20.0),
+    TerminalSurface::for_logical_size(
+        f32::from(cols) * 9.0 + 20.0,
+        f32::from(rows) * 22.0 + 20.0,
         CellMetrics::new(9.0, 22.0),
         TerminalPadding::uniform(10.0),
     )

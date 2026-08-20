@@ -235,12 +235,100 @@ fn background_command_vertices_keep_decorations_before_cursor() {
 }
 
 #[test]
-fn terminal_callback_key_distinguishes_terminal_viewports() {
+fn terminal_callback_key_tracks_renderer_identity_not_viewport_geometry() {
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let left = terminal_callback_key(SurfaceRect::from_min_size(0.0, 0.0, 10.0, 10.0), format);
-    let right = terminal_callback_key(SurfaceRect::from_min_size(10.0, 0.0, 10.0, 10.0), format);
+    let first_id = TerminalRendererId::unique();
+    let second_id = TerminalRendererId::unique();
+    let first = TerminalCallbackKey {
+        renderer: first_id.value,
+        target_format: format,
+    };
+    let moved = TerminalCallbackKey {
+        renderer: first_id.value,
+        target_format: format,
+    };
+    let second = TerminalCallbackKey {
+        renderer: second_id.value,
+        target_format: format,
+    };
 
-    assert_ne!(left, right);
+    assert_eq!(first, moved);
+    assert_ne!(first, second);
+}
+
+#[test]
+fn renderer_identity_lifetime_ends_after_widget_and_callbacks_drop() {
+    let identity = TerminalRendererId::unique();
+    let callback_lifetime = Arc::clone(&identity.lifetime);
+    let cached_lifetime = Arc::downgrade(&callback_lifetime);
+
+    drop(identity);
+    assert!(cached_lifetime.strong_count() > 0);
+    drop(callback_lifetime);
+    assert_eq!(cached_lifetime.strong_count(), 0);
+}
+
+#[test]
+fn prepared_frame_cache_rejects_font_policy_and_geometry_changes() {
+    let surface = SurfaceRect::from_min_size(0.0, 0.0, 20.0, 10.0);
+    let frame_with = |surface, value| TerminalRenderFrame {
+        surface,
+        commands: vec![TerminalRenderCommand::Text(TextCommand {
+            rect: surface,
+            text: "<>".to_owned(),
+            attrs: TextAttrs {
+                fg: PlanColor {
+                    r: 255,
+                    g: 255,
+                    b: 255,
+                    a: 255,
+                },
+                bold: false,
+                italic: false,
+                underline: libghostty_vt::style::Underline::None,
+                strikethrough: false,
+                overline: false,
+            },
+            face: Arc::new(ResolvedFontFace {
+                family: "Maple Mono".to_owned(),
+                fallback_families: Vec::new(),
+                style: FontStyle::Regular,
+            }),
+            font_size: 16.0,
+            font_features: Arc::from(vec![crate::terminal_text::FontFeature::new(
+                *b"liga", value,
+            )]),
+        })],
+    };
+    let enabled = frame_with(surface, 1);
+    let disabled = frame_with(surface, 0);
+    let moved = frame_with(SurfaceRect::from_min_size(12.0, 8.0, 20.0, 10.0), 1);
+    let cache = PreparedTerminalFrameCache {
+        frame: enabled.clone(),
+        pixels_per_point_bits: 1.0_f32.to_bits(),
+        view_bits: [1.0_f32.to_bits(), 0.0_f32.to_bits(), 0.0_f32.to_bits()],
+        atlas_resized_count: 0,
+        vertex_count: 6,
+    };
+
+    assert!(cache.matches(
+        &enabled,
+        1.0_f32.to_bits(),
+        [1.0_f32.to_bits(), 0.0_f32.to_bits(), 0.0_f32.to_bits()],
+        0,
+    ));
+    assert!(!cache.matches(
+        &disabled,
+        1.0_f32.to_bits(),
+        [1.0_f32.to_bits(), 0.0_f32.to_bits(), 0.0_f32.to_bits()],
+        0,
+    ));
+    assert!(!cache.matches(
+        &moved,
+        1.0_f32.to_bits(),
+        [1.0_f32.to_bits(), 0.0_f32.to_bits(), 0.0_f32.to_bits()],
+        0,
+    ));
 }
 
 #[test]
@@ -267,7 +355,8 @@ fn virtual_placements_without_drawable_layers_do_not_schedule_wgpu_callback() {
     };
 
     assert!(
-        terminal_render_callback(
+        terminal_render_callback_for_renderer(
+            TerminalRendererId::unique(),
             &frame,
             wgpu::TextureFormat::Rgba8Unorm,
             ViewTransform::IDENTITY
@@ -300,6 +389,7 @@ fn zero_width_text_does_not_advance_following_glyphs() {
             style: FontStyle::Regular,
         }),
         font_size: 10.0,
+        font_features: Arc::from(crate::terminal_text::default_font_features()),
     };
 
     let b_min_x = text_draws(&command, 1.0)

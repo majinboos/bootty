@@ -1,0 +1,12 @@
+[package]
+name = "bootty-identity"
+edition.workspace = true
+
+[features]
+bootty-dev = []
+
+[lints]
+workspace = true
+
+[dependencies]
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }

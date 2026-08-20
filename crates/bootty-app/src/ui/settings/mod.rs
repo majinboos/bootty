@@ -21,7 +21,7 @@ use crate::{
     color::Color,
     config::{
         BoottyConfig, ConfigDocument, ConfigResult, MultiplexerBackendConfig, SidebarPosition,
-        load_or_create_config_document,
+        update_config_document,
     },
     direct_input::ModifierSideState,
 };
@@ -852,12 +852,10 @@ impl SettingsSurface {
     // --- config writeback -------------------------------------------------------------------
 
     fn write(&mut self, mutate: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>) {
-        let result = (|| {
-            let mut document = load_or_create_config_document(&self.config_path)?;
-            mutate(&mut document)?;
-            document.write_to_disk()
-        })();
-        self.last_write_error = result.err().map(|error| error.to_string());
+        self.last_write_error = match update_config_document(&self.config_path, mutate) {
+            Ok(outcome) => outcome.durability_warning().map(str::to_owned),
+            Err(error) => Some(error.to_string()),
+        };
     }
 
     fn set_f32(&mut self, path: &[&str], value: f32) {

@@ -2,15 +2,5 @@
 name = "bootty-surface"
 edition.workspace = true
 
-[features]
-default = ["geometry"]
-geometry = ["dep:eframe"]
-
-[dependencies]
-eframe = { workspace = true, optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-eframe = { workspace = true, features = ["wayland", "x11"] }
-
 [dev-dependencies]
 proptest.workspace = true

@@ -5,7 +5,7 @@ edition.workspace = true
 build = "build.rs"
 
 [features]
-bootty-dev = []
+bootty-dev = ["bootty-identity/bootty-dev"]
 
 [[bin]]
 name = "bootty"
@@ -19,8 +19,11 @@ eframe.workspace = true
 egui_code_editor.workspace = true
 iconflow.workspace = true
 fontdb.workspace = true
+getrandom.workspace = true
 libghostty-vt.workspace = true
 bootty-winit = { path = "../bootty-winit", default-features = false }
+bootty-font = { path = "../bootty-font" }
+bootty-identity = { path = "../bootty-identity" }
 bootty-config = { path = "../bootty-config" }
 bootty-mux = { path = "../bootty-mux" }
 bootty-ui = { path = "../bootty-ui" }
@@ -40,11 +43,12 @@ starship-battery.workspace = true
 strum.workspace = true
 notify.workspace = true
 sysinfo.workspace = true
+tempfile.workspace = true
 ttf-parser.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 keepawake.workspace = true
-mlua = { version = "0.12.0", features = ["luau"] }
+mlua = { version = "0.12.0", features = ["luau", "serialize"] }
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -61,6 +65,7 @@ winit = { workspace = true, features = ["wayland", "x11"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"] }
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [build-dependencies]
 embed-resource.workspace = true
@@ -72,7 +77,6 @@ indoc.workspace = true
 pollster.workspace = true
 proptest.workspace = true
 rstest.workspace = true
-tempfile.workspace = true
 
 [[bench]]
 name = "paint_plan"

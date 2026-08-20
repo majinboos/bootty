@@ -4,6 +4,10 @@ use crate::geometry::{SurfacePoint, TerminalSurface, ViewTransform};
 
 use bootty_terminal::terminal_engine::TerminalSelectionEvent;
 
+fn surface_point(pos: Pos2) -> SurfacePoint {
+    SurfacePoint { x: pos.x, y: pos.y }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TerminalSelectionAction {
     Begin(TerminalSelectionEvent),
@@ -58,7 +62,7 @@ impl TerminalSelectionRouter {
                     button: egui::PointerButton::Primary,
                     pressed: true,
                     modifiers,
-                } if surface.rect.contains(pos)
+                } if surface.rect.contains(surface_point(pos))
                     && !chrome_handle_rects.iter().any(|rect| rect.contains(pos)) =>
                 {
                     let rectangle = modifiers.alt || frame_modifiers.alt;
@@ -208,13 +212,10 @@ fn terminal_selection_event(
     pos: Pos2,
     rectangle: bool,
 ) -> Option<TerminalSelectionEvent> {
-    let position = surface.relative_position(view.inverse_point(pos))?;
+    let position = surface.relative_position(view.inverse_point(surface_point(pos)))?;
     Some(TerminalSelectionEvent {
         surface,
-        position: SurfacePoint {
-            x: position.x,
-            y: position.y,
-        },
+        position,
         rectangle,
     })
 }
@@ -228,16 +229,16 @@ fn previous_inside_coordinate(min: f32, max: f32) -> f32 {
     (max - inset).max(min)
 }
 
-fn terminal_grid_edge(surface: TerminalSurface) -> Pos2 {
+fn terminal_grid_edge(surface: TerminalSurface) -> SurfacePoint {
     let geometry = surface.geometry();
     let right =
-        surface.rect.left() + surface.padding.left + f32::from(geometry.cols) * surface.cell.width;
+        surface.rect.min_x + surface.padding.left + f32::from(geometry.cols) * surface.cell.width;
     let bottom =
-        surface.rect.top() + surface.padding.top + f32::from(geometry.rows) * surface.cell.height;
-    Pos2::new(
-        right.min(surface.rect.right()),
-        bottom.min(surface.rect.bottom()),
-    )
+        surface.rect.min_y + surface.padding.top + f32::from(geometry.rows) * surface.cell.height;
+    SurfacePoint {
+        x: right.min(surface.rect.max_x),
+        y: bottom.min(surface.rect.max_y),
+    }
 }
 
 pub(super) fn terminal_selection_event_clamped(
@@ -246,19 +247,19 @@ pub(super) fn terminal_selection_event_clamped(
     pos: Pos2,
     rectangle: bool,
 ) -> Option<TerminalSelectionEvent> {
-    let pos = view.inverse_point(pos);
+    let pos = view.inverse_point(surface_point(pos));
     let grid_edge = terminal_grid_edge(surface);
-    let max_x = previous_inside_coordinate(surface.rect.left(), grid_edge.x);
-    let max_y = previous_inside_coordinate(surface.rect.top(), grid_edge.y);
+    let max_x = previous_inside_coordinate(surface.rect.min_x, grid_edge.x);
+    let max_y = previous_inside_coordinate(surface.rect.min_y, grid_edge.y);
     let pos = Pos2::new(
-        pos.x.clamp(surface.rect.left(), max_x),
-        pos.y.clamp(surface.rect.top(), max_y),
+        pos.x.clamp(surface.rect.min_x, max_x),
+        pos.y.clamp(surface.rect.min_y, max_y),
     );
     terminal_selection_event(surface, ViewTransform::IDENTITY, pos, rectangle)
 }
 
 pub(super) fn selection_drag_scroll_delta(surface: TerminalSurface, pos: Pos2) -> isize {
-    let top = surface.rect.top();
+    let top = surface.rect.min_y;
     let bottom = terminal_grid_edge(surface).y;
     let hot_zone = (surface.cell.height * 0.35)
         .clamp(4.0, 12.0)

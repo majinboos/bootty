@@ -9,7 +9,7 @@ use bootty_app::{
         RepaintHandle,
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
-    renderer::{RendererMetrics, TerminalRenderSource, TerminalWidget},
+    renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
     terminal::{RenderFrame, TerminalEngine},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
@@ -45,18 +45,23 @@ impl BenchTerminal {
     }
 }
 
-impl TerminalRenderSource for BenchTerminal {
+impl TerminalFrameSource for BenchTerminal {
+    fn set_display_scale(&mut self, display_scale: f32) -> Result<()> {
+        self.engine.set_display_scale(display_scale);
+        Ok(())
+    }
+
+    fn set_render_cell_metrics(&mut self, cell: bootty_app::geometry::CellMetrics) -> Result<()> {
+        self.engine.set_render_cell_metrics(cell);
+        Ok(())
+    }
+
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
         self.engine.resize(geometry)
     }
 
     fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
         Ok(Arc::new(self.engine.extract_frame()?.clone()))
-    }
-
-    fn scroll_viewport_delta(&mut self, delta: isize) -> Result<()> {
-        self.engine.scroll_viewport_delta(delta);
-        Ok(())
     }
 }
 

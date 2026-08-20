@@ -1066,7 +1066,7 @@ mod tests {
         label: &str,
         controller: &mut crate::controller::MuxController,
         repaint: &crate::RepaintHandle,
-        config: &bootty_config::config::MultiplexerConfig,
+        config: &bootty_mux_model::MuxBindingConfig,
         mut done: impl FnMut(&crate::controller::MuxController) -> bool,
     ) -> Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
@@ -1232,8 +1232,8 @@ mod tests {
         );
 
         let repaint: crate::RepaintHandle = std::sync::Arc::new(|| {});
-        let config = bootty_config::config::MultiplexerConfig {
-            backend: bootty_config::config::MultiplexerBackendConfig::Rmux,
+        let config = bootty_mux_model::MuxBindingConfig {
+            backend: bootty_mux_model::MuxBackendKind::Rmux,
             ..Default::default()
         };
         let mut controller = crate::controller::MuxController::new();

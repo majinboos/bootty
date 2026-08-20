@@ -5,6 +5,7 @@ use bootty_app::{
         BoottyConfig, MultiplexerBackendConfig, builtin_theme_names, load_config_from_path,
         resolve_theme, write_font_size_preference,
     },
+    input::resolve_modifier_remaps,
     input_binding_set::BindingSet,
     workspace::{SessionOrderStore, WorkspaceRepository},
 };
@@ -201,7 +202,8 @@ fn bench_config_load(c: &mut Criterion) {
     let config = load_config_from_path(&fixture.config_path).expect("load benchmark config");
     c.bench_function("startup_config_modifier_and_keybind_build", |b| {
         b.iter(|| {
-            let remaps = config.input.modifier_remaps().expect("modifier remaps");
+            let remaps =
+                resolve_modifier_remaps(&config.input.modifier_remap).expect("modifier remaps");
             black_box((remaps, parse_keybinds(black_box(&config))))
         })
     });

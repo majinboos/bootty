@@ -1,3 +1,6 @@
+#![allow(clippy::needless_raw_string_hashes)]
+#![allow(clippy::float_cmp)]
+
 use super::keybind_presets::{
     BOOTTY_PREFIX_KEYBINDS, TMUX_PREFIX_KEYBINDS, common_keybinds_macos, common_keybinds_other,
     common_keybinds_windows, ghostty_common_keybinds_macos, ghostty_common_keybinds_other,
@@ -18,7 +21,7 @@ use std::str::FromStr;
 use std::{collections::BTreeMap, fs};
 
 struct ConfigSandbox {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     path: PathBuf,
 }
 
@@ -26,7 +29,7 @@ impl ConfigSandbox {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        Self { _dir: dir, path }
+        Self { dir, path }
     }
 
     fn with_config(source: &str) -> Self {
@@ -36,7 +39,7 @@ impl ConfigSandbox {
     }
 
     fn write(&self, relative_path: &str, source: &str) {
-        let path = self._dir.path().join(relative_path);
+        let path = self.dir.path().join(relative_path);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -69,7 +72,7 @@ proptest! {
         let mut target = integer_table(&base);
         let overlay_table = integer_table(&overlay);
 
-        merge_toml_tables(&mut target, overlay_table);
+        merge_toml_tables(&mut target, &overlay_table);
 
         for (key, value) in base {
             if !overlay.contains_key(&key) {
@@ -87,7 +90,7 @@ proptest! {
         let mut target = integer_table(&BTreeMap::from([(key.clone(), base_value)]));
         let overlay = integer_table(&BTreeMap::from([(key.clone(), overlay_value)]));
 
-        merge_toml_tables(&mut target, overlay);
+        merge_toml_tables(&mut target, &overlay);
 
         prop_assert_eq!(target[&key].as_integer(), Some(overlay_value));
     }
@@ -135,7 +138,7 @@ fn merge_toml_tables_recurses_into_nested_tables() {
     .parse::<DocumentMut>()
     .unwrap();
 
-    merge_toml_tables(target.as_table_mut(), overlay.into_table());
+    merge_toml_tables(target.as_table_mut(), &overlay.into_table());
 
     assert_eq!(target["window"]["title"].as_str(), Some("included"));
     assert_eq!(target["window"]["width"].as_integer(), Some(1000));
@@ -150,16 +153,6 @@ fn config_path_prefers_xdg_then_home(
     #[case] expected: &str,
 ) {
     assert_eq!(config_path_from_env(xdg, home), PathBuf::from(expected));
-}
-
-#[test]
-fn empty_session_working_directory_resolves_to_home() {
-    let expected_home = default_working_directory().expect("home directory should be discoverable");
-
-    assert_eq!(
-        SessionConfig::default().launch_config().working_directory,
-        Some(expected_home)
-    );
 }
 
 #[cfg(windows)]
@@ -183,19 +176,6 @@ fn windows_default_working_directory_uses_home_drive_and_path_without_userprofil
     });
 
     assert_eq!(home, Some(PathBuf::from("C:\\Users\\bootty")));
-}
-
-#[test]
-fn configured_session_working_directory_overrides_home_default() {
-    let config = SessionConfig {
-        working_directory: Some(PathBuf::from("tmp/bootty-project")),
-        ..SessionConfig::default()
-    };
-
-    assert_eq!(
-        config.launch_config().working_directory,
-        Some(PathBuf::from("tmp/bootty-project"))
-    );
 }
 
 #[test]
@@ -555,14 +535,10 @@ fn config_accepts_ghostty_palette_generation_settings() {
 
     assert!(config.colors.palette_generate);
     assert!(config.colors.palette_harmonious);
-
-    let terminal_colors = config.colors.terminal_color_config();
-    assert!(terminal_colors.palette_generate);
-    assert!(terminal_colors.palette_harmonious);
 }
 
 #[test]
-fn config_maps_font_features_to_terminal_text_config() {
+fn config_resolves_font_features_in_product_order() {
     let config = load_config_source(indoc! {r#"
         font-feature = ["cv01", "ss05"]
 
@@ -570,17 +546,22 @@ fn config_maps_font_features_to_terminal_text_config() {
         features = ["cv33", "-calt"]
     "#});
 
-    let features = config.font.terminal_text_config().font_features;
+    let features = config.font.features;
 
-    assert!(features.contains(&FontFeature::new(*b"liga", 1)));
-    assert!(features.contains(&FontFeature::new(*b"cv01", 1)));
-    assert!(features.contains(&FontFeature::new(*b"ss05", 1)));
-    assert!(features.contains(&FontFeature::new(*b"cv33", 1)));
-    assert!(features.contains(&FontFeature::new(*b"calt", 0)));
+    assert_eq!(
+        features,
+        vec![
+            FontFeature::new(*b"liga", 1),
+            FontFeature::new(*b"cv33", 1),
+            FontFeature::new(*b"calt", 0),
+            FontFeature::new(*b"cv01", 1),
+            FontFeature::new(*b"ss05", 1),
+        ]
+    );
 }
 
 #[test]
-fn config_maps_font_fit_cell_height_to_terminal_text_config() {
+fn config_resolves_font_fit_cell_height() {
     assert!(load_config_source("").font.fit_cell_height);
 
     let config = load_config_source(indoc! {r#"
@@ -589,11 +570,10 @@ fn config_maps_font_fit_cell_height_to_terminal_text_config() {
     "#});
 
     assert!(!config.font.fit_cell_height);
-    assert!(!config.font.terminal_text_config().fit_cell_height);
 }
 
 #[test]
-fn config_maps_font_fit_cell_width_to_terminal_text_config() {
+fn config_resolves_font_fit_cell_width() {
     assert!(!load_config_source("").font.fit_cell_width);
 
     let config = load_config_source(indoc! {r#"
@@ -602,7 +582,6 @@ fn config_maps_font_fit_cell_width_to_terminal_text_config() {
     "#});
 
     assert!(config.font.fit_cell_width);
-    assert!(config.font.terminal_text_config().fit_cell_width);
 }
 
 #[test]
@@ -630,7 +609,7 @@ fn config_rejects_invalid_font_features() {
     .load()
     .unwrap_err();
 
-    assert!(error.to_string().contains("invalid font feature"));
+    assert_eq!(error.to_string(), "invalid font feature: toolong");
 }
 
 #[test]
@@ -655,14 +634,13 @@ fn config_accepts_xterm_dynamic_color_slots() {
         Some(Color::from_hex("#131415").unwrap())
     );
 
-    let terminal_colors = config.colors.terminal_color_config();
     assert_eq!(
-        terminal_colors.pointer_background,
-        Some(Color::from_hex("#040506").unwrap().into())
+        config.colors.pointer_background,
+        Some(Color::from_hex("#040506").unwrap())
     );
     assert_eq!(
-        terminal_colors.tektronix_cursor,
-        Some(Color::from_hex("#101112").unwrap().into())
+        config.colors.tektronix_cursor,
+        Some(Color::from_hex("#101112").unwrap())
     );
 }
 
@@ -841,8 +819,8 @@ fn missing_include_behavior_depends_on_optional_marker(
 #[test]
 fn reload_keeps_last_good_config_when_new_config_is_invalid() {
     let sandbox = ConfigSandbox::new();
-    let good_path = sandbox._dir.path().join("good.toml");
-    let bad_path = sandbox._dir.path().join("bad.toml");
+    let good_path = sandbox.dir.path().join("good.toml");
+    let bad_path = sandbox.dir.path().join("bad.toml");
     sandbox.write(
         "good.toml",
         indoc! {r#"
@@ -883,8 +861,7 @@ fn config_document_preserves_comments_and_order_for_writeback() {
 
     let document = load_config_document(&sandbox.path).unwrap().unwrap();
 
-    assert_eq!(document.path(), sandbox.path);
-    assert_eq!(document.to_toml_string(), source);
+    assert_eq!(document.document().to_string(), source);
 }
 
 #[test]
@@ -900,12 +877,10 @@ fn config_document_writeback_preserves_unrelated_comments_and_order() {
         [chrome]
         sidebar = true
     "#});
-    let mut document = load_config_document(&sandbox.path).unwrap().unwrap();
-
-    document
-        .set_item(&["font", "size"], toml_edit::value(15.0))
-        .unwrap();
-    document.write_to_disk().unwrap();
+    update_config_document(&sandbox.path, |document| {
+        document.set_item(&["font", "size"], toml_edit::value(15.0))
+    })
+    .unwrap();
 
     let written = fs::read_to_string(&sandbox.path).unwrap();
     assert!(written.contains("# user comment"));
@@ -972,7 +947,7 @@ fn input_copy_on_select_defaults_off_and_can_be_enabled() {
 }
 
 #[test]
-fn config_maps_macos_option_as_alt_to_terminal_session_config() {
+fn config_parses_macos_option_as_alt_policy() {
     let config = load_config_source(indoc! {r#"
         [input]
         macos-option-as-alt = "right"
@@ -982,37 +957,20 @@ fn config_maps_macos_option_as_alt_to_terminal_session_config() {
         config.input.macos_option_as_alt,
         MacosOptionAsAltConfig::Right
     );
-    assert_eq!(
-        config.terminal_session_config().macos_option_as_alt,
-        MacosOptionAsAlt::Right
-    );
-    assert_eq!(
-        BoottyConfig::default()
-            .terminal_session_config()
-            .macos_option_as_alt,
-        MacosOptionAsAlt::Both
-    );
 }
 
 #[test]
-fn config_maps_session_scrollback_to_terminal_session_config() {
+fn config_parses_session_scrollback_policy() {
     let config = load_config_source(indoc! {r#"
         [session]
         max-scrollback = 0
     "#});
 
     assert_eq!(config.session.max_scrollback, 0);
-    assert_eq!(config.terminal_session_config().max_scrollback, 0);
-    assert_eq!(
-        BoottyConfig::default()
-            .terminal_session_config()
-            .max_scrollback,
-        NATIVE_MAX_SCROLLBACK
-    );
 }
 
 #[test]
-fn config_maps_cursor_defaults_to_terminal_session_config() {
+fn config_parses_cursor_policy() {
     let config = load_config_source(indoc! {r#"
         [cursor]
         style = "underline"
@@ -1021,34 +979,16 @@ fn config_maps_cursor_defaults_to_terminal_session_config() {
 
     assert_eq!(config.cursor.style, Some(CursorStyleConfig::Underline));
     assert_eq!(config.cursor.blink, Some(true));
-    assert_eq!(
-        config.terminal_session_config().cursor,
-        bootty_terminal::terminal_engine::TerminalCursorConfig {
-            style: Some(bootty_terminal::terminal_engine::TerminalCursorStyle::Underline),
-            blink: Some(true),
-        }
-    );
-    assert_eq!(
-        BoottyConfig::default().terminal_session_config().cursor,
-        bootty_terminal::terminal_engine::TerminalCursorConfig::default()
-    );
 }
 
 #[test]
-fn config_maps_glyph_protocol_policy_to_terminal_features() {
+fn config_parses_glyph_protocol_policy() {
     let config = load_config_source(indoc! {r#"
         [session]
         glyph-protocol = false
     "#});
 
     assert!(!config.session.glyph_protocol);
-    assert!(!config.terminal_session_config().features.glyph_protocol);
-    assert!(
-        BoottyConfig::default()
-            .terminal_session_config()
-            .features
-            .glyph_protocol
-    );
 }
 
 #[test]
@@ -1190,6 +1130,56 @@ fn config_accepts_native_multiplexer_backend() {
     assert_eq!(config.multiplexer.backend, MultiplexerBackendConfig::Native);
 }
 
+#[test]
+fn config_accepts_every_multiplexer_backend_token() {
+    for (token, backend) in [
+        ("native", MultiplexerBackendConfig::Native),
+        ("rmux", MultiplexerBackendConfig::Rmux),
+        ("tmux", MultiplexerBackendConfig::Tmux),
+        ("zellij", MultiplexerBackendConfig::Zellij),
+    ] {
+        let config = load_config_source(&format!("[multiplexer]\nbackend = \"{token}\"\n"));
+        assert_eq!(config.multiplexer.backend, backend, "backend token {token}");
+    }
+}
+
+#[test]
+fn ssh_remote_defaults_and_all_fields_are_preserved() {
+    let defaults = load_config_source(indoc! {r#"
+        [multiplexer]
+        backend = "tmux"
+
+        [multiplexer.remote]
+        host = "devbox"
+    "#});
+    assert_eq!(
+        defaults.multiplexer.remote,
+        Some(SshRemoteConfig::for_host("devbox"))
+    );
+
+    let explicit = load_config_source(indoc! {r#"
+        [multiplexer]
+        backend = "tmux"
+
+        [multiplexer.remote]
+        host = "10.0.0.4"
+        user = "dev"
+        port = 2222
+        program = "ssh-custom"
+        args = ["-i", "key"]
+    "#});
+    assert_eq!(
+        explicit.multiplexer.remote,
+        Some(SshRemoteConfig {
+            host: "10.0.0.4".to_owned(),
+            user: Some("dev".to_owned()),
+            port: Some(2222),
+            program: "ssh-custom".to_owned(),
+            args: vec!["-i".to_owned(), "key".to_owned()],
+        })
+    );
+}
+
 /// A host without a usable `~/.ssh/config` — the common case on Windows — has to be reachable from
 /// the config file alone, so every connection detail the SSH client needs can be written here.
 #[test]
@@ -1238,6 +1228,29 @@ fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
         )
         .load()
         .is_err()
+    );
+}
+
+#[test]
+fn multiplexer_remote_validation_errors_keep_their_exact_text() {
+    let empty_host = ConfigSandbox::with_config(
+        "[multiplexer]\nbackend = \"tmux\"\n\n[multiplexer.remote]\nhost = \"  \"\n",
+    )
+    .load()
+    .unwrap_err();
+    assert_eq!(
+        empty_host.to_string(),
+        "multiplexer.remote.host must name a host"
+    );
+
+    let unsupported = ConfigSandbox::with_config(
+        "[multiplexer]\nbackend = \"native\"\n\n[multiplexer.remote]\nhost = \"devbox\"\n",
+    )
+    .load()
+    .unwrap_err();
+    assert_eq!(
+        unsupported.to_string(),
+        "multiplexer.remote needs a backend with a client to run there, got Native"
     );
 }
 

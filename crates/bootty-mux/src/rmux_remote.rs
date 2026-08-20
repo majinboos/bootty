@@ -465,11 +465,11 @@ mod tests {
     #[cfg(feature = "app")]
     use crate::controller::{BindingId, SpaceId};
     #[cfg(feature = "app")]
-    use bootty_config::config::SshRemoteConfig;
+    use bootty_mux_model::SshTarget;
 
     #[cfg(feature = "app")]
     fn remote() -> SshRemote {
-        SshRemote::new(SshRemoteConfig::for_host("devbox"))
+        SshRemote::new(SshTarget::for_host("devbox"))
     }
 
     #[cfg(feature = "app")]
@@ -486,6 +486,7 @@ mod tests {
             args.first().map(String::as_str),
             Some(REMOTE_RMUX_SUBCOMMAND)
         );
+        assert_eq!(args.len(), 2);
     }
 
     #[cfg(feature = "app")]

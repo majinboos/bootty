@@ -32,7 +32,10 @@ use pipelines::{
     text_pipeline, text_texture_format,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Weak,
+    atomic::{AtomicU64, Ordering},
+};
 #[cfg(test)]
 use vertices::color_to_float;
 #[cfg(test)]
@@ -196,7 +199,8 @@ pub fn terminal_decoration_draws(frame: &TerminalRenderFrame) -> Vec<TerminalBac
         .collect()
 }
 
-pub fn terminal_render_callback(
+pub fn terminal_render_callback_for_renderer(
+    renderer_id: TerminalRendererId,
     frame: &TerminalRenderFrame,
     target_format: wgpu::TextureFormat,
     view: ViewTransform,
@@ -209,8 +213,11 @@ pub fn terminal_render_callback(
         egui_wgpu::Callback::new_paint_callback(
             egui_rect(frame.surface),
             TerminalRenderCallback {
-                target_format,
-                key: terminal_callback_key(frame.surface, target_format),
+                key: TerminalCallbackKey {
+                    renderer: renderer_id.value,
+                    target_format,
+                },
+                lifetime: Arc::clone(&renderer_id.lifetime),
                 frame: frame.clone(),
                 view,
             },
@@ -234,8 +241,8 @@ fn has_wgpu_draw_commands(commands: &[TerminalRenderCommand]) -> bool {
 }
 
 struct TerminalRenderCallback {
-    target_format: wgpu::TextureFormat,
     key: TerminalCallbackKey,
+    lifetime: Arc<()>,
     frame: TerminalRenderFrame,
     view: ViewTransform,
 }
@@ -262,17 +269,21 @@ impl egui_wgpu::CallbackTrait for TerminalRenderCallback {
             renderers,
             text_builder,
         } = cache;
-        renderers
+        renderers.retain(|_, cached| cached.is_alive());
+        let cached = renderers
             .entry(self.key)
-            .or_insert_with(|| TerminalWgpuRenderer::new(device, self.target_format))
-            .prepare_terminal_frame_with_text_builder(
-                device,
-                queue,
-                text_builder,
-                &self.frame,
-                screen_descriptor.pixels_per_point,
-                self.view,
-            );
+            .or_insert_with(|| CachedTerminalRenderer {
+                renderer: TerminalWgpuRenderer::new(device, self.key.target_format),
+                lifetime: Arc::downgrade(&self.lifetime),
+            });
+        cached.renderer.prepare_terminal_frame_with_text_builder(
+            device,
+            queue,
+            text_builder,
+            &self.frame,
+            screen_descriptor.pixels_per_point,
+            self.view,
+        );
         Vec::new()
     }
 
@@ -285,15 +296,26 @@ impl egui_wgpu::CallbackTrait for TerminalRenderCallback {
         let Some(cache) = callback_resources.get::<TerminalWgpuRendererCache>() else {
             return;
         };
-        if let Some(renderer) = cache.renderers.get(&self.key) {
-            renderer.paint(render_pass);
+        if let Some(cached) = cache.renderers.get(&self.key) {
+            cached.renderer.paint(render_pass);
         };
     }
 }
 
 struct TerminalWgpuRendererCache {
-    renderers: HashMap<TerminalCallbackKey, TerminalWgpuRenderer>,
+    renderers: HashMap<TerminalCallbackKey, CachedTerminalRenderer>,
     text_builder: TextAtlasBuilder,
+}
+
+struct CachedTerminalRenderer {
+    renderer: TerminalWgpuRenderer,
+    lifetime: Weak<()>,
+}
+
+impl CachedTerminalRenderer {
+    fn is_alive(&self) -> bool {
+        self.lifetime.strong_count() > 0
+    }
 }
 
 impl Default for TerminalWgpuRendererCache {
@@ -305,26 +327,32 @@ impl Default for TerminalWgpuRendererCache {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct TerminalCallbackKey {
-    target_format: wgpu::TextureFormat,
-    min_x: u32,
-    min_y: u32,
-    max_x: u32,
-    max_y: u32,
+#[derive(Clone, Debug)]
+pub struct TerminalRendererId {
+    value: u64,
+    lifetime: Arc<()>,
 }
 
-fn terminal_callback_key(
-    surface: SurfaceRect,
-    target_format: wgpu::TextureFormat,
-) -> TerminalCallbackKey {
-    TerminalCallbackKey {
-        target_format,
-        min_x: surface.min_x.to_bits(),
-        min_y: surface.min_y.to_bits(),
-        max_x: surface.max_x.to_bits(),
-        max_y: surface.max_y.to_bits(),
+impl TerminalRendererId {
+    pub fn unique() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        Self {
+            value: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            lifetime: Arc::new(()),
+        }
     }
+}
+
+impl Default for TerminalRendererId {
+    fn default() -> Self {
+        Self::unique()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TerminalCallbackKey {
+    renderer: u64,
+    target_format: wgpu::TextureFormat,
 }
 
 struct TerminalBackgroundFrameResources {
@@ -405,6 +433,21 @@ struct PreparedTerminalFrameCache {
     // Atlas growth shifts every glyph's UVs, so a stale count must invalidate the cached vertices.
     atlas_resized_count: u64,
     vertex_count: u32,
+}
+
+impl PreparedTerminalFrameCache {
+    fn matches(
+        &self,
+        frame: &TerminalRenderFrame,
+        pixels_per_point_bits: u32,
+        view_bits: [u32; 3],
+        atlas_resized_count: u64,
+    ) -> bool {
+        self.pixels_per_point_bits == pixels_per_point_bits
+            && self.view_bits == view_bits
+            && self.atlas_resized_count == atlas_resized_count
+            && self.frame == *frame
+    }
 }
 
 const PREPARED_FRAME_CACHE_MISS_COOLDOWN: u8 = 8;
@@ -534,11 +577,7 @@ impl TerminalWgpuRenderer {
             self.prepared_frame_cache_cooldown -= 1;
             update_frame_cache = self.prepared_frame_cache_cooldown == 0;
         } else if let Some(cache) = &self.prepared_frame_cache {
-            if cache.pixels_per_point_bits == pixels_per_point_bits
-                && cache.view_bits == view_bits
-                && cache.atlas_resized_count == atlas_resized_count
-                && cache.frame == *frame
-            {
+            if cache.matches(frame, pixels_per_point_bits, view_bits, atlas_resized_count) {
                 return cache.vertex_count;
             }
             self.prepared_frame_cache_cooldown = PREPARED_FRAME_CACHE_MISS_COOLDOWN;

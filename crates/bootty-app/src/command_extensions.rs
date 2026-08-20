@@ -3,19 +3,20 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 use crate::{
     commands::{
-        ArgumentSchema, CommandCancellation, CommandCatalog, CommandDescriptor, CommandInvocation,
-        CommandOutcome, CompactSchema, MutationClass, ResourceKind, ValueType,
+        AppCommandSendError, ArgumentSchema, BoundAppCommandSender, Caller, CommandCancellation,
+        CommandCatalog, CommandDescriptor, CommandInvocation, CommandOutcome, CompactSchema,
+        MutationClass, ResourceKind, ValueType,
     },
     control::ControlPlane,
 };
-use mlua::{Function, Lua, RegistryKey, Table, Value as LuaValue};
+use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -34,9 +35,16 @@ struct Invocation {
     response: mpsc::Sender<CommandOutcome>,
 }
 
+#[derive(Clone)]
+struct ActiveInvocation {
+    deadline: Instant,
+    cancellation: CommandCancellation,
+}
+
 pub struct CommandExtensionHost {
     root: PathBuf,
     catalog: Arc<CommandCatalog>,
+    commands: BoundAppCommandSender,
     plane: ControlPlane,
     workers: Vec<thread::JoinHandle<()>>,
     fingerprint: u64,
@@ -44,10 +52,16 @@ pub struct CommandExtensionHost {
 }
 
 impl CommandExtensionHost {
-    pub fn load(root: &Path, catalog: Arc<CommandCatalog>, plane: ControlPlane) -> Self {
+    pub fn load(
+        root: &Path,
+        catalog: Arc<CommandCatalog>,
+        commands: BoundAppCommandSender,
+        plane: ControlPlane,
+    ) -> Self {
         let mut host = Self {
             root: root.to_owned(),
             catalog,
+            commands,
             plane,
             workers: Vec::new(),
             fingerprint: 0,
@@ -100,8 +114,9 @@ impl CommandExtensionHost {
         let id = manifest.id.clone();
         let worker_id = id.clone();
         let plane = self.plane.clone();
+        let commands = self.commands.clone();
         let thread = thread::Builder::new()
-            .spawn(move || run_package(worker_id, source, rx, ready_tx, plane))
+            .spawn(move || run_package(worker_id, source, rx, ready_tx, commands, plane))
             .map_err(|error| error.to_string())?;
         let descriptors = ready_rx
             .recv()
@@ -185,16 +200,20 @@ fn run_package(
     source: String,
     rx: mpsc::Receiver<Invocation>,
     ready: mpsc::SyncSender<Result<Vec<CommandDescriptor>, String>>,
+    commands: BoundAppCommandSender,
     plane: ControlPlane,
 ) {
     let lua = Lua::new();
     let handlers = Arc::new(std::sync::Mutex::new(BTreeMap::<String, RegistryKey>::new()));
     let descriptors = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let active = Arc::new(Mutex::new(None));
     let setup = install_host_interface(
         &lua,
         &id,
         Arc::clone(&handlers),
         Arc::clone(&descriptors),
+        Arc::clone(&active),
+        commands,
         plane,
     )
     .and_then(|()| lua.load(&source).set_name(&id).exec());
@@ -211,7 +230,7 @@ fn run_package(
     }
     while let Ok(work) = rx.recv() {
         let response = work.response.clone();
-        let _ = response.send(invoke_handler(&lua, &handlers, work));
+        let _ = response.send(invoke_handler(&lua, &handlers, &active, work));
     }
 }
 
@@ -220,6 +239,8 @@ fn install_host_interface(
     id: &str,
     handlers: Arc<std::sync::Mutex<BTreeMap<String, RegistryKey>>>,
     descriptors: Arc<std::sync::Mutex<Vec<CommandDescriptor>>>,
+    active: Arc<Mutex<Option<ActiveInvocation>>>,
+    app_commands: BoundAppCommandSender,
     plane: ControlPlane,
 ) -> mlua::Result<()> {
     let bootty = lua.create_table()?;
@@ -239,6 +260,29 @@ fn install_host_interface(
                 .map_err(|_| mlua::Error::runtime("extension descriptor lock poisoned"))?
                 .push(descriptor);
             Ok(())
+        })?,
+    )?;
+    commands.set(
+        "invoke",
+        lua.create_function(move |lua, spec: Table| {
+            let active = active
+                .lock()
+                .map_err(|_| mlua::Error::runtime("extension invocation lock poisoned"))?
+                .clone()
+                .ok_or_else(|| {
+                    mlua::Error::runtime(
+                        "bootty.commands.invoke is available only inside a command handler",
+                    )
+                })?;
+            let mut value = lua_value(LuaValue::Table(spec), 0)?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                mlua::Error::runtime("bootty.commands.invoke needs a command table")
+            })?;
+            object.insert("caller".to_owned(), json!(Caller::Luau));
+            let invocation = serde_json::from_value(value)
+                .map_err(|error| mlua::Error::runtime(error.to_string()))?;
+            let outcome = submit_app_command(&app_commands, invocation, active);
+            lua.to_value(&outcome)
         })?,
     )?;
     bootty.set("commands", commands)?;
@@ -271,6 +315,7 @@ fn install_host_interface(
 fn invoke_handler(
     lua: &Lua,
     handlers: &std::sync::Mutex<BTreeMap<String, RegistryKey>>,
+    active: &Mutex<Option<ActiveInvocation>>,
     work: Invocation,
 ) -> CommandOutcome {
     if work.cancellation.is_cancelled() {
@@ -284,6 +329,13 @@ fn invoke_handler(
             message: "extension command deadline expired".to_owned(),
         }
     } else {
+        let context = ActiveInvocation {
+            deadline: work.deadline,
+            cancellation: work.cancellation.clone(),
+        };
+        if let Ok(mut active) = active.lock() {
+            *active = Some(context);
+        }
         let result = handlers
             .lock()
             .map_err(|_| "extension handler lock poisoned".to_owned())
@@ -305,6 +357,9 @@ fn invoke_handler(
                     .call::<LuaValue>(context)
                     .map_err(|error| error.to_string())
             });
+        if let Ok(mut active) = active.lock() {
+            *active = None;
+        }
         match result {
             Ok(value) => match lua_value(value, 0) {
                 Ok(value) => CommandOutcome::Success {
@@ -320,6 +375,54 @@ fn invoke_handler(
                 code: "extension_failed".to_owned(),
                 message,
             },
+        }
+    }
+}
+
+fn submit_app_command(
+    commands: &BoundAppCommandSender,
+    invocation: CommandInvocation,
+    active: ActiveInvocation,
+) -> CommandOutcome {
+    let receiver = match commands.submit(invocation, active.deadline, active.cancellation.clone()) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            return match error {
+                AppCommandSendError::Overloaded => CommandOutcome::Failed {
+                    code: "overloaded".to_owned(),
+                    message: "application command queue is overloaded".to_owned(),
+                },
+                AppCommandSendError::Shutdown => CommandOutcome::Failed {
+                    code: "shutdown".to_owned(),
+                    message: "application command channel shut down".to_owned(),
+                },
+            };
+        }
+    };
+    loop {
+        if active.cancellation.is_cancelled() {
+            return CommandOutcome::Failed {
+                code: "cancelled".to_owned(),
+                message: "command was cancelled".to_owned(),
+            };
+        }
+        let remaining = active.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            active.cancellation.cancel();
+            return CommandOutcome::Failed {
+                code: "deadline_exceeded".to_owned(),
+                message: "command deadline expired".to_owned(),
+            };
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(5))) {
+            Ok(outcome) => return outcome,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return CommandOutcome::Failed {
+                    code: "shutdown".to_owned(),
+                    message: "application command response channel closed".to_owned(),
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }

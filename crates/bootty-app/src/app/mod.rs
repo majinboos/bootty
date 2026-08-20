@@ -1,6 +1,12 @@
 mod command_runtime;
+mod mux_config;
+#[cfg(test)]
+mod mux_config_tests;
 mod state;
+mod terminal_config;
 mod workspace_runtime;
+
+use terminal_config::terminal_text_config;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -361,7 +367,7 @@ impl BoottyApp {
         let repaint_ctx = cc.egui_ctx.clone();
         let repaint: crate::mux::RepaintHandle =
             std::sync::Arc::new(move || repaint_ctx.request_repaint());
-        let text_config = config.font.terminal_text_config();
+        let text_config = terminal_text_config(&config.font);
         let target_format = cc
             .wgpu_render_state
             .as_ref()
@@ -398,6 +404,7 @@ impl BoottyApp {
         let command_extensions = crate::command_extensions::CommandExtensionHost::load(
             &config_dir.join("extensions"),
             state.command_catalog(),
+            state.app_command_sender(Caller::Luau),
             control_plane.clone(),
         );
         Ok(Self {
@@ -964,7 +971,17 @@ impl BoottyApp {
             "primary-terminal",
             self.state.terminal_mut(),
         ) {
-            Ok(surface) => self.state.record_surface(surface),
+            Ok(output) => {
+                if output.viewport_scroll_delta != 0
+                    && let Err(error) = self
+                        .state
+                        .terminal_mut()
+                        .scroll_viewport_delta(output.viewport_scroll_delta)
+                {
+                    self.state.record_render_error(error);
+                }
+                self.state.record_surface(output.surface);
+            }
             Err(error) => self.state.record_render_error(error),
         }
         paint_pane_corner_masks(ui.painter(), rect, corner_radius_px, background);
@@ -1075,12 +1092,26 @@ impl BoottyApp {
                         .with_text_config(terminal_text_config.clone())
                 });
                 widget.set_terminal_cursor_icon(*terminal_cursor_icon);
-                state.render_source_for_pane(pane_id).map(|source| {
-                    widget.show_at_rect(ui, *rect, ("native-pane", &widget_key), source)
+                state.terminal_runtime_for_pane(pane_id).map(|source| {
+                    let output =
+                        widget.show_at_rect(ui, *rect, ("native-pane", &widget_key), source)?;
+                    if output.viewport_scroll_delta != 0 {
+                        source.scroll_viewport_delta(output.viewport_scroll_delta)?;
+                    }
+                    Ok(output)
                 })
             };
             match result {
-                Some(Ok(surface)) if is_focused => state.record_surface(surface),
+                Some(Ok(output)) if is_focused => {
+                    if output.viewport_scroll_delta != 0
+                        && let Err(error) = state
+                            .terminal_mut()
+                            .scroll_viewport_delta(output.viewport_scroll_delta)
+                    {
+                        state.record_render_error(error);
+                    }
+                    state.record_surface(output.surface);
+                }
                 Some(Ok(_)) | None => {}
                 Some(Err(error)) => state.record_render_error(error),
             }

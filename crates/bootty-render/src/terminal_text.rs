@@ -3,7 +3,8 @@ use crate::{
     paint_plan::{TerminalPaintPlan, TextAttrs, TextRun},
     terminal_sprite::{SpriteFamily, SpriteGlyph, SpriteRegistry},
 };
-use std::{fmt, sync::Arc};
+pub use bootty_font::FontFeature;
+use std::sync::Arc;
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -278,131 +279,8 @@ struct CodepointFontEntry {
     family: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct FontFeature {
-    tag: [u8; 4],
-    value: u32,
-}
-
-impl FontFeature {
-    pub const fn new(tag: [u8; 4], value: u32) -> Self {
-        Self { tag, value }
-    }
-
-    pub fn parse(setting: &str) -> Option<Self> {
-        let setting = setting.split_once(',').map_or(setting, |(head, _)| head);
-        parse_font_feature_setting(setting)
-    }
-
-    pub fn tag(self) -> [u8; 4] {
-        self.tag
-    }
-
-    pub fn value(self) -> u32 {
-        self.value
-    }
-
-    fn tag_str(self) -> String {
-        String::from_utf8_lossy(&self.tag).into_owned()
-    }
-}
-
-impl fmt::Display for FontFeature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.value <= 1 {
-            f.write_str(if self.value == 0 { "-" } else { "+" })?;
-            f.write_str(&self.tag_str())
-        } else {
-            write!(f, "{}={}", self.tag_str(), self.value)
-        }
-    }
-}
-
 pub fn default_font_features() -> Vec<FontFeature> {
     vec![FontFeature::new(*b"liga", 1)]
-}
-
-pub fn parse_font_features(settings: &str) -> Vec<FontFeature> {
-    settings
-        .split(',')
-        .filter_map(parse_font_feature_setting)
-        .collect()
-}
-
-fn parse_font_feature_setting(setting: &str) -> Option<FontFeature> {
-    let bytes = setting.as_bytes();
-    let mut index = skip_space(bytes, 0);
-    let mut prefixed_value = None;
-    match bytes.get(index).copied() {
-        Some(b'+') => {
-            prefixed_value = Some(1);
-            index += 1;
-        }
-        Some(b'-') => {
-            prefixed_value = Some(0);
-            index += 1;
-        }
-        _ => {}
-    }
-
-    let mut tag = [0_u8; 4];
-    let mut len = 0_usize;
-    while let Some(byte) = bytes.get(index).copied() {
-        if byte == b'\'' || byte == b'"' {
-            index += 1;
-            continue;
-        }
-        if len == 4 || byte == b' ' || byte == b'\t' || byte == b'=' || byte == b',' {
-            break;
-        }
-        tag[len] = byte;
-        len += 1;
-        index += 1;
-    }
-    if len != 4 {
-        return None;
-    }
-
-    let mut rest = &setting[index..];
-    loop {
-        let trimmed = rest.trim_start_matches([' ', '\t', '\'', '"']);
-        if trimmed.len() == rest.len() {
-            break;
-        }
-        rest = trimmed;
-    }
-
-    let value = if let Some(value) = prefixed_value {
-        if rest.trim_matches([' ', '\t']).is_empty() {
-            value
-        } else {
-            return None;
-        }
-    } else if rest.trim_matches([' ', '\t']).is_empty() {
-        1
-    } else {
-        let rest = rest.trim_start_matches([' ', '\t']);
-        let rest = rest.strip_prefix('=').map_or(rest, |value| value);
-        parse_font_feature_value(rest.trim_matches([' ', '\t']))?
-    };
-
-    Some(FontFeature { tag, value })
-}
-
-fn parse_font_feature_value(value: &str) -> Option<u32> {
-    match value {
-        "on" | "ON" | "On" => Some(1),
-        "off" | "OFF" | "Off" => Some(0),
-        _ if value.bytes().all(|byte| byte.is_ascii_digit()) => value.parse().ok(),
-        _ => None,
-    }
-}
-
-fn skip_space(bytes: &[u8], mut index: usize) -> usize {
-    while matches!(bytes.get(index), Some(b' ' | b'\t')) {
-        index += 1;
-    }
-    index
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -693,17 +571,20 @@ pub enum NativeSymbolClass {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TerminalTextContract {
-    pub config: TerminalTextConfig,
-    pub resolver: FontResolver,
-    pub native_symbol_policy: NativeSymbolPolicy,
-    pub sprite_registry: SpriteRegistry,
+    pub(crate) config: TerminalTextConfig,
+    pub(crate) font_features: Arc<[FontFeature]>,
+    pub(crate) resolver: FontResolver,
+    pub(crate) native_symbol_policy: NativeSymbolPolicy,
+    pub(crate) sprite_registry: SpriteRegistry,
 }
 
 impl TerminalTextContract {
     pub fn new(config: TerminalTextConfig, native_symbol_policy: NativeSymbolPolicy) -> Self {
         let resolver = FontResolver::new(config.clone());
+        let font_features = Arc::from(config.font_features.clone());
         Self {
             config,
+            font_features,
             resolver,
             native_symbol_policy,
             sprite_registry: SpriteRegistry::prompt_graphics(),
@@ -984,71 +865,6 @@ mod tests {
         assert!(!config.fit_cell_width);
         assert_eq!(config.baseline_adjustment, 3.0);
         assert_eq!(config.font_features, vec![FontFeature::new(*b"liga", 1)]);
-    }
-
-    #[test]
-    fn font_feature_settings_match_upstream_harfbuzz_syntax() {
-        let kern_on = FontFeature::new(*b"kern", 1);
-        for setting in [
-            "kern",
-            "kern, ",
-            "kern on",
-            "kern on, ",
-            "+kern",
-            "+kern, ",
-            "\"kern\" = 1",
-            "\"kern\" = 1, ",
-        ] {
-            assert_eq!(FontFeature::parse(setting), Some(kern_on), "{setting}");
-        }
-
-        let kern_off = FontFeature::new(*b"kern", 0);
-        for setting in [
-            "kern off",
-            "kern off, ",
-            "-'kern'",
-            "-'kern', ",
-            "\"kern\" = 0",
-            "\"kern\" = 0, ",
-        ] {
-            assert_eq!(FontFeature::parse(setting), Some(kern_off), "{setting}");
-        }
-
-        let aalt_2 = FontFeature::new(*b"aalt", 2);
-        for setting in ["aalt=2", "aalt=2, ", "'aalt' 2", "'aalt'\t2, "] {
-            assert_eq!(FontFeature::parse(setting), Some(aalt_2), "{setting}");
-        }
-
-        for invalid in [
-            "aalt=2x",
-            "toolong",
-            "sht",
-            "-kern 1",
-            "-kern on",
-            "aalt=o,",
-            "aalt=ofn,",
-        ] {
-            assert_eq!(FontFeature::parse(invalid), None, "{invalid}");
-        }
-
-        let features = parse_font_features(
-            "  kern, kern on , +kern, \"kern\"  = 1,\
-             kern    off, -'kern' , \"kern\"=0,\
-             aalt=2,  'aalt'\t2,\
-             aalt=2x, toolong, sht, -kern 1, -kern on, aalt=o, aalt=ofn,\
-             last",
-        );
-        let expected = [
-            vec![kern_on; 4],
-            vec![kern_off; 3],
-            vec![aalt_2; 2],
-            vec![FontFeature::new(*b"last", 1)],
-        ]
-        .concat();
-        assert_eq!(features, expected);
-        assert_eq!(kern_on.to_string(), "+kern");
-        assert_eq!(kern_off.to_string(), "-kern");
-        assert_eq!(aalt_2.to_string(), "aalt=2");
     }
 
     #[test]

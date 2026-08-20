@@ -145,6 +145,7 @@ impl TerminalRenderFrame {
                 RunFont {
                     face,
                     font_size: text_contract.config.font_size,
+                    font_features: Arc::clone(&text_contract.font_features),
                 },
                 text_pool,
             );
@@ -174,6 +175,7 @@ impl TerminalRenderFrame {
                         RunFont {
                             face,
                             font_size: text_contract.config.font_size,
+                            font_features: Arc::clone(&text_contract.font_features),
                         },
                         text_pool,
                     );
@@ -207,6 +209,7 @@ impl TerminalRenderFrame {
                 RunFont {
                     face,
                     font_size: text_contract.config.font_size,
+                    font_features: Arc::clone(&text_contract.font_features),
                 },
                 text_pool,
             );
@@ -282,6 +285,7 @@ impl TerminalRenderFrame {
             attrs: run.attrs,
             face: font.face,
             font_size: font.font_size,
+            font_features: font.font_features,
         }));
     }
 
@@ -407,6 +411,7 @@ struct TextCellSpan {
 struct RunFont {
     face: Arc<ResolvedFontFace>,
     font_size: f32,
+    font_features: Arc<[crate::terminal_text::FontFeature]>,
 }
 
 fn command_capacity_for_plan(plan: &TerminalPaintPlan, images: &KittyImageFrame) -> usize {
@@ -471,6 +476,7 @@ pub struct TextCommand {
     pub attrs: TextAttrs,
     pub face: Arc<ResolvedFontFace>,
     pub font_size: f32,
+    pub font_features: Arc<[crate::terminal_text::FontFeature]>,
 }
 
 impl PartialEq for TextCommand {
@@ -482,6 +488,7 @@ impl PartialEq for TextCommand {
             && self.text == other.text
             && self.attrs == other.attrs
             && self.font_size == other.font_size
+            && self.font_features == other.font_features
             && (Arc::ptr_eq(&self.face, &other.face) || self.face == other.face)
     }
 }
@@ -590,6 +597,10 @@ mod tests {
             TerminalRenderCommand::Text(command) => {
                 assert_eq!(command.text, "ab");
                 assert_eq!(
+                    command.font_features.as_ref(),
+                    [crate::terminal_text::FontFeature::new(*b"liga", 1)]
+                );
+                assert_eq!(
                     command.rect,
                     SurfaceRect::from_min_size(0.0, 0.0, 20.0, 10.0)
                 );
@@ -616,6 +627,38 @@ mod tests {
             }
             command => panic!("expected trailing text command, got {command:?}"),
         }
+    }
+
+    #[test]
+    fn explicit_empty_font_policy_reaches_every_text_command() {
+        let plan = TerminalPaintPlan {
+            surface: SurfaceRect::from_min_size(0.0, 0.0, 30.0, 20.0),
+            default_background: color(0),
+            backgrounds: Vec::new(),
+            text_runs: vec![TextRun {
+                rect: SurfaceRect::from_min_size(0.0, 0.0, 30.0, 20.0),
+                cell_rect: SurfaceRect::from_min_size(0.0, 0.0, 30.0, 20.0),
+                cells: 3,
+                text: "abc".to_owned(),
+                attrs: attrs(),
+            }],
+            decorations: Vec::new(),
+            cursor: None,
+        };
+        let contract = TerminalTextContract::new(
+            TerminalTextConfig {
+                font_features: Vec::new(),
+                ..TerminalTextConfig::default()
+            },
+            NativeSymbolPolicy::terminal_glyph_primitives(),
+        );
+
+        let frame = TerminalRenderFrame::from_plan(&plan, &contract);
+
+        assert!(frame.commands.iter().all(|command| match command {
+            TerminalRenderCommand::Text(command) => command.font_features.is_empty(),
+            _ => true,
+        }));
     }
 
     #[test]

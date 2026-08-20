@@ -3,7 +3,6 @@
 use std::{fmt, io::Read, process::ExitCode};
 
 use anyhow::{Context, Result};
-#[cfg(target_os = "macos")]
 use bootty_app::application_identity::ApplicationIdentity;
 use bootty_app::{
     cli::{Cli, Command, RemoteSpaceCommand},
@@ -50,6 +49,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<()> {
+    let identity = ApplicationIdentity::current();
+    bootty_mux::prepare_local_rmux_daemon(identity)?;
     if let Some(code) = bootty_mux::run_embedded_rmux_daemon()? {
         std::process::exit(code);
     }

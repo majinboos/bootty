@@ -9,8 +9,8 @@ use bootty_app::{
     terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
     terminal_wgpu::{
-        TerminalWgpuRenderer, terminal_background_draws, terminal_cursor_draws,
-        terminal_decoration_draws, terminal_render_callback, terminal_sprite_draws,
+        TerminalRendererId, TerminalWgpuRenderer, terminal_background_draws, terminal_cursor_draws,
+        terminal_decoration_draws, terminal_render_callback_for_renderer, terminal_sprite_draws,
         terminal_text_draws,
     },
 };
@@ -527,7 +527,8 @@ fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
         ("image-only", image_only_frame()),
         ("cursor-only", cursor_frame(CursorShape::Block)),
     ] {
-        let shape = terminal_render_callback(
+        let shape = terminal_render_callback_for_renderer(
+            TerminalRendererId::unique(),
             &frame,
             eframe::wgpu::TextureFormat::Rgba8Unorm,
             ViewTransform::IDENTITY,

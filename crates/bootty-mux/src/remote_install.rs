@@ -10,7 +10,7 @@ use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
-use crate::{process::CommandRunner, ssh::SshRemote};
+use crate::{process::CommandRunner, ssh::SshRemote, tmux_protocol::shell_quote};
 
 const REPOSITORY_OWNER: &str = "majindotboo";
 const REPOSITORY_NAME: &str = "bootty";
@@ -245,10 +245,13 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
     let target = detect_target(remote, runner)?;
     let daemon = artifacts.daemon(target)?;
     let installed = remote_daemon_path();
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    let temporary = format!("{installed}.{}-{nonce}.upload", std::process::id());
+    let mut generation = [0_u8; 16];
+    getrandom::fill(&mut generation).context("allocate remote daemon candidate generation")?;
+    let generation = u128::from_ne_bytes(generation);
+    let temporary = format!(
+        "{installed}.{}-{generation:032x}.upload",
+        std::process::id()
+    );
     let create = if target.is_unix() {
         format!("mkdir -p {REMOTE_DAEMON_DIRECTORY}")
     } else {
@@ -257,20 +260,40 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
     require_remote_success(remote, runner, &create, "create remote daemon directory")?;
 
     let (program, args) = remote.scp_command(&daemon, &temporary);
-    let output = runner.run(&program, &args)?;
-    if !output.success {
-        bail!("upload Bootty daemon: {}", first_error(&output.stderr))
+    match runner.run(&program, &args) {
+        Ok(output) if output.success => {}
+        Ok(output) => {
+            remove_remote_candidate(target, remote, runner, &temporary);
+            bail!("upload Bootty daemon: {}", first_error(&output.stderr))
+        }
+        Err(error) => {
+            remove_remote_candidate(target, remote, runner, &temporary);
+            return Err(error).context("upload Bootty daemon");
+        }
     }
-    if target.is_unix() {
-        require_remote_success(
+    if target.is_unix()
+        && let Err(error) = require_remote_success(
             remote,
             runner,
             &format!("chmod 700 {temporary}"),
             "make remote daemon executable",
-        )?;
+        )
+    {
+        remove_remote_candidate(target, remote, runner, &temporary);
+        return Err(error);
+    }
+
+    let candidate = if target.is_unix() {
+        candidate_ping(remote, runner, &temporary)
+    } else {
+        Ok(())
+    };
+    if let Err(error) = candidate {
+        remove_remote_candidate(target, remote, runner, &temporary);
+        return Err(error);
     }
     let promote = if target.is_unix() {
-        format!("ln {temporary} {installed} && rm -f {temporary}")
+        unix_publish_command(&temporary, installed)
     } else {
         format!(
             "cmd.exe /d /s /c \"move /-y {} {} <nul >nul\"",
@@ -279,8 +302,15 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
         )
     };
     let (program, args) = remote.raw_command(&promote);
-    let output = runner.run(&program, &args)?;
+    let output = match runner.run(&program, &args) {
+        Ok(output) => output,
+        Err(error) => {
+            remove_remote_candidate(target, remote, runner, &temporary);
+            return Err(error).context("publish Bootty daemon");
+        }
+    };
     if !output.success {
+        remove_remote_candidate(target, remote, runner, &temporary);
         let (program, args) = remote.ping_command();
         if !daemon_matches(&runner.run(&program, &args)?) {
             bail!("install Bootty daemon: {}", first_error(&output.stderr))
@@ -299,6 +329,43 @@ fn ensure_with<R: CommandRunner, A: ArtifactProvider>(
         )
     }
     Ok(())
+}
+
+fn unix_publish_command(temporary: &str, installed: &str) -> String {
+    format!(
+        "mv -f {} {}",
+        shell_quote(temporary),
+        shell_quote(installed)
+    )
+}
+
+fn candidate_ping<R: CommandRunner>(remote: &SshRemote, runner: &R, temporary: &str) -> Result<()> {
+    let command = format!("{} remote-ping", shell_quote(&format!("./{temporary}")));
+    let (program, args) = remote.raw_command(&command);
+    let output = runner.run(&program, &args)?;
+    if daemon_matches(&output) {
+        return Ok(());
+    }
+    bail!(
+        "uploaded Bootty daemon on {} did not start with protocol {}: {}",
+        remote.host(),
+        crate::ssh::REMOTE_DAEMON_PROTOCOL_VERSION,
+        first_error(&output.stderr)
+    )
+}
+
+fn remove_remote_candidate<R: CommandRunner>(
+    target: RemoteTarget,
+    remote: &SshRemote,
+    runner: &R,
+    temporary: &str,
+) {
+    if !target.is_unix() {
+        return;
+    }
+    let command = format!("rm -f {}", shell_quote(temporary));
+    let (program, args) = remote.raw_command(&command);
+    let _ = runner.run(&program, &args);
 }
 
 fn daemon_matches(output: &crate::process::CommandOutput) -> bool {
@@ -380,7 +447,7 @@ mod tests {
         time::Duration,
     };
 
-    use bootty_config::config::SshRemoteConfig;
+    use bootty_mux_model::SshTarget;
 
     use super::*;
     use crate::process::CommandOutput;
@@ -532,6 +599,9 @@ mod tests {
             fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput> {
                 let command = args.last().map(String::as_str).unwrap_or_default();
                 if command.ends_with("remote-ping") {
+                    if command.contains(".upload") {
+                        return Ok(ping_output());
+                    }
                     return Ok(if self.installed.load(Ordering::SeqCst) {
                         ping_output()
                     } else {
@@ -541,7 +611,7 @@ mod tests {
                 if command == "uname -s && uname -m" {
                     return Ok(output(true, "Linux\nx86_64\n"));
                 }
-                if command.contains("ln .bootty/bin/bootty-daemon-") {
+                if command.contains("mv -f") {
                     self.promotions.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(20));
                     self.installed.store(true, Ordering::SeqCst);
@@ -562,7 +632,7 @@ mod tests {
                 let runner = runner.clone();
                 std::thread::spawn(move || {
                     ensure_with(
-                        &SshRemote::new(SshRemoteConfig::for_host("lab")),
+                        &SshRemote::new(SshTarget::for_host("lab")),
                         runner.as_ref(),
                         &Artifacts { path: daemon },
                     )
@@ -587,12 +657,13 @@ mod tests {
                 output(true, ""),
                 output(true, ""),
                 output(true, ""),
+                ping_output(),
                 output(true, ""),
                 ping_output(),
             ])),
             calls: RefCell::new(Vec::new()),
         };
-        let remote = SshRemote::new(SshRemoteConfig::for_host("lab"));
+        let remote = SshRemote::new(SshTarget::for_host("lab"));
 
         ensure_with(
             &remote,
@@ -604,7 +675,7 @@ mod tests {
         .expect("install daemon");
 
         let calls = runner.calls.into_inner();
-        assert_eq!(calls.len(), 8);
+        assert_eq!(calls.len(), 9);
         assert!(calls[4].0.ends_with("scp"));
         assert!(calls[4].1.last().expect("destination").contains(&format!(
             "{}.{}-",
@@ -618,11 +689,19 @@ mod tests {
                 .expect("chmod command")
                 .contains("chmod 700")
         );
-        let promotion = calls[6].1.last().expect("promotion command");
-        assert!(promotion.contains(&format!("ln {}.", remote_daemon_path())));
+        let candidate_ping = calls[6].1.last().expect("candidate ping command");
+        assert!(candidate_ping.contains("remote-ping"));
+        assert!(candidate_ping.contains(".upload"));
+        let promotion = calls[7].1.last().expect("promotion command");
+        assert!(promotion.contains("mv -f"));
         assert!(promotion.contains(remote_daemon_path()));
-        assert!(!promotion.contains("mv -f"));
-        assert!(calls[7].1.last().expect("ping").contains("remote-ping"));
+        assert!(
+            calls[8]
+                .1
+                .last()
+                .expect("installed ping")
+                .contains("remote-ping")
+        );
     }
 
     #[test]
@@ -637,14 +716,16 @@ mod tests {
                     output(true, ""),
                     output(true, ""),
                     output(true, ""),
+                    ping_output(),
                     output(false, ""),
+                    output(true, ""),
                     winner,
                 ])),
                 calls: RefCell::new(Vec::new()),
             };
 
             let result = ensure_with(
-                &SshRemote::new(SshRemoteConfig::for_host("lab")),
+                &SshRemote::new(SshTarget::for_host("lab")),
                 &runner,
                 &Artifacts {
                     path: daemon.path().to_owned(),
@@ -656,10 +737,149 @@ mod tests {
                 runner.calls.borrow()[6]
                     .1
                     .last()
+                    .expect("candidate ping")
+                    .contains("remote-ping")
+            );
+            assert!(
+                runner.calls.borrow()[7]
+                    .1
+                    .last()
                     .expect("promotion")
-                    .contains("ln ")
+                    .contains("mv -f")
+            );
+            assert!(
+                runner.calls.borrow()[8]
+                    .1
+                    .last()
+                    .expect("candidate cleanup")
+                    .contains("rm -f")
+            );
+            assert!(
+                runner.calls.borrow()[9]
+                    .1
+                    .last()
+                    .expect("installed ping")
+                    .contains("remote-ping")
             );
         }
+    }
+
+    #[test]
+    fn incompatible_unix_daemon_is_replaced_after_candidate_ping() {
+        let daemon = tempfile::NamedTempFile::new().expect("daemon");
+        let runner = Runner {
+            outputs: RefCell::new(VecDeque::from([
+                output(true, "1:old"),
+                output(true, "1:old"),
+                output(true, "Linux\nx86_64\n"),
+                output(true, ""),
+                output(true, ""),
+                output(true, ""),
+                ping_output(),
+                output(true, ""),
+                ping_output(),
+            ])),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        ensure_with(
+            &SshRemote::new(SshTarget::for_host("lab")),
+            &runner,
+            &Artifacts {
+                path: daemon.path().to_owned(),
+            },
+        )
+        .expect("replace old daemon");
+
+        let calls = runner.calls.into_inner();
+        assert!(
+            calls[6]
+                .1
+                .last()
+                .expect("candidate ping")
+                .contains("remote-ping")
+        );
+        assert!(
+            calls[6]
+                .1
+                .last()
+                .expect("candidate ping")
+                .contains(".upload")
+        );
+        assert!(calls[7].1.last().expect("promotion").contains("mv -f"));
+        assert!(
+            calls[8]
+                .1
+                .last()
+                .expect("installed ping")
+                .contains("remote-ping")
+        );
+    }
+
+    #[test]
+    fn bad_candidate_preserves_old_daemon_and_cleans_candidate() {
+        let daemon = tempfile::NamedTempFile::new().expect("daemon");
+        let runner = Runner {
+            outputs: RefCell::new(VecDeque::from([
+                output(true, "1:old"),
+                output(true, "1:old"),
+                output(true, "Linux\nx86_64\n"),
+                output(true, ""),
+                output(true, ""),
+                output(true, ""),
+                output(true, "0:bad"),
+                output(true, ""),
+            ])),
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let result = ensure_with(
+            &SshRemote::new(SshTarget::for_host("lab")),
+            &runner,
+            &Artifacts {
+                path: daemon.path().to_owned(),
+            },
+        );
+
+        assert!(result.is_err());
+        let calls = runner.calls.into_inner();
+        assert_eq!(calls.len(), 8);
+        assert!(calls[7].1.last().expect("cleanup").contains("rm -f"));
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| { args.last().is_some_and(|command| command.contains("mv -f")) })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_publication_replaces_the_path_without_changing_the_open_inode() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let installed = directory.path().join("installed daemon");
+        let candidate = directory.path().join("candidate daemon");
+        std::fs::write(&installed, b"old daemon").expect("old daemon");
+        std::fs::write(&candidate, b"new daemon").expect("new daemon");
+        let mut running_inode = std::fs::File::open(&installed).expect("open old daemon inode");
+
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(unix_publish_command(
+                candidate.to_str().expect("candidate path"),
+                installed.to_str().expect("installed path"),
+            ))
+            .status()
+            .expect("publish daemon");
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read(&installed).expect("installed daemon"),
+            b"new daemon"
+        );
+        let mut old_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut running_inode, &mut old_bytes)
+            .expect("read old daemon inode");
+        assert_eq!(old_bytes, b"old daemon");
     }
 
     #[test]
@@ -687,7 +907,7 @@ mod tests {
         let artifacts = TargetArtifacts(RefCell::new(None));
 
         ensure_with(
-            &SshRemote::new(SshRemoteConfig::for_host("windows")),
+            &SshRemote::new(SshTarget::for_host("windows")),
             &runner,
             &artifacts,
         )
@@ -695,8 +915,21 @@ mod tests {
 
         assert_eq!(artifacts.0.into_inner(), Some(RemoteTarget::WindowsX64));
         let calls = runner.calls.into_inner();
+        assert_eq!(calls.len(), 8);
+        assert!(!calls.iter().any(|(_, args)| {
+            args.last().is_some_and(|command| {
+                command.contains(".upload") && command.contains("remote-ping")
+            })
+        }));
         let promotion = calls[6].1.last().expect("promotion command");
         assert!(promotion.contains("move /-y"));
         assert!(!promotion.contains("move /y"));
+        assert!(
+            calls[7]
+                .1
+                .last()
+                .expect("installed ping")
+                .contains("remote-ping")
+        );
     }
 }

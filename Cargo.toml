@@ -56,6 +56,7 @@ egui = "0.35"
 egui_code_editor = "0.3.7"
 epaint_default_fonts = "0.35"
 fontdb = "0.23"
+getrandom = "0.3"
 iconflow = { version = "1", features = [
   "pack-bootstrap",
   "pack-lucide",
@@ -128,6 +129,7 @@ wgpu = { version = "29", default-features = false, features = [
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 embed-resource = "3.0.9"
 windows-sys = "0.61"
+winsafe = { version = "0.0.28", default-features = false, features = ["kernel"] }
 
 
 [profile.dev]
@@ -174,11 +176,16 @@ debug = false
 [dev-dependencies]
 anyhow.workspace = true
 bootty-app = { path = "crates/bootty-app" }
+bootty-config = { path = "crates/bootty-config" }
+bootty-font = { path = "crates/bootty-font" }
 bootty-mux = { path = "crates/bootty-mux" }
+bootty-mux-model = { path = "crates/bootty-mux-model" }
+clap.workspace = true
 egui.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
+toml_edit.workspace = true
 
 [dependencies]
 bootty-workspace-hack = { version = "0.1", path = "crates/bootty-workspace-hack" }

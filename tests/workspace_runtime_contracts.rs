@@ -37,6 +37,50 @@ fn frame(now: Instant) -> FrameInputs {
 }
 
 #[test]
+fn a_failed_placement_commit_preserves_the_live_and_durable_binding() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let repaint = Arc::new(|| {});
+    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    let space = state.space_summaries()[0].clone();
+    let database = directory.path().join("session-order.sqlite3");
+    let lock = Connection::open(&database).expect("open lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold workspace write lock");
+
+    assert!(!state.update_space_from_ui(
+        space.id,
+        &space.name,
+        &space.icon,
+        space.color,
+        space.tint_sidebar,
+        SpaceMuxOverride {
+            backend: Some(MultiplexerBackendConfig::Tmux),
+            remote: SpaceRemoteOverride::Local,
+        },
+    ));
+    assert_eq!(
+        state.multiplexer_backend(),
+        MultiplexerBackendConfig::Native
+    );
+
+    lock.execute_batch("ROLLBACK").expect("release write lock");
+    drop(lock);
+    let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
+    let binding = &reopened.spaces()[0].bindings()[0];
+    assert_eq!(binding.backend_override(), None);
+    assert_eq!(binding.remote_override(), &SpaceRemoteOverride::Inherit);
+}
+
+#[test]
 fn a_failed_session_membership_commit_preserves_the_live_runtime_and_database() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
@@ -368,4 +412,60 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
         .expect("second session name metadata");
     assert_eq!(record.session_name, "project-2");
     assert_eq!(record.display_name, "project");
+}
+
+#[test]
+fn a_corrected_ssh_profile_rebuilds_an_unavailable_binding() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        ..BoottyConfig::default()
+    };
+    let (mut repository, snapshot) =
+        WorkspaceRepository::open(&config_path).expect("workspace repository");
+    let space = &snapshot.spaces()[0];
+    let scope = space.bindings()[0].mux_scope();
+    repository
+        .update_space_and_binding(
+            scope,
+            space.name(),
+            space.icon(),
+            space.color(),
+            space.tint_sidebar(),
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Native),
+                remote: SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                    profile_id: "development".to_owned(),
+                    remote_space_id: "remote-space".to_owned(),
+                    remote_space_name: "Remote Space".to_owned(),
+                    backend: MultiplexerBackendConfig::Native,
+                }),
+            },
+        )
+        .expect("configure missing profile binding");
+
+    let repaint = Arc::new(|| {});
+    let mut state = AppState::new(config, repaint, None, None).expect("app state");
+    assert_eq!(
+        state.space_summaries()[0].error.as_deref(),
+        Some("SSH profile 'development' is unavailable")
+    );
+
+    std::fs::write(
+        &config_path,
+        r#"
+[ssh-profiles.development]
+name = "Development"
+host = "devbox"
+user = "dev"
+port = 2222
+program = "ssh-wrapper"
+args = ["-i", "key"]
+"#,
+    )
+    .expect("write corrected profile");
+
+    assert!(state.reload_config(&mut Vec::new()));
+    assert_eq!(state.space_summaries()[0].error, None);
 }

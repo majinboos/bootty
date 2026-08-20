@@ -5,6 +5,7 @@ edition.workspace = true
 [dependencies]
 ab_glyph.workspace = true
 anyhow.workspace = true
+bootty-font = { path = "../bootty-font" }
 eframe.workspace = true
 fontdb.workspace = true
 libghostty-vt.workspace = true

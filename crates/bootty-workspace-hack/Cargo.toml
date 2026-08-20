@@ -30,11 +30,13 @@ epaint = { version = "0.35", default-features = false, features = ["bytemuck", "
 flate2 = { version = "1", features = ["zlib-rs"] }
 font-types = { version = "0.11", default-features = false, features = ["bytemuck", "serde", "std"] }
 futures-util = { version = "0.3" }
+getrandom = { version = "0.3", default-features = false, features = ["std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 http = { version = "1" }
 libc = { version = "0.2", features = ["extra_traits"] }
 lock_api = { version = "0.4", features = ["arc_lock"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
 memchr = { version = "2" }
 miniz_oxide = { version = "0.8", features = ["simd"] }
 num-traits = { version = "0.2" }
@@ -88,6 +90,7 @@ core-foundation-sys = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
+half = { version = "2", features = ["num-traits"] }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["msl-out", "wgsl-in"] }
@@ -112,18 +115,23 @@ ahash = { version = "0.8" }
 arboard = { version = "3" }
 crossbeam-utils = { version = "0.8" }
 fastrand = { version = "2" }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+futures-core = { version = "0.3" }
+half = { version = "2", default-features = false, features = ["num-traits"] }
 indexmap = { version = "2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1" }
+quote = { version = "1" }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
+slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
+uuid = { version = "1" }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
 wgpu = { version = "29", default-features = false, features = ["gles", "parking_lot", "std", "vulkan", "wgsl"] }
 wgpu-core = { version = "29", features = ["gles", "portable-atomic", "renderdoc", "vulkan", "wgsl"] }
@@ -159,6 +167,7 @@ core-foundation-sys = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
+half = { version = "2", features = ["num-traits"] }
 image = { version = "0.25", default-features = false, features = ["png", "tiff"] }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["msl-out", "wgsl-in"] }
@@ -180,7 +189,7 @@ syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = fals
 
 [target.x86_64-pc-windows-gnu.dependencies]
 arboard = { version = "3" }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+half = { version = "2", default-features = false, features = ["num-traits"] }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["hlsl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
@@ -203,7 +212,7 @@ syn-f595c2ba2a3f28df = { package = "syn", version = "2", default-features = fals
 
 [target.x86_64-pc-windows-msvc.dependencies]
 arboard = { version = "3" }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+half = { version = "2", default-features = false, features = ["num-traits"] }
 indexmap = { version = "2" }
 naga = { version = "29", features = ["hlsl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
@@ -230,18 +239,23 @@ ahash = { version = "0.8" }
 arboard = { version = "3" }
 crossbeam-utils = { version = "0.8" }
 fastrand = { version = "2" }
-getrandom = { version = "0.3", default-features = false, features = ["std"] }
+futures-core = { version = "0.3" }
+half = { version = "2", default-features = false, features = ["num-traits"] }
 indexmap = { version = "2" }
 linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "system", "xdp"] }
 mio = { version = "1", features = ["net", "os-ext"] }
 naga = { version = "29", features = ["glsl-out", "spv-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 phf_shared = { version = "0.13", default-features = false, features = ["std"] }
+proc-macro2 = { version = "1" }
+quote = { version = "1" }
 rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", "runtime", "shm", "system", "termios", "thread", "time"] }
+slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
+uuid = { version = "1" }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
 wgpu = { version = "29", default-features = false, features = ["gles", "parking_lot", "std", "vulkan", "wgsl"] }
 wgpu-core = { version = "29", features = ["gles", "portable-atomic", "renderdoc", "vulkan", "wgsl"] }

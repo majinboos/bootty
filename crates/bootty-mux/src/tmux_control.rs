@@ -350,7 +350,7 @@ mod tests {
     /// server, whose sessions bootty is not showing.
     #[test]
     fn a_remote_runner_forks_its_mutations_at_the_other_host() {
-        let remote = SshRemote::new(bootty_config::config::SshRemoteConfig {
+        let remote = SshRemote::new(bootty_mux_model::SshTarget {
             host: "devbox".to_owned(),
             user: None,
             port: None,

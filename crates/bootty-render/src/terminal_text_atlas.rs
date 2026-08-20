@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
+    fmt::Write as _,
     hash::{Hash, Hasher},
     sync::Arc,
 };
@@ -24,29 +25,14 @@ use crate::{
     terminal_render::{SpriteCommandBatch, TextCommand},
     terminal_sprite::SpriteCommand,
     terminal_text::{
-        FontFeature, FontStyle, ResolvedFontFace, default_font_features, terminal_char_width,
-        terminal_grapheme_cells,
+        FontFeature, FontStyle, ResolvedFontFace, terminal_char_width, terminal_grapheme_cells,
     },
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TerminalTextShaper {
-    font_features: Vec<FontFeature>,
-}
-
-impl Default for TerminalTextShaper {
-    fn default() -> Self {
-        Self {
-            font_features: default_font_features(),
-        }
-    }
-}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TerminalTextShaper;
 
 impl TerminalTextShaper {
-    pub fn with_features(font_features: Vec<FontFeature>) -> Self {
-        Self { font_features }
-    }
-
     pub fn shape(&self, text: &str, start_cell: u16) -> Vec<ShapedCluster> {
         let mut clusters = Vec::with_capacity(text.chars().count().max(1));
         self.shape_into(text, start_cell, &mut clusters);
@@ -752,14 +738,16 @@ struct PreparedTextCommandCacheEntry {
     quads: Vec<TexturedGlyphQuad>,
 }
 
-/// Identity of a shaped run: shaping output depends only on the text, the resolved
-/// face, and the font size, so a run that merely moved (scrolling) or reappeared keys
-/// to the same entry. Position, color, and atlas state are deliberately excluded.
+/// Identity of a shaped run: shaping output depends on the text, the resolved
+/// face, the font size, and the ordered font-feature policy. A run that merely
+/// moved or reappeared keys to the same entry. Position, color, and atlas state
+/// are deliberately excluded.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ShapedRunCacheKey {
     text: String,
     face: GlyphAtlasFaceKey,
     font_size_bits: u32,
+    font_features: Arc<[FontFeature]>,
 }
 
 #[derive(Clone, Debug)]
@@ -802,7 +790,7 @@ impl TextAtlasBuilder {
 
     pub fn with_format(width: u32, height: u32, format: GlyphAtlasFormat) -> Self {
         Self {
-            shaper: TerminalTextShaper::default(),
+            shaper: TerminalTextShaper,
             atlas: GlyphAtlas::with_format(width, height, format),
             fonts: FontLibrary::new(),
             face_cache: HashMap::new(),
@@ -999,6 +987,7 @@ impl TextAtlasBuilder {
             text: command.text.clone(),
             face: face_key.clone(),
             font_size_bits: command.font_size.to_bits(),
+            font_features: Arc::clone(&command.font_features),
         };
         let (total_cells, cluster_len) = if let Some(entry) = self.shaped_run_cache.get(&cache_key)
         {
@@ -1006,12 +995,11 @@ impl TextAtlasBuilder {
             clusters.extend_from_slice(&entry.clusters);
             (entry.total_cells, entry.clusters.len())
         } else {
-            let features = self.shaper.font_features.clone();
             let shaped = self.fonts.shape_into_clusters(
                 &command.face,
                 &command.text,
                 command.font_size,
-                &features,
+                &command.font_features,
                 &mut clusters,
             );
             match shaped {
@@ -1180,7 +1168,7 @@ impl TextAtlasBuilder {
     fn prepare_cluster(&mut self, request: ClusterGlyphRequest<'_>) -> (GlyphAtlasEntry, bool) {
         let key = GlyphAtlasKey {
             face: request.face_key,
-            text: self.intern_cluster_key(request.cluster),
+            text: self.intern_cluster_key(request.cluster, &request.command.font_features),
             font_size_bits: request.command.font_size.to_bits(),
             pixels_per_point_bits: request.pixels_per_point.to_bits(),
             width: request.glyph_width,
@@ -1224,12 +1212,30 @@ impl TextAtlasBuilder {
     /// Atlas key for a cluster. Shaped (ligature/contextual) clusters key on
     /// their glyph ids rather than source text, because the same characters can
     /// shape to different glyphs depending on run context.
-    fn intern_cluster_key(&mut self, cluster: &ShapedCluster) -> GlyphAtlasTextKey {
+    fn intern_cluster_key(
+        &mut self,
+        cluster: &ShapedCluster,
+        font_features: &[FontFeature],
+    ) -> GlyphAtlasTextKey {
         if cluster.glyphs.is_empty() {
             return self.intern_cluster_text(&cluster.text);
         }
         let mut signature = String::with_capacity(cluster.glyphs.len() * 22 + 1);
         signature.push('\u{1}');
+        for feature in font_features {
+            let tag = feature.tag();
+            write!(
+                signature,
+                "{:02x}{:02x}{:02x}{:02x}{:08x}",
+                tag[0],
+                tag[1],
+                tag[2],
+                tag[3],
+                feature.value()
+            )
+            .expect("writing to String is infallible");
+        }
+        signature.push('\u{2}');
         for glyph in &cluster.glyphs {
             signature.push_str(&glyph.glyph_id.to_string());
             signature.push('@');

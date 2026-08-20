@@ -11,7 +11,7 @@ use eframe::{
 
 use crate::{
     geometry::{
-        CellMetrics, SurfacePoint, SurfaceRect, TerminalSurface, ViewTransform,
+        CellMetrics, SurfacePoint, SurfaceRect, TerminalPadding, TerminalSurface, ViewTransform,
         fit_cell_height_to_available_space, fit_cell_width_to_available_space,
     },
     paint_plan::{CursorBlinkPhase, PaintPlanner, TerminalPaintPlan},
@@ -20,11 +20,27 @@ use crate::{
     terminal_image::KittyImageFrame,
     terminal_render::{RenderFramePool, TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
-    terminal_wgpu::{terminal_render_callback, terminal_text_cell_metrics},
+    terminal_wgpu::{
+        TerminalRendererId, terminal_render_callback_for_renderer, terminal_text_cell_metrics,
+    },
 };
+
+fn surface_rect(rect: Rect) -> SurfaceRect {
+    SurfaceRect {
+        min_x: rect.min.x,
+        min_y: rect.min.y,
+        max_x: rect.max.x,
+        max_y: rect.max.y,
+    }
+}
+
+fn surface_point(pos: Pos2) -> SurfacePoint {
+    SurfacePoint { x: pos.x, y: pos.y }
+}
 
 #[derive(Default)]
 pub struct TerminalWidget {
+    renderer_id: TerminalRendererId,
     planner: PaintPlanner,
     metrics: RendererMetrics,
     cell: CellMetrics,
@@ -43,7 +59,7 @@ pub struct TerminalWidget {
     last_surface: Option<SurfaceRect>,
 }
 
-pub use bootty_runtime::render_source::TerminalRenderSource;
+pub use bootty_runtime::frame_source::TerminalFrameSource;
 
 impl TerminalWidget {
     pub fn new(target_format: Option<wgpu::TextureFormat>) -> Self {
@@ -90,15 +106,15 @@ impl TerminalWidget {
         let Some(surface) = self.last_surface else {
             return;
         };
-        let center = Pos2::new(
-            (surface.min_x + surface.max_x) * 0.5,
-            (surface.min_y + surface.max_y) * 0.5,
-        );
-        let focal = focal.unwrap_or(center);
-        let focal = Pos2::new(
-            focal.x.clamp(surface.min_x, surface.max_x),
-            focal.y.clamp(surface.min_y, surface.max_y),
-        );
+        let center = SurfacePoint {
+            x: (surface.min_x + surface.max_x) * 0.5,
+            y: (surface.min_y + surface.max_y) * 0.5,
+        };
+        let focal = focal.map(surface_point).unwrap_or(center);
+        let focal = SurfacePoint {
+            x: focal.x.clamp(surface.min_x, surface.max_x),
+            y: focal.y.clamp(surface.min_y, surface.max_y),
+        };
         self.view = self.view.pinched(factor, focal, surface);
     }
 
@@ -106,7 +122,7 @@ impl TerminalWidget {
         let Some(surface) = self.last_surface else {
             return;
         };
-        self.view = self.view.panned(delta, surface);
+        self.view = self.view.panned(delta.x, delta.y, surface);
     }
 
     pub fn set_transition_key(&mut self, key: Option<String>) {
@@ -127,14 +143,20 @@ impl TerminalWidget {
     }
 
     pub fn initial_geometry() -> crate::geometry::TerminalGeometry {
-        TerminalSurface::default_for_size(Vec2::new(1000.0, 672.0)).geometry()
+        TerminalSurface::for_logical_size(
+            1000.0,
+            672.0,
+            CellMetrics::default(),
+            TerminalPadding::default(),
+        )
+        .geometry()
     }
 
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
-        terminal: &mut dyn TerminalRenderSource,
-    ) -> Result<TerminalSurface> {
+        terminal: &mut dyn TerminalFrameSource,
+    ) -> Result<TerminalWidgetOutput> {
         let available = ui.available_size_before_wrap();
         let desired = Vec2::new(available.x.max(320.0), available.y.max(240.0));
         let (rect, _) = ui.allocate_exact_size(desired, Sense::click_and_drag());
@@ -146,8 +168,8 @@ impl TerminalWidget {
         ui: &mut egui::Ui,
         rect: Rect,
         id_salt: impl std::hash::Hash + std::fmt::Debug,
-        terminal: &mut dyn TerminalRenderSource,
-    ) -> Result<TerminalSurface> {
+        terminal: &mut dyn TerminalFrameSource,
+    ) -> Result<TerminalWidgetOutput> {
         let widget_id = ui.make_persistent_id(("terminal-widget", id_salt));
         let response = ui.interact(rect, widget_id, Sense::click_and_drag());
         if response.clicked() || response.drag_started() {
@@ -155,7 +177,7 @@ impl TerminalWidget {
         }
 
         self.cell = self.cell_metrics_for_rect(rect);
-        let surface = TerminalSurface::for_rect(rect, self.cell);
+        let surface = TerminalSurface::for_rect(surface_rect(rect), self.cell);
         terminal.set_display_scale(ui.ctx().pixels_per_point())?;
         terminal.set_render_cell_metrics(self.cell)?;
         terminal.resize(surface.geometry())?;
@@ -165,7 +187,8 @@ impl TerminalWidget {
         self.metrics.extract_total_us = extract_start.elapsed().as_micros() as u64;
         // Match the grid rect the renderer projects through, so pinch/pan math agrees with it.
         self.last_surface = Some(surface.grid_rect(frame.cols, frame.rows));
-        self.handle_scrollbar_interaction(ui, widget_id, surface, frame.as_ref(), terminal)?;
+        let viewport_scroll_delta =
+            self.handle_scrollbar_interaction(ui, widget_id, surface, frame.as_ref());
         self.paint(ui, surface, &frame)?;
         self.handle_hyperlink_interaction(ui, surface, frame.as_ref(), &response);
         self.metrics.render_state_update_us = frame.stats.render_state_update_us;
@@ -175,7 +198,10 @@ impl TerminalWidget {
         self.metrics.dirty_rows = frame.stats.dirty_rows;
         self.metrics.image_placements = frame.images.placements.len();
         self.metrics.virtual_placements = frame.images.virtual_placements.len();
-        Ok(surface)
+        Ok(TerminalWidgetOutput {
+            surface,
+            viewport_scroll_delta,
+        })
     }
 
     pub fn metrics(&self) -> RendererMetrics {
@@ -190,7 +216,7 @@ impl TerminalWidget {
     }
 
     pub fn geometry_for_rect(&self, rect: Rect) -> crate::geometry::TerminalGeometry {
-        TerminalSurface::for_rect(rect, self.cell_metrics_for_rect(rect)).geometry()
+        TerminalSurface::for_rect(surface_rect(rect), self.cell_metrics_for_rect(rect)).geometry()
     }
     fn cell_metrics_for_rect(&self, rect: Rect) -> CellMetrics {
         let mut cell = self.base_cell;
@@ -214,7 +240,9 @@ impl TerminalWidget {
             .hovered()
             .then(|| ui.input(|input| input.pointer.hover_pos()))
             .flatten()
-            .and_then(|pos| hyperlink_at(frame, surface, self.view.inverse_point(pos)));
+            .and_then(|pos| {
+                hyperlink_at(frame, surface, self.view.inverse_point(surface_point(pos)))
+            });
 
         if let Some(link) = hovered_link {
             let modifiers = ui.input(|input| input.modifiers);
@@ -290,6 +318,7 @@ impl TerminalWidget {
         self.render_cache.apply_cursor_phase(cursor_blink_phase);
         paint_terminal_content(
             ui,
+            self.renderer_id.clone(),
             self.render_cache.render_frame(),
             self.target_format,
             self.view,
@@ -340,15 +369,14 @@ impl TerminalWidget {
         widget_id: egui::Id,
         surface: TerminalSurface,
         frame: &crate::terminal::RenderFrame,
-        terminal: &mut dyn TerminalRenderSource,
-    ) -> Result<()> {
+    ) -> isize {
         let Some(scrollbar) = frame.scrollbar else {
             self.scrollbar.thumb_hovered = false;
-            return Ok(());
+            return 0;
         };
         if !is_scrollbar_scrollable(scrollbar) {
             self.scrollbar.thumb_hovered = false;
-            return Ok(());
+            return 0;
         }
 
         let now = Instant::now();
@@ -369,7 +397,7 @@ impl TerminalWidget {
             .is_some_and(|until| now <= until);
         if !active && !self.scrollbar.dragging {
             self.scrollbar.thumb_hovered = false;
-            return Ok(());
+            return 0;
         }
 
         let thumb = scrollbar_thumb_rect(surface, scrollbar, false);
@@ -388,19 +416,26 @@ impl TerminalWidget {
             self.scrollbar.dragging = false;
             self.scrollbar.drag_last_y = None;
         }
+        let mut viewport_scroll_delta = 0;
         if response.dragged()
             && let (Some(last_y), Some(pos)) =
                 (self.scrollbar.drag_last_y, response.interact_pointer_pos())
         {
             let delta = scrollbar_drag_delta_rows(surface, scrollbar, pos.y - last_y);
             if delta != 0 {
-                terminal.scroll_viewport_delta(delta)?;
+                viewport_scroll_delta = delta;
                 self.scrollbar.drag_last_y = Some(pos.y);
                 self.scrollbar.active_until = Some(Instant::now() + SCROLLBAR_VISIBLE_AFTER_SCROLL);
             }
         }
-        Ok(())
+        viewport_scroll_delta
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TerminalWidgetOutput {
+    pub surface: TerminalSurface,
+    pub viewport_scroll_delta: isize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -750,11 +785,15 @@ struct HoveredLink {
     cells: u16,
 }
 
-fn hyperlink_at(frame: &RenderFrame, surface: TerminalSurface, pos: Pos2) -> Option<HoveredLink> {
+fn hyperlink_at(
+    frame: &RenderFrame,
+    surface: TerminalSurface,
+    pos: SurfacePoint,
+) -> Option<HoveredLink> {
     if !surface.rect.contains(pos) {
         return None;
     }
-    let point = surface.surface_to_grid(SurfacePoint { x: pos.x, y: pos.y });
+    let point = surface.surface_to_grid(pos);
     if point.x >= frame.cols || point.y >= frame.rows {
         return None;
     }
@@ -874,8 +913,8 @@ fn paint_scrollbar(
 pub(crate) fn scrollbar_hit_rect(surface: TerminalSurface) -> Rect {
     let track = surface.rect;
     Rect::from_min_max(
-        Pos2::new(track.right() - SCROLLBAR_HIT_WIDTH, track.top()),
-        Pos2::new(track.right(), track.bottom()),
+        Pos2::new(track.max_x - SCROLLBAR_HIT_WIDTH, track.min_y),
+        Pos2::new(track.max_x, track.max_y),
     )
 }
 
@@ -900,9 +939,9 @@ fn scrollbar_thumb_rect(
     let thumb_height = (track.height() * (len / total)).clamp(28.0, track.height());
     let travel = (track.height() - thumb_height).max(0.0);
     let max_offset = scrollbar.total.saturating_sub(scrollbar.len).max(1) as f32;
-    let thumb_top = track.top() + travel * (offset / max_offset);
+    let thumb_top = track.min_y + travel * (offset / max_offset);
     Rect::from_min_size(
-        Pos2::new(track.right() - thumb_width - 3.0, thumb_top),
+        Pos2::new(track.max_x - thumb_width - 3.0, thumb_top),
         Vec2::new(thumb_width, thumb_height),
     )
 }
@@ -949,23 +988,25 @@ fn cursor_blink_opacity(elapsed: Duration) -> f32 {
 
 fn paint_terminal_content(
     ui: &mut egui::Ui,
+    renderer_id: TerminalRendererId,
     frame: &TerminalRenderFrame,
     target_format: Option<wgpu::TextureFormat>,
     view: ViewTransform,
 ) {
-    let Some(callback) = terminal_render_shape(frame, target_format, view) else {
+    let Some(callback) = terminal_render_shape(renderer_id, frame, target_format, view) else {
         return;
     };
     ui.painter_at(egui_rect(frame.surface)).add(callback);
 }
 
 fn terminal_render_shape(
+    renderer_id: TerminalRendererId,
     frame: &TerminalRenderFrame,
     target_format: Option<wgpu::TextureFormat>,
     view: ViewTransform,
 ) -> Option<egui::Shape> {
     let target_format = target_format?;
-    terminal_render_callback(frame, target_format, view)
+    terminal_render_callback_for_renderer(renderer_id, frame, target_format, view)
 }
 
 fn egui_rect(rect: SurfaceRect) -> Rect {

@@ -53,6 +53,10 @@ fn shaped_cluster(text: &str, cells: u16) -> ShapedCluster {
 }
 
 fn text_command(text: &str) -> TextCommand {
+    text_command_with_features(text, crate::terminal_text::default_font_features())
+}
+
+fn text_command_with_features(text: &str, font_features: Vec<FontFeature>) -> TextCommand {
     TextCommand {
         rect: SurfaceRect::from_min_size(0.0, 0.0, text.len() as f32 * 10.0, 20.0),
         text: text.to_owned(),
@@ -71,6 +75,7 @@ fn text_command(text: &str) -> TextCommand {
         },
         face: Arc::new(regular_face("Maple Mono", &[])),
         font_size: 16.0,
+        font_features: Arc::from(font_features),
     }
 }
 
@@ -205,7 +210,7 @@ fn atlas_rasterizer_outputs_constrained_nerd_font_icon_pixels() {
 fn atlas_rasterizer_matches_maple_nerd_font_icon_pixels() {
     let mut library = bootty_font_library(&["MapleMono-wght.ttf", "MapleMono-NF-Regular.ttf"]);
     let face = regular_face("Maple Mono", &["Maple Mono NF"]);
-    let clusters = TerminalTextShaper::default().shape("\u{f06ca}", 0);
+    let clusters = TerminalTextShaper.shape("\u{f06ca}", 0);
     let alpha = rasterize_cluster_for_test(
         &mut library,
         &face,
@@ -226,7 +231,7 @@ fn atlas_rasterizer_matches_maple_nerd_font_icon_pixels() {
 fn atlas_rasterizer_uses_database_fallback_for_private_use_icon_without_face_fallbacks() {
     let mut library = bootty_font_library(&["MapleMono-wght.ttf", "MapleMono-NF-Regular.ttf"]);
     let face = regular_face("Maple Mono", &[]);
-    let clusters = TerminalTextShaper::default().shape("\u{f0770}", 0);
+    let clusters = TerminalTextShaper.shape("\u{f0770}", 0);
     let alpha = rasterize_cluster_for_test(&mut library, &face, &clusters[0], 15.0, 2.0, 1, 20, 44);
     let bounds = alpha_bounds_at(&alpha, 20, 44, 128).expect("icon has ink");
 
@@ -239,8 +244,8 @@ fn atlas_rasterizer_shares_loaded_font_for_multiple_database_fallback_chars() {
     let mut library = bootty_font_library(&["MapleMono-wght.ttf", "MapleMono-NF-Regular.ttf"]);
     let face = regular_face("Maple Mono", &[]);
     let clusters = [
-        TerminalTextShaper::default().shape("\u{f06ca}", 0),
-        TerminalTextShaper::default().shape("\u{f0770}", 0),
+        TerminalTextShaper.shape("\u{f06ca}", 0),
+        TerminalTextShaper.shape("\u{f0770}", 0),
     ];
 
     for cluster in &clusters {
@@ -799,7 +804,7 @@ fn atlas_rasterizer_applies_nerd_font_icon_constraints() {
 
 #[test]
 fn symbol_before_space_uses_two_cell_constraint_tile() {
-    let clusters = TerminalTextShaper::default().shape("\u{f126} 4.9", 0);
+    let clusters = TerminalTextShaper.shape("\u{f126} 4.9", 0);
 
     assert_eq!(
         cluster_constraint_cells(None, &clusters[0], clusters.get(1)),
@@ -813,14 +818,14 @@ fn symbol_before_space_uses_two_cell_constraint_tile() {
 
 #[test]
 fn symbol_before_implicit_blank_uses_two_cell_constraint_tile() {
-    let clusters = TerminalTextShaper::default().shape("\u{f06ca}", 0);
+    let clusters = TerminalTextShaper.shape("\u{f06ca}", 0);
 
     assert_eq!(cluster_constraint_cells(None, &clusters[0], None), 2);
 }
 
 #[test]
 fn adjacent_symbols_stay_one_cell_wide() {
-    let clusters = TerminalTextShaper::default().shape("\u{f126}\u{f0f4} ", 0);
+    let clusters = TerminalTextShaper.shape("\u{f126}\u{f0f4} ", 0);
 
     assert_eq!(
         cluster_constraint_cells(None, &clusters[0], clusters.get(1)),
@@ -834,7 +839,7 @@ fn adjacent_symbols_stay_one_cell_wide() {
 
 #[test]
 fn terminal_graphics_symbols_stay_one_cell_wide() {
-    let clusters = TerminalTextShaper::default().shape("\u{e0b0} ", 0);
+    let clusters = TerminalTextShaper.shape("\u{e0b0} ", 0);
 
     assert_eq!(
         cluster_constraint_cells(None, &clusters[0], clusters.get(1)),
@@ -1031,6 +1036,115 @@ fn default_shaping_groups_contextual_operator_ligature_pieces() {
         assert_eq!(clusters[0].cells, 2, "{operator}");
         assert_eq!(clusters[0].glyphs.len(), 2, "{operator}: {clusters:?}");
     }
+}
+
+#[test]
+fn command_font_features_change_actual_maple_mono_shaping() {
+    let mut library = bootty_font_library(&["MapleMono-wght.ttf"]);
+    let face = regular_face("Maple Mono", &[]);
+    let mut enabled = Vec::new();
+    let mut disabled = Vec::new();
+
+    let (_, enabled_len) = library
+        .shape_into_clusters(
+            &face,
+            "<>",
+            16.0,
+            &[FontFeature::new(*b"liga", 1)],
+            &mut enabled,
+        )
+        .expect("Maple Mono advertises GSUB features");
+    let (_, disabled_len) = library
+        .shape_into_clusters(
+            &face,
+            "<>",
+            16.0,
+            &[FontFeature::new(*b"liga", 0)],
+            &mut disabled,
+        )
+        .expect("Maple Mono advertises GSUB features");
+
+    assert_eq!(enabled_len, 1, "enabled ligature: {enabled:?}");
+    assert_eq!(disabled_len, 2, "disabled ligature: {disabled:?}");
+    assert!(!enabled[0].glyphs.is_empty());
+    assert!(
+        disabled[..disabled_len]
+            .iter()
+            .all(|cluster| cluster.glyphs.is_empty())
+    );
+}
+
+#[test]
+fn shared_text_atlas_keeps_ordered_font_policies_independent() {
+    let enabled = text_command_with_features("<>", vec![FontFeature::new(*b"liga", 1)]);
+    let disabled = text_command_with_features("<>", vec![FontFeature::new(*b"liga", 0)]);
+    let mut builder = TextAtlasBuilder::new(256, 256);
+    builder.fonts = bootty_font_library(&["MapleMono-wght.ttf"]);
+
+    let enabled_first = builder.prepare_text_command(&enabled, 1.0);
+    let disabled_between = builder.prepare_text_command(&disabled, 1.0);
+    let enabled_again = builder.prepare_text_command(&enabled, 1.0);
+
+    let mut fresh_disabled = TextAtlasBuilder::new(256, 256);
+    fresh_disabled.fonts = bootty_font_library(&["MapleMono-wght.ttf"]);
+    let disabled_fresh = fresh_disabled.prepare_text_command(&disabled, 1.0);
+
+    assert_eq!(enabled_first.len(), 1);
+    assert_eq!(disabled_between.len(), 2);
+    assert_eq!(disabled_between.len(), disabled_fresh.len());
+    assert_eq!(
+        disabled_between
+            .iter()
+            .map(|quad| quad.rect)
+            .collect::<Vec<_>>(),
+        disabled_fresh
+            .iter()
+            .map(|quad| quad.rect)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(enabled_again, enabled_first);
+    assert_eq!(builder.shaped_run_cache.len(), 2);
+}
+
+#[test]
+fn prepared_text_cache_invalidates_on_font_policy_only_changes() {
+    let enabled = text_command_with_features("<>", vec![FontFeature::new(*b"liga", 1)]);
+    let disabled = text_command_with_features("<>", vec![FontFeature::new(*b"liga", 0)]);
+    let mut builder = TextAtlasBuilder::new(256, 256);
+    builder.fonts = bootty_font_library(&["MapleMono-wght.ttf"]);
+
+    let prepare = |builder: &mut TextAtlasBuilder, command: &TextCommand| {
+        let mut quads = Vec::new();
+        builder.begin_text_frame();
+        let changed = builder.prepare_text_command_into_frame(command, 1.0, &mut quads);
+        builder.finish_text_frame();
+        changed
+    };
+
+    assert!(prepare(&mut builder, &enabled));
+    assert!(!prepare(&mut builder, &enabled));
+    assert!(prepare(&mut builder, &disabled));
+    assert!(!prepare(&mut builder, &disabled));
+    assert!(prepare(&mut builder, &enabled));
+}
+
+#[test]
+fn shaped_atlas_key_preserves_raw_font_feature_identity() {
+    let mut builder = TextAtlasBuilder::new(64, 64);
+    let mut cluster = shaped_cluster("<>", 2);
+    cluster.glyphs.push(ShapedGlyph {
+        glyph_id: 42,
+        cluster: 0,
+        x_offset: 0.0,
+        y_offset: 0.0,
+    });
+
+    let first =
+        builder.intern_cluster_key(&cluster, &[FontFeature::new([0x80, b',', b'=', 0xff], 1)]);
+    let second =
+        builder.intern_cluster_key(&cluster, &[FontFeature::new([0x81, b',', b'=', 0xfe], 1)]);
+
+    assert_ne!(first, second);
 }
 
 #[test]
