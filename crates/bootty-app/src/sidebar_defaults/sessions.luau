@@ -1,6 +1,6 @@
 --!strict
--- Built-in sidebar `sessions` module. Override with ~/.config/bootty/sidebar/sessions.luau.
--- Owns session grouping and summary rows. Per-session content lives in ~/.config/bootty/session/.
+-- Built-in sidebar `sessions` module. Override with ~/.config/bootty/extensions/sessions.luau.
+-- Owns session grouping and summary rows. Other extension files add per-session content.
 local ui = bootty.ui
 
 return {

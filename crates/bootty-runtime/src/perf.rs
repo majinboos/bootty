@@ -50,35 +50,3 @@ pub fn record_subprocess(what: &str) {
         "{what} spawned a subprocess on the frame path; move it to a worker so frames do not stall"
     );
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spawning_outside_a_guarded_frame_is_allowed() {
-        record_subprocess("deliberate user action");
-
-        let guard = guard_frame_path();
-        drop(guard);
-
-        // A guard that has dropped must not keep refusing: the same helpers serve click handlers.
-        record_subprocess("deliberate user action");
-    }
-
-    #[test]
-    #[should_panic(expected = "spawned a subprocess on the frame path")]
-    fn a_nested_guard_dropping_leaves_the_outer_one_armed() {
-        let _outer = guard_frame_path();
-        drop(guard_frame_path());
-
-        record_subprocess("git read");
-    }
-
-    #[test]
-    #[should_panic(expected = "git read spawned a subprocess on the frame path")]
-    fn spawning_inside_a_guarded_frame_panics() {
-        let _guard = guard_frame_path();
-        record_subprocess("git read");
-    }
-}

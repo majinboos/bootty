@@ -4,7 +4,6 @@ pub mod ditch;
 pub mod icons;
 pub mod keybind_help;
 pub mod keycaps;
-pub mod lua_window;
 pub mod new_session_picker;
 pub mod overlay;
 pub mod rename;

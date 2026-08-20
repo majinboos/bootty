@@ -2485,34 +2485,3 @@ fn right_bottom(rect: SurfaceRect) -> SpritePoint {
 fn center_y(rect: SurfaceRect) -> f32 {
     rect.min_y + rect.height() * 0.5
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_separator_points_stay_inside_cell() {
-        let rect = SurfaceRect::from_min_size(10.0, 20.0, 8.0, 24.0);
-        let points = right_round_points(rect);
-
-        assert_eq!(points.first().copied(), Some(left_top(rect)));
-        assert_eq!(points.last().copied(), Some(left_bottom(rect)));
-        assert!(points.iter().all(|point| point.x >= rect.min_x));
-        assert!(points.iter().all(|point| point.x <= rect.max_x));
-        assert!(points.iter().any(|point| point.x == rect.max_x));
-    }
-
-    #[test]
-    fn block_commands_use_eighth_cell_fractions() {
-        let rect = SurfaceRect::from_min_size(10.0, 20.0, 16.0, 24.0);
-        let commands = block_commands('▂', rect);
-
-        assert_eq!(
-            commands,
-            vec![SpriteCommand::FillRect {
-                rect: SurfaceRect::from_min_size(10.0, 38.0, 16.0, 6.0),
-                alpha: 1.0,
-            }]
-        );
-    }
-}

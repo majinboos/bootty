@@ -1322,22 +1322,24 @@ fn target_matches_anchor(
 pub(super) fn backend_attach_launch(
     backend: MuxBackendKind,
     session: &str,
+    identity: bootty_identity::ApplicationIdentity,
 ) -> (String, Vec<String>) {
     let session = session.to_owned();
     match backend {
         // -T declares outer-terminal features tmux cannot learn from the
         // forced xterm-256color terminfo; "clipboard" enables OSC 52 and
         // "sync" wraps redraws in DEC 2026 to avoid blank layout flashes.
-        MuxBackendKind::Tmux => (
-            "tmux".to_owned(),
-            vec![
+        MuxBackendKind::Tmux => {
+            let mut args = crate::tmux::local_server_args(identity);
+            args.extend([
                 "-T".to_owned(),
                 TMUX_CLIENT_FEATURES.to_owned(),
                 "attach-session".to_owned(),
                 "-t".to_owned(),
                 session,
-            ],
-        ),
+            ]);
+            ("tmux".to_owned(), args)
+        }
         MuxBackendKind::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
         MuxBackendKind::Native => {
             unreachable!("native panes are rendered directly by Bootty")
@@ -1374,6 +1376,7 @@ fn backend_attach_session_config(
         attach_session,
         bootty_terminfo_available,
         env::var_os("PATH").as_deref(),
+        bootty_identity::ApplicationIdentity::for_process(),
     )
 }
 
@@ -1384,8 +1387,14 @@ fn backend_attach_session_config_with_path(
     attach_session: &str,
     bootty_terminfo_available: bool,
     path: Option<&OsStr>,
+    local_identity: bootty_identity::ApplicationIdentity,
 ) -> Result<TerminalSessionConfig> {
-    let (program, args) = backend_attach_launch(backend, attach_session);
+    let identity = if remote.is_some() {
+        bootty_identity::ApplicationIdentity::Production
+    } else {
+        local_identity
+    };
+    let (program, args) = backend_attach_launch(backend, attach_session, identity);
     // A remote pane runs the same attach client, in the SSH session that carries its PTY.
     let (program, args) = match remote {
         Some(remote) => remote.proxy_tty_command(&program, &args),
@@ -1394,6 +1403,15 @@ fn backend_attach_session_config_with_path(
     config.launch.shell = Some(resolve_launch_program_with_path(&program, path)?);
     config.launch.args = args;
     config.launch.env_remove = backend_attach_env_remove(backend);
+    if backend == MuxBackendKind::Zellij
+        && remote.is_none()
+        && let Some(socket_dir) = crate::zellij::prepare_socket_dir(identity)?
+    {
+        config.launch.env.push((
+            "ZELLIJ_SOCKET_DIR".to_owned(),
+            socket_dir.to_string_lossy().into_owned(),
+        ));
+    }
     // The attach client hard-fails on a TERM it cannot resolve. xterm-bootty
     // only resolves through Bootty's vendored terminfo; anything else falls
     // back to the universally installed xterm-256color, with required
@@ -2682,7 +2700,11 @@ mod tests {
     #[test]
     fn backend_owned_ui_launches_normal_backend_attach() {
         assert_eq!(
-            backend_attach_launch(MuxBackendKind::Tmux, "agents"),
+            backend_attach_launch(
+                MuxBackendKind::Tmux,
+                "agents",
+                bootty_identity::ApplicationIdentity::Production,
+            ),
             (
                 "tmux".to_owned(),
                 vec![
@@ -2695,8 +2717,13 @@ mod tests {
                 ]
             )
         );
+
         assert_eq!(
-            backend_attach_launch(MuxBackendKind::Zellij, "agents"),
+            backend_attach_launch(
+                MuxBackendKind::Zellij,
+                "agents",
+                bootty_identity::ApplicationIdentity::Production,
+            ),
             (
                 "zellij".to_owned(),
                 vec![
@@ -2745,6 +2772,7 @@ mod tests {
             "agents",
             true,
             Some(path.path().as_os_str()),
+            bootty_identity::ApplicationIdentity::Production,
         )
         .expect("attach config");
         assert_eq!(with_terminfo.launch.term, "xterm-bootty");
@@ -2756,6 +2784,7 @@ mod tests {
             "agents",
             false,
             Some(path.path().as_os_str()),
+            bootty_identity::ApplicationIdentity::Production,
         )
         .expect("attach config");
         assert_eq!(without_terminfo.launch.term, "xterm-256color");
@@ -2796,6 +2825,7 @@ mod tests {
             "agents",
             true,
             Some(path.path().as_os_str()),
+            bootty_identity::ApplicationIdentity::Development,
         )
         .expect("attach config");
 
@@ -2848,6 +2878,7 @@ mod tests {
             "agents",
             true,
             Some(path.path().as_os_str()),
+            bootty_identity::ApplicationIdentity::Production,
         )
         .expect("attach config");
         assert_eq!(attach.launch.term, "xterm-256color");
@@ -2869,7 +2900,11 @@ mod tests {
             side_effect_pane_id: None,
             benchmark_trace: None,
         };
-        let (program, args) = backend_attach_launch(MuxBackendKind::Tmux, "agents");
+        let (program, args) = backend_attach_launch(
+            MuxBackendKind::Tmux,
+            "agents",
+            bootty_identity::ApplicationIdentity::Production,
+        );
         config.launch.shell = Some(program);
         config.launch.args = args;
         config.launch.env_remove = backend_attach_env_remove(MuxBackendKind::Tmux);

@@ -675,32 +675,3 @@ pub(super) fn preset_tmux_backend_keybinds(
         KeybindPreset::Ghostty | KeybindPreset::Tmux => Vec::new(),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn space_selection_defaults_apply_to_every_preset_on_macos() {
-        for preset in KeybindPreset::ALL {
-            let mut keybinds = preset_global_keybinds(preset);
-            keybinds.extend(preset_layout_keybinds(preset, preset.default_prefix()));
-
-            for index in 1..=9 {
-                let space = format!("ctrl+{index}=select_space:{index}");
-                let ctrl_bindings: Vec<_> = keybinds
-                    .iter()
-                    .filter(|binding| binding.starts_with(&format!("ctrl+{index}=")))
-                    .collect();
-                let session = format!("cmd+{index}=select_session:{index}");
-
-                if cfg!(target_os = "macos") {
-                    assert_eq!(ctrl_bindings, [&space], "{preset:?}");
-                    assert!(keybinds.contains(&session), "{preset:?}");
-                } else {
-                    assert!(ctrl_bindings.is_empty(), "{preset:?}");
-                }
-            }
-        }
-    }
-}

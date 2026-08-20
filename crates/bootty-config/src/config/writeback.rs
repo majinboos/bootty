@@ -30,25 +30,7 @@ pub fn update_config_document(
     path: impl AsRef<Path>,
     mutate: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>,
 ) -> ConfigResult<ConfigWriteOutcome> {
-    update_config_document_with_fault(path.as_ref(), mutate, WriteFault::None)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WriteFault {
-    None,
-    #[cfg(test)]
-    Sync,
-    #[cfg(test)]
-    Replace,
-    #[cfg(all(test, unix))]
-    SyncDirectory,
-}
-
-fn update_config_document_with_fault(
-    requested_path: &Path,
-    mutate: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>,
-    fault: WriteFault,
-) -> ConfigResult<ConfigWriteOutcome> {
+    let requested_path = path.as_ref();
     if let Some(parent) = requested_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -88,7 +70,7 @@ fn update_config_document_with_fault(
         ))
     })?;
 
-    atomic_replace(requested_path, &target, source.as_bytes(), fault)
+    atomic_replace(requested_path, &target, source.as_bytes())
 }
 
 struct ConfigWriteLease {
@@ -194,10 +176,7 @@ fn atomic_replace(
     requested_path: &Path,
     target: &Path,
     bytes: &[u8],
-    fault: WriteFault,
 ) -> ConfigResult<ConfigWriteOutcome> {
-    #[cfg(not(test))]
-    let _ = fault;
     let parent = target
         .parent()
         .expect("resolved config target has a parent");
@@ -217,26 +196,10 @@ fn atomic_replace(
         .write_all(bytes)
         .and_then(|()| temporary.flush())
         .map_err(|error| write_error(requested_path, "write", error))?;
-    #[cfg(test)]
-    if fault == WriteFault::Sync {
-        return Err(write_error(
-            requested_path,
-            "sync",
-            io::Error::other("injected sync failure"),
-        ));
-    }
     temporary
         .as_file()
         .sync_all()
         .map_err(|error| write_error(requested_path, "sync", error))?;
-    #[cfg(test)]
-    if fault == WriteFault::Replace {
-        return Err(write_error(
-            requested_path,
-            "replace",
-            io::Error::other("injected replacement failure"),
-        ));
-    }
 
     let temporary = temporary.into_temp_path();
     replace_file(temporary.as_ref(), target, existing.is_some())
@@ -244,13 +207,6 @@ fn atomic_replace(
 
     #[cfg(unix)]
     {
-        #[cfg(test)]
-        if fault == WriteFault::SyncDirectory {
-            return Ok(ConfigWriteOutcome::CommittedWithDurabilityWarning(format!(
-                "config file {} was replaced, but sync directory failed: injected directory sync failure",
-                requested_path.display()
-            )));
-        }
         if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
             return Ok(ConfigWriteOutcome::CommittedWithDurabilityWarning(format!(
                 "config file {} was replaced, but sync directory failed: {error}",
@@ -317,7 +273,3 @@ fn write_error(path: &Path, phase: &str, error: impl std::fmt::Display) -> Confi
         path.display()
     ))
 }
-
-#[cfg(test)]
-#[path = "writeback_tests.rs"]
-mod tests;

@@ -91,14 +91,19 @@ pub fn build_backend_for_workspace(
         }),
         MuxBackendKind::Tmux => Box::new(match remote {
             Some(remote) => TmuxBackend::with_runner("tmux", TmuxControlRunner::for_remote(remote)),
-            None => TmuxBackend::new(),
+            None => TmuxBackend::for_identity(bootty_identity::ApplicationIdentity::for_process()),
         }),
         MuxBackendKind::Zellij => match remote {
             Some(remote) => Box::new(ZellijBackend::with_runner(SshCommandRunner::new(
                 remote,
                 SystemCommandRunner,
             ))),
-            None => Box::new(ZellijBackend::new()),
+            None => match ZellijBackend::for_identity(
+                bootty_identity::ApplicationIdentity::for_process(),
+            ) {
+                Ok(backend) => Box::new(backend),
+                Err(error) => unavailable_backend(error.to_string()),
+            },
         },
     }
 }

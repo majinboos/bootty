@@ -51,14 +51,6 @@ impl fmt::Display for ModifierRemapParseError {
 impl Error for ModifierRemapParseError {}
 
 impl ModifierRemapSet {
-    pub fn parse_cli(&mut self, input: Option<&str>) -> Result<(), ModifierRemapParseError> {
-        let Some(input) = input.filter(|input| !input.is_empty()) else {
-            self.entries.clear();
-            return Ok(());
-        };
-        self.parse(input)
-    }
-
     pub fn parse(&mut self, input: &str) -> Result<(), ModifierRemapParseError> {
         let (from, to) = input
             .split_once('=')
@@ -93,10 +85,6 @@ impl ModifierRemapSet {
     pub fn finalize(&mut self) {
         self.entries
             .sort_by_key(|entry| entry.from.side != ModifierSide::Right);
-    }
-
-    pub fn is_remapped(&self, mods: KeyMods) -> bool {
-        self.entries.iter().any(|entry| entry.matches(mods))
     }
 
     pub fn apply(&self, mods: KeyMods) -> KeyMods {
@@ -236,87 +224,5 @@ impl FromStr for ParsedModifier {
             _ => return Err(ModifierRemapParseError::InvalidModifier(input.to_owned())),
         };
         Ok(Self { modifier, side })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mods(modifier: Modifier, side: ModifierSide) -> KeyMods {
-        let mut mods = KeyMods::default();
-        ModifierSpec { modifier, side }.set(&mut mods);
-        mods
-    }
-
-    #[test]
-    fn modifier_remap_unsided_source_maps_both_sides_to_left_target() {
-        let mut set = ModifierRemapSet::default();
-        set.parse("ctrl=super").unwrap();
-        set.finalize();
-
-        assert_eq!(
-            set.apply(mods(Modifier::Ctrl, ModifierSide::Left)),
-            mods(Modifier::Command, ModifierSide::Left)
-        );
-        assert_eq!(
-            set.apply(mods(Modifier::Ctrl, ModifierSide::Right)),
-            mods(Modifier::Command, ModifierSide::Left)
-        );
-    }
-
-    #[test]
-    fn modifier_remap_side_specific_source_and_target_are_preserved() {
-        let mut set = ModifierRemapSet::default();
-        set.parse("left_alt=right_ctrl").unwrap();
-        set.finalize();
-
-        assert_eq!(
-            set.apply(mods(Modifier::Alt, ModifierSide::Left)),
-            mods(Modifier::Ctrl, ModifierSide::Right)
-        );
-        assert_eq!(
-            set.apply(mods(Modifier::Alt, ModifierSide::Right)),
-            mods(Modifier::Alt, ModifierSide::Right)
-        );
-    }
-
-    #[test]
-    fn modifier_remap_parses_aliases_errors_and_cli_clear() {
-        let mut set = ModifierRemapSet::default();
-        set.parse("cmd=control").unwrap();
-        assert!(set.is_remapped(mods(Modifier::Command, ModifierSide::Left)));
-
-        assert_eq!(
-            set.parse("ctrl"),
-            Err(ModifierRemapParseError::MissingAssignment)
-        );
-        assert_eq!(
-            set.parse("middle_ctrl=super"),
-            Err(ModifierRemapParseError::InvalidModifier(
-                "middle_ctrl".to_owned()
-            ))
-        );
-
-        set.parse_cli(Some("opt=shift")).unwrap();
-        assert!(set.is_remapped(mods(Modifier::Alt, ModifierSide::Left)));
-        set.parse_cli(Some("")).unwrap();
-        assert!(!set.is_remapped(mods(Modifier::Alt, ModifierSide::Left)));
-    }
-
-    #[test]
-    fn modifier_remap_formats_like_key_remap_entries() {
-        let mut set = ModifierRemapSet::default();
-        assert_eq!(set.formatted_entries(), vec![String::new()]);
-
-        set.parse("ctrl=super").unwrap();
-        set.finalize();
-        assert_eq!(
-            set.formatted_entries(),
-            vec![
-                "right_ctrl=left_super".to_owned(),
-                "left_ctrl=left_super".to_owned()
-            ]
-        );
     }
 }

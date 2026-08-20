@@ -6,6 +6,7 @@ pub mod terminal_frame;
 pub mod terminal_image;
 pub mod terminal_input_model;
 pub mod terminal_palette;
+pub mod terminal_side_effect;
 
 pub mod geometry {
     pub use bootty_surface::geometry::*;

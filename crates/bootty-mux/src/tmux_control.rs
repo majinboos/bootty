@@ -37,15 +37,26 @@ const READY_TOKEN: &str = "bootty-control-ready";
 #[derive(Clone, Default)]
 pub struct TmuxControlRunner {
     clients: Arc<Mutex<HashMap<String, ClientSlot>>>,
+    prefix_args: Arc<[String]>,
     /// Set when the tmux server lives on another host. The control client is then a long-lived SSH
     /// process, which is the one place a remote snapshot poll can be as cheap as a local one.
     remote: Option<SshRemote>,
 }
 
 impl TmuxControlRunner {
+    pub fn for_identity(identity: bootty_identity::ApplicationIdentity) -> Self {
+        let prefix_args = crate::tmux::local_server_args(identity);
+        Self {
+            clients: Arc::default(),
+            prefix_args: prefix_args.into(),
+            remote: None,
+        }
+    }
+
     pub fn for_remote(remote: SshRemote) -> Self {
         Self {
             clients: Arc::default(),
+            prefix_args: Arc::default(),
             remote: Some(remote),
         }
     }
@@ -88,21 +99,24 @@ struct TmuxControlClient {
 }
 
 impl TmuxControlClient {
-    fn start(program: &str, remote: Option<&SshRemote>) -> Result<Self> {
-        Self::start_with(program, &[], remote)
+    fn start(program: &str, prefix_args: &[String], remote: Option<&SshRemote>) -> Result<Self> {
+        Self::start_with(program, prefix_args, remote)
     }
 
     /// `prefix_args` go before `-C`, which is where tmux wants `-L`/`-S`. Only tests pass any.
-    fn start_with(program: &str, prefix_args: &[&str], remote: Option<&SshRemote>) -> Result<Self> {
+    fn start_with(
+        program: &str,
+        prefix_args: &[String],
+        remote: Option<&SshRemote>,
+    ) -> Result<Self> {
         // No `-t`: the most recently used session is as good as any, since the client is only ever
         // asked about the server as a whole. `no-output` keeps pane data out of the pipe, which
         // bootty reads from its own PTY attachments, and `ignore-size` keeps a client with no
         // terminal from having an opinion about window size.
         let tmux_args = prefix_args
             .iter()
-            .copied()
-            .chain(["-C", "attach-session", "-f", "ignore-size,no-output"])
-            .map(str::to_owned)
+            .cloned()
+            .chain(["-C", "attach-session", "-f", "ignore-size,no-output"].map(str::to_owned))
             .collect::<Vec<_>>();
         let (program, args) = spawn_argv(program, &tmux_args, remote);
         let mut child = Command::new(program)
@@ -215,7 +229,13 @@ impl TmuxControlRunner {
     /// argv for running `program args...` as its own process: an SSH invocation for a remote
     /// server, and the command itself for a local one.
     fn spawned(&self, program: &str, args: &[String]) -> (String, Vec<String>) {
-        spawn_argv(program, args, self.remote.as_ref())
+        let args = self
+            .prefix_args
+            .iter()
+            .cloned()
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+        spawn_argv(program, &args, self.remote.as_ref())
     }
 
     /// Answer `args` from this backend's control client, or `None` to let the caller run its own
@@ -230,7 +250,7 @@ impl TmuxControlRunner {
             if slot.retry_after.is_some_and(|at| Instant::now() < at) {
                 return None;
             }
-            match TmuxControlClient::start(program, self.remote.as_ref()) {
+            match TmuxControlClient::start(program, &self.prefix_args, self.remote.as_ref()) {
                 Ok(client) => {
                     slot.client = Some(client);
                     slot.retry_after = None;
@@ -264,7 +284,7 @@ impl TmuxControlRunner {
     fn client_key(&self, program: &str) -> String {
         match &self.remote {
             Some(remote) => format!("{}@{program}", remote.destination()),
-            None => program.to_owned(),
+            None => format!("{program}\0{}", self.prefix_args.join("\0")),
         }
     }
 }
@@ -498,7 +518,7 @@ mod tests {
         let _guard = KillServer(socket.clone());
 
         let mut client =
-            TmuxControlClient::start_with("tmux", &["-L", &socket, "-f", "/dev/null"], None)
+            TmuxControlClient::start_with("tmux", &args(&["-L", &socket, "-f", "/dev/null"]), None)
                 .expect("control client");
         let query = "list-sessions -F '#{session_name}'";
 

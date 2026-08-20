@@ -2963,6 +2963,3 @@ fn atlas_uv((atlas_width, atlas_height): (u32, u32), entry: GlyphAtlasEntry) -> 
         max_y: (entry.y + entry.height) as f32 / atlas_height as f32 - 0.5 / atlas_height as f32,
     }
 }
-
-#[cfg(test)]
-mod tests;

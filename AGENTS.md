@@ -123,16 +123,38 @@ cargo --version
 
 - Project overview: `README.md`
 - Architecture: `docs/architecture.md`
-- Architecture decisions: `docs/decisions/README.md`
 - Egui oracle inventory: `docs/current-egui-behavior.md`
 - Input encoders: `docs/input-encoders.md`
 - Benchmark process and performance guardrails: `docs/benchmarking.md`
 - Benchmark reports: `docs/benchmark-report.md`
 - `libghostty-rs` dependency boundary: `docs/libghostty-rs.md`
 
-Record a durable architecture or product choice before or with its implementation
-when alternatives, invariants, failure behavior, or migration consequences are not
-evident from code. The vault owns product vocabulary. Accepted decision records
-own rationale and rejected alternatives. `docs/architecture.md` owns the current
-production structure and clearly labeled accepted targets. Add a superseding record
-when a decision changes. Do not use accepted records as progress logs.
+## Rust Module Layout
+
+Keep `mod.rs` and `lib.rs` as module declarations and re-exports.
+
+Put implementation logic, state, adapters, and tests in named modules.
+
+Do not put `#[cfg(test)]`, test declarations, fixtures, or test support in
+`mod.rs` or `lib.rs`.
+
+When a touched `mod.rs` or `lib.rs` already contains implementation logic, move
+the touched responsibility into a named module instead of adding more logic.
+
+Keep all test code out of production source files.
+
+Do not register tests from production with `#[cfg(test)]`, `mod tests`, or a
+test `#[path]`. A path bridge into `tests/` still violates this boundary.
+
+Put crate-owned tests under that crate's `tests/` directory as normal Cargo
+integration targets. Replace private white-box checks with public behavior
+contracts. Delete implementation-detail checks that do not protect public
+behavior. Do not make a production interface public only for a test.
+
+Use the workspace root `tests/` directory only for cross-crate product behavior
+and executable boundaries. It does not replace direct tests for each crate.
+
+The vault owns product vocabulary, plans, progress, rationale, and durable
+decisions. Keep only current developer documentation that must version with the
+code in this repository. `docs/architecture.md` describes current production
+structure. Do not store decision history or progress logs under `docs/`.

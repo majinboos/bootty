@@ -9,6 +9,8 @@ pub use bootty_config::{color, config, config_reload};
 pub mod cli;
 pub mod control;
 pub mod diagnostics;
+pub(crate) mod extension_source_writer;
+pub mod extension_ui;
 pub use bootty_render::{
     geometry, paint_plan, renderer_frame, selection, terminal_font_face, terminal_render,
     terminal_sprite, terminal_text, terminal_text_atlas, terminal_wgpu,
@@ -21,7 +23,6 @@ pub mod input;
 pub mod layout;
 pub mod menu;
 pub use bootty_mux as mux;
-pub mod extensions;
 pub mod native_host;
 pub mod platform;
 pub mod project_catalog;

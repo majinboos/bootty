@@ -383,7 +383,7 @@ pub(crate) async fn list_pane_rows(_rmux: &Rmux, name: &SessionName) -> Result<V
 }
 
 pub(crate) async fn rmux_request(request: Request) -> Result<Response> {
-    let endpoint = crate::bootty_rmux_endpoint_path().context("resolve Bootty rmux endpoint")?;
+    let endpoint = crate::local_rmux::endpoint_path().context("resolve Bootty rmux endpoint")?;
     let response =
         tokio::task::spawn_blocking(move || rmux_client::connect(&endpoint)?.roundtrip(&request))
             .await

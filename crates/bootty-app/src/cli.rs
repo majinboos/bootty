@@ -27,11 +27,19 @@ pub enum Command {
     #[command(name = "command")]
     Invoke {
         name: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(num_args = 0.., allow_hyphen_values = true)]
         arguments: Vec<String>,
         #[arg(long)]
         yes: bool,
+        #[arg(long = "detach")]
+        detached: bool,
     },
+    /// Inspect or cancel one detached command task.
+    #[command(name = "task", subcommand)]
+    Task(TaskCommand),
+    /// Create, poll, or remove one bounded event subscription.
+    #[command(name = "events", subcommand)]
+    Events(EventCommand),
     /// Legacy remote Space protocol retained while daemon installations roll out.
     #[command(name = "remote-space", hide = true, subcommand)]
     RemoteSpace(RemoteSpaceCommand),
@@ -47,6 +55,28 @@ pub enum Command {
     /// Invoke a command discovered from a running Bootty instance.
     #[command(external_subcommand)]
     Dynamic(Vec<String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum TaskCommand {
+    Status { task: String },
+    Cancel { task: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+pub enum EventCommand {
+    Subscribe {
+        #[arg(required = true, num_args = 1..)]
+        topics: Vec<String>,
+    },
+    Poll {
+        subscription: String,
+        #[arg(long, default_value_t = 0)]
+        cursor: u64,
+    },
+    Unsubscribe {
+        subscription: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]

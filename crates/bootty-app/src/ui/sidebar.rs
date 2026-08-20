@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use eframe::egui::Color32;
 
 use crate::{
-    extensions::{ModuleItem, ModulePrimitive},
+    command_extensions::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem},
     mux::{
         controller::{BindingId, MuxScope, SpaceId},
         snapshot::MuxSession,
@@ -63,6 +63,7 @@ pub struct SidebarItem<'a> {
     pub can_return_to_last_session: bool,
     pub icon: Option<&'a str>,
     pub primitives: &'a [ModulePrimitive],
+    pub extension_action: Option<ExtensionUiAction>,
 }
 
 pub fn build_sidebar_items<'a>(
@@ -115,6 +116,7 @@ pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec
             can_return_to_last_session: false,
             icon: Some("terminal"),
             primitives: &[],
+            extension_action: None,
         });
         let display_names = group
             .sessions
@@ -191,13 +193,40 @@ pub fn build_sidebar_items_from_module_items<'a>(
     items
         .iter()
         .filter_map(|item| {
-            sidebar_item_from_module_item(item, scope, selected_session, can_return_to_last_session)
+            sidebar_item_from_module_item(
+                item,
+                None,
+                scope,
+                selected_session,
+                can_return_to_last_session,
+            )
+        })
+        .collect()
+}
+
+pub fn build_sidebar_items_from_published_items<'a>(
+    items: &'a [PublishedSurfaceItem],
+    scope: MuxScope,
+    selected_session: Option<&str>,
+    can_return_to_last_session: bool,
+) -> Vec<SidebarItem<'a>> {
+    items
+        .iter()
+        .filter_map(|published| {
+            sidebar_item_from_module_item(
+                &published.item,
+                published.action(),
+                scope,
+                selected_session,
+                can_return_to_last_session,
+            )
         })
         .collect()
 }
 
 fn sidebar_item_from_module_item<'a>(
     item: &'a ModuleItem,
+    extension_action: Option<ExtensionUiAction>,
     scope: MuxScope,
     selected_session: Option<&str>,
     can_return_to_last_session: bool,
@@ -256,6 +285,7 @@ fn sidebar_item_from_module_item<'a>(
         can_return_to_last_session: item.session_id.is_some() && can_return_to_last_session,
         icon: item.icon.as_deref(),
         primitives: &item.primitives,
+        extension_action,
     })
 }
 
@@ -360,6 +390,7 @@ fn build_sidebar_items_inner<'a>(
                     can_return_to_last_session: false,
                     icon: None,
                     primitives: &[],
+                    extension_action: None,
                 });
                 if max_rows.is_some_and(|limit| items.len() >= limit) {
                     break;
@@ -406,6 +437,7 @@ fn build_sidebar_items_inner<'a>(
             can_return_to_last_session,
             icon: None,
             primitives: &[],
+            extension_action: None,
         });
         if max_rows.is_some_and(|limit| items.len() >= limit) {
             break;

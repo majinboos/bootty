@@ -48,7 +48,7 @@ impl StabilityTrace {
         let _ = writeln!(
             self.file,
             "{},{},{},{},{},{},{},{},{}",
-            sample.elapsed_ms,
+            self.started_at.elapsed().as_millis(),
             csv_field(sample.selected_session.unwrap_or("")),
             sample.cols,
             sample.rows,
@@ -62,7 +62,6 @@ impl StabilityTrace {
 }
 
 pub struct StabilityTraceSample<'a> {
-    pub elapsed_ms: u128,
     pub selected_session: Option<&'a str>,
     pub cols: u16,
     pub rows: u16,

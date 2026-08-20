@@ -1,7 +1,7 @@
 --!strict
 -- Built-in `sysinfo` module: keep-awake toggle, load/CPU, memory, and power
 -- status from native cross-platform metrics. Override by creating
--- ~/.config/bootty/status/sysinfo.luau.
+-- ~/.config/bootty/extensions/sysinfo.luau.
 
 return {
 	interval = 2,

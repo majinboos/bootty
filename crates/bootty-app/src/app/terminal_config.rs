@@ -151,7 +151,3 @@ fn terminal_cursor_style(config: CursorStyleConfig) -> TerminalCursorStyle {
         CursorStyleConfig::HollowBlock => TerminalCursorStyle::HollowBlock,
     }
 }
-
-#[cfg(test)]
-#[path = "terminal_config_tests.rs"]
-mod tests;

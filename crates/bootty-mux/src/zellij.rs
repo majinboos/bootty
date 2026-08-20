@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 
 #[cfg(feature = "app")]
 use super::{
@@ -15,11 +17,19 @@ use super::{
 #[derive(Clone, Debug)]
 pub struct ZellijBackend<R = SystemCommandRunner> {
     runner: R,
+    socket_dir: Option<PathBuf>,
 }
 
 impl ZellijBackend<SystemCommandRunner> {
     pub fn new() -> Self {
         Self::with_runner(SystemCommandRunner)
+    }
+
+    pub fn for_identity(identity: bootty_identity::ApplicationIdentity) -> Result<Self> {
+        Ok(Self {
+            runner: SystemCommandRunner,
+            socket_dir: prepare_socket_dir(identity)?,
+        })
     }
 }
 
@@ -31,21 +41,65 @@ impl Default for ZellijBackend<SystemCommandRunner> {
 
 impl<R> ZellijBackend<R> {
     pub fn with_runner(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            socket_dir: None,
+        }
     }
 }
 
 impl<R: CommandRunner> ZellijBackend<R> {
+    fn command(&self, args: &[String]) -> Result<crate::process::CommandOutput> {
+        let Some(socket_dir) = &self.socket_dir else {
+            return self.runner.run("zellij", args);
+        };
+        let output = std::process::Command::new("zellij")
+            .args(args)
+            .env("ZELLIJ_SOCKET_DIR", socket_dir)
+            .output()
+            .context("run zellij")?;
+        Ok(crate::process::CommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+
     fn run(&self, args: &[&str]) -> Result<String> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let output = self.runner.run("zellij", &args)?;
+        let output = self.command(&args)?;
         require_success("zellij", &args, output)
     }
 
     fn run_owned(&self, args: Vec<String>) -> Result<String> {
-        let output = self.runner.run("zellij", &args)?;
+        let output = self.command(&args)?;
         require_success("zellij", &args, output)
     }
+}
+
+pub(crate) fn prepare_socket_dir(
+    identity: bootty_identity::ApplicationIdentity,
+) -> Result<Option<PathBuf>> {
+    if identity == bootty_identity::ApplicationIdentity::Production {
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut path = rmux_ipc::endpoint_for_label(identity.namespace())?.into_path();
+        path.pop();
+        path.push("zellij");
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("create zellij socket directory {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("secure zellij socket directory {}", path.display()))?;
+        Ok(Some(path))
+    }
+
+    #[cfg(not(unix))]
+    anyhow::bail!("BoottyDev local zellij is unavailable on this platform")
 }
 
 impl<R: CommandRunner> ZellijBackend<R> {

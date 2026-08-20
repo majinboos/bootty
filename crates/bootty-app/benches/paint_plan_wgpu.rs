@@ -12,7 +12,7 @@ use bootty_app::{
     terminal_render::{TerminalRenderCommand, TerminalRenderFrame},
     terminal_text::{NativeSymbolPolicy, TerminalTextConfig, TerminalTextContract},
     terminal_text_atlas::TextAtlasBuilder,
-    terminal_wgpu::{TerminalWgpuRenderer, terminal_text_draws},
+    terminal_wgpu::TerminalWgpuRenderer,
 };
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use eframe::wgpu;
@@ -550,18 +550,6 @@ fn bench_wgpu_scroll_text_prepare(c: &mut Criterion) {
         })
     });
 }
-fn bench_terminal_text_draws_dirty_ascii(c: &mut Criterion) {
-    let frames = (0..16).map(ascii_dirty_text_frame).collect::<Vec<_>>();
-    let mut tick = 0_usize;
-
-    c.bench_function("terminal_text_draws_dirty_ascii_240x90", |b| {
-        b.iter(|| {
-            tick = tick.wrapping_add(1);
-            let frame = &frames[tick % frames.len()];
-            black_box(terminal_text_draws(frame))
-        })
-    });
-}
 fn bench_text_atlas_prepare_dirty_ascii(c: &mut Criterion) {
     let frames = (0..16).map(ascii_dirty_text_frame).collect::<Vec<_>>();
     let mut builder = TextAtlasBuilder::new(2048, 2048);
@@ -709,7 +697,6 @@ targets =
     bench_wgpu_zoom_prepare,
     bench_wgpu_dirty_text_prepare,
     bench_wgpu_scroll_text_prepare,
-    bench_terminal_text_draws_dirty_ascii,
     bench_text_atlas_prepare_dirty_ascii,
     bench_wgpu_incremental_text_atlas_upload,
     bench_wgpu_render_pass,

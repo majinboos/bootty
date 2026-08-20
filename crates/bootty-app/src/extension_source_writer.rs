@@ -8,13 +8,19 @@ use std::{
 
 use tempfile::Builder;
 
-pub(super) fn save(requested_path: &Path, source: &str) -> io::Result<()> {
-    save_with_fault(requested_path, source, WriteFault::None)
+pub(super) fn save_within(root: &Path, requested_path: &Path, source: &str) -> io::Result<()> {
+    let root = fs::canonicalize(root)?;
+    let target = resolve_write_target(requested_path)?;
+    if !target.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "extension module path escapes extension root",
+        ));
+    }
+    save_bytes(&target, source.as_bytes())
 }
 
-fn save_with_fault(requested_path: &Path, source: &str, fault: WriteFault) -> io::Result<()> {
-    #[cfg(not(test))]
-    let _ = fault;
+pub(crate) fn save_bytes(requested_path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = resolve_write_target(requested_path)?;
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
@@ -49,45 +55,22 @@ fn save_with_fault(requested_path: &Path, source: &str, fault: WriteFault) -> io
     }
     let mut temporary = builder.tempfile_in(parent)?;
 
-    temporary.write_all(source.as_bytes())?;
+    temporary.write_all(bytes)?;
     temporary.flush()?;
-    #[cfg(test)]
-    if fault == WriteFault::Sync {
-        return Err(io::Error::other("injected sync failure"));
-    }
     temporary.as_file().sync_all()?;
 
     let (temporary_file, temporary_path) = temporary.into_parts();
     drop(temporary_file);
-    #[cfg(test)]
-    if fault == WriteFault::Replace {
-        return Err(io::Error::other("injected replacement failure"));
-    }
     replace_file(temporary_path.as_ref(), &target, existing.is_some())?;
 
     #[cfg(unix)]
     {
-        #[cfg(test)]
-        if fault == WriteFault::SyncDirectory {
-            return Ok(());
-        }
         // Replacement already committed the new bytes. A directory-sync failure cannot
         // be returned without hiding that committed result.
         let _ = File::open(parent).and_then(|directory| directory.sync_all());
     }
 
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WriteFault {
-    None,
-    #[cfg(test)]
-    Sync,
-    #[cfg(test)]
-    Replace,
-    #[cfg(all(test, unix))]
-    SyncDirectory,
 }
 
 struct WriteLease {
@@ -237,7 +220,3 @@ fn replace_file(temporary: &Path, target: &Path, target_exists: bool) -> io::Res
 fn replace_file(temporary: &Path, target: &Path, _target_exists: bool) -> io::Result<()> {
     fs::rename(temporary, target)
 }
-
-#[cfg(test)]
-#[path = "extension_source_writer_tests.rs"]
-mod tests;

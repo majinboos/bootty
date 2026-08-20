@@ -29,9 +29,9 @@ bootty-mux = { path = "../bootty-mux" }
 bootty-ui = { path = "../bootty-ui" }
 bootty-render = { path = "../bootty-render" }
 bootty-runtime = { path = "../bootty-runtime" }
-bootty-surface = { path = "../bootty-surface" }
 bootty-terminal = { path = "../bootty-terminal" }
 png.workspace = true
+process-wrap.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -73,10 +73,8 @@ embed-resource.workspace = true
 [dev-dependencies]
 bootty-winit = { path = "../bootty-winit", features = ["bare-host"] }
 criterion.workspace = true
-indoc.workspace = true
+egui.workspace = true
 pollster.workspace = true
-proptest.workspace = true
-rstest.workspace = true
 
 [[bench]]
 name = "paint_plan"

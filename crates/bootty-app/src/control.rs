@@ -44,37 +44,29 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
-    pub fn register_extension_topic(&self, package: &str, topic: &str) -> Result<(), String> {
-        if !topic.starts_with(package) || !topic[package.len()..].starts_with('.') {
-            return Err("extension event topic must be namespaced by its package".to_owned());
-        }
-        lock_control_state(&self.state)
-            .topics
-            .insert(topic.to_owned());
-        Ok(())
-    }
-
     pub fn publish_extension_event(
         &self,
-        package: &str,
+        catalog: &CommandCatalog,
+        module: &str,
+        generation: u64,
         topic: &str,
         payload: Value,
     ) -> Result<(), String> {
-        self.register_extension_topic(package, topic)?;
         let scope = self
             .instance_scope
             .lock()
             .map_err(|_| "control plane scope is unavailable".to_owned())?
             .clone()
             .ok_or_else(|| "control plane is not bound to an instance".to_owned())?;
-        lock_control_state(&self.state).publish_event(
-            scope,
-            topic,
-            json!({"extension": package}),
-            Value::Null,
-            payload,
-        );
-        Ok(())
+        catalog.with_active_extension_topic(module, generation, topic, || {
+            lock_control_state(&self.state).publish_event(
+                scope,
+                topic,
+                json!({"extension": module, "generation": generation}),
+                Value::Null,
+                payload,
+            );
+        })
     }
 }
 
@@ -354,9 +346,8 @@ async fn handle_request(
                 "command.describe", "command.invoke", "event.subscribe", "event.unsubscribe",
                 "task.status", "task.cancel"
             ],
-            "event_topics": lock_control_state(&state)
-                .topics
-                .iter()
+            "event_topics": available_event_topics(&state, &catalog)
+                .into_iter()
                 .map(|topic| (topic.clone(), json!({
                     "snapshot": if topic == COMMAND_COMPLETED_TOPIC {
                         Some("instance.describe")
@@ -378,10 +369,10 @@ async fn handle_request(
         "command.invoke" => {
             invoke_command(request.params, descriptor, commands, state, owner_pid).await
         }
-        "event.subscribe" => subscribe_events(request.params, descriptor, state, owner_pid),
-        "event.unsubscribe" => unsubscribe_events(request.params, state, owner_pid),
-        "task.status" => task_status(request.params, state, owner_pid),
-        "task.cancel" => task_cancel(request.params, state, owner_pid),
+        "event.subscribe" => subscribe_events(request.params, descriptor, state, &catalog),
+        "event.unsubscribe" => unsubscribe_events(request.params, state),
+        "task.status" => task_status(request.params, state),
+        "task.cancel" => task_cancel(request.params, state),
         _ => Err(RpcError::new(-32601, "method not found")),
     };
     match result {
@@ -488,7 +479,7 @@ fn start_task(
         state.finish_task(&task_id, outcome.clone());
         state.publish_command_completion(scope, owner_pid, &invocation, outcome);
     }
-    lock_control_state(&state).task_value(&task_id, owner_pid)
+    lock_control_state(&state).task_value(&task_id)
 }
 
 fn enqueue_command(
@@ -584,46 +575,35 @@ fn subscribe_events(
     params: Value,
     descriptor: InstanceDescriptor,
     state: SharedControlState,
-    owner_pid: u32,
+    catalog: &CommandCatalog,
 ) -> Result<Value, RpcError> {
-    let mut state = lock_control_state(&state);
     if let Some(subscription) = params.get("subscription").and_then(Value::as_str) {
         let cursor = params
             .get("cursor")
             .and_then(Value::as_u64)
             .ok_or_else(|| RpcError::new(-32602, "missing subscription cursor"))?;
-        return state.poll_subscription(subscription, owner_pid, cursor);
+        return lock_control_state(&state).poll_subscription(subscription, cursor);
     }
-    let topics = event_topics(&params, &state)?;
+    let extension_topics = catalog.extension_topics();
+    let mut state = lock_control_state(&state);
+    let topics = event_topics(&params, &state, &extension_topics)?;
     let scope = event_scope(&params, &descriptor)?;
-    state.create_subscription(owner_pid, topics, scope)
+    state.create_subscription(topics, scope)
 }
 
-fn unsubscribe_events(
-    params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
-) -> Result<Value, RpcError> {
+fn unsubscribe_events(params: Value, state: SharedControlState) -> Result<Value, RpcError> {
     let subscription = subscription_id(&params)?;
-    lock_control_state(&state).unsubscribe(subscription, owner_pid)
+    lock_control_state(&state).unsubscribe(subscription)
 }
 
-fn task_status(
-    params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
-) -> Result<Value, RpcError> {
+fn task_status(params: Value, state: SharedControlState) -> Result<Value, RpcError> {
     let task = task_id(&params)?;
-    lock_control_state(&state).task_value(task, owner_pid)
+    lock_control_state(&state).task_value(task)
 }
 
-fn task_cancel(
-    params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
-) -> Result<Value, RpcError> {
+fn task_cancel(params: Value, state: SharedControlState) -> Result<Value, RpcError> {
     let task = task_id(&params)?;
-    lock_control_state(&state).cancel_task(task, owner_pid)
+    lock_control_state(&state).cancel_task(task)
 }
 
 fn task_id(params: &Value) -> Result<&str, RpcError> {
@@ -641,7 +621,17 @@ fn subscription_id(params: &Value) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::new(-32602, "missing subscription"))
 }
 
-fn event_topics(params: &Value, state: &ControlState) -> Result<BTreeSet<String>, RpcError> {
+fn event_topics(
+    params: &Value,
+    state: &ControlState,
+    extension_topics: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, RpcError> {
+    let available = state
+        .topics
+        .iter()
+        .cloned()
+        .chain(extension_topics.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let topics = params
         .get("topics")
         .and_then(Value::as_array)
@@ -655,12 +645,24 @@ fn event_topics(params: &Value, state: &ControlState) -> Result<BTreeSet<String>
             let Some(topic) = topic.as_str() else {
                 return Err(RpcError::new(-32602, "event topic must be a string"));
             };
-            if topic.is_empty() || topic.len() > EVENT_TOPIC_LIMIT || !state.topics.contains(topic)
-            {
+            if topic.is_empty() || topic.len() > EVENT_TOPIC_LIMIT || !available.contains(topic) {
                 return Err(RpcError::new(-32602, "unsupported event topic"));
             }
             Ok(topic.to_owned())
         })
+        .collect()
+}
+
+fn available_event_topics(
+    state: &SharedControlState,
+    catalog: &CommandCatalog,
+) -> BTreeSet<String> {
+    let extension_topics = catalog.extension_topics();
+    lock_control_state(state)
+        .topics
+        .iter()
+        .cloned()
+        .chain(extension_topics)
         .collect()
 }
 
@@ -683,10 +685,8 @@ fn instance_scope(descriptor: &InstanceDescriptor) -> String {
 type SharedControlState = Arc<Mutex<ControlState>>;
 
 struct ControlState {
-    next_task: u64,
     tasks: BTreeMap<String, TaskRecord>,
     completed_tasks: VecDeque<String>,
-    next_subscription: u64,
     subscriptions: BTreeMap<String, SubscriptionRecord>,
     revisions: BTreeMap<String, u64>,
     topics: BTreeSet<String>,
@@ -695,10 +695,8 @@ struct ControlState {
 impl Default for ControlState {
     fn default() -> Self {
         Self {
-            next_task: 1,
             tasks: BTreeMap::new(),
             completed_tasks: VecDeque::new(),
-            next_subscription: 1,
             subscriptions: BTreeMap::new(),
             revisions: BTreeMap::new(),
             topics: BTreeSet::from([COMMAND_COMPLETED_TOPIC.to_owned()]),
@@ -721,7 +719,6 @@ struct TaskRecord {
 }
 
 struct SubscriptionRecord {
-    owner_pid: u32,
     topics: BTreeSet<String>,
     scope: String,
     sequence: u64,
@@ -758,8 +755,12 @@ impl ControlState {
             };
             self.tasks.remove(&completed);
         }
-        let id = format!("task-{}", self.next_task);
-        self.next_task += 1;
+        let id = loop {
+            let candidate = capability_id("task")?;
+            if !self.tasks.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         self.tasks.insert(
             id.clone(),
             TaskRecord {
@@ -785,9 +786,11 @@ impl ControlState {
         }
     }
 
-    fn task_value(&self, task: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_task(task, owner_pid)?;
-        let record = self.tasks.get(task).expect("owned task exists");
+    fn task_value(&self, task: &str) -> Result<Value, RpcError> {
+        let record = self
+            .tasks
+            .get(task)
+            .ok_or_else(|| RpcError::new(-32602, "unknown task"))?;
         Ok(json!({
             "task": {
                 "id": task,
@@ -797,13 +800,15 @@ impl ControlState {
         }))
     }
 
-    fn cancel_task(&mut self, task: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_task(task, owner_pid)?;
-        let record = self.tasks.get_mut(task).expect("owned task exists");
+    fn cancel_task(&mut self, task: &str) -> Result<Value, RpcError> {
+        let record = self
+            .tasks
+            .get_mut(task)
+            .ok_or_else(|| RpcError::new(-32602, "unknown task"))?;
         if matches!(record.state, TaskState::Running) && record.cancellation.cancel() {
             record.state = TaskState::Cancelling;
         }
-        self.task_value(task, owner_pid)
+        self.task_value(task)
     }
 
     fn cancel_all_tasks(&mut self) {
@@ -815,33 +820,24 @@ impl ControlState {
         }
     }
 
-    fn owned_task(&self, task: &str, owner_pid: u32) -> Result<(), RpcError> {
-        let Some(record) = self.tasks.get(task) else {
-            return Err(RpcError::new(-32602, "unknown task"));
-        };
-        if record.owner_pid != owner_pid {
-            return Err(RpcError::new(-32006, "task is owned by another process"));
-        }
-        Ok(())
-    }
-
     fn create_subscription(
         &mut self,
-        owner_pid: u32,
         topics: BTreeSet<String>,
         scope: String,
     ) -> Result<Value, RpcError> {
-        self.reap_dead_subscriptions();
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
             return Err(RpcError::new(-32001, "subscription limit reached"));
         }
-        let id = format!("subscription-{}", self.next_subscription);
-        self.next_subscription += 1;
+        let id = loop {
+            let candidate = capability_id("subscription")?;
+            if !self.subscriptions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let revision = *self.revisions.get(&scope).unwrap_or(&0);
         self.subscriptions.insert(
             id.clone(),
             SubscriptionRecord {
-                owner_pid,
                 topics,
                 scope: scope.clone(),
                 sequence: 0,
@@ -859,14 +855,9 @@ impl ControlState {
         }))
     }
 
-    fn poll_subscription(
-        &mut self,
-        subscription: &str,
-        owner_pid: u32,
-        cursor: u64,
-    ) -> Result<Value, RpcError> {
+    fn poll_subscription(&mut self, subscription: &str, cursor: u64) -> Result<Value, RpcError> {
         let (scope, cursor, events) = {
-            let record = self.owned_subscription(subscription, owner_pid)?;
+            let record = self.subscription(subscription)?;
             if let Some(gap) = &record.gap {
                 return Err(rebase_error(
                     subscription,
@@ -920,36 +911,16 @@ impl ControlState {
         }))
     }
 
-    fn reap_dead_subscriptions(&mut self) {
-        let system = sysinfo::System::new_all();
-        self.subscriptions.retain(|_, subscription| {
-            system
-                .process(sysinfo::Pid::from_u32(subscription.owner_pid))
-                .is_some()
-        });
-    }
-
-    fn unsubscribe(&mut self, subscription: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_subscription(subscription, owner_pid)?;
+    fn unsubscribe(&mut self, subscription: &str) -> Result<Value, RpcError> {
+        self.subscription(subscription)?;
         self.subscriptions.remove(subscription);
         Ok(json!({"unsubscribed": subscription}))
     }
 
-    fn owned_subscription(
-        &mut self,
-        subscription: &str,
-        owner_pid: u32,
-    ) -> Result<&mut SubscriptionRecord, RpcError> {
-        let Some(record) = self.subscriptions.get_mut(subscription) else {
-            return Err(RpcError::new(-32602, "unknown subscription"));
-        };
-        if record.owner_pid != owner_pid {
-            return Err(RpcError::new(
-                -32006,
-                "subscription is owned by another process",
-            ));
-        }
-        Ok(record)
+    fn subscription(&mut self, subscription: &str) -> Result<&mut SubscriptionRecord, RpcError> {
+        self.subscriptions
+            .get_mut(subscription)
+            .ok_or_else(|| RpcError::new(-32602, "unknown subscription"))
     }
 
     fn publish_command_completion(
@@ -1018,6 +989,17 @@ fn rebase_error(subscription: &str, scope: &str, cursor: u64, sequence: u64) -> 
     error
 }
 
+fn capability_id(prefix: &str) -> Result<String, RpcError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| RpcError::new(-32603, format!("generate capability ID: {error}")))?;
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{prefix}-{token}"))
+}
+
 fn lock_control_state(state: &SharedControlState) -> std::sync::MutexGuard<'_, ControlState> {
     state
         .lock()
@@ -1065,6 +1047,10 @@ fn internal_error(error: serde_json::Error) -> RpcError {
 pub fn invoke_or_start(start: bool, method: &str, params: Value) -> Result<RpcResponse> {
     let descriptor = select_or_start(start)?;
     invoke_instance(&descriptor, method, params)
+}
+
+pub fn running_instance() -> Result<Option<InstanceDescriptor>> {
+    discover_instance()
 }
 
 pub fn select_or_start(start: bool) -> Result<InstanceDescriptor> {

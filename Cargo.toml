@@ -88,6 +88,11 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 ] }
 pollster = "0.4"
 png = "0.18"
+process-wrap = { version = "9.1", default-features = false, features = [
+  "job-object",
+  "process-group",
+  "std",
+] }
 portable-pty = "0.9"
 proptest = "1"
 rmux-client = "0.10"
@@ -177,13 +182,8 @@ debug = false
 anyhow.workspace = true
 bootty-app = { path = "crates/bootty-app" }
 bootty-config = { path = "crates/bootty-config" }
-bootty-font = { path = "crates/bootty-font" }
 bootty-mux = { path = "crates/bootty-mux" }
-bootty-mux-model = { path = "crates/bootty-mux-model" }
-clap.workspace = true
-egui.workspace = true
 serde_json.workspace = true
-rusqlite.workspace = true
 tempfile.workspace = true
 toml_edit.workspace = true
 

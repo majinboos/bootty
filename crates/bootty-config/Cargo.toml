@@ -17,7 +17,5 @@ bootty-identity = { path = "../bootty-identity" }
 winsafe.workspace = true
 
 [dev-dependencies]
-bootty-winit = { path = "../bootty-winit", default-features = false }
 indoc.workspace = true
-proptest.workspace = true
 rstest.workspace = true

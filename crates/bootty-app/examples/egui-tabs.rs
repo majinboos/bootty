@@ -166,7 +166,7 @@ impl TabsExample {
             cursor_blinking: metrics.cursor_blinking,
             input_commands,
         });
-        ctx.request_repaint_after(repaint.after);
+        ctx.request_repaint_after(repaint);
     }
 
     fn show_tabs(&mut self, ui: &mut egui::Ui) {

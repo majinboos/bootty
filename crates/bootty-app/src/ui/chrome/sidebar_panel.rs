@@ -5,8 +5,8 @@ use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
 use crate::{
     assets,
+    command_extensions::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem},
     config::ChromeConfig,
-    extensions::ModuleItem,
     mux::{
         controller::{MuxScope, SpaceId},
         snapshot::MuxSession,
@@ -24,7 +24,7 @@ use super::{item_primitives::paint_item_primitives, start_window_drag_on_primary
 #[derive(Clone)]
 pub struct SidebarModel<'a> {
     pub items: &'a [SidebarItem<'a>],
-    pub footer_items: &'a [ModuleItem],
+    pub footer_items: &'a [PublishedSurfaceItem],
     pub session_count: usize,
     pub has_sessions: bool,
     pub title_visible: bool,
@@ -47,6 +47,7 @@ pub struct SidebarModel<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarEvent {
+    ExtensionAction(ExtensionUiAction),
     ActivateSession(ScopedSessionTarget),
     ContextAction {
         target: ScopedSessionTarget,
@@ -545,6 +546,13 @@ pub fn show_sidebar(
         if event.is_none()
             && !suppress_click
             && response.clicked_by(egui::PointerButton::Primary)
+            && let Some(action) = item.extension_action.clone()
+        {
+            event = Some(SidebarEvent::ExtensionAction(action));
+        }
+        if event.is_none()
+            && !suppress_click
+            && response.clicked_by(egui::PointerButton::Primary)
             && item.selectable
             && let Some((scope, session_id)) = item_key
         {
@@ -604,7 +612,7 @@ pub fn show_sidebar(
         }
     }
 
-    paint_sidebar_footer(
+    let footer_action = paint_sidebar_footer(
         ui,
         rect,
         footer_h,
@@ -613,6 +621,9 @@ pub fn show_sidebar(
         palette,
         border_color,
     );
+    if event.is_none() {
+        event = footer_action.map(SidebarEvent::ExtensionAction);
+    }
     event
 }
 
@@ -1032,7 +1043,7 @@ fn sidebar_item_row(
     // Any row carrying an anchor drags its whole block, so grabbing a detail row
     // (process/branch/status/progress) reorders just like grabbing the title row.
     let draggable = item.reorder_anchor.is_some();
-    let clickable = item.selectable && item.session_id.is_some();
+    let clickable = item.extension_action.is_some() || item.selectable && item.session_id.is_some();
     let response = ui.interact(
         rect,
         ui.make_persistent_id(("mux-sidebar-item", &item.id)),
@@ -1250,7 +1261,7 @@ fn paint_generic_sidebar_item(
     }
 }
 
-fn sidebar_footer_items(items: &[ModuleItem]) -> &[ModuleItem] {
+fn sidebar_footer_items(items: &[PublishedSurfaceItem]) -> &[PublishedSurfaceItem] {
     let len = items.len().min(SIDEBAR_MAX_FOOTER_ITEMS);
     &items[..len]
 }
@@ -1261,14 +1272,14 @@ fn sidebar_footer_height(footer_item_count: usize) -> f32 {
 }
 
 fn paint_sidebar_footer(
-    ui: &egui::Ui,
+    ui: &mut egui::Ui,
     rect: Rect,
     footer_h: f32,
-    footer_items: &[ModuleItem],
+    footer_items: &[PublishedSurfaceItem],
     separator_visible: bool,
     palette: ThemePalette,
     border_color: egui::Color32,
-) {
+) -> Option<ExtensionUiAction> {
     let painter = ui.painter_at(rect);
     let y = rect.max.y - footer_h;
     if separator_visible {
@@ -1279,11 +1290,34 @@ fn paint_sidebar_footer(
     }
 
     let mut row_y = y + 18.0;
-    for item in footer_items.iter() {
+    let mut action = None;
+    for (index, published) in footer_items.iter().enumerate() {
+        let item = &published.item;
         let item_rect = Rect::from_min_size(
             Pos2::new(rect.min.x + 14.0, row_y - 10.0),
             egui::vec2(rect.width() - 28.0, 26.0),
         );
+        let response = ui.interact(
+            item_rect,
+            ui.make_persistent_id((
+                "extension-sidebar-footer",
+                published.module.as_str(),
+                published.generation,
+                published.surface.as_str(),
+                index,
+            )),
+            if item.action.is_some() {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            },
+        );
+        if response.hovered() && item.action.is_some() {
+            ui.set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if action.is_none() && response.clicked_by(egui::PointerButton::Primary) {
+            action = published.action();
+        }
         let color = readable_color(palette.base, item.fg.unwrap_or(palette.subtext));
         paint_item_primitives(
             &painter,
@@ -1299,6 +1333,7 @@ fn paint_sidebar_footer(
         }
         row_y += SIDEBAR_FOOTER_ITEM_HEIGHT;
     }
+    action
 }
 
 fn paint_footer_fallback(
