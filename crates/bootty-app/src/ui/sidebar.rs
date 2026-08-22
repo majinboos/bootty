@@ -6,10 +6,7 @@ use eframe::egui::Color32;
 
 use crate::{
     command_extensions::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem},
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::MuxSession,
-    },
+    mux::{controller::MuxScope, snapshot::MuxSession},
     ui::session_navigation::BindingSessionGroup,
 };
 
@@ -66,37 +63,6 @@ pub struct SidebarItem<'a> {
     pub icon: Option<&'a str>,
     pub primitives: &'a [ModulePrimitive],
     pub extension_action: Option<ExtensionUiAction>,
-}
-
-pub fn build_sidebar_items<'a>(
-    sessions: &'a [MuxSession],
-    selected_session: Option<&str>,
-) -> Vec<SidebarItem<'a>> {
-    build_sidebar_items_inner(
-        default_scope(),
-        sessions,
-        &[],
-        selected_session,
-        true,
-        false,
-        None,
-    )
-}
-
-pub fn build_visible_sidebar_items<'a>(
-    sessions: &'a [MuxSession],
-    selected_session: Option<&str>,
-    max_rows: usize,
-) -> Vec<SidebarItem<'a>> {
-    build_sidebar_items_inner(
-        default_scope(),
-        sessions,
-        &[],
-        selected_session,
-        true,
-        false,
-        Some(max_rows),
-    )
 }
 
 pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec<SidebarItem<'a>> {
@@ -177,26 +143,6 @@ pub fn sidebar_session_colors<'a>(
                 color,
                 dim_color,
             })
-        })
-        .collect()
-}
-
-pub fn build_sidebar_items_from_published_items<'a>(
-    items: &'a [PublishedSurfaceItem],
-    scope: MuxScope,
-    selected_session: Option<&str>,
-    can_return_to_last_session: bool,
-) -> Vec<SidebarItem<'a>> {
-    items
-        .iter()
-        .filter_map(|item| {
-            sidebar_item_from_module_item(
-                item,
-                None,
-                scope,
-                selected_session,
-                can_return_to_last_session,
-            )
         })
         .collect()
 }

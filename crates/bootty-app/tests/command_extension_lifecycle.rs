@@ -8,7 +8,7 @@ use bootty_app::{
     command_extensions::{ExtensionHost, ExtensionUiAction, SurfacePlacement},
     commands::{
         Caller, CommandCancellation, CommandCatalog, CommandExecutor, CommandInvocation,
-        CommandOutcome, app_command_channel,
+        CommandOutcome, app_command_channel_with_repaint,
     },
     control::ControlPlane,
     extension_ui::MuxView,
@@ -36,6 +36,15 @@ for _, placement in ipairs({ "status", "sidebar", "session", "floating", "docked
     end)
 end
 "#;
+
+fn app_command_channel(
+    capacity: usize,
+) -> (
+    bootty_app::commands::AppCommandSender,
+    bootty_app::commands::AppCommandReceiver,
+) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
 
 const VERSION_ONE: &str = r#"
 bootty.events.register("probe.changed")

@@ -221,6 +221,5 @@ fn parse_zellij_snapshot(output: &str) -> MuxSnapshot {
     MuxSnapshot {
         sessions,
         active_session_id: None,
-        ..MuxSnapshot::default()
     }
 }

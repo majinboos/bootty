@@ -8,11 +8,7 @@ use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 use crate::{
     assets,
     command_extensions::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem},
-    config::ChromeConfig,
-    mux::{
-        controller::{MuxScope, SpaceId},
-        snapshot::MuxSession,
-    },
+    mux::controller::{MuxScope, SpaceId},
     strings::truncate_label,
     theme::module_color32,
     ui::{

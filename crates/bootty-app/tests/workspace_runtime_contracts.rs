@@ -20,7 +20,6 @@ use rusqlite::Connection;
 fn frame(now: Instant) -> FrameInputs {
     FrameInputs {
         now,
-        stable_dt_ms: 1.0,
         events: Vec::new(),
         dropped_file_paths: Vec::new(),
         modifiers: egui::Modifiers::NONE,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
@@ -9,8 +9,10 @@ use bootty_config::config::MultiplexerBackendConfig;
 use bootty_terminal::terminal_engine::TerminalSideEffectEvent;
 
 use super::{
+    binding_terminal_facts::BindingTerminalFacts,
     mux_config::realize_binding,
-    state::{SpaceSummary, TerminalProgress},
+    remote_reconnect::{BindingReconnect, NetworkChangeDetector},
+    state::SpaceSummary,
     terminal_config::terminal_session_config_with_side_effects,
 };
 
@@ -162,13 +164,7 @@ pub(super) struct BindingRuntime {
     pub(super) scope: MuxScope,
     pub(super) label: String,
     placement: SpaceMuxOverride,
-    /// Set while this binding's remote attach client is gone and bootty is waiting to start
-    /// another. Per binding, not per window: one space's outage is not another's, and a reconnect
-    /// pending here must not discard the pane of whichever space is active when it comes due.
-    pub(super) reattach: Option<RemoteReattach>,
-    /// When this binding's current remote attach client was asked for, so an outage that keeps
-    /// ending clients can be told from one connection that lasted and then dropped much later.
-    pub(super) remote_attach_started: Option<Instant>,
+    pub(super) reconnect: BindingReconnect,
     pub(super) multiplexer: crate::config::MultiplexerConfig,
     pub(super) terminal: Box<ActiveTerminal>,
     pub(super) mux: BindingMuxController,
@@ -182,12 +178,7 @@ pub(super) struct BindingRuntime {
     pub(super) terminal_side_effect_rx: mpsc::Receiver<TerminalSideEffectEvent>,
     pub(super) pane_layouts: HashMap<ScopedWindowId, PaneLayout>,
     pub(super) pending_pane_split_directions: HashMap<ScopedWindowId, SplitDirection>,
-    pub(super) custom_tab_names: HashSet<ScopedWindowId>,
-    pub(super) terminal_tab_titles: HashMap<ScopedWindowId, String>,
-    pub(super) terminal_progress: HashMap<ScopedPaneId, TerminalProgress>,
-    pub(super) unscoped_terminal_progress: Option<TerminalProgress>,
-    pub(super) terminal_ports: HashMap<ScopedPaneId, Vec<u16>>,
-    pub(super) unscoped_terminal_ports: Vec<u16>,
+    pub(super) terminal_facts: BindingTerminalFacts,
     pub(super) persisted_sessions_restored: bool,
 }
 
@@ -235,8 +226,7 @@ impl BindingRuntime {
         let mut binding = Self {
             label: binding_label(scope, &realized.config),
             placement,
-            reattach: None,
-            remote_attach_started: None,
+            reconnect: BindingReconnect::default(),
             multiplexer: realized.config,
             scope,
             terminal,
@@ -251,12 +241,7 @@ impl BindingRuntime {
             generated_names_signature: None,
             pane_layouts: HashMap::new(),
             pending_pane_split_directions: HashMap::new(),
-            custom_tab_names: HashSet::new(),
-            terminal_tab_titles: HashMap::new(),
-            terminal_progress: HashMap::new(),
-            terminal_ports: HashMap::new(),
-            unscoped_terminal_ports: Vec::new(),
-            unscoped_terminal_progress: None,
+            terminal_facts: BindingTerminalFacts::default(),
             persisted_sessions_restored: false,
         };
         if let Some(error) = remote_error {
@@ -379,19 +364,6 @@ impl BindingRuntime {
             .apply_session_order(&self.session_order.session_names());
     }
 
-    pub(super) fn resolve_empty_remote_after_attach_exit(
-        &mut self,
-        refresh_completed: bool,
-    ) -> bool {
-        if !refresh_completed || self.reattach.is_none() || !self.mux.sessions().is_empty() {
-            return false;
-        }
-        self.reattach = None;
-        self.remote_attach_started = None;
-        self.mux.set_availability_error(None);
-        true
-    }
-
     /// The names bootty shows for `sessions`, in the same order.
     ///
     /// A backend name has to be unique across a whole shared server, so bootty's own name for a
@@ -500,13 +472,6 @@ impl BindingRuntime {
             pane_id: pane_id.into(),
         }
     }
-
-    pub(super) fn degraded_error(&self) -> Option<String> {
-        self.mux.last_error().map(str::to_owned).or_else(|| {
-            self.reattach
-                .map(|reattach| format!("reconnecting (attempt {})", reattach.attempts))
-        })
-    }
 }
 
 pub(super) struct SpaceRuntime {
@@ -558,54 +523,6 @@ impl SpaceRuntime {
     }
 }
 
-/// A remote binding's attach client is gone and bootty is waiting to start the next one.
-///
-/// The sessions themselves live on the other host and outlive the connection, so a lost link is
-/// reconnected to rather than treated as the pane ending. Attempts back off, because the same loss
-/// that ends one client usually ends the next few too, and each attempt is a fresh SSH handshake.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct RemoteReattach {
-    pub(super) retry_at: Instant,
-    pub(super) attempts: u32,
-    /// Set once the waiting is over and a new attach client has been asked for.
-    pub(super) started: bool,
-}
-
-impl RemoteReattach {
-    pub(super) const FIRST_DELAY: Duration = Duration::from_millis(500);
-    pub(super) const MAX_DELAY: Duration = Duration::from_secs(30);
-    /// How long an attach client has to survive before its connection counts as established. A
-    /// client that dies sooner is the same outage continuing, so the backoff keeps growing.
-    pub(super) const STABLE_AFTER: Duration = Duration::from_secs(5);
-
-    pub(super) fn after_failure(
-        previous: Option<Self>,
-        attached_for: Option<Duration>,
-        now: Instant,
-    ) -> Self {
-        let established = attached_for.is_some_and(|elapsed| elapsed >= Self::STABLE_AFTER);
-        let attempts = match previous {
-            Some(previous) if !established => previous.attempts.saturating_add(1),
-            _ => 1,
-        };
-        Self {
-            retry_at: now + Self::delay(attempts),
-            attempts,
-            started: false,
-        }
-    }
-
-    pub(super) fn due(self, now: Instant) -> bool {
-        !self.started && now >= self.retry_at
-    }
-
-    pub(super) fn delay(attempts: u32) -> Duration {
-        Self::FIRST_DELAY
-            .saturating_mul(1u32 << attempts.saturating_sub(1).min(8))
-            .min(Self::MAX_DELAY)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SpaceTransition {
     pub(super) from: SpaceId,
@@ -641,6 +558,7 @@ pub(super) struct WorkspaceRuntime {
     pub(super) inactive_spaces: Vec<SpaceRuntime>,
     pub(super) space_transition: Option<SpaceTransition>,
     pub(super) parked_native_terminal: Option<NativeTerminalOwner>,
+    pub(super) network_change_detector: NetworkChangeDetector,
 }
 
 impl WorkspaceRuntime {
@@ -680,6 +598,7 @@ impl WorkspaceRuntime {
             inactive_spaces: spaces,
             space_transition: None,
             parked_native_terminal: None,
+            network_change_detector: NetworkChangeDetector::new(Instant::now()),
         })
     }
 

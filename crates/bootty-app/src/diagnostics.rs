@@ -1,8 +1,6 @@
 use std::{fs::File, io::Write, time::Instant};
 
-use bootty_config::config::BoottyConfig;
-
-use crate::strings::csv_field;
+use crate::{config::BoottyConfig, strings::csv_field};
 
 pub use bootty_runtime::latency::{start as latency_start, trace_phase, trace_slow};
 
@@ -56,12 +54,4 @@ pub struct StabilityTraceSample<'a> {
     pub drain_elapsed_us: u64,
     pub text_runs: usize,
     pub last_error: Option<&'a str>,
-}
-
-pub fn should_sample_status_metrics(elapsed: Duration) -> bool {
-    elapsed >= STATUS_METRICS_SAMPLE_INTERVAL
-}
-
-pub fn us_to_ms(us: u64) -> f32 {
-    us as f32 / 1000.0
 }

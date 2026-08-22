@@ -2,21 +2,24 @@ use std::{collections::HashMap, hint::black_box, path::PathBuf, sync::Arc, time:
 
 use anyhow::Result;
 use bootty_app::{
-    app::{AppState, FrameInputs, ViewportSnapshot},
+    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
     config::{BoottyConfig, MultiplexerBackendConfig},
     geometry::{TerminalGeometry, ViewTransform},
     mux::{
         RepaintHandle,
+        controller::{BindingId, MuxScope, SpaceId},
         snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
     },
     renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
     terminal::{RenderFrame, TerminalEngine},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
+        icons,
         session_navigation::BindingSessionGroup,
         sidebar::build_binding_sidebar_items,
         space::SpaceEditorEvent,
     },
+    workspace::SpaceMuxOverride,
 };
 use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
 use bootty_mux::{

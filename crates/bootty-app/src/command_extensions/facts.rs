@@ -9,7 +9,7 @@ use std::time::SystemTime;
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, LuaSerdeExt, Table, Value, serde::SerializeOptions};
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
 use sysinfo::{MemoryRefreshKind, System};
 
@@ -377,39 +377,14 @@ fn battery_status(
     }
 }
 
-fn json_value_to_lua(lua: &Lua, value: serde_json::Value) -> mlua::Result<Value> {
-    match value {
-        serde_json::Value::Null => Ok(Value::Nil),
-        serde_json::Value::Bool(value) => Ok(Value::Boolean(value)),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Ok(Value::Integer(value))
-            } else if let Some(value) = value.as_u64() {
-                if let Ok(value) = i64::try_from(value) {
-                    Ok(Value::Integer(value))
-                } else {
-                    Ok(Value::Number(value as f64))
-                }
-            } else {
-                Ok(Value::Number(value.as_f64().unwrap_or_default()))
-            }
-        }
-        serde_json::Value::String(value) => Ok(Value::String(lua.create_string(&value)?)),
-        serde_json::Value::Array(values) => {
-            let table = lua.create_table_with_capacity(values.len(), 0)?;
-            for (index, value) in values.into_iter().enumerate() {
-                table.set(index + 1, json_value_to_lua(lua, value)?)?;
-            }
-            Ok(Value::Table(table))
-        }
-        serde_json::Value::Object(entries) => {
-            let table = lua.create_table_with_capacity(0, entries.len())?;
-            for (key, value) in entries {
-                table.set(key, json_value_to_lua(lua, value)?)?;
-            }
-            Ok(Value::Table(table))
-        }
-    }
+fn json_value_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
+    lua.to_value_with(
+        value,
+        SerializeOptions::new()
+            .set_array_metatable(false)
+            .serialize_none_to_null(false)
+            .serialize_unit_to_null(false),
+    )
 }
 
 static RUN_JOB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -947,7 +922,7 @@ fn install_ui_host_interface(
         "decode",
         lua.create_function(|lua, text: String| {
             let value = serde_json::from_str(&text).map_err(mlua::Error::external)?;
-            json_value_to_lua(lua, value)
+            json_value_to_lua(lua, &value)
         })?,
     )?;
     json_table.set(

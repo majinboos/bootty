@@ -18,7 +18,6 @@ bootty-identity = { path = "../bootty-identity" }
 bootty-mux-model = { path = "../bootty-mux-model" }
 anyhow.workspace = true
 derive_more = { workspace = true, optional = true }
-libghostty-vt = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 rmux-client.workspace = true
 rmux-ipc.workspace = true
