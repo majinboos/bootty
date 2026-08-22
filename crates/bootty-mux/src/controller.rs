@@ -629,10 +629,6 @@ impl BindingMuxController {
         self.observed_resources = current;
     }
 
-    pub fn synchronize_resource_generations(&mut self) {
-        self.record_resource_snapshot();
-    }
-
     pub fn create_project_session(
         &mut self,
         request: NewMuxSessionRequest,

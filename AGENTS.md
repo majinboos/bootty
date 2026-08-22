@@ -123,7 +123,6 @@ cargo --version
 
 - Project overview: `README.md`
 - Architecture: `docs/architecture.md`
-- Egui oracle inventory: `docs/current-egui-behavior.md`
 - Input encoders: `docs/input-encoders.md`
 - Benchmark process and performance guardrails: `docs/benchmarking.md`
 - `libghostty-rs` dependency boundary: `docs/libghostty-rs.md`

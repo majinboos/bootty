@@ -1,9 +1,8 @@
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, path::Path};
 
 use bootty_app::{
     color::Color,
     config::BoottyConfig,
-    diagnostics::{STATUS_METRICS_SAMPLE_INTERVAL, should_sample_status_metrics},
     input::{focus::InputFocus, router::route_events},
     mux::{
         controller::{BindingId, MuxScope, SpaceId},
@@ -223,14 +222,6 @@ fn configured_terminal_colors_drive_the_ui_palette() {
     assert_eq!(palette.accent, Color32::from_rgb(0, 0, 100));
     assert_eq!(palette.warning, Color32::from_rgb(100, 80, 0));
     assert_eq!(palette.success, Color32::from_rgb(0, 100, 0));
-}
-
-#[test]
-fn status_metrics_sample_at_four_hertz() {
-    assert!(!should_sample_status_metrics(
-        STATUS_METRICS_SAMPLE_INTERVAL - Duration::from_millis(1)
-    ));
-    assert!(should_sample_status_metrics(STATUS_METRICS_SAMPLE_INTERVAL));
 }
 
 #[test]

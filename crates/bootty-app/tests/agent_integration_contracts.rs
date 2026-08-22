@@ -14,11 +14,27 @@ use bootty_app::{
     command_extensions::ExtensionHost,
     commands::{
         Caller, CommandCancellation, CommandCatalog, CommandExecutor, CommandInvocation,
-        CommandOutcome, app_command_channel,
+        CommandOutcome, app_command_channel_with_repaint,
     },
     control::ControlPlane,
 };
 use serde_json::{Value, json};
+
+/// Wall-clock budget for every step that waits on a real agent process.
+///
+/// A loaded machine can starve these fixtures for seconds, so the budget only
+/// has to be generous enough to never expire on a healthy run. A dead fixture
+/// is caught by the `stopped` status instead of by the clock.
+const AGENT_BUDGET: Duration = Duration::from_secs(30);
+
+fn app_command_channel(
+    capacity: usize,
+) -> (
+    bootty_app::commands::AppCommandSender,
+    bootty_app::commands::AppCommandReceiver,
+) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
 
 #[test]
 fn pi_and_codex_keep_their_native_jsonl_protocols_outside_rust_core() {
@@ -264,8 +280,8 @@ fn replacing_an_agent_generation_stops_its_managed_process_tree() {
         "agents.pi.start",
         vec![path_text(directory.path()), path_text(&program)],
     ));
-    let parent_pid = wait_for_pid(&parent_marker);
-    let child_pid = wait_for_pid(&child_marker);
+    let parent_pid = wait_for_pid(&catalog, &parent_marker);
+    let child_pid = wait_for_pid(&catalog, &child_marker);
 
     fs::create_dir_all(extension_root.join("agents")).expect("agent extension directory");
     fs::write(
@@ -277,9 +293,9 @@ end)
 "#,
     )
     .expect("replace Pi generation");
-    host.refresh(Instant::now() + Duration::from_secs(1));
+    host.refresh(Instant::now() + AGENT_BUDGET);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + AGENT_BUDGET;
     while process_exists(parent_pid) || process_exists(child_pid) {
         assert!(
             Instant::now() < deadline,
@@ -321,8 +337,8 @@ fn agent_stop_waits_for_the_process_tree_and_allows_an_immediate_restart() {
         "agents.pi.start",
         vec![path_text(directory.path()), path_text(&program)],
     ));
-    let first_parent = wait_for_pid(&parent_marker);
-    let first_child = wait_for_pid(&child_marker);
+    let first_parent = wait_for_pid(&catalog, &parent_marker);
+    let first_child = wait_for_pid(&catalog, &child_marker);
     assert_success(invoke_confirmed(&catalog, "agents.pi.stop", Vec::new()));
     assert!(!process_exists(first_parent));
     assert!(!process_exists(first_child));
@@ -334,8 +350,8 @@ fn agent_stop_waits_for_the_process_tree_and_allows_an_immediate_restart() {
         "agents.pi.start",
         vec![path_text(directory.path()), path_text(&program)],
     ));
-    let second_parent = wait_for_pid(&parent_marker);
-    let second_child = wait_for_pid(&child_marker);
+    let second_parent = wait_for_pid(&catalog, &parent_marker);
+    let second_child = wait_for_pid(&catalog, &child_marker);
     assert!(process_exists(second_parent));
     assert!(process_exists(second_child));
     assert_success(invoke_confirmed(&catalog, "agents.pi.stop", Vec::new()));
@@ -371,10 +387,10 @@ fn invoke_with(
     };
     handler(
         resolved.invocation,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + AGENT_BUDGET,
         CommandCancellation::new(),
     )
-    .recv_timeout(Duration::from_secs(2))
+    .recv_timeout(AGENT_BUDGET)
     .expect("agent command outcome")
 }
 
@@ -383,12 +399,17 @@ fn wait_for_state(
     command: &str,
     ready: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + AGENT_BUDGET;
     loop {
         let state = success_value(invoke(catalog, command, Vec::new()));
         if ready(&state) {
             return state;
         }
+        assert_ne!(
+            state["status"],
+            json!("stopped"),
+            "{command} reported a stopped agent process before the state became ready"
+        );
         assert!(
             Instant::now() < deadline,
             "agent state did not become ready"
@@ -432,14 +453,20 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn wait_for_pid(path: &Path) -> u32 {
-    let deadline = Instant::now() + Duration::from_secs(2);
+fn wait_for_pid(catalog: &CommandCatalog, path: &Path) -> u32 {
+    let deadline = Instant::now() + AGENT_BUDGET;
     loop {
         if let Ok(value) = fs::read_to_string(path)
             && let Ok(pid) = value.parse()
         {
             return pid;
         }
+        assert_ne!(
+            success_value(invoke(catalog, "agents.pi.state", Vec::new()))["status"],
+            json!("stopped"),
+            "fixture process exited before it recorded {}",
+            path.display()
+        );
         assert!(Instant::now() < deadline, "fixture process did not start");
         std::thread::sleep(Duration::from_millis(10));
     }

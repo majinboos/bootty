@@ -7,21 +7,30 @@ use bootty_app::commands::{
     AppCommandRequest, Caller, CommandCancellation, CommandCatalog, CommandDescriptor,
     CommandExecutor, CommandInvocation, CommandOutcome, CommandTarget, CompactSchema,
     ExtensionGenerationCandidate, ExtensionGenerationToken, MutationClass, ResourceKind,
-    app_command_channel,
+    app_command_channel_with_repaint,
 };
 use bootty_app::{
-    app::{AppState, FrameInputs, ViewportSnapshot},
+    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
     command_extensions::{ExtensionHost, ModuleIdentity},
     config::{BoottyConfig, MultiplexerBackendConfig},
     control::ControlPlane,
     geometry::ViewTransform,
     renderer::RendererMetrics,
+    ui::new_session_picker::NewSessionPickerEvent,
 };
+
+fn app_command_channel(
+    capacity: usize,
+) -> (
+    bootty_app::commands::AppCommandSender,
+    bootty_app::commands::AppCommandReceiver,
+) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
 
 fn frame(now: Instant) -> FrameInputs {
     FrameInputs {
         now,
-        stable_dt_ms: 1.0,
         events: Vec::new(),
         dropped_file_paths: Vec::new(),
         modifiers: egui::Modifiers::NONE,
@@ -112,6 +121,126 @@ fn discovered_resource_target_cannot_retarget_a_replacement_binding() {
         started + Duration::from_millis(20),
     );
     assert!(matches!(outcome, CommandOutcome::StaleTarget { .. }));
+}
+
+#[test]
+fn native_split_command_publishes_the_binding_owned_layout() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config = BoottyConfig {
+        config_path: directory.path().join("config.toml"),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let started = Instant::now();
+    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let open = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_mux_session", Caller::Socket),
+        started,
+    );
+    assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
+    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
+    else {
+        panic!("expected new session dialog");
+    };
+    state.apply_picker_event(
+        dialog,
+        NewSessionPickerEvent::CreateSession {
+            cwd: directory.path().to_string_lossy().into_owned(),
+        },
+    );
+    for tick in 1..5 {
+        state.update_frame(frame(started + Duration::from_millis(tick)));
+    }
+
+    let outcome = submit_command(
+        &mut state,
+        CommandInvocation::from_action("split_right", Caller::Socket),
+        started + Duration::from_millis(10),
+    );
+
+    assert!(
+        matches!(outcome, CommandOutcome::Success { .. }),
+        "{outcome:?}"
+    );
+    assert!(state.native_multi_pane());
+    assert_eq!(
+        state
+            .pane_rects(
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0),),
+                4.0
+            )
+            .len(),
+        2
+    );
+    assert!(state.focused_pane().is_some());
+}
+
+#[test]
+fn native_window_actions_use_the_binding_owned_plan() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config = BoottyConfig {
+        config_path: directory.path().join("config.toml"),
+        multiplexer: bootty_app::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_app::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let started = Instant::now();
+    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let open = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_mux_session", Caller::Socket),
+        started,
+    );
+    assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
+    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
+    else {
+        panic!("expected new session dialog");
+    };
+    state.apply_picker_event(
+        dialog,
+        NewSessionPickerEvent::CreateSession {
+            cwd: directory.path().to_string_lossy().into_owned(),
+        },
+    );
+    for tick in 1..5 {
+        state.update_frame(frame(started + Duration::from_millis(tick)));
+    }
+
+    let session = state.mux().sessions()[0].clone();
+    let first_window = session.windows[0].id.clone();
+    assert!(state.new_tab_for_window_from_ui(&session.id, &first_window));
+    for tick in 5..10 {
+        state.update_frame(frame(started + Duration::from_millis(tick)));
+    }
+
+    let session = state
+        .mux()
+        .sessions()
+        .iter()
+        .find(|candidate| candidate.id == session.id)
+        .expect("created session");
+    assert_eq!(session.windows.len(), 2);
+    let second_window = session
+        .windows
+        .iter()
+        .find(|window| window.id != first_window)
+        .expect("new window")
+        .id
+        .clone();
+    let session_id = session.id.clone();
+
+    assert!(state.activate_relative_window_from_ui(&session_id, &first_window, 1));
+    assert_eq!(state.mux().selected_window(), Some(second_window.as_str()));
+    assert!(state.activate_last_window_from_ui(&session_id));
+    assert_eq!(state.mux().selected_window(), Some(first_window.as_str()));
+    assert!(state.move_window_from_ui(&session_id, &second_window, -1));
+    assert!(state.close_pane_for_window_from_ui(&session_id, &second_window));
 }
 
 #[test]

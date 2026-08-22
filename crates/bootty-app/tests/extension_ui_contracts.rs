@@ -1,14 +1,25 @@
+use std::sync::Arc;
+
 use bootty_app::{
     command_extensions::{
         ExtensionHost, ModuleIdentity, editable_module_source, import_legacy_extension_module,
         legacy_extension_modules, module_identities, preview_module_surfaces, reset_module_source,
         save_module_source,
     },
-    commands::{Caller, CommandCatalog, app_command_channel},
+    commands::{Caller, CommandCatalog, app_command_channel_with_repaint},
     config::{AppearanceVariant, BoottyConfig},
     control::ControlPlane,
     theme::theme_tokens,
 };
+
+fn app_command_channel(
+    capacity: usize,
+) -> (
+    bootty_app::commands::AppCommandSender,
+    bootty_app::commands::AppCommandReceiver,
+) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
 
 fn theme() -> Vec<(String, String)> {
     theme_tokens(&BoottyConfig::default(), AppearanceVariant::Dark)

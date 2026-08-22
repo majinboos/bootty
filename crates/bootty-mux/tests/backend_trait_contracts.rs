@@ -1,6 +1,10 @@
 use anyhow::Result;
 use bootty_mux::backend::MuxBackend;
+use bootty_mux::capability::{
+    BINDING_CAPABILITY_DESCRIPTOR_VERSION, BindingOperation, BindingOperationOutcome,
+};
 use bootty_mux::command::MuxCommand;
+use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
 use bootty_mux::snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot};
 
 #[derive(Default)]
@@ -18,7 +22,6 @@ impl MuxBackend for FakeBackend {
                 .find(|session| session.active)
                 .map(|session| session.id.clone()),
             sessions: self.sessions.clone(),
-            ..MuxSnapshot::default()
         })
     }
 
@@ -78,4 +81,29 @@ fn fake_backend_contract_covers_session_lifecycle_and_anchors() {
     }
 
     assert_eq!(backend.commands, commands);
+}
+
+#[test]
+fn every_backend_has_a_scoped_default_capability_descriptor() {
+    let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+    let descriptor = FakeBackend::default().capabilities(scope);
+
+    assert_eq!(descriptor.version(), BINDING_CAPABILITY_DESCRIPTOR_VERSION);
+    assert_eq!(descriptor.scope(), scope);
+    assert!(!descriptor.supports(BindingOperation::SplitPane));
+}
+
+#[test]
+fn checked_execution_does_not_mutate_an_unsupported_backend() {
+    let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+    let mut backend = FakeBackend::default();
+    let outcome = backend.execute_checked(
+        scope,
+        MuxCommand::DitchSession {
+            session_id: "project".to_owned(),
+        },
+    );
+
+    assert!(matches!(outcome, BindingOperationOutcome::Unsupported));
+    assert!(backend.commands.is_empty());
 }

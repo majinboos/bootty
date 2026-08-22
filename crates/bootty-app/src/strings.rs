@@ -42,7 +42,7 @@ fn home_relative_path(path: &str) -> Option<&str> {
 }
 
 pub fn home_dir() -> Option<PathBuf> {
-    bootty_config::config::default_working_directory()
+    crate::config::default_working_directory()
 }
 
 pub fn truncate_label(text: &str, max_chars: usize) -> String {

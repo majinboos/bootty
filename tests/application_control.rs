@@ -9,12 +9,20 @@ use std::{
 #[cfg(unix)]
 use bootty_app::{
     application_identity::ApplicationIdentity,
-    commands::{Caller, CommandCatalog, app_command_channel},
+    commands::{
+        AppCommandReceiver, AppCommandSender, Caller, CommandCatalog,
+        app_command_channel_with_repaint,
+    },
     control::{ControlPlane, ControlServer, InstanceDescriptor, invoke_instance},
 };
 
 #[cfg(unix)]
 const HELPER_ENV: &str = "BOOTTY_APPLICATION_CONTROL_TEST_HELPER";
+
+#[cfg(unix)]
+fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
 
 #[cfg(unix)]
 #[test]

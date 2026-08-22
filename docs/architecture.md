@@ -57,6 +57,18 @@ It loads one validated `WorkspaceSnapshot`.
 `WorkspaceRuntime` owns the live committed workspace value.
 `BindingRuntime` owns one committed placement and one realized
 `MuxBindingConfig`.
+It also owns binding-scoped pane layouts, terminal titles, progress, and ports.
+It reconciles backend pane snapshots and owns pane focus, split ratios, and
+per-pane terminal attachment.
+It resolves and applies binding-scoped session and window actions from its own
+mux snapshot and realized config.
+It owns remote attach recovery and backoff for its binding.
+`RemoteReconnectRuntime` detects network changes and coordinates reconnects
+across the workspace.
+`WorkspaceRuntime` owns project-session creation, generated display-name
+reconciliation, and the durable metadata commit around those backend actions.
+It projects binding session groups for the sidebar and cross-Space session
+finder. The host does not traverse active and inactive binding storage.
 
 A durable workspace mutation uses this order:
 
@@ -174,15 +186,20 @@ contents, or transcripts.
 ## Application modules
 
 - `app/state.rs` owns the window-independent application state machine.
-- `app/host.rs` owns the eframe adapter and window host policy.
+- `app/host.rs` owns the eframe lifecycle adapter.
+- `app/chrome_runtime.rs` owns product chrome state, projection, layout, and event routing.
 - `app/config_runtime.rs` owns accepted config and derived input policy.
 - `app/dialog_runtime.rs` owns the one modal dialog value.
 - `app/terminal_workspace_view.rs` owns terminal widget and renderer lifecycle.
 - `app/workspace_runtime.rs` owns live Space and binding composition.
+- `workspace.rs` owns workspace values and the `WorkspaceRepository` interface.
+  Its private `workspace/` modules own schema migration, snapshot hydration,
+  and legacy import.
 - `command_extensions.rs` and its child modules own extension generations.
 - `commands.rs` owns typed command descriptions and submission.
 - `control.rs` owns local transport and instance publication.
-- `ui/settings/surface.rs` owns settings UI composition.
+- `ui/settings/surface.rs` owns settings navigation and editor state.
+  Its private controls module owns the shared settings widget grammar.
 
 These files can remain large only while each keeps one cohesive owner and a
 small interface. File size is a signal for review. It is not proof of depth.

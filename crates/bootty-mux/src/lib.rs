@@ -1,10 +1,6 @@
 pub use bootty_mux_model::{MuxBackendKind, MuxBindingConfig, RemoteSpaceSummary, SshTarget};
 #[cfg(feature = "app")]
-use std::sync::Arc;
-
-#[cfg(feature = "app")]
-pub type RepaintHandle = Arc<dyn Fn() + Send + Sync + 'static>;
-pub use bootty_mux_model::{MuxBackendKind, MuxBindingConfig, RemoteSpaceSummary, SshTarget};
+pub use controller::RepaintHandle;
 pub use local_rmux::{
     endpoint_path_for as bootty_rmux_endpoint_path_for, prepare_local_rmux_daemon,
     socket_name as bootty_rmux_socket_name,
@@ -30,7 +26,15 @@ pub mod membership;
 pub mod native;
 pub mod process;
 pub mod project;
-pub mod provider;
+mod remote_exec;
+#[cfg(feature = "remote-install")]
+mod remote_install;
+#[cfg(feature = "app")]
+pub mod remote_space;
+pub mod remote_space_protocol;
+pub mod rmux;
+pub(crate) mod rmux_bridge;
+pub mod rmux_remote;
 pub mod snapshot;
 #[cfg(feature = "app")]
 pub mod terminal;

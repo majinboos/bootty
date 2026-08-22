@@ -17,6 +17,15 @@ use bootty_terminal::{
         KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
         MouseInput, TerminalKey,
     },
+    terminal_render::TerminalRenderFrame,
+    terminal_text::{TerminalTextConfig, TerminalTextContract},
+    ui::{
+        chrome::{self, SidebarModel},
+        icons,
+        session_navigation::BindingSessionGroup,
+        session_picker::SessionPickerDialog,
+        sidebar::build_binding_sidebar_items,
+    },
 };
 use bootty_ui::icons;
 use bootty_winit::input::{
