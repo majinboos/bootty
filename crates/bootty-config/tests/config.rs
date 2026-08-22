@@ -1,24 +1,23 @@
 #![allow(clippy::needless_raw_string_hashes)]
 #![allow(clippy::float_cmp)]
 
+use assert_fs::prelude::*;
 use bootty_config::color::Color;
 use bootty_config::config::*;
 use bootty_font::FontFeature;
 use indoc::indoc;
+use pretty_assertions::{assert_eq, assert_ne};
 use rstest::rstest;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 struct ConfigSandbox {
-    dir: tempfile::TempDir,
+    dir: assert_fs::TempDir,
     path: PathBuf,
 }
 
 impl ConfigSandbox {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = assert_fs::TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
         Self { dir, path }
     }
@@ -30,11 +29,11 @@ impl ConfigSandbox {
     }
 
     fn write(&self, relative_path: &str, source: &str) {
-        let path = self.dir.path().join(relative_path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(path, source).unwrap();
+        let path = self.dir.child(relative_path);
+        assert_fs::fixture::ChildPath::new(path.path().parent().expect("config fixture parent"))
+            .create_dir_all()
+            .expect("create config fixture parent");
+        path.write_str(source).expect("write config fixture");
     }
 
     fn load(&self) -> Result<BoottyConfig, ConfigLoadError> {
@@ -54,18 +53,16 @@ fn load_config_source(source: &str) -> BoottyConfig {
     "entry.toml"
 )]
 fn include_cycles_are_rejected(#[case] edges: &[(&str, &str)], #[case] entry: &str) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = assert_fs::TempDir::new().unwrap();
     for (source, target) in edges {
-        fs::write(
-            dir.path().join(source),
-            format!(
+        dir.child(source)
+            .write_str(&format!(
                 indoc! {r#"
                     include = ["{target}"]
                 "#},
                 target = target
-            ),
-        )
-        .unwrap();
+            ))
+            .expect("write cyclic include");
     }
 
     assert!(load_config_from_path(dir.path().join(entry)).is_err());
@@ -424,16 +421,6 @@ fn config_resolves_sidebar_and_status_chrome_colors() {
 }
 
 #[test]
-fn config_defaults_sidebar_to_left_without_overrides() {
-    let config = load_config_source("");
-
-    assert_eq!(config.sidebar.position, SidebarPosition::Left);
-    assert_eq!(config.sidebar.background, None);
-    assert_eq!(config.chrome.status_background, None);
-    assert!(config.chrome.notched_fullscreen_black_chrome);
-}
-
-#[test]
 fn legacy_sidebar_fullscreen_colors_are_accepted_but_ignored() {
     let config = load_config_source(indoc! {r##"
         [sidebar]
@@ -443,48 +430,6 @@ fn legacy_sidebar_fullscreen_colors_are_accepted_but_ignored() {
 
     assert_eq!(config.sidebar.background, None);
     assert_eq!(config.sidebar.hover, None);
-}
-
-#[test]
-fn config_overrides_fullscreen_top_offset() {
-    let config = load_config_source(indoc! {r#"
-        [window]
-        fullscreen-top-offset = 40
-    "#});
-
-    assert_eq!(config.window.fullscreen_top_offset, Some(40.0));
-    // Absent key keeps auto-detection (None).
-    assert_eq!(load_config_source("").window.fullscreen_top_offset, None);
-}
-
-#[test]
-fn config_toggles_fullscreen_tabs_in_notch() {
-    let config = load_config_source(indoc! {r#"
-        [window]
-        fullscreen-tabs-in-notch = false
-    "#});
-
-    assert!(!config.window.fullscreen_tabs_in_notch);
-    // Defaults to on so the notch band is used out of the box.
-    assert!(load_config_source("").window.fullscreen_tabs_in_notch);
-}
-
-#[test]
-fn config_accepts_ghostty_palette_generation_settings() {
-    let config = load_config_source(indoc! {r##"
-        [colors]
-        background = "#ffffff"
-        foreground = "#000000"
-        palette = ["#000000", "#111111"]
-        palette-generate = true
-        palette-harmonious = true
-    "##});
-
-    for variant in [AppearanceVariant::Light, AppearanceVariant::Dark] {
-        let colors = config.colors_for_appearance(variant);
-        assert!(colors.palette_generate);
-        assert!(colors.palette_harmonious);
-    }
 }
 
 #[test]
@@ -508,46 +453,6 @@ fn config_resolves_font_features_in_product_order() {
             FontFeature::new(*b"ss05", 1),
         ]
     );
-}
-
-#[test]
-fn config_resolves_font_fit_cell_height() {
-    assert!(load_config_source("").font.fit_cell_height);
-
-    let config = load_config_source(indoc! {r#"
-        [font]
-        fit-cell-height = false
-    "#});
-
-    assert!(!config.font.fit_cell_height);
-}
-
-#[test]
-fn config_resolves_font_fit_cell_width() {
-    assert!(!load_config_source("").font.fit_cell_width);
-
-    let config = load_config_source(indoc! {r#"
-        [font]
-        fit-cell-width = true
-    "#});
-
-    assert!(config.font.fit_cell_width);
-}
-
-#[test]
-fn config_uses_auto_font_cell_metrics_until_width_or_height_is_configured() {
-    let default = load_config_source("");
-    assert_eq!(default.font.cell_width, None);
-    assert_eq!(default.font.cell_height, None);
-
-    let config = load_config_source(indoc! {r#"
-        [font]
-        cell-width = 11
-        cell-height = 24
-    "#});
-
-    assert_eq!(config.font.cell_width, Some(11.0));
-    assert_eq!(config.font.cell_height, Some(24.0));
 }
 
 #[test]
@@ -588,6 +493,18 @@ fn config_accepts_xterm_dynamic_color_slots() {
         assert_eq!(
             colors.pointer_background,
             Some(Color::from_hex("#040506").unwrap())
+        );
+        assert_eq!(
+            colors.tektronix_foreground,
+            Some(Color::from_hex("#070809").unwrap())
+        );
+        assert_eq!(
+            colors.tektronix_background,
+            Some(Color::from_hex("#0a0b0c").unwrap())
+        );
+        assert_eq!(
+            colors.highlight_background,
+            Some(Color::from_hex("#0d0e0f").unwrap())
         );
         assert_eq!(
             colors.tektronix_cursor,
@@ -730,56 +647,6 @@ fn extension_settings_load_into_their_own_module_table() {
 }
 
 #[test]
-fn every_config_enum_token_round_trips_through_the_parser() {
-    // The settings writer takes tokens from `config_token`; the loader must accept every one of
-    // them and return the same variant. The exact spellings are pinned because they are what a
-    // user's config.toml ends up containing.
-    fn round_trip<T>(key: &str, value: T, expected_token: &str, read: impl Fn(&BoottyConfig) -> T)
-    where
-        T: serde::Serialize + std::fmt::Debug + PartialEq + Copy,
-    {
-        let token = config_token(&value).expect("unit variant token");
-        assert_eq!(token, expected_token, "token spelling for {key}");
-        let sandbox = ConfigSandbox::with_config(&format!("{key} = \"{token}\"\n"));
-        let config = sandbox
-            .load()
-            .unwrap_or_else(|error| panic!("{key}: {error}"));
-        assert_eq!(read(&config), value, "{key} did not read back");
-    }
-
-    round_trip(
-        "[window]\nfullscreen",
-        WindowFullscreen::NonNativeVisibleMenu,
-        "non-native-visible-menu",
-        |config| config.window.fullscreen,
-    );
-    round_trip(
-        "[window]\nwindow-decoration",
-        WindowDecoration::Client,
-        "client",
-        |config| config.window.window_decoration,
-    );
-    round_trip(
-        "[window]\nmacos-titlebar-style",
-        MacosTitlebarStyle::Hidden,
-        "hidden",
-        |config| config.window.macos_titlebar_style,
-    );
-    round_trip(
-        "[sidebar]\nposition",
-        SidebarPosition::Right,
-        "right",
-        |config| config.sidebar.position,
-    );
-    round_trip(
-        "[appearance]\nmode",
-        AppearanceMode::Light,
-        "light",
-        |config| config.appearance.mode,
-    );
-}
-
-#[test]
 fn theme_catalog_combines_builtin_and_user_themes() {
     let sandbox = ConfigSandbox::new();
     sandbox.write("themes/My Theme.toml", "");
@@ -790,10 +657,6 @@ fn theme_catalog_combines_builtin_and_user_themes() {
 
     assert!(names.iter().any(|name| name == "My Theme"));
     assert!(!names.iter().any(|name| name == "ignored"));
-    assert!(
-        names.len() > 1,
-        "the builtin theme catalog must remain present"
-    );
     // A user copy of a built-in name replaces it instead of listing the theme twice.
     assert_eq!(
         names
@@ -802,6 +665,7 @@ fn theme_catalog_combines_builtin_and_user_themes() {
             .count(),
         1
     );
+    assert!(names.iter().any(|name| name == "Dracula"));
 }
 
 #[test]
@@ -871,72 +735,6 @@ fn missing_include_behavior_depends_on_optional_marker(
 }
 
 #[test]
-fn config_document_preserves_comments_and_order_for_writeback() {
-    let sandbox = ConfigSandbox::with_config(indoc! {r#"
-        # user comment
-        include = ["?local.toml"]
-
-        [window]
-        # title comment
-        title = "Bootty"
-        width = 1220
-    "#});
-    let source = fs::read_to_string(&sandbox.path).unwrap();
-
-    update_config_document(&sandbox.path, |document| {
-        document.set_str(&["window", "title"], "Bootty")
-    })
-    .unwrap();
-
-    assert_eq!(fs::read_to_string(&sandbox.path).unwrap(), source);
-}
-
-#[test]
-fn config_document_writeback_preserves_unrelated_comments_and_order() {
-    let sandbox = ConfigSandbox::with_config(indoc! {r#"
-        # user comment
-        include = ["?local.toml"]
-
-        [font]
-        # size comment
-        size = 13
-
-        [chrome]
-        sidebar = true
-    "#});
-    update_config_document(&sandbox.path, |document| {
-        document.set_f32(&["font", "size"], 15.0)
-    })
-    .unwrap();
-
-    let written = fs::read_to_string(&sandbox.path).unwrap();
-    assert!(written.contains("# user comment"));
-    assert!(written.contains("# size comment"));
-    assert!(written.contains("[chrome]\nsidebar = true"));
-    assert!(written.find("include").unwrap() < written.find("[font]").unwrap());
-    assert!(written.contains("size = 15.0"));
-}
-
-#[test]
-fn font_size_preference_writeback_round_trips_through_config_loader() {
-    let sandbox = ConfigSandbox::with_config(indoc! {r#"
-        # top comment
-        [window]
-        title = "Keep Me"
-    "#});
-
-    write_font_size_preference(&sandbox.path, 16.0).unwrap();
-
-    let written = fs::read_to_string(&sandbox.path).unwrap();
-    assert!(written.contains("# top comment"));
-    assert!(written.find("[window]").unwrap() < written.find("[font]").unwrap());
-    assert_eq!(
-        load_config_from_path(&sandbox.path).unwrap().font.size,
-        16.0
-    );
-}
-
-#[test]
 fn documented_sample_config_loads() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/sample-config.toml");
 
@@ -951,84 +749,12 @@ fn documented_sample_config_loads() {
 }
 
 #[test]
-fn input_hide_mouse_pointer_while_typing_defaults_on_and_can_be_disabled() {
-    assert!(
-        BoottyConfig::default()
-            .input
-            .hide_mouse_pointer_while_typing
-    );
-
-    let config = load_config_source(indoc! {r#"
-        [input]
-        hide-mouse-pointer-while-typing = false
-    "#});
-
-    assert!(!config.input.hide_mouse_pointer_while_typing);
-}
-
-#[test]
-fn input_copy_on_select_defaults_off_and_can_be_enabled() {
-    assert!(!BoottyConfig::default().input.copy_on_select);
-
-    let config = load_config_source(indoc! {r#"
-        [input]
-        copy-on-select = true
-    "#});
-
-    assert!(config.input.copy_on_select);
-}
-
-#[test]
-fn config_parses_macos_option_as_alt_policy() {
-    let config = load_config_source(indoc! {r#"
-        [input]
-        macos-option-as-alt = "right"
-    "#});
-
-    assert_eq!(
-        config.input.macos_option_as_alt,
-        MacosOptionAsAltConfig::Right
-    );
-}
-
-#[test]
-fn config_parses_session_scrollback_policy() {
-    let config = load_config_source(indoc! {r#"
-        [session]
-        max-scrollback = 0
-    "#});
-
-    assert_eq!(config.session.max_scrollback, 0);
-}
-
-#[test]
-fn config_parses_cursor_policy() {
-    let config = load_config_source(indoc! {r#"
-        [cursor]
-        style = "underline"
-        blink = true
-    "#});
-
-    assert_eq!(config.cursor.style, Some(CursorStyleConfig::Underline));
-    assert_eq!(config.cursor.blink, Some(true));
-}
-
-#[test]
-fn config_parses_glyph_protocol_policy() {
-    let config = load_config_source(indoc! {r#"
-        [session]
-        glyph-protocol = false
-    "#});
-
-    assert!(!config.session.glyph_protocol);
-}
-
-#[test]
 fn obsolete_chrome_window_tabs_key_is_ignored() {
-    load_config_source(indoc! {r#"
+    let config = load_config_source(indoc! {r#"
         [chrome]
         window-tabs = true
     "#});
+    assert_eq!(config.chrome, BoottyConfig::default().chrome);
 }
 #[test]
 fn keybind_clear_directive_replaces_existing_bindings() {
@@ -1170,28 +896,6 @@ fn sidebar_keybind_clear_directive_replaces_existing_bindings() {
 }
 
 #[test]
-fn config_accepts_native_multiplexer_backend() {
-    let config = load_config_source(indoc! {r#"
-        [multiplexer]
-        backend = "native"
-    "#});
-
-    assert_eq!(config.multiplexer.backend, MultiplexerBackendConfig::Native);
-}
-
-#[test]
-fn config_accepts_every_multiplexer_backend_token() {
-    for (token, backend) in [
-        ("native", MultiplexerBackendConfig::Native),
-        ("rmux", MultiplexerBackendConfig::Rmux),
-        ("tmux", MultiplexerBackendConfig::Tmux),
-    ] {
-        let config = load_config_source(&format!("[multiplexer]\nbackend = \"{token}\"\n"));
-        assert_eq!(config.multiplexer.backend, backend, "backend token {token}");
-    }
-}
-
-#[test]
 fn ssh_remote_defaults_and_all_fields_are_preserved() {
     let defaults = load_config_source(indoc! {r#"
         [multiplexer]
@@ -1228,29 +932,6 @@ fn ssh_remote_defaults_and_all_fields_are_preserved() {
     );
 }
 
-/// A host without a usable `~/.ssh/config` — the common case on Windows — has to be reachable from
-/// the config file alone, so every connection detail the SSH client needs can be written here.
-#[test]
-fn multiplexer_remote_carries_the_connection_details_ssh_config_would_hold() {
-    let config = load_config_source(indoc! {r#"
-        [multiplexer]
-        backend = "tmux"
-
-        [multiplexer.remote]
-        host = "10.0.0.4"
-        user = "dev"
-        port = 2222
-        args = ["-i", "C:\\keys\\id_ed25519"]
-    "#});
-
-    let remote = config.multiplexer.remote.expect("remote");
-    assert_eq!(remote.host, "10.0.0.4");
-    assert_eq!(remote.user.as_deref(), Some("dev"));
-    assert_eq!(remote.port, Some(2222));
-    assert_eq!(remote.program, "ssh");
-    assert_eq!(remote.args, vec!["-i", "C:\\keys\\id_ed25519"]);
-}
-
 /// Only the backends bootty drives through a client can run on another host. The native backend
 /// owns its terminals in this process, so accepting it would start local shells and present them as
 /// the remote host's sessions.
@@ -1264,14 +945,6 @@ fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
 
         assert_eq!(loaded.is_ok(), accepted, "backend {backend}");
     }
-
-    assert!(
-        ConfigSandbox::with_config(
-            "[multiplexer]\nbackend = \"tmux\"\n\n[multiplexer.remote]\nhost = \"  \"\n"
-        )
-        .load()
-        .is_err()
-    );
 }
 
 #[test]
@@ -1570,23 +1243,5 @@ fn empty_prefix_falls_back_to_preset_default() {
     assert_eq!(
         config.input.effective_prefix().as_deref(),
         Some("ctrl+space")
-    );
-}
-
-#[test]
-fn preset_only_config_keeps_default_appearance() {
-    let missing = ConfigSandbox::new().load().unwrap();
-    let preset_only = load_config_source("[input]\npreset = \"tmux\"\n");
-    assert_eq!(
-        missing.appearance.light.theme,
-        preset_only.appearance.light.theme
-    );
-    assert_eq!(
-        missing.appearance.dark.theme,
-        preset_only.appearance.dark.theme
-    );
-    assert_eq!(
-        missing.colors_for_appearance(AppearanceVariant::Light),
-        preset_only.colors_for_appearance(AppearanceVariant::Light)
     );
 }

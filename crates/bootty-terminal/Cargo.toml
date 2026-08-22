@@ -12,7 +12,9 @@ png.workspace = true
 
 [dev-dependencies]
 libc = "0.2"
+pretty_assertions.workspace = true
 proptest.workspace = true
+proptest-derive.workspace = true
 rstest.workspace = true
 unicode-width.workspace = true
 

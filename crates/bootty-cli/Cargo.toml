@@ -19,4 +19,7 @@ clap.workspace = true
 self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "checksums", "compression-tar-gz", "compression-zip-deflate", "github", "rustls", "ureq"] }
 
 [dev-dependencies]
-tempfile.workspace = true
+assert_fs.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+rstest.workspace = true

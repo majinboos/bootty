@@ -1,0 +1,469 @@
+use pretty_assertions::assert_eq;
+use rstest::rstest;
+
+use bootty_app::{
+    SpaceSummary,
+    theme::theme_palette_from_colors,
+    ui::chrome::{
+        ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarModel, SidebarSpaceSwipeState,
+        SpaceSwitcherEvent, StatusBarModel, show_sidebar, show_space_switcher, show_status_bar,
+        sidebar_drop_target, status_bar_layout, take_sidebar_space_swipe,
+    },
+};
+use bootty_config::config::ColorConfig;
+use bootty_extension::ModuleItem;
+use bootty_mux::controller::SpaceId;
+use bootty_ui::icons::install_icon_fonts;
+use bootty_ui::item_list::ROW_HEIGHT as SIDEBAR_ROW_HEIGHT;
+use bootty_ui::status_layout::Align;
+use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
+
+fn space(id: i64, name: &str, active: bool) -> SpaceSummary {
+    SpaceSummary {
+        id: SpaceId::from_persistence(id),
+        name: name.to_owned(),
+        icon: "folder".to_owned(),
+        color: [0x7a, 0xa2, 0xf7],
+        tint_sidebar: false,
+        active,
+        error: None,
+        accepts_moves: !active,
+    }
+}
+
+fn wheel(delta: Vec2, phase: TouchPhase) -> Event {
+    Event::MouseWheel {
+        unit: MouseWheelUnit::Point,
+        delta,
+        phase,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+fn resolved(item: &ModuleItem) -> ResolvedItem<'_> {
+    ResolvedItem {
+        item,
+        icon: item.icon.as_deref(),
+        fg: None,
+        bg: None,
+        stroke: None,
+    }
+}
+
+fn status_rows(prefix: Option<&str>, tab: &str, notch: (f32, f32), height: f32) -> usize {
+    let context = egui::Context::default();
+    let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, height));
+    let prefix_item = ModuleItem {
+        text: prefix.unwrap_or_default().to_owned(),
+        ..ModuleItem::default()
+    };
+    let tab_item = ModuleItem {
+        text: tab.to_owned(),
+        ..ModuleItem::default()
+    };
+    let mut segments = Vec::new();
+    if prefix.is_some() {
+        segments.push(ResolvedSegment {
+            align: Align::Left,
+            wrappable: false,
+            module: "prefix",
+            items: vec![resolved(&prefix_item)],
+            ..ResolvedSegment::default()
+        });
+    }
+    segments.push(ResolvedSegment {
+        align: Align::Left,
+        wrappable: true,
+        source_slot: segments.len(),
+        module: "windows.luau",
+        surface: "windows",
+        items: vec![resolved(&tab_item)],
+        ..ResolvedSegment::default()
+    });
+
+    let mut rows = 0;
+    context
+        .run_ui(RawInput::default(), |ui| {
+            rows = status_bar_layout(ui, bar, &segments, STATUS_EDGE_PAD, Some(notch)).row_count();
+        })
+        .drop_without_applying_deltas();
+    rows
+}
+
+#[rstest]
+#[case(None, "1 alpha-with-long-name", (20.0, 40.0), 30.0, 2)]
+#[case(None, "1 alpha-with-long-name", (500.0, 540.0), 30.0, 1)]
+#[case(Some("a deliberately wide leading segment"), "1 alpha", (20.0, 40.0), 300.0, 1)]
+fn notch_wraps_only_when_it_crosses_the_window_segment(
+    #[case] prefix: Option<&str>,
+    #[case] tab: &str,
+    #[case] notch: (f32, f32),
+    #[case] height: f32,
+    #[case] expected_rows: usize,
+) {
+    assert_eq!(status_rows(prefix, tab, notch, height), expected_rows);
+}
+
+#[test]
+fn pressing_empty_status_chrome_starts_a_native_window_drag() {
+    let context = egui::Context::default();
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 300.0));
+    let palette = theme_palette_from_colors(&ColorConfig::default());
+    let show = |ui: &mut egui::Ui| {
+        let segments = [];
+        let layout = status_bar_layout(ui, screen, &segments, STATUS_EDGE_PAD, None);
+        show_status_bar(
+            ui,
+            palette,
+            StatusBarModel {
+                layout: &layout,
+                tab_context: None,
+                background: palette.base,
+                row_height: screen.height(),
+                interaction_id: "global-status-drag-test",
+            },
+        );
+    };
+
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(Pos2::new(20.0, 15.0))],
+                ..RawInput::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| show(ui));
+            },
+        )
+        .drop_without_applying_deltas();
+    let output = context.run_ui(
+        RawInput {
+            screen_rect: Some(screen),
+            events: vec![Event::PointerButton {
+                pos: Pos2::new(20.0, 15.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..RawInput::default()
+        },
+        |ui| {
+            egui::CentralPanel::default().show(ui, |ui| show(ui));
+        },
+    );
+
+    let root = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .expect("root viewport output");
+    assert!(root.commands.contains(&egui::ViewportCommand::StartDrag));
+    output.drop_without_applying_deltas();
+}
+
+#[test]
+fn horizontal_space_swipes_switch_once_and_leave_vertical_scroll_available() {
+    let context = egui::Context::default();
+    let sidebar = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 200.0));
+    let spaces = [space(1, "Work", true), space(2, "Review", false)];
+    let mut state = SidebarSpaceSwipeState::default();
+    let mut remaining_wheels = Vec::new();
+    let mut selected = None;
+
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(sidebar),
+                events: vec![
+                    Event::PointerMoved(sidebar.center()),
+                    wheel(egui::vec2(-12.0, 1.0), TouchPhase::Start),
+                    wheel(egui::vec2(-12.0, 1.0), TouchPhase::Move),
+                    wheel(egui::vec2(0.0, 12.0), TouchPhase::Move),
+                ],
+                ..RawInput::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    selected = take_sidebar_space_swipe(ui, sidebar, &spaces, &mut state);
+                    remaining_wheels = ui.input(|input| {
+                        input
+                            .events
+                            .iter()
+                            .filter_map(|event| match event {
+                                Event::MouseWheel { delta, .. } => Some(*delta),
+                                _ => None,
+                            })
+                            .collect()
+                    });
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+
+    assert_eq!(selected, Some(spaces[1].id));
+    assert_eq!(remaining_wheels, [egui::vec2(0.0, 12.0)]);
+}
+
+#[test]
+fn clicking_a_space_switcher_control_activates_that_space() {
+    let context = egui::Context::default();
+    install_icon_fonts(&context);
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 44.0));
+    let spaces = [space(1, "Work", true), space(2, "Review", false)];
+    let palette = theme_palette_from_colors(&ColorConfig::default());
+    let show = |events: Vec<Event>| {
+        let mut event = None;
+        context
+            .run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            event = show_space_switcher(ui, palette, &spaces, None, false);
+                        });
+                },
+            )
+            .drop_without_applying_deltas();
+        event
+    };
+    let second = Pos2::new(120.0, 22.0);
+
+    show(vec![Event::PointerMoved(second)]);
+    show(vec![Event::PointerButton {
+        pos: second,
+        button: PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+    let event = show(vec![Event::PointerButton {
+        pos: second,
+        button: PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    }]);
+
+    assert_eq!(event, Some(SpaceSwitcherEvent::Activate(spaces[1].id)));
+}
+
+/// A sidebar row that participates in reordering, with `anchor` naming its block.
+fn reorder_row<'a>(id: &'a str, anchor: &'a str) -> bootty_app::ui::sidebar::SidebarItem<'a> {
+    bootty_app::ui::sidebar::SidebarItem {
+        id,
+        text: id,
+        number: None,
+        indent: 0,
+        tree: None,
+        selectable: true,
+        session_id: Some(id),
+        scope: SpaceId::from_persistence(1),
+        reorder_anchor: Some(anchor),
+        color: egui::Color32::WHITE,
+        dim_color: egui::Color32::GRAY,
+        kind: "session",
+        active: false,
+        current: false,
+        can_return_to_last_session: false,
+        context_position: None,
+        icon: None,
+        primitives: &[],
+        extension_action: None,
+    }
+}
+
+#[test]
+fn a_sidebar_drop_lands_before_the_block_under_the_pointer() {
+    let items = [
+        reorder_row("a", "a"),
+        reorder_row("b", "b"),
+        reorder_row("c", "c"),
+    ];
+    let top = 100.0;
+    let row = SIDEBAR_ROW_HEIGHT;
+    let at = |y: f32| Pos2::new(20.0, y);
+
+    let (before, indicator) =
+        sidebar_drop_target(&items, Some(at(top + row * 2.2)), 0.0, top, 200.0, "a")
+            .expect("a drop before c");
+    assert_eq!(before, Some("c"));
+    assert_eq!(indicator, top + row * 2.0);
+
+    // The bottom half of the last block means end-of-list.
+    let (before, indicator) =
+        sidebar_drop_target(&items, Some(at(top + row * 2.8)), 0.0, top, 200.0, "a")
+            .expect("a drop at the end");
+    assert_eq!(before, None);
+    assert_eq!(indicator, top + row * 3.0);
+
+    // Dropping a block back onto itself, or immediately after itself, changes nothing.
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 0.2)), 0.0, top, 200.0, "a").is_none());
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 0.8)), 0.0, top, 200.0, "a").is_none());
+    // And the last block cannot be dropped at the end it already occupies.
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 2.8)), 0.0, top, 200.0, "c").is_none());
+
+    // No pointer, or a pointer outside the rows, is not a drop.
+    assert!(sidebar_drop_target(&items, None, 0.0, top, 200.0, "a").is_none());
+    assert!(sidebar_drop_target(&items, Some(at(top - 5.0)), 0.0, top, 200.0, "a").is_none());
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 9.0)), 0.0, top, 200.0, "a").is_none());
+}
+
+#[test]
+fn a_sidebar_block_moves_as_a_whole() {
+    // "b" owns two rows; a drop decided against its midpoint covers both.
+    let items = [
+        reorder_row("a", "a"),
+        reorder_row("b", "b"),
+        reorder_row("b-detail", "b"),
+        reorder_row("c", "c"),
+    ];
+    let top = 0.0;
+    let row = SIDEBAR_ROW_HEIGHT;
+    let at = |y: f32| Pos2::new(20.0, y);
+
+    // The block spans rows 1..=2, so its midpoint is at row 2.0: above it inserts before "b".
+    let (before, indicator) =
+        sidebar_drop_target(&items, Some(at(row * 1.5)), 0.0, top, 200.0, "c")
+            .expect("c drops before b");
+    assert_eq!(before, Some("b"));
+    assert_eq!(indicator, row);
+
+    // Below the midpoint targets the next block, "c" — a no-op for "c" itself.
+    assert!(sidebar_drop_target(&items, Some(at(row * 2.5)), 0.0, top, 200.0, "c").is_none());
+    // ...but a real move for "a".
+    let (before, _) = sidebar_drop_target(&items, Some(at(row * 2.5)), 0.0, top, 200.0, "a")
+        .expect("a drops before c");
+    assert_eq!(before, Some("c"));
+}
+
+/// One frame of the real chrome: the session list, then the Space switcher beneath it, sharing the
+/// drag the sidebar hands over when the pointer leaves through its bottom edge.
+fn sidebar_and_switcher_frame(
+    context: &egui::Context,
+    screen: Rect,
+    list_height: f32,
+    spaces: &[SpaceSummary],
+    items: &[bootty_app::ui::sidebar::SidebarItem<'_>],
+    events: Vec<Event>,
+) -> Option<SpaceSwitcherEvent> {
+    let palette = theme_palette_from_colors(&ColorConfig::default());
+    let mut switcher = None;
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        show_sidebar(
+                            ui,
+                            palette,
+                            list_height,
+                            SidebarModel {
+                                items,
+                                footer_items: &[],
+                                session_count: items.len(),
+                                title_visible: false,
+                                reserve_titlebar_buttons: false,
+                                title_icon: None,
+                                top_inset: 0.0,
+                                border_visible: false,
+                                border_bottom: false,
+                                separator_visible: false,
+                                focused: true,
+                                hovered_session: None,
+                                fullscreen: false,
+                                hover_override: None,
+                                current_override: None,
+                                border_override: None,
+                            },
+                        );
+                        switcher = show_space_switcher(ui, palette, spaces, None, false);
+                    });
+            },
+        )
+        .drop_without_applying_deltas();
+    switcher
+}
+
+/// Drags the first row out of the list and drops it at `target`, returning the switcher's answer.
+fn drag_first_row_onto(
+    context: &egui::Context,
+    screen: Rect,
+    list_height: f32,
+    spaces: &[SpaceSummary],
+    items: &[bootty_app::ui::sidebar::SidebarItem<'_>],
+    target: Pos2,
+) -> Option<SpaceSwitcherEvent> {
+    let grab = Pos2::new(120.0, SIDEBAR_ROW_HEIGHT * 0.5);
+    let button = |pos: Pos2, pressed: bool| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let frame = |events: Vec<Event>| {
+        sidebar_and_switcher_frame(context, screen, list_height, spaces, items, events)
+    };
+    frame(vec![Event::PointerMoved(grab)]);
+    frame(vec![button(grab, true)]);
+    frame(vec![Event::PointerMoved(target)]);
+    frame(vec![button(target, false)])
+}
+
+/// Dropping a session on a Space icon hands it over, and a grouped row takes its group with it --
+/// the same cohesion a reorder has, so a drop cannot split a group across two Spaces.
+#[test]
+fn dropping_a_session_on_a_space_icon_moves_it_there() {
+    let context = egui::Context::default();
+    install_icon_fonts(&context);
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 244.0));
+    let list_height = 200.0;
+    let items = [
+        reorder_row("agents-main", "agents"),
+        reorder_row("agents-review", "agents"),
+        reorder_row("scratch", "scratch"),
+    ];
+    let spaces = [space(1, "Work", true), space(2, "Review", false)];
+    // Three buttons laid out from the strip centre put the second Space here.
+    let target = Pos2::new(120.0, list_height + 22.0);
+
+    let event = drag_first_row_onto(&context, screen, list_height, &spaces, &items, target);
+
+    let Some(SpaceSwitcherEvent::MoveSessions { sessions, to }) = event else {
+        panic!("a drop on a Space icon moves sessions, got {event:?}");
+    };
+    assert_eq!(to, spaces[1].id);
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["agents-main", "agents-review"]
+    );
+}
+
+/// A Space on another multiplexer cannot take the session, so the drop is refused rather than
+/// reported as a move that then fails.
+#[test]
+fn dropping_a_session_on_an_unreachable_space_moves_nothing() {
+    let context = egui::Context::default();
+    install_icon_fonts(&context);
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 244.0));
+    let list_height = 200.0;
+    let items = [reorder_row("scratch", "scratch")];
+    let mut spaces = [space(1, "Work", true), space(2, "Remote", false)];
+    spaces[1].accepts_moves = false;
+    let target = Pos2::new(120.0, list_height + 22.0);
+
+    let event = drag_first_row_onto(&context, screen, list_height, &spaces, &items, target);
+    assert_eq!(event, None);
+}

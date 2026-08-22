@@ -32,11 +32,13 @@ bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 embed-resource.workspace = true
 
 [dev-dependencies]
+assert_fs.workspace = true
 bootty-config = { path = "../bootty-config" }
 bootty-extension = { path = "../bootty-extension" }
 bootty-render = { path = "../bootty-render" }
 egui.workspace = true
-tempfile.workspace = true
+pretty_assertions.workspace = true
+rstest.workspace = true
 
 [lints]
 workspace = true

@@ -10,6 +10,8 @@ use bootty_mux::{
     project::{ProjectPickerEntry, WorktreePickerEntry},
 };
 
+use crate::error_catalog::ErrorNotice;
+
 pub(crate) enum RemoteEffect {
     ListProjects,
     ListWorktrees(String, Vec<String>),
@@ -56,7 +58,7 @@ impl RemoteNewSession {
             cancellation,
         });
         let Some(permit) = RemoteWorkerPermit::acquire() else {
-            let error = "the previous remote project operation is still stopping".to_owned();
+            let error = ErrorNotice::RemoteProjectOperationStopping.to_string();
             let _ = sender.send(Err(error));
             repaint();
             return;
@@ -73,7 +75,9 @@ impl RemoteNewSession {
         let result = match self.task.as_ref()?.receiver.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => Err("remote project task stopped".to_owned()),
+            Err(TryRecvError::Disconnected) => {
+                Err(ErrorNotice::RemoteProjectTaskStopped.to_string())
+            }
         };
         self.task = None;
         Some(result)

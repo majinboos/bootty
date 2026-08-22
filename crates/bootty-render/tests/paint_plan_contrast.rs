@@ -4,6 +4,24 @@ use bootty_terminal::terminal_frame::{
     CellStyle, FrameColors, FrameSelection, FrameStats, RenderCell, RenderFrame,
 };
 use libghostty_vt::style::RgbColor;
+use pretty_assertions::assert_eq;
+use proptest::prelude::*;
+use proptest_derive::Arbitrary;
+
+static_assertions::assert_impl_all!(PlanColor: Copy, Eq, Send, Sync);
+
+#[derive(Arbitrary, Clone, Copy, Debug)]
+struct TestRgb {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl From<TestRgb> for RgbColor {
+    fn from(color: TestRgb) -> Self {
+        rgb(color.r, color.g, color.b)
+    }
+}
 
 fn rgb(r: u8, g: u8, b: u8) -> RgbColor {
     RgbColor { r, g, b }
@@ -58,17 +76,14 @@ fn frame_with_text(text: &[char]) -> RenderFrame {
 }
 
 fn plan(frame: &RenderFrame) -> TerminalPaintPlan {
-    let cell = CellMetrics::new(10.0, 20.0);
-    let surface = TerminalSurface::for_logical_size(
-        cell.width,
-        cell.height * f32::from(frame.rows),
-        cell,
-        TerminalPadding::default(),
-    );
-    PaintPlanner::default().plan(surface, frame, 16.0).clone()
+    make_plan(frame, false)
 }
 
 fn minimum_contrast_plan(frame: &RenderFrame) -> TerminalPaintPlan {
+    make_plan(frame, true)
+}
+
+fn make_plan(frame: &RenderFrame, minimum_contrast: bool) -> TerminalPaintPlan {
     let cell = CellMetrics::new(10.0, 20.0);
     let surface = TerminalSurface::for_logical_size(
         cell.width,
@@ -76,9 +91,13 @@ fn minimum_contrast_plan(frame: &RenderFrame) -> TerminalPaintPlan {
         cell,
         TerminalPadding::default(),
     );
-    PaintPlanner::default()
-        .plan_with_minimum_contrast(surface, frame, 16.0)
-        .clone()
+    let mut planner = PaintPlanner::default();
+    if minimum_contrast {
+        planner.plan_with_minimum_contrast(surface, frame, 16.0)
+    } else {
+        planner.plan(surface, frame, 16.0)
+    }
+    .clone()
 }
 
 fn foreground(plan: &TerminalPaintPlan, text: &str) -> PlanColor {
@@ -91,26 +110,14 @@ fn foreground(plan: &TerminalPaintPlan, text: &str) -> PlanColor {
 }
 
 #[test]
-fn ordinary_planner_keeps_low_contrast_text_color() {
-    let plan = plan(&frame(&['a']));
+fn minimum_contrast_is_opt_in() {
+    let source = frame(&['a']);
 
-    assert_eq!(foreground(&plan, "a"), color(10, 10, 10));
-}
-
-#[test]
-fn minimum_contrast_adjusts_low_contrast_text() {
-    let plan = minimum_contrast_plan(&frame(&['a']));
-
-    assert_eq!(foreground(&plan, "a"), color(255, 255, 255));
-}
-
-#[test]
-fn minimum_contrast_keeps_old_native_graphics_source_colors() {
-    let block = minimum_contrast_plan(&frame(&['█']));
-    let geometric = minimum_contrast_plan(&frame(&['■']));
-
-    assert_eq!(foreground(&block, "█"), color(10, 10, 10));
-    assert_eq!(foreground(&geometric, "■"), color(10, 10, 10));
+    assert_eq!(foreground(&plan(&source), "a"), color(10, 10, 10));
+    assert_eq!(
+        foreground(&minimum_contrast_plan(&source), "a"),
+        color(255, 255, 255)
+    );
 }
 
 #[test]
@@ -220,4 +227,25 @@ fn overlay_backgrounds_keep_unclipped_ranges_while_the_text_mask_is_clipped() {
     assert_eq!(plan.backgrounds[1].rect.width(), 20.0);
     assert_eq!(plan.backgrounds[1].rect.min_y, 40.0);
     assert_eq!(foreground(&plan, "a"), color(20, 20, 20));
+}
+
+proptest! {
+    /// Property: minimum contrast never recolors glyphs rendered as native terminal graphics.
+    #[test]
+    fn native_graphics_preserve_their_source_foreground(
+        glyph in prop::sample::select(vec!['█', '■']),
+        foreground_color in any::<TestRgb>(),
+        background in any::<TestRgb>(),
+    ) {
+        let mut source = frame(&[glyph]);
+        source.colors.background = background.into();
+        source.cells[0].fg = Some(foreground_color.into());
+
+        let actual = foreground(&minimum_contrast_plan(&source), &glyph.to_string());
+
+        prop_assert_eq!(
+            actual,
+            color(foreground_color.r, foreground_color.g, foreground_color.b)
+        );
+    }
 }

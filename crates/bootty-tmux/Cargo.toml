@@ -17,7 +17,11 @@ inventory.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [dev-dependencies]
-tempfile.workspace = true
+assert_fs.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true
+rstest.workspace = true
 
 [lints]
 workspace = true

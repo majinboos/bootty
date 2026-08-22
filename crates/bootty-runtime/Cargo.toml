@@ -17,5 +17,8 @@ name = "flood_response"
 harness = false
 
 [dev-dependencies]
+assert_fs.workspace = true
 criterion.workspace = true
-tempfile.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true

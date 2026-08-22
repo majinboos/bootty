@@ -14,6 +14,7 @@ use bootty_winit::direct_input::{
 };
 use eframe::egui;
 
+use crate::error_catalog::{self, ErrorNotice};
 use crate::renderer::{TerminalWorkspaceView, animate_indeterminate_progress};
 use crate::state::{AppEffect, AppState, FrameInputs, ViewportSnapshot};
 use crate::ui::chrome::ChromeRuntime;
@@ -33,6 +34,9 @@ pub struct BoottyApp {
     chrome: ChromeRuntime,
     settings: SettingsSurface,
     error_details_open: bool,
+    error_toast_identity: Option<String>,
+    error_toast_message: Option<String>,
+    error_toast_started: Option<Instant>,
     // Held for the process lifetime so the native menu stays installed.
     _menu: Option<AppMenu>,
     extensions: ExtensionHost,
@@ -97,6 +101,9 @@ impl BoottyApp {
             chrome: ChromeRuntime::default(),
             settings,
             error_details_open: false,
+            error_toast_identity: None,
+            error_toast_message: None,
+            error_toast_started: None,
             _menu: crate::menu::install(),
             extensions,
             extension_theme,
@@ -476,29 +483,29 @@ fn show_extension_surface_items(ui: &mut egui::Ui, items: &[ModuleItem]) -> Opti
     selected
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ErrorToastText {
-    summary: String,
-    details: Option<String>,
-}
-
-fn error_toast_text(error: &str) -> ErrorToastText {
-    let normalized = error.trim();
-    let lower = normalized.to_ascii_lowercase();
-    let summary = if lower.contains("rmux") {
-        "Could not reach remote rmux.".to_owned()
-    } else if lower.contains("ssh") || lower.contains("connection") {
-        "Could not reach the remote workspace.".to_owned()
-    } else {
-        let first_line = normalized.lines().next().unwrap_or("Operation failed.");
-        if first_line.chars().count() <= 96 {
-            first_line.to_owned()
-        } else {
-            "The operation failed. Open details for the technical error.".to_owned()
+impl BoottyApp {
+    fn sync_error_toast(&mut self, notice: &ErrorNotice, now: Instant) {
+        let identity = notice.raw_message();
+        if self.error_toast_identity.as_deref() == Some(identity.as_str()) {
+            return;
         }
-    };
-    let details = (summary != normalized).then(|| normalized.to_owned());
-    ErrorToastText { summary, details }
+        self.error_toast_identity = Some(identity);
+        self.error_toast_message = Some(notice.to_string());
+        self.error_toast_started = Some(now);
+        self.error_details_open = false;
+    }
+
+    fn reset_error_toast(&mut self) {
+        self.error_details_open = false;
+        self.error_toast_identity = None;
+        self.error_toast_message = None;
+        self.error_toast_started = None;
+    }
+
+    fn dismiss_error_toast(&mut self) {
+        self.state.clear_last_error();
+        self.reset_error_toast();
+    }
 }
 
 impl eframe::App for BoottyApp {
@@ -660,61 +667,167 @@ impl eframe::App for BoottyApp {
                 );
             }
         });
-        if let Some(error) = self.state.last_error().map(str::to_owned) {
-            let toast = error_toast_text(&error);
-            let mut dismiss = false;
-            egui::Area::new(egui::Id::new("last-error"))
-                .order(egui::Order::Tooltip)
-                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -12.0])
-                .show(ui.ctx(), |ui| {
-                    let max_width = (ui.ctx().content_rect().width() - 48.0).clamp(280.0, 560.0);
-                    egui::Frame::popup(ui.style()).show(ui, |ui| {
-                        ui.set_max_width(max_width);
-                        ui.vertical(|ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&toast.summary).color(palette.destructive),
-                                )
-                                .wrap(),
-                            );
-                            ui.horizontal(|ui| {
-                                if toast.details.is_some()
-                                    && ui
-                                        .button(if self.error_details_open {
-                                            "Hide details"
-                                        } else {
-                                            "Details"
-                                        })
-                                        .clicked()
-                                {
-                                    self.error_details_open = !self.error_details_open;
-                                }
-                                dismiss = ui.button("Dismiss").clicked();
-                            });
-                            if self.error_details_open
-                                && let Some(details) = &toast.details
-                            {
-                                egui::ScrollArea::vertical()
-                                    .max_height(180.0)
-                                    .show(ui, |ui| {
+        let now = Instant::now();
+        let mut dismiss_error = false;
+        if let Some(notice) = self.state.error_notice() {
+            self.sync_error_toast(&notice, now);
+            let expired = !self.error_details_open
+                && self.error_toast_started.is_some_and(|started| {
+                    now.duration_since(started) >= error_catalog::auto_dismiss_after()
+                });
+            if expired {
+                dismiss_error = true;
+            } else {
+                let remaining = self.error_toast_started.and_then(|started| {
+                    error_catalog::auto_dismiss_after().checked_sub(now.duration_since(started))
+                });
+                if !self.error_details_open
+                    && let Some(remaining) = remaining
+                {
+                    ui.ctx().request_repaint_after(remaining);
+                }
+
+                let mut close = false;
+                egui::Area::new(egui::Id::new("last-error"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::RIGHT_TOP, [-16.0, 16.0])
+                    .show(ui.ctx(), |ui| {
+                        let max_width =
+                            (ui.ctx().content_rect().width() - 32.0).clamp(280.0, 760.0);
+                        let width = if self.error_details_open {
+                            max_width.min(640.0)
+                        } else {
+                            max_width.min(400.0)
+                        };
+                        egui::Frame::NONE
+                            .fill(palette.pane)
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                palette.destructive.gamma_multiply(0.65),
+                            ))
+                            .corner_radius(egui::CornerRadius::same(palette.radius))
+                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .show(ui, |ui| {
+                                ui.set_width(width);
+                                let content_width = (ui.available_width() - 32.0).max(0.0);
+                                ui.horizontal_top(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(content_width);
                                         ui.add(
                                             egui::Label::new(
-                                                egui::RichText::new(details)
-                                                    .monospace()
-                                                    .size(11.0)
-                                                    .color(palette.subtext),
+                                                egui::RichText::new(notice.to_string())
+                                                    .color(palette.destructive)
+                                                    .strong(),
                                             )
                                             .wrap(),
                                         );
+                                        if let Some(details) = notice.details() {
+                                            let response = egui::CollapsingHeader::new(
+                                                egui::RichText::new("Technical details")
+                                                    .color(palette.subtext)
+                                                    .size(12.0),
+                                            )
+                                            .id_salt("last-error-details")
+                                            .open(Some(self.error_details_open))
+                                            .icon(|ui, openness, response| {
+                                                let center = response.rect.center();
+                                                let closed = [
+                                                    egui::pos2(center.x - 3.0, center.y - 4.0),
+                                                    egui::pos2(center.x + 3.0, center.y),
+                                                    egui::pos2(center.x - 3.0, center.y + 4.0),
+                                                ];
+                                                let open = [
+                                                    egui::pos2(center.x - 4.0, center.y - 2.0),
+                                                    egui::pos2(center.x, center.y + 3.0),
+                                                    egui::pos2(center.x + 4.0, center.y - 2.0),
+                                                ];
+                                                let interpolate =
+                                                    |from: egui::Pos2, to: egui::Pos2| {
+                                                        from + (to - from) * openness
+                                                    };
+                                                let stroke =
+                                                    ui.style().interact(response).fg_stroke;
+                                                ui.painter().line_segment(
+                                                    [
+                                                        interpolate(closed[0], open[0]),
+                                                        interpolate(closed[1], open[1]),
+                                                    ],
+                                                    stroke,
+                                                );
+                                                ui.painter().line_segment(
+                                                    [
+                                                        interpolate(closed[1], open[1]),
+                                                        interpolate(closed[2], open[2]),
+                                                    ],
+                                                    stroke,
+                                                );
+                                            })
+                                            .show_unindented(ui, |ui| {
+                                                egui::Frame::NONE
+                                                    .fill(palette.base)
+                                                    .stroke(egui::Stroke::new(1.0, palette.border))
+                                                    .corner_radius(egui::CornerRadius::same(
+                                                        palette.radius,
+                                                    ))
+                                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                                    .show(ui, |ui| {
+                                                        egui::ScrollArea::vertical()
+                                                            .max_height(360.0)
+                                                            .show(ui, |ui| {
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(
+                                                                            details,
+                                                                        )
+                                                                        .monospace()
+                                                                        .size(11.0)
+                                                                        .color(palette.subtext),
+                                                                    )
+                                                                    .wrap(),
+                                                                );
+                                                            });
+                                                    });
+                                            });
+                                            if response.header_response.clicked() {
+                                                self.error_details_open = !self.error_details_open;
+                                                self.error_toast_started =
+                                                    if self.error_details_open {
+                                                        None
+                                                    } else {
+                                                        Some(now)
+                                                    };
+                                                ui.ctx().request_repaint();
+                                            }
+                                        }
                                     });
-                            }
-                        });
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("×")
+                                                    .size(18.0)
+                                                    .color(palette.muted),
+                                            )
+                                            .frame(false)
+                                            .min_size(egui::vec2(24.0, 24.0)),
+                                        )
+                                        .on_hover_text("Dismiss")
+                                        .clicked()
+                                    {
+                                        close = true;
+                                    }
+                                });
+                            });
                     });
-                });
-            if dismiss {
-                self.error_details_open = false;
-                self.state.clear_last_error();
+                if close {
+                    dismiss_error = true;
+                }
             }
+        } else if self.error_toast_message.is_some() {
+            self.reset_error_toast();
+        }
+        if dismiss_error {
+            self.dismiss_error_toast();
         }
         if !self.state.settings_open() {
             self.show_modal_dialog(ui.ctx());

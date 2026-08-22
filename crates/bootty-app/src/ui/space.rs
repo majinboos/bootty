@@ -11,6 +11,7 @@ use bootty_ui::{
 use eframe::egui;
 use iconflow::{Pack, list};
 
+use crate::error_catalog::ErrorNotice;
 use crate::remote_catalog::{RemoteCatalogResult, RemoteCatalogTask, RemoteSpaceSummary};
 use bootty_workspace::{
     DEFAULT_SPACE_COLOR, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
@@ -436,8 +437,12 @@ impl SpaceEditorDialog {
             .find(|(id, _)| id == profile_id)
             .map(|(_, profile)| profile.clone())
         else {
-            self.catalog =
-                RemoteCatalogState::Failed(format!("SSH profile '{profile_id}' is unavailable"));
+            self.catalog = RemoteCatalogState::Failed(
+                ErrorNotice::SshProfileUnavailable(format!(
+                    "SSH profile '{profile_id}' is unavailable"
+                ))
+                .raw_message(),
+            );
             return;
         };
         self.catalog = match RemoteCatalogTask::start(profile_id.to_owned(), profile, create) {

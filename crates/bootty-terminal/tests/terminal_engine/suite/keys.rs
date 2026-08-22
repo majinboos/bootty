@@ -1,4 +1,5 @@
 use super::{super::*, terminal_engine::test_terminal_engine};
+use pretty_assertions::assert_eq;
 
 fn terminal_key_input(
     key: TerminalKey,
@@ -12,6 +13,15 @@ fn terminal_key_input(
         repeat: false,
         utf8,
         unshifted,
+    }
+}
+
+fn key_mods(ctrl: bool, alt: bool, shift: bool) -> KeyMods {
+    KeyMods {
+        ctrl,
+        alt,
+        shift,
+        ..Default::default()
     }
 }
 
@@ -128,197 +138,103 @@ fn key_encoder_supports_legacy_core_cases() -> Result<()> {
     let mut engine = test_terminal_engine()?;
     let mut out = Vec::new();
 
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+    for (key, mods, utf8, unshifted, expected) in [
+        (
             TerminalKey::C,
-            KeyMods {
-                ctrl: true,
-                ..Default::default()
-            },
+            key_mods(true, false, false),
             Some("c"),
             Some('c'),
+            b"\x03".as_slice(),
         ),
-        b"\x03",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::D,
-            KeyMods {
-                ctrl: true,
-                ..Default::default()
-            },
+            key_mods(true, false, false),
             Some("d"),
             Some('d'),
+            b"\x04",
         ),
-        b"\x04",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::B,
-            KeyMods {
-                alt: true,
-                ..Default::default()
-            },
+            key_mods(false, true, false),
             Some("b"),
             Some('b'),
+            b"\x1bb",
         ),
-        b"\x1bb",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::Q,
-            KeyMods {
-                alt: true,
-                shift: true,
-                ..Default::default()
-            },
+            key_mods(false, true, true),
             Some("Q"),
             Some('q'),
+            b"\x1bQ",
         ),
-        b"\x1bQ",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::C,
-            KeyMods {
-                ctrl: true,
-                alt: true,
-                ..Default::default()
-            },
+            key_mods(true, true, false),
             Some("c"),
             Some('c'),
+            b"\x1b\x03",
         ),
-        b"\x1b\x03",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::Space,
-            KeyMods {
-                ctrl: true,
-                ..Default::default()
-            },
+            key_mods(true, false, false),
             Some(" "),
             Some(' '),
+            b"\x00",
         ),
-        b"\x00",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::Minus,
-            KeyMods {
-                ctrl: true,
-                shift: true,
-                ..Default::default()
-            },
+            key_mods(true, false, true),
             Some("_"),
             Some('-'),
+            b"\x1f",
         ),
-        b"\x1f",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(TerminalKey::Backspace, KeyMods::default(), None, None),
-        b"\x7f",
-    )?;
-
-    engine.write_vt(b"\x1b[?67h");
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(TerminalKey::Backspace, KeyMods::default(), None, None),
-        b"\x08",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
+        (
             TerminalKey::Backspace,
-            KeyMods {
-                ctrl: true,
-                ..Default::default()
-            },
+            KeyMods::default(),
             None,
             None,
+            b"\x7f",
         ),
-        b"\x7f",
-    )?;
-
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
-            TerminalKey::ArrowUp,
-            KeyMods {
-                shift: true,
-                ..Default::default()
-            },
-            None,
-            None,
-        ),
-        b"\x1b[1;2A",
-    )?;
-
-    for (key, expected) in [
-        (TerminalKey::F1, b"\x1b[1;5P".as_slice()),
-        (TerminalKey::F2, b"\x1b[1;5Q".as_slice()),
-        (TerminalKey::F3, b"\x1b[13;5~".as_slice()),
-        (TerminalKey::F4, b"\x1b[1;5S".as_slice()),
-        (TerminalKey::F5, b"\x1b[15;5~".as_slice()),
     ] {
         assert_engine_key(
             &mut engine,
             &mut out,
-            terminal_key_input(
-                key,
-                KeyMods {
-                    ctrl: true,
-                    ..Default::default()
-                },
-                None,
-                None,
-            ),
+            terminal_key_input(key, mods, utf8, unshifted),
             expected,
         )?;
     }
 
-    assert_engine_key(
-        &mut engine,
-        &mut out,
-        terminal_key_input(
-            TerminalKey::Tab,
-            KeyMods {
-                shift: true,
-                ..Default::default()
-            },
-            None,
-            None,
+    engine.write_vt(b"\x1b[?67h");
+    for (key, mods, expected) in [
+        (
+            TerminalKey::Backspace,
+            KeyMods::default(),
+            b"\x08".as_slice(),
         ),
-        b"\x1b[Z",
-    )?;
-
+        (
+            TerminalKey::Backspace,
+            key_mods(true, false, false),
+            b"\x7f",
+        ),
+        (
+            TerminalKey::ArrowUp,
+            key_mods(false, false, true),
+            b"\x1b[1;2A",
+        ),
+        (TerminalKey::F1, key_mods(true, false, false), b"\x1b[1;5P"),
+        (TerminalKey::F2, key_mods(true, false, false), b"\x1b[1;5Q"),
+        (TerminalKey::F3, key_mods(true, false, false), b"\x1b[13;5~"),
+        (TerminalKey::F4, key_mods(true, false, false), b"\x1b[1;5S"),
+        (TerminalKey::F5, key_mods(true, false, false), b"\x1b[15;5~"),
+        (TerminalKey::Tab, key_mods(false, false, true), b"\x1b[Z"),
+    ] {
+        assert_engine_key(
+            &mut engine,
+            &mut out,
+            terminal_key_input(key, mods, None, None),
+            expected,
+        )?;
+    }
     Ok(())
 }
 

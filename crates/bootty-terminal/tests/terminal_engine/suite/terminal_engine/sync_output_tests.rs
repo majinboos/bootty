@@ -1,5 +1,4 @@
 use super::support::*;
-
 #[test]
 fn synchronized_output_mode_follows_vt_2026() {
     let mut engine = test_terminal_engine().expect("terminal engine");

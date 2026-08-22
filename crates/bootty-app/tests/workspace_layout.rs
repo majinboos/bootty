@@ -1,6 +1,8 @@
 use bootty_app::layout::{Direction, PaneId, PaneLayout, SplitDirection};
 use bootty_mux::snapshot::{MuxPaneLayout, MuxPaneSplitDirection};
 use egui::{Pos2, Rect, Vec2};
+use pretty_assertions::assert_eq;
+use proptest::prelude::*;
 
 fn area() -> Rect {
     Rect::from_min_size(Pos2::ZERO, Vec2::new(100.0, 80.0))
@@ -18,84 +20,15 @@ fn approx(actual: f32, expected: f32) {
     assert!((actual - expected).abs() < 0.01, "{actual} != {expected}");
 }
 
-#[test]
-fn one_pane_fills_the_terminal_area_without_a_divider() {
-    let layout = PaneLayout::single("a".to_owned());
-    let rects = layout.rects(area(), 4.0);
-
-    assert_eq!(rects.len(), 1);
-    assert_eq!(*rect_for(&rects, "a"), area());
-    assert!(layout.dividers(area(), 4.0).is_empty());
-    assert!(layout.is_single());
-}
-
-#[test]
-fn splitting_right_places_and_focuses_the_new_pane() {
-    let mut layout = PaneLayout::single("a".to_owned());
-    layout.split_focused("b".to_owned(), SplitDirection::Right);
-
-    assert_eq!(layout.focused(), "b");
-    assert_eq!(layout.panes(), vec!["a".to_owned(), "b".to_owned()]);
-
-    let rects = layout.rects(area(), 4.0);
-    let left = rect_for(&rects, "a");
-    let right = rect_for(&rects, "b");
-    approx(left.width(), 48.0);
-    approx(right.width(), 48.0);
-    approx(left.min.x, 0.0);
-    approx(right.min.x, 52.0);
-    approx(left.height(), 80.0);
-}
-
-#[test]
-fn splitting_down_reserves_the_configured_gap() {
-    let mut layout = PaneLayout::single("a".to_owned());
-    layout.split_focused("b".to_owned(), SplitDirection::Down);
-
-    let rects = layout.rects(area(), 6.0);
-    let top = rect_for(&rects, "a");
-    let bottom = rect_for(&rects, "b");
-    approx(top.height(), 37.0);
-    approx(bottom.height(), 37.0);
-    approx(bottom.min.y, 43.0);
-    approx(top.width(), 100.0);
-}
-
-#[test]
-fn a_nested_split_only_subdivides_the_focused_pane() {
-    let mut layout = PaneLayout::single("a".to_owned());
-    layout.split_focused("b".to_owned(), SplitDirection::Right);
-    layout.split_focused("c".to_owned(), SplitDirection::Down);
-
-    assert_eq!(
-        layout.panes(),
-        vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
-    );
-
-    let rects = layout.rects(area(), 0.0);
-    approx(rect_for(&rects, "a").width(), 50.0);
-    approx(rect_for(&rects, "b").width(), 50.0);
-    approx(rect_for(&rects, "b").height(), 40.0);
-    approx(rect_for(&rects, "c").min.y, 40.0);
-}
-
-#[test]
-fn removing_a_pane_collapses_its_parent_and_refocuses_the_survivor() {
-    let mut layout = PaneLayout::single("a".to_owned());
-    layout.split_focused("b".to_owned(), SplitDirection::Right);
-
-    assert!(layout.remove("b"));
-    assert_eq!(layout.panes(), vec!["a".to_owned()]);
-    assert_eq!(layout.focused(), "a");
-    assert_eq!(*rect_for(&layout.rects(area(), 4.0), "a"), area());
-}
-
-#[test]
-fn the_last_pane_cannot_be_removed() {
-    let mut layout = PaneLayout::single("a".to_owned());
-
-    assert!(!layout.remove("a"));
-    assert_eq!(layout.panes(), vec!["a".to_owned()]);
+#[derive(Clone, Copy, Debug, proptest_derive::Arbitrary)]
+struct SplitLayoutInput {
+    #[proptest(strategy = "10u16..2_000")]
+    width: u16,
+    #[proptest(strategy = "10u16..2_000")]
+    height: u16,
+    #[proptest(strategy = "0u8..=25")]
+    gap_percent: u8,
+    horizontal: bool,
 }
 
 #[test]
@@ -110,34 +43,6 @@ fn dividers_keep_their_split_direction_and_tree_path() {
     assert_eq!(dividers[0].direction, SplitDirection::Right);
     assert_eq!(dividers[1].path, vec![1]);
     assert_eq!(dividers[1].direction, SplitDirection::Down);
-}
-
-#[test]
-fn a_divider_maps_pointer_position_to_split_ratio() {
-    let mut right = PaneLayout::single("a".to_owned());
-    right.split_focused("b".to_owned(), SplitDirection::Right);
-    let divider = right.dividers(area(), 0.0).remove(0);
-    approx(divider.ratio_at(Pos2::new(75.0, 40.0), 0.0), 0.75);
-
-    let mut down = PaneLayout::single("a".to_owned());
-    down.split_focused("b".to_owned(), SplitDirection::Down);
-    let divider = down.dividers(area(), 0.0).remove(0);
-    approx(divider.ratio_at(Pos2::new(50.0, 20.0), 0.0), 0.25);
-}
-
-#[test]
-fn resizing_a_split_clamps_both_children_to_their_minimums() {
-    let mut layout = PaneLayout::single("a".to_owned());
-    layout.split_focused("b".to_owned(), SplitDirection::Right);
-
-    layout.set_ratio_at(&[], 0.75, 0.1, 0.1);
-    let rects = layout.rects(area(), 0.0);
-    approx(rect_for(&rects, "a").width(), 75.0);
-    approx(rect_for(&rects, "b").width(), 25.0);
-
-    layout.set_ratio_at(&[], 0.99, 0.1, 0.2);
-    let rects = layout.rects(area(), 0.0);
-    approx(rect_for(&rects, "a").width(), 80.0);
 }
 
 #[test]
@@ -157,25 +62,6 @@ fn reconciliation_removes_closed_panes_and_adopts_new_panes() {
     let before = layout.clone();
     layout.reconcile(&["a".to_owned(), "c".to_owned(), "d".to_owned()]);
     assert_eq!(layout, before);
-}
-
-#[test]
-fn closing_the_bottom_right_pane_preserves_the_left_split() {
-    let mut layout = PaneLayout::single("left".to_owned());
-    layout.split_focused("top-right".to_owned(), SplitDirection::Right);
-    layout.split_focused("bottom-right".to_owned(), SplitDirection::Down);
-
-    layout.reconcile(&["left".to_owned(), "top-right".to_owned()]);
-
-    let rects = layout.rects(area(), 0.0);
-    assert_eq!(
-        layout.panes(),
-        vec!["left".to_owned(), "top-right".to_owned()]
-    );
-    approx(rect_for(&rects, "left").height(), 80.0);
-    approx(rect_for(&rects, "left").width(), 50.0);
-    approx(rect_for(&rects, "top-right").height(), 80.0);
-    approx(rect_for(&rects, "top-right").width(), 50.0);
 }
 
 #[test]
@@ -236,19 +122,86 @@ fn terminal_window_size_includes_internal_split_borders() {
     );
 }
 
-#[test]
-fn directional_navigation_finds_the_geometric_neighbor() {
-    let mut layout = PaneLayout::single("a".to_owned());
-    layout.split_focused("b".to_owned(), SplitDirection::Right);
+proptest! {
+    /// Property: a split partitions the available axis exactly once, accounting for its gap.
+    #[test]
+    fn split_rectangles_conserve_available_space(input in any::<SplitLayoutInput>()) {
+        let SplitLayoutInput { width, height, gap_percent, horizontal } = input;
+        let width = f32::from(width);
+        let height = f32::from(height);
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, height));
+        let gap = f32::from(gap_percent) / 100.0 * if horizontal { width } else { height };
+        let single = PaneLayout::single("a".to_owned());
+        prop_assert_eq!(*rect_for(&single.rects(area, gap), "a"), area);
+        prop_assert!(single.dividers(area, gap).is_empty() && single.is_single());
+        let direction = if horizontal { SplitDirection::Right } else { SplitDirection::Down };
+        let mut layout = PaneLayout::single("a".to_owned());
+        layout.split_focused("b".to_owned(), direction);
+        prop_assert_eq!(layout.focused(), "b");
+        prop_assert_eq!(layout.panes(), vec!["a".to_owned(), "b".to_owned()]);
+        let rects = layout.rects(area, gap);
+        let divider = layout.dividers(area, gap).remove(0);
+        prop_assert!((divider.ratio_at(area.center(), 0.0) - 0.5).abs() < 0.01);
+        let first = rect_for(&rects, "a");
+        let second = rect_for(&rects, "b");
+        let occupied = if horizontal {
+            first.width() + gap + second.width()
+        } else {
+            first.height() + gap + second.height()
+        };
 
-    assert_eq!(
-        layout.neighbor("a", Direction::Right, area(), 0.0),
-        Some("b".to_owned())
-    );
-    assert_eq!(
-        layout.neighbor("b", Direction::Left, area(), 0.0),
-        Some("a".to_owned())
-    );
-    assert_eq!(layout.neighbor("a", Direction::Up, area(), 0.0), None);
-    assert_eq!(layout.neighbor("a", Direction::Left, area(), 0.0), None);
+        prop_assert!((occupied - if horizontal { width } else { height }).abs() < 0.01,
+            "first={first:?}, second={second:?}, gap={gap}, area={area:?}");
+        let separated = if horizontal {
+            first.max.x <= second.min.x
+        } else {
+            first.max.y <= second.min.y
+        };
+        prop_assert!(separated, "split panes overlap: {first:?}, {second:?}");
+        if horizontal {
+            prop_assert_eq!(first.height(), height);
+            prop_assert_eq!(second.height(), height);
+        } else {
+            prop_assert_eq!(first.width(), width);
+            prop_assert_eq!(second.width(), width);
+        }
+
+        let (forward, backward, outside) = if horizontal {
+            (Direction::Right, Direction::Left, Direction::Up)
+        } else {
+            (Direction::Down, Direction::Up, Direction::Left)
+        };
+        prop_assert_eq!(layout.neighbor("a", forward, area, gap), Some("b".to_owned()));
+        prop_assert_eq!(layout.neighbor("b", backward, area, gap), Some("a".to_owned()));
+        prop_assert_eq!(layout.neighbor("a", outside, area, gap), None);
+
+        let mut nested = layout.clone();
+        nested.split_focused("c".to_owned(), if horizontal { SplitDirection::Down } else { SplitDirection::Right });
+        prop_assert_eq!(nested.panes(), vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]);
+        let nested_rects = nested.rects(area, 0.0);
+        let primary = |rect: &Rect| if horizontal { rect.width() / width } else { rect.height() / height };
+        let secondary = |rect: &Rect| if horizontal { rect.height() / height } else { rect.width() / width };
+        prop_assert!((primary(rect_for(&nested_rects, "a")) - 0.5).abs() < 0.01);
+        prop_assert!((primary(rect_for(&nested_rects, "b")) - 0.5).abs() < 0.01);
+        prop_assert!((secondary(rect_for(&nested_rects, "b")) - 0.5).abs() < 0.01);
+        nested.reconcile(&["a".to_owned(), "b".to_owned()]);
+        let reconciled = nested.rects(area, 0.0);
+        prop_assert!((secondary(rect_for(&reconciled, "b")) - 1.0).abs() < 0.01);
+
+        layout.set_ratio_at(&[], 0.99, 0.1, 0.2);
+        let clamped = layout.rects(area, 0.0);
+        let first_fraction = if horizontal {
+            rect_for(&clamped, "a").width() / width
+        } else {
+            rect_for(&clamped, "a").height() / height
+        };
+        prop_assert!((first_fraction - 0.8).abs() < 0.01, "clamped ratio={first_fraction}");
+
+        let mut collapsed = layout;
+        prop_assert!(collapsed.remove("b"));
+        prop_assert_eq!(collapsed.panes(), vec!["a".to_owned()]);
+        prop_assert_eq!(collapsed.focused(), "a");
+        prop_assert_eq!(*rect_for(&collapsed.rects(area, gap), "a"), area);
+        prop_assert!(!collapsed.remove("a"));
+    }
 }

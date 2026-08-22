@@ -321,7 +321,7 @@ impl AppState {
             {
                 Ok(true) => self.input_focus = crate::input::focus::InputFocus::Terminal,
                 Ok(false) => {}
-                Err(error) => self.last_error = Some(error.to_string()),
+                Err(error) => self.record_error(error),
             }
             self.sync_native_layout_terminal_now();
             return;

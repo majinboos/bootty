@@ -3,6 +3,7 @@ use std::sync::mpsc;
 use bootty_terminal::terminal_side_effect::{
     TerminalSideEffect, TerminalSideEffectEvent, deliver_terminal_side_effects,
 };
+use pretty_assertions::assert_eq;
 
 #[test]
 fn delivery_adds_the_pane_identity_and_preserves_order() {

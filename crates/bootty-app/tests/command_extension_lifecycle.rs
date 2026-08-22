@@ -1,28 +1,23 @@
 use std::{
-    fs,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use assert_fs::prelude::*;
 use bootty_app::ui::{
     chrome::{SidebarEvent, SidebarModel, show_sidebar},
     sidebar::build_sidebar_items_from_published_items,
 };
-use bootty_command::{
-    AppCommandReceiver, AppCommandSender, Caller, app_command_channel as command_channel,
-};
+use bootty_command::{Caller, app_command_channel};
 use bootty_extension::{ExtensionHost, ExtensionUiAction, SurfacePlacement, event_queue};
 use bootty_mux::controller::SpaceId;
 use egui::{Event, PointerButton, Pos2, RawInput, Rect};
-
-fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
-    command_channel(capacity, Arc::new(|| {}))
-}
+use pretty_assertions::{assert_eq, assert_ne};
 
 #[test]
 fn sidebar_body_and_footer_actions_keep_the_exact_generation() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
-    let module = directory.path().join("sidebar-actions.luau");
+    let extension_directory = assert_fs::TempDir::new().expect("temporary extension root");
+    let module = extension_directory.child("sidebar-actions.luau");
     let source = |version| {
         format!(
             r#"
@@ -39,11 +34,13 @@ end)
 "#
         )
     };
-    fs::write(&module, source(1)).expect("first sidebar generation");
+    module
+        .write_str(&source(1))
+        .expect("first sidebar generation");
     let catalog = Arc::new(bootty_extension::ExtensionCatalog::default());
-    let (sender, _receiver) = app_command_channel(4);
+    let (sender, _receiver) = app_command_channel(4, Arc::new(|| {}));
     let mut host = ExtensionHost::load(
-        directory.path(),
+        extension_directory.path(),
         catalog.clone(),
         sender.for_caller(Caller::Luau),
         event_queue().0,
@@ -65,7 +62,9 @@ end)
         .expect("current footer action");
     wait_for_surface_text(&catalog, "body:footer-1");
 
-    fs::write(&module, source(2)).expect("second sidebar generation");
+    module
+        .write_str(&source(2))
+        .expect("second sidebar generation");
     host.refresh(Instant::now() + Duration::from_secs(1));
     assert_eq!(
         host.submit_ui_action(old_body.clone()),
@@ -78,28 +77,18 @@ end)
     wait_for_surface_text(&catalog, "body:body-2");
 }
 
-fn surface_text(
-    catalog: &bootty_extension::ExtensionCatalog,
-    module: &str,
-    surface: &str,
-) -> String {
-    catalog
-        .surfaces()
-        .into_iter()
-        .find(|published| {
-            published.module == module && published.snapshot.declaration.id == surface
-        })
-        .expect("published extension surface")
-        .snapshot
-        .items[0]
-        .text
-        .clone()
-}
-
 fn wait_for_surface_text(catalog: &bootty_extension::ExtensionCatalog, expected: &str) {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
-        if surface_text(catalog, "sidebar-actions.luau", "actions") == expected {
+        let published = catalog
+            .surfaces()
+            .into_iter()
+            .find(|published| {
+                published.module == "sidebar-actions.luau"
+                    && published.snapshot.declaration.id == "actions"
+            })
+            .expect("published extension surface");
+        if published.snapshot.items[0].text == expected {
             return;
         }
         assert!(Instant::now() < deadline, "sidebar action did not publish");

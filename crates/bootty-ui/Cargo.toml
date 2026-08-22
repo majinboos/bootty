@@ -11,3 +11,8 @@ bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["wayland", "x11"] }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+proptest.workspace = true
+rstest.workspace = true

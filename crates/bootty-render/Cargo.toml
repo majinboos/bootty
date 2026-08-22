@@ -26,3 +26,10 @@ wgpu = { workspace = true, features = ["gles", "vulkan"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"] }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true
+rstest.workspace = true
+static_assertions.workspace = true

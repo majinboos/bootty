@@ -2,7 +2,7 @@
 //!
 //! The refactor that split the settings surface into a declarative schema silently dropped rows,
 //! labels and controls. Comparing every page's painted text against a committed baseline is the
-//! only check that notices; a page's *content* is the contract, not the code that produces it.
+//! only check that notices; a page's rendered content is the behavior under test.
 //!
 //! Run with `UPDATE_SETTINGS_SNAPSHOTS=1` to rewrite the baselines after an intended change.
 //!
@@ -10,7 +10,7 @@
 //! "Loading module source…" where a real session shows the editor and its preview. Those are
 //! covered by the unit tests in `ui::settings::surface::modules`, not here.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use bootty_app::{
     theme::theme_from_config,
@@ -22,14 +22,10 @@ use bootty_ui::icons::install_icon_fonts;
 use bootty_winit::direct_input::ModifierSideState;
 use egui::{RawInput, Shape};
 
-fn snapshot_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/settings")
-}
-
 /// Every text run the surface painted, ordered top-to-bottom then left-to-right. Coordinates are
 /// rounded so sub-pixel layout jitter cannot churn the baseline.
 fn painted_text(page: SettingsPage) -> String {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
         ..BoottyConfig::default()
@@ -107,7 +103,7 @@ fn collect_text(shape: &Shape, out: &mut Vec<(i32, i32, String)>) {
 #[test]
 fn every_settings_page_renders_its_baseline_content() {
     let update = std::env::var_os("UPDATE_SETTINGS_SNAPSHOTS").is_some();
-    let directory = snapshot_dir();
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/settings");
     if update {
         std::fs::create_dir_all(&directory).expect("snapshot directory");
     }

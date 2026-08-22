@@ -1,0 +1,33 @@
+[package]
+name = "bootty-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+autolib = false
+autobins = false
+autoexamples = false
+autobenches = false
+autotests = false
+
+[dependencies]
+bootty-workspace-hack = { version = "0.1", path = "../crates/bootty-workspace-hack" }
+
+[dev-dependencies]
+bootty-config = { path = "../crates/bootty-config" }
+bootty-identity = { path = "../crates/bootty-identity" }
+bootty-rmux = { path = "../crates/bootty-rmux" }
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true
+rstest.workspace = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "child_process_identity"
+path = "child_process_identity.rs"
+
+[[test]]
+name = "identity_paths"
+path = "identity_paths.rs"

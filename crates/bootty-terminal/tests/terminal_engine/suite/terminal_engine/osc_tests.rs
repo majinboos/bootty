@@ -1,5 +1,5 @@
 use super::super::super::*;
-
+use pretty_assertions::assert_eq;
 #[test]
 fn terminal_engine_tracks_completed_working_directory_reports() -> Result<()> {
     let mut engine = TerminalEngine::new(TerminalGeometry {

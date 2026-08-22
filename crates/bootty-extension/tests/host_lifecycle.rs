@@ -12,6 +12,7 @@ use bootty_extension::{
     ExtensionCatalog, ExtensionHost, ExtensionInvocationSender, ExtensionUiAction, MuxView,
     SessionReorder, SurfacePlacement, event_queue,
 };
+use pretty_assertions::assert_eq;
 
 /// Wall-clock budget for every step that waits on a real extension worker.
 ///
@@ -43,7 +44,7 @@ fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver
 
 #[test]
 fn structured_storage_is_bounded_and_follows_the_module_path_identity() {
-    let directory = tempfile::tempdir().expect("temporary config root");
+    let directory = assert_fs::TempDir::new().expect("temporary config root");
     let extension_root = directory.path().join("extensions");
     fs::create_dir(&extension_root).expect("create extension root");
     let module = extension_root.join("counter.luau");
@@ -145,7 +146,7 @@ end)
 
 #[test]
 fn one_generation_publishes_and_refreshes_every_surface_placement() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
     fs::write(
         directory.path().join("surface.luau"),
         r#"
@@ -207,7 +208,7 @@ end
 
 #[test]
 fn commands_topics_surfaces_and_actions_switch_as_one_generation() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
     let module = directory.path().join("mixed.luau");
     fs::write(&module, MIXED_GENERATION.replace("__VERSION__", "1"))
         .expect("first mixed generation");
@@ -313,7 +314,7 @@ fn commands_topics_surfaces_and_actions_switch_as_one_generation() {
 
 #[test]
 fn runaway_surface_render_is_retired_without_late_publication() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
     let module = directory.path().join("render.luau");
     fs::write(
         &module,
@@ -367,7 +368,7 @@ end)
 
 #[test]
 fn a_surface_collision_rejects_the_complete_candidate_generation() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
     fs::write(
         directory.path().join("a.luau"),
         r#"
@@ -410,7 +411,7 @@ end)
 
 #[test]
 fn declarations_close_after_candidate_setup() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
     fs::write(
         directory.path().join("late.luau"),
         r#"
@@ -464,7 +465,7 @@ end)
 
 #[test]
 fn a_retired_generation_cannot_enqueue_a_session_reorder() {
-    let directory = tempfile::tempdir().expect("temporary extension root");
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
     let module = directory.path().join("reorder.luau");
     fs::write(
         &module,
@@ -512,10 +513,9 @@ end)
     )
     .expect("new reorder generation");
     host.refresh(Instant::now() + Duration::from_secs(1));
-    nested
-        .response
-        .send(CommandOutcome::success())
-        .expect("complete nested request");
+    // Retiring the old generation may cancel its nested receiver before the
+    // synthetic response can be delivered.
+    let _ = nested.response.send(CommandOutcome::success());
     assert!(matches!(
         old_outcome.recv_timeout(EXTENSION_BUDGET).expect("old outcome"),
         CommandOutcome::Failed { code, .. }

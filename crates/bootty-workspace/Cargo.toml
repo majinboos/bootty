@@ -16,4 +16,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+assert_fs.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true
+rstest.workspace = true
+static_assertions.workspace = true

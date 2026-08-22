@@ -1,5 +1,6 @@
 use super::super::super::*;
 use super::support::*;
+use pretty_assertions::assert_eq;
 use proptest::prelude::*;
 
 #[test]
@@ -470,6 +471,7 @@ fn terminal_engine_applies_configured_default_cursor_style_and_blink() -> Result
 }
 
 proptest! {
+    /// Property: arbitrary SGR truecolor components survive parsing and frame extraction exactly.
     #[test]
     fn terminal_engine_extracts_truecolor_sgr_cells(
         fg_r in any::<u8>(),

@@ -4,6 +4,7 @@ use bootty_ui::status_layout::{
     status_bar_layout, status_bar_layout_with_tab_wrap,
 };
 use eframe::egui::{self, Pos2, RawInput, Rect};
+use pretty_assertions::assert_eq;
 
 fn tab(anchor: &str, text: &str) -> ModuleItem {
     ModuleItem {

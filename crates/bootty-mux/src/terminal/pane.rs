@@ -455,10 +455,16 @@ impl BackendPaneTerminal {
         if let Err(error) = self.terminal.apply_live_config(config.clone()) {
             failures.push(format!("active terminal: {error}"));
         }
+        let mut failed_cached_targets = Vec::new();
         for (target, terminal) in &mut self.native_terminals {
-            if let Err(error) = terminal.apply_live_config(config.clone()) {
-                failures.push(format!("cached terminal {target:?}: {error}"));
+            if terminal.apply_live_config(config.clone()).is_err() {
+                // A cached runtime cannot recover from a failed command: its pane or worker is
+                // gone. Retire it so the next backend reconciliation can create a fresh runtime.
+                failed_cached_targets.push(target.clone());
             }
+        }
+        for target in failed_cached_targets {
+            self.native_terminals.remove(&target);
         }
         if failures.is_empty() {
             Ok(())

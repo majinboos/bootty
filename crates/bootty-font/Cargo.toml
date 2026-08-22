@@ -7,3 +7,8 @@ workspace = true
 
 [dependencies]
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+proptest.workspace = true
+rstest.workspace = true

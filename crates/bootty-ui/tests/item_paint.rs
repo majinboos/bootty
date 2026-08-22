@@ -1,5 +1,6 @@
 use bootty_item::{ModuleCoord, ModuleCornerRadius};
 use bootty_ui::item_paint::{RUN_END_RADIUS, SWEEP_PERIOD, corner_radius, rect_radius, sweep_x};
+use pretty_assertions::assert_eq;
 
 fn coord(frac: f32) -> ModuleCoord {
     ModuleCoord { frac, px: 0.0 }

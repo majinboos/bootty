@@ -3,26 +3,32 @@ use bootty_app::ui::settings::surface::modules::{
 };
 use bootty_extension::{ModuleIdentity, preview_builtin_surfaces, preview_module_surfaces};
 use eframe::egui;
+use pretty_assertions::assert_eq;
+use rstest::rstest;
 
 #[test]
-fn editor_hides_only_the_file_terminating_newline() {
+fn editor_hides_and_restores_one_file_terminating_newline() {
     assert_eq!(displayed_source("return {}\n"), "return {}");
     assert_eq!(displayed_source("return {}\n\n"), "return {}\n");
     assert_eq!(saved_source("return {}"), "return {}\n");
     assert_eq!(saved_source("return {}\n"), "return {}\n");
 }
 
-#[test]
-fn a_new_module_name_gains_the_module_extension() {
+#[rstest]
+#[case::trimmed(" my_module ", Some("my_module.luau"))]
+#[case::existing_extension("nested/thing.luau", Some("nested/thing.luau"))]
+#[case::invalid("bad name!", None)]
+fn a_new_module_name_gains_the_module_extension(
+    #[case] input: &str,
+    #[case] expected: Option<&str>,
+) {
     assert_eq!(
-        new_module_identity(" my_module ").map(|id| id.as_str().to_owned()),
-        Ok("my_module.luau".to_owned())
+        new_module_identity(input)
+            .ok()
+            .as_ref()
+            .map(ModuleIdentity::as_str),
+        expected
     );
-    assert_eq!(
-        new_module_identity("nested/thing.luau").map(|id| id.as_str().to_owned()),
-        Ok("nested/thing.luau".to_owned())
-    );
-    assert!(new_module_identity("bad name!").is_err());
 }
 
 /// Every text run the preview painted, so a regression back to labelling items — which prints
@@ -81,11 +87,8 @@ fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
     }
 }
 
-/// A session module decorates the built-in session rows, so its preview has to show them —
-/// on its own it renders detail rows with nothing to attach to, i.e. "no sessions".
-#[test]
-fn a_session_surface_previews_over_the_builtin_session_rows() {
-    let runs = preview_text(
+#[rstest]
+#[case(
         "bootty.ui.register({ id = \"preview\", placement = \"session\" }, function()\n\
          \treturn bootty.ui.session_components({\n\
          \t\tsessions = bootty.sessions(),\n\
@@ -94,65 +97,40 @@ fn a_session_surface_previews_over_the_builtin_session_rows() {
          \t\tend,\n\
          \t})\n\
          end)\n",
-    );
-    assert!(
-        !runs.iter().any(|run| run == "no sessions"),
-        "the built-in session rows are composed in: {runs:?}"
-    );
-    assert!(
-        runs.iter().any(|run| run.contains("api")),
-        "an example session is named: {runs:?}"
-    );
-}
-
-/// A sidebar module renders beside the session rows, not instead of them, so its preview shows
-/// them too — and previewing `sessions` itself must not double them.
-#[test]
-fn a_sidebar_surface_previews_beside_the_builtin_session_rows() {
-    let runs = preview_text(
+        &["api"],
+        &["no sessions"],
+)]
+#[case(
         "bootty.ui.register({ id = \"preview\", placement = \"sidebar\" }, function()\n\
          \treturn { { kind = \"footer\", text = \"usage 42%\" } }\n\
          end)\n",
-    );
-    assert!(
-        !runs.iter().any(|run| run == "no sessions"),
-        "the session rows are drawn alongside: {runs:?}"
-    );
-    assert!(
-        runs.iter().any(|run| run.contains("api")),
-        "an example session is named: {runs:?}"
-    );
-    assert!(
-        runs.iter().any(|run| run.contains("usage 42%")),
-        "the module's own item is drawn: {runs:?}"
-    );
-}
-
-#[test]
-fn a_status_surface_previews_through_the_real_strip() {
-    let runs = preview_text(
+        &["api", "usage 42%"],
+        &["no sessions"],
+)]
+#[case(
         "bootty.ui.register({ id = \"preview\", placement = \"status\" }, function()\n\
          \treturn { { text = \"42%\", icon = \"battery-charging\" } }\n\
          end)\n",
-    );
-
-    assert!(runs.iter().any(|run| run == "42%"), "{runs:?}");
-    // The icon is drawn as a glyph, never spelled out.
-    assert!(
-        !runs.iter().any(|run| run == "battery-charging"),
-        "{runs:?}"
-    );
-}
-
-#[test]
-fn a_sidebar_surface_previews_through_the_real_sidebar() {
-    let runs = preview_text(
+        &["42%"],
+        &["battery-charging"],
+)]
+#[case(
         "bootty.ui.register({ id = \"preview\", placement = \"sidebar\" }, function()\n\
          \treturn { { text = \"work/api\", kind = \"session\", session_id = \"$1\" } }\n\
          end)\n",
-    );
-
-    assert!(runs.iter().any(|run| run == "work/api"), "{runs:?}");
-    // A session row means the mock counted it, so the empty-state text stays away.
-    assert!(!runs.iter().any(|run| run == "no sessions"), "{runs:?}");
+        &["work/api"],
+        &["no sessions"],
+)]
+fn previews_render_their_real_composition(
+    #[case] source: &str,
+    #[case] present: &[&str],
+    #[case] absent: &[&str],
+) {
+    let runs = preview_text(source);
+    for expected in present {
+        assert!(runs.iter().any(|run| run.contains(expected)), "{runs:?}");
+    }
+    for unexpected in absent {
+        assert!(!runs.iter().any(|run| run == unexpected), "{runs:?}");
+    }
 }

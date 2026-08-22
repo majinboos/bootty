@@ -1,5 +1,6 @@
 use super::super::super::*;
 use super::support::*;
+use pretty_assertions::assert_eq;
 
 fn test_mouse_size() -> MouseEncoderSize {
     MouseEncoderSize {

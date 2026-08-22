@@ -45,7 +45,7 @@ impl AppState {
             Ok(Some(space_id)) => space_id,
             Ok(None) => return false,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 return false;
             }
         };
@@ -109,7 +109,7 @@ impl AppState {
             }
             Ok(_) => false,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 false
             }
         }
@@ -145,7 +145,7 @@ impl AppState {
             &self.repaint,
             Instant::now(),
         ) {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
             return false;
         }
         self.publish_backend_transition(app_key_bindings);

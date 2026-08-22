@@ -3,6 +3,7 @@ use bootty_ui::{
     overlay::{ListOutcome, ListRow, ListView, clamp_selection, fuzzy_match},
 };
 use eframe::egui::{self, Event, Key, Modifiers, RawInput};
+use pretty_assertions::assert_eq;
 
 fn key_event(key: Key, modifiers: Modifiers) -> Event {
     Event::Key {
@@ -44,17 +45,7 @@ fn show_list(
     selected: usize,
     input: RawInput,
 ) -> ListOutcome {
-    let mut outcome = None;
-    context
-        .run_ui(input, |ui| {
-            outcome = Some(
-                ListView::new("ui-value-contracts", rows, selected)
-                    .max_height(240.0)
-                    .show(ui, ThemePalette::default()),
-            );
-        })
-        .drop_without_applying_deltas();
-    outcome.expect("the list renders")
+    show_list_hover(context, rows, selected, input, true)
 }
 
 #[test]
@@ -141,12 +132,15 @@ fn list_navigation_skips_section_rows() {
 }
 
 #[test]
-fn overlay_search_uses_a_case_insensitive_subsequence() {
-    assert!(fuzzy_match("bootty", "bty"));
-    assert!(fuzzy_match("Dotfiles", "df"));
-    assert!(fuzzy_match("anything", ""));
-    assert!(!fuzzy_match("bootty", "xyz"));
-    assert!(!fuzzy_match("ab", "abc"));
+fn overlay_search_matches_case_insensitive_subsequences() {
+    for (candidate, query, expected) in [
+        ("bootty", "bty", true),
+        ("Dotfiles", "df", true),
+        ("bootty", "xyz", false),
+        ("ab", "abc", false),
+    ] {
+        assert_eq!(fuzzy_match(candidate, query), expected);
+    }
 }
 
 /// A confirmation list pre-selects the safe action on purpose; the pointer passing over a

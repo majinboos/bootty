@@ -20,8 +20,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+assert_fs.workspace = true
+pretty_assertions.workspace = true
 rmux-server.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
 
 [lints]
