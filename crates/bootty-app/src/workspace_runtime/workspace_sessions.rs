@@ -67,32 +67,30 @@ impl WorkspaceRuntime {
             .collect::<Vec<_>>();
         spaces.sort_by_key(|(position, ..)| *position);
 
-        let mut seen = HashSet::new();
-        let sessions_across_spaces = spaces
-            .iter()
-            .flat_map(|(_, _, bindings)| bindings)
-            .flat_map(|binding| binding.mux.all_sessions())
-            .filter(|session| seen.insert(session.name.as_str()))
-            .collect::<Vec<_>>();
-
+        // The tag on each session says which Space holds it, so this is a grouping rather than a
+        // lookup: nothing has to be matched up by name, and nothing can end up in two Spaces.
         let mut claimed = HashSet::new();
         let mut groups = Vec::new();
         for (_, space_name, bindings) in &spaces {
             for binding in bindings {
-                let members = binding.session_order.session_names();
-                let sessions = members
+                let sessions = binding
+                    .sessions
+                    .sessions()
                     .iter()
-                    .filter_map(|name| {
-                        binding
-                            .mux
-                            .all_sessions()
-                            .iter()
-                            .chain(sessions_across_spaces.iter().copied())
-                            .find(|session| session.name == *name)
-                            .cloned()
+                    .filter_map(|claimed_session| {
+                        binding.mux.all_sessions().iter().find(|session| {
+                            session.tag.identity.as_deref() == Some(&claimed_session.identity)
+                        })
                     })
+                    .cloned()
                     .collect::<Vec<_>>();
-                claimed.extend(members);
+                claimed.extend(
+                    binding
+                        .sessions
+                        .sessions()
+                        .iter()
+                        .map(|session| session.identity.clone()),
+                );
                 if sessions.is_empty() {
                     continue;
                 }
@@ -110,9 +108,23 @@ impl WorkspaceRuntime {
             }
         }
 
-        let unclaimed = sessions_across_spaces
-            .into_iter()
-            .filter(|session| !claimed.contains(&session.name))
+        // Everything the active binding's backend has that no Space holds: sessions made outside
+        // bootty, and sessions a deleted Space left behind.
+        let mut seen = HashSet::new();
+        let unclaimed = self
+            .active
+            .binding
+            .mux
+            .all_sessions()
+            .iter()
+            .filter(|session| {
+                session
+                    .tag
+                    .identity
+                    .as_deref()
+                    .is_none_or(|identity| !claimed.contains(identity))
+            })
+            .filter(|session| seen.insert(session.id.clone()))
             .cloned()
             .collect::<Vec<_>>();
         if !unclaimed.is_empty() {

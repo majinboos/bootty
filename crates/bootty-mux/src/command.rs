@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::snapshot::MuxSessionTag;
+
 #[cfg(feature = "app")]
 use crate::capability::BindingOperation;
 
@@ -98,10 +100,14 @@ pub enum MuxCommand {
     CreateProjectSession {
         session_id: String,
         cwd: String,
+        /// What to stamp onto the new session. Bootty mints the identity rather than the backend
+        /// so a create whose result never came back can be settled by looking for this id.
+        tag: MuxSessionTag,
     },
     CreateWorktreeSession {
         session_id: String,
         cwd: String,
+        tag: MuxSessionTag,
     },
     RenameSession {
         session_id: String,
@@ -109,6 +115,12 @@ pub enum MuxCommand {
     },
     DitchSession {
         session_id: String,
+    },
+    /// Write `tag` onto a session that already exists: adopting one bootty did not create, or
+    /// restoring one whose server restarted and dropped its tag.
+    StampSession {
+        session_id: String,
+        tag: MuxSessionTag,
     },
 }
 
@@ -136,6 +148,7 @@ impl MuxCommand {
             Self::CreateWorktreeSession { .. } => BindingOperation::CreateWorktreeSession,
             Self::RenameSession { .. } => BindingOperation::RenameSession,
             Self::DitchSession { .. } => BindingOperation::DitchSession,
+            Self::StampSession { .. } => BindingOperation::StampSession,
         }
     }
 }

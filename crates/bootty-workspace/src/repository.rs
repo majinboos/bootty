@@ -20,10 +20,7 @@ use legacy::*;
 use schema::*;
 use snapshot::*;
 
-use crate::{
-    session_names::{SessionNameRecord, SessionNameStore},
-    session_order::SessionOrderStore,
-};
+use crate::sessions::{SessionMembership, WorkspaceSession};
 
 use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig, default_config_path};
 pub use bootty_mux::membership::BackendMembership;
@@ -32,9 +29,7 @@ use bootty_mux::{
     membership::MembershipOperation,
 };
 
-use crate::session_order::SessionGroup;
-
-const WORKSPACE_SNAPSHOT_REVISION: i64 = 3;
+const WORKSPACE_SNAPSHOT_REVISION: i64 = 4;
 const DEFAULT_SPACE_NAME: &str = "Default Space";
 pub const DEFAULT_SPACE_ICON: &str = "folder";
 pub const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
@@ -72,52 +67,56 @@ pub type WorkspaceResult<T> = Result<T, WorkspacePersistenceError>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BindingMembershipMutation {
     Create {
-        session_id: String,
+        identity: String,
         session_name: String,
         display_name: String,
         explicit: bool,
-        cwd: Option<String>,
+        cwd: String,
     },
     Rename {
-        session_id: String,
+        identity: String,
         old_name: String,
         new_name: String,
         display_name: String,
         explicit: bool,
-        cwd: Option<String>,
     },
     Ditch {
-        session_id: String,
+        identity: String,
         old_name: String,
     },
 }
 
 impl BindingMembershipMutation {
+    pub fn identity(&self) -> &str {
+        match self {
+            Self::Create { identity, .. }
+            | Self::Rename { identity, .. }
+            | Self::Ditch { identity, .. } => identity,
+        }
+    }
+
     fn backend_operation(&self) -> MembershipOperation {
         match self {
             Self::Create {
-                session_id,
+                identity,
                 session_name,
                 ..
             } => MembershipOperation::Create {
-                session_id: session_id.clone(),
+                identity: identity.clone(),
                 session_name: session_name.clone(),
             },
             Self::Rename {
-                session_id,
+                identity,
                 old_name,
                 new_name,
                 ..
             } => MembershipOperation::Rename {
-                session_id: session_id.clone(),
+                identity: identity.clone(),
                 old_name: old_name.clone(),
                 new_name: new_name.clone(),
             },
-            Self::Ditch {
-                session_id,
-                old_name,
-            } => MembershipOperation::Ditch {
-                session_id: session_id.clone(),
+            Self::Ditch { identity, old_name } => MembershipOperation::Ditch {
+                identity: identity.clone(),
                 old_name: old_name.clone(),
             },
         }
@@ -168,8 +167,7 @@ pub struct WorkspaceBinding {
     hide_tmux_status: bool,
     unavailable: bool,
     selection: Option<WorkspaceBindingSelection>,
-    session_order: SessionOrderStore,
-    session_names: SessionNameStore,
+    sessions: SessionMembership,
 }
 
 impl WorkspaceBinding {
@@ -201,12 +199,8 @@ impl WorkspaceBinding {
         self.selection.as_ref()
     }
 
-    pub fn session_order(&self) -> &SessionOrderStore {
-        &self.session_order
-    }
-
-    pub fn session_names(&self) -> &SessionNameStore {
-        &self.session_names
+    pub fn sessions(&self) -> &SessionMembership {
+        &self.sessions
     }
 }
 
@@ -377,11 +371,6 @@ impl WorkspaceRepository {
             ],
         )?;
         let binding_id = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO workspace_session_groups (binding_id, name, position)
-             VALUES (?1, '', 0)",
-            [binding_id],
-        )?;
         tx.commit()?;
 
         let space = WorkspaceSpace {
@@ -403,14 +392,7 @@ impl WorkspaceRepository {
                 hide_tmux_status,
                 unavailable: false,
                 selection: None,
-                session_order: SessionOrderStore::from_groups(
-                    vec![SessionGroup {
-                        name: String::new(),
-                        sessions: Vec::new(),
-                    }],
-                    true,
-                ),
-                session_names: SessionNameStore::default(),
+                sessions: SessionMembership::default(),
             }],
         };
         Ok(Some(space))
@@ -560,17 +542,17 @@ impl WorkspaceRepository {
     pub fn commit_binding_state(
         &mut self,
         scope: MuxScope,
-        session_order: &SessionOrderStore,
-        session_names: &SessionNameStore,
+        sessions: &SessionMembership,
     ) -> WorkspaceResult<()> {
-        let states = [(scope, session_order.clone(), session_names.clone())];
-        self.commit_binding_states(&states)
+        self.commit_binding_states(&[(scope, sessions.clone())])
     }
 
-    /// Record a binding membership mutation before calling the backend.
+    /// Record a membership mutation before calling the backend.
     ///
-    /// One binding can have one unresolved remote mutation. The unique scope protects the journal
-    /// from overlapping commands that could not be reconciled in order.
+    /// One row per session, so operations on different sessions never collide and nothing a user
+    /// does can be refused because of a row they cannot see. A second mutation on the *same*
+    /// session supersedes the first, which is what reconciliation would do with one whose effect
+    /// it cannot observe anyway.
     pub fn begin_binding_membership_mutation(
         &mut self,
         scope: MuxScope,
@@ -587,14 +569,23 @@ impl WorkspaceRepository {
         let stored = binding_membership_mutation_to_storage(mutation);
         tx.execute(
             "INSERT INTO workspace_pending_binding_operations
-                (space_id, binding_id, operation, session_id, old_name, new_name,
+                (space_id, binding_id, operation, identity, old_name, new_name,
                  display_name, explicit, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(identity) DO UPDATE SET
+                space_id = excluded.space_id,
+                binding_id = excluded.binding_id,
+                operation = excluded.operation,
+                old_name = excluded.old_name,
+                new_name = excluded.new_name,
+                display_name = excluded.display_name,
+                explicit = excluded.explicit,
+                cwd = excluded.cwd",
             params![
                 scope.space_id().persistence_value(),
                 scope.binding_id().persistence_value(),
                 stored.operation,
-                stored.session_id,
+                stored.identity,
                 stored.old_name,
                 stored.new_name,
                 stored.display_name,
@@ -608,14 +599,14 @@ impl WorkspaceRepository {
         Ok(())
     }
 
-    pub fn pending_binding_membership_mutation(
+    pub fn pending_binding_membership_mutations(
         &mut self,
         scope: MuxScope,
-    ) -> WorkspaceResult<Option<PendingBindingMembershipMutation>> {
+    ) -> WorkspaceResult<Vec<PendingBindingMembershipMutation>> {
         let conn = open_db(&self.path).map_err(|error| {
             self.database_error("open database to read binding membership", error)
         })?;
-        self.load_pending_binding_membership_mutation(&conn, scope)
+        self.load_pending_binding_membership_mutations(&conn, scope)
     }
 
     /// Apply a completed remote mutation and clear its journal row in one transaction.
@@ -626,13 +617,11 @@ impl WorkspaceRepository {
         &mut self,
         scope: MuxScope,
         mutation: &BindingMembershipMutation,
-        session_order: &mut SessionOrderStore,
-        session_names: &mut SessionNameStore,
+        sessions: &mut SessionMembership,
     ) -> WorkspaceResult<()> {
         validate_binding_membership_mutation(mutation)?;
-        let mut next_order = session_order.clone();
-        let mut next_names = session_names.clone();
-        apply_binding_membership_mutation(mutation, &mut next_order, &mut next_names)?;
+        let mut next = sessions.clone();
+        apply_binding_membership_mutation(mutation, &mut next)?;
 
         let mut conn = open_db(&self.path).map_err(|error| {
             self.database_error("open database to commit binding membership", error)
@@ -641,25 +630,23 @@ impl WorkspaceRepository {
             .transaction()
             .map_err(|error| self.database_error("begin binding membership commit", error))?;
         self.require_pending_binding_membership_mutation(&tx, scope, mutation)?;
-        self.write_binding_state(&tx, scope, &next_order, &next_names)?;
-        self.delete_pending_binding_membership_mutation(&tx, scope)?;
+        self.write_binding_state(&tx, scope, &next)?;
+        self.delete_pending_binding_membership_mutation(&tx, mutation.identity())?;
         tx.commit()
             .map_err(|error| self.database_error("commit binding membership", error))?;
-        *session_order = next_order;
-        *session_names = next_names;
+        *sessions = next;
         Ok(())
     }
 
-    /// Reconcile a leftover remote mutation against a fresh backend membership snapshot.
+    /// Settle every leftover mutation for a binding against a fresh backend snapshot.
     ///
-    /// The repository applies the mutation when the snapshot proves that the backend effect
-    /// happened. It only clears the row when the snapshot proves that the effect did not happen.
-    pub fn reconcile_binding_membership_mutation(
+    /// Each one is applied when the snapshot shows a session carrying its identity, and discarded
+    /// when it does not. Either way the row goes.
+    pub fn reconcile_binding_membership_mutations(
         &mut self,
         scope: MuxScope,
         memberships: &[BackendMembership],
-        session_order: &mut SessionOrderStore,
-        session_names: &mut SessionNameStore,
+        sessions: &mut SessionMembership,
     ) -> WorkspaceResult<bool> {
         let mut conn = open_db(&self.path).map_err(|error| {
             self.database_error("open database to reconcile binding membership", error)
@@ -667,32 +654,27 @@ impl WorkspaceRepository {
         let tx = conn.transaction().map_err(|error| {
             self.database_error("begin binding membership reconciliation", error)
         })?;
-        let Some(pending) = self.load_pending_binding_membership_mutation(&tx, scope)? else {
+        let pending = self.load_pending_binding_membership_mutations(&tx, scope)?;
+        if pending.is_empty() {
             return Ok(false);
-        };
-        if pending
-            .mutation
-            .backend_operation()
-            .effect_occurred(memberships)
-        {
-            let mut next_order = session_order.clone();
-            let mut next_names = session_names.clone();
-            apply_binding_membership_mutation(&pending.mutation, &mut next_order, &mut next_names)?;
-            self.write_binding_state(&tx, scope, &next_order, &next_names)?;
-            self.delete_pending_binding_membership_mutation(&tx, scope)?;
-            tx.commit().map_err(|error| {
-                self.database_error("commit binding membership reconciliation", error)
-            })?;
-            *session_order = next_order;
-            *session_names = next_names;
-            Ok(true)
-        } else {
-            self.delete_pending_binding_membership_mutation(&tx, scope)?;
-            tx.commit().map_err(|error| {
-                self.database_error("discard binding membership reconciliation", error)
-            })?;
-            Ok(true)
         }
+        let mut next = sessions.clone();
+        for pending in &pending {
+            if pending
+                .mutation
+                .backend_operation()
+                .effect_occurred(memberships)
+            {
+                apply_binding_membership_mutation(&pending.mutation, &mut next)?;
+            }
+            self.delete_pending_binding_membership_mutation(&tx, pending.mutation.identity())?;
+        }
+        self.write_binding_state(&tx, scope, &next)?;
+        tx.commit().map_err(|error| {
+            self.database_error("commit binding membership reconciliation", error)
+        })?;
+        *sessions = next;
+        Ok(true)
     }
 
     fn validate_binding_scope(&self, tx: &Transaction<'_>, scope: MuxScope) -> WorkspaceResult<()> {
@@ -708,26 +690,31 @@ impl WorkspaceRepository {
         Ok(())
     }
 
-    fn load_pending_binding_membership_mutation(
+    fn load_pending_binding_membership_mutations(
         &self,
         conn: &Connection,
         scope: MuxScope,
-    ) -> WorkspaceResult<Option<PendingBindingMembershipMutation>> {
-        conn.query_row(
-            "SELECT operation, session_id, old_name, new_name, display_name, explicit, cwd
-             FROM workspace_pending_binding_operations
-             WHERE space_id = ?1 AND binding_id = ?2",
-            params![
-                scope.space_id().persistence_value(),
-                scope.binding_id().persistence_value()
-            ],
-            |row| {
-                binding_membership_mutation_from_row(row, 0)
-                    .map(|mutation| PendingBindingMembershipMutation { mutation })
-            },
-        )
-        .optional()
-        .map_err(|error| self.database_error("load binding membership journal", error))
+    ) -> WorkspaceResult<Vec<PendingBindingMembershipMutation>> {
+        let load = || -> rusqlite::Result<Vec<PendingBindingMembershipMutation>> {
+            let mut statement = conn.prepare(
+                "SELECT operation, identity, old_name, new_name, display_name, explicit, cwd
+                 FROM workspace_pending_binding_operations
+                 WHERE space_id = ?1 AND binding_id = ?2
+                 ORDER BY identity",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    scope.space_id().persistence_value(),
+                    scope.binding_id().persistence_value()
+                ],
+                |row| {
+                    binding_membership_mutation_from_row(row, 0)
+                        .map(|mutation| PendingBindingMembershipMutation { mutation })
+                },
+            )?;
+            rows.collect()
+        };
+        load().map_err(|error| self.database_error("load binding membership journal", error))
     }
 
     fn require_pending_binding_membership_mutation(
@@ -736,14 +723,10 @@ impl WorkspaceRepository {
         scope: MuxScope,
         mutation: &BindingMembershipMutation,
     ) -> WorkspaceResult<()> {
-        let Some(pending) = self.load_pending_binding_membership_mutation(tx, scope)? else {
+        let pending = self.load_pending_binding_membership_mutations(tx, scope)?;
+        if !pending.iter().any(|pending| pending.mutation == *mutation) {
             return Err(WorkspacePersistenceError::new(
-                "commit binding membership: pending mutation is missing",
-            ));
-        };
-        if pending.mutation != *mutation {
-            return Err(WorkspacePersistenceError::new(
-                "commit binding membership: pending mutation does not match",
+                "commit binding membership: pending mutation is missing or superseded",
             ));
         }
         Ok(())
@@ -752,15 +735,11 @@ impl WorkspaceRepository {
     fn delete_pending_binding_membership_mutation(
         &self,
         tx: &Transaction<'_>,
-        scope: MuxScope,
+        identity: &str,
     ) -> WorkspaceResult<()> {
         tx.execute(
-            "DELETE FROM workspace_pending_binding_operations
-             WHERE space_id = ?1 AND binding_id = ?2",
-            params![
-                scope.space_id().persistence_value(),
-                scope.binding_id().persistence_value()
-            ],
+            "DELETE FROM workspace_pending_binding_operations WHERE identity = ?1",
+            [identity],
         )
         .map_err(|error| self.database_error("delete binding membership journal", error))?;
         Ok(())
@@ -772,7 +751,7 @@ impl WorkspaceRepository {
     /// method succeeds.
     pub fn commit_binding_states(
         &mut self,
-        states: &[(MuxScope, SessionOrderStore, SessionNameStore)],
+        states: &[(MuxScope, SessionMembership)],
     ) -> WorkspaceResult<()> {
         if states.is_empty() {
             return Ok(());
@@ -783,8 +762,8 @@ impl WorkspaceRepository {
         let tx = conn
             .transaction()
             .map_err(|error| self.database_error("begin binding state commit", error))?;
-        for (scope, session_order, session_names) in states {
-            self.write_binding_state(&tx, *scope, session_order, session_names)?;
+        for (scope, sessions) in states {
+            self.write_binding_state(&tx, *scope, sessions)?;
         }
         tx.commit()
             .map_err(|error| self.database_error("commit binding state", error))?;
@@ -792,11 +771,9 @@ impl WorkspaceRepository {
         Ok(())
     }
 
-    fn validate_binding_states(
-        states: &[(MuxScope, SessionOrderStore, SessionNameStore)],
-    ) -> WorkspaceResult<()> {
+    fn validate_binding_states(states: &[(MuxScope, SessionMembership)]) -> WorkspaceResult<()> {
         let mut scopes = HashSet::new();
-        for (scope, session_order, session_names) in states {
+        for (scope, sessions) in states {
             if !scopes.insert(*scope) {
                 return Err(WorkspacePersistenceError::new(format!(
                     "validate binding state: duplicate binding {} in Space {}",
@@ -805,39 +782,21 @@ impl WorkspaceRepository {
                 )));
             }
 
-            let mut sessions = HashSet::new();
-            for group in session_order.groups() {
-                if group.name.contains('\0') {
-                    return Err(WorkspacePersistenceError::new(
-                        "validate binding state: group name contains a null byte",
-                    ));
-                }
-                for session in &group.sessions {
-                    if session.is_empty()
-                        || session.contains('\0')
-                        || !sessions.insert(session.as_str())
-                    {
-                        return Err(WorkspacePersistenceError::new(
-                            "validate binding state: session membership is invalid or duplicated",
-                        ));
-                    }
-                }
-            }
-
-            let mut directories = HashSet::new();
-            for (key, record) in session_names.records() {
-                if key != &record.session_id
-                    || record.session_id.is_empty()
-                    || record.session_id.contains('\0')
-                    || record.cwd.contains('\0')
-                    || record.generated_name.is_empty()
-                    || record.generated_name.contains('\0')
-                    || record.session_name.contains('\0')
-                    || record.display_name.contains('\0')
-                    || (!record.cwd.is_empty() && !directories.insert(record.cwd.as_str()))
+            let mut identities = HashSet::new();
+            for session in sessions.sessions() {
+                // Only the identity has to be unique. Two sessions may legitimately share a
+                // display name, and a shared server may have made their backend names differ by a
+                // suffix bootty does not show.
+                if session.identity.is_empty()
+                    || session.identity.contains('\0')
+                    || session.backend_name.is_empty()
+                    || session.backend_name.contains('\0')
+                    || session.display_name.contains('\0')
+                    || session.cwd.contains('\0')
+                    || !identities.insert(session.identity.as_str())
                 {
                     return Err(WorkspacePersistenceError::new(
-                        "validate binding state: session name metadata is invalid or duplicated",
+                        "validate binding state: session membership is invalid or duplicated",
                     ));
                 }
             }
@@ -849,8 +808,7 @@ impl WorkspaceRepository {
         &self,
         tx: &Transaction<'_>,
         scope: MuxScope,
-        session_order: &SessionOrderStore,
-        session_names: &SessionNameStore,
+        sessions: &SessionMembership,
     ) -> WorkspaceResult<()> {
         let binding_exists = binding_scope_exists(tx, scope)
             .map_err(|error| self.database_error("validate binding state scope", error))?;
@@ -867,60 +825,23 @@ impl WorkspaceRepository {
             "DELETE FROM workspace_sessions WHERE binding_id = ?1",
             [binding_id],
         )
-        .map_err(|error| self.database_error("replace persisted session order", error))?;
-        tx.execute(
-            "DELETE FROM workspace_session_groups WHERE binding_id = ?1",
-            [binding_id],
-        )
-        .map_err(|error| self.database_error("replace persisted session groups", error))?;
-        for (group_position, group) in session_order.groups().iter().enumerate() {
+        .map_err(|error| self.database_error("replace persisted sessions", error))?;
+        for (position, session) in sessions.sessions().iter().enumerate() {
             tx.execute(
-                "INSERT INTO workspace_session_groups (binding_id, name, position)
-                 VALUES (?1, ?2, ?3)",
-                params![binding_id, group.name, group_position as i64],
-            )
-            .map_err(|error| self.database_error("insert persisted session group", error))?;
-            let group_id = tx.last_insert_rowid();
-            for (session_position, session) in group.sessions.iter().enumerate() {
-                tx.execute(
-                    "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![binding_id, session, group_id, session_position as i64],
-                )
-                .map_err(|error| self.database_error("insert persisted session order", error))?;
-            }
-        }
-        if session_order.groups().is_empty() {
-            tx.execute(
-                "INSERT INTO workspace_session_groups (binding_id, name, position)
-                 VALUES (?1, '', 0)",
-                [binding_id],
-            )
-            .map_err(|error| self.database_error("initialize persisted session group", error))?;
-        }
-
-        tx.execute(
-            "DELETE FROM workspace_session_name_metadata WHERE binding_id = ?1",
-            [binding_id],
-        )
-        .map_err(|error| self.database_error("replace persisted session names", error))?;
-        for record in session_names.records().values() {
-            tx.execute(
-                "INSERT INTO workspace_session_name_metadata
-                    (binding_id, session_id, cwd, generated_name, session_name, display_name,
-                     explicit)
+                "INSERT INTO workspace_sessions
+                    (identity, binding_id, backend_name, display_name, explicit, cwd, position)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
+                    session.identity,
                     binding_id,
-                    record.session_id,
-                    record.cwd,
-                    record.generated_name,
-                    record.session_name,
-                    record.display_name,
-                    i64::from(record.explicit)
+                    session.backend_name,
+                    session.display_name,
+                    i64::from(session.explicit),
+                    session.cwd,
+                    position as i64
                 ],
             )
-            .map_err(|error| self.database_error("insert persisted session name", error))?;
+            .map_err(|error| self.database_error("insert persisted session", error))?;
         }
         Ok(())
     }
@@ -965,11 +886,12 @@ impl WorkspaceRepository {
                 migrate_workspace_binding_cardinality(&conn)?;
             }
             let tx = conn.transaction()?;
+            // Before the current schema is created, so revision 3's tables are still there to read.
+            migrate_workspace_sessions_to_identities(&tx)?;
             create_workspace_schema(&tx)?;
             migrate_workspace_space_icons(&tx)?;
             migrate_workspace_remote_ids(&tx)?;
             migrate_workspace_space_appearance(&tx)?;
-            migrate_workspace_session_name_metadata(&tx)?;
             migrate_workspace_snapshot_state(&tx)?;
             let space_count = tx.query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
                 row.get::<_, i64>(0)
@@ -1027,7 +949,7 @@ fn validate_pending_binding_operations(
         .flat_map(|space| space.bindings.iter().map(|binding| binding.scope))
         .collect::<HashSet<_>>();
     let mut statement = tx.prepare(
-        "SELECT space_id, binding_id, operation, session_id, old_name, new_name,
+        "SELECT space_id, binding_id, operation, identity, old_name, new_name,
                 display_name, explicit, cwd
          FROM workspace_pending_binding_operations ORDER BY space_id, binding_id",
     )?;
@@ -1062,20 +984,11 @@ fn validate_binding_membership_mutation(
         .validate()
         .map_err(|_| WorkspacePersistenceError::new("binding membership mutation is invalid"))?;
     let valid_text = |value: &str| !value.is_empty() && !value.contains('\0');
-    let valid_cwd = |cwd: &Option<String>| cwd.as_deref().is_none_or(|cwd| !cwd.contains('\0'));
     let valid = match mutation {
         BindingMembershipMutation::Create {
-            display_name,
-            explicit: _,
-            cwd,
-            ..
-        } => valid_text(display_name) && valid_cwd(cwd),
-        BindingMembershipMutation::Rename {
-            display_name,
-            explicit: _,
-            cwd,
-            ..
-        } => valid_text(display_name) && valid_cwd(cwd),
+            display_name, cwd, ..
+        } => valid_text(display_name) && !cwd.contains('\0'),
+        BindingMembershipMutation::Rename { display_name, .. } => valid_text(display_name),
         BindingMembershipMutation::Ditch { .. } => true,
     };
     valid
@@ -1085,7 +998,7 @@ fn validate_binding_membership_mutation(
 
 struct StoredBindingMembershipMutation<'a> {
     operation: &'static str,
-    session_id: &'a str,
+    identity: &'a str,
     old_name: Option<&'a str>,
     new_name: Option<&'a str>,
     display_name: Option<&'a str>,
@@ -1098,54 +1011,52 @@ fn binding_membership_mutation_to_storage(
 ) -> StoredBindingMembershipMutation<'_> {
     match mutation {
         BindingMembershipMutation::Create {
-            session_id,
+            identity,
             session_name,
             display_name,
             explicit,
             cwd,
         } => StoredBindingMembershipMutation {
             operation: "create",
-            session_id,
+            identity,
             old_name: None,
             new_name: Some(session_name),
             display_name: Some(display_name),
             explicit: Some(*explicit),
-            cwd: cwd.as_deref(),
+            cwd: Some(cwd),
         },
         BindingMembershipMutation::Rename {
-            session_id,
+            identity,
             old_name,
             new_name,
             display_name,
             explicit,
-            cwd,
         } => StoredBindingMembershipMutation {
             operation: "rename",
-            session_id,
+            identity,
             old_name: Some(old_name),
             new_name: Some(new_name),
             display_name: Some(display_name),
             explicit: Some(*explicit),
-            cwd: cwd.as_deref(),
-        },
-        BindingMembershipMutation::Ditch {
-            session_id,
-            old_name,
-        } => StoredBindingMembershipMutation {
-            operation: "ditch",
-            session_id,
-            old_name: Some(old_name),
-            new_name: None,
-            display_name: None,
-            explicit: None,
             cwd: None,
         },
+        BindingMembershipMutation::Ditch { identity, old_name } => {
+            StoredBindingMembershipMutation {
+                operation: "ditch",
+                identity,
+                old_name: Some(old_name),
+                new_name: None,
+                display_name: None,
+                explicit: None,
+                cwd: None,
+            }
+        }
     }
 }
 
 fn binding_membership_mutation_from_storage(
     operation: &str,
-    session_id: String,
+    identity: String,
     old_name: Option<String>,
     new_name: Option<String>,
     display_name: Option<String>,
@@ -1159,43 +1070,25 @@ fn binding_membership_mutation_from_storage(
             })
         })
         .transpose()?;
+    let missing = |what: &str| WorkspacePersistenceError::new(format!("binding membership {what}"));
     let mutation = match operation {
         "create" if old_name.is_none() => BindingMembershipMutation::Create {
-            session_id,
-            session_name: new_name.ok_or_else(|| {
-                WorkspacePersistenceError::new("create binding membership is missing its name")
-            })?,
-            display_name: display_name.ok_or_else(|| {
-                WorkspacePersistenceError::new(
-                    "create binding membership is missing its display name",
-                )
-            })?,
-            explicit: explicit.ok_or_else(|| {
-                WorkspacePersistenceError::new(
-                    "create binding membership is missing its explicit-name state",
-                )
-            })?,
-            cwd,
+            identity,
+            session_name: new_name.ok_or_else(|| missing("create is missing its name"))?,
+            display_name: display_name
+                .ok_or_else(|| missing("create is missing its display name"))?,
+            explicit: explicit
+                .ok_or_else(|| missing("create is missing its explicit-name state"))?,
+            cwd: cwd.unwrap_or_default(),
         },
-        "rename" => BindingMembershipMutation::Rename {
-            session_id,
-            old_name: old_name.ok_or_else(|| {
-                WorkspacePersistenceError::new("rename binding membership is missing its old name")
-            })?,
-            new_name: new_name.ok_or_else(|| {
-                WorkspacePersistenceError::new("rename binding membership is missing its new name")
-            })?,
-            display_name: display_name.ok_or_else(|| {
-                WorkspacePersistenceError::new(
-                    "rename binding membership is missing its display name",
-                )
-            })?,
-            explicit: explicit.ok_or_else(|| {
-                WorkspacePersistenceError::new(
-                    "rename binding membership is missing its explicit-name state",
-                )
-            })?,
-            cwd,
+        "rename" if cwd.is_none() => BindingMembershipMutation::Rename {
+            identity,
+            old_name: old_name.ok_or_else(|| missing("rename is missing its old name"))?,
+            new_name: new_name.ok_or_else(|| missing("rename is missing its new name"))?,
+            display_name: display_name
+                .ok_or_else(|| missing("rename is missing its display name"))?,
+            explicit: explicit
+                .ok_or_else(|| missing("rename is missing its explicit-name state"))?,
         },
         "ditch"
             if new_name.is_none()
@@ -1204,12 +1097,8 @@ fn binding_membership_mutation_from_storage(
                 && cwd.is_none() =>
         {
             BindingMembershipMutation::Ditch {
-                session_id,
-                old_name: old_name.ok_or_else(|| {
-                    WorkspacePersistenceError::new(
-                        "ditch binding membership is missing its old name",
-                    )
-                })?,
+                identity,
+                old_name: old_name.ok_or_else(|| missing("ditch is missing its old name"))?,
             }
         }
         _ => {
@@ -1253,88 +1142,52 @@ fn binding_scope_exists(tx: &Transaction<'_>, scope: MuxScope) -> rusqlite::Resu
     )
 }
 
+/// Apply a mutation whose backend effect is known to have happened. Keyed on the identity, so it
+/// lands on the session it was issued for even if the name moved on in between.
 fn apply_binding_membership_mutation(
     mutation: &BindingMembershipMutation,
-    session_order: &mut SessionOrderStore,
-    session_names: &mut SessionNameStore,
+    sessions: &mut SessionMembership,
 ) -> WorkspaceResult<()> {
     match mutation {
         BindingMembershipMutation::Create {
-            session_id,
+            identity,
             session_name,
             display_name,
             explicit,
             cwd,
         } => {
-            if !session_order.add_session(session_name)
-                && !session_order
-                    .session_names()
-                    .iter()
-                    .any(|name| name == session_name)
-            {
-                return Err(WorkspacePersistenceError::new(
-                    "apply binding membership: created session is already represented differently",
-                ));
-            }
-            if let Some(cwd) = cwd {
-                if *explicit {
-                    session_names.mark_explicit(session_id, session_name, display_name, cwd);
-                } else {
-                    session_names.remember_generated(session_id, cwd, session_name, display_name);
-                }
-            }
+            // A create that already landed is not an error: reconciliation replays the same
+            // mutation the commit path did, and both have to agree on the outcome.
+            sessions.claim(WorkspaceSession {
+                identity: identity.clone(),
+                backend_name: session_name.clone(),
+                display_name: display_name.clone(),
+                explicit: *explicit,
+                cwd: cwd.clone(),
+            });
+            sessions.observe_backend_name(identity, session_name);
+            sessions.set_display_name(identity, display_name, *explicit);
         }
         BindingMembershipMutation::Rename {
-            session_id,
-            old_name,
+            identity,
+            old_name: _,
             new_name,
             display_name,
             explicit,
-            cwd,
         } => {
-            let renamed = session_order.rename_session(old_name, new_name);
-            let stored_names = session_order.session_names();
-            let already_renamed = stored_names.iter().any(|name| name == new_name)
-                && !stored_names.iter().any(|name| name == old_name);
-            if !(renamed || already_renamed) {
+            if !sessions.contains(identity) {
                 return Err(WorkspacePersistenceError::new(
-                    "apply binding membership: renamed session is not represented",
+                    "apply binding membership: renamed session is not claimed by this Space",
                 ));
             }
-            let stored_cwd = cwd
-                .clone()
-                .or_else(|| {
-                    session_names
-                        .record(session_id)
-                        .map(|record| record.cwd.clone())
-                })
-                .or_else(|| explicit.then(String::new));
-            if let Some(cwd) = stored_cwd {
-                let effective_session_id = if session_id == old_name {
-                    new_name
-                } else {
-                    session_id
-                };
-                if effective_session_id != session_id {
-                    session_names.remove_identity(session_id);
-                }
-                if *explicit {
-                    session_names.mark_explicit(effective_session_id, new_name, display_name, &cwd);
-                } else {
-                    session_names.remember_generated(
-                        effective_session_id,
-                        &cwd,
-                        new_name,
-                        display_name,
-                    );
-                }
-            }
+            sessions.observe_backend_name(identity, new_name);
+            sessions.set_display_name(identity, display_name, *explicit);
         }
-        BindingMembershipMutation::Ditch {
-            session_id: _,
-            old_name,
-        } => {
-            session_order.remove_session(old_name);
+        BindingMembershipMutation::Ditch { identity, .. } => {
+            // The session is gone for good, so its name goes with it. Leaving the record behind is
+            // what used to make the next session started in the same directory inherit a dead
+            // session's name.
+            sessions.release(identity);
         }
     }
     Ok(())
@@ -1393,7 +1246,6 @@ fn create_default_binding(tx: &Transaction<'_>, path: &Path) -> rusqlite::Result
         hide_tmux_status: false,
         unavailable: false,
         selection: None,
-        session_order: SessionOrderStore::default(),
-        session_names: SessionNameStore::default(),
+        sessions: SessionMembership::default(),
     })
 }

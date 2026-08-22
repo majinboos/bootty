@@ -53,8 +53,7 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
                     session_id,
                     window_id,
                 }),
-                session_order: SessionOrderStore::default(),
-                session_names: SessionNameStore::default(),
+                sessions: SessionMembership::default(),
             },
         ))
     })?;
@@ -95,118 +94,39 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
     if spaces.len() as i64 != stored_spaces || binding_ids.len() as i64 != stored_bindings {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let mut groups = HashMap::<i64, Vec<SessionGroup>>::new();
-    let mut group_ids = HashMap::<i64, (i64, usize)>::new();
-    let mut group_positions = HashSet::new();
+    let mut sessions = HashMap::<i64, Vec<WorkspaceSession>>::new();
+    let mut identities = HashSet::new();
     let mut statement = tx.prepare(
-        "SELECT id, binding_id, name, position
-         FROM workspace_session_groups ORDER BY binding_id, position, id",
+        "SELECT identity, binding_id, backend_name, display_name, explicit, cwd, position
+         FROM workspace_sessions ORDER BY binding_id, position",
     )?;
     for row in statement.query_map([], |row| {
         Ok((
-            row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })? {
-        let (group_id, binding_id, name, position) = row?;
-        if group_id <= 0
-            || !binding_ids.contains(&binding_id)
-            || name.contains('\0')
-            || position < 0
-            || !group_positions.insert((binding_id, position))
-        {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let binding_groups = groups.entry(binding_id).or_default();
-        if group_ids
-            .insert(group_id, (binding_id, binding_groups.len()))
-            .is_some()
-        {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        binding_groups.push(SessionGroup {
-            name,
-            sessions: Vec::new(),
-        });
-    }
-
-    let mut statement = tx.prepare(
-        "SELECT binding_id, name, group_id, position
-         FROM workspace_sessions ORDER BY binding_id, group_id, position",
-    )?;
-    let mut session_keys = HashSet::new();
-    for row in statement.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, i64>(3)?,
-        ))
-    })? {
-        let (binding_id, name, group_id, position) = row?;
-        if name.is_empty()
-            || position < 0
-            || !binding_ids.contains(&binding_id)
-            || !session_keys.insert((binding_id, name.clone()))
-        {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        let Some((_, group_index)) = group_ids
-            .get(&group_id)
-            .filter(|(owner, _)| *owner == binding_id)
-        else {
-            return Err(rusqlite::Error::InvalidQuery);
-        };
-        let Some(group) = groups
-            .get_mut(&binding_id)
-            .and_then(|groups| groups.get_mut(*group_index))
-        else {
-            return Err(rusqlite::Error::InvalidQuery);
-        };
-        if group.sessions.len() != position as usize {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        group.sessions.push(name);
-    }
-
-    let mut names = HashMap::<i64, HashMap<String, SessionNameRecord>>::new();
-    let mut name_cwds = HashSet::new();
-    let mut statement = tx.prepare(
-        "SELECT binding_id, session_id, cwd, generated_name, session_name, display_name, explicit
-         FROM workspace_session_name_metadata ORDER BY binding_id, session_id",
-    )?;
-    for row in statement.query_map([], |row| {
-        let explicit = bool_from_storage(row.get::<_, i64>(6)?)?;
-        Ok((
-            row.get::<_, i64>(0)?,
-            SessionNameRecord {
-                session_id: row.get(1)?,
-                cwd: row.get(2)?,
-                generated_name: row.get(3)?,
-                session_name: row.get(4)?,
-                display_name: row.get(5)?,
-                explicit,
+            row.get::<_, i64>(6)?,
+            WorkspaceSession {
+                identity: row.get(0)?,
+                backend_name: row.get(2)?,
+                display_name: row.get(3)?,
+                explicit: bool_from_storage(row.get::<_, i64>(4)?)?,
+                cwd: row.get(5)?,
             },
         ))
     })? {
-        let (binding_id, record) = row?;
-        if !binding_ids.contains(&binding_id)
-            || record.session_id.is_empty()
-            || record.generated_name.is_empty()
-            || (!record.cwd.is_empty() && !name_cwds.insert((binding_id, record.cwd.clone())))
+        let (binding_id, position, session) = row?;
+        if session.identity.is_empty()
+            || session.backend_name.is_empty()
+            || position < 0
+            || !binding_ids.contains(&binding_id)
+            || !identities.insert(session.identity.clone())
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        if names
-            .entry(binding_id)
-            .or_default()
-            .insert(record.session_id.clone(), record)
-            .is_some()
-        {
+        let claimed = sessions.entry(binding_id).or_default();
+        if claimed.len() != position as usize {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        claimed.push(session);
     }
 
     for space in &mut spaces {
@@ -221,14 +141,11 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
         }
         for binding in &mut space.bindings {
             let binding_id = binding.scope.binding_id().persistence_value();
-            let order = groups.remove(&binding_id).unwrap_or_default();
-            let has_order = !order.is_empty();
-            binding.session_order = SessionOrderStore::from_groups(order, has_order);
-            binding.session_names =
-                SessionNameStore::from_records(names.remove(&binding_id).unwrap_or_default());
+            binding.sessions =
+                SessionMembership::from_sessions(sessions.remove(&binding_id).unwrap_or_default());
         }
     }
-    if !groups.is_empty() || !names.is_empty() {
+    if !sessions.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
     Ok(spaces)

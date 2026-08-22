@@ -93,10 +93,11 @@ impl AppState {
             SessionPickerEvent::Close => self.dismiss_modal_dialog(),
             SessionPickerEvent::ActivateSession(target) => {
                 self.dismiss_modal_dialog();
-                if let Err(error) = self
-                    .workspace
-                    .add_session_to_binding(target.scope, &target.session_id)
-                {
+                if let Err(error) = self.workspace.adopt_session_into_binding(
+                    target.scope,
+                    &target.session_id,
+                    &self.repaint,
+                ) {
                     self.last_error = Some(error.to_string());
                     return;
                 }
@@ -354,13 +355,12 @@ impl AppState {
             .map(|session| {
                 // Prefill what bootty shows, so a backend-only uniqueness suffix is not something
                 // the user has to delete out of the field.
-                let name = self
-                    .workspace
-                    .active
-                    .binding
-                    .session_names
-                    .display_name(&session.id)
-                    .unwrap_or(session.name.as_str())
+                let name = session
+                    .tag
+                    .identity
+                    .as_deref()
+                    .and_then(|identity| self.workspace.active.binding.sessions.get(identity))
+                    .map_or(session.name.as_str(), |claimed| claimed.label())
                     .to_owned();
                 (session.id.clone(), name)
             })

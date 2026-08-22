@@ -19,7 +19,7 @@ use bootty_mux::{
         MuxAppBackendPolicy, MuxBackendRegistry, MuxCommandDispatch, PaneTopology,
         PersistedSessionPolicy, SelectionPublicationPolicy, TerminalResidency,
     },
-    snapshot::MuxSession,
+    snapshot::{MuxSession, MuxSessionTag},
     terminal::ActiveTerminal,
 };
 use bootty_runtime::terminal_session::DrainStats;
@@ -51,9 +51,8 @@ use crate::{
     terminal_config::terminal_session_config_with_side_effects,
 };
 use bootty_workspace::{
-    BindingMembershipMutation, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
-    SpaceRemoteOverride, WorkspaceBinding, WorkspacePersistenceError, WorkspaceRepository,
-    WorkspaceSpace,
+    BindingMembershipMutation, SessionMembership, SpaceMuxOverride, SpaceRemoteOverride,
+    WorkspaceBinding, WorkspacePersistenceError, WorkspaceRepository, WorkspaceSpace,
 };
 
 macro_rules! swap_terminal_owner {
@@ -93,7 +92,6 @@ pub(super) struct SpaceUpdateOutcome {
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingGeneratedName {
-    pub(super) cwd: String,
     /// The name asked of the backend, unique across the whole server.
     pub(super) name: String,
     /// What bootty calls it, which drops any uniqueness suffix `name` had to carry.
@@ -211,10 +209,12 @@ pub(super) struct BindingRuntime {
     placement: SpaceMuxOverride,
     reconnect: BindingReconnect,
     pub(super) multiplexer: bootty_config::config::MultiplexerConfig,
+    /// The Space id stamped onto every session this binding creates. A remote binding uses the
+    /// id the far side knows its Space by, since that is what its daemon filters on.
+    pub(super) space_tag: String,
     pub(super) terminal: Box<ActiveTerminal>,
     pub(super) mux: MuxController,
-    pub(super) session_order: SessionOrderStore,
-    pub(super) session_names: SessionNameStore,
+    pub(super) sessions: SessionMembership,
     pub(super) pending_generated_names: HashMap<String, PendingGeneratedName>,
     pub(super) membership_reconciliation_ready: bool,
     pub(super) membership_reconciliation_waiting_for_refresh: bool,
@@ -230,8 +230,7 @@ pub(super) struct BindingRuntime {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct BindingStateCandidate {
     pub(super) scope: MuxScope,
-    pub(super) session_order: SessionOrderStore,
-    pub(super) session_names: SessionNameStore,
+    pub(super) sessions: SessionMembership,
 }
 
 impl BindingRuntime {
@@ -244,11 +243,7 @@ impl BindingRuntime {
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
-        let BindingStateCandidate {
-            scope,
-            session_order,
-            session_names,
-        } = state;
+        let BindingStateCandidate { scope, sessions } = state;
         let remote_error = realized.availability_error.clone();
         let backend_policy = backends.app_policy(&realized.config);
         let mut binding_config = config.clone();
@@ -269,14 +264,14 @@ impl BindingRuntime {
             label: binding_label(scope, &realized.config),
             placement,
             reconnect: BindingReconnect::default(),
+            space_tag: realized.space_tag,
             multiplexer: realized.config,
             scope,
             terminal,
             terminal_side_effect_tx,
             terminal_side_effect_rx,
             mux,
-            session_order,
-            session_names,
+            sessions,
             pending_generated_names: HashMap::new(),
             membership_reconciliation_ready: false,
             membership_reconciliation_waiting_for_refresh: false,
@@ -296,6 +291,7 @@ impl BindingRuntime {
         workspace_binding: &WorkspaceBinding,
         config: &BoottyConfig,
         backends: Arc<MuxBackendRegistry>,
+        space_tag: String,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
@@ -303,12 +299,11 @@ impl BindingRuntime {
             backend: workspace_binding.backend_override(),
             remote: workspace_binding.remote_override().clone(),
         };
-        let realized = realize_binding(config, placement.backend, &placement.remote);
+        let realized = realize_binding(config, placement.backend, &placement.remote, space_tag);
         let mut binding = Self::new_with_binding_config(
             BindingStateCandidate {
                 scope: workspace_binding.mux_scope(),
-                session_order: workspace_binding.session_order().clone(),
-                session_names: workspace_binding.session_names().clone(),
+                sessions: workspace_binding.sessions().clone(),
             },
             config,
             backends,
@@ -318,8 +313,12 @@ impl BindingRuntime {
             repaint.clone(),
         );
         binding.label = workspace_binding.name().to_owned();
+        // Last session ended with this binding erroring. Say so, but as a runtime error, not a
+        // configured one: a configured error stops `refresh_sessions` from even trying, so a
+        // binding that was merely unreachable once could never refresh, never succeed, and never
+        // clear the flag. A runtime error clears itself the moment a refresh works.
         if workspace_binding.unavailable() && binding.mux.unavailable_reason().is_none() {
-            binding.mux.set_configured_availability_error(Some(
+            binding.mux.set_availability_error(Some(
                 "binding unavailable; reconnect to restore it".to_owned(),
             ));
         }
@@ -346,12 +345,16 @@ impl BindingRuntime {
     ) {
         let state = BindingStateCandidate {
             scope: self.scope,
-            session_order: std::mem::take(&mut self.session_order),
-            session_names: std::mem::take(&mut self.session_names),
+            sessions: std::mem::take(&mut self.sessions),
         };
         let pending_generated_names = std::mem::take(&mut self.pending_generated_names);
         let label = self.label.clone();
-        let realized = realize_binding(config, placement.backend, &placement.remote);
+        let realized = realize_binding(
+            config,
+            placement.backend,
+            &placement.remote,
+            self.space_tag.clone(),
+        );
         let mut replacement = Self::new_with_binding_config(
             state,
             config,
@@ -388,25 +391,33 @@ impl BindingRuntime {
         }
 
         // Flat-session fallback only; split-tree restoration remains out of scope.
-        for (session_id, name, cwd) in self
-            .session_names
-            .persisted_sessions(&self.session_order.session_names())
-        {
+        //
+        // Each session comes back under the identity it had. A backend that does not persist gets
+        // a new session either way, but as far as the workspace is concerned it is the same one,
+        // so its name, its place in the Space, and its order all survive the restart.
+        for session in self.sessions.sessions().to_vec() {
             self.mux.create_project_session(
                 bootty_mux::controller::NewMuxSessionRequest {
-                    session_id: session_id.clone(),
-                    cwd,
+                    session_id: session.backend_name.clone(),
+                    cwd: session.cwd.clone(),
+                    tag: MuxSessionTag {
+                        identity: Some(session.identity.clone()),
+                        space: (!self.space_tag.is_empty()).then(|| self.space_tag.clone()),
+                    },
                 },
                 repaint,
                 &self.multiplexer,
             );
-            if name != session_id {
-                self.mux
-                    .rename_session(&session_id, name, repaint, &self.multiplexer);
-            }
         }
-        self.mux
-            .apply_session_order(&self.session_order.session_names());
+        self.mux.apply_session_order(&self.sessions.backend_names());
+    }
+
+    /// The stamp for a session this binding is about to create. A fresh identity every time.
+    pub(super) fn new_session_tag(&self) -> MuxSessionTag {
+        MuxSessionTag {
+            identity: Some(bootty_mux::snapshot::new_session_identity()),
+            space: (!self.space_tag.is_empty()).then(|| self.space_tag.clone()),
+        }
     }
 
     /// The names bootty shows for `sessions`, in the same order.
@@ -422,10 +433,12 @@ impl BindingRuntime {
         let candidates = sessions
             .iter()
             .map(|session| {
-                let display_name = self
-                    .session_names
-                    .display_name(&session.id)
-                    .unwrap_or(session.name.as_str());
+                let display_name = session
+                    .tag
+                    .identity
+                    .as_deref()
+                    .and_then(|identity| self.sessions.get(identity))
+                    .map_or(session.name.as_str(), |claimed| claimed.label());
                 *counts.entry(display_name).or_default() += 1;
                 display_name
             })
@@ -456,38 +469,104 @@ impl BindingRuntime {
             .collect()
     }
 
-    fn reconcile_session_state(&self, candidate: &mut BindingStateCandidate) {
-        let sessions = self.mux.all_sessions();
-        let renames = sessions
+    /// Bring this Space's claims in line with what the backend reports.
+    ///
+    /// Membership is read rather than maintained: each session says which Space holds it. Returns
+    /// the stamps to write back, for claimed sessions that arrived untagged after a server restart.
+    fn reconcile_session_state(&self, candidate: &mut BindingStateCandidate) -> Vec<MuxCommand> {
+        let backend = self.mux.all_sessions();
+        let remote = self.multiplexer.remote.is_some();
+
+        for session in backend {
+            let Some(identity) = session.tag.identity.as_deref() else {
+                continue;
+            };
+            if session.tag.space.as_deref() != Some(self.space_tag.as_str()) {
+                continue;
+            }
+            if let Some(claimed) = candidate.sessions.get(identity) {
+                // A rename from anywhere lands here and nowhere else. The claim does not move.
+                // A name bootty did not ask for is one the user chose somewhere else, so bootty
+                // adopts it and stops regenerating a name over the top of it.
+                if claimed.backend_name != session.name
+                    && !self
+                        .pending_generated_names
+                        .values()
+                        .any(|pending| pending.name == session.name)
+                {
+                    candidate
+                        .sessions
+                        .set_display_name(identity, &session.name, true);
+                }
+                candidate
+                    .sessions
+                    .observe_backend_name(identity, &session.name);
+            } else {
+                candidate
+                    .sessions
+                    .claim(bootty_workspace::WorkspaceSession {
+                        identity: identity.to_owned(),
+                        backend_name: session.name.clone(),
+                        display_name: String::new(),
+                        explicit: false,
+                        cwd: session
+                            .anchor
+                            .cwd
+                            .as_deref()
+                            .map(|cwd| binding_session_names::session_cwd(cwd, remote))
+                            .unwrap_or_default(),
+                    });
+            }
+            if let Some(cwd) = session.anchor.cwd.as_deref() {
+                candidate
+                    .sessions
+                    .set_cwd(identity, &binding_session_names::session_cwd(cwd, remote));
+            }
+        }
+
+        let carried = backend
             .iter()
-            .filter_map(|session| {
-                let previous = candidate.session_names.last_observed_name(&session.id)?;
-                (previous != session.name).then(|| (previous.to_owned(), session.name.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (previous, current) in renames {
-            candidate.session_order.rename_session(&previous, &current);
-        }
-        if self.multiplexer.remote_space_id.is_some() {
-            for session in sessions {
-                candidate.session_order.add_session(&session.name);
+            .filter_map(|session| session.tag.identity.as_deref())
+            .collect::<HashSet<_>>();
+        let mut restamps = Vec::new();
+        for claimed in candidate.sessions.sessions() {
+            if carried.contains(claimed.identity.as_str()) {
+                continue;
             }
+            // The name is only ever consulted here, and only to re-find a session whose tag the
+            // multiplexer lost. It is a hint for recovery, never a key.
+            let Some(session) = backend.iter().find(|session| {
+                session.tag.identity.is_none() && session.name == claimed.backend_name
+            }) else {
+                continue;
+            };
+            restamps.push(MuxCommand::StampSession {
+                session_id: session.id.clone(),
+                tag: MuxSessionTag {
+                    identity: Some(claimed.identity.clone()),
+                    space: Some(self.space_tag.clone()),
+                },
+            });
         }
+
+        // A claim survives while its re-stamp is still in flight; the next pass sees it carried.
+        let alive = carried
+            .into_iter()
+            .map(str::to_owned)
+            .chain(restamps.iter().filter_map(|command| match command {
+                MuxCommand::StampSession { tag, .. } => tag.identity.clone(),
+                _ => None,
+            }))
+            .collect::<HashSet<_>>();
         candidate
-            .session_order
-            .sync_sessions(sessions.iter().map(|session| session.name.as_str()));
-        for pending in self.pending_generated_names.values() {
-            if sessions.iter().any(|session| session.name == pending.name) {
-                candidate.session_order.add_session(&pending.name);
-            }
-        }
+            .sessions
+            .retain_alive(&alive.iter().map(String::as_str).collect());
+        restamps
     }
 
     fn publish_session_state(&mut self, candidate: BindingStateCandidate) {
-        self.session_order = candidate.session_order;
-        self.session_names = candidate.session_names;
-        self.mux
-            .apply_session_order(&self.session_order.session_names());
+        self.sessions = candidate.sessions;
+        self.mux.apply_session_order(&self.sessions.backend_names());
     }
 
     pub(super) fn discard_terminal_side_effects(&mut self) {
@@ -551,6 +630,7 @@ impl SpaceRuntime {
                     workspace_binding,
                     config,
                     Arc::clone(&backends),
+                    space.remote_id().to_owned(),
                     variant,
                     repaint.clone(),
                 )
@@ -656,7 +736,7 @@ pub(super) struct WorkspaceRuntime {
 }
 
 impl WorkspaceRuntime {
-    fn spaces(&self) -> impl Iterator<Item = &SpaceRuntime> {
+    pub(super) fn spaces(&self) -> impl Iterator<Item = &SpaceRuntime> {
         std::iter::once(&self.active).chain(self.inactive_spaces.iter())
     }
 
@@ -866,7 +946,7 @@ impl WorkspaceRuntime {
         if let Err(error) = self.reconcile_generated_session_names(repaint) {
             errors.push(error.to_string());
         }
-        if let Err(error) = self.reconcile_binding_states() {
+        if let Err(error) = self.reconcile_binding_states(repaint) {
             errors.push(error.to_string());
         }
 
@@ -1034,7 +1114,7 @@ impl WorkspaceRuntime {
 
     /// Bring the freshly activated binding's multiplexer back in step with its persisted state.
     fn resume_active_binding(&mut self, repaint: &RepaintHandle) {
-        if self.active.binding.session_order.session_names().is_empty() {
+        if self.active.binding.sessions.is_empty() {
             return;
         }
         self.active.binding.mux.refresh_on_next_frame();
@@ -1046,7 +1126,7 @@ impl WorkspaceRuntime {
         self.active
             .binding
             .mux
-            .apply_session_order(&self.active.binding.session_order.session_names());
+            .apply_session_order(&self.active.binding.sessions.backend_names());
         if self.active.binding.backend_policy.persisted_sessions
             == PersistedSessionPolicy::Immediate
         {
@@ -1226,21 +1306,8 @@ impl WorkspaceRuntime {
         &mut self,
         space_id: SpaceId,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let scopes: Vec<MuxScope> = self
-            .space(space_id)
-            .map(|space| space.bindings().map(|binding| binding.scope).collect())
-            .unwrap_or_default();
-        for scope in scopes {
-            if self
-                .repository
-                .pending_binding_membership_mutation(scope)?
-                .is_some()
-            {
-                return Err(WorkspacePersistenceError::operation(
-                    "finish the pending binding membership recovery before deleting this Space",
-                ));
-            }
-        }
+        // Any journal rows go with the Space. Its sessions keep running and stop being claimed,
+        // which is what the sidebar shows as unassigned.
         let deleted = self.repository.delete_space(space_id)?;
         if deleted {
             self.inactive_spaces.retain(|space| space.id != space_id);
@@ -1264,16 +1331,6 @@ impl WorkspaceRuntime {
         let placement_changed = self
             .binding(scope)
             .is_some_and(|binding| binding.placement != mux);
-        if placement_changed
-            && self
-                .repository
-                .pending_binding_membership_mutation(scope)?
-                .is_some()
-        {
-            return Err(WorkspacePersistenceError::operation(
-                "finish the pending binding membership recovery before changing its backend",
-            ));
-        }
         let updated = self.repository.update_space_and_binding(
             scope,
             &summary.name,
@@ -1326,11 +1383,11 @@ impl WorkspaceRuntime {
             .collect::<Vec<_>>();
         let mut pending_scopes = HashSet::new();
         for scope in &profile_scopes {
-            match self.repository.pending_binding_membership_mutation(*scope) {
-                Ok(Some(_)) => {
+            match self.repository.pending_binding_membership_mutations(*scope) {
+                Ok(pending) if !pending.is_empty() => {
                     pending_scopes.insert(*scope);
                 }
-                Ok(None) => {}
+                Ok(_) => {}
                 Err(error) => {
                     self.deferred_profile_binding_rebuilds
                         .extend(profile_scopes.iter().copied());
@@ -1359,8 +1416,7 @@ impl WorkspaceRuntime {
         let binding = self.binding(scope)?;
         Some(BindingStateCandidate {
             scope,
-            session_order: binding.session_order.clone(),
-            session_names: binding.session_names.clone(),
+            sessions: binding.sessions.clone(),
         })
     }
 
@@ -1369,34 +1425,30 @@ impl WorkspaceRuntime {
             .expect("the active binding has committed workspace state")
     }
 
+    /// The identity a backend session carries, or `None` when no Space claims it.
+    pub(super) fn session_identity(&self, scope: MuxScope, session_id: &str) -> Option<String> {
+        self.binding(scope)?
+            .mux
+            .backend_session_by_id_or_name(session_id)?
+            .tag
+            .identity
+            .clone()
+    }
+
+    fn active_session_identity(&self, session_id: &str) -> Option<String> {
+        self.session_identity(self.active.binding.scope, session_id)
+    }
+
     pub(super) fn move_active_session(
         &mut self,
         session_id: &str,
         delta: i32,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let Some(session_name) = self
-            .active
-            .binding
-            .mux
-            .session_by_id_or_name(session_id)
-            .map(|session| session.name.clone())
-        else {
+        let Some(identity) = self.active_session_identity(session_id) else {
             return Ok(false);
         };
-        let sessions = self
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
         let mut candidate = self.active_binding_state_candidate();
-        if !candidate.session_order.move_session(
-            &session_name,
-            delta,
-            sessions.iter().map(String::as_str),
-        ) {
+        if !candidate.sessions.move_by(&identity, delta) {
             return Ok(false);
         }
         self.commit_binding_state_candidate(candidate)
@@ -1408,155 +1460,260 @@ impl WorkspaceRuntime {
         source: &str,
         before: Option<&str>,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let sessions = self
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
+        let Some(source) = self.active_session_identity(source) else {
+            return Ok(false);
+        };
+        let before = match before {
+            Some(before) => match self.active_session_identity(before) {
+                Some(identity) => Some(identity),
+                None => return Ok(false),
+            },
+            None => None,
+        };
         let mut candidate = self.active_binding_state_candidate();
-        if !candidate.session_order.move_session_before(
-            source,
-            before,
-            sessions.iter().map(String::as_str),
-        ) {
+        if !candidate.sessions.move_before(&source, before.as_deref()) {
             return Ok(false);
         }
         self.commit_binding_state_candidate(candidate)
             .map(|()| true)
     }
 
-    pub(super) fn add_session_to_binding(
+    /// Bring a session this Space does not hold into it, minting an identity if it has none.
+    pub(super) fn adopt_session_into_binding(
         &mut self,
         scope: MuxScope,
         session_id: &str,
+        repaint: &RepaintHandle,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let Some(session_name) = self.binding(scope).and_then(|binding| {
-            binding
-                .mux
-                .backend_session_by_id_or_name(session_id)
-                .map(|session| session.name.clone())
-        }) else {
+        let Some(binding) = self.binding(scope) else {
             return Ok(false);
         };
+        let Some(session) = binding.mux.backend_session_by_id_or_name(session_id) else {
+            return Ok(false);
+        };
+        let identity = session
+            .tag
+            .identity
+            .clone()
+            .unwrap_or_else(bootty_mux::snapshot::new_session_identity);
+        let claimed = bootty_workspace::WorkspaceSession {
+            identity: identity.clone(),
+            backend_name: session.name.clone(),
+            display_name: String::new(),
+            explicit: false,
+            cwd: session.anchor.cwd.clone().unwrap_or_default(),
+        };
+        let backend_session_id = session.id.clone();
+        let space_tag = binding.space_tag.clone();
+
         let mut candidate = self
             .binding_state_candidate(scope)
             .expect("a live binding has committed workspace state");
-        let added = candidate.session_order.add_session(&session_name);
+        if !candidate.sessions.claim(claimed) {
+            return Ok(false);
+        }
         self.commit_binding_state_candidate(candidate)?;
-        Ok(added)
+
+        let binding = self
+            .binding_mut(scope)
+            .expect("a committed binding remains live");
+        let config = binding.multiplexer.clone();
+        binding.mux.execute_command(
+            repaint,
+            &config,
+            MuxCommand::StampSession {
+                session_id: backend_session_id,
+                tag: MuxSessionTag {
+                    identity: Some(identity),
+                    space: (!space_tag.is_empty()).then_some(space_tag),
+                },
+            },
+        );
+        Ok(true)
     }
 
+    /// Whether `session_id` can move from `from` into `to`.
+    ///
+    /// Only within one multiplexer: a session cannot change servers, so a local Space and a remote
+    /// one are never reachable from each other.
+    pub(super) fn session_move_is_possible(&self, from: MuxScope, to: SpaceId) -> bool {
+        let Some(source) = self.binding(from) else {
+            return false;
+        };
+        self.space(to).is_some_and(|space| {
+            space.binding.scope != from
+                && space.binding.multiplexer.backend == source.multiplexer.backend
+                && space.binding.multiplexer.remote == source.multiplexer.remote
+        })
+    }
+
+    /// Hand a session over to another Space on the same multiplexer.
+    ///
+    /// The session itself is untouched -- only which Space claims it changes, in both bootty's
+    /// record and the tag the multiplexer holds.
+    pub(super) fn move_session_to_space(
+        &mut self,
+        from: MuxScope,
+        session_id: &str,
+        to: SpaceId,
+        repaint: &RepaintHandle,
+    ) -> Result<bool, WorkspacePersistenceError> {
+        if !self.session_move_is_possible(from, to) {
+            return Ok(false);
+        }
+        let Some(identity) = self.session_identity(from, session_id) else {
+            return Ok(false);
+        };
+        let backend_session_id = self
+            .binding(from)
+            .and_then(|binding| binding.mux.backend_session_by_id_or_name(session_id))
+            .map(|session| session.id.clone());
+        let Some(target) = self.space(to).map(|space| space.binding.scope) else {
+            return Ok(false);
+        };
+        let space_tag = self
+            .binding(target)
+            .map(|binding| binding.space_tag.clone())
+            .unwrap_or_default();
+
+        let mut source_state = self
+            .binding_state_candidate(from)
+            .expect("a live binding has committed workspace state");
+        let Some(claimed) = source_state.sessions.release(&identity) else {
+            return Ok(false);
+        };
+        let mut target_state = self
+            .binding_state_candidate(target)
+            .expect("a live binding has committed workspace state");
+        target_state.sessions.claim(claimed);
+        self.commit_binding_state_candidates(vec![source_state, target_state])?;
+
+        if let Some(backend_session_id) = backend_session_id
+            && let Some(binding) = self.binding_mut(from)
+        {
+            let config = binding.multiplexer.clone();
+            binding.mux.execute_command(
+                repaint,
+                &config,
+                MuxCommand::StampSession {
+                    session_id: backend_session_id,
+                    tag: MuxSessionTag {
+                        identity: Some(identity),
+                        space: (!space_tag.is_empty()).then_some(space_tag),
+                    },
+                },
+            );
+        }
+        Ok(true)
+    }
+
+    /// Let go of a session, leaving it running and claimed by nobody.
     pub(super) fn detach_session_from_space(
         &mut self,
         scope: MuxScope,
         session_id: &str,
+        repaint: &RepaintHandle,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let Some(session_name) = self.binding(scope).and_then(|binding| {
-            binding
-                .mux
-                .backend_session_by_id_or_name(session_id)
-                .map(|session| session.name.clone())
-        }) else {
+        let Some(identity) = self.session_identity(scope, session_id) else {
             return Ok(false);
         };
+        let backend_session_id = self
+            .binding(scope)
+            .and_then(|binding| binding.mux.backend_session_by_id_or_name(session_id))
+            .map(|session| session.id.clone());
         let mut candidate = self
             .binding_state_candidate(scope)
             .expect("a live binding has committed workspace state");
-        if !candidate.session_order.remove_session(&session_name) {
+        if candidate.sessions.release(&identity).is_none() {
             return Ok(false);
         }
-        self.commit_binding_state_candidate(candidate)
-            .map(|()| true)
+        self.commit_binding_state_candidate(candidate)?;
+
+        // The identity stays on the session so a Space can take it back without minting a new one;
+        // only the Space claim is cleared.
+        if let Some(backend_session_id) = backend_session_id
+            && let Some(binding) = self.binding_mut(scope)
+        {
+            let config = binding.multiplexer.clone();
+            binding.mux.execute_command(
+                repaint,
+                &config,
+                MuxCommand::StampSession {
+                    session_id: backend_session_id,
+                    tag: MuxSessionTag {
+                        identity: Some(identity),
+                        space: None,
+                    },
+                },
+            );
+        }
+        Ok(true)
     }
 
+    /// Journal what bootty is about to ask the backend for, keyed on the session's identity, so
+    /// an ambiguous answer is recoverable without guessing from names.
     pub(super) fn begin_active_binding_membership_mutation(
         &mut self,
         command: &MuxCommand,
         naming: Option<&PendingGeneratedName>,
     ) -> Result<Option<BindingMembershipMutation>, WorkspacePersistenceError> {
+        let display_name = |fallback: &str| {
+            naming
+                .map(|naming| naming.display_name.clone())
+                .unwrap_or_else(|| fallback.to_owned())
+        };
         let mutation = match command {
-            MuxCommand::CreateProjectSession { session_id, cwd }
-            | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
-                Some(BindingMembershipMutation::Create {
-                    session_id: session_id.clone(),
+            MuxCommand::CreateProjectSession {
+                session_id,
+                cwd,
+                tag,
+            }
+            | MuxCommand::CreateWorktreeSession {
+                session_id,
+                cwd,
+                tag,
+            } => tag
+                .identity
+                .clone()
+                .map(|identity| BindingMembershipMutation::Create {
+                    identity,
                     session_name: session_id.clone(),
-                    display_name: naming
-                        .map(|naming| naming.display_name.clone())
-                        .unwrap_or_else(|| session_id.clone()),
+                    display_name: display_name(session_id),
                     explicit: naming.is_none_or(|naming| naming.explicit),
-                    cwd: Some(cwd.clone()),
-                })
-            }
+                    cwd: cwd.clone(),
+                }),
             MuxCommand::RenameSession { session_id, name } => {
-                let session = self
-                    .active
-                    .binding
-                    .mux
-                    .backend_session_by_id_or_name(session_id);
-                let old_name = session
-                    .map(|session| session.name.clone())
-                    .or_else(|| {
-                        self.active
-                            .binding
-                            .session_names
-                            .last_observed_name(session_id)
-                            .map(str::to_owned)
-                    })
-                    .or_else(|| {
-                        self.active
-                            .binding
-                            .session_order
-                            .session_names()
-                            .into_iter()
-                            .find(|stored| stored == session_id)
-                    })
-                    .ok_or_else(|| {
-                        WorkspacePersistenceError::operation(format!(
-                            "rename session {session_id}: current binding membership is unavailable"
-                        ))
-                    })?;
-                let cwd = self
-                    .active
-                    .binding
-                    .session_names
-                    .record(session_id)
-                    .map(|record| record.cwd.clone())
-                    .or_else(|| session.and_then(|session| session.anchor.cwd.clone()))
-                    .or_else(|| naming.map(|naming| naming.cwd.clone()));
-                Some(BindingMembershipMutation::Rename {
-                    session_id: session_id.clone(),
-                    old_name,
-                    new_name: name.clone(),
-                    display_name: naming
-                        .map(|naming| naming.display_name.clone())
-                        .unwrap_or_else(|| name.clone()),
-                    explicit: naming.is_none_or(|naming| naming.explicit),
-                    cwd,
-                })
-            }
-            MuxCommand::DitchSession { session_id } => {
+                let identity = self.active_session_identity(session_id).ok_or_else(|| {
+                    WorkspacePersistenceError::operation(format!(
+                        "rename session {session_id}: this Space does not hold it"
+                    ))
+                })?;
                 let old_name = self
                     .active
                     .binding
-                    .mux
-                    .backend_session_by_id_or_name(session_id)
-                    .map(|session| session.name.clone())
-                    .or_else(|| {
-                        self.active
-                            .binding
-                            .session_names
-                            .last_observed_name(session_id)
-                            .map(str::to_owned)
-                    })
+                    .sessions
+                    .get(&identity)
+                    .map(|claimed| claimed.backend_name.clone())
                     .unwrap_or_else(|| session_id.clone());
-                Some(BindingMembershipMutation::Ditch {
-                    session_id: session_id.clone(),
+                Some(BindingMembershipMutation::Rename {
+                    identity,
                     old_name,
+                    new_name: name.clone(),
+                    display_name: display_name(name),
+                    explicit: naming.is_none_or(|naming| naming.explicit),
                 })
             }
+            MuxCommand::DitchSession { session_id } => self
+                .active_session_identity(session_id)
+                .map(|identity| BindingMembershipMutation::Ditch {
+                    old_name: self
+                        .active
+                        .binding
+                        .sessions
+                        .get(&identity)
+                        .map_or_else(|| session_id.clone(), |c| c.backend_name.clone()),
+                    identity,
+                }),
             _ => None,
         };
         if let Some(mutation) = &mutation {
@@ -1593,8 +1750,7 @@ impl WorkspaceRuntime {
         if let Err(error) = self.repository.commit_binding_membership_mutation(
             candidate.scope,
             membership,
-            &mut candidate.session_order,
-            &mut candidate.session_names,
+            &mut candidate.sessions,
         ) {
             self.defer_binding_membership_reconciliation(scope);
             return Err(error);
@@ -1653,6 +1809,7 @@ impl WorkspaceRuntime {
                         .map(|session| BackendMembership {
                             id: session.id.clone(),
                             name: session.name.clone(),
+                            identity: session.tag.identity.clone(),
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -1662,11 +1819,10 @@ impl WorkspaceRuntime {
             let mut candidate = self
                 .binding_state_candidate(scope)
                 .expect("each observed binding remains live");
-            let resolution = self.repository.reconcile_binding_membership_mutation(
+            let resolution = self.repository.reconcile_binding_membership_mutations(
                 scope,
                 &memberships,
-                &mut candidate.session_order,
-                &mut candidate.session_names,
+                &mut candidate.sessions,
             )?;
             if resolution {
                 self.binding_mut(scope)
@@ -1684,24 +1840,39 @@ impl WorkspaceRuntime {
 
     pub(super) fn active_reconciled_binding_state_candidate(&self) -> BindingStateCandidate {
         let mut candidate = self.active_binding_state_candidate();
+        // The re-stamps this pass would ask for are dropped: the caller is committing a naming
+        // change, and `reconcile_binding_states` issues them on the next frame anyway.
         self.active.binding.reconcile_session_state(&mut candidate);
         candidate
     }
 
-    pub(super) fn reconcile_binding_states(&mut self) -> Result<(), WorkspacePersistenceError> {
-        let candidates = self
-            .all_bindings()
-            .map(|binding| {
-                let mut candidate = BindingStateCandidate {
-                    scope: binding.scope,
-                    session_order: binding.session_order.clone(),
-                    session_names: binding.session_names.clone(),
-                };
-                binding.reconcile_session_state(&mut candidate);
-                candidate
-            })
-            .collect::<Vec<_>>();
-        self.commit_binding_state_candidates(candidates)
+    pub(super) fn reconcile_binding_states(
+        &mut self,
+        repaint: &RepaintHandle,
+    ) -> Result<(), WorkspacePersistenceError> {
+        let mut candidates = Vec::new();
+        let mut restamps = Vec::new();
+        for binding in self.all_bindings() {
+            let mut candidate = BindingStateCandidate {
+                scope: binding.scope,
+                sessions: binding.sessions.clone(),
+            };
+            for command in binding.reconcile_session_state(&mut candidate) {
+                restamps.push((binding.scope, command));
+            }
+            candidates.push(candidate);
+        }
+        self.commit_binding_state_candidates(candidates)?;
+        // After the commit: a stamp that fails is retried by the next reconcile, whereas a claim
+        // dropped before the stamp landed would have to be rediscovered by name all over again.
+        for (scope, command) in restamps {
+            let Some(binding) = self.binding_mut(scope) else {
+                continue;
+            };
+            let config = binding.multiplexer.clone();
+            binding.mux.execute_command(repaint, &config, command);
+        }
+        Ok(())
     }
 
     pub(super) fn commit_binding_state_candidate(
@@ -1721,13 +1892,8 @@ impl WorkspaceRuntime {
                 let binding = self
                     .binding(candidate.scope)
                     .expect("a candidate binding remains live");
-                (binding.session_order != candidate.session_order
-                    || binding.session_names != candidate.session_names)
-                    .then_some((
-                        candidate.scope,
-                        candidate.session_order.clone(),
-                        candidate.session_names.clone(),
-                    ))
+                (binding.sessions != candidate.sessions)
+                    .then_some((candidate.scope, candidate.sessions.clone()))
             })
             .collect::<Vec<_>>();
         self.repository.commit_binding_states(&changed)?;

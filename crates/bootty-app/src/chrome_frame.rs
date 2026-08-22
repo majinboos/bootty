@@ -328,6 +328,7 @@ fn apply_sidebar_event(
             Action::MoveUp => state.move_session_from_ui(&target.session_id, -1),
             Action::MoveDown => state.move_session_from_ui(&target.session_id, 1),
             Action::Detach => state.detach_scoped_session_from_space(&target),
+            Action::MoveToSpace(space_id) => state.move_scoped_session_to_space(&target, space_id),
             Action::Ditch => state.open_ditch_session_dialog_for(&target.session_id),
         },
     }

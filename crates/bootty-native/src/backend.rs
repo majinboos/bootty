@@ -11,7 +11,7 @@ use bootty_mux::{
     capability::{BindingCapabilityDescriptor, BindingOperation},
     command::MuxCommand,
     controller::MuxScope,
-    snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag, MuxSnapshot, MuxWindow},
     terminal::{
         BackendPanePolicy, MuxPaneTarget, PaneLayoutResizeRequest, PaneStartRequest,
         ScopedMuxPaneTarget, StartingNativeTerminal, TerminalRuntime,
@@ -39,6 +39,10 @@ struct NativeSession {
     name: String,
     active_window_id: String,
     windows: Vec<NativeWindow>,
+    /// Native sessions live and die with the process, so this is only ever the tag the workspace
+    /// handed over when it asked for the session — including when it is recreating one it
+    /// persisted. Nothing outside Bootty can write here, and nothing survives a restart.
+    tag: MuxSessionTag,
 }
 
 #[derive(Debug)]
@@ -57,8 +61,15 @@ impl NativeMuxState {
         }
     }
 
-    fn ensure_session(&mut self, session_id: &str, cwd: impl Into<PathBuf>) {
-        if self.sessions.iter().any(|session| session.id == session_id) {
+    fn ensure_session(&mut self, session_id: &str, cwd: impl Into<PathBuf>, tag: MuxSessionTag) {
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            if !tag.is_empty() {
+                session.tag = tag;
+            }
             session_id.clone_into(&mut self.active_session_id);
             return;
         }
@@ -77,8 +88,19 @@ impl NativeMuxState {
             name: session_id.to_owned(),
             active_window_id: window.id.clone(),
             windows: vec![window],
+            tag,
         });
         session_id.clone_into(&mut self.active_session_id);
+    }
+
+    fn stamp_session(&mut self, session_id: &str, tag: MuxSessionTag) {
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.tag = tag;
+        }
     }
 
     fn activate_window(&mut self, session_id: &str, window_id: &str) {
@@ -396,6 +418,7 @@ impl NativeMuxState {
             anchor,
             active_window_id: Some(session.active_window_id.clone()),
             windows,
+            tag: session.tag.clone(),
         }
     }
 
@@ -597,14 +620,23 @@ impl MuxBackend for NativeBackend {
                 pane_id,
             } => state.close_pane(&session_id, pane_id.as_deref()),
             MuxCommand::TogglePaneZoom { .. } => {}
-            MuxCommand::CreateProjectSession { session_id, cwd }
-            | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
-                state.ensure_session(&session_id, cwd);
+            MuxCommand::CreateProjectSession {
+                session_id,
+                cwd,
+                tag,
+            }
+            | MuxCommand::CreateWorktreeSession {
+                session_id,
+                cwd,
+                tag,
+            } => {
+                state.ensure_session(&session_id, cwd, tag);
             }
             MuxCommand::RenameSession { session_id, name } => {
                 state.rename_session(&session_id, name);
             }
             MuxCommand::DitchSession { session_id } => state.kill_session(&session_id),
+            MuxCommand::StampSession { session_id, tag } => state.stamp_session(&session_id, tag),
         }
         Ok(())
     }
@@ -623,6 +655,7 @@ pub fn native_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
             BindingOperation::NavigatePane,
             BindingOperation::ClosePane,
             BindingOperation::CreateProjectSession,
+            BindingOperation::StampSession,
             BindingOperation::CreateWorktreeSession,
             BindingOperation::RenameSession,
             BindingOperation::DitchSession,

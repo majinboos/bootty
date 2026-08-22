@@ -915,6 +915,7 @@ fn sidebar_preview(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, surface:
                 palette,
                 size.y,
                 crate::ui::chrome::SidebarModel {
+                    move_targets: &[],
                     items: &items,
                     footer_items: &footer,
                     session_count,

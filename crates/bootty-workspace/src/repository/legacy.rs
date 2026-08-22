@@ -11,41 +11,31 @@ pub(super) fn migrate_legacy_metadata(
 ) -> rusqlite::Result<()> {
     let imported_sessions = if table_exists(tx, "session_groups")? && table_exists(tx, "sessions")?
     {
-        let session_count: i64 =
-            tx.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
-        if session_count == 0 {
-            false
-        } else {
-            tx.execute(
-                "INSERT INTO workspace_session_groups (binding_id, name, position)
-                 SELECT ?1, name, position FROM session_groups ORDER BY position",
-                [binding_id],
-            )?;
-            tx.execute(
-                "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
-                 SELECT ?1, old_session.name, scoped_group.id, old_session.position
-                 FROM sessions old_session
-                 JOIN session_groups old_group ON old_group.id = old_session.group_id
-                 JOIN workspace_session_groups scoped_group
-                   ON scoped_group.binding_id = ?1 AND scoped_group.position = old_group.position
-                 ORDER BY old_group.position, old_session.position",
-                [binding_id],
-            )? > 0
-        }
+        // Imported sessions get a provisional identity, the same as a revision 3 upgrade: the
+        // first successful refresh finds each by name and stamps a real one.
+        tx.execute(
+            "INSERT INTO workspace_sessions
+                (identity, binding_id, backend_name, display_name, explicit, cwd, position)
+             SELECT
+                 'legacy:' || ?1 || ':' || old_session.name,
+                 ?1,
+                 old_session.name,
+                 COALESCE(metadata.generated_name, ''),
+                 COALESCE(metadata.explicit, 0),
+                 COALESCE(metadata.cwd, ''),
+                 ROW_NUMBER() OVER (ORDER BY old_group.position, old_session.position) - 1
+             FROM sessions old_session
+             JOIN session_groups old_group ON old_group.id = old_session.group_id
+             LEFT JOIN session_name_metadata metadata
+                 ON metadata.generated_name = old_session.name
+                 OR metadata.session_id = old_session.name",
+            [binding_id],
+        )? > 0
     } else {
         false
     };
     if !imported_sessions {
         migrate_legacy_order_file(tx, binding_id, path)?;
-    }
-    if table_exists(tx, "session_name_metadata")? {
-        tx.execute(
-            "INSERT INTO workspace_session_name_metadata
-                 (binding_id, session_id, cwd, generated_name, session_name, explicit)
-             SELECT ?1, session_id, cwd, generated_name, generated_name, explicit
-             FROM session_name_metadata",
-            [binding_id],
-        )?;
     }
     Ok(())
 }
@@ -88,20 +78,17 @@ fn migrate_legacy_order_file(
             });
         }
     }
-    for (group_position, group) in groups.iter().enumerate() {
+    for (position, session) in groups
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .enumerate()
+    {
         tx.execute(
-            "INSERT INTO workspace_session_groups (binding_id, name, position)
-             VALUES (?1, ?2, ?3)",
-            params![binding_id, group.name, group_position as i64],
+            "INSERT INTO workspace_sessions
+                (identity, binding_id, backend_name, position)
+             VALUES ('legacy:' || ?1 || ':' || ?2, ?1, ?2, ?3)",
+            params![binding_id, session, position as i64],
         )?;
-        let group_id = tx.last_insert_rowid();
-        for (session_position, session) in group.sessions.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO workspace_sessions (binding_id, name, group_id, position)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![binding_id, session, group_id, session_position as i64],
-            )?;
-        }
     }
     Ok(())
 }

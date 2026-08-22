@@ -916,6 +916,7 @@ dependencies = [
  "bootty-terminal",
  "bootty-write",
  "derive_more",
+ "getrandom 0.4.3",
  "inventory",
  "serde",
  "serde_json",

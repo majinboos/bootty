@@ -6,7 +6,7 @@ use bootty_config::config::{
     resolve_theme, write_font_size_preference,
 };
 use bootty_winit::input_binding_set::BindingSet;
-use bootty_workspace::{SessionOrderStore, WorkspaceRepository};
+use bootty_workspace::{SessionMembership, WorkspaceRepository, WorkspaceSession};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 struct BenchDir {
@@ -151,9 +151,19 @@ fn session_names(count: usize) -> Vec<String> {
         .collect()
 }
 
-fn session_order(config_path: &std::path::Path) -> SessionOrderStore {
+fn session_membership(config_path: &std::path::Path, names: &[String]) -> SessionMembership {
     let (_, snapshot) = WorkspaceRepository::open(config_path).expect("workspace repository");
-    snapshot.spaces()[0].bindings()[0].session_order().clone()
+    let mut sessions = snapshot.spaces()[0].bindings()[0].sessions().clone();
+    for (index, name) in names.iter().enumerate() {
+        sessions.claim(WorkspaceSession {
+            identity: format!("id-{index:03}"),
+            backend_name: name.clone(),
+            display_name: String::new(),
+            explicit: false,
+            cwd: "/repo".to_owned(),
+        });
+    }
+    sessions
 }
 
 fn parse_keybinds(config: &BoottyConfig) -> usize {
@@ -220,38 +230,26 @@ fn bench_config_load(c: &mut Criterion) {
 
 fn bench_session_order(c: &mut Criterion) {
     let sessions = session_names(384);
-    let session_refs = sessions.iter().map(String::as_str).collect::<Vec<_>>();
+    let alive = (0..sessions.len())
+        .map(|index| format!("id-{index:03}"))
+        .collect::<Vec<_>>();
+    let alive_refs = alive
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
 
     let steady_dir = BenchDir::new("session-order-steady");
-    let steady_config_path = steady_dir.path("config.toml");
-    let mut steady_store = session_order(&steady_config_path);
-    steady_store.sync_sessions(session_refs.iter().copied());
+    let mut steady = session_membership(&steady_dir.path("config.toml"), &sessions);
     c.bench_function("session_order_steady_sync_384", |b| {
-        b.iter(|| {
-            black_box(
-                steady_store
-                    .sync_sessions(black_box(session_refs.iter().copied()))
-                    .len(),
-            )
-        })
+        b.iter(|| black_box(steady.retain_alive(black_box(&alive_refs))))
     });
 
     let move_dir = BenchDir::new("session-order-move");
-    let move_config_path = move_dir.path("config.toml");
-    let mut move_store = session_order(&move_config_path);
-    move_store.sync_sessions(session_refs.iter().copied());
+    let mut moving = session_membership(&move_dir.path("config.toml"), &sessions);
     c.bench_function("session_order_move_session_persist_384", |b| {
         b.iter(|| {
-            let moved_up = move_store.move_session_before(
-                black_box("group-5/session-005"),
-                black_box(Some("group-0/session-000")),
-                black_box(session_refs.iter().copied()),
-            );
-            let moved_down = move_store.move_session_before(
-                black_box("group-5/session-005"),
-                black_box(None),
-                black_box(session_refs.iter().copied()),
-            );
+            let moved_up = moving.move_before(black_box("id-005"), black_box(Some("id-000")));
+            let moved_down = moving.move_before(black_box("id-005"), black_box(None));
             black_box((moved_up, moved_down))
         })
     });
@@ -261,9 +259,8 @@ fn bench_session_order(c: &mut Criterion) {
         b.iter(|| {
             cold_index = cold_index.wrapping_add(1);
             let dir = BenchDir::new(&format!("session-order-cold-{cold_index}"));
-            let config_path = dir.path("config.toml");
-            let mut store = session_order(&config_path);
-            black_box(store.sync_sessions(session_refs.iter().copied()).len())
+            let mut store = session_membership(&dir.path("config.toml"), &sessions);
+            black_box(store.retain_alive(&alive_refs))
         })
     });
 }

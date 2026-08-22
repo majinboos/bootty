@@ -89,6 +89,7 @@ fn built_backends_publish_the_exact_capability_matrix() {
                 BindingOperation::CreateWorktreeSession,
                 BindingOperation::RenameSession,
                 BindingOperation::DitchSession,
+                BindingOperation::StampSession,
             ],
         ),
         (
@@ -105,6 +106,7 @@ fn built_backends_publish_the_exact_capability_matrix() {
                 BindingOperation::CreateWorktreeSession,
                 BindingOperation::RenameSession,
                 BindingOperation::DitchSession,
+                BindingOperation::StampSession,
             ],
         ),
         (
@@ -123,6 +125,7 @@ fn built_backends_publish_the_exact_capability_matrix() {
                 BindingOperation::CreateWorktreeSession,
                 BindingOperation::RenameSession,
                 BindingOperation::DitchSession,
+                BindingOperation::StampSession,
             ],
         ),
     ] {

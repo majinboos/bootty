@@ -23,6 +23,7 @@ pub enum BindingOperation {
     CreateWorktreeSession,
     RenameSession,
     DitchSession,
+    StampSession,
 }
 
 /// Versioned capability declaration for one binding runtime.

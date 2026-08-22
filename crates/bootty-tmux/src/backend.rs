@@ -11,7 +11,10 @@ use bootty_mux::{
     backend::MuxBackend,
     command::{MuxCommand, MuxDirection, MuxSplitDirection},
     process::{CommandRunner, require_success},
-    snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxWindow, MuxWindowProgress},
+    snapshot::{
+        MuxPaneAnchor, MuxSession, MuxSessionTag, MuxSnapshot, MuxWindow, MuxWindowProgress,
+        SESSION_IDENTITY_OPTION, SESSION_SPACE_OPTION,
+    },
 };
 #[cfg(feature = "app")]
 use bootty_mux::{
@@ -332,15 +335,27 @@ impl<R> TmuxBackend<R> {
 }
 
 impl<R: CommandRunner> TmuxBackend<R> {
+    /// One tmux command, retried once against a fresh server when the old one had crashed. A
+    /// crashed server keeps failing every command from its leftover socket — including the
+    /// `new-session` meant to replace it — so without clearing it a tmux crash stays unrecoverable
+    /// until someone deletes the socket by hand.
+    fn run_recovering(&self, args: &[String]) -> Result<bootty_mux::process::CommandOutput> {
+        let output = self.runner.run(&self.program, args)?;
+        if output.success || !tmux_server_exited(&output.stderr) || !clear_stale_local_socket() {
+            return Ok(output);
+        }
+        self.runner.run(&self.program, args)
+    }
+
     fn run(&self, args: &[&str]) -> Result<()> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let output = self.runner.run(&self.program, &args)?;
+        let output = self.run_recovering(&args)?;
         require_success(&self.program, &args, output).map(|_| ())
     }
 
     fn run_snapshot(&self, args: &[&str]) -> Result<Option<String>> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let output = self.runner.run(&self.program, &args)?;
+        let output = self.run_recovering(&args)?;
         if output.success {
             return Ok(Some(output.stdout));
         }
@@ -351,12 +366,12 @@ impl<R: CommandRunner> TmuxBackend<R> {
     }
 
     fn run_owned(&self, args: &[String]) -> Result<()> {
-        let output = self.runner.run(&self.program, args)?;
+        let output = self.run_recovering(args)?;
         require_success(&self.program, args, output).map(|_| ())
     }
 
     fn run_owned_allow_server_exit(&self, args: &[String]) -> Result<()> {
-        let output = self.runner.run(&self.program, args)?;
+        let output = self.run_recovering(args)?;
         if !output.success && tmux_server_exited(&output.stderr) {
             return Ok(());
         }
@@ -402,7 +417,7 @@ impl<R: CommandRunner> TmuxBackend<R> {
         let Some(combined) = self.run_snapshot(&[
             "list-sessions",
             "-F",
-            "s\x1f#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}",
+            "s\x1f#{session_id}\x1f#{session_name}\x1f#{@bootty_id}\x1f#{@bootty_space}\x1f#{session_attached}\x1f#{session_windows}\x1f#{pane_id}\x1f#{pane_pid}\x1f#{pane_current_path}\x1f#{pane_current_command}",
             ";",
             "list-panes",
             "-a",
@@ -420,16 +435,44 @@ impl<R: CommandRunner> TmuxBackend<R> {
             MuxCommand::ActivateWindow { window_id, .. } => {
                 self.run_owned(&["select-window".into(), "-t".into(), window_id])?;
             }
-            MuxCommand::CreateProjectSession { session_id, cwd }
-            | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
-                self.run_disowned_owned(&[
-                    "new-session".into(),
-                    "-d".into(),
-                    "-s".into(),
-                    session_id,
-                    "-c".into(),
+            MuxCommand::CreateProjectSession {
+                session_id,
+                cwd,
+                tag,
+            }
+            | MuxCommand::CreateWorktreeSession {
+                session_id,
+                cwd,
+                tag,
+            } => {
+                // The stamps ride along in the same tmux invocation as the create, so the session
+                // is never visible in an untagged state that another Space could claim.
+                let mut args = vec![
+                    "new-session".to_owned(),
+                    "-d".to_owned(),
+                    "-s".to_owned(),
+                    session_id.clone(),
+                    "-c".to_owned(),
                     cwd,
-                ])?;
+                ];
+                if let Some(identity) = &tag.identity {
+                    args.extend(set_session_option_args(
+                        &session_id,
+                        SESSION_IDENTITY_OPTION,
+                        identity,
+                    ));
+                }
+                if let Some(space) = &tag.space {
+                    args.extend(set_session_option_args(
+                        &session_id,
+                        SESSION_SPACE_OPTION,
+                        space,
+                    ));
+                }
+                self.run_disowned_owned(&args)?;
+            }
+            MuxCommand::StampSession { session_id, tag } => {
+                self.run_owned(&stamp_session_args(&session_id, &tag))?;
             }
             MuxCommand::RenameSession { session_id, name } => {
                 self.run_owned(&["rename-session".into(), "-t".into(), session_id, name])?;
@@ -587,14 +630,64 @@ pub fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
             BindingOperation::TogglePaneZoom,
             BindingOperation::CreateProjectSession,
             BindingOperation::CreateWorktreeSession,
+            BindingOperation::StampSession,
             BindingOperation::RenameSession,
             BindingOperation::DitchSession,
         ],
     )
 }
 
+/// Whether tmux reported that its server is not there. Two different messages mean it: a server
+/// that was never started, and one that died — the second is what a crashed server leaves behind,
+/// and treating only the first as "gone" turned a tmux crash into a fatal bootty error.
 fn tmux_server_exited(stderr: &str) -> bool {
-    stderr.contains("no server running")
+    stderr.contains("no server running") || stderr.contains("server exited unexpectedly")
+}
+
+/// A crashed tmux server can leave a socket that every later command still fails against, including
+/// the `new-session` that would replace it — so the socket has to go before tmux will start a fresh
+/// server. Only ever removes a dead socket on this machine, at tmux's own default path.
+///
+/// Limit: bootty's production backend runs tmux with no `-L`/`-S`, so the path is derivable. Give
+/// the local backend its own socket name and this has to take that name instead.
+#[cfg(unix)]
+fn clear_stale_local_socket() -> bool {
+    default_socket_path().is_some_and(|path| clear_dead_socket(&path))
+}
+
+/// Remove `path` only if it is a socket nothing is listening on. A live server answers `connect`,
+/// and deleting its socket would strand every client that has not connected yet.
+#[cfg(unix)]
+fn clear_dead_socket(path: &std::path::Path) -> bool {
+    let is_socket = path
+        .symlink_metadata()
+        .is_ok_and(|metadata| std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()));
+    if !is_socket || std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
+}
+
+/// tmux's default socket: `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/default`.
+#[cfg(unix)]
+fn default_socket_path() -> Option<std::path::PathBuf> {
+    let directory = std::env::var_os("TMUX_TMPDIR").map_or_else(
+        || std::path::PathBuf::from("/tmp"),
+        std::path::PathBuf::from,
+    );
+    // Our own uid, taken from a directory we are guaranteed to own rather than through libc, which
+    // would need an unsafe block this workspace denies.
+    let uid = std::os::unix::fs::MetadataExt::uid(
+        &std::fs::metadata(std::env::var_os("HOME").map(std::path::PathBuf::from)?).ok()?,
+    );
+    let path = directory.join(format!("tmux-{uid}")).join("default");
+    Some(path)
+}
+
+/// Windows has no unix socket to clear, and no crashed-server state to recover from this way.
+#[cfg(not(unix))]
+fn clear_stale_local_socket() -> bool {
+    false
 }
 
 fn tmux_fields(line: &str, fixed_fields_before_tail: usize) -> Vec<String> {
@@ -653,6 +746,56 @@ fn strip_snapshot_tag(line: &str, tag: char) -> Option<&str> {
         .or_else(|| tagged.strip_prefix("\\t"))
 }
 
+/// The `set-option` half of a chained tmux invocation, as separate argv entries.
+///
+/// tmux reads `;` as a command separator only when it arrives as its own argument, which is why
+/// this returns the separator rather than joining a string.
+fn set_session_option_args(session_id: &str, option: &str, value: &str) -> Vec<String> {
+    vec![
+        ";".to_owned(),
+        "set-option".to_owned(),
+        "-t".to_owned(),
+        session_id.to_owned(),
+        option.to_owned(),
+        value.to_owned(),
+    ]
+}
+
+/// The one tmux invocation that writes a whole tag onto an existing session.
+///
+/// A `None` half is a claim being dropped, so it unsets the option rather than blanking it: an
+/// empty user option still reads back as set, which would look like a tag nobody can match.
+fn stamp_session_args(session_id: &str, tag: &MuxSessionTag) -> Vec<String> {
+    let mut args = Vec::new();
+    for (option, value) in [
+        (SESSION_IDENTITY_OPTION, tag.identity.as_deref()),
+        (SESSION_SPACE_OPTION, tag.space.as_deref()),
+    ] {
+        let mut entry = match value {
+            Some(value) => set_session_option_args(session_id, option, value),
+            None => unset_session_option_args(session_id, option),
+        };
+        if args.is_empty() {
+            // Only a command that follows another one carries the chaining separator.
+            entry.remove(0);
+        }
+        args.extend(entry);
+    }
+    args
+}
+
+/// The `set-option -u` half of a chained tmux invocation, which removes the option outright.
+fn unset_session_option_args(session_id: &str, option: &str) -> Vec<String> {
+    vec![
+        ";".to_owned(),
+        "set-option".to_owned(),
+        "-u".to_owned(),
+        "-t".to_owned(),
+        session_id.to_owned(),
+        option.to_owned(),
+    ]
+}
+
 fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
@@ -663,12 +806,18 @@ fn parse_tmux_snapshot(session_listing: &str, pane_listing: &str) -> Result<MuxS
         .lines()
         .filter(|line| !line.trim().is_empty())
     {
-        let mut fields = tmux_fields(line, 6).into_iter();
+        let mut fields = tmux_fields(line, 8).into_iter();
         let id = fields.next().context("tmux snapshot missing session id")?;
         let name = fields
             .next()
             .and_then(nonempty)
             .unwrap_or_else(|| id.clone());
+        // tmux renders an unset user option as the empty string, so an untagged session and one
+        // tagged with nothing are the same thing here: unclaimed.
+        let tag = MuxSessionTag {
+            identity: fields.next().and_then(nonempty),
+            space: fields.next().and_then(nonempty),
+        };
         let attached = fields.next().is_some_and(|value| value != "0");
         let _windows = fields.next();
         let pane_id = fields.next().and_then(nonempty);
@@ -688,6 +837,7 @@ fn parse_tmux_snapshot(session_listing: &str, pane_listing: &str) -> Result<MuxS
             },
             active_window_id: None,
             windows: Vec::new(),
+            tag,
         });
     }
     add_tmux_windows(&mut sessions, pane_listing);
@@ -794,5 +944,127 @@ fn add_tmux_windows(sessions: &mut [MuxSession], pane_listing: &str) {
     }
     for session in sessions {
         session.windows.sort_by_key(|window| window.index);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A stamp is one invocation: the leading command carries no separator, and a claim being
+    /// dropped unsets its option rather than writing an empty value that still reads as set.
+    #[test]
+    fn stamping_a_session_writes_both_halves_and_unsets_the_ones_being_dropped() {
+        assert_eq!(
+            stamp_session_args(
+                "$3",
+                &MuxSessionTag {
+                    identity: Some("9f3a".to_owned()),
+                    space: Some("space-7".to_owned()),
+                },
+            ),
+            [
+                "set-option",
+                "-t",
+                "$3",
+                "@bootty_id",
+                "9f3a",
+                ";",
+                "set-option",
+                "-t",
+                "$3",
+                "@bootty_space",
+                "space-7",
+            ]
+        );
+        assert_eq!(
+            stamp_session_args(
+                "$3",
+                &MuxSessionTag {
+                    identity: Some("9f3a".to_owned()),
+                    space: None,
+                },
+            ),
+            [
+                "set-option",
+                "-t",
+                "$3",
+                "@bootty_id",
+                "9f3a",
+                ";",
+                "set-option",
+                "-u",
+                "-t",
+                "$3",
+                "@bootty_space",
+            ]
+        );
+    }
+
+    /// tmux renders an option nothing set as the empty string, so an untagged session and a
+    /// tagged one arrive down the same listing and have to be told apart by field, not by shape.
+    #[test]
+    fn a_session_listing_carries_the_bootty_tag_and_leaves_untagged_sessions_unclaimed() {
+        let listing = concat!(
+            "$0\x1fwork\x1f9f3a\x1fspace-7\x1f1\x1f2\x1f%1\x1f4242\x1f/repo\x1fzsh\n",
+            "$1\x1fscratch\x1f\x1f\x1f0\x1f1\x1f%2\x1f4243\x1f/tmp\x1fbash\n",
+        );
+        let snapshot = parse_tmux_snapshot(listing, "").expect("parse the session listing");
+
+        assert_eq!(
+            snapshot.sessions[0].tag,
+            MuxSessionTag {
+                identity: Some("9f3a".to_owned()),
+                space: Some("space-7".to_owned()),
+            }
+        );
+        assert!(snapshot.sessions[1].tag.is_empty());
+        // The fields after the tag still have to land where they did before it existed.
+        assert_eq!(snapshot.sessions[0].name, "work");
+        assert!(snapshot.sessions[0].active, "session_attached was 1");
+        assert!(!snapshot.sessions[1].active);
+        assert_eq!(snapshot.sessions[0].anchor.cwd.as_deref(), Some("/repo"));
+        assert_eq!(snapshot.sessions[0].anchor.pane_pid, Some(4242));
+        assert_eq!(snapshot.sessions[1].anchor.process.as_deref(), Some("bash"));
+    }
+
+    /// The two ways tmux says its server is not there. Only matching the first turned a crashed
+    /// server into a fatal bootty error instead of something to recover from.
+    #[test]
+    fn a_crashed_server_reads_as_gone_the_same_as_one_never_started() {
+        assert!(tmux_server_exited(
+            "no server running on /tmp/tmux-1/default"
+        ));
+        assert!(tmux_server_exited("server exited unexpectedly"));
+        assert!(!tmux_server_exited("can't find session: bogus"));
+    }
+
+    #[test]
+    fn a_dead_socket_is_cleared_and_a_live_one_is_left_alone() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+
+        let dead = directory.path().join("dead");
+        drop(std::os::unix::net::UnixListener::bind(&dead).expect("bind the dead socket"));
+        assert!(
+            clear_dead_socket(&dead),
+            "a socket nobody answers is cleared"
+        );
+        assert!(!dead.exists());
+
+        let alive = directory.path().join("alive");
+        let _listener = std::os::unix::net::UnixListener::bind(&alive).expect("bind a live socket");
+        assert!(
+            !clear_dead_socket(&alive),
+            "a server that answers keeps its socket"
+        );
+        assert!(alive.exists());
+
+        let regular = directory.path().join("regular");
+        std::fs::write(&regular, "not a socket").expect("write a regular file");
+        assert!(
+            !clear_dead_socket(&regular),
+            "only a socket is ever removed"
+        );
+        assert!(regular.exists());
     }
 }
