@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use bootty_config::config::{BoottyConfig, load_config_from_path};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use bootty_identity::ApplicationIdentity;
 
@@ -15,8 +15,10 @@ mod config_overrides;
 
 use config_overrides::ConfigOverrides;
 
-#[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
+#[derive(Clone, Debug, Subcommand)]
 pub enum Command {
+    /// Launch the Bootty terminal application.
+    App(Box<AppArgs>),
     /// Download and install the latest Bootty release.
     Update,
     /// List commands exposed by a running Bootty instance.
@@ -55,6 +57,24 @@ pub enum Command {
     /// Invoke a command discovered from a running Bootty instance.
     #[command(external_subcommand)]
     Dynamic(Vec<String>),
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct AppArgs {
+    /// Load config from this TOML file instead of the default XDG path.
+    #[arg(long, value_name = "PATH", conflicts_with = "defaults")]
+    config: Option<PathBuf>,
+
+    /// Ignore user config and start from built-in defaults with isolated temp sidecar state.
+    #[arg(long, conflicts_with = "config")]
+    defaults: bool,
+
+    /// Stable persistence identity for this application window.
+    #[arg(long, default_value = "main", hide = true)]
+    window_state_key: String,
+
+    #[command(flatten)]
+    overrides: ConfigOverrides,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Subcommand)]
@@ -121,18 +141,6 @@ impl From<RemoteSpaceBackend> for bootty_mux_model::MuxBackendKind {
 #[derive(Debug, Parser)]
 #[command(name = "bootty", version, about = "Bootty terminal emulator")]
 pub struct Cli {
-    /// Load config from this TOML file instead of the default XDG path.
-    #[arg(long, value_name = "PATH", conflicts_with = "defaults")]
-    config: Option<PathBuf>,
-
-    /// Ignore user config and start from built-in defaults with isolated temp sidecar state.
-    #[arg(long, conflicts_with = "config")]
-    defaults: bool,
-
-    /// Stable persistence identity for this application window.
-    #[arg(long, default_value = "main", hide = true)]
-    window_state_key: String,
-
     /// Print the exact JSON-RPC response.
     #[arg(long, global = true)]
     json: bool,
@@ -141,26 +149,20 @@ pub struct Cli {
     #[arg(long, global = true)]
     start: bool,
 
-    #[command(flatten)]
-    overrides: ConfigOverrides,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 impl Cli {
     pub fn load_config(&self) -> Result<BoottyConfig> {
-        let path = self.selected_config_path();
-        if self.defaults {
-            create_parent_dir_for_defaults(&path)?;
-        }
-        let mut config = load_config_from_path(&path)?;
-        self.overrides.apply(&mut config)?;
-        Ok(config)
+        self.app_args().load_config()
     }
 
     pub fn window_state_key(&self) -> &str {
-        &self.window_state_key
+        match self.command.as_ref() {
+            Some(Command::App(args)) => args.window_state_key(),
+            _ => "main",
+        }
     }
 
     pub fn subcommand(&self) -> Option<&Command> {
@@ -173,6 +175,29 @@ impl Cli {
 
     pub fn start(&self) -> bool {
         self.start
+    }
+
+    fn app_args(&self) -> AppArgs {
+        match self.command.as_ref() {
+            Some(Command::App(args)) => (**args).clone(),
+            _ => AppArgs::default(),
+        }
+    }
+}
+
+impl AppArgs {
+    pub fn load_config(&self) -> Result<BoottyConfig> {
+        let path = self.selected_config_path();
+        if self.defaults {
+            create_parent_dir_for_defaults(&path)?;
+        }
+        let mut config = load_config_from_path(&path)?;
+        self.overrides.apply(&mut config)?;
+        Ok(config)
+    }
+
+    pub fn window_state_key(&self) -> &str {
+        &self.window_state_key
     }
 
     fn selected_config_path(&self) -> PathBuf {

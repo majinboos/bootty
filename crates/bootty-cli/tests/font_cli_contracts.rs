@@ -9,6 +9,7 @@ fn font_feature_cli_overrides_use_the_shared_grammar() {
     std::fs::write(&config_path, "[font]\nfeatures = [\"-liga\"]\n").expect("write config");
     let cli = Cli::try_parse_from([
         "bootty",
+        "app",
         "--config",
         config_path.to_str().expect("UTF-8 config path"),
         "--font-feature",
@@ -35,6 +36,7 @@ fn invalid_font_feature_cli_override_keeps_the_exact_error() {
     std::fs::write(&config_path, "").expect("write config");
     let cli = Cli::try_parse_from([
         "bootty",
+        "app",
         "--config",
         config_path.to_str().expect("UTF-8 config path"),
         "--font-feature",

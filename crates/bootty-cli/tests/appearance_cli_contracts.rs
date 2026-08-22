@@ -14,6 +14,7 @@ fn load_with_overrides(source: &str, overrides: &[&str]) -> Result<BoottyConfig>
     std::fs::write(&config_path, source).expect("write config");
     let mut arguments = vec![
         OsString::from("bootty"),
+        OsString::from("app"),
         OsString::from("--config"),
         config_path.into_os_string(),
     ];
@@ -145,6 +146,7 @@ fn invalid_cli_theme_keeps_the_config_theme_error() {
     );
     let cli = Cli::try_parse_from([
         "bootty",
+        "app",
         "--config",
         config_path.to_str().expect("UTF-8 config path"),
         "--theme",
