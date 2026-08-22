@@ -314,7 +314,7 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
             shell: Some("/bin/sh".to_owned()),
             args: vec![
                 "-c".to_owned(),
-                "printf '%s' \"$TERM|$COLORTERM|$TERM_PROGRAM|$TERM_PROGRAM_VERSION|${TERMINFO-unset}|${REMOVE_ME-unset}|$PWD|$1|$BOOTTY_PANE\" > \"$BOOTTY_TEST_OUTPUT\""
+                "temporary_output=${BOOTTY_TEST_OUTPUT}.tmp.$$; printf '%s' \"$TERM|$COLORTERM|$TERM_PROGRAM|$TERM_PROGRAM_VERSION|${TERMINFO-unset}|${REMOVE_ME-unset}|$PWD|$1|$BOOTTY_PANE\" > \"$temporary_output\" && mv \"$temporary_output\" \"$BOOTTY_TEST_OUTPUT\""
                     .to_owned(),
                 "bootty-runtime-test".to_owned(),
                 "argument".to_owned(),
