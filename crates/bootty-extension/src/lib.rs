@@ -13,8 +13,8 @@ mod queue;
 mod source_writer;
 mod storage;
 mod surfaces;
-mod values;
 
+pub use bootty_item::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModuleItem, ModulePrimitive};
 pub use catalog::{ExtensionCatalog, ExtensionGenerationCandidate, ExtensionGenerationToken};
 pub use fact_values::{MuxView, SessionProgressView, SessionReorder, SessionView, WindowView};
 pub use git_helpers::{display_path, head_branch};
@@ -36,4 +36,3 @@ pub use surfaces::{
     ExtensionUiAction, PublishedSurfaceItem, PublishedSurfaceSnapshot, SurfaceDeclaration,
     SurfacePlacement, SurfaceSnapshot,
 };
-pub use values::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModuleItem, ModulePrimitive};

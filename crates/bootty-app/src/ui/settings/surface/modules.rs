@@ -7,7 +7,7 @@ use bootty_extension::{
 use bootty_ui::icons;
 use eframe::egui::{self, RichText};
 
-use crate::theme::module_color32;
+use bootty_ui::item_paint::module_color32;
 
 use super::SettingsSurface;
 

@@ -869,6 +869,7 @@ version = "0.4.0"
 dependencies = [
  "bootty-command",
  "bootty-config",
+ "bootty-item",
  "bootty-workspace-hack",
  "bootty-write",
  "mlua",
@@ -894,6 +895,13 @@ version = "0.0.0"
 dependencies = [
  "bootty-workspace-hack",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "bootty-item"
+version = "0.0.0"
+dependencies = [
+ "bootty-workspace-hack",
 ]
 
 [[package]]
@@ -1082,6 +1090,7 @@ dependencies = [
 name = "bootty-ui"
 version = "0.0.0"
 dependencies = [
+ "bootty-item",
  "bootty-workspace-hack",
  "eframe",
  "iconflow",

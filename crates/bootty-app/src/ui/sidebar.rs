@@ -4,7 +4,9 @@ use bootty_extension::{ExtensionUiAction, ModuleItem, ModulePrimitive, Published
 use bootty_mux::{controller::MuxScope, snapshot::MuxSession};
 use eframe::egui::Color32;
 
-use crate::{theme::module_color32, ui::session_navigation::BindingSessionGroup};
+use bootty_ui::item_paint::module_color32;
+
+use crate::ui::session_navigation::BindingSessionGroup;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarItem<'a> {

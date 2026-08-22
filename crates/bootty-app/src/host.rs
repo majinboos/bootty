@@ -22,7 +22,7 @@ use crate::{
     menu::AppMenu,
     theme::theme_tokens,
     ui::{
-        ModalDialog, ModalKind,
+        ModalDialog,
         settings::{SettingsAction, SettingsSurface},
     },
 };
@@ -282,108 +282,99 @@ impl BoottyApp {
     }
 
     fn show_modal_dialog(&mut self, ctx: &egui::Context) {
-        let Some(kind) = self.state.modal_dialog().map(ModalDialog::kind) else {
-            return;
-        };
         let theme = self.state.ui_theme();
-        match kind {
-            ModalKind::NewSession => {
-                let open_cwds = self
-                    .state
+        // Two dialogs need a read of the workspace before the modal is borrowed mutably; take
+        // those first, only when that dialog is actually open.
+        let open_cwds = matches!(self.state.modal_dialog(), Some(ModalDialog::NewSession(_)))
+            .then(|| {
+                self.state
                     .mux()
                     .sessions()
                     .iter()
                     .filter_map(|session| session.anchor.cwd.clone())
-                    .collect::<Vec<_>>();
-                let Some(ModalDialog::NewSession(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme, &open_cwds);
-                if let Some(event) = event {
-                    self.state.apply_picker_event(event);
-                }
-            }
-            ModalKind::SpaceEditor => {
-                let Some(ModalDialog::SpaceEditor(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let intent = dialog.show(ctx, theme);
-                if let Some(intent) = intent {
-                    self.state.apply_space_editor_intent(intent);
-                }
-            }
-            ModalKind::SessionPicker => {
-                let groups = self.state.session_finder_groups();
-                let Some(ModalDialog::SessionPicker(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme, &groups);
-                if let Some(event) = event {
-                    self.state.apply_session_picker_event(event);
-                }
-            }
-            ModalKind::RenameSession => {
-                let Some(ModalDialog::RenameSession(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme);
-                if let Some(event) = event {
-                    self.state.apply_rename_session_event(event);
-                }
-            }
-            ModalKind::RenameTab => {
-                let Some(ModalDialog::RenameTab(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme);
-                if let Some(event) = event {
-                    self.state.apply_rename_tab_event(event);
-                }
-            }
-            ModalKind::DitchSession => {
-                let Some(ModalDialog::DitchSession(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme);
-                if let Some(event) = event {
-                    self.state.apply_ditch_session_event(event);
-                }
-            }
-            ModalKind::KeybindHelp => {
-                let Some(ModalDialog::KeybindHelp(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let groups = matches!(
+            self.state.modal_dialog(),
+            Some(ModalDialog::SessionPicker(_))
+        )
+        .then(|| self.state.session_finder_groups())
+        .unwrap_or_default();
+
+        // What each dialog returned, applied after the borrow ends.
+        enum Outcome {
+            None,
+            Picker(crate::ui::new_session_picker::NewSessionPickerEvent),
+            SpaceEditor(crate::ui::space::SpaceEditorIntent),
+            SessionPicker(crate::ui::session_picker::SessionPickerEvent),
+            RenameSession(crate::ui::rename::RenameSessionEvent),
+            RenameTab(crate::ui::rename::RenameTabEvent),
+            Ditch(crate::ui::ditch::DitchSessionEvent),
+            DismissKeybindHelp,
+            CommandPalette(crate::ui::command_palette::CommandPaletteEvent),
+            ThemePicker(crate::ui::theme_picker::ThemePickerEvent),
+        }
+
+        let outcome = match self.state.modal_dialog_mut() {
+            None => return,
+            Some(ModalDialog::NewSession(dialog)) => dialog
+                .show(ctx, theme, &open_cwds)
+                .map_or(Outcome::None, Outcome::Picker),
+            Some(ModalDialog::SpaceEditor(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::SpaceEditor),
+            Some(ModalDialog::SessionPicker(dialog)) => dialog
+                .show(ctx, theme, &groups)
+                .map_or(Outcome::None, Outcome::SessionPicker),
+            Some(ModalDialog::RenameSession(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::RenameSession),
+            Some(ModalDialog::RenameTab(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::RenameTab),
+            Some(ModalDialog::DitchSession(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::Ditch),
+            Some(ModalDialog::KeybindHelp(dialog)) => {
                 if dialog.show(ctx, theme) {
-                    self.state.dismiss_keybind_help();
+                    Outcome::DismissKeybindHelp
+                } else {
+                    Outcome::None
                 }
             }
-            ModalKind::CommandPalette => {
-                let Some(ModalDialog::CommandPalette(dialog)) = self.state.modal_dialog_mut()
-                else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme);
-                if let Some(event) = event {
-                    let run = matches!(
-                        event,
-                        crate::ui::command_palette::CommandPaletteEvent::Run(_)
-                    );
-                    self.state.apply_command_palette_event(event);
-                    if run {
-                        ctx.request_repaint();
-                    }
+            Some(ModalDialog::CommandPalette(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::CommandPalette),
+            Some(ModalDialog::ThemePicker(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::ThemePicker),
+        };
+
+        match outcome {
+            Outcome::None => {}
+            Outcome::Picker(event) => self.state.apply_picker_event(event),
+            Outcome::SpaceEditor(intent) => self.state.apply_space_editor_intent(intent),
+            Outcome::SessionPicker(event) => self.state.apply_session_picker_event(event),
+            Outcome::RenameSession(event) => self.state.apply_rename_session_event(event),
+            Outcome::RenameTab(event) => self.state.apply_rename_tab_event(event),
+            Outcome::Ditch(event) => self.state.apply_ditch_session_event(event),
+            Outcome::DismissKeybindHelp => self.state.dismiss_keybind_help(),
+            Outcome::CommandPalette(event) => {
+                let run = matches!(
+                    event,
+                    crate::ui::command_palette::CommandPaletteEvent::Run(_)
+                );
+                self.state.apply_command_palette_event(event);
+                if run {
+                    ctx.request_repaint();
                 }
             }
-            ModalKind::ThemePicker => {
-                let Some(ModalDialog::ThemePicker(dialog)) = self.state.modal_dialog_mut() else {
-                    return;
-                };
-                let event = dialog.show(ctx, theme);
-                if let Some(event) = event {
-                    let mut effects = Vec::new();
-                    self.state.apply_theme_picker_event(event, &mut effects);
-                    self.apply_effects(ctx, effects);
-                }
+            Outcome::ThemePicker(event) => {
+                // Preview, restore and select all run before the effects they produce.
+                let mut effects = Vec::new();
+                self.state.apply_theme_picker_event(event, &mut effects);
+                self.apply_effects(ctx, effects);
             }
         }
     }
