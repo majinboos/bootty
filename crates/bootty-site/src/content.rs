@@ -164,7 +164,7 @@ export, and selection serialization. The web build proves the Rust wasm package,
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 mise run test
-cargo test -p bootty-app --bench paint_plan --no-run
+mise run bench -- --ci-smoke
 ```
 
 The default test task includes offscreen WGPU readback tests. Keep executable

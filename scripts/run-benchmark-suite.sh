@@ -108,6 +108,7 @@ run_logged() {
 
 bench_targets=(
   paint_plan
+  pipeline_resources
   paint_plan_wgpu
   startup_config
   startup_milestones

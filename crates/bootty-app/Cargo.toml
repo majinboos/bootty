@@ -2,6 +2,7 @@
 name = "bootty-app"
 version.workspace = true
 edition.workspace = true
+autobenches = false
 
 [features]
 bootty-dev = ["bootty-identity/bootty-dev", "bootty-control/bootty-dev"]

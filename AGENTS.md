@@ -44,7 +44,7 @@ Default correctness gate for code changes:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 mise run test
-cargo test -p bootty-app --bench paint_plan --no-run
+mise run bench -- --ci-smoke
 ```
 
 The default Nextest run includes the WGPU integration target. Keep executable
@@ -55,11 +55,10 @@ Use targeted tests first while iterating, for example
 Cargo commands in parallel; concurrent Rust builds compete for CPU, memory, disk,
 and Cargo locks.
 
-For non-performance chores that need benchmark smoke coverage, use the fast
-CPU/egui benchmark harness:
+For non-performance chores, use the fast benchmark validation mode:
 
 ```bash
-cargo test -p bootty-app --bench paint_plan
+mise run bench -- --ci-smoke
 ```
 
 Compile release-profile or workspace benchmarks only when a change needs those
