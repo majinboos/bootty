@@ -85,6 +85,7 @@ fn fullscreen_status_content_offset(
 pub(crate) struct ChromeRuntime {
     app_icon_texture: Option<TextureHandle>,
     sidebar_space_swipe: chrome::SidebarSpaceSwipeState,
+    top_tabs_wrapped: bool,
 }
 
 impl ChromeRuntime {
@@ -313,24 +314,38 @@ impl ChromeView<'_> {
             right_rect.min,
             egui::vec2(right_rect.width(), bottom_base_status_height),
         );
+        let top_tabs_were_wrapped = self.chrome.top_tabs_wrapped;
         let [top_status_layout, bottom_status_layout] = [
             (
                 top_bar,
                 candidate_top_status_rect,
                 top_segments.as_slice(),
                 notch_span,
+                top_tabs_were_wrapped,
             ),
             (
                 bottom_bar,
                 candidate_bottom_status_rect,
                 bottom_segments.as_slice(),
                 None,
+                false,
             ),
         ]
-        .map(|(visible, rect, segments, notch)| {
-            visible
-                .then(|| chrome::status_bar_layout(ui, rect, segments, status_left_padding, notch))
+        .map(|(visible, rect, segments, notch, tabs_were_wrapped)| {
+            visible.then(|| {
+                chrome::status_bar_layout_with_tab_wrap(
+                    ui,
+                    rect,
+                    segments,
+                    status_left_padding,
+                    notch,
+                    tabs_were_wrapped,
+                )
+            })
         });
+        self.chrome.top_tabs_wrapped = top_status_layout
+            .as_ref()
+            .is_some_and(|layout| layout.row_count() > 1);
         let top_tab_row_count = top_status_layout
             .as_ref()
             .map_or(1, chrome::StatusBarLayout::row_count);

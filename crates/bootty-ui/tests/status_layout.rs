@@ -1,5 +1,8 @@
 use bootty_item::ModuleItem;
-use bootty_ui::status_layout::{Align, ResolvedItem, ResolvedSegment, status_bar_layout};
+use bootty_ui::status_layout::{
+    Align, ResolvedItem, ResolvedSegment, STATUS_NOTCH_WRAP_HYSTERESIS, item_width,
+    status_bar_layout, status_bar_layout_with_tab_wrap,
+};
 use eframe::egui::{self, Pos2, RawInput, Rect};
 
 fn tab(anchor: &str, text: &str) -> ModuleItem {
@@ -66,5 +69,64 @@ fn only_a_row_ending_tab_reports_a_complete_run() {
                 );
             },
         )
+        .drop_without_applying_deltas();
+}
+
+#[test]
+fn wrapped_tabs_need_clearance_before_collapsing() {
+    let items = [tab("w0", "window")];
+    let segments = [ResolvedSegment {
+        align: Align::Left,
+        wrappable: true,
+        items: items.iter().map(resolved).collect(),
+        ..ResolvedSegment::default()
+    }];
+    let context = egui::Context::default();
+
+    context
+        .run_ui(RawInput::default(), |ui| {
+            let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 30.0));
+            let width = item_width(ui, &segments[0].items[0], &egui::FontId::monospace(12.0));
+            let notch_right = width + 40.0;
+
+            assert_eq!(
+                status_bar_layout_with_tab_wrap(
+                    ui,
+                    bar,
+                    &segments,
+                    0.0,
+                    Some((width - 1.0, notch_right)),
+                    false,
+                )
+                .row_count(),
+                2
+            );
+            assert_eq!(
+                status_bar_layout_with_tab_wrap(
+                    ui,
+                    bar,
+                    &segments,
+                    0.0,
+                    Some((width + 2.0, notch_right)),
+                    true,
+                )
+                .row_count(),
+                2,
+                "a wrapped tab stays wrapped inside the hysteresis window"
+            );
+            assert_eq!(
+                status_bar_layout_with_tab_wrap(
+                    ui,
+                    bar,
+                    &segments,
+                    0.0,
+                    Some((width + STATUS_NOTCH_WRAP_HYSTERESIS + 1.0, notch_right)),
+                    true,
+                )
+                .row_count(),
+                1,
+                "tabs collapse after clearing the notch by the hysteresis margin"
+            );
+        })
         .drop_without_applying_deltas();
 }
