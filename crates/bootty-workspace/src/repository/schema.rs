@@ -84,23 +84,15 @@ pub(super) fn classify_schema(
                 .as_slice(),
             ),
             (
-                "workspace_session_groups",
-                ["id", "binding_id", "name", "position"].as_slice(),
-            ),
-            (
                 "workspace_sessions",
-                ["binding_id", "name", "group_id", "position"].as_slice(),
-            ),
-            (
-                "workspace_session_name_metadata",
                 [
+                    "identity",
                     "binding_id",
-                    "session_id",
-                    "cwd",
-                    "generated_name",
-                    "session_name",
+                    "backend_name",
                     "display_name",
                     "explicit",
+                    "cwd",
+                    "position",
                 ]
                 .as_slice(),
             ),
@@ -111,10 +103,10 @@ pub(super) fn classify_schema(
             (
                 "workspace_pending_binding_operations",
                 [
+                    "identity",
                     "space_id",
                     "binding_id",
                     "operation",
-                    "session_id",
                     "old_name",
                     "new_name",
                     "display_name",
@@ -234,6 +226,64 @@ pub(super) fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqli
     migration.and(foreign_keys)
 }
 
+/// Move name-keyed session state onto the identity-keyed table revision 4 uses.
+///
+/// Each session gets a provisional `legacy:<binding>:<name>` identity. Nothing carries that value,
+/// so the first successful refresh finds the session by its name hint and stamps a real one.
+///
+/// Pending journal rows are dropped: they were keyed by a backend session id nothing can be
+/// matched against now, and reconciliation would discard them on the next refresh anyway.
+pub(super) fn migrate_workspace_sessions_to_identities(
+    tx: &Transaction<'_>,
+) -> rusqlite::Result<()> {
+    let tables = user_tables(tx)?;
+    if !tables.contains("workspace_session_groups") {
+        return Ok(());
+    }
+
+    tx.execute_batch(
+        "CREATE TABLE workspace_sessions_by_identity (
+            identity TEXT PRIMARY KEY,
+            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            backend_name TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            explicit INTEGER NOT NULL DEFAULT 0,
+            cwd TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL,
+            UNIQUE(binding_id, position)
+        );
+        INSERT INTO workspace_sessions_by_identity
+            (identity, binding_id, backend_name, display_name, explicit, cwd, position)
+        SELECT
+            'legacy:' || s.binding_id || ':' || s.name,
+            s.binding_id,
+            s.name,
+            COALESCE(m.display_name, ''),
+            COALESCE(m.explicit, 0),
+            COALESCE(m.cwd, ''),
+            ROW_NUMBER() OVER (
+                PARTITION BY s.binding_id ORDER BY g.position, g.id, s.position
+            ) - 1
+        FROM workspace_sessions s
+        JOIN workspace_session_groups g ON g.id = s.group_id
+        LEFT JOIN workspace_session_name_metadata m
+            ON m.binding_id = s.binding_id
+           AND (m.session_name = s.name OR m.generated_name = s.name OR m.session_id = s.name);
+        DROP TABLE workspace_sessions;
+        DROP TABLE workspace_session_groups;
+        DROP TABLE workspace_session_name_metadata;
+        ALTER TABLE workspace_sessions_by_identity RENAME TO workspace_sessions;",
+    )?;
+
+    // The journal is rebuilt rather than altered: it is keyed by identity now, one row per
+    // session instead of one per binding. A database old enough not to have one yet gets the
+    // current shape from `create_workspace_schema` instead.
+    if tables.contains("workspace_pending_binding_operations") {
+        tx.execute_batch("DROP TABLE workspace_pending_binding_operations")?;
+    }
+    Ok(())
+}
+
 pub(super) fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_spaces (
@@ -256,46 +306,30 @@ pub(super) fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<
             selected_session_id TEXT,
             selected_window_id TEXT
         );
-        CREATE TABLE IF NOT EXISTS workspace_session_groups (
-            id INTEGER PRIMARY KEY,
-            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            position INTEGER NOT NULL,
-            UNIQUE(binding_id, position)
-        );
         CREATE TABLE IF NOT EXISTS workspace_sessions (
+            identity TEXT PRIMARY KEY,
             binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            group_id INTEGER NOT NULL REFERENCES workspace_session_groups(id) ON DELETE CASCADE,
-            position INTEGER NOT NULL,
-            PRIMARY KEY(binding_id, name),
-            UNIQUE(binding_id, group_id, position)
-        );
-        CREATE TABLE IF NOT EXISTS workspace_session_name_metadata (
-            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
-            session_id TEXT NOT NULL,
-            cwd TEXT NOT NULL,
-            generated_name TEXT NOT NULL,
-            session_name TEXT NOT NULL DEFAULT '',
+            backend_name TEXT NOT NULL,
             display_name TEXT NOT NULL DEFAULT '',
             explicit INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY(binding_id, session_id)
+            cwd TEXT NOT NULL DEFAULT '',
+            position INTEGER NOT NULL,
+            UNIQUE(binding_id, position)
         );
         CREATE TABLE IF NOT EXISTS workspace_window_state (
             window_key TEXT PRIMARY KEY,
             selected_space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS workspace_pending_binding_operations (
+            identity TEXT PRIMARY KEY,
             space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
             binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
             operation TEXT NOT NULL,
-            session_id TEXT NOT NULL,
             old_name TEXT,
             new_name TEXT,
             display_name TEXT,
             explicit INTEGER,
-            cwd TEXT,
-            PRIMARY KEY(space_id, binding_id)
+            cwd TEXT
         );",
     )
 }
@@ -361,26 +395,6 @@ pub(super) fn migrate_workspace_space_appearance(tx: &Transaction<'_>) -> rusqli
         &columns,
         "tint_sidebar",
         "ALTER TABLE workspace_spaces ADD COLUMN tint_sidebar INTEGER NOT NULL DEFAULT 0",
-    )
-}
-
-pub(super) fn migrate_workspace_session_name_metadata(
-    tx: &Transaction<'_>,
-) -> rusqlite::Result<()> {
-    let columns = table_columns(tx, "workspace_session_name_metadata")?;
-    add_column_if_missing(
-        tx,
-        &columns,
-        "session_name",
-        "ALTER TABLE workspace_session_name_metadata
-         ADD COLUMN session_name TEXT NOT NULL DEFAULT ''",
-    )?;
-    add_column_if_missing(
-        tx,
-        &columns,
-        "display_name",
-        "ALTER TABLE workspace_session_name_metadata
-         ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
     )
 }
 

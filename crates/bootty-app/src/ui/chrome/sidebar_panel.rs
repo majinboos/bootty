@@ -1,5 +1,5 @@
 use bootty_extension::{ExtensionUiAction, PublishedSurfaceItem};
-use bootty_mux::controller::MuxScope;
+use bootty_mux::controller::{MuxScope, SpaceId};
 use bootty_ui::{ThemePalette, mix};
 use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
@@ -22,6 +22,8 @@ pub struct SidebarModel<'a> {
     pub separator_visible: bool,
     pub focused: bool,
     pub hovered_session: Option<&'a ScopedSessionTarget>,
+    /// The Spaces the hovered session's context menu can hand it to.
+    pub move_targets: &'a [SpaceMoveTarget],
     /// Explicit color overrides from `[sidebar]`; each falls back to a theme-derived tint.
     pub fullscreen: bool,
     pub hover_override: Option<egui::Color32>,
@@ -56,6 +58,19 @@ pub enum SessionContextAction {
     MoveDown,
     Detach,
     Ditch,
+    MoveToSpace(SpaceId),
+}
+
+/// A Space a session can be handed to, as the move menu shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceMoveTarget {
+    pub id: SpaceId,
+    pub name: String,
+    pub icon: String,
+    /// Whether the move is possible at all: a session cannot change multiplexers.
+    pub reachable: bool,
+    /// Whether this is the Space the session is already in.
+    pub current: bool,
 }
 
 const SIDEBAR_HEADER_HEIGHT: f32 = 44.0;
@@ -258,6 +273,7 @@ pub fn show_sidebar(
                 item.reorder_anchor.is_some() && position + 1 < binding_session_count,
                 binding_session_count > 1,
                 item.can_return_to_last_session,
+                model.move_targets,
             )
         {
             event = Some(SidebarEvent::ContextAction {
@@ -324,9 +340,19 @@ fn session_context_action(
     can_move_down: bool,
     can_navigate: bool,
     can_return_to_last_session: bool,
+    move_targets: &[SpaceMoveTarget],
 ) -> Option<SessionContextAction> {
     use SessionContextAction as A;
     use bootty_ui::menu::MenuEntry as E;
+    // A Space on another multiplexer stays listed but disabled: "not from here" is a more useful
+    // answer than an absent entry the user has to guess the reason for.
+    let mut spaces = move_targets
+        .iter()
+        .filter(|target| !target.current)
+        .map(|target| E::enabled_item(target.reachable, &target.name, A::MoveToSpace(target.id)))
+        .collect::<Vec<_>>();
+    spaces.push(E::Separator);
+    spaces.push(E::item("Nothing (unassign)", A::Detach));
     bootty_ui::menu::context_menu(
         response,
         &[
@@ -347,7 +373,7 @@ fn session_context_action(
             E::enabled_item(can_move_up, "Move Session Up", A::MoveUp),
             E::enabled_item(can_move_down, "Move Session Down", A::MoveDown),
             E::Separator,
-            E::item("Detach from Space", A::Detach),
+            E::submenu("Move to Space", spaces),
             E::item("Ditch Session…", A::Ditch),
         ],
     )

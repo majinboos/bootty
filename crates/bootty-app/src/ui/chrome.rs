@@ -15,7 +15,8 @@ pub use bootty_ui::status_layout::{
 };
 pub(crate) use sidebar_panel::MACOS_TITLEBAR_BUTTON_SAFE_WIDTH;
 pub use sidebar_panel::{
-    SessionContextAction, SidebarEvent, SidebarModel, show_sidebar, sidebar_drop_target,
+    SessionContextAction, SidebarEvent, SidebarModel, SpaceMoveTarget, show_sidebar,
+    sidebar_drop_target,
 };
 pub(crate) use space_switcher::SPACE_SWITCHER_HEIGHT;
 pub use space_switcher::{

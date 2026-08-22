@@ -4,7 +4,9 @@ use anyhow::Result;
 use bootty_mux::{
     backend::MuxBackend,
     command::{MuxCommand, MuxDirection, MuxSplitDirection},
-    snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot, MuxSnapshotDisposition, MuxWindow},
+    snapshot::{
+        MuxPaneAnchor, MuxSession, MuxSessionTag, MuxSnapshot, MuxSnapshotDisposition, MuxWindow,
+    },
 };
 use bootty_rmux::RmuxBackend;
 
@@ -101,10 +103,12 @@ fn rmux_backend_forwards_every_control_command_unchanged() {
         MuxCommand::CreateProjectSession {
             session_id: "project".to_owned(),
             cwd: "/repo".to_owned(),
+            tag: MuxSessionTag::default(),
         },
         MuxCommand::CreateWorktreeSession {
             session_id: "worktree".to_owned(),
             cwd: "/repo/worktree".to_owned(),
+            tag: MuxSessionTag::default(),
         },
         MuxCommand::RenameSession {
             session_id: "project".to_owned(),
@@ -152,6 +156,7 @@ fn session_with_panes(panes: Vec<MuxPaneAnchor>) -> MuxSession {
             layout: None,
             progress: None,
         }],
+        tag: MuxSessionTag::default(),
     }
 }
 

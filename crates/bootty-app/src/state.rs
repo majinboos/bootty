@@ -205,10 +205,8 @@ fn terminal_report_variable_response(name: &str, session_name: Option<&str>) -> 
     }
 }
 
-pub(super) fn new_mux_session_request_with_name(
-    config: &BoottyConfig,
-    name: impl Into<String>,
-) -> crate::ui::new_session_picker::NewMuxSessionRequest {
+/// Where a session starts when nothing else says otherwise.
+pub(super) fn default_session_cwd(config: &BoottyConfig) -> String {
     let cwd = config
         .session
         .working_directory
@@ -222,10 +220,7 @@ pub(super) fn new_mux_session_request_with_name(
                 .unwrap_or(std::path::Path::new("."))
                 .to_owned()
         });
-    crate::ui::new_session_picker::NewMuxSessionRequest {
-        session_id: name.into(),
-        cwd: cwd.to_string_lossy().into_owned(),
-    }
+    cwd.to_string_lossy().into_owned()
 }
 
 impl AppState {
@@ -894,15 +889,54 @@ impl AppState {
         }
     }
     pub fn detach_scoped_session_from_space(&mut self, target: &ScopedSessionTarget) -> bool {
-        let result = self
-            .workspace
-            .detach_session_from_space(target.scope, &target.session_id);
+        let result = self.workspace.detach_session_from_space(
+            target.scope,
+            &target.session_id,
+            &self.repaint,
+        );
         let changed = self.apply_workspace_change(result);
         if changed {
             (self.repaint)();
         }
         changed
     }
+    pub fn move_scoped_session_to_space(
+        &mut self,
+        target: &ScopedSessionTarget,
+        space_id: SpaceId,
+    ) -> bool {
+        let result = self.workspace.move_session_to_space(
+            target.scope,
+            &target.session_id,
+            space_id,
+            &self.repaint,
+        );
+        let changed = self.apply_workspace_change(result);
+        if changed {
+            (self.repaint)();
+        }
+        changed
+    }
+
+    /// The Spaces `target` could move to, in switcher order, for the sidebar's move menu.
+    pub fn session_move_targets(
+        &self,
+        target: &ScopedSessionTarget,
+    ) -> Vec<crate::ui::chrome::SpaceMoveTarget> {
+        self.workspace
+            .spaces()
+            .map(|space| crate::ui::chrome::SpaceMoveTarget {
+                id: space.id,
+                name: space.name.clone(),
+                icon: space.icon.clone(),
+                reachable: self
+                    .workspace
+                    .session_move_is_possible(target.scope, space.id),
+                current: space.binding.scope == target.scope,
+            })
+            .collect()
+    }
+
     pub fn take_terminal_find_dialog(&mut self) -> Option<TerminalFindDialog> {
         self.terminal_interaction.take_find_dialog()
     }
@@ -1251,7 +1285,7 @@ impl AppState {
             .active
             .binding
             .clear_pending_generated_names();
-        if let Err(error) = self.workspace.reconcile_binding_states() {
+        if let Err(error) = self.workspace.reconcile_binding_states(&self.repaint) {
             warnings.push(error.to_string());
         }
         if self.config_runtime.has_new_session_config_changes() {

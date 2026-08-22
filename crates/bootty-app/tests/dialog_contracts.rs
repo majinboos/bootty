@@ -15,7 +15,7 @@ use bootty_app::{
 use bootty_config::config::{AppearanceVariant, BoottyConfig};
 use bootty_mux::{
     controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use bootty_ui::icons::install_icon_fonts;
 use bootty_workspace::SpaceMuxOverride;
@@ -93,6 +93,7 @@ fn session_picker_activates_the_selected_session() {
             ..MuxPaneAnchor::default()
         },
         active_window_id: None,
+        tag: MuxSessionTag::default(),
         windows: Vec::new(),
     };
     let groups = [BindingSessionGroup {

@@ -11,7 +11,7 @@ use bootty_app::{
 use bootty_config::{color::Color, config::BoottyConfig};
 use bootty_mux::{
     controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use egui::{Color32, Event, Key, Modifiers};
 
@@ -45,6 +45,7 @@ fn session(id: &str, name: &str) -> MuxSession {
             ..Default::default()
         },
         active_window_id: None,
+        tag: MuxSessionTag::default(),
         windows: Vec::new(),
     }
 }

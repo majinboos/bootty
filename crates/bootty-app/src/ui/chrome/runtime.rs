@@ -478,6 +478,12 @@ impl ChromeView<'_> {
                         &space_items,
                         &mut self.chrome.sidebar_space_swipe,
                     );
+                    // The move menu lists Spaces for whichever row the pointer is over.
+                    let move_targets = self
+                        .state
+                        .sidebar_hovered_session()
+                        .map(|target| self.state.session_move_targets(target))
+                        .unwrap_or_default();
                     let title_icon = title_visible.then(|| {
                         chrome::load_app_icon_texture(ui.ctx(), &mut self.chrome.app_icon_texture)
                     });
@@ -498,6 +504,7 @@ impl ChromeView<'_> {
                             separator_visible: false,
                             focused: self.state.sidebar_focused(),
                             hovered_session: self.state.sidebar_hovered_session(),
+                            move_targets: &move_targets,
                             fullscreen: fullscreen_chrome,
                             hover_override: sidebar_cfg.hover.map(crate::theme::config_color32),
                             current_override: sidebar_cfg

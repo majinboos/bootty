@@ -14,18 +14,25 @@ use bootty_workspace::SpaceRemoteOverride;
 pub(super) struct RealizedMuxBinding {
     pub(super) config: MultiplexerConfig,
     pub(super) availability_error: Option<String>,
+    /// The Space id stamped onto sessions this binding creates.
+    ///
+    /// A remote binding uses the id the host on the far side knows the Space by, because that is
+    /// what its daemon filters on. Everything else uses the Space's own portable id.
+    pub(super) space_tag: String,
 }
 
 pub(super) fn realize_binding(
     config: &BoottyConfig,
     backend_override: Option<MultiplexerBackendConfig>,
     remote_override: &SpaceRemoteOverride,
+    space_tag: String,
 ) -> RealizedMuxBinding {
     realize_binding_from(
         &config.multiplexer,
         &config.ssh_profiles,
         backend_override,
         remote_override,
+        space_tag,
     )
 }
 
@@ -34,6 +41,7 @@ pub(super) fn realize_binding_from(
     ssh_profiles: &BTreeMap<String, SshProfileConfig>,
     backend_override: Option<MultiplexerBackendConfig>,
     remote_override: &SpaceRemoteOverride,
+    space_tag: String,
 ) -> RealizedMuxBinding {
     let mut config = product.clone();
 
@@ -75,6 +83,7 @@ pub(super) fn realize_binding_from(
     }
 
     RealizedMuxBinding {
+        space_tag: config.remote_space_id.clone().unwrap_or(space_tag),
         config,
         availability_error,
     }

@@ -89,7 +89,7 @@ impl AppState {
     ) -> Option<MuxCommand> {
         if matches!(target, ExactMuxTarget::Binding(_)) {
             return matches!(action, ExactMuxAction::NewTab).then(|| {
-                let cwd = super::new_mux_session_request_with_name(self.config(), "").cwd;
+                let cwd = super::default_session_cwd(self.config());
                 self.workspace.project_session_command(&cwd)
             });
         }

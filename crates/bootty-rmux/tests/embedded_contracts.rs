@@ -5,7 +5,12 @@ use std::thread;
 
 use anyhow::Result;
 use bootty_identity::ApplicationIdentity;
-use bootty_mux::{command::MuxCommand, provider::MuxBackendRegistry, terminal::ActiveTerminal};
+use bootty_mux::{
+    command::MuxCommand,
+    provider::MuxBackendRegistry,
+    snapshot::{MuxSessionTag, new_session_identity},
+    terminal::ActiveTerminal,
+};
 use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 use bootty_rmux::{RmuxBackend, endpoint_path_for};
 use bootty_runtime::{frame_source::TerminalFrameSource, terminal_session::TerminalSessionConfig};
@@ -64,9 +69,14 @@ fn embedded_rmux_owns_session_lifecycle_without_an_external_executable_helper() 
     let registry = std::sync::Arc::new(MuxBackendRegistry::collect([MuxBackendKind::Rmux])?);
     let session_id = format!("bootty-mux-contract-{}", std::process::id());
     let mut backend = RmuxBackend::new();
+    let tag = MuxSessionTag {
+        identity: Some(new_session_identity()),
+        space: Some("space-under-test".to_owned()),
+    };
     backend.execute(MuxCommand::CreateProjectSession {
         session_id: session_id.clone(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        tag: tag.clone(),
     })?;
 
     let snapshot = backend.snapshot()?;
@@ -75,6 +85,9 @@ fn embedded_rmux_owns_session_lifecycle_without_an_external_executable_helper() 
         .iter()
         .find(|session| session.id == session_id)
         .expect("created rmux session");
+    // The whole membership design rests on rmux resolving `@` user options inside a list format,
+    // the same way tmux does. If that ever stops holding, every Space claim silently empties.
+    assert_eq!(session.tag, tag, "rmux reports the tag bootty stamped");
     let window = session.windows.first().expect("created rmux window");
     let pane = window.panes.first().expect("created rmux pane").clone();
 
@@ -271,6 +284,10 @@ fn create_embedded_session() -> Result<(
     backend.execute(MuxCommand::CreateProjectSession {
         session_id: session_id.clone(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        tag: MuxSessionTag {
+            identity: Some(new_session_identity()),
+            space: None,
+        },
     })?;
 
     let snapshot = backend.snapshot()?;

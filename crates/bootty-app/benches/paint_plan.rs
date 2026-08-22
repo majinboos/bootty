@@ -12,7 +12,7 @@ use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
 use bootty_extension::{ModuleItem, PublishedSurfaceItem};
 use bootty_mux::{
     controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag, MuxWindow},
 };
 use bootty_render::{
     geometry::ViewTransform,
@@ -77,6 +77,7 @@ fn sidebar_sessions(count: usize) -> Vec<MuxSession> {
                 active: index == 0,
                 anchor: anchor.clone(),
                 active_window_id: None,
+                tag: MuxSessionTag::default(),
                 windows: (0..3)
                     .map(|window| MuxWindow {
                         id: format!("@{}:{window}", index + 1),
@@ -600,6 +601,7 @@ fn bench_sidebar_ui(c: &mut Criterion) {
                                 bootty_ui::ThemePalette::default(),
                                 900.0,
                                 SidebarModel {
+                                    move_targets: &[],
                                     items: black_box(&items),
                                     footer_items: &[],
                                     session_count: group.sessions.len(),
@@ -665,6 +667,7 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
                                 bootty_ui::ThemePalette::default(),
                                 900.0,
                                 SidebarModel {
+                                    move_targets: &[],
                                     items: black_box(&items),
                                     footer_items: black_box(&footer_items),
                                     session_count: group.sessions.len(),

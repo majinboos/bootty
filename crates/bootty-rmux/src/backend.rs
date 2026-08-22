@@ -1,5 +1,10 @@
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
-use rmux_proto::{ListPanesRequest, ListWindowsRequest, Request, Response};
+use rmux_proto::{
+    ListPanesRequest, ListSessionsRequest, ListWindowsRequest, OptionScopeSelector, Request,
+    Response, SetOptionByNameRequest, SetOptionMode, ShowOptionsRequest,
+};
 use rmux_sdk::{Rmux, SessionName};
 
 #[cfg(feature = "app")]
@@ -10,7 +15,8 @@ use bootty_mux::{
     backend::MuxBackend,
     command::MuxCommand,
     snapshot::{
-        MuxPaneAnchor, MuxPaneLayout, MuxSession, MuxSnapshot, MuxSnapshotDisposition, MuxWindow,
+        MuxPaneAnchor, MuxPaneLayout, MuxSession, MuxSessionTag, MuxSnapshot,
+        MuxSnapshotDisposition, MuxWindow, SESSION_IDENTITY_OPTION, SESSION_SPACE_OPTION,
     },
     tmux_compatible_layout::{parse, parse_with_checksum},
 };
@@ -23,6 +29,8 @@ use bootty_mux::{
 const RMUX_FIELD_SEPARATOR: char = '\u{1f}';
 pub(crate) const RMUX_WINDOW_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{window_index}\u{1f}#{window_active}\u{1f}#{window_name}\u{1f}#{window_layout}";
 pub(crate) const RMUX_PANE_FORMAT: &str = "#{session_name}\u{1f}#{window_id}\u{1f}#{pane_id}\u{1f}#{pane_index}\u{1f}#{pane_active}\u{1f}#{pane_current_path}\u{1f}#{pane_current_command}";
+/// Names and rename-stable ids, which is what the Bootty tag is keyed by.
+pub(crate) const RMUX_SESSION_ID_FORMAT: &str = "#{session_name}\u{1f}#{session_id}";
 
 pub struct RmuxBackend<C = RmuxControl> {
     control: C,
@@ -99,6 +107,7 @@ pub fn rmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
             BindingOperation::SplitPane,
             BindingOperation::ClosePane,
             BindingOperation::CreateProjectSession,
+            BindingOperation::StampSession,
             BindingOperation::CreateWorktreeSession,
             BindingOperation::RenameSession,
             BindingOperation::DitchSession,
@@ -121,6 +130,27 @@ impl MuxBackend for RmuxControl {
 #[cfg(feature = "app")]
 pub(crate) fn resize_bootty_rmux_window(window_id: &str, cols: u16, rows: u16) -> Result<()> {
     resize_rmux_window(window_id, cols, rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only ids below the highest live session are dead. rmux hands out increasing ids, so an
+    /// option above every live one belongs to a session that is still being created.
+    #[test]
+    fn a_tag_option_is_matched_to_its_session_id_and_nothing_else() {
+        assert_eq!(tag_option_id("@bootty_id_3"), Some(3));
+        assert_eq!(tag_option_id("@bootty_space_12"), Some(12));
+        assert_eq!(tag_option_id("@bootty_id"), None);
+        assert_eq!(tag_option_id("@someone_elses_option_3"), None);
+        assert_eq!(tag_option_id("@bootty_id_notanumber"), None);
+        assert_eq!(numeric_session_id("$7"), Some(7));
+        assert_eq!(
+            session_tag_option("$7", SESSION_IDENTITY_OPTION),
+            "@bootty_id_7"
+        );
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,6 +292,7 @@ fn rmux_window_layout(raw: &str) -> Option<MuxPaneLayout> {
 
 pub(crate) fn session_from_rows(
     name: &str,
+    tag: MuxSessionTag,
     window_rows: &[RmuxWindowRow],
     pane_rows: &[RmuxPaneRow],
 ) -> MuxSession {
@@ -345,7 +376,149 @@ pub(crate) fn session_from_rows(
         anchor,
         active_window_id,
         windows,
+        tag,
     }
+}
+
+/// The Bootty tag for one rmux session, at server scope, keyed by the session's stable id.
+///
+/// tmux hangs options off the session itself, so a tag written there survives a rename from
+/// anywhere. rmux keys its option store by session *name* and does not migrate it on rename
+/// (`rmux-core::session::store::rename_session` rekeys leases, subscriptions and attaches, but not
+/// options), so a session-scoped tag would be orphaned by a rename bootty did not issue. Keying on
+/// `session_id` -- which rmux documents as its stable identity -- gets the same guarantee.
+fn session_tag_option(session_id: &str, option: &str) -> String {
+    // rmux renders session ids as `$3`; the sigil buys nothing inside an option name.
+    format!("{option}_{}", session_id.trim_start_matches('$'))
+}
+
+/// Every session's name and stable id, in rmux's own order.
+async fn list_session_ids() -> Result<Vec<(String, String)>> {
+    let response = rmux_request(Request::ListSessions(ListSessionsRequest {
+        format: Some(RMUX_SESSION_ID_FORMAT.to_owned()),
+        filter: None,
+        sort_order: None,
+        reversed: false,
+    }))
+    .await?;
+    let Response::ListSessions(response) = response else {
+        anyhow::bail!("rmux returned an unexpected list-sessions response");
+    };
+    Ok(String::from_utf8_lossy(&response.output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(RMUX_FIELD_SEPARATOR);
+            let name = fields.next().and_then(non_empty_rmux_field)?;
+            let id = fields.next().and_then(non_empty_rmux_field)?;
+            Some((name, id))
+        })
+        .collect())
+}
+
+/// Every `@`-prefixed server option, which is where the tags live.
+async fn server_user_options() -> Result<HashMap<String, String>> {
+    let response = rmux_request(Request::ShowOptions(ShowOptionsRequest {
+        scope: OptionScopeSelector::ServerGlobal,
+        name: None,
+        value_only: false,
+        include_inherited: false,
+        quiet: true,
+        include_hooks: false,
+    }))
+    .await?;
+    let Response::ShowOptions(response) = response else {
+        anyhow::bail!("rmux returned an unexpected show-options response");
+    };
+    Ok(String::from_utf8_lossy(&response.output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('@'))
+        .filter_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            Some((name.to_owned(), value.to_owned()))
+        })
+        .collect())
+}
+
+/// The tag each live session carries, keyed by session name.
+///
+/// Also clears tags left behind by sessions that are gone, since rmux reuses a session id once
+/// nothing holds it and a stale option would be inherited by whatever takes that id next.
+pub(crate) async fn list_session_tags(_rmux: &Rmux) -> Result<HashMap<String, MuxSessionTag>> {
+    let sessions = list_session_ids().await?;
+    let mut options = server_user_options().await?;
+    let mut tags = HashMap::with_capacity(sessions.len());
+    let mut highest = 0;
+    for (name, id) in &sessions {
+        highest = highest.max(numeric_session_id(id).unwrap_or(0));
+        let tag = MuxSessionTag {
+            identity: options.remove(&session_tag_option(id, SESSION_IDENTITY_OPTION)),
+            space: options.remove(&session_tag_option(id, SESSION_SPACE_OPTION)),
+        };
+        if !tag.is_empty() {
+            tags.insert(name.clone(), tag);
+        }
+    }
+
+    // Only ids below the highest live one are safely dead. rmux hands out increasing ids, so an
+    // id above every live session belongs to one that was created but is not in this listing yet
+    // -- pruning it would throw away the tag of a session mid-creation.
+    let stale = options
+        .keys()
+        .filter(|name| tag_option_id(name).is_some_and(|id| id < highest))
+        .cloned()
+        .collect::<Vec<_>>();
+    for option in stale {
+        set_server_option(&option, None).await?;
+    }
+    Ok(tags)
+}
+
+fn numeric_session_id(session_id: &str) -> Option<u32> {
+    session_id.trim_start_matches('$').parse().ok()
+}
+
+/// The session id a tag option is keyed by, for the options bootty owns.
+fn tag_option_id(option: &str) -> Option<u32> {
+    [SESSION_IDENTITY_OPTION, SESSION_SPACE_OPTION]
+        .into_iter()
+        .find_map(|owned| option.strip_prefix(owned)?.strip_prefix('_'))
+        .and_then(|id| id.parse().ok())
+}
+
+/// Writes one server option, or clears it when `value` is `None`.
+async fn set_server_option(name: &str, value: Option<&str>) -> Result<()> {
+    rmux_request_checked(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+        scope: OptionScopeSelector::ServerGlobal,
+        name: name.to_owned(),
+        value: value.map(str::to_owned),
+        mode: SetOptionMode::Replace,
+        only_if_unset: false,
+        unset: value.is_none(),
+        unset_pane_overrides: false,
+        format: false,
+        format_target: None,
+    })))
+    .await
+}
+
+/// Writes `tag` onto the named session. A half that is `None` is a claim being dropped, so it
+/// clears its option rather than writing an empty value.
+pub(crate) async fn stamp_session_tag(name: &SessionName, tag: &MuxSessionTag) -> Result<()> {
+    let name = name.to_string();
+    let Some((_, id)) = list_session_ids()
+        .await?
+        .into_iter()
+        .find(|(session, _)| *session == name)
+    else {
+        anyhow::bail!("rmux session {name} is unavailable")
+    };
+    for (option, value) in [
+        (SESSION_IDENTITY_OPTION, tag.identity.as_deref()),
+        (SESSION_SPACE_OPTION, tag.space.as_deref()),
+    ] {
+        set_server_option(&session_tag_option(&id, option), value).await?;
+    }
+    Ok(())
 }
 
 fn anchor_for_pane_row(session_name: &str, pane: &RmuxPaneRow) -> MuxPaneAnchor {

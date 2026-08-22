@@ -19,7 +19,7 @@ use crate::{
     capability::{BindingOperation, BindingOperationOutcome},
     command::MuxCommand,
     provider::{MuxBackendRegistry, MuxCommandDispatch},
-    snapshot::{MuxSession, MuxSnapshot, selection_after_refresh, session_matches},
+    snapshot::{MuxSession, MuxSessionTag, MuxSnapshot, selection_after_refresh, session_matches},
 };
 
 pub type RepaintHandle = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -53,6 +53,8 @@ pub fn mux_session_refresh_interval(focused: bool) -> Duration {
 pub struct NewMuxSessionRequest {
     pub session_id: String,
     pub cwd: String,
+    /// What the new session is stamped with. See [`MuxCommand::CreateProjectSession`].
+    pub tag: MuxSessionTag,
 }
 
 type SessionRefreshSnapshot = std::result::Result<(MuxBackendKind, MuxSnapshot), String>;
@@ -310,7 +312,8 @@ fn command_session_id(command: &MuxCommand) -> &str {
         | MuxCommand::CreateProjectSession { session_id, .. }
         | MuxCommand::CreateWorktreeSession { session_id, .. }
         | MuxCommand::RenameSession { session_id, .. }
-        | MuxCommand::DitchSession { session_id } => session_id,
+        | MuxCommand::DitchSession { session_id }
+        | MuxCommand::StampSession { session_id, .. } => session_id,
     }
 }
 
@@ -1148,6 +1151,7 @@ impl MuxController {
         let command = MuxCommand::CreateProjectSession {
             session_id: request.session_id.clone(),
             cwd: request.cwd,
+            tag: request.tag,
         };
         self.expected_session = Some(request.session_id.clone());
         if self.registry.command_dispatch(config) == MuxCommandDispatch::CallerThread {

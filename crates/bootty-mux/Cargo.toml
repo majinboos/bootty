@@ -18,6 +18,7 @@ bootty-mux-model = { path = "../bootty-mux-model" }
 bootty-write = { path = "../bootty-write" }
 anyhow.workspace = true
 derive_more = { workspace = true, optional = true }
+getrandom.workspace = true
 inventory.workspace = true
 serde.workspace = true
 strum.workspace = true

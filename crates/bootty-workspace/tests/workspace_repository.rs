@@ -6,8 +6,8 @@ use bootty_mux::{
     membership::BackendMembership,
 };
 use bootty_workspace::{
-    BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SessionNameStore,
-    SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride, WorkspaceRepository,
+    BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SessionMembership,
+    SpaceMuxOverride, SpaceRemoteOverride, WorkspaceRepository, WorkspaceSession,
     WorkspaceSnapshot,
 };
 use rusqlite::Connection;
@@ -40,20 +40,34 @@ impl LoadedRepository {
             .map(|binding| binding.mux_scope().binding_id())
     }
 
-    fn session_order(&self, binding_id: BindingId) -> Option<SessionOrderStore> {
+    fn sessions(&self, binding_id: BindingId) -> Option<SessionMembership> {
         self.spaces()
             .iter()
             .flat_map(|space| space.bindings())
             .find(|binding| binding.mux_scope().binding_id() == binding_id)
-            .map(|binding| binding.session_order().clone())
+            .map(|binding| binding.sessions().clone())
     }
+}
 
-    fn session_names(&self, binding_id: BindingId) -> Option<SessionNameStore> {
-        self.spaces()
-            .iter()
-            .flat_map(|space| space.bindings())
-            .find(|binding| binding.mux_scope().binding_id() == binding_id)
-            .map(|binding| binding.session_names().clone())
+fn session(identity: &str, backend_name: &str) -> WorkspaceSession {
+    WorkspaceSession {
+        identity: identity.to_owned(),
+        backend_name: backend_name.to_owned(),
+        display_name: String::new(),
+        explicit: false,
+        cwd: "/worktree".to_owned(),
+    }
+}
+
+fn backend_names(sessions: &SessionMembership) -> Vec<String> {
+    sessions.backend_names()
+}
+
+fn membership(id: &str, name: &str, identity: &str) -> BackendMembership {
+    BackendMembership {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        identity: Some(identity.to_owned()),
     }
 }
 
@@ -213,15 +227,15 @@ fn the_single_binding_schema_migration_preserves_binding_and_restore_state() {
             .map(|selection| (selection.session_id(), selection.window_id(),)),
         Some(("session-1", Some("window-1")))
     );
-    assert_eq!(binding.session_order().session_names(), vec!["session-1"]);
-    let record = binding
-        .session_names()
-        .record("session-1")
-        .expect("session name metadata");
-    assert!(record.explicit);
-    assert_eq!(record.cwd, "/worktree");
-    assert_eq!(record.generated_name, "generated");
-    assert_eq!(record.display_name, "Display");
+    // Sessions come across under a provisional identity. Nothing in any multiplexer carries that
+    // value, so the first successful refresh finds each one by its name and stamps a real id.
+    let claimed = binding.sessions().sessions();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].identity, "legacy:9:session-1");
+    assert_eq!(claimed[0].backend_name, "session-1");
+    assert_eq!(claimed[0].label(), "Display");
+    assert!(claimed[0].explicit);
+    assert_eq!(claimed[0].cwd, "/worktree");
 }
 
 #[test]
@@ -368,34 +382,26 @@ fn a_multi_binding_commit_is_atomic_when_the_second_binding_fails() {
         .expect("second space");
     let second_binding = second_space.bindings()[0].clone();
 
-    let mut first_order = first_binding.session_order().clone();
-    let mut second_order = second_binding.session_order().clone();
-    first_order.add_session("first-old");
-    second_order.add_session("second-old");
+    let mut first = first_binding.sessions().clone();
+    let mut second = second_binding.sessions().clone();
+    first.claim(session("id-1", "first-old"));
+    second.claim(session("id-2", "second-old"));
     repository
         .commit_binding_states(&[
-            (
-                first_binding.mux_scope(),
-                first_order.clone(),
-                first_binding.session_names().clone(),
-            ),
-            (
-                second_binding.mux_scope(),
-                second_order.clone(),
-                second_binding.session_names().clone(),
-            ),
+            (first_binding.mux_scope(), first.clone()),
+            (second_binding.mux_scope(), second.clone()),
         ])
         .expect("commit baseline binding states");
 
-    first_order.add_session("first-new");
-    second_order.add_session("second-new");
+    first.claim(session("id-3", "first-new"));
+    second.claim(session("id-4", "second-new"));
     let database = directory.path().join("session-order.sqlite3");
     let connection = Connection::open(&database).expect("open workspace database");
     connection
         .execute_batch(&format!(
             "CREATE TRIGGER fail_second_binding_session
              BEFORE INSERT ON workspace_sessions
-             WHEN NEW.binding_id = {} AND NEW.name = 'second-new'
+             WHEN NEW.binding_id = {} AND NEW.backend_name = 'second-new'
              BEGIN
                  SELECT RAISE(ABORT, 'forced second binding failure');
              END;",
@@ -406,33 +412,25 @@ fn a_multi_binding_commit_is_atomic_when_the_second_binding_fails() {
 
     repository
         .commit_binding_states(&[
-            (
-                first_binding.mux_scope(),
-                first_order,
-                first_binding.session_names().clone(),
-            ),
-            (
-                second_binding.mux_scope(),
-                second_order,
-                second_binding.session_names().clone(),
-            ),
+            (first_binding.mux_scope(), first),
+            (second_binding.mux_scope(), second),
         ])
         .expect_err("the second binding failure must roll back the first binding");
     drop(repository);
 
     let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
-    let stored_orders = reopened
+    let stored = reopened
         .spaces()
         .iter()
         .flat_map(|space| space.bindings())
-        .map(|binding| (binding.mux_scope(), binding.session_order().session_names()))
+        .map(|binding| (binding.mux_scope(), backend_names(binding.sessions())))
         .collect::<std::collections::HashMap<_, _>>();
     assert_eq!(
-        stored_orders.get(&first_binding.mux_scope()),
+        stored.get(&first_binding.mux_scope()),
         Some(&vec!["first-old".to_owned()])
     );
     assert_eq!(
-        stored_orders.get(&second_binding.mux_scope()),
+        stored.get(&second_binding.mux_scope()),
         Some(&vec!["second-old".to_owned()])
     );
 }
@@ -443,11 +441,11 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
     let binding = repository.spaces()[0].bindings()[0].clone();
     let scope = binding.mux_scope();
     let mutation = BindingMembershipMutation::Create {
-        session_id: "created-id".to_owned(),
+        identity: "id-1".to_owned(),
         session_name: "created-name".to_owned(),
         display_name: "created-name".to_owned(),
         explicit: true,
-        cwd: Some("/worktree".to_owned()),
+        cwd: "/worktree".to_owned(),
     };
     repository
         .begin_binding_membership_mutation(scope, &mutation)
@@ -459,58 +457,53 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
         .execute_batch(
             "CREATE TRIGGER fail_remote_metadata_commit
              BEFORE INSERT ON workspace_sessions
-             WHEN NEW.name = 'created-name'
+             WHEN NEW.backend_name = 'created-name'
              BEGIN
                  SELECT RAISE(ABORT, 'forced remote metadata failure');
              END;",
         )
         .expect("install metadata failure");
-    let mut order = binding.session_order().clone();
-    let mut names = binding.session_names().clone();
+    let mut sessions = binding.sessions().clone();
     repository
-        .commit_binding_membership_mutation(scope, &mutation, &mut order, &mut names)
+        .commit_binding_membership_mutation(scope, &mutation, &mut sessions)
         .expect_err("metadata failure must retain the binding operation journal");
-    assert!(order.session_names().is_empty());
+    assert!(sessions.is_empty());
     assert_eq!(
         repository
-            .pending_binding_membership_mutation(scope)
-            .expect("read pending mutation")
-            .as_ref()
-            .map(|pending| pending.mutation()),
-        Some(&mutation)
+            .pending_binding_membership_mutations(scope)
+            .expect("read pending mutations")
+            .iter()
+            .map(|pending| pending.mutation())
+            .collect::<Vec<_>>(),
+        [&mutation]
     );
 
     connection
         .execute("DROP TRIGGER fail_remote_metadata_commit", [])
         .expect("remove metadata failure");
     drop(connection);
+    // The backend renamed the session on its way in, which the identity makes irrelevant.
     assert!(
         repository
-            .reconcile_binding_membership_mutation(
+            .reconcile_binding_membership_mutations(
                 scope,
-                &[BackendMembership {
-                    id: "created-id".to_owned(),
-                    name: "created-name".to_owned(),
-                }],
-                &mut order,
-                &mut names,
+                &[membership("$4", "created-name-2", "id-1")],
+                &mut sessions,
             )
             .expect("reconcile authoritative backend snapshot"),
     );
-    assert_eq!(order.session_names(), vec!["created-name"]);
+    assert_eq!(backend_names(&sessions), vec!["created-name"]);
     assert!(
         repository
-            .pending_binding_membership_mutation(scope)
-            .expect("read cleared mutation")
-            .is_none()
+            .pending_binding_membership_mutations(scope)
+            .expect("read cleared mutations")
+            .is_empty()
     );
     drop(repository);
 
     let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
     assert_eq!(
-        reopened.spaces()[0].bindings()[0]
-            .session_order()
-            .session_names(),
+        backend_names(reopened.spaces()[0].bindings()[0].sessions()),
         vec!["created-name"]
     );
 }
@@ -520,147 +513,90 @@ fn remote_rename_and_ditch_mutations_commit_binding_membership() {
     let (_directory, mut repository) = repository();
     let binding = repository.spaces()[0].bindings()[0].clone();
     let scope = binding.mux_scope();
-    let mut order = binding.session_order().clone();
-    let mut names = binding.session_names().clone();
-    order.add_session("old-name");
-    names.mark_explicit("session-id", "old-name", "Old name", "/worktree");
+    let mut sessions = binding.sessions().clone();
+    sessions.claim(session("id-1", "old-name"));
     repository
-        .commit_binding_state(scope, &order, &names)
+        .commit_binding_state(scope, &sessions)
         .expect("commit baseline membership");
 
     let rename = BindingMembershipMutation::Rename {
-        session_id: "session-id".to_owned(),
+        identity: "id-1".to_owned(),
         old_name: "old-name".to_owned(),
         new_name: "new-name".to_owned(),
         display_name: "New name".to_owned(),
         explicit: true,
-        cwd: Some("/worktree".to_owned()),
     };
     repository
         .begin_binding_membership_mutation(scope, &rename)
         .expect("journal rename");
     repository
-        .commit_binding_membership_mutation(scope, &rename, &mut order, &mut names)
+        .commit_binding_membership_mutation(scope, &rename, &mut sessions)
         .expect("commit rename");
-    assert_eq!(order.session_names(), vec!["new-name"]);
+    assert_eq!(backend_names(&sessions), vec!["new-name"]);
+    assert_eq!(
+        sessions.get("id-1").map(|claimed| claimed.label()),
+        Some("New name"),
+        "the claim keeps its identity across the rename"
+    );
 
     let ditch = BindingMembershipMutation::Ditch {
-        session_id: "session-id".to_owned(),
+        identity: "id-1".to_owned(),
         old_name: "new-name".to_owned(),
     };
     repository
         .begin_binding_membership_mutation(scope, &ditch)
         .expect("journal ditch");
     repository
-        .commit_binding_membership_mutation(scope, &ditch, &mut order, &mut names)
+        .commit_binding_membership_mutation(scope, &ditch, &mut sessions)
         .expect("commit ditch");
-    assert!(order.session_names().is_empty());
+    assert!(sessions.is_empty());
 }
 
+/// A ditched session takes its name with it. Leaving the record behind is what used to make the
+/// next session started in the same directory come back wearing a dead session's name.
 #[test]
-fn a_name_keyed_backend_rename_is_recovered_from_its_new_identity() {
+fn a_ditched_session_leaves_no_name_behind_for_the_next_one_in_that_directory() {
     let (_directory, mut repository) = repository();
     let binding = repository.spaces()[0].bindings()[0].clone();
     let scope = binding.mux_scope();
-    let mut order = binding.session_order().clone();
-    let mut names = binding.session_names().clone();
-    order.add_session("old-name");
-    names.mark_explicit("old-name", "old-name", "Old display", "");
+    let mut sessions = binding.sessions().clone();
+    sessions.claim(session("id-1", "bootty"));
+    sessions.set_display_name("id-1", "the name I picked", true);
     repository
-        .commit_binding_state(scope, &order, &names)
-        .expect("commit baseline membership");
-    let rename = BindingMembershipMutation::Rename {
-        session_id: "old-name".to_owned(),
-        old_name: "old-name".to_owned(),
-        new_name: "new-name".to_owned(),
-        display_name: "New display".to_owned(),
-        explicit: true,
-        cwd: None,
+        .commit_binding_state(scope, &sessions)
+        .expect("commit the named session");
+
+    let ditch = BindingMembershipMutation::Ditch {
+        identity: "id-1".to_owned(),
+        old_name: "bootty".to_owned(),
     };
     repository
-        .begin_binding_membership_mutation(scope, &rename)
-        .expect("journal name-keyed rename");
-
-    assert!(
-        repository
-            .reconcile_binding_membership_mutation(
-                scope,
-                &[BackendMembership {
-                    id: "new-name".to_owned(),
-                    name: "new-name".to_owned(),
-                }],
-                &mut order,
-                &mut names,
-            )
-            .expect("reconcile name-keyed backend snapshot"),
-    );
-    assert_eq!(order.session_names(), vec!["new-name"]);
-    assert!(names.record("old-name").is_none());
-    let record = names
-        .record("new-name")
-        .expect("name-keyed metadata follows the new identity");
-    assert_eq!(record.display_name, "New display");
-    assert!(record.explicit);
-}
-
-#[test]
-fn multiple_name_keyed_records_survive_a_generic_binding_commit() {
-    let (directory, mut repository) = repository();
-    let binding = repository.spaces()[0].bindings()[0].clone();
-    let scope = binding.mux_scope();
-    let mut order = binding.session_order().clone();
-    let mut names = binding.session_names().clone();
-    for name in ["first", "second"] {
-        order.add_session(name);
-        names.mark_explicit(name, name, name, "");
-    }
+        .begin_binding_membership_mutation(scope, &ditch)
+        .expect("journal ditch");
     repository
-        .commit_binding_state(scope, &order, &names)
-        .expect("commit name-keyed records without worktree paths");
+        .commit_binding_membership_mutation(scope, &ditch, &mut sessions)
+        .expect("commit ditch");
 
-    let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
-    let names = reopened.spaces()[0].bindings()[0].session_names();
-    assert!(names.record("first").is_some());
-    assert!(names.record("second").is_some());
-}
-
-#[test]
-fn a_stable_id_backend_rename_is_recovered_from_its_new_name() {
-    let (_directory, mut repository) = repository();
-    let binding = repository.spaces()[0].bindings()[0].clone();
-    let scope = binding.mux_scope();
-    let mut order = binding.session_order().clone();
-    let mut names = binding.session_names().clone();
-    order.add_session("old-name");
-    repository
-        .commit_binding_state(scope, &order, &names)
-        .expect("commit baseline membership");
-    let rename = BindingMembershipMutation::Rename {
-        session_id: "stable-id".to_owned(),
-        old_name: "old-name".to_owned(),
-        new_name: "new-name".to_owned(),
-        display_name: "new-name".to_owned(),
-        explicit: true,
-        cwd: None,
+    let replacement = BindingMembershipMutation::Create {
+        identity: "id-2".to_owned(),
+        session_name: "bootty".to_owned(),
+        display_name: "bootty".to_owned(),
+        explicit: false,
+        cwd: "/worktree".to_owned(),
     };
     repository
-        .begin_binding_membership_mutation(scope, &rename)
-        .expect("journal stable-id rename");
+        .begin_binding_membership_mutation(scope, &replacement)
+        .expect("journal the replacement create");
+    repository
+        .commit_binding_membership_mutation(scope, &replacement, &mut sessions)
+        .expect("commit the replacement create");
 
-    assert!(
-        repository
-            .reconcile_binding_membership_mutation(
-                scope,
-                &[BackendMembership {
-                    id: "stable-id".to_owned(),
-                    name: "new-name".to_owned(),
-                }],
-                &mut order,
-                &mut names,
-            )
-            .expect("reconcile stable-id backend snapshot"),
+    assert_eq!(
+        sessions.get("id-2").map(|claimed| claimed.label()),
+        Some("bootty"),
+        "the new session is named for its directory, not for the one that was ditched"
     );
-    assert_eq!(order.session_names(), vec!["new-name"]);
+    assert!(sessions.get("id-1").is_none());
 }
 
 #[test]
@@ -673,8 +609,8 @@ fn a_pending_operation_with_forbidden_fields_is_rejected_on_reopen() {
     connection
         .execute(
             "INSERT INTO workspace_pending_binding_operations
-                (space_id, binding_id, operation, session_id, old_name, new_name, cwd)
-             VALUES (?1, ?2, 'ditch', 'session-id', 'old-name', 'forbidden', '/forbidden')",
+                (space_id, binding_id, operation, identity, old_name, new_name, cwd)
+             VALUES (?1, ?2, 'ditch', 'id-1', 'old-name', 'forbidden', '/forbidden')",
             [
                 scope.space_id().persistence_value(),
                 scope.binding_id().persistence_value(),
@@ -696,9 +632,9 @@ fn a_pending_operation_with_a_non_boolean_explicit_value_is_rejected() {
     connection
         .execute(
             "INSERT INTO workspace_pending_binding_operations
-                (space_id, binding_id, operation, session_id, new_name,
+                (space_id, binding_id, operation, identity, new_name,
                  display_name, explicit, cwd)
-             VALUES (?1, ?2, 'create', 'session-id', 'backend-name',
+             VALUES (?1, ?2, 'create', 'id-1', 'backend-name',
                      'display-name', 2, '/worktree')",
             [
                 scope.space_id().persistence_value(),
@@ -814,7 +750,7 @@ fn space_creation_rejects_blank_values_and_uniquifies_names() {
 }
 
 #[test]
-fn session_order_is_binding_scoped_and_persists() {
+fn session_membership_is_binding_scoped_and_persists() {
     let (directory, mut repository) = repository();
     let first_binding = repository.default_binding_id().expect("default binding");
     let second_space = repository
@@ -832,103 +768,91 @@ fn session_order_is_binding_scoped_and_persists() {
     let second_scope = second_space.bindings()[0].mux_scope();
 
     let mut first = repository
-        .session_order(first_binding)
-        .expect("first binding order");
-    let first_names = repository
-        .session_names(first_binding)
-        .expect("first binding names");
-    let mut second = second_space.bindings()[0].session_order().clone();
-    let second_names = second_space.bindings()[0].session_names().clone();
-    first.sync_sessions(["arc/migrations", "arc/readiness", "agents", "bootty"]);
-    second.add_session("other");
-    assert!(first.move_session_before(
-        "agents",
-        Some("arc/migrations"),
-        ["arc/migrations", "arc/readiness", "agents", "bootty"],
-    ));
+        .sessions(first_binding)
+        .expect("first binding membership");
+    let mut second = second_space.bindings()[0].sessions().clone();
+    for (identity, name) in [
+        ("id-1", "arc/migrations"),
+        ("id-2", "arc/readiness"),
+        ("id-3", "agents"),
+        ("id-4", "bootty"),
+    ] {
+        first.claim(session(identity, name));
+    }
+    second.claim(session("id-5", "other"));
+    assert!(first.move_before("id-3", Some("id-1")));
+
     let first_scope = binding_scope(&repository, first_binding);
     repository
-        .commit_binding_state(first_scope, &first, &first_names)
+        .commit_binding_state(first_scope, &first)
         .expect("commit first binding");
     repository
-        .commit_binding_state(second_scope, &second, &second_names)
+        .commit_binding_state(second_scope, &second)
         .expect("commit second binding");
 
     repository = LoadedRepository::open(&directory.path().join("config.toml"));
     assert_eq!(
-        repository
-            .session_order(first_binding)
-            .expect("reopened first binding order")
-            .sync_sessions([
-                "arc/migrations",
-                "arc/readiness",
-                "agents",
-                "bootty",
-                "other"
-            ]),
+        backend_names(
+            &repository
+                .sessions(first_binding)
+                .expect("reopened first binding")
+        ),
         vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
     );
     assert_eq!(
-        repository
-            .session_order(second_binding)
-            .expect("reopened second binding order")
-            .sync_sessions(["arc/migrations", "other"]),
-        vec!["other"]
+        backend_names(
+            &repository
+                .sessions(second_binding)
+                .expect("reopened second binding")
+        ),
+        vec!["other"],
+        "one Space's sessions never leak into another's"
     );
 }
 
+/// A backend that answers with nothing has not told us the Space emptied, only that it has not
+/// answered yet.
 #[test]
-fn an_empty_backend_refresh_does_not_erase_session_order() {
+fn an_empty_backend_refresh_does_not_erase_the_claimed_sessions() {
     let (directory, mut repository) = repository();
     let binding = repository.default_binding_id().expect("default binding");
-    let mut order = repository.session_order(binding).expect("binding order");
-    let names = repository.session_names(binding).expect("binding names");
-    order.sync_sessions(["first", "second"]);
-    assert!(order.move_session_before("second", Some("first"), ["first", "second"]));
-    assert!(order.sync_sessions(std::iter::empty()).is_empty());
+    let mut sessions = repository.sessions(binding).expect("binding membership");
+    sessions.claim(session("id-1", "first"));
+    sessions.claim(session("id-2", "second"));
+    assert!(sessions.move_before("id-2", Some("id-1")));
+    assert!(!sessions.retain_alive(&std::collections::HashSet::new()));
     let scope = binding_scope(&repository, binding);
     repository
-        .commit_binding_state(scope, &order, &names)
-        .expect("commit order");
+        .commit_binding_state(scope, &sessions)
+        .expect("commit membership");
 
     let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
     assert_eq!(
-        reopened
-            .session_order(binding)
-            .expect("reopened binding order")
-            .sync_sessions(["first", "second"]),
+        backend_names(&reopened.sessions(binding).expect("reopened binding")),
         vec!["second", "first"]
     );
 }
 
+/// The name bootty shows is stored against the identity, so a backend that had to add a uniqueness
+/// suffix does not push that suffix into the sidebar.
 #[test]
-fn generated_names_survive_backend_id_discovery_and_explicit_renames() {
+fn the_shown_name_survives_a_backend_name_the_server_had_to_uniquify() {
     let (directory, mut repository) = repository();
     let binding = repository.default_binding_id().expect("default binding");
-    let order = repository.session_order(binding).expect("binding order");
-    let mut names = repository.session_names(binding).expect("binding names");
-    names.remember_generated("bootty/main", "/repo", "bootty/main", "bootty/main");
-
-    let discovered = names
-        .observe_session("$1", "bootty/main", "/repo")
-        .expect("stored generated name");
-    assert_eq!(discovered.session_id, "$1");
-    names.mark_explicit("$1", "release", "release", "/repo");
-    names.remember_generated("$1", "/repo", "project/feature", "project/feature");
+    let mut sessions = repository.sessions(binding).expect("binding membership");
+    sessions.claim(session("id-1", "agents/main-2"));
+    sessions.set_display_name("id-1", "agents/main", true);
     let scope = binding_scope(&repository, binding);
     repository
-        .commit_binding_state(scope, &order, &names)
-        .expect("commit session names");
+        .commit_binding_state(scope, &sessions)
+        .expect("commit membership");
 
     let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
-    let record = reopened
-        .session_names(binding)
-        .expect("reopened binding names")
-        .observe_session("$1", "release", "/repo")
-        .expect("stored explicit name");
-    assert!(record.explicit);
-    assert_eq!(record.generated_name, "bootty/main");
-    assert_eq!(record.display_name, "release");
+    let sessions = reopened.sessions(binding).expect("reopened binding");
+    let claimed = sessions.get("id-1").expect("the claimed session");
+    assert_eq!(claimed.label(), "agents/main");
+    assert_eq!(claimed.backend_name, "agents/main-2");
+    assert!(claimed.explicit);
 }
 
 #[test]
@@ -936,12 +860,10 @@ fn a_failed_binding_commit_keeps_the_committed_snapshot_and_database() {
     let (directory, mut repository) = repository();
     let binding = repository.default_binding_id().expect("default binding");
     let scope = binding_scope(&repository, binding);
-    let mut committed_order = repository.session_order(binding).expect("binding order");
-    let mut committed_names = repository.session_names(binding).expect("binding names");
-    assert!(committed_order.add_session("stable"));
-    assert!(committed_names.remember_generated("stable", "/workspace/stable", "stable", "stable",));
+    let mut committed = repository.sessions(binding).expect("binding membership");
+    assert!(committed.claim(session("id-1", "stable")));
     repository
-        .commit_binding_state(scope, &committed_order, &committed_names)
+        .commit_binding_state(scope, &committed)
         .expect("commit baseline");
 
     let database = directory.path().join("session-order.sqlite3");
@@ -949,39 +871,84 @@ fn a_failed_binding_commit_keeps_the_committed_snapshot_and_database() {
     lock.execute_batch("BEGIN IMMEDIATE")
         .expect("hold workspace write lock");
 
-    let mut candidate_order = committed_order.clone();
-    let mut candidate_names = committed_names.clone();
-    assert!(candidate_order.add_session("uncommitted"));
-    assert!(candidate_names.remember_generated(
-        "uncommitted",
-        "/workspace/uncommitted",
-        "uncommitted",
-        "uncommitted",
-    ));
+    let mut candidate = committed.clone();
+    assert!(candidate.claim(session("id-2", "uncommitted")));
     let error = repository
-        .commit_binding_state(scope, &candidate_order, &candidate_names)
+        .commit_binding_state(scope, &candidate)
         .expect_err("locked database must reject the candidate");
     assert!(error.to_string().contains("workspace persistence error"));
     lock.execute_batch("ROLLBACK").expect("release write lock");
     drop(lock);
     let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
-    assert_eq!(reopened.session_order(binding), Some(committed_order));
-    assert_eq!(reopened.session_names(binding), Some(committed_names));
+    assert_eq!(reopened.sessions(binding), Some(committed));
 }
 
 #[test]
-fn a_reused_backend_id_does_not_transfer_name_metadata_between_directories() {
-    let (_directory, repository) = repository();
-    let binding = repository.default_binding_id().expect("default binding");
-    let mut names = repository.session_names(binding).expect("binding names");
-    names.remember_generated("$1", "/old", "project/main", "project/main");
-    names.mark_explicit("$1", "release", "release", "/old");
-    names.remember_generated("$1", "/new", "other/main", "other/main");
+fn a_stranded_mutation_does_not_block_a_change_to_another_session() {
+    let (_directory, mut repository) = repository();
+    let scope = repository.spaces()[0].bindings()[0].mux_scope();
+    let stranded = BindingMembershipMutation::Create {
+        identity: "stranded-id".to_owned(),
+        session_name: "stranded-name".to_owned(),
+        display_name: "stranded-name".to_owned(),
+        explicit: true,
+        cwd: String::new(),
+    };
+    repository
+        .begin_binding_membership_mutation(scope, &stranded)
+        .expect("journal the first mutation");
 
-    let record = names
-        .observe_session("$1", "other/main", "/new")
-        .expect("new directory metadata");
-    assert!(!record.explicit);
-    assert_eq!(record.generated_name, "other/main");
-    assert_eq!(record.cwd, "/new");
+    let next = BindingMembershipMutation::Create {
+        identity: "next-id".to_owned(),
+        session_name: "next-name".to_owned(),
+        display_name: "next-name".to_owned(),
+        explicit: true,
+        cwd: String::new(),
+    };
+    repository
+        .begin_binding_membership_mutation(scope, &next)
+        .expect("a stranded entry does not block the next change");
+
+    let pending = repository
+        .pending_binding_membership_mutations(scope)
+        .expect("read the pending mutations");
+    assert_eq!(
+        pending
+            .iter()
+            .map(|pending| pending.mutation().clone())
+            .collect::<Vec<_>>(),
+        [next, stranded],
+        "operations on different sessions do not collide"
+    );
+}
+
+/// A second operation on the *same* session replaces the first rather than erroring: the older one
+/// is exactly what reconciliation would discard.
+#[test]
+fn a_second_mutation_on_one_session_supersedes_the_first() {
+    let (_directory, mut repository) = repository();
+    let scope = repository.spaces()[0].bindings()[0].mux_scope();
+    for name in ["first-name", "second-name"] {
+        repository
+            .begin_binding_membership_mutation(
+                scope,
+                &BindingMembershipMutation::Create {
+                    identity: "one-session".to_owned(),
+                    session_name: name.to_owned(),
+                    display_name: name.to_owned(),
+                    explicit: true,
+                    cwd: String::new(),
+                },
+            )
+            .expect("journal the mutation");
+    }
+
+    let pending = repository
+        .pending_binding_membership_mutations(scope)
+        .expect("read the pending mutations");
+    assert_eq!(pending.len(), 1);
+    assert!(matches!(
+        pending[0].mutation(),
+        BindingMembershipMutation::Create { session_name, .. } if session_name == "second-name"
+    ));
 }

@@ -16,7 +16,7 @@ use bootty_extension::ModuleItem;
 use bootty_mux::{
     RepaintHandle,
     controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag, MuxWindow},
 };
 use bootty_render::geometry::{TerminalGeometry, ViewTransform};
 use bootty_render::terminal_text::TerminalTextConfig;
@@ -198,6 +198,7 @@ fn sidebar_sessions(count: usize) -> Vec<MuxSession> {
                 active: index == 0,
                 anchor: anchor.clone(),
                 active_window_id: None,
+                tag: MuxSessionTag::default(),
                 windows: (0..3)
                     .map(|window| MuxWindow {
                         id: format!("@{}:{window}", index + 1),
@@ -229,6 +230,7 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, group: &BindingSessionGroup) {
                 palette,
                 sidebar_rect.height(),
                 SidebarModel {
+                    move_targets: &[],
                     items: &items,
                     footer_items: &[],
                     session_count: group.sessions.len(),

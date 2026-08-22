@@ -140,6 +140,7 @@ fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction
                                 bootty_ui::ThemePalette::default(),
                                 screen.height(),
                                 SidebarModel {
+                                    move_targets: &[],
                                     items: &rows,
                                     footer_items: &footer_items,
                                     session_count: 1,

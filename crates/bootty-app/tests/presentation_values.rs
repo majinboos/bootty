@@ -12,7 +12,7 @@ use bootty_extension::{
 };
 use bootty_mux::{
     controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use egui::Color32;
 
@@ -34,6 +34,7 @@ fn session(id: &str, name: &str, process: &str) -> MuxSession {
             ..MuxPaneAnchor::default()
         },
         active_window_id: None,
+        tag: MuxSessionTag::default(),
         windows: Vec::new(),
     }
 }

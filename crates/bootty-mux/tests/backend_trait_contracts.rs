@@ -1,7 +1,7 @@
 use anyhow::Result;
 use bootty_mux::backend::MuxBackend;
 use bootty_mux::command::MuxCommand;
-use bootty_mux::snapshot::{MuxPaneAnchor, MuxSession, MuxSnapshot};
+use bootty_mux::snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag, MuxSnapshot};
 
 #[derive(Default)]
 struct FakeBackend {
@@ -44,6 +44,7 @@ fn fake_backend_contract_covers_session_lifecycle_and_anchors() {
             },
             active_window_id: None,
             windows: Vec::new(),
+            tag: MuxSessionTag::default(),
         }],
         commands: Vec::new(),
     };
@@ -60,10 +61,12 @@ fn fake_backend_contract_covers_session_lifecycle_and_anchors() {
         MuxCommand::CreateProjectSession {
             session_id: "next".to_owned(),
             cwd: "/next".to_owned(),
+            tag: MuxSessionTag::default(),
         },
         MuxCommand::CreateWorktreeSession {
             session_id: "worktree".to_owned(),
             cwd: "/repo-worktree".to_owned(),
+            tag: MuxSessionTag::default(),
         },
         MuxCommand::RenameSession {
             session_id: "project".to_owned(),

@@ -1,9 +1,6 @@
-use std::{
-    collections::HashSet,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, TryRecvError},
-    },
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, TryRecvError},
 };
 
 use anyhow::{Result, bail};
@@ -14,16 +11,14 @@ pub use bootty_mux::RemoteSpaceSummary;
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
     command::MuxCommand,
-    membership::BackendMembership,
     process::{CancellableCommandRunner, CommandCancellation, CommandRunner, SystemCommandRunner},
     provider::MuxBackendRegistry,
-    snapshot::{MuxSnapshot, session_matches},
+    snapshot::MuxSnapshot,
 };
 use bootty_remote::ssh::{SshRemote, remote_daemon_failure};
 use bootty_workspace::{
-    BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SessionNameStore,
-    SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride, WorkspaceBinding,
-    WorkspaceRepository,
+    DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON, SpaceMuxOverride, SpaceRemoteOverride,
+    WorkspaceBinding, WorkspaceRepository,
 };
 
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
@@ -164,40 +159,25 @@ pub fn create(
     })
 }
 
+/// The sessions this remote Space holds: the ones carrying its `@bootty_space` tag. The client
+/// wrote that tag and can read it back, so there is no second copy to keep in step.
 pub fn snapshot(
     config: &BoottyConfig,
     backends: &MuxBackendRegistry,
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<MuxSnapshot> {
-    let mut runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
-    let snapshot = runtime.backend.snapshot()?;
-    runtime.reconcile_pending_membership(&snapshot)?;
-    let snapshot = filter_snapshot_for_space(snapshot, &mut runtime.session_order);
-    runtime.repository.commit_binding_state(
-        runtime.scope,
-        &runtime.session_order,
-        &runtime.session_names,
-    )?;
-    Ok(snapshot)
+    let runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
+    Ok(filter_snapshot_for_space(
+        runtime.backend.snapshot()?,
+        space_id,
+    ))
 }
 
-fn filter_snapshot_for_space(
-    mut snapshot: MuxSnapshot,
-    sessions: &mut SessionOrderStore,
-) -> MuxSnapshot {
-    let alive = snapshot
-        .sessions
-        .iter()
-        .map(|session| session.name.as_str())
-        .collect::<Vec<_>>();
-    let allowed = sessions
-        .sync_sessions(alive)
-        .into_iter()
-        .collect::<HashSet<_>>();
+fn filter_snapshot_for_space(mut snapshot: MuxSnapshot, space_id: &str) -> MuxSnapshot {
     snapshot
         .sessions
-        .retain(|session| allowed.iter().any(|id| session_matches(session, id)));
+        .retain(|session| session.tag.space.as_deref() == Some(space_id));
     snapshot.active_session_id = snapshot
         .active_session_id
         .filter(|id| snapshot.sessions.iter().any(|session| &session.id == id));
@@ -213,98 +193,24 @@ pub fn execute(
 ) -> Result<()> {
     let command = bootty_remote::space_protocol::decode_command(payload)?;
     let mut runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
-    let snapshot = runtime.backend.snapshot()?;
-    runtime.reconcile_pending_membership(&snapshot)?;
-    let owned_names = runtime.session_order.session_names();
-    if let Some(session_id) = created_session_id(&command)
-        && !owned_names.iter().any(|name| name == session_id)
-        && snapshot
+    // A command may only touch a session this Space holds. Asking the session itself is the whole
+    // check: no ownership table to consult, and no way for the answer to drift from the truth.
+    if let Some(session_id) = command_session_id(&command) {
+        let snapshot = runtime.backend.snapshot()?;
+        let session = snapshot
             .sessions
             .iter()
-            .any(|session| session_matches(session, session_id))
-    {
-        bail!("session already belongs to another remote Space")
+            .find(|session| bootty_mux::snapshot::session_matches(session, session_id))
+            .ok_or_else(|| anyhow::anyhow!("session is unavailable"))?;
+        if session.tag.space.as_deref() != Some(space_id) {
+            bail!("session does not belong to remote Space {space_id}")
+        }
     }
-    let owned_session_name =
-        resolve_owned_session_name(&snapshot, &owned_names, &command, space_id)?;
-    let mutation = binding_membership_mutation(
-        &command,
-        owned_session_name.as_deref(),
-        &runtime.session_names,
-    );
-    let Some(mutation) = mutation else {
-        runtime.backend.execute(command)?;
-        return Ok(());
-    };
-
-    runtime
-        .repository
-        .begin_binding_membership_mutation(runtime.scope, &mutation)?;
-    if let Err(backend_error) = runtime.backend.execute(command) {
-        return Err(anyhow::anyhow!(
-            "remote backend result is ambiguous: {backend_error}; binding membership recovery is pending"
-        ));
-    }
-    if let Err(persistence_error) = runtime.repository.commit_binding_membership_mutation(
-        runtime.scope,
-        &mutation,
-        &mut runtime.session_order,
-        &mut runtime.session_names,
-    ) {
-        return Err(anyhow::Error::new(persistence_error).context(format!(
-            "remote backend completed {mutation:?}, but workspace persistence failed"
-        )));
-    }
-    Ok(())
-}
-
-fn resolve_owned_session_name(
-    snapshot: &MuxSnapshot,
-    owned_names: &[String],
-    command: &MuxCommand,
-    space_id: &str,
-) -> Result<Option<String>> {
-    let Some(session_id) = command_session_id(command) else {
-        return Ok(None);
-    };
-    let name = snapshot
-        .sessions
-        .iter()
-        .find(|session| session_matches(session, session_id))
-        .map(|session| session.name.clone())
-        .ok_or_else(|| anyhow::anyhow!("session is unavailable"))?;
-    if !owned_names.contains(&name) {
-        bail!("session does not belong to remote Space {space_id}")
-    }
-    Ok(Some(name))
+    runtime.backend.execute(command)
 }
 
 struct RemoteSpaceRuntime {
     backend: Box<dyn bootty_mux::backend::MuxBackend>,
-    repository: WorkspaceRepository,
-    scope: bootty_mux::controller::MuxScope,
-    session_order: SessionOrderStore,
-    session_names: SessionNameStore,
-}
-
-impl RemoteSpaceRuntime {
-    fn reconcile_pending_membership(&mut self, snapshot: &MuxSnapshot) -> Result<()> {
-        let memberships = snapshot
-            .sessions
-            .iter()
-            .map(|session| BackendMembership {
-                id: session.id.clone(),
-                name: session.name.clone(),
-            })
-            .collect::<Vec<_>>();
-        self.repository.reconcile_binding_membership_mutation(
-            self.scope,
-            &memberships,
-            &mut self.session_order,
-            &mut self.session_names,
-        )?;
-        Ok(())
-    }
 }
 
 fn remote_space_runtime(
@@ -313,7 +219,7 @@ fn remote_space_runtime(
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<RemoteSpaceRuntime> {
-    let (repository, snapshot) = WorkspaceRepository::open(&config.config_path)?;
+    let (_repository, snapshot) = WorkspaceRepository::open(&config.config_path)?;
     let space = snapshot
         .spaces()
         .iter()
@@ -339,16 +245,8 @@ fn remote_space_runtime(
     }
     multiplexer.remote = None;
     multiplexer.remote_space_id = None;
-    let backend = backends.build_backend(&multiplexer, Some(&config.config_path));
-    let scope = binding.mux_scope();
-    let session_order = binding.session_order().clone();
-    let session_names = binding.session_names().clone();
     Ok(RemoteSpaceRuntime {
-        backend,
-        repository,
-        scope,
-        session_order,
-        session_names,
+        backend: backends.build_backend(&multiplexer, Some(&config.config_path)),
     })
 }
 
@@ -372,53 +270,8 @@ fn command_session_id(command: &MuxCommand) -> Option<&str> {
         | MuxCommand::ClosePane { session_id, .. }
         | MuxCommand::TogglePaneZoom { session_id, .. }
         | MuxCommand::RenameSession { session_id, .. }
-        | MuxCommand::DitchSession { session_id } => Some(session_id),
-    }
-}
-
-fn binding_membership_mutation(
-    command: &MuxCommand,
-    owned_session_name: Option<&str>,
-    session_names: &SessionNameStore,
-) -> Option<BindingMembershipMutation> {
-    match command {
-        MuxCommand::CreateProjectSession { session_id, cwd }
-        | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
-            Some(BindingMembershipMutation::Create {
-                session_id: session_id.clone(),
-                session_name: session_id.clone(),
-                display_name: session_id.clone(),
-                explicit: true,
-                cwd: Some(cwd.clone()),
-            })
-        }
-        MuxCommand::RenameSession { session_id, name } => {
-            let old_name = owned_session_name?.to_owned();
-            let cwd = session_names
-                .record(session_id)
-                .map(|record| record.cwd.clone());
-            Some(BindingMembershipMutation::Rename {
-                session_id: session_id.clone(),
-                old_name,
-                new_name: name.clone(),
-                display_name: name.clone(),
-                explicit: true,
-                cwd,
-            })
-        }
-        MuxCommand::DitchSession { session_id } => Some(BindingMembershipMutation::Ditch {
-            session_id: session_id.clone(),
-            old_name: owned_session_name?.to_owned(),
-        }),
-        _ => None,
-    }
-}
-
-fn created_session_id(command: &MuxCommand) -> Option<&str> {
-    match command {
-        MuxCommand::CreateProjectSession { session_id, .. }
-        | MuxCommand::CreateWorktreeSession { session_id, .. } => Some(session_id),
-        _ => None,
+        | MuxCommand::DitchSession { session_id }
+        | MuxCommand::StampSession { session_id, .. } => Some(session_id),
     }
 }
 

@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use super::{BindingRuntime, PendingGeneratedName, WorkspaceRuntime};
 use crate::ui::new_session_picker::NewMuxSessionRequest;
 use bootty_mux::{RepaintHandle, command::MuxCommand, provider::GeneratedSessionNamePolicy};
-use bootty_workspace::{SessionNameStore, WorkspacePersistenceError};
+use bootty_workspace::WorkspacePersistenceError;
 
 pub(crate) enum RenameSessionOutcome {
     Missing,
@@ -12,7 +12,7 @@ pub(crate) enum RenameSessionOutcome {
     Started,
 }
 
-fn session_cwd(cwd: &str, remote: bool) -> String {
+pub(super) fn session_cwd(cwd: &str, remote: bool) -> String {
     if remote {
         cwd.to_owned()
     } else {
@@ -25,21 +25,6 @@ fn suggested_session_name(cwd: &str, remote: bool) -> String {
         crate::strings::session_name_for_remote_path(cwd)
     } else {
         bootty_mux::project::suggested_session_name(cwd)
-    }
-}
-
-fn record_session_name(
-    names: &mut SessionNameStore,
-    session_id: &str,
-    cwd: &str,
-    name: &str,
-    display_name: &str,
-    explicit: bool,
-) {
-    if explicit {
-        names.mark_explicit(session_id, name, display_name, cwd);
-    } else {
-        names.remember_generated(session_id, cwd, name, display_name);
     }
 }
 
@@ -79,6 +64,11 @@ impl WorkspaceRuntime {
         hasher.finish()
     }
 
+    /// Name every claimed session after its project, and ask the backend to use that name.
+    ///
+    /// A shared server may add a uniqueness suffix to what it was asked for; that stays the
+    /// backend's business, since what bootty shows is stored against the identity. Sessions the
+    /// user renamed elsewhere are already explicit by now, and explicit names are left alone.
     pub(super) fn reconcile_generated_session_names(
         &mut self,
         repaint: &RepaintHandle,
@@ -95,146 +85,58 @@ impl WorkspaceRuntime {
         if self.active.binding.generated_names_signature == Some(signature) {
             return self.commit_binding_state_candidate(candidate);
         }
+
         let sessions = self.active.binding.mux.sessions().to_vec();
-        let mut renames = Vec::new();
-        pending_generated_names.retain(|session_id, pending| {
-            if sessions.iter().any(|session| session.name == pending.name) {
-                return false;
-            }
-            sessions
-                .iter()
-                .find(|session| session.id == *session_id)
-                .is_none_or(|session| {
-                    session
-                        .anchor
-                        .cwd
-                        .as_deref()
-                        .is_some_and(|cwd| session_cwd(cwd, remote) == pending.cwd)
-                })
-        });
+        // A rename bootty asked for is only still pending while the backend has not shown it.
+        pending_generated_names
+            .retain(|_, pending| !sessions.iter().any(|session| session.name == pending.name));
         let mut planned_names = pending_generated_names
             .values()
             .map(|pending| pending.name.clone())
             .collect::<HashSet<_>>();
         let taken_names = self.taken_session_names(None);
+        let mut renames = Vec::new();
 
         for session in &sessions {
-            let Some(raw_cwd) = session.anchor.cwd.as_deref() else {
+            let Some(identity) = session.tag.identity.as_deref() else {
                 continue;
             };
-            let cwd = session_cwd(raw_cwd, remote);
-            let mut record = if let Some(record) =
-                candidate
-                    .session_names
-                    .observe_session(&session.id, &session.name, &cwd)
-            {
-                record
-            } else {
-                let legacy_name = if remote {
-                    crate::strings::session_name_for_remote_path(&cwd)
-                } else {
-                    crate::strings::session_name_for_path(&cwd)
-                };
-                record_session_name(
-                    &mut candidate.session_names,
-                    &session.id,
-                    &cwd,
-                    &session.name,
-                    &session.name,
-                    session.name != legacy_name,
-                );
-                candidate
-                    .session_names
-                    .observe_session(&session.id, &session.name, &cwd)
-                    .expect("session name metadata should be observable after recording")
+            let Some(claimed) = candidate.sessions.get(identity) else {
+                continue;
             };
+            let cwd = session
+                .anchor
+                .cwd
+                .as_deref()
+                .map_or_else(|| claimed.cwd.clone(), |cwd| session_cwd(cwd, remote));
+            let explicit = claimed.explicit;
+            let suggested = suggested_session_name(&cwd, remote);
 
-            if record.display_name.is_empty() {
-                if record.explicit
-                    && session.name != record.generated_name
-                    && crate::strings::is_uniquified_session_name(
-                        &session.name,
-                        &record.generated_name,
-                    )
-                {
-                    candidate
-                        .session_names
-                        .reclaim_generated(&session.id, &session.name);
-                    record.generated_name = session.name.clone();
-                    record.explicit = false;
-                }
-                let display_name = if record.explicit {
-                    session.name.clone()
-                } else {
-                    let suggested = suggested_session_name(&cwd, remote);
-                    if crate::strings::is_uniquified_session_name(&session.name, &suggested) {
-                        suggested
-                    } else {
-                        session.name.clone()
-                    }
-                };
-                candidate
-                    .session_names
-                    .set_display_name(&session.id, &display_name);
-                record.display_name = display_name;
-            }
-
-            if let Some(pending) = pending_generated_names.remove(&session.id)
-                && pending.cwd == cwd
-            {
-                if session.name == pending.name {
-                    planned_names.remove(&pending.name);
-                    record_session_name(
-                        &mut candidate.session_names,
-                        &session.id,
-                        &cwd,
-                        &pending.name,
-                        &pending.display_name,
-                        pending.explicit,
-                    );
-                } else if session.name != record.generated_name {
-                    planned_names.remove(&pending.name);
-                    candidate.session_names.mark_explicit(
-                        &session.id,
-                        &session.name,
-                        &session.name,
-                        &cwd,
-                    );
-                } else {
-                    pending_generated_names.insert(session.id.clone(), pending);
-                }
+            if explicit {
                 continue;
             }
-            if record.explicit {
-                continue;
-            }
-            if session.name != record.generated_name {
-                candidate.session_names.mark_explicit(
-                    &session.id,
-                    &session.name,
-                    &session.name,
-                    &cwd,
-                );
-                continue;
-            }
+            candidate
+                .sessions
+                .set_display_name(identity, &suggested, false);
 
             let existing_names = taken_names
                 .iter()
                 .map(String::as_str)
                 .filter(|name| *name != session.name)
                 .chain(planned_names.iter().map(String::as_str));
-            let display_name = suggested_session_name(&cwd, remote);
-            let desired = crate::strings::unique_session_name(&display_name, existing_names);
-            if desired == session.name {
+            let desired = crate::strings::unique_session_name(&suggested, existing_names);
+            // Already called what it should be, suffix and all.
+            if desired == session.name
+                || crate::strings::is_uniquified_session_name(&session.name, &suggested)
+            {
                 continue;
             }
             planned_names.insert(desired.clone());
             pending_generated_names.insert(
                 session.id.clone(),
                 PendingGeneratedName {
-                    cwd,
                     name: desired.clone(),
-                    display_name,
+                    display_name: suggested,
                     explicit: false,
                 },
             );
@@ -279,7 +181,11 @@ impl WorkspaceRuntime {
             &display_name,
             self.taken_session_names(None).iter().map(String::as_str),
         );
-        MuxCommand::CreateProjectSession { session_id, cwd }
+        MuxCommand::CreateProjectSession {
+            session_id,
+            cwd,
+            tag: self.active.binding.new_session_tag(),
+        }
     }
 
     pub(crate) fn create_project_session(
@@ -288,14 +194,18 @@ impl WorkspaceRuntime {
         repaint: &RepaintHandle,
     ) -> Result<bool, WorkspacePersistenceError> {
         let remote = self.active.binding.multiplexer.remote.is_some();
-        let MuxCommand::CreateProjectSession { session_id, cwd } = &command else {
+        let MuxCommand::CreateProjectSession {
+            session_id,
+            cwd,
+            tag,
+        } = &command
+        else {
             return Err(WorkspacePersistenceError::operation(
                 "project session creation received a non-project command",
             ));
         };
         let display_name = suggested_session_name(cwd, remote);
         let pending_name = PendingGeneratedName {
-            cwd: cwd.clone(),
             name: session_id.clone(),
             display_name,
             explicit: false,
@@ -315,6 +225,7 @@ impl WorkspaceRuntime {
             NewMuxSessionRequest {
                 session_id: session_id.clone(),
                 cwd: cwd.clone(),
+                tag: tag.clone(),
             },
             repaint,
             &config,
@@ -340,12 +251,6 @@ impl WorkspaceRuntime {
         else {
             return Ok(RenameSessionOutcome::Missing);
         };
-        let cwd = session
-            .anchor
-            .cwd
-            .as_deref()
-            .map(session_root)
-            .unwrap_or_default();
         let taken = self.taken_session_names(Some(session.name.as_str()));
         let backend_name =
             crate::strings::unique_session_name(display_name, taken.iter().map(String::as_str));
@@ -354,7 +259,6 @@ impl WorkspaceRuntime {
             name: backend_name.clone(),
         };
         let pending_name = PendingGeneratedName {
-            cwd,
             name: backend_name.clone(),
             display_name: display_name.to_owned(),
             explicit: true,

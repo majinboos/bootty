@@ -26,12 +26,13 @@ use rmux_sdk::{
 use tokio::runtime::Builder;
 
 use crate::backend::{
-    RmuxWindowRow, list_pane_rows, list_window_rows, rmux_request_checked, session_from_rows,
+    RmuxWindowRow, list_pane_rows, list_session_tags, list_window_rows, rmux_request_checked,
+    session_from_rows, stamp_session_tag,
 };
 use crate::pane_io::{RmuxPaneTarget, pane_for_target};
 use bootty_mux::{
     command::{MuxCommand, MuxSplitDirection},
-    snapshot::MuxSnapshot,
+    snapshot::{MuxSessionTag, MuxSnapshot},
 };
 
 const TERM_ENV: &str = "TERM";
@@ -381,9 +382,11 @@ impl RmuxBridgeState {
     async fn snapshot_current_sessions(&mut self) -> Result<MuxSnapshot> {
         let names = self.list_session_names().await?;
         let rmux = self.rmux().await?;
+        let mut tags = list_session_tags(rmux).await?;
         let mut sessions = Vec::with_capacity(names.len());
         for name in names {
-            sessions.push(snapshot_session(rmux, &name).await?);
+            let tag = tags.remove(&name.to_string()).unwrap_or_default();
+            sessions.push(snapshot_session(rmux, &name, tag).await?);
         }
         Ok(MuxSnapshot {
             active_session_id: sessions
@@ -409,14 +412,23 @@ impl RmuxBridgeState {
                 session_id,
                 window_id,
             } => self.activate_window(&session_id, &window_id).await,
-            MuxCommand::CreateProjectSession { session_id, cwd }
-            | MuxCommand::CreateWorktreeSession { session_id, cwd } => {
-                self.ensure_session(&session_id, &cwd).await
+            MuxCommand::CreateProjectSession {
+                session_id,
+                cwd,
+                tag,
             }
+            | MuxCommand::CreateWorktreeSession {
+                session_id,
+                cwd,
+                tag,
+            } => self.ensure_session(&session_id, &cwd, &tag).await,
             MuxCommand::RenameSession { session_id, name } => {
                 self.rename_session(&session_id, &name).await
             }
             MuxCommand::DitchSession { session_id } => self.kill_session(&session_id).await,
+            MuxCommand::StampSession { session_id, tag } => {
+                self.stamp_session(&session_id, &tag).await
+            }
             MuxCommand::RenameWindow {
                 session_id,
                 window_id,
@@ -480,11 +492,16 @@ impl RmuxBridgeState {
         }
     }
 
-    async fn ensure_session(&mut self, session_name: &str, cwd: &str) -> Result<()> {
+    async fn ensure_session(
+        &mut self,
+        session_name: &str,
+        cwd: &str,
+        tag: &MuxSessionTag,
+    ) -> Result<()> {
         let rmux = self.rmux().await?;
         let name = SessionName::new(session_name).context("invalid rmux session name")?;
         rmux.ensure_session(
-            EnsureSession::named(name)
+            EnsureSession::named(name.clone())
                 .policy(EnsureSessionPolicy::CreateOrReuse)
                 .detached(true)
                 .working_directory(cwd)
@@ -492,16 +509,26 @@ impl RmuxBridgeState {
                 .environment(bootty_rmux_process_environment()),
         )
         .await?;
-        Ok(())
+        // rmux has no way to set options as part of the create, so there is a window where the
+        // session exists untagged. A snapshot taken inside it reads the session as unclaimed,
+        // which the next one corrects.
+        stamp_session_tag(&name, tag).await
     }
 
     async fn rename_session(&mut self, session_name: &str, name: &str) -> Result<()> {
         self.rmux().await?;
+        // The tag is keyed by the session's stable id, so a rename carries it without help.
         rmux_request_checked(Request::RenameSession(RenameSessionRequest {
             target: SessionName::new(session_name).context("invalid rmux session name")?,
             new_name: SessionName::new(name).context("invalid rmux session name")?,
         }))
         .await
+    }
+
+    async fn stamp_session(&mut self, session_name: &str, tag: &MuxSessionTag) -> Result<()> {
+        self.rmux().await?;
+        let name = SessionName::new(session_name).context("invalid rmux session name")?;
+        stamp_session_tag(&name, tag).await
     }
 
     async fn kill_session(&mut self, session_name: &str) -> Result<()> {
@@ -740,9 +767,10 @@ fn display_window_index(rows: &[RmuxWindowRow], row: &RmuxWindowRow) -> u32 {
 async fn snapshot_session(
     rmux: &Rmux,
     name: &SessionName,
+    tag: MuxSessionTag,
 ) -> Result<bootty_mux::snapshot::MuxSession> {
     let session_name = name.to_string();
     let windows = list_window_rows(rmux, name).await?;
     let panes = list_pane_rows(rmux, name).await?;
-    Ok(session_from_rows(&session_name, &windows, &panes))
+    Ok(session_from_rows(&session_name, tag, &windows, &panes))
 }

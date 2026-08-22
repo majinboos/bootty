@@ -1,9 +1,10 @@
 use bootty_mux::membership::{BackendMembership, MembershipOperation};
 
-fn membership(id: &str, name: &str) -> BackendMembership {
+fn membership(id: &str, name: &str, identity: Option<&str>) -> BackendMembership {
     BackendMembership {
         id: id.to_owned(),
         name: name.to_owned(),
+        identity: identity.map(str::to_owned),
     }
 }
 
@@ -11,16 +12,16 @@ fn membership(id: &str, name: &str) -> BackendMembership {
 fn membership_operations_reject_invalid_backend_facts() {
     for invalid in [
         MembershipOperation::Create {
-            session_id: String::new(),
+            identity: String::new(),
             session_name: "session".to_owned(),
         },
         MembershipOperation::Rename {
-            session_id: "session".to_owned(),
+            identity: "id-1".to_owned(),
             old_name: "same".to_owned(),
             new_name: "same".to_owned(),
         },
         MembershipOperation::Ditch {
-            session_id: "session\0id".to_owned(),
+            identity: "id\u{0}1".to_owned(),
             old_name: "session".to_owned(),
         },
     ] {
@@ -31,30 +32,30 @@ fn membership_operations_reject_invalid_backend_facts() {
     }
 }
 
+/// An operation is settled by the identity bootty stamped onto the session, never by the name it
+/// happened to have. A backend that renamed the session, or handed the old name to someone else,
+/// cannot change the answer.
 #[test]
-fn authoritative_membership_classifies_each_backend_identity_model() {
+fn an_operation_is_settled_by_the_identity_and_not_by_any_name() {
     let create = MembershipOperation::Create {
-        session_id: "stable-1".to_owned(),
+        identity: "id-1".to_owned(),
         session_name: "created".to_owned(),
     };
-    assert!(create.effect_occurred(&[membership("stable-1", "created")]));
-    assert!(create.effect_occurred(&[membership("created", "created")]));
+    assert!(create.effect_occurred(&[membership("$4", "created-2", Some("id-1"))]));
+    assert!(!create.effect_occurred(&[membership("$4", "created", None)]));
 
     let rename = MembershipOperation::Rename {
-        session_id: "stable-1".to_owned(),
+        identity: "id-1".to_owned(),
         old_name: "before".to_owned(),
         new_name: "after".to_owned(),
     };
-    assert!(rename.effect_occurred(&[membership("stable-1", "after")]));
-    assert!(rename.effect_occurred(&[membership("after", "after")]));
-    assert!(
-        !rename.effect_occurred(&[membership("before", "before"), membership("other", "after"),])
-    );
+    assert!(rename.effect_occurred(&[membership("$4", "after", Some("id-1"))]));
+    assert!(!rename.effect_occurred(&[membership("$4", "after", Some("id-2"))]));
 
     let ditch = MembershipOperation::Ditch {
-        session_id: "stable-1".to_owned(),
+        identity: "id-1".to_owned(),
         old_name: "after".to_owned(),
     };
-    assert!(ditch.effect_occurred(&[membership("other", "other")]));
-    assert!(!ditch.effect_occurred(&[membership("stable-1", "after")]));
+    assert!(ditch.effect_occurred(&[membership("$4", "after", Some("id-2"))]));
+    assert!(!ditch.effect_occurred(&[membership("$4", "renamed", Some("id-1"))]));
 }

@@ -13,11 +13,10 @@ use bootty_mux::{
     MuxBackendKind, MuxBindingConfig, RemoteSpaceSummary,
     backend::MuxBackend,
     command::MuxCommand,
-    membership::{BackendMembership, MembershipOperation},
     provider::MuxBackendRegistry,
-    snapshot::{MuxSnapshot, session_matches},
+    snapshot::{MuxSessionTag, MuxSnapshot, new_session_identity, session_matches},
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 mod legacy_import;
@@ -114,18 +113,7 @@ impl Catalog {
                  position INTEGER NOT NULL,
                  PRIMARY KEY (space_id, session_name)
              );
-             CREATE TABLE IF NOT EXISTS remote_space_pending_membership_operations (
-                 space_id TEXT PRIMARY KEY REFERENCES remote_spaces(id) ON DELETE CASCADE,
-                 operation TEXT NOT NULL CHECK (operation IN ('create', 'rename', 'ditch')),
-                 session_id TEXT NOT NULL CHECK (session_id != ''),
-                 old_name TEXT,
-                 new_name TEXT,
-                 CHECK (
-                     (operation = 'create' AND old_name IS NULL AND new_name IS NOT NULL)
-                     OR (operation = 'rename' AND old_name IS NOT NULL AND new_name IS NOT NULL)
-                     OR (operation = 'ditch' AND old_name IS NOT NULL AND new_name IS NULL)
-                 )
-             );",
+             DROP TABLE IF EXISTS remote_space_pending_membership_operations;",
         )?;
         let mut catalog = Self {
             connection,
@@ -295,6 +283,10 @@ impl Catalog {
         self.snapshot_with_backend(space_id, expected, backend.as_mut())
     }
 
+    /// The sessions this Space holds, which each session says for itself.
+    ///
+    /// The daemon reads the `@bootty_space` tag rather than keeping a catalog of names beside the
+    /// multiplexer, so there is no second copy to fall out of step and nothing to journal.
     pub fn snapshot_with_backend(
         &mut self,
         space_id: &str,
@@ -303,11 +295,11 @@ impl Catalog {
     ) -> Result<MuxSnapshot> {
         let backend_kind = self.space_backend(space_id, expected)?;
         let _lease = self.backend_lease(backend_kind)?;
+        self.adopt_membership_recorded_by_name(space_id, backend)?;
         let mut snapshot = backend.snapshot()?;
-        let owned = self.reconcile_and_sync_sessions(space_id, &snapshot)?;
         snapshot
             .sessions
-            .retain(|session| owned.contains(&session.name));
+            .retain(|session| session.tag.space.as_deref() == Some(space_id));
         snapshot.active_session_id = snapshot
             .active_session_id
             .filter(|id| snapshot.sessions.iter().any(|session| session.id == *id));
@@ -333,103 +325,58 @@ impl Catalog {
     ) -> Result<()> {
         let backend_kind = self.space_backend(space_id, expected)?;
         let _lease = self.backend_lease(backend_kind)?;
-        let snapshot = backend.snapshot()?;
-        let owned = self.reconcile_and_sync_sessions(space_id, &snapshot)?;
-        let owned_name = resolve_owned_session_name(&snapshot, &owned, &command, space_id)?;
-        let operation = membership_operation(&command, owned_name.as_deref())?;
-        if let Some(MembershipOperation::Create { session_id, .. }) = &operation
-            && !owned.contains(session_id)
-            && snapshot
+        // A command may only touch a session this Space holds. Asking the session itself is the
+        // whole check, and it cannot disagree with what the client sees.
+        if let Some(session_id) = command_session_id(&command) {
+            let snapshot = backend.snapshot()?;
+            let session = snapshot
                 .sessions
                 .iter()
-                .any(|session| session_matches(session, session_id))
-        {
-            bail!("session already belongs to another remote Space")
-        }
-        if let Some(operation) = operation.as_ref() {
-            operation
-                .validate()
-                .map_err(|error| anyhow::anyhow!(error))?;
-            self.journal(space_id, operation)?;
-        }
-        if let Err(error) = backend.execute(command) {
-            if operation.is_some() {
-                return Err(anyhow::anyhow!(
-                    "remote backend result is ambiguous: {error}; remote Space membership recovery is pending"
-                ));
+                .find(|session| session_matches(session, session_id))
+                .with_context(|| format!("session {session_id} is unavailable"))?;
+            if session.tag.space.as_deref() != Some(space_id) {
+                bail!("session does not belong to remote Space {space_id}")
             }
-            return Err(error);
         }
-        if let Some(operation) = operation {
-            self.commit_membership(space_id, &operation).map_err(|error| {
-                anyhow::anyhow!(
-                    "remote Space membership completed but catalog commit failed: {error}; recovery is pending"
-                )
-            })?;
-        }
-        Ok(())
+        backend.execute(command)
     }
 
-    fn journal(&mut self, space_id: &str, operation: &MembershipOperation) -> Result<()> {
-        let (operation_name, session_id, old_name, new_name) = operation_storage(operation);
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO remote_space_pending_membership_operations
-             (space_id, operation, session_id, old_name, new_name)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![space_id, operation_name, session_id, old_name, new_name],
-        )?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn commit_membership(&mut self, space_id: &str, operation: &MembershipOperation) -> Result<()> {
-        let transaction = self.connection.transaction()?;
-        let pending = load_pending_operation(&transaction, space_id)?
-            .context("pending remote Space membership operation is missing")?;
-        if pending != *operation {
-            bail!("pending remote Space membership operation does not match completion")
-        }
-        apply_membership_operation(&transaction, space_id, operation)?;
-        delete_pending_operation(&transaction, space_id)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    fn reconcile_and_sync_sessions(
+    /// Stamp the sessions the old name-keyed table claims, then drop its rows. Runs once per
+    /// Space; a name the backend no longer has goes away with the rows.
+    fn adopt_membership_recorded_by_name(
         &mut self,
         space_id: &str,
-        snapshot: &MuxSnapshot,
-    ) -> Result<HashSet<String>> {
-        let memberships = snapshot
-            .sessions
-            .iter()
-            .map(|session| BackendMembership {
-                id: session.id.clone(),
-                name: session.name.clone(),
-            })
-            .collect::<Vec<_>>();
-        let alive = memberships
-            .iter()
-            .map(|session| session.name.as_str())
-            .collect::<HashSet<_>>();
-        let transaction = self.connection.transaction()?;
-        if let Some(operation) = load_pending_operation(&transaction, space_id)? {
-            if operation.effect_occurred(&memberships) {
-                apply_membership_operation(&transaction, space_id, &operation)?;
-            }
-            delete_pending_operation(&transaction, space_id)?;
-        }
-        let owned = session_names(&transaction, space_id)?;
-        for missing in owned.iter().filter(|name| !alive.contains(name.as_str())) {
-            transaction.execute(
-                "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
-                params![space_id, missing],
+        backend: &mut dyn MuxBackend,
+    ) -> Result<()> {
+        let recorded = {
+            let mut statement = self.connection.prepare(
+                "SELECT session_name FROM remote_space_sessions
+                 WHERE space_id = ?1 ORDER BY position",
             )?;
+            statement
+                .query_map([space_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?
+        };
+        if recorded.is_empty() {
+            return Ok(());
         }
-        let owned = session_names(&transaction, space_id)?;
-        transaction.commit()?;
-        Ok(owned)
+        for session in backend.snapshot()?.sessions {
+            if !session.tag.is_empty() || !recorded.contains(&session.name) {
+                continue;
+            }
+            backend.execute(MuxCommand::StampSession {
+                session_id: session.id.clone(),
+                tag: MuxSessionTag {
+                    identity: Some(new_session_identity()),
+                    space: Some(space_id.to_owned()),
+                },
+            })?;
+        }
+        self.connection.execute(
+            "DELETE FROM remote_space_sessions WHERE space_id = ?1",
+            [space_id],
+        )?;
+        Ok(())
     }
 
     fn space_backend(&self, space_id: &str, expected: Backend) -> Result<Backend> {
@@ -488,103 +435,6 @@ impl BackendLease {
     }
 }
 
-fn session_names(transaction: &Transaction<'_>, space_id: &str) -> Result<HashSet<String>> {
-    let mut statement = transaction.prepare(
-        "SELECT session_name FROM remote_space_sessions WHERE space_id = ?1 ORDER BY position",
-    )?;
-    Ok(statement
-        .query_map([space_id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<_>>()?)
-}
-
-fn apply_membership_operation(
-    transaction: &Transaction<'_>,
-    space_id: &str,
-    operation: &MembershipOperation,
-) -> Result<()> {
-    operation
-        .validate()
-        .map_err(|error| anyhow::anyhow!(error))?;
-    match operation {
-        MembershipOperation::Create { session_name, .. } => {
-            let position = transaction.query_row(
-                "SELECT COALESCE(MAX(position) + 1, 0)
-                 FROM remote_space_sessions WHERE space_id = ?1",
-                [space_id],
-                |row| row.get::<_, i64>(0),
-            )?;
-            transaction.execute(
-                "INSERT OR IGNORE INTO remote_space_sessions
-                 (space_id, session_name, position) VALUES (?1, ?2, ?3)",
-                params![space_id, session_name, position],
-            )?;
-        }
-        MembershipOperation::Rename {
-            old_name, new_name, ..
-        } => {
-            let changed = transaction.execute(
-                "UPDATE remote_space_sessions SET session_name = ?3
-                 WHERE space_id = ?1 AND session_name = ?2",
-                params![space_id, old_name, new_name],
-            )?;
-            if changed == 0 {
-                let already_renamed = transaction.query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM remote_space_sessions
-                         WHERE space_id = ?1 AND session_name = ?2
-                     )",
-                    params![space_id, new_name],
-                    |row| row.get::<_, bool>(0),
-                )?;
-                if !already_renamed {
-                    bail!("pending rename membership is unavailable")
-                }
-            }
-        }
-        MembershipOperation::Ditch { old_name, .. } => {
-            transaction.execute(
-                "DELETE FROM remote_space_sessions WHERE space_id = ?1 AND session_name = ?2",
-                params![space_id, old_name],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn load_pending_operation(
-    transaction: &Transaction<'_>,
-    space_id: &str,
-) -> Result<Option<MembershipOperation>> {
-    let pending = transaction
-        .query_row(
-            "SELECT operation, session_id, old_name, new_name
-             FROM remote_space_pending_membership_operations WHERE space_id = ?1",
-            [space_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    pending
-        .map(|(operation, session_id, old_name, new_name)| {
-            operation_from_storage(&operation, session_id, old_name, new_name)
-        })
-        .transpose()
-}
-
-fn delete_pending_operation(transaction: &Transaction<'_>, space_id: &str) -> Result<()> {
-    transaction.execute(
-        "DELETE FROM remote_space_pending_membership_operations WHERE space_id = ?1",
-        [space_id],
-    )?;
-    Ok(())
-}
-
 fn default_legacy_catalog(identity: ApplicationIdentity) -> Option<LegacyCatalog> {
     let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
@@ -604,27 +454,6 @@ fn unique_name(requested: &str, existing: &HashSet<String>) -> String {
         .map(|suffix| format!("{requested} {suffix}"))
         .find(|candidate| !existing.contains(candidate))
         .expect("all numbered remote Space names are occupied")
-}
-
-fn resolve_owned_session_name(
-    snapshot: &MuxSnapshot,
-    owned_names: &HashSet<String>,
-    command: &MuxCommand,
-    space_id: &str,
-) -> Result<Option<String>> {
-    let Some(session_id) = command_session_id(command) else {
-        return Ok(None);
-    };
-    let name = snapshot
-        .sessions
-        .iter()
-        .find(|session| session_matches(session, session_id))
-        .map(|session| session.name.clone())
-        .context("session is unavailable")?;
-    if !owned_names.contains(&name) {
-        bail!("session does not belong to remote Space {space_id}")
-    }
-    Ok(Some(name))
 }
 
 fn command_session_id(command: &MuxCommand) -> Option<&str> {
@@ -647,77 +476,7 @@ fn command_session_id(command: &MuxCommand) -> Option<&str> {
         | MuxCommand::ClosePane { session_id, .. }
         | MuxCommand::TogglePaneZoom { session_id, .. }
         | MuxCommand::RenameSession { session_id, .. }
-        | MuxCommand::DitchSession { session_id } => Some(session_id),
+        | MuxCommand::DitchSession { session_id }
+        | MuxCommand::StampSession { session_id, .. } => Some(session_id),
     }
-}
-
-fn membership_operation(
-    command: &MuxCommand,
-    old_name: Option<&str>,
-) -> Result<Option<MembershipOperation>> {
-    Ok(match command {
-        MuxCommand::CreateProjectSession { session_id, .. }
-        | MuxCommand::CreateWorktreeSession { session_id, .. } => {
-            Some(MembershipOperation::Create {
-                session_id: session_id.clone(),
-                session_name: session_id.clone(),
-            })
-        }
-        MuxCommand::RenameSession { session_id, name } => Some(MembershipOperation::Rename {
-            session_id: session_id.clone(),
-            old_name: old_name.context("session is unavailable")?.to_owned(),
-            new_name: name.clone(),
-        }),
-        MuxCommand::DitchSession { session_id } => Some(MembershipOperation::Ditch {
-            session_id: session_id.clone(),
-            old_name: old_name.context("session is unavailable")?.to_owned(),
-        }),
-        _ => None,
-    })
-}
-
-fn operation_storage(operation: &MembershipOperation) -> (&str, &str, Option<&str>, Option<&str>) {
-    match operation {
-        MembershipOperation::Create {
-            session_id,
-            session_name,
-        } => ("create", session_id, None, Some(session_name)),
-        MembershipOperation::Rename {
-            session_id,
-            old_name,
-            new_name,
-        } => ("rename", session_id, Some(old_name), Some(new_name)),
-        MembershipOperation::Ditch {
-            session_id,
-            old_name,
-        } => ("ditch", session_id, Some(old_name), None),
-    }
-}
-
-fn operation_from_storage(
-    operation: &str,
-    session_id: String,
-    old_name: Option<String>,
-    new_name: Option<String>,
-) -> Result<MembershipOperation> {
-    let operation = match operation {
-        "create" if old_name.is_none() => MembershipOperation::Create {
-            session_id,
-            session_name: new_name.context("pending create has no session name")?,
-        },
-        "rename" => MembershipOperation::Rename {
-            session_id,
-            old_name: old_name.context("pending rename has no old name")?,
-            new_name: new_name.context("pending rename has no new name")?,
-        },
-        "ditch" if new_name.is_none() => MembershipOperation::Ditch {
-            session_id,
-            old_name: old_name.context("pending ditch has no old name")?,
-        },
-        _ => bail!("pending membership operation has an invalid shape"),
-    };
-    operation
-        .validate()
-        .map_err(|error| anyhow::anyhow!(error))?;
-    Ok(operation)
 }

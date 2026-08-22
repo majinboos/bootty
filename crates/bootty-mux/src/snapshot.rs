@@ -32,6 +32,56 @@ pub struct MuxSession {
     pub anchor: MuxPaneAnchor,
     pub active_window_id: Option<String>,
     pub windows: Vec<MuxWindow>,
+    #[serde(default, skip_serializing_if = "MuxSessionTag::is_empty")]
+    pub tag: MuxSessionTag,
+}
+
+/// Bootty's handle on a session, stored in the multiplexer rather than in bootty.
+///
+/// Names belong to whoever is looking at them, so nothing bootty persists may key on one. Empty
+/// means the session belongs to no Space yet -- made outside bootty, or its server restarted.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct MuxSessionTag {
+    /// The durable id bootty minted for this session, stable across every rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// The Space that claims it, as that Space's portable id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+}
+
+impl MuxSessionTag {
+    pub fn is_empty(&self) -> bool {
+        self.identity.is_none() && self.space.is_none()
+    }
+}
+
+/// The multiplexer option holding [`MuxSessionTag::identity`].
+///
+/// tmux hangs it off the session itself. rmux keys its option store by session name and does not
+/// migrate it on rename, so the rmux backend keys the same option on the session's stable id at
+/// server scope instead. Either way the tag lives in the multiplexer and every bootty window
+/// looking at that server reads the same answer.
+pub const SESSION_IDENTITY_OPTION: &str = "@bootty_id";
+
+/// The multiplexer option holding [`MuxSessionTag::space`]. See [`SESSION_IDENTITY_OPTION`].
+pub const SESSION_SPACE_OPTION: &str = "@bootty_space";
+
+/// Mints a session identity. Random, because two bootty installs can share one server.
+pub fn new_session_identity() -> String {
+    let mut bytes = [0_u8; 16];
+    // A failure here would leave the session untagged, which reads as "belongs to no Space" and is
+    // recoverable, so it is not worth failing a session creation over.
+    if getrandom::fill(&mut bytes).is_err() {
+        return String::new();
+    }
+    let digits = b"0123456789abcdef";
+    let mut identity = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        identity.push(digits[(byte >> 4) as usize] as char);
+        identity.push(digits[(byte & 0x0f) as usize] as char);
+    }
+    identity
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
