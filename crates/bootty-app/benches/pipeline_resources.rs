@@ -26,6 +26,7 @@ use bootty_render::{
     terminal_render::{RenderFramePool, TerminalRenderFrame},
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
+use bootty_terminal::terminal_engine::TerminalEngine;
 
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);

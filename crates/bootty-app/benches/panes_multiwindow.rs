@@ -5,7 +5,9 @@ mod paint_plan_fixtures;
 use bootty_app::{
     app_actions::{AppKeyBindings, KeybindAction, MuxKeyAction},
     commands::{CommandExecutor, CommandRegistry, CoreCommandExecutor},
-    config::{BoottyConfig, MultiplexerBackendConfig},
+};
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_render::{
     geometry::TerminalSurface,
     paint_plan::PaintPlanner,
     terminal_render::TerminalRenderFrame,

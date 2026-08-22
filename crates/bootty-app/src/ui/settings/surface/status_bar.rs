@@ -141,9 +141,7 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         .writeback
         .path()
         .parent()
-        .and_then(|parent| {
-            crate::command_extensions::module_identities(&parent.join("extensions")).ok()
-        })
+        .and_then(|parent| bootty_extension::module_identities(&parent.join("extensions")).ok())
         .map(|identities| {
             identities
                 .into_iter()

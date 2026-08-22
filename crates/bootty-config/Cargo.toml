@@ -8,14 +8,13 @@ workspace = true
 [dependencies]
 bootty-font = { path = "../bootty-font" }
 bootty-mux-model = { path = "../bootty-mux-model" }
+bootty-write = { path = "../bootty-write" }
 serde.workspace = true
-tempfile.workspace = true
 toml_edit.workspace = true
 bootty-identity = { path = "../bootty-identity" }
-
-[target.'cfg(windows)'.dependencies]
-winsafe.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 indoc.workspace = true
 rstest.workspace = true
+tempfile.workspace = true

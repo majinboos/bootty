@@ -10,10 +10,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use bootty_identity::ApplicationIdentity;
 use bootty_mux::{
-    MuxBackendKind, RemoteSpaceSummary,
+    MuxBackendKind, MuxBindingConfig, RemoteSpaceSummary,
+    backend::MuxBackend,
     command::MuxCommand,
     membership::{BackendMembership, MembershipOperation},
-    rmux::RmuxBackend,
+    provider::MuxBackendRegistry,
     snapshot::{MuxSnapshot, session_matches},
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -66,36 +67,17 @@ struct LegacyCatalog {
 pub struct Catalog {
     connection: Connection,
     lock_directory: PathBuf,
-}
-
-/// Backend seam used by catalog mutations and recovery.
-pub trait CatalogBackend {
-    fn snapshot(&self) -> Result<MuxSnapshot>;
-    fn execute(&mut self, command: MuxCommand) -> Result<()>;
-}
-
-impl CatalogBackend for Backend {
-    fn snapshot(&self) -> Result<MuxSnapshot> {
-        match self {
-            Self::Rmux => MuxBackendKind::Rmux,
-            Self::Tmux => MuxBackendKind::Tmux,
-            Self::Zellij => MuxBackendKind::Zellij,
-        }
-    }
-
-    fn execute(&mut self, command: MuxCommand) -> Result<()> {
-        match self {
-            Self::Rmux => RmuxBackend::new().execute(command),
-            Self::Tmux => TmuxBackend::new().execute(command),
-            Self::Zellij => ZellijBackend::new().execute(command),
-        }
-    }
+    backends: Arc<MuxBackendRegistry>,
 }
 
 impl Catalog {
-    pub fn open(path: &Path, identity: ApplicationIdentity) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        identity: ApplicationIdentity,
+        backends: Arc<MuxBackendRegistry>,
+    ) -> Result<Self> {
         let legacy = default_legacy_catalog(identity);
-        Self::open_with_legacy(path, legacy.as_ref())
+        Self::open_with_legacy(path, legacy.as_ref(), backends)
     }
 
     fn open_with_legacy(
@@ -151,6 +133,7 @@ impl Catalog {
         let mut catalog = Self {
             connection,
             lock_directory,
+            backends,
         };
         catalog.migrate_legacy(legacy)?;
         Ok(catalog)
@@ -311,15 +294,16 @@ impl Catalog {
     }
 
     pub fn snapshot(&mut self, space_id: &str, expected: Backend) -> Result<MuxSnapshot> {
-        let mut backend = self.space_backend(space_id, expected)?;
-        self.snapshot_with_backend(space_id, expected, &mut backend)
+        let backend_kind = self.space_backend(space_id, expected)?;
+        let mut backend = self.backend(backend_kind);
+        self.snapshot_with_backend(space_id, expected, backend.as_mut())
     }
 
     pub fn snapshot_with_backend(
         &mut self,
         space_id: &str,
         expected: Backend,
-        backend: &mut dyn CatalogBackend,
+        backend: &mut dyn MuxBackend,
     ) -> Result<MuxSnapshot> {
         let backend_kind = self.space_backend(space_id, expected)?;
         let _lease = self.backend_lease(backend_kind)?;
@@ -340,8 +324,9 @@ impl Catalog {
         expected: Backend,
         command: MuxCommand,
     ) -> Result<()> {
-        let mut backend = self.space_backend(space_id, expected)?;
-        self.execute_with_backend(space_id, expected, command, &mut backend)
+        let backend_kind = self.space_backend(space_id, expected)?;
+        let mut backend = self.backend(backend_kind);
+        self.execute_with_backend(space_id, expected, command, backend.as_mut())
     }
 
     pub fn execute_with_backend(
@@ -349,7 +334,7 @@ impl Catalog {
         space_id: &str,
         expected: Backend,
         command: MuxCommand,
-        backend: &mut dyn CatalogBackend,
+        backend: &mut dyn MuxBackend,
     ) -> Result<()> {
         let backend_kind = self.space_backend(space_id, expected)?;
         let _lease = self.backend_lease(backend_kind)?;
@@ -471,6 +456,17 @@ impl Catalog {
             )
         }
         Ok(stored)
+    }
+
+    fn backend(&self, backend: Backend) -> Box<dyn MuxBackend> {
+        self.backends.build_backend_for_kind(
+            backend.wire_kind(),
+            &MuxBindingConfig {
+                backend: backend.wire_kind(),
+                ..MuxBindingConfig::default()
+            },
+            None,
+        )
     }
 
     fn backend_lease(&self, backend: Backend) -> Result<BackendLease> {

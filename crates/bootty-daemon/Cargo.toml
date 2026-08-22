@@ -11,6 +11,10 @@ path = "src/main.rs"
 anyhow.workspace = true
 bootty-config = { path = "../bootty-config" }
 bootty-mux = { path = "../bootty-mux", default-features = false }
+bootty-remote = { path = "../bootty-remote", default-features = false }
+bootty-rmux = { path = "../bootty-rmux", default-features = false }
+bootty-tmux = { path = "../bootty-tmux", default-features = false }
+bootty-zellij = { path = "../bootty-zellij", default-features = false }
 bootty-identity = { path = "../bootty-identity" }
 rusqlite.workspace = true
 serde.workspace = true

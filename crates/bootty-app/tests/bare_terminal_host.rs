@@ -11,7 +11,14 @@ use bootty_render::{
     terminal_sprite::SpriteFamily,
     terminal_text::TerminalTextConfig,
 };
-use bootty_terminal::terminal_engine::TerminalColorConfig;
+use bootty_terminal::terminal_image::{
+    KittyImageFrame, KittyImageLayer, KittyImagePlacement, KittyVirtualPlacement,
+};
+use bootty_terminal::{
+    terminal_engine::{TerminalColorConfig, TerminalEngine},
+    terminal_frame::{CellStyle, CursorSnapshot, FrameColors, FrameStats, RenderCell, RenderFrame},
+    terminal_input_model::{KeyMods, MouseAction, MouseButton, MouseEncoderSize, TerminalKey},
+};
 use bootty_winit::bare_host::{
     BareRendererSurfaceConfig, BareTerminalInput, BareTerminalViewport, bare_terminal_key_input,
     bare_terminal_key_input_with_remaps, bare_terminal_key_input_with_sides,

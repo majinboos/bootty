@@ -4,11 +4,7 @@ use bootty_extension::{ExtensionUiAction, ModuleItem, ModulePrimitive, Published
 use bootty_mux::{controller::MuxScope, snapshot::MuxSession};
 use eframe::egui::Color32;
 
-use crate::{
-    command_extensions::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem},
-    mux::{controller::MuxScope, snapshot::MuxSession},
-    ui::session_navigation::BindingSessionGroup,
-};
+use crate::{theme::module_color32, ui::session_navigation::BindingSessionGroup};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SidebarState {

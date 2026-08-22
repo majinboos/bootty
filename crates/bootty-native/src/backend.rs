@@ -577,10 +577,12 @@ impl MuxBackend for NativeBackend {
                     state.activate_window(&session_id, &window_id);
                 }
                 match direction {
-                    super::command::MuxDirection::Left | super::command::MuxDirection::Up => {
+                    bootty_mux::command::MuxDirection::Left
+                    | bootty_mux::command::MuxDirection::Up => {
                         state.select_relative_pane(&session_id, -1);
                     }
-                    super::command::MuxDirection::Right | super::command::MuxDirection::Down => {
+                    bootty_mux::command::MuxDirection::Right
+                    | bootty_mux::command::MuxDirection::Down => {
                         state.select_relative_pane(&session_id, 1);
                     }
                 }
@@ -628,4 +630,60 @@ impl MuxBackend for NativeBackend {
         }
         Ok(())
     }
+}
+
+pub fn native_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+    BindingCapabilityDescriptor::new(
+        scope,
+        [
+            BindingOperation::ActivateWindow,
+            BindingOperation::CreateWindow,
+            BindingOperation::RenameWindow,
+            BindingOperation::NavigateWindow,
+            BindingOperation::MoveWindow,
+            BindingOperation::SplitPane,
+            BindingOperation::NavigatePane,
+            BindingOperation::ClosePane,
+            BindingOperation::CreateProjectSession,
+            BindingOperation::CreateWorktreeSession,
+            BindingOperation::RenameSession,
+            BindingOperation::DitchSession,
+        ],
+    )
+}
+
+pub struct NativePanePolicy;
+
+impl BackendPanePolicy for NativePanePolicy {
+    fn remote_target(&self) -> Option<&bootty_mux_model::SshTarget> {
+        None
+    }
+
+    fn start_terminal(
+        &mut self,
+        request: PaneStartRequest<'_>,
+    ) -> Result<Option<Box<dyn TerminalRuntime>>> {
+        if !matches!(request.target.mux_target(), MuxPaneTarget::Pane { .. }) {
+            return Ok(None);
+        }
+        let mut config = request.terminal_config.clone();
+        config.launch.working_directory =
+            request.target.cwd().map(Path::new).map(Path::to_path_buf);
+        config.side_effect_pane_id = request.target.side_effect_pane_id();
+        Ok(Some(Box::new(StartingNativeTerminal::spawn(
+            request.spawn_geometry,
+            config,
+            Arc::clone(request.repaint_wakeup),
+        ))))
+    }
+
+    fn sync_target(&mut self, _target: Option<&ScopedMuxPaneTarget>, _hide_tmux_status: bool) {}
+
+    fn set_layout_window(&mut self, _window_id: Option<&str>) {}
+
+    fn resize_layout_window(&mut self, _request: PaneLayoutResizeRequest<'_>) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn deactivate(&mut self) {}
 }

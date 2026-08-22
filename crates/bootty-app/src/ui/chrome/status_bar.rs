@@ -8,11 +8,7 @@ use bootty_ui::{
 };
 use eframe::egui::{self, CornerRadius, Pos2, Rect, Stroke, StrokeKind};
 
-use crate::{
-    command_extensions::ModulePrimitive,
-    config::SegmentAlign,
-    ui::icons::{has_slug, paint_icon_slug},
-};
+use bootty_config::config::SegmentAlign;
 
 use super::{
     item_primitives::{paint_item_hover_overlay, paint_item_primitives, primitive_background},

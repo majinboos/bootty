@@ -1,17 +1,15 @@
 use bootty_app::{
-    config::{ColorConfig, SegmentAlign},
-    mux::controller::SpaceId,
     theme::theme_palette_from_colors,
-    ui::{
-        chrome::{
-            ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState,
-            SpaceSwitcherEvent, SpaceSwitcherItem, StatusBarModel, show_space_switcher,
-            show_status_bar, status_bar_window_tab_row_count, status_bar_windows_intersect_x_range,
-            take_sidebar_space_swipe,
-        },
-        icons::install_icon_fonts,
+    ui::chrome::{
+        ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState, SpaceSwitcherEvent,
+        SpaceSwitcherItem, StatusBarModel, show_space_switcher, show_status_bar,
+        status_bar_window_tab_row_count, status_bar_windows_intersect_x_range,
+        take_sidebar_space_swipe,
     },
 };
+use bootty_config::config::{ColorConfig, SegmentAlign};
+use bootty_mux::controller::SpaceId;
+use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
 
 fn space(id: i64, name: &str, active: bool) -> SpaceSwitcherItem {
@@ -48,39 +46,41 @@ fn window_tabs_move_to_another_row_when_the_notch_crosses_them() {
         }],
     }];
 
-    let _ = context.run_ui(
-        RawInput {
-            screen_rect: Some(screen),
-            ..RawInput::default()
-        },
-        |ui| {
-            let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 30.0));
-            assert!(status_bar_windows_intersect_x_range(
-                ui,
-                bar,
-                &segments,
-                STATUS_EDGE_PAD,
-                (20.0, 40.0),
-            ));
-            assert!(!status_bar_windows_intersect_x_range(
-                ui,
-                bar,
-                &segments,
-                STATUS_EDGE_PAD,
-                (500.0, 540.0),
-            ));
-            assert_eq!(
-                status_bar_window_tab_row_count(
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                ..RawInput::default()
+            },
+            |ui| {
+                let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 30.0));
+                assert!(status_bar_windows_intersect_x_range(
                     ui,
                     bar,
                     &segments,
                     STATUS_EDGE_PAD,
-                    Some((20.0, 40.0)),
-                ),
-                2
-            );
-        },
-    );
+                    (20.0, 40.0),
+                ));
+                assert!(!status_bar_windows_intersect_x_range(
+                    ui,
+                    bar,
+                    &segments,
+                    STATUS_EDGE_PAD,
+                    (500.0, 540.0),
+                ));
+                assert_eq!(
+                    status_bar_window_tab_row_count(
+                        ui,
+                        bar,
+                        &segments,
+                        STATUS_EDGE_PAD,
+                        Some((20.0, 40.0)),
+                    ),
+                    2
+                );
+            },
+        )
+        .drop_without_applying_deltas();
 }
 
 #[test]
@@ -105,16 +105,18 @@ fn pressing_empty_status_chrome_starts_a_native_window_drag() {
         );
     };
 
-    let _ = context.run_ui(
-        RawInput {
-            screen_rect: Some(screen),
-            events: vec![Event::PointerMoved(Pos2::new(20.0, 15.0))],
-            ..RawInput::default()
-        },
-        |ui| {
-            egui::CentralPanel::default().show(ui, |ui| show(ui));
-        },
-    );
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events: vec![Event::PointerMoved(Pos2::new(20.0, 15.0))],
+                ..RawInput::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| show(ui));
+            },
+        )
+        .drop_without_applying_deltas();
     let output = context.run_ui(
         RawInput {
             screen_rect: Some(screen),
@@ -136,6 +138,7 @@ fn pressing_empty_status_chrome_starts_a_native_window_drag() {
         .get(&egui::ViewportId::ROOT)
         .expect("root viewport output");
     assert!(root.commands.contains(&egui::ViewportCommand::StartDrag));
+    output.drop_without_applying_deltas();
 }
 
 #[test]
@@ -147,33 +150,35 @@ fn horizontal_space_swipes_switch_once_and_leave_vertical_scroll_available() {
     let mut remaining_wheels = Vec::new();
     let mut selected = None;
 
-    let _ = context.run_ui(
-        RawInput {
-            screen_rect: Some(sidebar),
-            events: vec![
-                Event::PointerMoved(sidebar.center()),
-                wheel(egui::vec2(-12.0, 1.0), TouchPhase::Start),
-                wheel(egui::vec2(-12.0, 1.0), TouchPhase::Move),
-                wheel(egui::vec2(0.0, 12.0), TouchPhase::Move),
-            ],
-            ..RawInput::default()
-        },
-        |ui| {
-            egui::CentralPanel::default().show(ui, |ui| {
-                selected = take_sidebar_space_swipe(ui, sidebar, &spaces, &mut state);
-                remaining_wheels = ui.input(|input| {
-                    input
-                        .events
-                        .iter()
-                        .filter_map(|event| match event {
-                            Event::MouseWheel { delta, .. } => Some(*delta),
-                            _ => None,
-                        })
-                        .collect()
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(sidebar),
+                events: vec![
+                    Event::PointerMoved(sidebar.center()),
+                    wheel(egui::vec2(-12.0, 1.0), TouchPhase::Start),
+                    wheel(egui::vec2(-12.0, 1.0), TouchPhase::Move),
+                    wheel(egui::vec2(0.0, 12.0), TouchPhase::Move),
+                ],
+                ..RawInput::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    selected = take_sidebar_space_swipe(ui, sidebar, &spaces, &mut state);
+                    remaining_wheels = ui.input(|input| {
+                        input
+                            .events
+                            .iter()
+                            .filter_map(|event| match event {
+                                Event::MouseWheel { delta, .. } => Some(*delta),
+                                _ => None,
+                            })
+                            .collect()
+                    });
                 });
-            });
-        },
-    );
+            },
+        )
+        .drop_without_applying_deltas();
 
     assert_eq!(selected, Some(spaces[1].id));
     assert_eq!(remaining_wheels, [egui::vec2(0.0, 12.0)]);
@@ -188,20 +193,22 @@ fn clicking_a_space_switcher_control_activates_that_space() {
     let palette = theme_palette_from_colors(&ColorConfig::default());
     let show = |events: Vec<Event>| {
         let mut event = None;
-        let _ = context.run_ui(
-            RawInput {
-                screen_rect: Some(screen),
-                events,
-                ..RawInput::default()
-            },
-            |ui| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::NONE)
-                    .show(ui, |ui| {
-                        event = show_space_switcher(ui, palette, &spaces, None);
-                    });
-            },
-        );
+        context
+            .run_ui(
+                RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..RawInput::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            event = show_space_switcher(ui, palette, &spaces, None);
+                        });
+                },
+            )
+            .drop_without_applying_deltas();
         event
     };
     let second = Pos2::new(120.0, 22.0);

@@ -21,6 +21,57 @@ fn page_routes_select_the_expected_section() {
 }
 
 #[test]
+fn public_mouse_tabs_follow_the_rendered_nested_tab_row() {
+    let mut site = SiteBackend::for_page("docs");
+    let initial = site.render_frame().expect("render docs");
+    let (tab_y, row) = rows(&initial)
+        .into_iter()
+        .enumerate()
+        .find(|(_, row)| row.contains("Browser") && row.contains("Node"))
+        .expect("render Browser and Node tabs");
+    let browser_x = row
+        .find("Browser")
+        .expect("render Browser tab")
+        .saturating_add(1) as u16;
+    let node_x = row.find("Node").expect("render Node tab").saturating_add(1) as u16;
+
+    let browser = site
+        .mouse_frame("down", browser_x, tab_y as u16, 0)
+        .expect("click Browser tab");
+    assert!(
+        frame_text(&browser).contains("mountCanvasTerminal"),
+        "clicking the rendered Browser tab must select the Browser content"
+    );
+
+    let selected = site
+        .mouse_frame("down", node_x, tab_y as u16, 0)
+        .expect("click Node tab");
+
+    assert!(
+        frame_text(&selected).contains("createEmptyFrame"),
+        "clicking the rendered Node tab must select the Node content"
+    );
+}
+
+#[test]
+fn non_alternative_pages_keep_content_clicks_out_of_tab_dispatch() {
+    for page in ["overview", "quickstart", "renderer", "config"] {
+        let mut site = SiteBackend::for_page(page);
+        site.mouse_frame("down", 5, 6, 0)
+            .unwrap_or_else(|error| panic!("begin {page} content selection: {error}"));
+        site.mouse_frame("move", 12, 6, 0)
+            .unwrap_or_else(|error| panic!("drag {page} content selection: {error}"));
+        site.mouse_frame("up", 12, 6, 0)
+            .unwrap_or_else(|error| panic!("finish {page} content selection: {error}"));
+
+        assert!(
+            site.selected_text().is_some(),
+            "{page} content click must not be consumed as a fake tab hit"
+        );
+    }
+}
+
+#[test]
 fn mouse_selection_and_scroll_stay_in_the_host_neutral_backend() {
     let mut site = SiteBackend::for_page("quickstart");
     let before = site.render_frame().expect("render quickstart");
@@ -86,7 +137,7 @@ fn product_pages_render_complete_content_without_markdown_fences() {
     let quickstart = scrolling_text(&mut SiteBackend::for_page("quickstart"));
     assert!(quickstart.contains("Native app"));
     assert!(quickstart.contains("Glyph probe"));
-    assert!(quickstart.contains("cargo run -p bootty-app --bin bootty"));
+    assert!(quickstart.contains("cargo run -p bootty --bin bootty"));
 
     let renderer = scrolling_text(&mut SiteBackend::for_page("renderer"));
     assert!(renderer.contains("Frame contract"));
@@ -111,7 +162,8 @@ fn docs_keyboard_navigation_renders_each_nested_package_surface() {
     site.input_frame("]").expect("switch to Rust docs");
     let rust = scrolling_text(&mut site);
     assert!(rust.contains("TerminalSession::new_with_repaint_wakeup"));
-    assert!(rust.contains("RendererFrame::from_terminal"));
+    assert!(rust.contains("TerminalTextContract::for_terminal_paint_plan"));
+    assert!(rust.contains("planner preserves terminal appearance and placement as paint commands"));
     assert!(!rust.contains("```"));
 }
 

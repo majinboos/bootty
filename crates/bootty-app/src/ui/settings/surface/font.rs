@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use super::SettingsWindow;
+use super::SettingsSurface;
 use bootty_font::{FontFeature, parse_font_features};
 
 pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {

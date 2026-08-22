@@ -4,11 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-bootty-dev = ["bootty-identity/bootty-dev"]
-
-[[bin]]
-name = "bootty"
-path = "src/main.rs"
+bootty-dev = ["bootty-identity/bootty-dev", "bootty-control/bootty-dev"]
 
 [dependencies]
 bootty-command = { path = "../bootty-command" }
@@ -18,8 +14,6 @@ anyhow.workspace = true
 arboard.workspace = true
 eframe.workspace = true
 iconflow.workspace = true
-fontdb.workspace = true
-getrandom.workspace = true
 libghostty-vt.workspace = true
 bootty-winit = { path = "../bootty-winit", default-features = false }
 bootty-font = { path = "../bootty-font" }
@@ -33,24 +27,12 @@ bootty-runtime = { path = "../bootty-runtime" }
 bootty-terminal = { path = "../bootty-terminal" }
 bootty-workspace = { path = "../bootty-workspace" }
 png.workspace = true
-process-wrap.workspace = true
-rusqlite.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-rmux-ipc.workspace = true
-rmux-os.workspace = true
-tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync", "time"] }
-self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "checksums", "compression-tar-gz", "compression-zip-deflate", "github", "rustls", "ureq"] }
-starship-battery.workspace = true
 strum.workspace = true
-notify.workspace = true
-sysinfo.workspace = true
-tempfile.workspace = true
-ttf-parser.workspace = true
 wgpu.workspace = true
 winit.workspace = true
 keepawake.workspace = true
-mlua = { version = "0.12.0", features = ["luau", "serialize"] }
+thiserror.workspace = true
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -64,7 +46,6 @@ winit = { workspace = true, features = ["wayland", "x11"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"] }
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 bootty-native = { path = "../bootty-native" }
@@ -75,6 +56,8 @@ bootty-winit = { path = "../bootty-winit", features = ["bare-host"] }
 criterion.workspace = true
 egui.workspace = true
 pollster.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "paint_plan"

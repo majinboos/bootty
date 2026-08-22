@@ -7,13 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_app::{
-    app::{AppEffect, AppState, FrameInputs, ViewportSnapshot},
-    config::{MultiplexerBackendConfig, load_config_from_path},
-    geometry::ViewTransform,
-    mux::snapshot::MuxPaneAnchor,
-    renderer::RendererMetrics,
-};
+use bootty_app::{AppEffect, AppState, FrameInputs, ViewportSnapshot, renderer::RendererMetrics};
+use bootty_config::config::{MultiplexerBackendConfig, load_config_from_path};
+use bootty_mux::snapshot::MuxPaneAnchor;
+use bootty_render::geometry::ViewTransform;
+
+mod support;
 
 fn frame(now: Instant) -> FrameInputs {
     FrameInputs {
@@ -49,7 +48,8 @@ fn native_terminal_progress_updates_active_binding_presentation() {
     std::fs::write(&config_path, "[multiplexer]\nbackend = \"native\"\n").expect("write config");
     let mut config = load_config_from_path(&config_path).expect("load config");
     config.session.shell = Some(script.to_string_lossy().into_owned());
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("start app state");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
     let pane = MuxPaneAnchor {
         session_id: "facts".to_owned(),
         pane_id: Some("%1".to_owned()),
@@ -68,7 +68,9 @@ fn native_terminal_progress_updates_active_binding_presentation() {
         )
         .expect("start terminal program");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // The budget bounds a genuine hang. It stays far above the scheduler jitter that a fully
+    // parallel test run adds to a pane spawn.
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut observed_progress_repaint = false;
     while Instant::now() < deadline && !observed_progress_repaint {
         for effect in state.update_frame(frame(Instant::now())) {

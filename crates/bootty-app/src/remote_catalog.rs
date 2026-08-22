@@ -1,14 +1,9 @@
 use std::collections::HashSet;
 
-use crate::{
-    config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
-    workspace::{
-        BackendMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON,
-        SessionNameStore, SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride,
-        WorkspaceBinding, WorkspaceRepository,
-    },
-};
 use anyhow::{Result, bail};
+use bootty_config::config::{
+    BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig,
+};
 pub use bootty_mux::RemoteSpaceSummary;
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
@@ -86,7 +81,7 @@ pub fn snapshot(
     space_id: &str,
     expected_backend: MultiplexerBackendConfig,
 ) -> Result<MuxSnapshot> {
-    let mut runtime = remote_space_runtime(config, space_id, expected_backend)?;
+    let mut runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
     let snapshot = runtime.backend.snapshot()?;
     runtime.reconcile_pending_membership(&snapshot)?;
     let snapshot = filter_snapshot_for_space(snapshot, &mut runtime.session_order);
@@ -127,8 +122,8 @@ pub fn execute(
     expected_backend: MultiplexerBackendConfig,
     payload: &str,
 ) -> Result<()> {
-    let command = bootty_mux::remote_space::decode_command(payload)?;
-    let mut runtime = remote_space_runtime(config, space_id, expected_backend)?;
+    let command = bootty_remote::space_protocol::decode_command(payload)?;
+    let mut runtime = remote_space_runtime(config, backends, space_id, expected_backend)?;
     let snapshot = runtime.backend.snapshot()?;
     runtime.reconcile_pending_membership(&snapshot)?;
     let owned_names = runtime.session_order.session_names();
@@ -255,8 +250,7 @@ fn remote_space_runtime(
     }
     multiplexer.remote = None;
     multiplexer.remote_space_id = None;
-    let backend =
-        bootty_mux::config::build_backend_for_workspace(&multiplexer, Some(&config.config_path));
+    let backend = backends.build_backend(&multiplexer, Some(&config.config_path));
     let scope = binding.mux_scope();
     let session_order = binding.session_order().clone();
     let session_names = binding.session_names().clone();

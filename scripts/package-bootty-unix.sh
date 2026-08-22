@@ -5,7 +5,7 @@ APP_NAME="Bootty"
 BINARY_NAME="bootty"
 CLI_NAME="bootty"
 BUNDLE_IDENTIFIER="dev.bootty.desktop"
-PACKAGE_NAME="bootty-app"
+PACKAGE_NAME="bootty"
 DAEMON_BINARY_NAME="bootty-daemon"
 DAEMON_PACKAGE_NAME="bootty-daemon"
 DIST_DIR="${BOOTTY_DIST_DIR:-dist}"
@@ -28,7 +28,7 @@ DAEMON_PROFILE_ARGS=(--profile daemon-release)
 FAST=0
 LINKAGE="dynamic"
 DEV=0
-CARGO_FEATURE_ARGS=()
+ALL_DAEMONS=0
 while (($#)); do
   case "$1" in
     --fast)
@@ -39,6 +39,9 @@ while (($#)); do
       ;;
     --dev)
       DEV=1
+      ;;
+    --all-daemons)
+      ALL_DAEMONS=1
       ;;
     *)
       echo "unknown package argument: $1" >&2
@@ -51,7 +54,6 @@ if [[ "$DEV" -eq 1 ]]; then
   APP_NAME="BoottyDev"
   CLI_NAME="bootty-dev"
   BUNDLE_IDENTIFIER="dev.bootty.desktop.dev"
-  CARGO_FEATURE_ARGS=(--features bootty-dev)
 fi
 if [[ "$FAST" -eq 1 ]]; then
   PROFILE="fast-release"
@@ -216,7 +218,7 @@ fi
 rm -rf "$DIST_DIR"
 mkdir -p "$DIST_DIR"
 
-cargo build "${CARGO_PROFILE_ARGS[@]}" "${CARGO_FEATURE_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
+cargo build "${CARGO_BUILD_ARGS[@]}" -p "$PACKAGE_NAME" --bin "$BINARY_NAME"
 
 case "$(uname -s)" in
   Darwin)
@@ -326,13 +328,14 @@ PLIST
       "$ROOT_DIR/share/icons/hicolor/scalable/apps"
 
     cp "$TARGET_ROOT/$PROFILE/$BINARY_NAME" "$ROOT_DIR/bin/$CLI_NAME"
-    HOST_DAEMON_TARGET="$(host_daemon_target)"
-    cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
-    mkdir -p "$ROOT_DIR/share/bootty/daemons"
-    for target in "${daemon_targets[@]}"; do
-      cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$ROOT_DIR/share/bootty/daemons/"
-      chmod +x "$ROOT_DIR/share/bootty/daemons/bootty-daemon-$target"
-    done
+    cp "$HOST_DAEMON_PATH" "$ROOT_DIR/bin/$DAEMON_BINARY_NAME"
+    if [[ "$ALL_DAEMONS" -eq 1 ]]; then
+      mkdir -p "$ROOT_DIR/share/bootty/daemons"
+      for target in "${daemon_targets[@]}"; do
+        cp "$DAEMON_OUTPUT_DIR/bootty-daemon-$target" "$ROOT_DIR/share/bootty/daemons/"
+        chmod +x "$ROOT_DIR/share/bootty/daemons/bootty-daemon-$target"
+      done
+    fi
     if [[ "$LINKAGE" == "dynamic" ]]; then
       copy_dynamic_libraries "$ROOT_DIR/bin/$CLI_NAME" "$ROOT_DIR/lib"
     fi

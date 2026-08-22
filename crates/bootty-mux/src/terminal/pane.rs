@@ -9,7 +9,7 @@ use bootty_surface::geometry::{CellMetrics, TerminalGeometry};
 use bootty_terminal::terminal_frame::RenderFrame;
 use derive_more::{Deref, DerefMut};
 
-use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
+use bootty_mux_model::{MuxBackendKind, MuxBindingConfig, SshTarget};
 use bootty_runtime::{
     DrainStats, TerminalSession, TerminalSessionConfig, frame_source::TerminalFrameSource,
 };
@@ -56,10 +56,10 @@ pub trait BackendPanePolicy: Send {
 
 #[derive(Deref, DerefMut)]
 pub struct BackendPaneTerminal {
-    backend: MuxBackendKind,
-    /// Set when this pane's multiplexer runs on another host: the attach client and the pane-local
-    /// options bootty sets alongside it all have to reach that host's server rather than this one's.
-    remote: Option<SshRemote>,
+    registry: Arc<MuxBackendRegistry>,
+    policy_kind: MuxBackendKind,
+    policy: Box<dyn BackendPanePolicy>,
+    behavior: PaneBehavior,
     active_target: Option<ScopedMuxPaneTarget>,
     geometry: TerminalGeometry,
     terminal_config: TerminalSessionConfig,
@@ -342,6 +342,7 @@ impl TerminalRuntime for TerminalSession {
 impl BackendPaneTerminal {
     pub fn new(
         geometry: TerminalGeometry,
+        registry: Arc<MuxBackendRegistry>,
         config: &MuxBindingConfig,
         terminal_config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -362,7 +363,10 @@ impl BackendPaneTerminal {
 
     fn new_with_policy(
         geometry: TerminalGeometry,
-        backend: MuxBackendKind,
+        registry: Arc<MuxBackendRegistry>,
+        policy_kind: MuxBackendKind,
+        policy: Box<dyn BackendPanePolicy>,
+        behavior: PaneBehavior,
         terminal_config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> Self {
@@ -492,60 +496,16 @@ impl BackendPaneTerminal {
 
     fn start_terminal(
         &mut self,
-        backend: MuxBackendKind,
         target: Option<&ScopedMuxPaneTarget>,
     ) -> Result<Box<dyn TerminalRuntime>> {
         let Some(target) = target else {
             return Ok(idle_terminal());
         };
 
-        match backend {
-            MuxBackendKind::Native | MuxBackendKind::Rmux => {
-                // A native session whose tabs have all been closed resolves to a session-level target
-                // with no pane; it has no shell to attach, so it renders as idle. Rmux session targets
-                // can resolve to the active backend pane.
-                if backend == MuxBackendKind::Native
-                    && !matches!(&target.target, MuxPaneTarget::Pane { .. })
-                {
-                    return Ok(idle_terminal());
-                }
-                if let Some(terminal) = self.native_terminals.remove(target) {
-                    return Ok(terminal);
-                }
-                if backend == MuxBackendKind::Native {
-                    return self.spawn_native_runtime(target);
-                }
-                let mut config = self.terminal_config.clone();
-                config.side_effect_pane_id = target.side_effect_pane_id();
-                Ok(Box::new(RmuxNativeTerminal::new(
-                    target.target.clone(),
-                    self.remote.as_ref(),
-                    self.native_window_spawn_geometry.unwrap_or(self.geometry),
-                    config,
-                    Arc::clone(&self.repaint_wakeup),
-                )?))
-            }
-            MuxBackendKind::Tmux | MuxBackendKind::Zellij => {
-                if backend == MuxBackendKind::Tmux
-                    && let Some(terminal) = self.native_terminals.remove(target)
-                {
-                    return Ok(terminal);
-                }
-                let mut terminal_config = self.terminal_config.clone();
-                terminal_config.side_effect_pane_id = target.side_effect_pane_id();
-                let config = backend_attach_session_config(
-                    terminal_config,
-                    backend,
-                    self.remote.as_ref(),
-                    target.session_id(),
-                    bootty_runtime::terminfo::vendored_terminfo_dir().is_some(),
-                )?;
-                Ok(Box::new(TerminalSession::new_with_config(
-                    self.geometry,
-                    config,
-                    Arc::clone(&self.repaint_wakeup),
-                )?))
-            }
+        if self.behavior.cache_terminals
+            && let Some(terminal) = self.native_terminals.remove(target)
+        {
+            return Ok(terminal);
         }
 
         let request = PaneStartRequest {
@@ -621,8 +581,8 @@ impl BackendPaneTerminal {
     ) -> Result<()> {
         debug_assert_eq!(self.policy_kind, layout_backend);
         debug_assert!(matches!(
-            layout_backend,
-            MuxBackendKind::Native | MuxBackendKind::Rmux
+            self.behavior.topology,
+            PaneTopology::ProcessLocal | PaneTopology::BackendReconciled
         ));
         let targets: Vec<ScopedMuxPaneTarget> = window_panes
             .iter()
@@ -677,73 +637,12 @@ impl BackendPaneTerminal {
             cell_width: self.geometry.cell_width,
             cell_height: self.geometry.cell_height,
         });
-        self.drain_rmux_window_resize_results()?;
-        if self.backend != MuxBackendKind::Rmux {
-            return Ok(());
-        }
-        let Some(window_id) = self.native_window_id.clone() else {
-            return Ok(());
-        };
-        let requested = (window_id.clone(), cols, rows);
-        if self.last_rmux_window_size.as_ref() == Some(&requested) {
-            return Ok(());
-        }
-        self.ensure_rmux_window_resize_worker();
-        let Some(worker) = &self.rmux_window_resize_worker else {
-            anyhow::bail!("rmux window resize worker did not start");
-        };
-        worker
-            .tx
-            .send(RmuxWindowResizeRequest {
-                window_id,
-                cols,
-                rows,
-            })
-            .map_err(|_| anyhow::anyhow!("rmux window resize worker stopped"))?;
-        self.last_rmux_window_size = Some(requested);
-        Ok(())
-    }
-
-    fn ensure_rmux_window_resize_worker(&mut self) {
-        if self.rmux_window_resize_worker.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel::<RmuxWindowResizeRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<std::result::Result<(), String>>();
-        let repaint = Arc::clone(&self.repaint_wakeup);
-        thread::spawn(move || {
-            while let Ok(mut request) = rx.recv() {
-                while let Ok(next) = rx.try_recv() {
-                    request = next;
-                }
-                let result = crate::rmux::resize_bootty_rmux_window(
-                    &request.window_id,
-                    request.cols,
-                    request.rows,
-                )
-                .map_err(|error| error.to_string());
-                let _ = result_tx.send(result);
-                repaint();
-            }
-        });
-        self.rmux_window_resize_worker = Some(RmuxWindowResizeWorker { tx, result_rx });
-    }
-
-    fn drain_rmux_window_resize_results(&mut self) -> Result<()> {
-        let mut completed = false;
-        let mut error = None;
-        if let Some(worker) = &self.rmux_window_resize_worker {
-            while let Ok(result) = worker.result_rx.try_recv() {
-                match result {
-                    Ok(()) => completed = true,
-                    Err(result_error) => error = Some(result_error),
-                }
-            }
-        }
-        if let Some(error) = error {
-            self.last_rmux_window_size = None;
-            anyhow::bail!(error);
-        }
+        let completed = self.policy.resize_layout_window(PaneLayoutResizeRequest {
+            window_id: self.native_window_id.as_deref(),
+            cols,
+            rows,
+            repaint_wakeup: &self.repaint_wakeup,
+        })?;
         if completed {
             self.force_native_layout_pane_resizes()?;
         }
@@ -897,11 +796,8 @@ impl BackendPaneTerminal {
         self.terminal = idle_terminal();
     }
 
-    fn park_native_layout_terminal(&mut self) {
-        if !matches!(
-            self.backend,
-            MuxBackendKind::Native | MuxBackendKind::Rmux | MuxBackendKind::Tmux
-        ) {
+    fn park_cached_terminal(&mut self) {
+        if !self.behavior.cache_terminals {
             return;
         }
         let Some(target) = self.active_target.clone() else {
@@ -940,10 +836,7 @@ impl TerminalFrameSource for BackendPaneTerminal {
         }
         self.terminal_awaits_resize = false;
         self.geometry = geometry;
-        if self.backend == MuxBackendKind::Tmux {
-            // Parked sessions keep their `attach-session` client alive, and that client's size is
-            // the session's size. Skipping them leaves the window at the old size when we switch
-            // back, and clamps live windows under `window-size smallest`.
+        if self.behavior.resize_cached_terminals {
             for terminal in self.native_terminals.values_mut() {
                 terminal.resize(geometry)?;
             }
@@ -1204,7 +1097,7 @@ pub fn decode_scoped_pane_id(value: &str) -> Option<(MuxScope, String)> {
 }
 
 fn scoped_target_matches_anchor(
-    backend: MuxBackendKind,
+    topology: PaneTopology,
     scope: Option<MuxScope>,
     target: Option<&ScopedMuxPaneTarget>,
     anchor: Option<&MuxPaneAnchor>,
@@ -1217,7 +1110,7 @@ fn scoped_target_matches_anchor(
 }
 
 fn target_matches_anchor(
-    backend: MuxBackendKind,
+    topology: PaneTopology,
     target: Option<&MuxPaneTarget>,
     anchor: Option<&MuxPaneAnchor>,
 ) -> bool {
@@ -1230,7 +1123,7 @@ fn target_matches_anchor(
             // Attached clients (tmux/zellij attach PTYs) follow pane and
             // window changes server-side; restarting them on an active-pane
             // change blanks the whole surface for nothing.
-            if matches!(backend, MuxBackendKind::Tmux | MuxBackendKind::Zellij) {
+            if topology == PaneTopology::Attach {
                 return true;
             }
             let anchor_selector = anchor.pane_id.as_deref().unwrap_or(&anchor.session_id);
@@ -1238,294 +1131,4 @@ fn target_matches_anchor(
         }
         _ => false,
     }
-}
-
-pub(super) fn backend_attach_launch(
-    backend: MuxBackendKind,
-    session: &str,
-    identity: bootty_identity::ApplicationIdentity,
-) -> (String, Vec<String>) {
-    let session = session.to_owned();
-    match backend {
-        // -T declares outer-terminal features tmux cannot learn from the
-        // forced xterm-256color terminfo; "clipboard" enables OSC 52 and
-        // "sync" wraps redraws in DEC 2026 to avoid blank layout flashes.
-        MuxBackendKind::Tmux => {
-            let mut args = crate::tmux::local_server_args(identity);
-            args.extend([
-                "-T".to_owned(),
-                TMUX_CLIENT_FEATURES.to_owned(),
-                "attach-session".to_owned(),
-                "-t".to_owned(),
-                session,
-            ]);
-            ("tmux".to_owned(), args)
-        }
-        MuxBackendKind::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
-        MuxBackendKind::Native => {
-            unreachable!("native panes are rendered directly by Bootty")
-        }
-        MuxBackendKind::Zellij => (
-            "zellij".to_owned(),
-            vec!["attach".to_owned(), "--create".to_owned(), session],
-        ),
-    }
-}
-
-fn backend_attach_env_remove(backend: MuxBackendKind) -> Vec<String> {
-    match backend {
-        MuxBackendKind::Tmux => vec!["TMUX".to_owned()],
-        MuxBackendKind::Rmux => unreachable!("rmux is rendered natively via rmux-sdk"),
-        MuxBackendKind::Native => {
-            unreachable!("native panes are rendered directly by Bootty")
-        }
-        MuxBackendKind::Zellij => vec!["ZELLIJ".to_owned()],
-    }
-}
-
-fn backend_attach_session_config(
-    config: TerminalSessionConfig,
-    backend: MuxBackendKind,
-    remote: Option<&SshRemote>,
-    attach_session: &str,
-    bootty_terminfo_available: bool,
-) -> Result<TerminalSessionConfig> {
-    backend_attach_session_config_with_path(
-        config,
-        backend,
-        remote,
-        attach_session,
-        bootty_terminfo_available,
-        env::var_os("PATH").as_deref(),
-        bootty_identity::ApplicationIdentity::for_process(),
-    )
-}
-
-fn backend_attach_session_config_with_path(
-    mut config: TerminalSessionConfig,
-    backend: MuxBackendKind,
-    remote: Option<&SshRemote>,
-    attach_session: &str,
-    bootty_terminfo_available: bool,
-    path: Option<&OsStr>,
-    local_identity: bootty_identity::ApplicationIdentity,
-) -> Result<TerminalSessionConfig> {
-    let identity = if remote.is_some() {
-        bootty_identity::ApplicationIdentity::Production
-    } else {
-        local_identity
-    };
-    let (program, args) = backend_attach_launch(backend, attach_session, identity);
-    // A remote pane runs the same attach client, in the SSH session that carries its PTY.
-    let (program, args) = match remote {
-        Some(remote) => remote.proxy_tty_command(&program, &args),
-        None => Ok((program, args)),
-    }?;
-    config.launch.shell = Some(resolve_launch_program_with_path(&program, path)?);
-    config.launch.args = args;
-    config.launch.env_remove = backend_attach_env_remove(backend);
-    if backend == MuxBackendKind::Zellij
-        && remote.is_none()
-        && let Some(socket_dir) = crate::zellij::prepare_socket_dir(identity)?
-    {
-        config.launch.env.push((
-            "ZELLIJ_SOCKET_DIR".to_owned(),
-            socket_dir.to_string_lossy().into_owned(),
-        ));
-    }
-    // The attach client hard-fails on a TERM it cannot resolve. xterm-bootty
-    // only resolves through Bootty's vendored terminfo; anything else falls
-    // back to the universally installed xterm-256color, with required
-    // features pinned via the -T attach flag either way.
-    //
-    // That vendored terminfo is on this machine. SSH forwards the name of the
-    // terminal and nothing else, so a remote client looks xterm-bootty up in the
-    // other host's terminfo and refuses to start: "missing or unsuitable
-    // terminal". A remote attach therefore always takes the fallback.
-    let terminfo_reaches_the_client = bootty_terminfo_available && remote.is_none();
-    if config.launch.term != bootty_runtime::terminfo::XTERM_BOOTTY || !terminfo_reaches_the_client
-    {
-        config.launch.term = "xterm-256color".to_owned();
-    }
-    Ok(config)
-}
-
-fn resolve_launch_program(program: &str) -> Result<String> {
-    resolve_launch_program_with_path(program, env::var_os("PATH").as_deref())
-}
-
-fn resolve_launch_program_with_path(program: &str, path: Option<&OsStr>) -> Result<String> {
-    if Path::new(program).is_absolute() {
-        return Ok(program.to_owned());
-    }
-    if let Some(found) = path
-        .into_iter()
-        .flat_map(env::split_paths)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-    {
-        return Ok(found.to_string_lossy().into_owned());
-    }
-    anyhow::bail!("backend attach program {program:?} not found in PATH")
-}
-
-fn passthrough_override_target(
-    backend: MuxBackendKind,
-    target: Option<&MuxPaneTarget>,
-) -> Option<&str> {
-    if backend != MuxBackendKind::Tmux {
-        return None;
-    }
-    target.map(|target| match target {
-        MuxPaneTarget::Pane { pane_id, .. } => pane_id.as_str(),
-        MuxPaneTarget::Session { session_id, .. } => session_id.as_str(),
-    })
-}
-
-/// Read the pane's current `allow-passthrough` and switch it to `all`, returning the value to put
-/// back on drop.
-///
-/// tmux runs a `;`-separated sequence in one process, so this is a single fork on the
-/// session-switch path instead of three. Both reads always run: asking for the global costs
-/// nothing extra once the process exists, and it saves a second fork when the pane has no local
-/// value. A pane-local value prints its own line first, so two lines means local and one means the
-/// pane was inheriting the global.
-fn take_pane_allow_passthrough(
-    remote: Option<&SshRemote>,
-    pane_id: &str,
-) -> Result<TmuxOptionValue> {
-    let stdout = run_tmux(
-        remote,
-        &[
-            "show-options",
-            "-p",
-            "-t",
-            pane_id,
-            "allow-passthrough",
-            ";",
-            "show-options",
-            "-g",
-            "allow-passthrough",
-            ";",
-            "set-option",
-            "-p",
-            "-t",
-            pane_id,
-            "allow-passthrough",
-            "all",
-        ],
-        "allow-passthrough read-and-set",
-    )?;
-    parse_allow_passthrough(&stdout)
-        .ok_or_else(|| anyhow::anyhow!("tmux reported no allow-passthrough value"))
-}
-
-/// Run one tmux command against the server the pane's runtime is attached to: this machine's, or
-/// the remote binding's over SSH. Pane-local options only mean anything on the server that owns the
-/// pane, so every one of these has to follow the attach client to its host.
-fn run_tmux(remote: Option<&SshRemote>, args: &[&str], what: &str) -> Result<String> {
-    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    let (program, args) = match remote {
-        Some(remote) => remote.command("tmux", &args),
-        None => ("tmux".to_owned(), args),
-    };
-    let output = Command::new(resolve_launch_program(&program)?)
-        .args(&args)
-        .env_remove("TMUX")
-        .env_remove("ZELLIJ")
-        .output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "tmux {what} failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
-
-/// Pick the effective `allow-passthrough` out of the paired `show-options` output.
-///
-/// tmux prints the pane-local line first and the global second, and omits the local line when the
-/// pane has none. So two lines means the pane owns a value worth restoring, and one means it was
-/// inheriting and should be unset again on drop.
-fn parse_allow_passthrough(stdout: &str) -> Option<TmuxOptionValue> {
-    let values: Vec<&str> = stdout
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .collect();
-    Some(TmuxOptionValue {
-        value: (*values.first()?).to_owned(),
-        local: values.len() > 1,
-    })
-}
-
-fn set_pane_allow_passthrough(
-    remote: Option<&SshRemote>,
-    pane_id: &str,
-    value: &str,
-) -> Result<()> {
-    run_tmux(
-        remote,
-        &[
-            "set-option",
-            "-p",
-            "-t",
-            pane_id,
-            "allow-passthrough",
-            value,
-        ],
-        "set-option allow-passthrough",
-    )
-    .map(|_| ())
-}
-
-fn restore_pane_allow_passthrough(
-    remote: Option<&SshRemote>,
-    previous: &TmuxPanePassthroughOverride,
-) -> Result<()> {
-    if previous.previous.local {
-        return set_pane_allow_passthrough(remote, &previous.pane_id, &previous.previous.value);
-    }
-    unset_pane_allow_passthrough(remote, &previous.pane_id)
-}
-
-fn unset_pane_allow_passthrough(remote: Option<&SshRemote>, pane_id: &str) -> Result<()> {
-    run_tmux(
-        remote,
-        &["set-option", "-u", "-p", "-t", pane_id, "allow-passthrough"],
-        "unset-option allow-passthrough",
-    )
-    .map(|_| ())
-}
-
-/// The session whose tmux status bar should be hidden: only with the feature on,
-/// the tmux backend, and a session attached. Native/rmux/zellij are never
-/// touched, so this can only ever issue a `set-option` against a tmux server.
-fn status_bar_hidden_target(
-    hide_enabled: bool,
-    backend: MuxBackendKind,
-    session_id: Option<&str>,
-) -> Option<&str> {
-    if hide_enabled && backend == MuxBackendKind::Tmux {
-        session_id
-    } else {
-        None
-    }
-}
-
-/// Toggle a single tmux session's `status` option on the default-socket server
-/// bootty attached. Hiding sets it off for that session alone; restoring unsets
-/// the session override so it falls back to the global default. Never sets a
-/// global option, so it cannot affect any other session.
-fn set_session_status_hidden(
-    remote: Option<&SshRemote>,
-    session_id: &str,
-    hidden: bool,
-) -> Result<()> {
-    let args: &[&str] = if hidden {
-        &["set-option", "-t", session_id, "status", "off"]
-    } else {
-        &["set-option", "-u", "-t", session_id, "status"]
-    };
-    run_tmux(remote, args, "set-option status").map(|_| ())
 }
