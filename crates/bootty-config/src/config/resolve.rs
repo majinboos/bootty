@@ -74,6 +74,7 @@ impl ConfigResolver<'_> {
         apply_partial_sidebar(&mut config.sidebar, raw.sidebar);
         apply_partial_multiplexer(&mut config.multiplexer, raw.multiplexer)?;
         config.ssh_profiles = raw.ssh_profiles;
+        config.extensions = raw.extensions;
         for (id, profile) in &config.ssh_profiles {
             profile.validate(id)?;
         }

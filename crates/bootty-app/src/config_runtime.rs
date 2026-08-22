@@ -1,7 +1,9 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
 use bootty_command::CommandInvocation;
+use bootty_config::settings_schema::{ExtensionSetting, SettingsSchema};
 use bootty_config::{
     config::{
         AppearanceVariant, BoottyConfig, ConfigDocument, ConfigWriteOutcome,
@@ -63,6 +65,10 @@ pub(super) struct AppConfigRuntime {
     /// Bumped by every accepted or live change to `current`/`document`. Views hold the
     /// revision they last read so they can skip re-cloning an unchanged config.
     revision: u64,
+    /// Built-in settings plus whatever the loaded extensions declared.
+    schema: Arc<SettingsSchema>,
+    /// The extension declaration revision `schema` was built from.
+    schema_revision: Option<u64>,
 }
 
 struct BackendKeyBindings {
@@ -118,6 +124,8 @@ impl AppConfigRuntime {
             has_new_session_config_changes: false,
             stability_trace,
             revision: 0,
+            schema: Arc::new(SettingsSchema::with_extensions(&[])),
+            schema_revision: None,
         })
     }
 
@@ -127,6 +135,24 @@ impl AppConfigRuntime {
 
     pub(super) fn revision(&self) -> u64 {
         self.revision
+    }
+
+    pub(super) fn settings_schema(&self) -> Arc<SettingsSchema> {
+        Arc::clone(&self.schema)
+    }
+
+    /// Rebuild the settings schema for `declarations`, but only when the extension host says its
+    /// declaration set actually changed: a module edit republishes generations continuously.
+    pub(super) fn sync_settings_schema(
+        &mut self,
+        declarations: &[ExtensionSetting],
+        revision: u64,
+    ) {
+        if self.schema_revision == Some(revision) {
+            return;
+        }
+        self.schema = Arc::new(SettingsSchema::with_extensions(declarations));
+        self.schema_revision = Some(revision);
     }
 
     /// The only mutable path to the accepted config: taking it records the change.

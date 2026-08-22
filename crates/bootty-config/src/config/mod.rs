@@ -16,11 +16,12 @@ pub use load::{
 pub use model::{
     AppearanceBranchConfig, AppearanceConfig, AppearanceMode, AppearanceVariant,
     BackendKeybindConfig, BoottyConfig, ChromeConfig, ColorConfig, CursorConfig, CursorStyleConfig,
-    DiagnosticsConfig, FontConfig, InputConfig, KeybindPreset, MacosOptionAsAltConfig,
-    MacosTitlebarStyle, MultiplexerBackendConfig, MultiplexerConfig, ResolvedTheme, SegmentAlign,
-    SessionConfig, SidebarConfig, SidebarPosition, SshAuthenticationConfig, SshHostKeyPolicyConfig,
-    SshProfileConfig, SshRemoteConfig, StatusSegment, ThemeInfo, WindowConfig, WindowDecoration,
-    WindowFullscreen,
+    DiagnosticsConfig, ExtensionSettingValue, FontConfig, InputConfig, KeybindPreset,
+    MacosOptionAsAltConfig, MacosTitlebarStyle, MultiplexerBackendConfig, MultiplexerConfig,
+    ResolvedTheme, SegmentAlign, SessionConfig, SidebarConfig, SidebarPosition,
+    SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, SshRemoteConfig,
+    StatusSegment, ThemeInfo, WindowConfig, WindowDecoration, WindowFullscreen, config_token,
+    extension_setting_path,
 };
 pub use resolve::{available_theme_names, resolve_theme};
 pub use theme_catalog::{DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, builtin_theme_names};

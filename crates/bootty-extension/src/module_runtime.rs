@@ -28,6 +28,7 @@ use bootty_command::{
     CommandDescriptor, CommandInvocation, CommandOutcome, CompactSchema, MutationClass,
     ResourceKind, ValueType,
 };
+use bootty_config::config::ExtensionSettingValue;
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue, VmState};
 use serde_json::{Map, Value, json};
 
@@ -36,6 +37,7 @@ const SETUP_RESPONSE_LIMIT: Duration = Duration::from_millis(250);
 const MODULE_COMMAND_LIMIT: usize = 64;
 const MODULE_TOPIC_LIMIT: usize = 64;
 const MODULE_SURFACE_LIMIT: usize = 64;
+const MODULE_SETTING_LIMIT: usize = 32;
 
 #[derive(Clone)]
 pub(crate) struct ActiveInvocation {
@@ -75,18 +77,67 @@ pub(crate) struct ActiveModule {
     pub(crate) fingerprint: u64,
     pub(crate) worker: ModuleWorker,
     pub(crate) storage: ExtensionStorage,
+    /// What this module declared through `bootty.settings.register`.
+    pub(crate) settings: Vec<ExtensionSettingDeclaration>,
+}
+
+/// A setting an extension declared for itself. The host stamps `module` from the module's own
+/// identity, so a declaration can only ever land in that module's namespace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtensionSettingDeclaration {
+    pub module: String,
+    pub key: String,
+    pub label: String,
+    pub help: String,
+    /// The value shown, and used by the module, until the user sets one. Its shape also decides
+    /// which control the settings UI renders.
+    pub default: ExtensionSettingValue,
+}
+
+fn setting_declaration_from_table(spec: &Table) -> mlua::Result<ExtensionSettingDeclaration> {
+    let key: String = spec.get("key")?;
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(mlua::Error::runtime(
+            "a setting key must be non-empty and use only letters, digits, - or _",
+        ));
+    }
+    let default = match spec.get::<LuaValue>("default")? {
+        LuaValue::Boolean(value) => ExtensionSettingValue::Bool(value),
+        LuaValue::Integer(value) => ExtensionSettingValue::Number(value as f64),
+        LuaValue::Number(value) => ExtensionSettingValue::Number(value),
+        LuaValue::String(value) => ExtensionSettingValue::Text(value.to_str()?.to_owned()),
+        _ => {
+            return Err(mlua::Error::runtime(
+                "a setting default must be a boolean, number or string",
+            ));
+        }
+    };
+    Ok(ExtensionSettingDeclaration {
+        // Filled in by the host, which knows the module's identity.
+        module: String::new(),
+        key,
+        label: spec.get::<Option<String>>("label")?.unwrap_or_default(),
+        help: spec.get::<Option<String>>("help")?.unwrap_or_default(),
+        default,
+    })
 }
 
 struct ModuleDeclarations {
     commands: Vec<CommandDescriptor>,
     topics: Vec<String>,
     surfaces: Vec<SurfaceSnapshot>,
+    settings: Vec<ExtensionSettingDeclaration>,
 }
 
 pub(crate) struct PreparedModule {
     pub(crate) commands: Vec<(CommandDescriptor, ExtensionInvocationSender)>,
     pub(crate) topics: Vec<String>,
     pub(crate) surfaces: Vec<SurfaceSnapshot>,
+    pub(crate) settings: Vec<ExtensionSettingDeclaration>,
     pub(crate) worker: ModuleWorker,
 }
 
@@ -98,6 +149,7 @@ struct SurfaceHandler {
 #[derive(Default)]
 struct ModuleRegistry {
     handlers: RefCell<BTreeMap<String, RegistryKey>>,
+    settings: RefCell<Vec<ExtensionSettingDeclaration>>,
     descriptors: RefCell<Vec<CommandDescriptor>>,
     topics: RefCell<Vec<String>>,
     surface_handlers: RefCell<BTreeMap<String, SurfaceHandler>>,
@@ -153,6 +205,15 @@ pub fn preview_module_surfaces(
 }
 
 fn install_preview_noop_tables(lua: &Lua, bootty: &Table) -> mlua::Result<()> {
+    let settings = lua.create_table()?;
+    settings.set("register", lua.create_function(|_, _: Table| Ok(()))?)?;
+    settings.set(
+        "get",
+        lua.create_function(|_, _: String| Ok(LuaValue::Nil))?,
+    )?;
+    settings.set_readonly(true);
+    bootty.set("settings", settings)?;
+
     let commands = lua.create_table()?;
     commands.set(
         "register",
@@ -234,6 +295,7 @@ pub(crate) fn prepare_module(
         ("command", declarations.commands.len(), MODULE_COMMAND_LIMIT),
         ("event topic", declarations.topics.len(), MODULE_TOPIC_LIMIT),
         ("surface", declarations.surfaces.len(), MODULE_SURFACE_LIMIT),
+        ("setting", declarations.settings.len(), MODULE_SETTING_LIMIT),
     ] {
         if count > limit {
             let _ = worker.retire();
@@ -242,6 +304,15 @@ pub(crate) fn prepare_module(
             ));
         }
     }
+    let module_namespace = module.identity.namespace();
+    let settings = declarations
+        .settings
+        .into_iter()
+        .map(|declaration| ExtensionSettingDeclaration {
+            module: module_namespace.clone(),
+            ..declaration
+        })
+        .collect();
     let registrations = declarations
         .commands
         .into_iter()
@@ -251,6 +322,7 @@ pub(crate) fn prepare_module(
         commands: registrations,
         topics: declarations.topics,
         surfaces: declarations.surfaces,
+        settings,
         worker,
     })
 }
@@ -277,6 +349,7 @@ fn run_module_worker(
         commands: std::mem::take(&mut *registry.descriptors.borrow_mut()),
         topics: std::mem::take(&mut *registry.topics.borrow_mut()),
         surfaces,
+        settings: std::mem::take(&mut *registry.settings.borrow_mut()),
     });
     host.control.setup_complete.store(true, Ordering::Release);
     if ready.send(registered).is_err() {
@@ -393,6 +466,37 @@ fn install_host_interface(
         })?,
     )?;
     bootty.set("commands", commands)?;
+
+    // `bootty.settings`: a module declares its own settings during setup and reads their accepted
+    // values any time. The module never names its namespace — the host derives it from the
+    // module's identity — so one extension cannot declare or read another's settings.
+    let settings = lua.create_table()?;
+    let settings_setup = Arc::clone(&host.control);
+    let settings_registry = Rc::clone(&registry);
+    settings.set(
+        "register",
+        lua.create_function(move |_, spec: Table| {
+            require_setup_phase(&settings_setup)?;
+            let declaration = setting_declaration_from_table(&spec)?;
+            settings_registry.settings.borrow_mut().push(declaration);
+            Ok(())
+        })?,
+    )?;
+    let settings_facts = host.facts.clone();
+    let settings_module = host.identity.namespace();
+    settings.set(
+        "get",
+        lua.create_function(move |lua, key: String| {
+            match settings_facts.extension_setting(&settings_module, &key) {
+                Some(ExtensionSettingValue::Bool(value)) => lua.pack(value),
+                Some(ExtensionSettingValue::Number(value)) => lua.pack(value),
+                Some(ExtensionSettingValue::Text(value)) => lua.pack(value),
+                None => Ok(LuaValue::Nil),
+            }
+        })?,
+    )?;
+    settings.set_readonly(true);
+    bootty.set("settings", settings)?;
 
     let events = lua.create_table()?;
     let event_namespace = host.namespace.clone();

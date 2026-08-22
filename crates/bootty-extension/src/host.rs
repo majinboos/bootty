@@ -8,7 +8,9 @@ use std::{
 
 use crate::fact_values::{MuxView, SessionReorder};
 use crate::facts::ExtensionFacts;
-use crate::module_runtime::{ActiveModule, ModuleWorker, prepare_module};
+use crate::module_runtime::{
+    ActiveModule, ExtensionSettingDeclaration, ModuleWorker, prepare_module,
+};
 use crate::module_sources::{
     LegacyExtensionModule, ModuleSourceOutcome, ModuleSourceRequest, ModuleSources,
     create_module_source, discover_modules, editable_module_source, import_legacy_extension_module,
@@ -34,6 +36,10 @@ pub struct ExtensionHost {
     discovered: Vec<ModuleIdentity>,
     /// Inactive pre-module extension files awaiting import, refreshed by each scan.
     legacy: Vec<LegacyExtensionModule>,
+    /// Settings the loaded modules declared for themselves, in module then declaration order.
+    settings: Vec<ExtensionSettingDeclaration>,
+    /// Bumped whenever `settings` changes, so the app rebuilds its schema only then.
+    settings_revision: u64,
     retired: Vec<thread::JoinHandle<()>>,
     next_check: Instant,
     next_generation: u64,
@@ -76,6 +82,8 @@ impl ExtensionHost {
             active: BTreeMap::new(),
             discovered: Vec::new(),
             legacy: Vec::new(),
+            settings: Vec::new(),
+            settings_revision: 0,
             retired: Vec::new(),
             next_check: Instant::now(),
             next_generation: 1,
@@ -180,6 +188,27 @@ impl ExtensionHost {
             .sender
             .try_action(action)
             .map_err(str::to_owned)
+    }
+
+    /// Settings the loaded extensions declared for themselves, and a revision that changes only
+    /// when the set does.
+    #[must_use]
+    pub fn setting_declarations(&self) -> (&[ExtensionSettingDeclaration], u64) {
+        (&self.settings, self.settings_revision)
+    }
+
+    /// Publish the accepted extension settings so a module reads the user's value. A module can
+    /// only ever see its own table.
+    pub fn update_settings(
+        &self,
+        settings: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, bootty_config::config::ExtensionSettingValue>,
+        >,
+    ) {
+        if self.facts.set_extension_settings(settings) {
+            self.render_all();
+        }
     }
 
     /// Modules the settings editor may open, and the legacy files it may import. Both come
@@ -335,6 +364,7 @@ impl ExtensionHost {
                 fingerprint: source.fingerprint,
                 worker: prepared.worker,
                 storage,
+                settings: prepared.settings,
             };
             if let Some(previous) = self.active.insert(identity, next) {
                 self.retire_worker(previous.worker);
@@ -354,7 +384,22 @@ impl ExtensionHost {
                 .remove_generation(identity.as_str(), previous.generation);
             self.retire_worker(previous.worker);
         }
+        self.refresh_setting_declarations();
         self.reap_retired();
+    }
+
+    /// Recompute the declaration list from the active modules, bumping the revision only when it
+    /// actually changed.
+    fn refresh_setting_declarations(&mut self) {
+        let settings: Vec<ExtensionSettingDeclaration> = self
+            .active
+            .values()
+            .flat_map(|active| active.settings.iter().cloned())
+            .collect();
+        if settings != self.settings {
+            self.settings = settings;
+            self.settings_revision = self.settings_revision.wrapping_add(1);
+        }
     }
 
     fn retire_worker(&mut self, worker: ModuleWorker) {

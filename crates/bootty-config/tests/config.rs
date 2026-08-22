@@ -687,6 +687,86 @@ fn key_file_profile_requires_an_identity_file() {
 }
 
 #[test]
+fn extension_settings_load_into_their_own_module_table() {
+    // Before this table existed, deny_unknown_fields made any extension key fail the whole config.
+    let sandbox = ConfigSandbox::with_config(indoc! {r#"
+        [extensions.greeter]
+        greeting = "hello"
+        loud = true
+        repeats = 3
+    "#});
+
+    let config = sandbox
+        .load()
+        .expect("config with extension settings loads");
+
+    let greeter = config.extensions.get("greeter").expect("module table");
+    assert_eq!(
+        greeter.get("greeting"),
+        Some(&ExtensionSettingValue::Text("hello".to_owned()))
+    );
+    assert_eq!(
+        greeter.get("loud"),
+        Some(&ExtensionSettingValue::Bool(true))
+    );
+    assert_eq!(
+        greeter.get("repeats"),
+        Some(&ExtensionSettingValue::Number(3.0))
+    );
+    assert!(!config.extensions.contains_key("someone-else"));
+}
+
+#[test]
+fn every_config_enum_token_round_trips_through_the_parser() {
+    // The settings writer takes tokens from `config_token`; the loader must accept every one of
+    // them and return the same variant. The exact spellings are pinned because they are what a
+    // user's config.toml ends up containing.
+    fn round_trip<T>(key: &str, value: T, expected_token: &str, read: impl Fn(&BoottyConfig) -> T)
+    where
+        T: serde::Serialize + std::fmt::Debug + PartialEq + Copy,
+    {
+        let token = config_token(&value).expect("unit variant token");
+        assert_eq!(token, expected_token, "token spelling for {key}");
+        let sandbox = ConfigSandbox::with_config(&format!("{key} = \"{token}\"\n"));
+        let config = sandbox
+            .load()
+            .unwrap_or_else(|error| panic!("{key}: {error}"));
+        assert_eq!(read(&config), value, "{key} did not read back");
+    }
+
+    round_trip(
+        "[window]\nfullscreen",
+        WindowFullscreen::NonNativeVisibleMenu,
+        "non-native-visible-menu",
+        |config| config.window.fullscreen,
+    );
+    round_trip(
+        "[window]\nwindow-decoration",
+        WindowDecoration::Client,
+        "client",
+        |config| config.window.window_decoration,
+    );
+    round_trip(
+        "[window]\nmacos-titlebar-style",
+        MacosTitlebarStyle::Hidden,
+        "hidden",
+        |config| config.window.macos_titlebar_style,
+    );
+    round_trip(
+        "[sidebar]\nposition",
+        SidebarPosition::Right,
+        "right",
+        |config| config.sidebar.position,
+    );
+    round_trip(
+        "[appearance]\nmode",
+        AppearanceMode::Light,
+        "light",
+        |config| config.appearance.mode,
+    );
+}
+
+#[test]
 fn theme_catalog_combines_builtin_and_user_themes() {
     let sandbox = ConfigSandbox::new();
     sandbox.write("themes/My Theme.toml", "");

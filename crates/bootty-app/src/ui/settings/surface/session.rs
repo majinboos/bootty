@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
 use eframe::egui;
 
@@ -19,74 +17,12 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
 
     super::section(ui, palette, "SHELL");
-    super::settings_row(
-        ui,
-        palette,
-        "Shell",
-        "Empty uses the macOS account login shell. Applies to new sessions.",
-        |ui| {
-            let mut shell = win.config.session.shell.clone().unwrap_or_default();
-            if super::settings_text_edit(ui, palette, &mut shell, "default login shell").changed() {
-                win.config.session.shell = super::nonempty(&shell);
-                super::write_optional_text(&mut win.writeback, &["session", "shell"], &shell);
-            }
-        },
-    );
-    super::settings_row(
-        ui,
-        palette,
-        "Working directory",
-        "Empty starts new sessions in your home directory.",
-        |ui| {
-            let mut cwd = win
-                .config
-                .session
-                .working_directory
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default();
-            if super::settings_text_edit(ui, palette, &mut cwd, "inherit from launcher").changed() {
-                win.config.session.working_directory = super::nonempty(&cwd).map(PathBuf::from);
-                super::write_optional_text(
-                    &mut win.writeback,
-                    &["session", "working-directory"],
-                    &cwd,
-                );
-            }
-        },
-    );
+    win.setting(ui, "session.shell");
+    win.setting(ui, "session.working-directory");
 
     super::section(ui, palette, "TERMINAL IDENTITY");
-    super::settings_row(
-        ui,
-        palette,
-        "TERM",
-        "Advertised terminal type for new shells.",
-        |ui| {
-            let mut term = win.config.session.term.clone();
-            if super::settings_text_edit(ui, palette, &mut term, "xterm-256color").changed() {
-                win.config.session.term = term.clone();
-                super::write_optional_text(&mut win.writeback, &["session", "term"], &term);
-            }
-        },
-    );
-    super::settings_row(
-        ui,
-        palette,
-        "COLORTERM",
-        "Advertised color capability for new shells.",
-        |ui| {
-            let mut colorterm = win.config.session.colorterm.clone();
-            if super::settings_text_edit(ui, palette, &mut colorterm, "truecolor").changed() {
-                win.config.session.colorterm = colorterm.clone();
-                super::write_optional_text(
-                    &mut win.writeback,
-                    &["session", "colorterm"],
-                    &colorterm,
-                );
-            }
-        },
-    );
+    win.setting(ui, "session.term");
+    win.setting(ui, "session.colorterm");
     super::settings_row(
         ui,
         palette,
@@ -109,18 +45,7 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             }
         },
     );
-    super::settings_toggle_row(
-        ui,
-        palette,
-        "Glyph protocol",
-        "Expose terminal image/glyph protocol support to new sessions.",
-        win.config.session.glyph_protocol,
-        |enabled| {
-            win.config.session.glyph_protocol = enabled;
-            win.writeback
-                .set_bool(&["session", "glyph-protocol"], enabled);
-        },
-    );
+    win.setting(ui, "session.glyph-protocol");
 
     super::section(ui, palette, "ENVIRONMENT");
     super::settings_notice(

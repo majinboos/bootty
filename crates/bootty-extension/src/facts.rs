@@ -1,5 +1,6 @@
 //! Read-only host facts and bounded platform jobs for one extension generation.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
@@ -7,6 +8,7 @@ use std::sync::{Arc, RwLock};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
+use bootty_config::config::ExtensionSettingValue;
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
 use sysinfo::{MemoryRefreshKind, System};
 
@@ -195,6 +197,8 @@ fn battery_status(
 pub(crate) struct ExtensionFacts {
     home: Option<PathBuf>,
     theme: Arc<RwLock<Vec<(String, String)>>>,
+    /// Accepted extension settings, keyed by module namespace then key.
+    extension_settings: Arc<RwLock<BTreeMap<String, BTreeMap<String, ExtensionSettingValue>>>>,
     mux: Arc<RwLock<MuxView>>,
     metrics: Arc<RwLock<Metrics>>,
     session_reorders: Arc<RwLock<Vec<QueuedSessionReorder>>>,
@@ -215,6 +219,7 @@ impl ExtensionFacts {
         Self {
             home,
             theme: Arc::new(RwLock::new(theme)),
+            extension_settings: Arc::default(),
             mux: Arc::default(),
             metrics: Arc::default(),
             session_reorders: Arc::default(),
@@ -227,6 +232,7 @@ impl ExtensionFacts {
         Self {
             home: None,
             theme: Arc::new(RwLock::new(theme)),
+            extension_settings: Arc::default(),
             mux: Arc::new(RwLock::new(preview_mux_view())),
             metrics: Arc::new(RwLock::new(Metrics {
                 cpu: 42.0,
@@ -248,6 +254,7 @@ impl ExtensionFacts {
         Self {
             home: self.home.clone(),
             theme: Arc::clone(&self.theme),
+            extension_settings: Arc::clone(&self.extension_settings),
             mux: Arc::clone(&self.mux),
             metrics: Arc::clone(&self.metrics),
             session_reorders: Arc::clone(&self.session_reorders),
@@ -277,6 +284,35 @@ impl ExtensionFacts {
             .read()
             .map(|theme| theme.clone())
             .unwrap_or_default()
+    }
+
+    /// One module's accepted setting value. The caller supplies the module namespace from the
+    /// module's own identity, so this can only read that module's table.
+    pub(crate) fn extension_setting(
+        &self,
+        module: &str,
+        key: &str,
+    ) -> Option<ExtensionSettingValue> {
+        self.extension_settings
+            .read()
+            .ok()?
+            .get(module)?
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn set_extension_settings(
+        &self,
+        settings: BTreeMap<String, BTreeMap<String, ExtensionSettingValue>>,
+    ) -> bool {
+        let Ok(mut current) = self.extension_settings.write() else {
+            return false;
+        };
+        if *current == settings {
+            return false;
+        }
+        *current = settings;
+        true
     }
 
     pub(crate) fn set_theme(&self, theme: Vec<(String, String)>) -> bool {

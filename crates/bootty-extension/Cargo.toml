@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 bootty-command = { path = "../bootty-command" }
+bootty-config = { path = "../bootty-config" }
 bootty-write = { path = "../bootty-write" }
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 mlua = { version = "0.12.0", features = ["luau", "serialize"] }

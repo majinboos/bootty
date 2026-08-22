@@ -1,6 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use bootty_command::{Caller, app_command_channel};
+use bootty_config::config::ExtensionSettingValue;
 use bootty_extension::{
     ExtensionCatalog, ExtensionHost, ModuleIdentity, ModuleSourceOutcome, ModuleSourceRequest,
     SurfacePlacement, display_path, editable_module_source, event_queue,
@@ -301,4 +302,82 @@ fn editor_requests_run_against_the_host_extension_root() {
         ModuleSourceOutcome::Reset(Ok(broken.clone()))
     );
     assert!(!host.module_sources().identities.contains(&broken));
+}
+
+#[test]
+fn a_module_declares_and_reads_only_its_own_settings() {
+    let root = tempfile::tempdir().expect("extension root");
+    std::fs::write(
+        root.path().join("themed.luau"),
+        r#"
+bootty.settings.register({ key = "greeting", label = "Greeting", default = "hi" })
+bootty.settings.register({ key = "loud", default = false })
+bootty.ui.register({ id = "themed", placement = "status" }, function()
+    local other = bootty.settings.get("nothing-of-mine")
+    return { { text = tostring(bootty.settings.get("greeting")) .. ":" .. tostring(other) } }
+end)
+"#,
+    )
+    .expect("write module");
+
+    let catalog = Arc::new(ExtensionCatalog::default());
+    let (sender, _receiver) = app_command_channel(4, Arc::new(|| {}));
+    let host = ExtensionHost::load(
+        root.path(),
+        catalog,
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+
+    let (declarations, revision) = host.setting_declarations();
+    let declared: Vec<_> = declarations
+        .iter()
+        .filter(|declaration| declaration.module == "themed")
+        .collect();
+    assert_eq!(declared.len(), 2, "both settings are declared");
+    // The module never names its namespace; the host stamps it from the module identity.
+    assert_eq!(declared[0].key, "greeting");
+    assert_eq!(declared[0].label, "Greeting");
+    assert_eq!(
+        declared[0].default,
+        ExtensionSettingValue::Text("hi".to_owned())
+    );
+    assert_eq!(declared[1].default, ExtensionSettingValue::Bool(false));
+    assert!(revision > 0, "declaring settings advances the revision");
+
+    // A user value reaches the module, and another module's table stays invisible to it.
+    let mut accepted = BTreeMap::new();
+    accepted.insert(
+        "themed".to_owned(),
+        BTreeMap::from([(
+            "greeting".to_owned(),
+            ExtensionSettingValue::Text("hello".to_owned()),
+        )]),
+    );
+    accepted.insert(
+        "other".to_owned(),
+        BTreeMap::from([(
+            "nothing-of-mine".to_owned(),
+            ExtensionSettingValue::Text("secret".to_owned()),
+        )]),
+    );
+    host.update_settings(accepted);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut rendered = None;
+    while std::time::Instant::now() < deadline {
+        if let Some(surface) = host.surface(SurfacePlacement::Status, "themed")
+            && let Some(item) = surface.snapshot.items.first()
+            && item.text == "hello:nil"
+        {
+            rendered = Some(item.text.clone());
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        rendered.as_deref(),
+        Some("hello:nil"),
+        "the module reads its own accepted value and cannot see another module's"
+    );
 }

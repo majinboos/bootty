@@ -203,6 +203,7 @@ impl Default for BoottyConfig {
             sidebar: SidebarConfig::default(),
             multiplexer: MultiplexerConfig::default(),
             ssh_profiles: BTreeMap::new(),
+            extensions: BTreeMap::new(),
             input: InputConfig::default(),
             session: SessionConfig::default(),
             diagnostics: DiagnosticsConfig::default(),

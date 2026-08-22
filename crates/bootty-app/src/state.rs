@@ -318,6 +318,33 @@ impl AppState {
         self.config_runtime.revision()
     }
 
+    /// Built-in settings plus whatever the loaded extensions declared.
+    pub(crate) fn settings_schema(
+        &self,
+    ) -> std::sync::Arc<bootty_config::settings_schema::SettingsSchema> {
+        self.config_runtime.settings_schema()
+    }
+
+    /// Rebuild the settings schema when the extension host's declarations change.
+    pub(crate) fn sync_settings_schema(
+        &mut self,
+        declarations: &[bootty_config::settings_schema::ExtensionSetting],
+        revision: u64,
+    ) {
+        self.config_runtime
+            .sync_settings_schema(declarations, revision);
+    }
+
+    /// The accepted extension settings, for publication to the modules that declared them.
+    pub(crate) fn extension_settings(
+        &self,
+    ) -> std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, bootty_config::config::ExtensionSettingValue>,
+    > {
+        self.config().extensions.clone()
+    }
+
     pub(crate) fn config_document(&self) -> ConfigDocument {
         self.config_runtime.document().clone()
     }

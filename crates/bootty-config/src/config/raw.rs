@@ -1,7 +1,7 @@
 use super::model::{
-    AppearanceMode, CursorStyleConfig, KeybindPreset, MacosOptionAsAltConfig, MacosTitlebarStyle,
-    MultiplexerBackendConfig, SidebarPosition, SshProfileConfig, SshRemoteConfig, StatusSegment,
-    WindowDecoration, WindowFullscreen,
+    AppearanceMode, CursorStyleConfig, ExtensionSettingValue, KeybindPreset,
+    MacosOptionAsAltConfig, MacosTitlebarStyle, MultiplexerBackendConfig, SidebarPosition,
+    SshProfileConfig, SshRemoteConfig, StatusSegment, WindowDecoration, WindowFullscreen,
 };
 use crate::color::Color;
 use serde::{Deserialize, Deserializer};
@@ -31,6 +31,8 @@ pub(super) struct RawConfig {
     pub(super) multiplexer: MultiplexerPatch,
     #[serde(default)]
     pub(super) ssh_profiles: BTreeMap<String, SshProfileConfig>,
+    #[serde(default)]
+    pub(super) extensions: BTreeMap<String, BTreeMap<String, ExtensionSettingValue>>,
     #[serde(default)]
     pub(super) input: InputPatch,
     #[serde(default)]

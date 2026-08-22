@@ -68,18 +68,7 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     }
 
     super::section(ui, palette, "TERMINAL METRICS");
-    slider(
-        ui,
-        win,
-        MetricSliderRow {
-            label: "Font size",
-            help: "Main terminal text size.",
-            path: &["font", "size"],
-            range: 6.0..=48.0,
-            suffix: "pt",
-            field: |font| &mut font.size,
-        },
-    );
+    win.setting(ui, "font.size");
     optional_slider(
         ui,
         win,
@@ -106,72 +95,13 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             field: |font| &mut font.cell_height,
         },
     );
-    let mut fit_cell_height = win.config.font.fit_cell_height;
-    super::settings_row(
-        ui,
-        palette,
-        "Fit rows to window",
-        "Stretch row spacing so terminal content fills available height.",
-        |ui| {
-            if super::settings_toggle(ui, palette, &mut fit_cell_height) {
-                win.config.font.fit_cell_height = fit_cell_height;
-                win.writeback
-                    .set_bool(&["font", "fit-cell-height"], fit_cell_height);
-            }
-        },
-    );
-    let mut fit_cell_width = win.config.font.fit_cell_width;
-    super::settings_row(
-        ui,
-        palette,
-        "Fit columns to window",
-        "Stretch column spacing so terminal content fills available width (avoids a gap on the right, common with split panes).",
-        |ui| {
-            if super::settings_toggle(ui, palette, &mut fit_cell_width) {
-                win.config.font.fit_cell_width = fit_cell_width;
-                win.writeback
-                    .set_bool(&["font", "fit-cell-width"], fit_cell_width);
-            }
-        },
-    );
+    win.setting(ui, "font.fit-cell-height");
+    win.setting(ui, "font.fit-cell-width");
 
     super::section(ui, palette, "GLYPH BEHAVIOR");
-    slider(
-        ui,
-        win,
-        MetricSliderRow {
-            label: "Baseline adjustment",
-            help: "Move glyphs up or down inside each cell.",
-            path: &["font", "baseline-adjustment"],
-            range: -12.0..=12.0,
-            suffix: "px",
-            field: |font| &mut font.baseline_adjustment,
-        },
-    );
-    slider(
-        ui,
-        win,
-        MetricSliderRow {
-            label: "Underline position",
-            help: "Tune where underline decoration is drawn.",
-            path: &["font", "underline-position"],
-            range: -12.0..=12.0,
-            suffix: "px",
-            field: |font| &mut font.underline_position,
-        },
-    );
-    slider(
-        ui,
-        win,
-        MetricSliderRow {
-            label: "Underline thickness",
-            help: "Tune underline stroke thickness.",
-            path: &["font", "underline-thickness"],
-            range: 0.0..=8.0,
-            suffix: "px",
-            field: |font| &mut font.underline_thickness,
-        },
-    );
+    win.setting(ui, "font.baseline-adjustment");
+    win.setting(ui, "font.underline-position");
+    win.setting(ui, "font.underline-thickness");
     font_feature_picker(win, ui);
 }
 
@@ -383,41 +313,13 @@ fn write_features(win: &mut SettingsSurface, features: &str) {
     }
 }
 
-fn slider(ui: &mut egui::Ui, win: &mut SettingsSurface, row: MetricSliderRow<'_>) {
-    let value = (row.field)(&mut win.config.font);
-    if super::number_row(
-        ui,
-        win.palette,
-        value,
-        super::NumberRow {
-            label: row.label,
-            help: row.help,
-            path: row.path,
-            range: row.range,
-            suffix: row.suffix,
-            scale: 1.0,
-            control: super::NumberControl::Slider,
-        },
-    ) {
-        win.writeback.set_f32(row.path, *value);
-    }
-}
-
-struct MetricSliderRow<'a> {
-    label: &'a str,
-    help: &'a str,
-    path: &'a [&'a str],
-    range: std::ops::RangeInclusive<f32>,
-    suffix: &'a str,
-    field: fn(&mut bootty_config::config::FontConfig) -> &mut f32,
-}
-
 struct MetricOverrideRow<'a> {
     label: &'a str,
     help: &'a str,
     path: &'a [&'a str],
     range: std::ops::RangeInclusive<f32>,
     suffix: &'a str,
+    /// Shown while the row is on "Auto": the value the renderer would pick anyway.
     default_value: f32,
     field: fn(&mut bootty_config::config::FontConfig) -> &mut Option<f32>,
 }
@@ -436,7 +338,6 @@ fn optional_slider(ui: &mut egui::Ui, win: &mut SettingsSurface, row: MetricOver
             range: row.range,
             suffix: row.suffix,
             scale: 1.0,
-            control: super::NumberControl::Slider,
         },
     ) {
         match *value {
