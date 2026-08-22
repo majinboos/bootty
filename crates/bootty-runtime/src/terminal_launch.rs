@@ -17,6 +17,7 @@ const COLORTERM_ENV: &str = "COLORTERM";
 const TERMINFO_ENV: &str = "TERMINFO";
 const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
 const TERM_PROGRAM_VERSION_ENV: &str = "TERM_PROGRAM_VERSION";
+const BOOTTY_PANE_ENV: &str = "BOOTTY_PANE";
 
 #[cfg(windows)]
 const DEFAULT_SHELL: &str = "powershell.exe";
@@ -93,6 +94,12 @@ pub(crate) fn spawn(
     command.env(COLORTERM_ENV, &config.colorterm);
     command.env(TERM_PROGRAM_ENV, TERMINAL_PROGRAM);
     command.env(TERM_PROGRAM_VERSION_ENV, TERMINAL_PROGRAM_VERSION);
+    // Pane identity for everything the pane runs, so a coding agent reporting an event can name the
+    // session it came from. Only backends that spawn the pane's own PTY know it; a tmux attach
+    // leaves it unset because tmux exports the same id as `$TMUX_PANE` inside each of its panes.
+    if let Some(pane_id) = &config.pane_id {
+        command.env(BOOTTY_PANE_ENV, pane_id);
+    }
     if let Some(terminfo) = &launch_env.terminfo {
         command.env(TERMINFO_ENV, terminfo.to_string_lossy().into_owned());
     }
@@ -156,7 +163,12 @@ fn resolve_launch_environment(
 fn is_managed_launch_env(name: &str) -> bool {
     matches!(
         name,
-        TERM_ENV | COLORTERM_ENV | TERMINFO_ENV | TERM_PROGRAM_ENV | TERM_PROGRAM_VERSION_ENV
+        TERM_ENV
+            | COLORTERM_ENV
+            | TERMINFO_ENV
+            | TERM_PROGRAM_ENV
+            | TERM_PROGRAM_VERSION_ENV
+            | BOOTTY_PANE_ENV
     )
 }
 

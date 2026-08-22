@@ -5,9 +5,9 @@ use bootty_command::{
 };
 use bootty_extension::{
     ExtensionCatalog, ExtensionGenerationCandidate, ExtensionGenerationToken, ExtensionHost,
-    ModuleColor, ModuleIdentity, ModuleItem, ModuleSourceOutcome, ModuleSourceRequest,
-    SessionReorder, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot, event_queue,
-    head_branch, module_identities, preview_builtin_surfaces,
+    IntegrationStatus, ModuleColor, ModuleIdentity, ModuleItem, ModuleSourceOutcome,
+    ModuleSourceRequest, SessionReorder, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot,
+    event_queue, head_branch, module_identities, preview_builtin_surfaces,
 };
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -435,5 +435,239 @@ fn the_live_render_is_available_for_previewing_an_unedited_module() {
     assert!(
         sources.live_for("nothing.luau").is_empty(),
         "a module that is not loaded offers nothing"
+    );
+}
+
+/// A module declaring one adapter: a hook script under the integration directory, and a JSON entry
+/// in `target` that points at the installed script by absolute path.
+fn integration_module(target: &Path, file_path: &str) -> String {
+    format!(
+        r##"bootty.integration.register({{
+    id = "hooks",
+    title = "Probe hooks",
+    summary = "Reports probe activity to Bootty.",
+    files = {{
+        {{ path = "{file_path}", contents = "#!/bin/sh\nexit 0\n", executable = true }},
+    }},
+    merge = {{
+        {{
+            path = "{target}",
+            value = {{ hooks = {{ SessionStart = {{ {{ command = bootty.integration.dir .. "/{file_path}" }} }} }} }},
+        }},
+    }},
+}})
+"##,
+        target = target.display(),
+    )
+}
+
+/// A host over `config/extensions`, so the integration directory lands beside it at
+/// `config/integrations` the way it does under a real config directory.
+fn integration_host(config: &Path, source: &str) -> ExtensionHost {
+    let root = config.join("extensions");
+    fs::create_dir_all(&root).expect("create the extension root");
+    fs::write(root.join("probe.luau"), source).expect("write the probe module");
+    // Nothing here invokes an app command, so the receiver may go; the host only needs a sender.
+    let (sender, _receiver) = app_command_channel(4, std::sync::Arc::new(|| {}));
+    ExtensionHost::load(
+        &root,
+        std::sync::Arc::new(ExtensionCatalog::default()),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    )
+}
+
+fn integration_status(host: &ExtensionHost) -> IntegrationStatus {
+    let sources = host.module_sources();
+    let integration = sources
+        .integrations
+        .iter()
+        .find(|integration| integration.declaration.module == "probe")
+        .expect("the probe module declares an integration");
+    integration.status
+}
+
+fn install_request(install: bool) -> ModuleSourceRequest {
+    let module = "probe".to_owned();
+    let id = "hooks".to_owned();
+    if install {
+        ModuleSourceRequest::InstallIntegration { module, id }
+    } else {
+        ModuleSourceRequest::UninstallIntegration { module, id }
+    }
+}
+
+fn read_json(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&fs::read_to_string(path).expect("read the merge target"))
+        .expect("the merge target is JSON")
+}
+
+/// The whole point of merging rather than writing: a real `hooks.json` already holds hooks Bootty
+/// knows nothing about, and neither installing nor removing ours may touch them.
+#[test]
+fn installing_an_integration_merges_into_a_file_it_never_owns() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let target = config.path().join("codex").join("hooks.json");
+    fs::create_dir_all(target.parent().expect("target parent")).expect("create the target parent");
+    fs::write(
+        &target,
+        r#"{"hooks":{"Stop":[{"command":"/usr/bin/true"}]}}"#,
+    )
+    .expect("write the pre-existing hooks");
+
+    let mut host = integration_host(config.path(), &integration_module(&target, "probe/hook.sh"));
+    assert_eq!(integration_status(&host), IntegrationStatus::Missing);
+
+    let outcome = host.apply_module_source_request(install_request(true));
+    assert!(
+        matches!(outcome, ModuleSourceOutcome::Integration(Ok(()))),
+        "install answers with an outcome: {outcome:?}"
+    );
+    assert_eq!(integration_status(&host), IntegrationStatus::Installed);
+
+    let script = config.path().join("integrations").join("probe/hook.sh");
+    assert!(script.is_file(), "the adapter file is written");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions()
+            .mode();
+        assert!(mode & 0o111 != 0, "an executable adapter is executable");
+    }
+
+    let merged = read_json(&target);
+    assert_eq!(
+        merged["hooks"]["Stop"],
+        serde_json::json!([{"command": "/usr/bin/true"}]),
+        "the user's unrelated hook survives the merge"
+    );
+    assert_eq!(
+        merged["hooks"]["SessionStart"],
+        serde_json::json!([{"command": script.to_string_lossy()}]),
+        "our hook points at the installed script"
+    );
+
+    let outcome = host.apply_module_source_request(install_request(false));
+    assert!(matches!(outcome, ModuleSourceOutcome::Integration(Ok(()))));
+    assert!(!script.exists(), "uninstall removes the file it wrote");
+    assert_eq!(integration_status(&host), IntegrationStatus::Missing);
+    let remaining = read_json(&target);
+    assert_eq!(
+        remaining,
+        serde_json::json!({"hooks": {"Stop": [{"command": "/usr/bin/true"}]}}),
+        "uninstall takes back exactly what it added"
+    );
+}
+
+/// Installing twice must not append our entry a second time, or every restart would grow the
+/// user's config by one more copy of the same hook.
+#[test]
+fn installing_an_integration_twice_adds_nothing_the_second_time() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let target = config.path().join("hooks.json");
+    let mut host = integration_host(config.path(), &integration_module(&target, "probe/hook.sh"));
+
+    assert!(matches!(
+        host.apply_module_source_request(install_request(true)),
+        ModuleSourceOutcome::Integration(Ok(()))
+    ));
+    let first = read_json(&target);
+    assert!(matches!(
+        host.apply_module_source_request(install_request(true)),
+        ModuleSourceOutcome::Integration(Ok(()))
+    ));
+    assert_eq!(read_json(&target), first, "a second install is a no-op");
+    assert_eq!(integration_status(&host), IntegrationStatus::Installed);
+}
+
+/// A declared path that climbs out of the integration directory is refused when the module loads,
+/// so no install can ever write outside it.
+#[test]
+fn an_integration_file_path_may_not_escape_the_integration_directory() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let target = config.path().join("hooks.json");
+    let host = integration_host(config.path(), &integration_module(&target, "../escape.sh"));
+    let sources = host.module_sources();
+    assert!(
+        !sources
+            .integrations
+            .iter()
+            .any(|integration| integration.declaration.module == "probe"),
+        "a module with an escaping path declares nothing"
+    );
+    assert!(
+        sources
+            .failures
+            .iter()
+            .any(|(identity, error)| identity.as_str() == "probe.luau"
+                && error.contains("stay inside the integration directory")),
+        "the module fails to load, with why: {:?}",
+        sources.failures
+    );
+}
+
+/// The dangerous merge is into an array the user already has an entry in — a real `hooks.json`
+/// carries an unrelated `Stop` hook, and installing ours must append beside it, not replace it.
+/// Uninstall then has to take back exactly ours.
+#[test]
+fn installing_into_an_array_the_user_already_uses_keeps_their_entry() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let target = config.path().join("hooks.json");
+    let theirs = serde_json::json!({
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "~/.local/bin/plannotator",
+                    "timeout": 345_600,
+                }],
+            }],
+        },
+    });
+    fs::write(
+        &target,
+        serde_json::to_string_pretty(&theirs).expect("their hooks"),
+    )
+    .expect("write the pre-existing hooks");
+
+    let module = format!(
+        r##"local script = bootty.integration.dir .. "/probe/hook.sh"
+bootty.integration.register({{
+    id = "hooks",
+    files = {{ {{ path = "probe/hook.sh", contents = "#!/bin/sh\nexit 0\n", executable = true }} }},
+    merge = {{
+        {{
+            path = "{target}",
+            value = {{ hooks = {{ Stop = {{ {{ hooks = {{ {{ type = "command", command = script, timeout = 2 }} }} }} }} }} }},
+        }},
+    }},
+}})
+"##,
+        target = target.display(),
+    );
+    let mut host = integration_host(config.path(), &module);
+    assert!(matches!(
+        host.apply_module_source_request(install_request(true)),
+        ModuleSourceOutcome::Integration(Ok(()))
+    ));
+
+    let stop = read_json(&target)["hooks"]["Stop"].clone();
+    let entries = stop.as_array().expect("Stop is an array");
+    assert_eq!(entries.len(), 2, "ours joins theirs: {stop:#}");
+    assert_eq!(
+        entries[0], theirs["hooks"]["Stop"][0],
+        "their entry is untouched and still first"
+    );
+
+    assert!(matches!(
+        host.apply_module_source_request(install_request(false)),
+        ModuleSourceOutcome::Integration(Ok(()))
+    ));
+    assert_eq!(
+        read_json(&target)["hooks"]["Stop"],
+        theirs["hooks"]["Stop"],
+        "uninstall takes back only ours"
     );
 }

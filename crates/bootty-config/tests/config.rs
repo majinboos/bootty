@@ -149,16 +149,15 @@ fn defaults_put_current_status_modules_in_visible_top_bar() {
 #[test]
 fn sidebar_modules_default_and_override_in_order() {
     let defaults = load_config_source("");
-    assert_eq!(
-        defaults.sidebar.modules,
-        ["sessions", "codexbar", "agents.pi", "agents.codex"]
-    );
+    assert_eq!(defaults.sidebar.modules, ["sessions", "codexbar"]);
     assert_eq!(
         defaults.sidebar.session_modules,
         [
             "diffs",
             "process",
-            "agent",
+            "agents.pi",
+            "agents.codex",
+            "agents.claude",
             "directory",
             "branch",
             "ports",

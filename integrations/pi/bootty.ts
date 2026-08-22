@@ -110,11 +110,14 @@ export function publishToBootty(
   event: PiEvent,
   spawnBootty: SpawnBootty = spawn,
 ): Promise<void> {
+  // The pane Pi runs in, so Bootty can show the event on the session hosting it. tmux names its
+  // own panes; Bootty names the panes it spawns itself.
+  const pane = process.env.TMUX_PANE ?? process.env.BOOTTY_PANE ?? "";
   return new Promise((resolve) => {
     let finished = false;
     const child = spawnBootty(
       "bootty",
-      ["--json", "command", "agents.pi.ingest", JSON.stringify(event)],
+      ["--json", "command", "agents.pi.ingest", JSON.stringify(event), pane],
       { stdio: "ignore", detached: false },
     );
     const finish = (): void => {

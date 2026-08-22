@@ -3,7 +3,23 @@
 Bootty uses native agent protocols.
 
 Bootty does not infer agent state from process names, terminal output, screen
-content, or transcript files.
+content, or transcript files. An agent reports, or Bootty shows nothing.
+
+## Which session an event belongs to
+
+An agent runs in a session, so every reported event names the pane it came
+from and the sidebar shows one row per session.
+
+Bootty exports `BOOTTY_PANE` into every pane it spawns itself, carrying the
+same pane id the mux snapshot reports as `session.pane_id`. tmux exports that
+id as `TMUX_PANE` inside its own panes.
+
+Each adapter reads `${TMUX_PANE:-${BOOTTY_PANE:-}}` and passes it as the
+second argument of its `ingest` command. An event with no pane lands on no
+session row.
+
+Every module declares its adapter through `bootty.integration.register`, so
+the files under `integrations/` are the same text Bootty installs.
 
 ## Pi
 
@@ -30,7 +46,8 @@ publish native events from existing interactive Pi sessions.
 
 A project can use `.pi/extensions/bootty.ts` after Pi trusts that project.
 
-The adapter calls `agents.pi.ingest` through the live Bootty owner.
+The adapter calls `agents.pi.ingest` through the live Bootty owner, with the
+pane Pi runs in as the second argument.
 
 The adapter uses one active publisher and a bounded event queue.
 
@@ -94,7 +111,63 @@ For example, `~/.codex/hooks.json` can contain:
 
 The hook reads one native hook JSON object from stdin.
 
-The hook calls `agents.codex.ingest` through the live Bootty owner.
+The hook calls `agents.codex.ingest` through the live Bootty owner, with the
+pane it ran in as the second argument.
+
+## Claude Code
+
+Claude Code reports through command hooks, like Codex.
+
+Bootty starts no managed Claude Code process; `agents.claude.state` inspects
+what the hooks reported:
+
+```sh
+bootty command agents.claude.state
+bootty command agents.claude.state %3
+```
+
+Copy `integrations/claude/bootty-hook.sh` to a stable executable path.
+
+Add that path as a command hook for the native Claude Code events that Bootty
+must show.
+
+For example, `~/.claude/settings.json` can contain:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "startup|resume|clear|compact",
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
+    }],
+    "PreToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
+    }],
+    "PostToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
+    }],
+    "Notification": [{
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
+    }],
+    "Stop": [{
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
+    }],
+    "SessionEnd": [{
+      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 1}]
+    }]
+  }
+}
+```
+
+The hook reads one native hook JSON object from stdin and calls
+`agents.claude.ingest` through the live Bootty owner.
+
+`Notification` is what tells Bootty that Claude Code is waiting on the person.
 
 ## Limits and cleanup
 

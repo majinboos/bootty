@@ -326,12 +326,13 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
             shell: Some("/bin/sh".to_owned()),
             args: vec![
                 "-c".to_owned(),
-                "printf '%s' \"$TERM|$COLORTERM|$TERM_PROGRAM|$TERM_PROGRAM_VERSION|${TERMINFO-unset}|${REMOVE_ME-unset}|$PWD|$1\" > \"$BOOTTY_TEST_OUTPUT\""
+                "printf '%s' \"$TERM|$COLORTERM|$TERM_PROGRAM|$TERM_PROGRAM_VERSION|${TERMINFO-unset}|${REMOVE_ME-unset}|$PWD|$1|$BOOTTY_PANE\" > \"$BOOTTY_TEST_OUTPUT\""
                     .to_owned(),
                 "bootty-contract".to_owned(),
                 "argument".to_owned(),
             ],
             working_directory: Some(working_directory.clone()),
+            pane_id: Some("%7".to_owned()),
             env: vec![
                 (
                     "BOOTTY_TEST_OUTPUT".to_owned(),
@@ -341,6 +342,7 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
                 ("COLORTERM".to_owned(), "wrong".to_owned()),
                 ("TERM_PROGRAM".to_owned(), "wrong".to_owned()),
                 ("TERM_PROGRAM_VERSION".to_owned(), "wrong".to_owned()),
+                ("BOOTTY_PANE".to_owned(), "wrong".to_owned()),
                 ("TERMINFO".to_owned(), "wrong".to_owned()),
                 ("REMOVE_ME".to_owned(), "present".to_owned()),
             ],
@@ -364,7 +366,7 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
 
     let output = wait_for_file(&output_path);
     let fields = output.split('|').collect::<Vec<_>>();
-    assert_eq!(fields.len(), 8, "launch output: {output}");
+    assert_eq!(fields.len(), 9, "launch output: {output}");
     assert_eq!(fields[0], "bootty-contract-term");
     assert_eq!(fields[1], "bootty-contract-color");
     assert_eq!(fields[2], TERMINAL_PROGRAM);
@@ -379,6 +381,7 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
             .to_string_lossy()
     );
     assert_eq!(fields[7], "argument");
+    assert_eq!(fields[8], "%7");
 }
 
 #[cfg(unix)]

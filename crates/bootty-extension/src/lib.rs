@@ -5,6 +5,7 @@ mod facts;
 mod git_helpers;
 mod host;
 mod identity;
+mod integrations;
 mod items;
 mod module_runtime;
 mod module_sources;
@@ -20,6 +21,9 @@ pub use fact_values::{MuxView, SessionProgressView, SessionReorder, SessionView,
 pub use git_helpers::{display_path, head_branch};
 pub use host::ExtensionHost;
 pub use identity::ModuleIdentity;
+pub use integrations::{
+    IntegrationDeclaration, IntegrationFile, IntegrationMerge, IntegrationState, IntegrationStatus,
+};
 pub use module_runtime::{
     ExtensionSettingDeclaration, preview_builtin_surfaces, preview_module_surfaces,
 };

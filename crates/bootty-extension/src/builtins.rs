@@ -13,7 +13,6 @@ const SIDEBAR: &[(&str, &str)] = &[
 const SESSION: &[(&str, &str)] = &[
     ("diffs", include_str!("session_defaults/diffs.luau")),
     ("process", include_str!("session_defaults/process.luau")),
-    ("agent", include_str!("session_defaults/agent.luau")),
     ("directory", include_str!("session_defaults/directory.luau")),
     ("branch", include_str!("session_defaults/branch.luau")),
     ("ports", include_str!("session_defaults/ports.luau")),
@@ -25,6 +24,10 @@ const AGENTS: &[(&str, &str)] = &[
     (
         "agents/codex.luau",
         include_str!("agent_integrations/codex.luau"),
+    ),
+    (
+        "agents/claude.luau",
+        include_str!("agent_integrations/claude.luau"),
     ),
 ];
 

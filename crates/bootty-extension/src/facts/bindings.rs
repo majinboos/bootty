@@ -9,9 +9,7 @@ use crate::fact_values::SessionReorder;
 use crate::facts::QueuedSessionReorder;
 use crate::git_helpers::{display_path, head_branch, worktree_revision};
 use crate::module_runtime::{lua_value, require_active};
-use crate::processes::{
-    ManagedProcesses, ProcessEvent, ProcessStatus, ProcessTree, descendant_processes,
-};
+use crate::processes::{ManagedProcesses, ProcessEvent, ProcessStatus};
 
 const EXTENSION_UI_PRELUDE: &str = include_str!("../extension_ui.luau");
 const SIDEBAR_FACTS_PRELUDE: &str = include_str!("../sidebar_session_facts.luau");
@@ -236,27 +234,6 @@ fn install_ui_host_interface(
 
     // Walk a process subtree natively. Modules used to shell out to `ps -axo` and rebuild the
     // whole machine's tree in Lua, which cost a full process listing several times a second.
-    let process_tree = std::sync::Mutex::new(ProcessTree::default());
-    bootty.set(
-        "descendants",
-        lua.create_function(move |lua, root_pid: u32| {
-            let table = lua.create_table()?;
-            let Ok(mut tree) = process_tree.lock() else {
-                return Ok(table);
-            };
-            for (index, descendant) in descendant_processes(&mut tree, root_pid)
-                .into_iter()
-                .enumerate()
-            {
-                let entry = lua.create_table()?;
-                entry.set("command", descendant.command)?;
-                entry.set("args", descendant.args)?;
-                table.set(index + 1, entry)?;
-            }
-            Ok(table)
-        })?,
-    )?;
-
     let path_table = lua.create_table()?;
     path_table.set(
         "display",

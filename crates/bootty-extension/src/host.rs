@@ -8,8 +8,9 @@ use std::{
 
 use crate::fact_values::{MuxView, SessionReorder};
 use crate::facts::ExtensionFacts;
+use crate::integrations::IntegrationState;
 use crate::module_runtime::{
-    ActiveModule, ExtensionSettingDeclaration, ModuleWorker, prepare_module,
+    ActiveModule, ExtensionSettingDeclaration, ModuleEnvironment, ModuleWorker, prepare_module,
 };
 use crate::module_sources::{
     LegacyExtensionModule, ModuleSourceOutcome, ModuleSourceRequest, ModuleSources,
@@ -45,12 +46,18 @@ pub struct ExtensionHost {
     legacy: Vec<LegacyExtensionModule>,
     /// Settings the loaded modules declared for themselves, in module then declaration order.
     settings: Vec<ExtensionSettingDeclaration>,
+    /// Adapters the loaded modules declared, with the install status of each. Recomputed at
+    /// reconcile so the settings editor never touches the filesystem while painting.
+    integrations: Vec<IntegrationState>,
     /// Bumped whenever `settings` changes, so the app rebuilds its schema only then.
     settings_revision: u64,
     retired: Vec<thread::JoinHandle<()>>,
     next_check: Instant,
     next_generation: u64,
     facts: ExtensionFacts,
+    /// The home directory a module's `~` merge path expands against, kept beside the facts copy so
+    /// installing an integration does not have to reach through them.
+    home: Option<PathBuf>,
     metrics_system: sysinfo::System,
     battery: Option<starship_battery::Manager>,
     next_metrics: Instant,
@@ -93,11 +100,13 @@ impl ExtensionHost {
             failures: Vec::new(),
             legacy: Vec::new(),
             settings: Vec::new(),
+            integrations: Vec::new(),
             settings_revision: 0,
             retired: Vec::new(),
             next_check: Instant::now(),
             next_generation: 1,
-            facts: ExtensionFacts::new(theme, home),
+            facts: ExtensionFacts::new(theme, home.clone()),
+            home,
             metrics_system: sysinfo::System::new(),
             battery: starship_battery::Manager::new().ok(),
             next_metrics: Instant::now(),
@@ -262,6 +271,7 @@ impl ExtensionHost {
             legacy: &self.legacy,
             scan_error: self.scan_error.clone(),
             failures: self.failures.clone(),
+            integrations: self.integrations.clone(),
             declared: self
                 .published_surfaces()
                 .into_iter()
@@ -348,7 +358,53 @@ impl ExtensionHost {
                 }
                 ModuleSourceOutcome::Imported(imported)
             }
+            ModuleSourceRequest::InstallIntegration { module, id } => {
+                ModuleSourceOutcome::Integration(self.run_integration(&module, &id, true))
+            }
+            ModuleSourceRequest::UninstallIntegration { module, id } => {
+                ModuleSourceOutcome::Integration(self.run_integration(&module, &id, false))
+            }
         }
+    }
+
+    /// What every module worker gets from this host.
+    fn environment(&self) -> ModuleEnvironment {
+        ModuleEnvironment {
+            catalog: Arc::clone(&self.catalog),
+            commands: self.commands.clone(),
+            events: self.events.clone(),
+            integration_dir: self.integration_dir(),
+        }
+    }
+
+    /// Where an integration's files live: beside the extension root, under the same config
+    /// directory the legacy scan already reads from.
+    fn integration_dir(&self) -> PathBuf {
+        self.root
+            .parent()
+            .unwrap_or(self.root.as_path())
+            .join("integrations")
+    }
+
+    /// Install or remove one declared integration, then refresh every status so the editor's next
+    /// paint shows what actually happened.
+    fn run_integration(&mut self, module: &str, id: &str, install: bool) -> Result<(), String> {
+        let declaration = self
+            .integrations
+            .iter()
+            .map(|state| &state.declaration)
+            .find(|declaration| declaration.module == module && declaration.id == id)
+            .cloned()
+            .ok_or_else(|| format!("no integration `{id}` declared by `{module}`"))?;
+        let dir = self.integration_dir();
+        let home = self.home.as_deref();
+        let result = if install {
+            crate::integrations::install(&dir, home, &declaration)
+        } else {
+            crate::integrations::uninstall(&dir, home, &declaration)
+        };
+        self.refresh_integration_declarations();
+        result
     }
 
     /// Note that `identity` will not render this reconcile, and why. Also logged, because a module
@@ -420,14 +476,13 @@ impl ExtensionHost {
                     }
                 },
             };
+            let environment = self.environment();
             let prepared = match prepare_module(
                 &source,
                 storage.clone(),
                 generation,
-                Arc::clone(&self.catalog),
-                self.commands.clone(),
-                self.events.clone(),
                 self.facts.for_generation(),
+                environment.clone(),
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -440,10 +495,8 @@ impl ExtensionHost {
                         &builtin,
                         storage.clone(),
                         generation,
-                        Arc::clone(&self.catalog),
-                        self.commands.clone(),
-                        self.events.clone(),
                         self.facts.for_generation(),
+                        environment,
                     ) {
                         Ok(prepared) => prepared,
                         Err(error) => {
@@ -474,6 +527,7 @@ impl ExtensionHost {
                 worker: prepared.worker,
                 storage,
                 settings: prepared.settings,
+                integrations: prepared.integrations,
             };
             if let Some(previous) = self.active.insert(identity, next) {
                 self.retire_worker(previous.worker);
@@ -494,6 +548,7 @@ impl ExtensionHost {
             self.retire_worker(previous.worker);
         }
         self.refresh_setting_declarations();
+        self.refresh_integration_declarations();
         self.reap_retired();
     }
 
@@ -509,6 +564,21 @@ impl ExtensionHost {
             self.settings = settings;
             self.settings_revision = self.settings_revision.wrapping_add(1);
         }
+    }
+
+    /// Recompute every declared integration and its status from the active modules.
+    fn refresh_integration_declarations(&mut self) {
+        let dir = self.integration_dir();
+        let home = self.home.clone();
+        self.integrations = self
+            .active
+            .values()
+            .flat_map(|active| active.integrations.iter())
+            .map(|declaration| IntegrationState {
+                status: crate::integrations::status(&dir, home.as_deref(), declaration),
+                declaration: declaration.clone(),
+            })
+            .collect();
     }
 
     fn retire_worker(&mut self, worker: ModuleWorker) {
