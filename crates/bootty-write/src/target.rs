@@ -95,18 +95,15 @@ impl WriteTarget {
         let process = PROCESS_WRITE_LOCK
             .lock()
             .map_err(|_| io::Error::other("Bootty writer lock is poisoned"))?;
-        let file_name = self.path.file_name().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "write target has no file name")
-        })?;
-        let mut lock_name = std::ffi::OsString::from(".");
-        lock_name.push(file_name);
-        lock_name.push(".bootty-write.lock");
+        remove_legacy_lock_file(&self.path);
+        let directory = lock_directory();
+        fs::create_dir_all(&directory)?;
         let lock_file = File::options()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(self.path.with_file_name(lock_name))?;
+            .open(directory.join(lock_file_name(&self.path)))?;
         lock_file.lock()?;
         Ok(LockedWriteTarget {
             path: self.path,
@@ -114,6 +111,61 @@ impl WriteTarget {
             _lock_file: lock_file,
         })
     }
+}
+
+/// Clear the lock file older builds left beside the target.
+///
+/// Best effort, and safe because the name is Bootty's own: nothing creates one any more, so the
+/// only cost of racing a still-running old build is the window that build already has against this
+/// one. Delete this once no installed build writes a sidecar lock.
+fn remove_legacy_lock_file(target: &Path) {
+    let Some(file_name) = target.file_name() else {
+        return;
+    };
+    let mut legacy = std::ffi::OsString::from(".");
+    legacy.push(file_name);
+    legacy.push(".bootty-write.lock");
+    let _ = fs::remove_file(target.with_file_name(legacy));
+}
+
+/// Where the cross-process write locks live.
+///
+/// Not beside the target: a lock file can never be removed — a writer that unlinked one would let
+/// the next writer create a second file and lock that instead, so two of them would believe they
+/// held the same target — and leaving one behind next to the target litters whatever directory the
+/// user pointed Bootty at, including their repositories.
+///
+/// The trade-off is that two users writing the same file share one lock path, and the second one
+/// cannot open a lock file the first one owns. Bootty writes into the user's own home; if a
+/// genuinely shared target ever appears, this is the line that has to grow a per-owner directory.
+fn lock_directory() -> PathBuf {
+    std::env::temp_dir().join("bootty-write-locks")
+}
+
+/// A stable file name for one target path.
+///
+/// The same path must always produce the same name, or two writers would lock different files.
+/// A collision only over-serialises two unrelated targets, so the hash is short on purpose and the
+/// tail of the path rides along to keep the directory readable.
+fn lock_file_name(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    // FNV-1a: fixed constants, so the answer does not depend on the standard library's hasher
+    // staying the same between the processes that have to agree on it.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let label = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = label
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-'))
+        .take(48)
+        .collect::<String>();
+    format!("{hash:016x}-{label}.lock")
 }
 
 fn normalize_absolute_path(path: &Path) -> io::Result<PathBuf> {
