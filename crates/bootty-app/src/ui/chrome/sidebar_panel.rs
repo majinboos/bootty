@@ -1,5 +1,5 @@
 use bootty_extension::{ExtensionUiAction, PublishedSurfaceItem};
-use bootty_mux::controller::{MuxScope, SpaceId};
+use bootty_mux::controller::SpaceId;
 use bootty_ui::{ThemePalette, mix};
 use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
@@ -22,8 +22,6 @@ pub struct SidebarModel<'a> {
     pub separator_visible: bool,
     pub focused: bool,
     pub hovered_session: Option<&'a ScopedSessionTarget>,
-    /// The Spaces the hovered session's context menu can hand it to.
-    pub move_targets: &'a [SpaceMoveTarget],
     /// Explicit color overrides from `[sidebar]`; each falls back to a theme-derived tint.
     pub fullscreen: bool,
     pub hover_override: Option<egui::Color32>,
@@ -35,6 +33,8 @@ pub struct SidebarModel<'a> {
 pub enum SidebarEvent {
     ExtensionAction(ExtensionUiAction),
     ActivateSession(ScopedSessionTarget),
+    /// A session no Space holds: taking it means claiming it first.
+    AdoptSession(ScopedSessionTarget),
     ContextAction {
         target: ScopedSessionTarget,
         action: SessionContextAction,
@@ -56,12 +56,11 @@ pub enum SessionContextAction {
     Rename,
     MoveUp,
     MoveDown,
-    Detach,
     Ditch,
-    MoveToSpace(SpaceId),
+    MoveToSpace,
 }
 
-/// A Space a session can be handed to, as the move menu shows it.
+/// A Space a session can be handed to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpaceMoveTarget {
     pub id: SpaceId,
@@ -72,6 +71,9 @@ pub struct SpaceMoveTarget {
     /// Whether this is the Space the session is already in.
     pub current: bool,
 }
+
+/// Row kind for a session no Space claims.
+pub const UNASSIGNED_KIND: &str = "unassigned";
 
 const SIDEBAR_HEADER_HEIGHT: f32 = 44.0;
 const SIDEBAR_FOOTER_BASE_HEIGHT: f32 = 14.0;
@@ -99,7 +101,7 @@ fn row_visual<'a>(item: &'a SidebarItem<'a>) -> ListRow<'a> {
     }
 }
 
-fn sidebar_session_key<'a>(item: &'a SidebarItem<'a>) -> Option<(MuxScope, &'a str)> {
+fn sidebar_session_key<'a>(item: &'a SidebarItem<'a>) -> Option<(SpaceId, &'a str)> {
     Some((item.scope, item.session_id?))
 }
 
@@ -189,10 +191,7 @@ pub fn show_sidebar(
         .floor()
         .max(0.0) as usize;
     let items = &model.items[..model.items.len().min(max_rows)];
-    let drag_id = egui::Id::new("mux-sidebar-drag-anchor");
-    let mut dragged = ui
-        .ctx()
-        .data_mut(|data| data.get_persisted::<SidebarDragState>(drag_id));
+    let mut dragged = session_drag(ui.ctx());
     let pointer_pos = ui.input(|input| {
         input
             .pointer
@@ -240,9 +239,16 @@ pub fn show_sidebar(
                     .iter()
                     .find(|item| item.reorder_anchor == Some(anchor))
                     .map_or_else(|| anchor.to_owned(), |item| item.text.to_owned()),
+                // Every row on the anchor: a grouped row carries its whole group, the same way a
+                // reorder moves the group rather than splitting it.
+                sessions: items
+                    .iter()
+                    .filter(|item| item.reorder_anchor == Some(anchor))
+                    .filter_map(|item| Some(ScopedSessionTarget::new(item.scope, item.session_id?)))
+                    .collect(),
             };
             ui.ctx()
-                .data_mut(|data| data.insert_persisted(drag_id, state.clone()));
+                .data_mut(|data| data.insert_persisted(drag_id(), state.clone()));
             dragged = Some(state);
             ui.ctx().request_repaint();
         }
@@ -257,9 +263,12 @@ pub fn show_sidebar(
                 && item.selectable
                 && let Some((scope, session_id)) = item_key
             {
-                event = Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
-                    scope, session_id,
-                )));
+                let target = ScopedSessionTarget::new(scope, session_id);
+                event = Some(if item.kind == UNASSIGNED_KIND {
+                    SidebarEvent::AdoptSession(target)
+                } else {
+                    SidebarEvent::ActivateSession(target)
+                });
             }
         }
         if event.is_none()
@@ -273,7 +282,6 @@ pub fn show_sidebar(
                 item.reorder_anchor.is_some() && position + 1 < binding_session_count,
                 binding_session_count > 1,
                 item.can_return_to_last_session,
-                model.move_targets,
             )
         {
             event = Some(SidebarEvent::ContextAction {
@@ -316,8 +324,10 @@ pub fn show_sidebar(
                     before: target.map(str::to_owned),
                 });
             }
-            ui.ctx()
-                .data_mut(|data| data.remove::<SidebarDragState>(drag_id));
+            // A release below the list is the Space switcher's drop, and it ends the drag itself.
+            if !released_over_space_switcher(pointer_pos, rect) {
+                end_session_drag(ui.ctx());
+            }
         }
     }
 
@@ -340,19 +350,9 @@ fn session_context_action(
     can_move_down: bool,
     can_navigate: bool,
     can_return_to_last_session: bool,
-    move_targets: &[SpaceMoveTarget],
 ) -> Option<SessionContextAction> {
     use SessionContextAction as A;
     use bootty_ui::menu::MenuEntry as E;
-    // A Space on another multiplexer stays listed but disabled: "not from here" is a more useful
-    // answer than an absent entry the user has to guess the reason for.
-    let mut spaces = move_targets
-        .iter()
-        .filter(|target| !target.current)
-        .map(|target| E::enabled_item(target.reachable, &target.name, A::MoveToSpace(target.id)))
-        .collect::<Vec<_>>();
-    spaces.push(E::Separator);
-    spaces.push(E::item("Nothing (unassign)", A::Detach));
     bootty_ui::menu::context_menu(
         response,
         &[
@@ -373,16 +373,36 @@ fn session_context_action(
             E::enabled_item(can_move_up, "Move Session Up", A::MoveUp),
             E::enabled_item(can_move_down, "Move Session Down", A::MoveDown),
             E::Separator,
-            E::submenu("Move to Space", spaces),
+            E::item("Move to Space…", A::MoveToSpace),
             E::item("Ditch Session…", A::Ditch),
         ],
     )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SidebarDragState {
+pub(super) struct SidebarDragState {
     anchor: String,
     preview: String,
+    /// The sessions the drag carries, for a drop the session list does not answer.
+    pub(super) sessions: Vec<ScopedSessionTarget>,
+}
+
+fn drag_id() -> egui::Id {
+    egui::Id::new("mux-sidebar-drag-anchor")
+}
+
+/// The sidebar drag in flight, so the Space switcher can accept a session dropped on it.
+pub(super) fn session_drag(ctx: &egui::Context) -> Option<SidebarDragState> {
+    ctx.data_mut(|data| data.get_persisted::<SidebarDragState>(drag_id()))
+}
+
+pub(super) fn end_session_drag(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<SidebarDragState>(drag_id()));
+}
+
+/// Whether the pointer left the session list through its bottom edge, where the switcher sits.
+fn released_over_space_switcher(pointer: Option<Pos2>, list: Rect) -> bool {
+    pointer.is_some_and(|pos| pos.y >= list.max.y && (list.min.x..=list.max.x).contains(&pos.x))
 }
 
 pub fn sidebar_drop_target<'a>(

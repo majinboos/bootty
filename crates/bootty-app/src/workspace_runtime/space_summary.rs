@@ -9,4 +9,7 @@ pub struct SpaceSummary {
     pub tint_sidebar: bool,
     pub active: bool,
     pub error: Option<String>,
+    /// Whether a session in the active Space can move here, which only holds within one
+    /// multiplexer. The switcher greys the rest rather than hiding them.
+    pub accepts_moves: bool,
 }

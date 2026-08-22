@@ -53,9 +53,8 @@ impl BindingRuntime {
         let window = self.current_window_id();
         let backend = selected_backend(&self.multiplexer);
         format!(
-            "{}:{}:{backend:?}:{}:{}:{pane_id}",
-            window.scope.space_id().persistence_value(),
-            window.scope.binding_id().persistence_value(),
+            "{}:{backend:?}:{}:{}:{pane_id}",
+            window.scope.persistence_value(),
             window.session_id,
             window.window_id,
         )

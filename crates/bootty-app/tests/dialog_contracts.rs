@@ -14,7 +14,7 @@ use bootty_app::{
 };
 use bootty_config::config::{AppearanceVariant, BoottyConfig};
 use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
+    controller::SpaceId,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use bootty_ui::icons::install_icon_fonts;
@@ -79,10 +79,7 @@ fn keybind_help_accepts_prefixed_bindings_for_display() {
 
 #[test]
 fn session_picker_activates_the_selected_session() {
-    let scope = MuxScope::new(
-        SpaceId::from_persistence(1),
-        BindingId::from_persistence(10),
-    );
+    let scope = SpaceId::from_persistence(1);
     let session = MuxSession {
         id: "session-1".to_owned(),
         name: "work".to_owned(),

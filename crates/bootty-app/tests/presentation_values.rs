@@ -1,26 +1,17 @@
-use std::collections::HashMap;
-
-use bootty_app::ui::{
-    session_navigation::BindingSessionGroup,
-    sidebar::{
-        build_binding_sidebar_items, build_sidebar_items_from_published_items, session_group,
-        session_suffix, sidebar_session_colors,
-    },
+use bootty_app::ui::sidebar::{
+    build_sidebar_items_from_published_items, session_group, sidebar_session_colors,
 };
 use bootty_extension::{
     ModuleColor, ModuleCoord, ModuleItem, ModulePrimitive, PublishedSurfaceItem,
 };
 use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
+    controller::SpaceId,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use egui::Color32;
 
-fn scope(binding: i64) -> MuxScope {
-    MuxScope::new(
-        SpaceId::from_persistence(1),
-        BindingId::from_persistence(binding),
-    )
+fn scope(space_id: i64) -> SpaceId {
+    SpaceId::from_persistence(space_id)
 }
 
 fn session(id: &str, name: &str, process: &str) -> MuxSession {
@@ -106,93 +97,6 @@ fn extension_session_rows_keep_identity_style_and_selection() {
 }
 
 #[test]
-fn binding_groups_keep_colliding_backend_ids_scoped() {
-    let local_scope = scope(10);
-    let remote_scope = scope(20);
-    let groups = vec![
-        BindingSessionGroup {
-            scope: local_scope,
-            label: "Local".to_owned(),
-            sessions: vec![session("$1", "work", "zsh")],
-            selected_session: Some("$1".to_owned()),
-            active: true,
-            can_return_to_last_session: false,
-            display_names: HashMap::new(),
-        },
-        BindingSessionGroup {
-            scope: remote_scope,
-            label: "Remote".to_owned(),
-            sessions: vec![session("$1", "work", "ssh")],
-            selected_session: Some("$1".to_owned()),
-            active: false,
-            can_return_to_last_session: true,
-            display_names: HashMap::new(),
-        },
-    ];
-
-    let items = build_binding_sidebar_items(&groups);
-
-    assert_eq!(items.len(), 4);
-    assert_eq!(items[0].text, "Local");
-    assert_eq!(items[2].text, "Remote");
-    assert_eq!(items[1].scope, local_scope);
-    assert_eq!(items[3].scope, remote_scope);
-    assert!(items[1].current);
-    assert!(!items[3].current);
-    assert_eq!(items[1].context_position, Some((0, 1)));
-    assert_eq!(items[3].context_position, Some((0, 1)));
-    assert_ne!((items[1].scope, items[1].id), (items[3].scope, items[3].id));
-}
-
-#[test]
-fn native_sessions_project_to_grouped_sidebar_rows() {
-    let sessions = vec![
-        session("$1", "work/api", "zsh"),
-        session("$2", "work/ui", "nvim"),
-    ];
-    let groups = [BindingSessionGroup {
-        scope: scope(0),
-        label: "Native".to_owned(),
-        sessions,
-        selected_session: Some("$1".to_owned()),
-        active: true,
-        can_return_to_last_session: false,
-        display_names: HashMap::new(),
-    }];
-    let items = build_binding_sidebar_items(&groups);
-
-    assert_eq!(items.len(), 4);
-    assert_eq!((items[2].number, items[2].text), (Some(1), "api"));
-    assert_eq!(items[2].tree, Some("middle"));
-    assert_eq!(items[3].tree, Some("last"));
-    assert_eq!(items[2].context_position, Some((0, 2)));
-    assert_eq!(items[3].context_position, Some((1, 2)));
-}
-
-#[test]
-fn selected_session_is_the_only_current_sidebar_row() {
-    let mut sessions = vec![session("$1", "one", "zsh"), session("$2", "two", "fish")];
-    sessions[0].active = true;
-    let groups = [BindingSessionGroup {
-        scope: scope(0),
-        label: "Native".to_owned(),
-        sessions,
-        selected_session: Some("$2".to_owned()),
-        active: true,
-        can_return_to_last_session: false,
-        display_names: HashMap::new(),
-    }];
-    let items = build_binding_sidebar_items(&groups);
-    let current = items
-        .iter()
-        .filter(|item| item.kind == "session" && item.current)
-        .map(|item| item.session_id)
-        .collect::<Vec<_>>();
-
-    assert_eq!(current, vec![Some("$2")]);
-}
-
-#[test]
 fn ungrouped_sessions_receive_distinct_accent_colors() {
     let sessions = vec![
         session("local", "local", "zsh"),
@@ -209,5 +113,4 @@ fn ungrouped_sessions_receive_distinct_accent_colors() {
 #[test]
 fn session_grouping_splits_only_at_the_first_slash() {
     assert_eq!(session_group("a/b/c"), "a");
-    assert_eq!(session_suffix("a/b/c"), "b/c");
 }

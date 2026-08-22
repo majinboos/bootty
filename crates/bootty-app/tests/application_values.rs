@@ -10,7 +10,7 @@ use bootty_app::{
 };
 use bootty_config::{color::Color, config::BoottyConfig};
 use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
+    controller::SpaceId,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use egui::{Color32, Event, Key, Modifiers};
@@ -28,11 +28,8 @@ fn key_event(key: Key) -> Event {
     }
 }
 
-fn scope(binding_id: i64) -> MuxScope {
-    MuxScope::new(
-        SpaceId::from_persistence(1),
-        BindingId::from_persistence(binding_id),
-    )
+fn scope(space_id: i64) -> SpaceId {
+    SpaceId::from_persistence(space_id)
 }
 
 fn session(id: &str, name: &str) -> MuxSession {

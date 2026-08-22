@@ -56,10 +56,11 @@ compares its painted text against a committed baseline. The same test was run at
 - [x] L4 New module: client-side validation messages gone, placeholder now demands an extension.
 - [x] L5 Keys: `→` moved to the UI font (tofu risk); the flags editor lost its frame and margins.
 - [x] L6 Extensions: number fields size from an unbounded range; section headers are raw namespaces.
-- [~] L7 Deleted tests. Replaced for every behaviour that actually regressed — action titles, the
+- [x] L7 Deleted tests. Replaced for every behaviour that actually regressed — action titles, the
       chord recorder's list, `hover_selects`, run-end rounding, the sweep clock, nav icons, the
       module preview, the editor gutter and comment toggle — plus a rendered-text snapshot per
-      settings page. The wider inline-test loss in the chrome files is not backfilled.
+      settings page. All of them now live in `tests/`, which is the house style: the crate has 115
+      integration files and, after this, no `#[cfg(test)] mod tests` in `src` at all.
 - [x] L8 Sidebar: empty state reworded.
 
 ## Second wave, from the non-settings audit

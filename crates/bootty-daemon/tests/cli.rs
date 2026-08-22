@@ -718,3 +718,95 @@ fn daemon_marks_canonical_worktree_aliases_as_occupied() {
         serde_json::from_slice(&output.stdout).expect("worktree JSON");
     assert!(worktrees[0].occupied);
 }
+
+/// A workspace where the connection lives on the Space itself, as revision 5 stores it.
+fn seed_folded_catalog(
+    path: &std::path::Path,
+    remote_id: &str,
+    name: &str,
+    stored_backend: &str,
+    session_names: &[&str],
+) {
+    std::fs::create_dir_all(path.parent().expect("folded catalog parent")).expect("folded parent");
+    let connection = Connection::open(path).expect("folded catalog");
+    connection
+        .execute_batch(
+            "PRAGMA user_version = 5;
+             CREATE TABLE workspace_spaces (
+                 id INTEGER PRIMARY KEY,
+                 remote_id TEXT,
+                 name TEXT NOT NULL,
+                 position INTEGER NOT NULL,
+                 backend TEXT NOT NULL,
+                 remote TEXT
+             );
+             CREATE TABLE workspace_sessions (
+                 identity TEXT PRIMARY KEY,
+                 space_id INTEGER NOT NULL,
+                 backend_name TEXT NOT NULL,
+                 position INTEGER NOT NULL
+             );",
+        )
+        .expect("folded schema");
+    connection
+        .execute(
+            "INSERT INTO workspace_spaces (id, remote_id, name, position, backend, remote)
+             VALUES (1, ?1, ?2, 0, ?3, '{\"source\":\"local\"}')",
+            params![remote_id, name, stored_backend],
+        )
+        .expect("folded space");
+    for (position, session_name) in session_names.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO workspace_sessions (identity, space_id, backend_name, position)
+                 VALUES ('id-' || ?1, 1, ?2, ?1)",
+                params![position as i64, session_name],
+            )
+            .expect("folded session");
+    }
+}
+
+/// The importer reads the connection off the Space once it has been folded in, so upgrading bootty
+/// on the workstation does not make its Spaces invisible to the daemon on the next ssh call.
+#[test]
+fn a_folded_workspace_imports_its_spaces_and_sessions() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let config = directory.path().join("config");
+    let state = directory.path().join("state");
+
+    std::fs::create_dir_all(config.join("bootty")).expect("config directory");
+    std::fs::write(
+        config.join("bootty/config.toml"),
+        "[multiplexer]\nbackend = \"rmux\"\n",
+    )
+    .expect("config file");
+    seed_folded_catalog(
+        &config.join("bootty/session-order.sqlite3"),
+        "folded-id",
+        "Folded legacy",
+        "tmux",
+        &["work", "review"],
+    );
+
+    let listed = run_daemon(
+        env!("CARGO_BIN_EXE_bootty-daemon"),
+        &config,
+        &state,
+        None,
+        &["remote-space", "list"],
+    );
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    let spaces: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("listed JSON");
+    assert_eq!(spaces[0]["name"], "Folded legacy");
+    assert_eq!(spaces[0]["backend"], "tmux");
+    let space_id = spaces[0]["id"].as_str().expect("imported Space id");
+    assert_eq!(
+        destination_sessions(&state.join("bootty/daemon.sqlite"), space_id),
+        ["work", "review"]
+    );
+}

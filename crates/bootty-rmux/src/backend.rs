@@ -23,7 +23,7 @@ use bootty_mux::{
 #[cfg(feature = "app")]
 use bootty_mux::{
     capability::{BindingCapabilityDescriptor, BindingOperation},
-    controller::MuxScope,
+    controller::SpaceId,
 };
 
 const RMUX_FIELD_SEPARATOR: char = '\u{1f}';
@@ -95,7 +95,7 @@ impl<C: MuxBackend> MuxBackend for RmuxBackend<C> {
 /// What an rmux binding can do, wherever its daemon runs. A remote binding drives the same rmux
 /// through its command line rather than the socket, so it has to claim the same operations and not
 /// the ones tmux happens to add.
-pub fn rmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+pub fn rmux_capabilities(scope: SpaceId) -> BindingCapabilityDescriptor {
     BindingCapabilityDescriptor::new(
         scope,
         [
@@ -130,27 +130,6 @@ impl MuxBackend for RmuxControl {
 #[cfg(feature = "app")]
 pub(crate) fn resize_bootty_rmux_window(window_id: &str, cols: u16, rows: u16) -> Result<()> {
     resize_rmux_window(window_id, cols, rows)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Only ids below the highest live session are dead. rmux hands out increasing ids, so an
-    /// option above every live one belongs to a session that is still being created.
-    #[test]
-    fn a_tag_option_is_matched_to_its_session_id_and_nothing_else() {
-        assert_eq!(tag_option_id("@bootty_id_3"), Some(3));
-        assert_eq!(tag_option_id("@bootty_space_12"), Some(12));
-        assert_eq!(tag_option_id("@bootty_id"), None);
-        assert_eq!(tag_option_id("@someone_elses_option_3"), None);
-        assert_eq!(tag_option_id("@bootty_id_notanumber"), None);
-        assert_eq!(numeric_session_id("$7"), Some(7));
-        assert_eq!(
-            session_tag_option("$7", SESSION_IDENTITY_OPTION),
-            "@bootty_id_7"
-        );
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -387,7 +366,7 @@ pub(crate) fn session_from_rows(
 /// (`rmux-core::session::store::rename_session` rekeys leases, subscriptions and attaches, but not
 /// options), so a session-scoped tag would be orphaned by a rename bootty did not issue. Keying on
 /// `session_id` -- which rmux documents as its stable identity -- gets the same guarantee.
-fn session_tag_option(session_id: &str, option: &str) -> String {
+pub fn session_tag_option(session_id: &str, option: &str) -> String {
     // rmux renders session ids as `$3`; the sigil buys nothing inside an option name.
     format!("{option}_{}", session_id.trim_start_matches('$'))
 }
@@ -473,12 +452,12 @@ pub(crate) async fn list_session_tags(_rmux: &Rmux) -> Result<HashMap<String, Mu
     Ok(tags)
 }
 
-fn numeric_session_id(session_id: &str) -> Option<u32> {
+pub fn numeric_session_id(session_id: &str) -> Option<u32> {
     session_id.trim_start_matches('$').parse().ok()
 }
 
 /// The session id a tag option is keyed by, for the options bootty owns.
-fn tag_option_id(option: &str) -> Option<u32> {
+pub fn tag_option_id(option: &str) -> Option<u32> {
     [SESSION_IDENTITY_OPTION, SESSION_SPACE_OPTION]
         .into_iter()
         .find_map(|owned| option.strip_prefix(owned)?.strip_prefix('_'))

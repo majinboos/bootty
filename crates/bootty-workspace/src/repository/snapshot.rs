@@ -4,47 +4,41 @@ use super::*;
 
 pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
     let mut statement = tx.prepare(
-        "SELECT s.id, s.remote_id, s.name, s.icon, s.color, s.tint_sidebar, s.position,
-                b.id, b.name, b.backend, b.hide_tmux_status, b.unavailable,
-                b.selected_session_id, b.selected_window_id, b.remote
-         FROM workspace_spaces s
-         JOIN workspace_bindings b ON b.space_id = s.id
-         ORDER BY s.position, s.id, b.id",
+        "SELECT id, remote_id, name, icon, color, tint_sidebar, position,
+                backend, hide_tmux_status, unavailable,
+                selected_session_id, selected_window_id, remote
+         FROM workspace_spaces
+         ORDER BY position, id",
     )?;
     let rows = statement.query_map([], |row| {
         let space_id = row.get::<_, i64>(0)?;
-        let binding_id = row.get::<_, i64>(7)?;
-        if space_id <= 0 || binding_id <= 0 {
+        if space_id <= 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let backend = backend_from_storage(&row.get::<_, String>(9)?)?;
-        let remote = remote_from_storage(row.get::<_, Option<String>>(14)?.as_deref())?;
+        let backend = backend_from_storage(&row.get::<_, String>(7)?)?;
+        let remote = remote_from_storage(row.get::<_, Option<String>>(12)?.as_deref())?;
         let color = color_from_hex(&row.get::<_, String>(4)?)
             .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
         let tint_sidebar = bool_from_storage(row.get::<_, i64>(5)?)?;
-        let hide_tmux_status = bool_from_storage(row.get::<_, i64>(10)?)?;
-        let unavailable = bool_from_storage(row.get::<_, i64>(11)?)?;
-        let session_id = row.get::<_, Option<String>>(12)?;
-        let window_id = row.get::<_, Option<String>>(13)?;
+        let hide_tmux_status = bool_from_storage(row.get::<_, i64>(8)?)?;
+        let unavailable = bool_from_storage(row.get::<_, i64>(9)?)?;
+        let session_id = row.get::<_, Option<String>>(10)?;
+        let window_id = row.get::<_, Option<String>>(11)?;
         if session_id.as_deref().is_some_and(str::is_empty)
             || (session_id.is_none() && window_id.is_some())
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        Ok((
-            space_id,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
+        Ok(WorkspaceSpace {
+            id: SpaceId::from_persistence(space_id),
+            remote_id: row.get(1)?,
+            name: row.get(2)?,
+            icon: row.get(3)?,
             color,
             tint_sidebar,
-            row.get::<_, i64>(6)?,
-            WorkspaceBinding {
-                scope: MuxScope::new(
-                    SpaceId::from_persistence(space_id),
-                    BindingId::from_persistence(binding_id),
-                ),
-                name: row.get(8)?,
+            position: row.get(6)?,
+            binding: WorkspaceBinding {
+                scope: SpaceId::from_persistence(space_id),
                 backend_override: backend,
                 remote_override: remote,
                 hide_tmux_status,
@@ -55,50 +49,22 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
                 }),
                 sessions: SessionMembership::default(),
             },
-        ))
+        })
     })?;
-    let mut spaces = Vec::<WorkspaceSpace>::new();
-    for row in rows {
-        let (space_id, remote_id, name, icon, color, tint_sidebar, position, binding) = row?;
-        if let Some(space) = spaces.last_mut()
-            && space.id.persistence_value() == space_id
-        {
-            space.bindings.push(binding);
-        } else {
-            spaces.push(WorkspaceSpace {
-                id: SpaceId::from_persistence(space_id),
-                remote_id,
-                name,
-                icon,
-                color,
-                tint_sidebar,
-                position,
-                bindings: vec![binding],
-            });
-        }
-    }
+    let mut spaces = rows.collect::<rusqlite::Result<Vec<WorkspaceSpace>>>()?;
     if spaces.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let binding_ids = spaces
+
+    let space_ids = spaces
         .iter()
-        .flat_map(|space| space.bindings.iter())
-        .map(|binding| binding.scope.binding_id().persistence_value())
+        .map(|space| space.id.persistence_value())
         .collect::<HashSet<_>>();
-    let (stored_spaces, stored_bindings) = tx.query_row(
-        "SELECT (SELECT COUNT(*) FROM workspace_spaces),
-                (SELECT COUNT(*) FROM workspace_bindings)",
-        [],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    )?;
-    if spaces.len() as i64 != stored_spaces || binding_ids.len() as i64 != stored_bindings {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
     let mut sessions = HashMap::<i64, Vec<WorkspaceSession>>::new();
     let mut identities = HashSet::new();
     let mut statement = tx.prepare(
-        "SELECT identity, binding_id, backend_name, display_name, explicit, cwd, position
-         FROM workspace_sessions ORDER BY binding_id, position",
+        "SELECT identity, space_id, backend_name, display_name, explicit, cwd, position
+         FROM workspace_sessions ORDER BY space_id, position",
     )?;
     for row in statement.query_map([], |row| {
         Ok((
@@ -113,16 +79,16 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
             },
         ))
     })? {
-        let (binding_id, position, session) = row?;
+        let (space_id, position, session) = row?;
         if session.identity.is_empty()
             || session.backend_name.is_empty()
             || position < 0
-            || !binding_ids.contains(&binding_id)
+            || !space_ids.contains(&space_id)
             || !identities.insert(session.identity.clone())
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let claimed = sessions.entry(binding_id).or_default();
+        let claimed = sessions.entry(space_id).or_default();
         if claimed.len() != position as usize {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -130,20 +96,18 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
     }
 
     for space in &mut spaces {
-        if space.id.persistence_value() <= 0
-            || space.name.trim().is_empty()
+        if space.name.trim().is_empty()
             || space.icon.trim().is_empty()
             || space.remote_id.trim().is_empty()
             || space.position < 0
-            || space.bindings.is_empty()
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        for binding in &mut space.bindings {
-            let binding_id = binding.scope.binding_id().persistence_value();
-            binding.sessions =
-                SessionMembership::from_sessions(sessions.remove(&binding_id).unwrap_or_default());
-        }
+        space.binding.sessions = SessionMembership::from_sessions(
+            sessions
+                .remove(&space.id.persistence_value())
+                .unwrap_or_default(),
+        );
     }
     if !sessions.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);

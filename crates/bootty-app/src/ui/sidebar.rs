@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 
 use bootty_extension::{ExtensionUiAction, ModuleItem, ModulePrimitive, PublishedSurfaceItem};
-use bootty_mux::{controller::MuxScope, snapshot::MuxSession};
+use bootty_mux::{controller::SpaceId, snapshot::MuxSession};
 use eframe::egui::Color32;
 
 use bootty_ui::item_paint::module_color32;
-
-use crate::ui::session_navigation::BindingSessionGroup;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarItem<'a> {
@@ -17,7 +15,7 @@ pub struct SidebarItem<'a> {
     pub tree: Option<&'a str>,
     pub selectable: bool,
     pub session_id: Option<&'a str>,
-    pub scope: MuxScope,
+    pub scope: SpaceId,
     pub reorder_anchor: Option<&'a str>,
     pub color: Color32,
     pub dim_color: Color32,
@@ -31,37 +29,66 @@ pub struct SidebarItem<'a> {
     pub extension_action: Option<ExtensionUiAction>,
 }
 
-pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec<SidebarItem<'a>> {
-    let mut items = Vec::new();
-    for group in groups {
-        items.push(SidebarItem {
-            id: &group.label,
-            text: &group.label,
-            number: None,
-            indent: 0,
-            tree: None,
-            selectable: false,
-            session_id: None,
-            scope: group.scope,
-            reorder_anchor: None,
-            color: Color32::WHITE,
-            dim_color: Color32::GRAY,
-            kind: "group",
-            active: false,
-            current: false,
-            can_return_to_last_session: false,
-            context_position: None,
-            icon: Some("terminal"),
-            primitives: &[],
-            extension_action: None,
-        });
-        let mut binding_items = build_sidebar_items_inner(group);
-        for item in &mut binding_items {
-            item.indent = item.indent.saturating_add(2);
-            item.reorder_anchor = None;
-        }
-        items.extend(binding_items);
+/// A session on this Space's multiplexer that no Space claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnclaimedSession {
+    pub session_id: String,
+    pub name: String,
+}
+
+/// The trailing "Unassigned" block, empty when nothing is unclaimed.
+///
+/// Sessions started outside bootty, and ones a deleted Space left behind, are otherwise invisible
+/// here -- membership is explicit now, so the sessions it does not cover have to be somewhere.
+pub fn unassigned_sidebar_items<'a>(
+    sessions: &'a [UnclaimedSession],
+    scope: SpaceId,
+) -> Vec<SidebarItem<'a>> {
+    if sessions.is_empty() {
+        return Vec::new();
     }
+    let mut items = vec![SidebarItem {
+        id: "unassigned",
+        text: "Unassigned",
+        number: None,
+        indent: 0,
+        tree: None,
+        selectable: false,
+        session_id: None,
+        scope,
+        reorder_anchor: None,
+        color: Color32::WHITE,
+        dim_color: Color32::GRAY,
+        kind: "group",
+        active: false,
+        current: false,
+        can_return_to_last_session: false,
+        context_position: None,
+        icon: Some("circle-dashed"),
+        primitives: &[],
+        extension_action: None,
+    }];
+    items.extend(sessions.iter().map(|session| SidebarItem {
+        id: &session.session_id,
+        text: &session.name,
+        number: None,
+        indent: 2,
+        tree: None,
+        selectable: true,
+        session_id: Some(&session.session_id),
+        scope,
+        reorder_anchor: None,
+        color: Color32::WHITE,
+        dim_color: Color32::GRAY,
+        kind: crate::ui::chrome::UNASSIGNED_KIND,
+        active: false,
+        current: false,
+        can_return_to_last_session: false,
+        context_position: None,
+        icon: Some("terminal"),
+        primitives: &[],
+        extension_action: None,
+    }));
     items
 }
 
@@ -91,7 +118,7 @@ pub fn sidebar_session_colors<'a, T: AsRef<str>>(
 
 pub fn build_sidebar_items_from_published_items<'a>(
     items: &'a [PublishedSurfaceItem],
-    scope: MuxScope,
+    scope: SpaceId,
     selected_session: Option<&str>,
     can_return_to_last_session: bool,
 ) -> Vec<SidebarItem<'a>> {
@@ -129,7 +156,7 @@ pub fn build_sidebar_items_from_published_items<'a>(
 fn sidebar_item_from_module_item<'a>(
     item: &'a ModuleItem,
     extension_action: Option<ExtensionUiAction>,
-    scope: MuxScope,
+    scope: SpaceId,
     selected_session: Option<&str>,
     can_return_to_last_session: bool,
 ) -> Option<SidebarItem<'a>> {
@@ -178,122 +205,13 @@ fn sidebar_item_from_module_item<'a>(
     })
 }
 
-fn build_sidebar_items_inner<'a>(binding: &'a BindingSessionGroup) -> Vec<SidebarItem<'a>> {
-    let sessions = &binding.sessions;
-    let scope = binding.scope;
-    let mut group_meta = GroupMeta::new(
-        sessions,
-        sessions.iter().map(|session| binding.display_name(session)),
-    );
-    let group_count = group_meta.groups.len();
-    let full_capacity = sessions.len().saturating_mul(2);
-    let mut items = Vec::with_capacity(full_capacity);
-    let mut last_group = "";
-
-    for (index, session) in sessions.iter().enumerate() {
-        let (group_index, group_info) = group_meta.session(index);
-        // Labels come from the name bootty shows; anchors and ids stay on the backend's.
-        let display_name = binding.display_name(session);
-        let group = group_info.name;
-        let group_total = if group.is_empty() {
-            0
-        } else {
-            group_info.count
-        };
-        let is_grouped = group_total > 1;
-        let is_last_in_group =
-            is_grouped && group_meta.session_groups.get(index + 1).copied() != Some(group_index);
-        let session_tree = if !is_grouped {
-            None
-        } else if is_last_in_group {
-            Some("last")
-        } else {
-            Some("middle")
-        };
-
-        let (color, dim_color) =
-            computed_color(group_index, group_count, group_info.position, group_total);
-        let selected = binding.session_is_current(session);
-        let reorder_anchor = if is_grouped {
-            group_info.leader_session
-        } else {
-            session.name.as_str()
-        };
-        let (text, number, indent) = if is_grouped {
-            if group != last_group {
-                items.push(SidebarItem {
-                    id: group,
-                    text: group,
-                    number: None,
-                    indent: 0,
-                    tree: None,
-                    selectable: false,
-                    session_id: None,
-                    scope,
-                    reorder_anchor: Some(reorder_anchor),
-                    color,
-                    dim_color,
-                    kind: "group",
-                    active: false,
-                    current: false,
-                    can_return_to_last_session: false,
-                    context_position: None,
-                    icon: None,
-                    primitives: &[],
-                    extension_action: None,
-                });
-            }
-            let suffix = session_suffix(display_name);
-            let label = if suffix.is_empty() { group } else { suffix };
-            (label, Some(index + 1), 2)
-        } else {
-            let label = if group.is_empty() {
-                display_name
-            } else {
-                group
-            };
-            (label, Some(index + 1), 0)
-        };
-
-        items.push(SidebarItem {
-            id: session.id.as_str(),
-            text,
-            number,
-            indent,
-            tree: session_tree,
-            selectable: true,
-            session_id: Some(session.id.as_str()),
-            scope,
-            reorder_anchor: Some(reorder_anchor),
-            color,
-            dim_color,
-            kind: "session",
-            active: selected,
-            current: selected,
-            can_return_to_last_session: binding.can_return_to_last_session,
-            context_position: Some((index, sessions.len())),
-            icon: None,
-            primitives: &[],
-            extension_action: None,
-        });
-        last_group = group;
-    }
-
-    items
-}
-
 pub fn session_group(name: &str) -> &str {
     name.split_once('/').map_or(name, |(group, _)| group)
-}
-
-pub fn session_suffix(name: &str) -> &str {
-    name.split_once('/').map_or("", |(_, suffix)| suffix)
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Group<'a> {
     name: &'a str,
-    leader_session: &'a str,
     count: usize,
     position: usize,
 }
@@ -306,8 +224,7 @@ struct GroupMeta<'a> {
 impl<'a> GroupMeta<'a> {
     /// Groups sessions by the name bootty shows, so a backend-only uniqueness suffix cannot split a
     /// project into two groups. `display_names` pairs with `sessions` by position and may be short,
-    /// in which case the backend name stands in. `leader_session` stays a backend name: it is the
-    /// reorder anchor, an identity rather than a label.
+    /// in which case the backend name stands in.
     fn new(
         display_sessions: &'a [MuxSession],
         mut display_names: impl Iterator<Item = &'a str>,
@@ -326,7 +243,6 @@ impl<'a> GroupMeta<'a> {
             let index = groups.len();
             groups.push(Group {
                 name: group,
-                leader_session: session.name.as_str(),
                 count: 1,
                 position: 0,
             });

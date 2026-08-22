@@ -139,6 +139,9 @@ command_catalog! {
     DitchSession:
         "Ditch Session", "Close the session and optionally remove its worktree",
         "ditch_session", "trash-2", shown, Destructive, Session, None;
+    MoveSessionToSpace:
+        "Move Session to Space", "Hand the current session to another space, or to no space",
+        "move_session_to_space", "shapes", shown, Write, Session, None;
     CreateSpace:
         "New Space", "Create and activate a new space",
         "create_space", "plus", shown, Write, ApplicationWindow, None;

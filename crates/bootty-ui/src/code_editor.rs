@@ -180,7 +180,8 @@ fn code_text_edit(
     output
 }
 
-fn dialect_syntax(keywords: &[&str]) -> Syntax {
+/// The base syntax with a dialect's extra keywords folded in.
+pub fn dialect_syntax(keywords: &[&str]) -> Syntax {
     let mut syntax = Syntax::lua();
     syntax
         .patch
@@ -202,7 +203,8 @@ fn take_comment_shortcut(events: &mut Vec<egui::Event>) -> bool {
 }
 
 /// `Cmd+/` — matched on the logical key (which a layout may report as `?`) or on the physical slash.
-fn is_comment_shortcut(event: &egui::Event) -> bool {
+/// Whether an event is the comment-toggle shortcut, by logical key or physical slash.
+pub fn is_comment_shortcut(event: &egui::Event) -> bool {
     matches!(
         event,
         egui::Event::Key {
@@ -220,7 +222,8 @@ fn is_comment_shortcut(event: &egui::Event) -> bool {
 
 /// Comment or uncomment every line the cursor or selection touches, preserving indentation. The
 /// block is uncommented only when all of its non-blank lines are already comments.
-fn toggle_comments_in(
+/// Comments or uncomments the lines the cursor or selection covers, returning the new range.
+pub fn toggle_comments_in(
     source: &mut String,
     range: egui::text::CCursorRange,
 ) -> egui::text::CCursorRange {
@@ -305,73 +308,11 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
 }
 
 /// One number per line the source actually has, so the gutter never numbers past the text.
-fn line_numbers(source: &str) -> String {
+/// The gutter text for `source`: one number per line the editor can put a cursor on.
+pub fn line_numbers(source: &str) -> String {
     let lines = source.lines().count() + usize::from(source.ends_with('\n'));
     (1..=lines.max(1))
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gutter_numbers_only_existing_source_lines() {
-        assert_eq!(line_numbers("first\nsecond"), "1\n2");
-        assert_eq!(line_numbers("first\n"), "1\n2");
-    }
-
-    #[test]
-    fn dialect_keywords_join_the_base_syntax() {
-        let syntax = dialect_syntax(&["continue", "export", "type"]);
-        assert!(syntax.is_keyword("continue"));
-        assert!(syntax.is_keyword("export"));
-        assert!(syntax.is_keyword("type"));
-        assert!(syntax.is_keyword("local"));
-    }
-
-    #[test]
-    fn comment_shortcut_accepts_logical_questionmark_and_physical_slash() {
-        let event = egui::Event::Key {
-            key: egui::Key::Questionmark,
-            physical_key: Some(egui::Key::Slash),
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::COMMAND,
-        };
-
-        assert!(is_comment_shortcut(&event));
-    }
-
-    #[test]
-    fn comment_toggle_handles_the_current_line() {
-        let mut source = "local value = 1".to_owned();
-        let cursor = egui::text::CCursorRange::one(egui::text::CCursor::new(6));
-
-        let cursor = toggle_comments_in(&mut source, cursor);
-        assert_eq!(source, "-- local value = 1");
-        assert_eq!(usize::from(cursor.primary.index), 9);
-
-        let cursor = toggle_comments_in(&mut source, cursor);
-        assert_eq!(source, "local value = 1");
-        assert_eq!(usize::from(cursor.primary.index), 6);
-    }
-
-    #[test]
-    fn comment_toggle_handles_selected_lines() {
-        let original = "  local a\n  local b\nnext";
-        let mut source = original.to_owned();
-        let selection = egui::text::CCursorRange::two(
-            egui::text::CCursor::new(0),
-            egui::text::CCursor::new(19),
-        );
-
-        let selection = toggle_comments_in(&mut source, selection);
-        assert_eq!(source, "  -- local a\n  -- local b\nnext");
-
-        toggle_comments_in(&mut source, selection);
-        assert_eq!(source, original);
-    }
 }

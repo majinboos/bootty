@@ -671,3 +671,69 @@ bootty.integration.register({{
         "uninstall takes back only ours"
     );
 }
+
+/// Grouping is the `sessions` module's job: a project holding more than one session gets a header
+/// row, its members indent under it, and the last one closes the tree. The preview facts hold
+/// `work/api` and `work/web`, which is exactly that shape.
+#[test]
+fn the_sessions_module_groups_a_project_and_closes_its_tree() {
+    let surfaces = preview_builtin_surfaces("sessions", Vec::new()).expect("the preview runs");
+    let sessions = surfaces
+        .iter()
+        .find(|surface| surface.declaration.id == "sessions")
+        .expect("the built-in declares its own surface");
+    let rows = sessions
+        .items
+        .iter()
+        .filter(|item| matches!(item.kind.as_deref(), Some("group" | "session")))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        rows.iter()
+            .map(|item| (item.text.as_str(), item.tree.as_deref(), item.indent))
+            .collect::<Vec<_>>(),
+        [
+            ("work", Some("none"), Some(0)),
+            ("api", Some("middle"), Some(2)),
+            ("web", Some("last"), Some(2)),
+        ],
+        "one header, then its members indented under it"
+    );
+    assert_eq!(
+        rows[1].reorder_anchor.as_deref(),
+        rows[0].reorder_anchor.as_deref(),
+        "the header drags the whole group, so it shares the first session's anchor"
+    );
+    assert_eq!(rows[1].number, Some(1));
+    assert_eq!(rows[2].number, Some(2));
+}
+
+/// Every agent bootty ships needs an adapter installed in the tool it reports from, so every agent
+/// module has to declare one. A module whose declaration never registers offers the user no way to
+/// install it at all, which is indistinguishable from the agent not working.
+#[test]
+fn every_builtin_agent_module_declares_an_installable_integration() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let root = config.path().join("extensions");
+    fs::create_dir_all(&root).expect("create the extension root");
+    let (sender, _receiver) = app_command_channel(4, std::sync::Arc::new(|| {}));
+    let host = ExtensionHost::load(
+        &root,
+        std::sync::Arc::new(ExtensionCatalog::default()),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+    let sources = host.module_sources();
+    let declared = sources
+        .integrations
+        .iter()
+        .map(|integration| integration.declaration.module.as_str())
+        .collect::<Vec<_>>();
+
+    for module in ["agents.claude", "agents.codex", "agents.pi"] {
+        assert!(
+            declared.contains(&module),
+            "{module} declares no integration; declared: {declared:?}"
+        );
+    }
+}

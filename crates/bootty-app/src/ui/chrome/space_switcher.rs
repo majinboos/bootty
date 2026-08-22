@@ -4,19 +4,27 @@ use bootty_mux::controller::SpaceId;
 use bootty_ui::{ThemePalette, icons::paint_icon_slug};
 use eframe::egui::{self, Pos2, Rect};
 
+use crate::ui::session_navigation::ScopedSessionTarget;
 use crate::workspace_runtime::SpaceSummary;
+
+use super::sidebar_panel::{end_session_drag, session_drag};
 
 pub(crate) const SPACE_SWITCHER_HEIGHT: f32 = 44.0;
 const SPACE_SWITCHER_BUTTON_SIZE: f32 = 28.0;
 const SPACE_SWITCHER_BUTTON_GAP: f32 = 4.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpaceSwitcherEvent {
     Activate(SpaceId),
     Create,
     Edit(SpaceId),
     Reconnect(SpaceId),
     Close(SpaceId),
+    /// Sessions dragged out of the sidebar and dropped on a Space icon.
+    MoveSessions {
+        sessions: Vec<ScopedSessionTarget>,
+        to: SpaceId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -163,9 +171,36 @@ pub fn show_space_switcher(
             egui::vec2(SPACE_SWITCHER_BUTTON_SIZE, SPACE_SWITCHER_BUTTON_SIZE),
         )
     };
+    // A session dragged out of the sidebar drops here, so the strip hit-tests the pointer itself:
+    // egui withholds hover from a widget while another one is being dragged.
+    let drag = session_drag(ui.ctx());
+    let pointer = ui.input(|input| input.pointer.latest_pos());
+    let released = ui.input(|input| !input.pointer.primary_down());
+
     let mut event = None;
     for (index, space) in spaces.iter().enumerate() {
         let item_rect = button_rect(index);
+        if let Some(drag) = &drag
+            && pointer.is_some_and(|pos| item_rect.contains(pos))
+        {
+            if space.accepts_moves {
+                painter.rect_filled(item_rect, 6.0, hover_color);
+                painter.rect_stroke(
+                    item_rect,
+                    6.0,
+                    egui::Stroke::new(1.0, palette.primary),
+                    egui::StrokeKind::Inside,
+                );
+                if released {
+                    event = Some(SpaceSwitcherEvent::MoveSessions {
+                        sessions: drag.sessions.clone(),
+                        to: space.id,
+                    });
+                }
+            } else {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::NotAllowed);
+            }
+        }
         let response = ui
             .interact(
                 item_rect,
@@ -228,6 +263,11 @@ pub fn show_space_switcher(
     paint_icon_slug(&painter, "plus", plus_rect.center(), 16.0, palette.subtext);
     if event.is_none() && response.clicked_by(egui::PointerButton::Primary) {
         event = Some(SpaceSwitcherEvent::Create);
+    }
+    // The sidebar hands a drag that left through its bottom edge over to this strip, so ending it
+    // is this strip's job whether or not it landed on a Space.
+    if drag.is_some() && released {
+        end_session_drag(ui.ctx());
     }
     event
 }

@@ -422,22 +422,18 @@ impl ChromeView<'_> {
                 .map(|space| (space.color, space.tint_sidebar))
                 .unwrap_or((DEFAULT_SPACE_COLOR, false));
             let space_transition = self.state.space_transition(std::time::Instant::now());
-            let binding_groups =
-                (self.state.binding_count() > 1).then(|| self.state.binding_session_groups());
-            let sidebar_items = if let Some(groups) = &binding_groups {
-                crate::ui::sidebar::build_binding_sidebar_items(groups)
-            } else {
-                crate::ui::sidebar::build_sidebar_items_from_published_items(
-                    &sidebar_module_items,
-                    self.state.mux_scope(),
-                    self.state.mux().selected_session(),
-                    self.state.mux().previous_selected_session().is_some(),
-                )
-            };
-            let session_count = binding_groups.as_ref().map_or_else(
-                || self.state.mux().sessions().len(),
-                |groups| groups.iter().map(|group| group.sessions.len()).sum(),
+            let unclaimed = self.state.unclaimed_sessions();
+            let mut sidebar_items = crate::ui::sidebar::build_sidebar_items_from_published_items(
+                &sidebar_module_items,
+                self.state.mux_scope(),
+                self.state.mux().selected_session(),
+                self.state.mux().previous_selected_session().is_some(),
             );
+            sidebar_items.extend(crate::ui::sidebar::unassigned_sidebar_items(
+                &unclaimed,
+                self.state.mux_scope(),
+            ));
+            let session_count = self.state.mux().sessions().len();
             ui.scope_builder(
                 UiBuilder::new()
                     .max_rect(sidebar_rect)
@@ -478,12 +474,6 @@ impl ChromeView<'_> {
                         &space_items,
                         &mut self.chrome.sidebar_space_swipe,
                     );
-                    // The move menu lists Spaces for whichever row the pointer is over.
-                    let move_targets = self
-                        .state
-                        .sidebar_hovered_session()
-                        .map(|target| self.state.session_move_targets(target))
-                        .unwrap_or_default();
                     let title_icon = title_visible.then(|| {
                         chrome::load_app_icon_texture(ui.ctx(), &mut self.chrome.app_icon_texture)
                     });
@@ -504,7 +494,6 @@ impl ChromeView<'_> {
                             separator_visible: false,
                             focused: self.state.sidebar_focused(),
                             hovered_session: self.state.sidebar_hovered_session(),
-                            move_targets: &move_targets,
                             fullscreen: fullscreen_chrome,
                             hover_override: sidebar_cfg.hover.map(crate::theme::config_color32),
                             current_override: sidebar_cfg

@@ -104,13 +104,19 @@ pub(super) fn load(config_path: &Path, database_path: &Path) -> Result<ImportPla
         "workspace_spaces",
         &["id", "remote_id", "name", "position"],
     )?;
-    required_table_columns(
-        &transaction,
-        "workspace_bindings",
-        &["id", "space_id", "backend", "remote"],
-    )?;
     let spaces = load_spaces(&transaction)?;
-    let bindings = load_bindings(&transaction, &spaces, &config)?;
+    // Revision 5 folded each Space's connection into the Space itself, so the Space row is the
+    // binding and its id stands in for the binding id everything downstream keys on.
+    let bindings = if table_exists(&transaction, "workspace_bindings")? {
+        required_table_columns(
+            &transaction,
+            "workspace_bindings",
+            &["id", "space_id", "backend", "remote"],
+        )?;
+        load_bindings(&transaction, &spaces, &config)?
+    } else {
+        load_folded_bindings(&transaction, &spaces, &config)?
+    };
     let binding_ids = bindings
         .iter()
         .map(|binding| binding.id)
@@ -191,16 +197,7 @@ fn load_bindings(
     spaces: &[LegacySpace],
     config: &BoottyConfig,
 ) -> Result<Vec<LegacyBinding>> {
-    let space_ids = spaces
-        .iter()
-        .filter(|space| {
-            space
-                .remote_id
-                .as_deref()
-                .is_some_and(|remote_id| !remote_id.is_empty())
-        })
-        .map(|space| space.database_id)
-        .collect::<HashSet<_>>();
+    let space_ids = remote_space_ids(spaces);
     if space_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -240,6 +237,58 @@ fn load_bindings(
         });
     }
     Ok(bindings)
+}
+
+/// The connections of a revision 5 database, where each Space holds its own.
+fn load_folded_bindings(
+    transaction: &Transaction<'_>,
+    spaces: &[LegacySpace],
+    config: &BoottyConfig,
+) -> Result<Vec<LegacyBinding>> {
+    required_table_columns(transaction, "workspace_spaces", &["backend", "remote"])?;
+    let space_ids = remote_space_ids(spaces);
+    if space_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut statement = transaction.prepare(
+        "SELECT id, backend, remote
+         FROM workspace_spaces
+         WHERE remote_id IS NOT NULL AND remote_id != ''
+         ORDER BY id",
+    )?;
+    let mut bindings = Vec::new();
+    for row in statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })? {
+        let (space_id, backend, remote) = row?;
+        if !space_ids.contains(&space_id) {
+            bail!("legacy workspace Space has an invalid connection")
+        }
+        bindings.push(LegacyBinding {
+            id: space_id,
+            space_id,
+            backend: parse_stored_backend(&backend, space_id)?,
+            local: decode_local_placement(remote.as_deref(), config, space_id)?,
+        });
+    }
+    Ok(bindings)
+}
+
+fn remote_space_ids(spaces: &[LegacySpace]) -> HashSet<i64> {
+    spaces
+        .iter()
+        .filter(|space| {
+            space
+                .remote_id
+                .as_deref()
+                .is_some_and(|remote_id| !remote_id.is_empty())
+        })
+        .map(|space| space.database_id)
+        .collect()
 }
 
 fn decode_local_placement(
@@ -292,6 +341,12 @@ fn load_sessions(
     if binding_ids.is_empty() || !table_exists(transaction, "workspace_sessions")? {
         return Ok(HashMap::new());
     }
+    // Revision 4 keys sessions by identity and keeps one flat order, with no groups table.
+    // Revision 5 keys them by Space, which is the same id by then.
+    let columns = table_columns(transaction, "workspace_sessions")?;
+    if columns.contains("backend_name") {
+        return load_identity_sessions(transaction, binding_ids, columns.contains("space_id"));
+    }
     let columns = required_table_columns(
         transaction,
         "workspace_sessions",
@@ -306,6 +361,53 @@ fn load_sessions(
     } else {
         load_ungrouped_sessions(transaction, binding_ids)
     }
+}
+
+fn load_identity_sessions(
+    transaction: &Transaction<'_>,
+    binding_ids: &HashSet<i64>,
+    keyed_by_space: bool,
+) -> Result<HashMap<i64, Vec<String>>> {
+    let key = if keyed_by_space {
+        "space_id"
+    } else {
+        "binding_id"
+    };
+    required_table_columns(
+        transaction,
+        "workspace_sessions",
+        &[key, "backend_name", "position"],
+    )?;
+    let owned = if keyed_by_space {
+        String::from(
+            "SELECT id FROM workspace_spaces WHERE remote_id IS NOT NULL AND remote_id != ''",
+        )
+    } else {
+        String::from(
+            "SELECT id FROM workspace_bindings
+             WHERE space_id IN (
+                 SELECT id FROM workspace_spaces
+                 WHERE remote_id IS NOT NULL AND remote_id != ''
+             )",
+        )
+    };
+    let mut sessions: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut statement = transaction.prepare(&format!(
+        "SELECT {key}, backend_name
+         FROM workspace_sessions
+         WHERE {key} IN ({owned})
+         ORDER BY {key}, position",
+    ))?;
+    for row in statement.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let (binding_id, name) = row?;
+        if name.is_empty() || name.contains('\0') || !binding_ids.contains(&binding_id) {
+            bail!("legacy workspace session has an invalid row")
+        }
+        sessions.entry(binding_id).or_default().push(name);
+    }
+    Ok(sessions)
 }
 
 fn load_grouped_sessions(

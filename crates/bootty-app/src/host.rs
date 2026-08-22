@@ -317,6 +317,7 @@ impl BoottyApp {
             DismissKeybindHelp,
             CommandPalette(crate::ui::command_palette::CommandPaletteEvent),
             ThemePicker(crate::ui::theme_picker::ThemePickerEvent),
+            SpacePicker(crate::ui::space_picker::SpacePickerEvent),
         }
 
         let outcome = match self.state.modal_dialog_mut() {
@@ -352,6 +353,9 @@ impl BoottyApp {
             Some(ModalDialog::ThemePicker(dialog)) => dialog
                 .show(ctx, theme)
                 .map_or(Outcome::None, Outcome::ThemePicker),
+            Some(ModalDialog::SpacePicker(dialog)) => dialog
+                .show(ctx, theme)
+                .map_or(Outcome::None, Outcome::SpacePicker),
         };
 
         match outcome {
@@ -363,6 +367,7 @@ impl BoottyApp {
             Outcome::RenameTab(event) => self.state.apply_rename_tab_event(event),
             Outcome::Ditch(event) => self.state.apply_ditch_session_event(event),
             Outcome::DismissKeybindHelp => self.state.dismiss_keybind_help(),
+            Outcome::SpacePicker(event) => self.state.apply_space_picker_event(event),
             Outcome::CommandPalette(event) => {
                 let run = matches!(
                     event,

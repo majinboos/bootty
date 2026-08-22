@@ -24,17 +24,13 @@ use crate::sessions::{SessionMembership, WorkspaceSession};
 
 use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig, default_config_path};
 pub use bootty_mux::membership::BackendMembership;
-use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
-    membership::MembershipOperation,
-};
+use bootty_mux::{controller::SpaceId, membership::MembershipOperation};
 
-const WORKSPACE_SNAPSHOT_REVISION: i64 = 4;
+const WORKSPACE_SNAPSHOT_REVISION: i64 = 5;
 const DEFAULT_SPACE_NAME: &str = "Default Space";
 pub const DEFAULT_SPACE_ICON: &str = "folder";
 pub const DEFAULT_SPACE_COLOR: [u8; 3] = [0x7A, 0xA2, 0xF7];
 const DEFAULT_TINT_SIDEBAR: bool = false;
-const DEFAULT_BINDING_NAME: &str = "Default Binding";
 
 /// The one error surface for workspace persistence.
 ///
@@ -160,8 +156,7 @@ pub enum SpaceRemoteOverride {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceBinding {
-    scope: MuxScope,
-    name: String,
+    scope: SpaceId,
     backend_override: Option<MultiplexerBackendConfig>,
     remote_override: SpaceRemoteOverride,
     hide_tmux_status: bool,
@@ -171,10 +166,6 @@ pub struct WorkspaceBinding {
 }
 
 impl WorkspaceBinding {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     pub fn backend_override(&self) -> Option<MultiplexerBackendConfig> {
         self.backend_override
     }
@@ -187,7 +178,7 @@ impl WorkspaceBinding {
         self.hide_tmux_status
     }
 
-    pub fn mux_scope(&self) -> MuxScope {
+    pub fn mux_scope(&self) -> SpaceId {
         self.scope
     }
 
@@ -228,14 +219,14 @@ pub struct WorkspaceSpace {
     color: [u8; 3],
     tint_sidebar: bool,
     position: i64,
-    bindings: Vec<WorkspaceBinding>,
+    binding: WorkspaceBinding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceSnapshot {
     spaces: Vec<WorkspaceSpace>,
     selected_spaces: HashMap<String, SpaceId>,
-    pending_binding_scopes: HashSet<MuxScope>,
+    pending_binding_scopes: HashSet<SpaceId>,
 }
 
 impl WorkspaceSnapshot {
@@ -247,7 +238,7 @@ impl WorkspaceSnapshot {
         self.selected_spaces.get(window_key).copied()
     }
 
-    pub fn has_pending_binding_operation(&self, scope: MuxScope) -> bool {
+    pub fn has_pending_binding_operation(&self, scope: SpaceId) -> bool {
         self.pending_binding_scopes.contains(&scope)
     }
 }
@@ -281,8 +272,9 @@ impl WorkspaceSpace {
         self.position
     }
 
-    pub fn bindings(&self) -> &[WorkspaceBinding] {
-        &self.bindings
+    /// The Space's connection to a multiplexer. There is exactly one.
+    pub fn binding(&self) -> &WorkspaceBinding {
+        &self.binding
     }
 }
 
@@ -347,30 +339,23 @@ impl WorkspaceRepository {
             |row| row.get(0),
         )?;
         tx.execute(
-            "INSERT INTO workspace_spaces (remote_id, name, icon, color, tint_sidebar, position)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO workspace_spaces
+                (remote_id, name, icon, color, tint_sidebar, position,
+                 backend, hide_tmux_status, remote)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 remote_id,
                 name,
                 icon,
                 color_to_hex(color),
                 i64::from(tint_sidebar),
-                position
-            ],
-        )?;
-        let space_id = tx.last_insert_rowid();
-        tx.execute(
-            "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status, remote)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                space_id,
-                DEFAULT_BINDING_NAME,
+                position,
                 backend_to_storage(mux.backend),
                 i64::from(hide_tmux_status),
                 remote,
             ],
         )?;
-        let binding_id = tx.last_insert_rowid();
+        let space_id = tx.last_insert_rowid();
         tx.commit()?;
 
         let space = WorkspaceSpace {
@@ -381,39 +366,35 @@ impl WorkspaceRepository {
             color,
             tint_sidebar,
             position,
-            bindings: vec![WorkspaceBinding {
-                scope: MuxScope::new(
-                    SpaceId::from_persistence(space_id),
-                    BindingId::from_persistence(binding_id),
-                ),
-                name: DEFAULT_BINDING_NAME.to_owned(),
+            binding: WorkspaceBinding {
+                scope: SpaceId::from_persistence(space_id),
                 backend_override: mux.backend,
                 remote_override: mux.remote,
                 hide_tmux_status,
                 unavailable: false,
                 selection: None,
                 sessions: SessionMembership::default(),
-            }],
+            },
         };
         Ok(Some(space))
     }
 
-    pub fn update_space_and_binding(
+    pub fn update_space(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         name: &str,
         icon: &str,
         color: [u8; 3],
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
     ) -> WorkspaceResult<bool> {
-        self.update_space_and_binding_db(scope, name, icon, color, tint_sidebar, mux)
+        self.update_space_db(scope, name, icon, color, tint_sidebar, mux)
             .map_err(|error| self.database_error("update space", error))
     }
 
-    fn update_space_and_binding_db(
+    fn update_space_db(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         name: &str,
         icon: &str,
         color: [u8; 3],
@@ -429,39 +410,22 @@ impl WorkspaceRepository {
         let color = color_to_hex(color);
         let backend = backend_to_storage(mux.backend);
         let remote = remote_to_storage(&mux.remote)?;
-        let mut conn = open_db(&self.path)?;
-        let tx = conn.transaction()?;
-        if tx.execute(
+        let conn = open_db(&self.path)?;
+        let updated = conn.execute(
             "UPDATE workspace_spaces
-             SET name = ?1, icon = ?2, color = ?3, tint_sidebar = ?4
-             WHERE id = ?5",
+             SET name = ?1, icon = ?2, color = ?3, tint_sidebar = ?4, backend = ?5, remote = ?6
+             WHERE id = ?7",
             params![
                 name,
                 icon,
                 color,
                 i64::from(tint_sidebar),
-                scope.space_id().persistence_value()
-            ],
-        )? == 0
-        {
-            return Ok(false);
-        }
-        if tx.execute(
-            "UPDATE workspace_bindings
-             SET backend = ?1, remote = ?2
-             WHERE id = ?3 AND space_id = ?4",
-            params![
                 backend,
                 remote,
-                scope.binding_id().persistence_value(),
-                scope.space_id().persistence_value()
+                scope.persistence_value()
             ],
-        )? == 0
-        {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-        tx.commit()?;
-        Ok(true)
+        )?;
+        Ok(updated != 0)
     }
 
     pub fn delete_space(&mut self, id: SpaceId) -> WorkspaceResult<bool> {
@@ -506,7 +470,7 @@ impl WorkspaceRepository {
 
     pub fn set_binding_restore_state(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         unavailable: bool,
         session_id: Option<&str>,
         window_id: Option<&str>,
@@ -516,24 +480,22 @@ impl WorkspaceRepository {
         })?;
         let changed = conn
             .execute(
-                "UPDATE workspace_bindings
+                "UPDATE workspace_spaces
              SET unavailable = ?1, selected_session_id = ?2, selected_window_id = ?3
-             WHERE id = ?4 AND space_id = ?5",
+             WHERE id = ?4",
                 params![
                     i64::from(unavailable),
                     session_id,
                     window_id,
-                    scope.binding_id().persistence_value(),
-                    scope.space_id().persistence_value(),
+                    scope.persistence_value(),
                 ],
             )
             .map_err(|error| self.database_error("save binding restore state", error))?
             != 0;
         if !changed {
             return Err(WorkspacePersistenceError::new(format!(
-                "save binding restore state: binding {} does not belong to Space {}",
-                scope.binding_id().persistence_value(),
-                scope.space_id().persistence_value()
+                "save binding restore state: Space {} is gone",
+                scope.persistence_value()
             )));
         }
         Ok(())
@@ -541,7 +503,7 @@ impl WorkspaceRepository {
 
     pub fn commit_binding_state(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         sessions: &SessionMembership,
     ) -> WorkspaceResult<()> {
         self.commit_binding_states(&[(scope, sessions.clone())])
@@ -555,7 +517,7 @@ impl WorkspaceRepository {
     /// it cannot observe anyway.
     pub fn begin_binding_membership_mutation(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         mutation: &BindingMembershipMutation,
     ) -> WorkspaceResult<()> {
         validate_binding_membership_mutation(mutation)?;
@@ -569,12 +531,11 @@ impl WorkspaceRepository {
         let stored = binding_membership_mutation_to_storage(mutation);
         tx.execute(
             "INSERT INTO workspace_pending_binding_operations
-                (space_id, binding_id, operation, identity, old_name, new_name,
+                (space_id, operation, identity, old_name, new_name,
                  display_name, explicit, cwd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(identity) DO UPDATE SET
                 space_id = excluded.space_id,
-                binding_id = excluded.binding_id,
                 operation = excluded.operation,
                 old_name = excluded.old_name,
                 new_name = excluded.new_name,
@@ -582,8 +543,7 @@ impl WorkspaceRepository {
                 explicit = excluded.explicit,
                 cwd = excluded.cwd",
             params![
-                scope.space_id().persistence_value(),
-                scope.binding_id().persistence_value(),
+                scope.persistence_value(),
                 stored.operation,
                 stored.identity,
                 stored.old_name,
@@ -601,7 +561,7 @@ impl WorkspaceRepository {
 
     pub fn pending_binding_membership_mutations(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
     ) -> WorkspaceResult<Vec<PendingBindingMembershipMutation>> {
         let conn = open_db(&self.path).map_err(|error| {
             self.database_error("open database to read binding membership", error)
@@ -615,7 +575,7 @@ impl WorkspaceRepository {
     /// old stores and the pending intent available for the next remote catalog operation.
     pub fn commit_binding_membership_mutation(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         mutation: &BindingMembershipMutation,
         sessions: &mut SessionMembership,
     ) -> WorkspaceResult<()> {
@@ -644,7 +604,7 @@ impl WorkspaceRepository {
     /// when it does not. Either way the row goes.
     pub fn reconcile_binding_membership_mutations(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         memberships: &[BackendMembership],
         sessions: &mut SessionMembership,
     ) -> WorkspaceResult<bool> {
@@ -677,41 +637,34 @@ impl WorkspaceRepository {
         Ok(true)
     }
 
-    fn validate_binding_scope(&self, tx: &Transaction<'_>, scope: MuxScope) -> WorkspaceResult<()> {
-        let exists = binding_scope_exists(tx, scope)
-            .map_err(|error| self.database_error("validate binding membership scope", error))?;
-        if !exists {
-            return Err(WorkspacePersistenceError::new(format!(
-                "binding membership scope: binding {} does not belong to Space {}",
-                scope.binding_id().persistence_value(),
-                scope.space_id().persistence_value()
-            )));
-        }
-        Ok(())
+    fn validate_binding_scope(&self, tx: &Transaction<'_>, scope: SpaceId) -> WorkspaceResult<()> {
+        space_exists(tx, scope)
+            .map_err(|error| self.database_error("validate binding membership scope", error))?
+            .then_some(())
+            .ok_or_else(|| {
+                WorkspacePersistenceError::new(format!(
+                    "binding membership scope: Space {} is gone",
+                    scope.persistence_value()
+                ))
+            })
     }
 
     fn load_pending_binding_membership_mutations(
         &self,
         conn: &Connection,
-        scope: MuxScope,
+        scope: SpaceId,
     ) -> WorkspaceResult<Vec<PendingBindingMembershipMutation>> {
         let load = || -> rusqlite::Result<Vec<PendingBindingMembershipMutation>> {
             let mut statement = conn.prepare(
                 "SELECT operation, identity, old_name, new_name, display_name, explicit, cwd
                  FROM workspace_pending_binding_operations
-                 WHERE space_id = ?1 AND binding_id = ?2
+                 WHERE space_id = ?1
                  ORDER BY identity",
             )?;
-            let rows = statement.query_map(
-                params![
-                    scope.space_id().persistence_value(),
-                    scope.binding_id().persistence_value()
-                ],
-                |row| {
-                    binding_membership_mutation_from_row(row, 0)
-                        .map(|mutation| PendingBindingMembershipMutation { mutation })
-                },
-            )?;
+            let rows = statement.query_map(params![scope.persistence_value()], |row| {
+                binding_membership_mutation_from_row(row, 0)
+                    .map(|mutation| PendingBindingMembershipMutation { mutation })
+            })?;
             rows.collect()
         };
         load().map_err(|error| self.database_error("load binding membership journal", error))
@@ -720,7 +673,7 @@ impl WorkspaceRepository {
     fn require_pending_binding_membership_mutation(
         &self,
         tx: &Transaction<'_>,
-        scope: MuxScope,
+        scope: SpaceId,
         mutation: &BindingMembershipMutation,
     ) -> WorkspaceResult<()> {
         let pending = self.load_pending_binding_membership_mutations(tx, scope)?;
@@ -751,7 +704,7 @@ impl WorkspaceRepository {
     /// method succeeds.
     pub fn commit_binding_states(
         &mut self,
-        states: &[(MuxScope, SessionMembership)],
+        states: &[(SpaceId, SessionMembership)],
     ) -> WorkspaceResult<()> {
         if states.is_empty() {
             return Ok(());
@@ -771,14 +724,13 @@ impl WorkspaceRepository {
         Ok(())
     }
 
-    fn validate_binding_states(states: &[(MuxScope, SessionMembership)]) -> WorkspaceResult<()> {
+    fn validate_binding_states(states: &[(SpaceId, SessionMembership)]) -> WorkspaceResult<()> {
         let mut scopes = HashSet::new();
         for (scope, sessions) in states {
             if !scopes.insert(*scope) {
                 return Err(WorkspacePersistenceError::new(format!(
-                    "validate binding state: duplicate binding {} in Space {}",
-                    scope.binding_id().persistence_value(),
-                    scope.space_id().persistence_value()
+                    "validate binding state: Space {} is listed twice",
+                    scope.persistence_value()
                 )));
             }
 
@@ -807,33 +759,30 @@ impl WorkspaceRepository {
     fn write_binding_state(
         &self,
         tx: &Transaction<'_>,
-        scope: MuxScope,
+        scope: SpaceId,
         sessions: &SessionMembership,
     ) -> WorkspaceResult<()> {
-        let binding_exists = binding_scope_exists(tx, scope)
-            .map_err(|error| self.database_error("validate binding state scope", error))?;
-        if !binding_exists {
+        if !space_exists(tx, scope)
+            .map_err(|error| self.database_error("validate binding state scope", error))?
+        {
             return Err(WorkspacePersistenceError::new(format!(
-                "commit binding state: binding {} does not belong to Space {}",
-                scope.binding_id().persistence_value(),
-                scope.space_id().persistence_value()
+                "commit binding state: Space {} is gone",
+                scope.persistence_value()
             )));
         }
-
-        let binding_id = scope.binding_id().persistence_value();
         tx.execute(
-            "DELETE FROM workspace_sessions WHERE binding_id = ?1",
-            [binding_id],
+            "DELETE FROM workspace_sessions WHERE space_id = ?1",
+            [scope.persistence_value()],
         )
         .map_err(|error| self.database_error("replace persisted sessions", error))?;
         for (position, session) in sessions.sessions().iter().enumerate() {
             tx.execute(
                 "INSERT INTO workspace_sessions
-                    (identity, binding_id, backend_name, display_name, explicit, cwd, position)
+                    (identity, space_id, backend_name, display_name, explicit, cwd, position)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     session.identity,
-                    binding_id,
+                    scope.persistence_value(),
                     session.backend_name,
                     session.display_name,
                     i64::from(session.explicit),
@@ -888,11 +837,12 @@ impl WorkspaceRepository {
             let tx = conn.transaction()?;
             // Before the current schema is created, so revision 3's tables are still there to read.
             migrate_workspace_sessions_to_identities(&tx)?;
+            migrate_workspace_bindings_into_spaces(&tx)?;
+            migrate_workspace_journal(&tx)?;
             create_workspace_schema(&tx)?;
             migrate_workspace_space_icons(&tx)?;
             migrate_workspace_remote_ids(&tx)?;
             migrate_workspace_space_appearance(&tx)?;
-            migrate_workspace_snapshot_state(&tx)?;
             let space_count = tx.query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
                 row.get::<_, i64>(0)
             })?;
@@ -943,35 +893,33 @@ impl WorkspaceRepository {
 fn validate_pending_binding_operations(
     tx: &Transaction<'_>,
     spaces: &[WorkspaceSpace],
-) -> rusqlite::Result<HashSet<MuxScope>> {
+) -> rusqlite::Result<HashSet<SpaceId>> {
     let scopes = spaces
         .iter()
-        .flat_map(|space| space.bindings.iter().map(|binding| binding.scope))
+        .map(|space| space.binding.scope)
         .collect::<HashSet<_>>();
     let mut statement = tx.prepare(
-        "SELECT space_id, binding_id, operation, identity, old_name, new_name,
+        "SELECT space_id, operation, identity, old_name, new_name,
                 display_name, explicit, cwd
-         FROM workspace_pending_binding_operations ORDER BY space_id, binding_id",
+         FROM workspace_pending_binding_operations ORDER BY space_id, identity",
     )?;
     let mut pending_scopes = HashSet::new();
     for row in statement.query_map([], |row| {
         Ok((
             row.get::<_, i64>(0)?,
-            row.get::<_, i64>(1)?,
-            binding_membership_mutation_from_row(row, 2)?,
+            binding_membership_mutation_from_row(row, 1)?,
         ))
     })? {
-        let (space_id, binding_id, _mutation) = row?;
-        if space_id <= 0 || binding_id <= 0 {
+        let (space_id, _mutation) = row?;
+        if space_id <= 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let scope = MuxScope::new(
-            SpaceId::from_persistence(space_id),
-            BindingId::from_persistence(binding_id),
-        );
-        if !scopes.contains(&scope) || !pending_scopes.insert(scope) {
+        let scope = SpaceId::from_persistence(space_id);
+        // One Space can hold several intents now, so a repeat is expected rather than corrupt.
+        if !scopes.contains(&scope) {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        pending_scopes.insert(scope);
     }
     Ok(pending_scopes)
 }
@@ -1128,18 +1076,14 @@ fn binding_membership_mutation_from_row(
     .map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
-fn binding_scope_exists(tx: &Transaction<'_>, scope: MuxScope) -> rusqlite::Result<bool> {
+fn space_exists(tx: &Transaction<'_>, space: SpaceId) -> rusqlite::Result<bool> {
     tx.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM workspace_bindings
-             WHERE id = ?1 AND space_id = ?2
-         )",
-        params![
-            scope.binding_id().persistence_value(),
-            scope.space_id().persistence_value()
-        ],
-        |row| row.get(0),
+        "SELECT 1 FROM workspace_spaces WHERE id = ?1",
+        [space.persistence_value()],
+        |_| Ok(()),
     )
+    .optional()
+    .map(|found| found.is_some())
 }
 
 /// Apply a mutation whose backend effect is known to have happened. Keyed on the identity, so it
@@ -1212,35 +1156,22 @@ pub(crate) fn open_db(path: &Path) -> rusqlite::Result<Connection> {
 fn create_default_binding(tx: &Transaction<'_>, path: &Path) -> rusqlite::Result<WorkspaceBinding> {
     let remote_id = new_remote_space_id(tx)?;
     tx.execute(
-        "INSERT INTO workspace_spaces (remote_id, name, icon, color, tint_sidebar, position)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        "INSERT INTO workspace_spaces
+            (remote_id, name, icon, color, tint_sidebar, position, backend, hide_tmux_status)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 0)",
         params![
             remote_id,
             DEFAULT_SPACE_NAME,
             DEFAULT_SPACE_ICON,
             color_to_hex(DEFAULT_SPACE_COLOR),
-            i64::from(DEFAULT_TINT_SIDEBAR)
+            i64::from(DEFAULT_TINT_SIDEBAR),
+            backend_to_storage(None),
         ],
     )?;
     let space_id = tx.last_insert_rowid();
-    tx.execute(
-        "INSERT INTO workspace_bindings (space_id, name, backend, hide_tmux_status)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            space_id,
-            DEFAULT_BINDING_NAME,
-            backend_to_storage(None),
-            0_i64,
-        ],
-    )?;
-    let binding_id = tx.last_insert_rowid();
-    migrate_legacy_metadata(tx, binding_id, path)?;
+    migrate_legacy_metadata(tx, space_id, path)?;
     Ok(WorkspaceBinding {
-        scope: MuxScope::new(
-            SpaceId::from_persistence(space_id),
-            BindingId::from_persistence(binding_id),
-        ),
-        name: DEFAULT_BINDING_NAME.to_owned(),
+        scope: SpaceId::from_persistence(space_id),
         backend_override: None,
         remote_override: SpaceRemoteOverride::Inherit,
         hide_tmux_status: false,

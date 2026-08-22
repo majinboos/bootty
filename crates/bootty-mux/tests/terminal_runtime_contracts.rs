@@ -223,14 +223,14 @@ fn pane_interactions_reach_the_mux_runtime_boundary() -> Result<()> {
 }
 
 #[test]
-fn scoped_pane_ids_round_trip_without_cross_binding_collisions() {
+fn scoped_pane_ids_round_trip_without_cross_space_collisions() {
     use bootty_mux::{
-        controller::{BindingId, MuxScope, SpaceId},
+        controller::SpaceId,
         terminal::{decode_scoped_pane_id, encode_scoped_pane_id},
     };
 
-    let first = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
-    let second = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(3));
+    let first = SpaceId::from_persistence(1);
+    let second = SpaceId::from_persistence(2);
 
     let first_id = encode_scoped_pane_id(first, "%7");
     let second_id = encode_scoped_pane_id(second, "%7");

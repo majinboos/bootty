@@ -25,33 +25,13 @@ fn session_group(
 
 impl WorkspaceRuntime {
     pub(crate) fn active_binding_session_groups(&self) -> Vec<BindingSessionGroup> {
-        let mut bindings = self.active.bindings().collect::<Vec<_>>();
-        bindings.sort_by_key(|binding| binding.scope.binding_id().persistence_value());
-        bindings
-            .iter()
-            .map(|binding| {
-                let duplicate_label = bindings
-                    .iter()
-                    .filter(|candidate| candidate.label == binding.label)
-                    .count()
-                    > 1;
-                let label = if duplicate_label {
-                    format!(
-                        "{} / Binding {}",
-                        binding.label,
-                        binding.scope.binding_id().persistence_value()
-                    )
-                } else {
-                    binding.label.clone()
-                };
-                session_group(
-                    binding,
-                    label,
-                    binding.mux.sessions().to_vec(),
-                    binding.scope == self.active.binding.scope,
-                )
-            })
-            .collect()
+        let binding = &self.active.binding;
+        vec![session_group(
+            binding,
+            binding.label.clone(),
+            binding.mux.sessions().to_vec(),
+            true,
+        )]
     }
 
     pub(crate) fn session_finder_groups(&self) -> Vec<BindingSessionGroup> {
@@ -94,11 +74,7 @@ impl WorkspaceRuntime {
                 if sessions.is_empty() {
                     continue;
                 }
-                let label = if bindings.len() > 1 {
-                    format!("{space_name} / {}", binding.label)
-                } else {
-                    (*space_name).to_owned()
-                };
+                let label = (*space_name).to_owned();
                 groups.push(session_group(
                     binding,
                     label,

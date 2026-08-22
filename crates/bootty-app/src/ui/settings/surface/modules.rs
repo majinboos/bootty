@@ -5,7 +5,7 @@ use bootty_extension::{
     ModuleSourceRequest, ModuleSources, PublishedSurfaceSnapshot, SurfacePlacement,
     SurfaceSnapshot, preview_builtin_surfaces, preview_module_surfaces,
 };
-use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
+use bootty_mux::controller::SpaceId;
 use bootty_ui::code_editor::{CodeEditorSpec, code_editor};
 use bootty_ui::icons;
 use bootty_ui::status_layout::{Align, ResolvedItem, ResolvedSegment, status_bar_layout};
@@ -644,7 +644,8 @@ pub(super) fn new_module_ui(
 
 /// The identity a typed name asks for. A bare name gets the `.luau` every module file carries, so
 /// the field stays a name rather than a path.
-fn new_module_identity(value: &str) -> Result<ModuleIdentity, String> {
+/// The identity a typed module name resolves to, gaining the module extension if it lacks one.
+pub fn new_module_identity(value: &str) -> Result<ModuleIdentity, String> {
     let value = value.trim();
     let value = if std::path::Path::new(value).extension().is_some() {
         value.to_owned()
@@ -747,7 +748,8 @@ pub(super) fn module_selector_row(
 
 /// The draft's surfaces, drawn by the chrome that will draw them for real: a status strip for a
 /// status surface, and the sidebar for every other placement, which all render as a row list.
-fn module_preview(
+/// Paints a module's declared surfaces the way the host will.
+pub fn module_preview(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
     surfaces: &[SurfaceSnapshot],
@@ -833,7 +835,8 @@ fn in_sidebar_context(
 }
 
 /// The built-in module that draws the session rows every other sidebar module sits beside.
-const SESSIONS_MODULE: &str = "sessions";
+/// The built-in module the preview renders session rows from.
+pub const SESSIONS_MODULE: &str = "sessions";
 
 fn status_preview(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, surface: &SurfaceSnapshot) {
     let items = surface
@@ -891,7 +894,7 @@ fn sidebar_preview(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, surface:
     let (footer, body): (Vec<_>, Vec<_>) = published
         .items()
         .partition(|item| item.item.kind.as_deref() == Some("footer"));
-    let scope = MuxScope::new(SpaceId::from_persistence(0), BindingId::from_persistence(0));
+    let scope = SpaceId::from_persistence(0);
     let items = crate::ui::sidebar::build_sidebar_items_from_published_items(
         &body,
         scope,
@@ -915,7 +918,6 @@ fn sidebar_preview(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, surface:
                 palette,
                 size.y,
                 crate::ui::chrome::SidebarModel {
-                    move_targets: &[],
                     items: &items,
                     footer_items: &footer,
                     session_count,
@@ -1084,11 +1086,14 @@ fn flush_source(state: &mut EditorState, identity: &ModuleIdentity) {
 
 /// The file's terminating newline is hidden while editing — an editor should not open on a blank
 /// last line — and [`saved_source`] puts it back, so the file on disk keeps it.
-fn displayed_source(source: &str) -> String {
+/// The editor text for a module file: the newline every file ends with is the file's, not the
+/// user's, so it is not shown.
+pub fn displayed_source(source: &str) -> String {
     source.strip_suffix('\n').unwrap_or(source).to_owned()
 }
 
-fn saved_source(source: &str) -> String {
+/// The file bytes for editor text, restoring the terminating newline.
+pub fn saved_source(source: &str) -> String {
     format!("{}\n", source.strip_suffix('\n').unwrap_or(source))
 }
 
@@ -1113,163 +1118,5 @@ pub(super) fn scan_error_notice(
             palette.destructive,
             &format!("{identity} did not load: {error}"),
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn editor_hides_only_the_file_terminating_newline() {
-        assert_eq!(displayed_source("return {}\n"), "return {}");
-        assert_eq!(displayed_source("return {}\n\n"), "return {}\n");
-        assert_eq!(saved_source("return {}"), "return {}\n");
-        assert_eq!(saved_source("return {}\n"), "return {}\n");
-    }
-
-    #[test]
-    fn a_new_module_name_gains_the_module_extension() {
-        assert_eq!(
-            new_module_identity(" my_module ").map(|id| id.as_str().to_owned()),
-            Ok("my_module.luau".to_owned())
-        );
-        assert_eq!(
-            new_module_identity("nested/thing.luau").map(|id| id.as_str().to_owned()),
-            Ok("nested/thing.luau".to_owned())
-        );
-        assert!(new_module_identity("bad name!").is_err());
-    }
-
-    /// Every text run the preview painted, so a regression back to labelling items — which prints
-    /// an icon slug where the icon belongs — fails here.
-    fn preview_text(source: &str) -> Vec<String> {
-        let identity = ModuleIdentity::parse("preview.luau").expect("identity");
-        let surfaces =
-            preview_module_surfaces(&identity, source, Vec::new()).expect("preview surfaces");
-        let sessions = preview_builtin_surfaces(SESSIONS_MODULE, Vec::new()).expect("session rows");
-        let context = egui::Context::default();
-        bootty_ui::icons::install_icon_fonts(&context);
-        let output = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(900.0, 600.0),
-                )),
-                ..egui::RawInput::default()
-            },
-            |ui| {
-                module_preview(
-                    ui,
-                    bootty_ui::ThemePalette::default(),
-                    &surfaces,
-                    None,
-                    &sessions,
-                    false,
-                )
-            },
-        );
-        let mut runs = Vec::new();
-        collect_text(
-            &egui::Shape::Vec(
-                output
-                    .shapes
-                    .iter()
-                    .map(|shape| shape.shape.clone())
-                    .collect(),
-            ),
-            &mut runs,
-        );
-        output.drop_without_applying_deltas();
-        runs
-    }
-
-    fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
-        match shape {
-            egui::Shape::Text(text) => {
-                let text = text.galley.text().trim();
-                if !text.is_empty() {
-                    out.push(text.to_owned());
-                }
-            }
-            egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| collect_text(shape, out)),
-            _ => {}
-        }
-    }
-
-    /// A session module decorates the built-in session rows, so its preview has to show them —
-    /// on its own it renders detail rows with nothing to attach to, i.e. "no sessions".
-    #[test]
-    fn a_session_surface_previews_over_the_builtin_session_rows() {
-        let runs = preview_text(
-            "bootty.ui.register({ id = \"preview\", placement = \"session\" }, function()\n\
-             \treturn bootty.ui.session_components({\n\
-             \t\tsessions = bootty.sessions(),\n\
-             \t\trender = function()\n\
-             \t\t\treturn { summary = { { text = \"+7\" } } }\n\
-             \t\tend,\n\
-             \t})\n\
-             end)\n",
-        );
-        assert!(
-            !runs.iter().any(|run| run == "no sessions"),
-            "the built-in session rows are composed in: {runs:?}"
-        );
-        assert!(
-            runs.iter().any(|run| run.contains("api")),
-            "an example session is named: {runs:?}"
-        );
-    }
-
-    /// A sidebar module renders beside the session rows, not instead of them, so its preview shows
-    /// them too — and previewing `sessions` itself must not double them.
-    #[test]
-    fn a_sidebar_surface_previews_beside_the_builtin_session_rows() {
-        let runs = preview_text(
-            "bootty.ui.register({ id = \"preview\", placement = \"sidebar\" }, function()\n\
-             \treturn { { kind = \"footer\", text = \"usage 42%\" } }\n\
-             end)\n",
-        );
-        assert!(
-            !runs.iter().any(|run| run == "no sessions"),
-            "the session rows are drawn alongside: {runs:?}"
-        );
-        assert!(
-            runs.iter().any(|run| run.contains("api")),
-            "an example session is named: {runs:?}"
-        );
-        assert!(
-            runs.iter().any(|run| run.contains("usage 42%")),
-            "the module's own item is drawn: {runs:?}"
-        );
-    }
-
-    #[test]
-    fn a_status_surface_previews_through_the_real_strip() {
-        let runs = preview_text(
-            "bootty.ui.register({ id = \"preview\", placement = \"status\" }, function()\n\
-             \treturn { { text = \"42%\", icon = \"battery-charging\" } }\n\
-             end)\n",
-        );
-
-        assert!(runs.iter().any(|run| run == "42%"), "{runs:?}");
-        // The icon is drawn as a glyph, never spelled out.
-        assert!(
-            !runs.iter().any(|run| run == "battery-charging"),
-            "{runs:?}"
-        );
-    }
-
-    #[test]
-    fn a_sidebar_surface_previews_through_the_real_sidebar() {
-        let runs = preview_text(
-            "bootty.ui.register({ id = \"preview\", placement = \"sidebar\" }, function()\n\
-             \treturn { { text = \"work/api\", kind = \"session\", session_id = \"$1\" } }\n\
-             end)\n",
-        );
-
-        assert!(runs.iter().any(|run| run == "work/api"), "{runs:?}");
-        // A session row means the mock counted it, so the empty-state text stays away.
-        assert!(!runs.iter().any(|run| run == "no sessions"), "{runs:?}");
     }
 }

@@ -6,12 +6,12 @@ use bootty_app::ui::{
     chrome::{self, SidebarModel},
     session_navigation::BindingSessionGroup,
     session_picker::SessionPickerDialog,
-    sidebar::build_binding_sidebar_items,
+    sidebar::build_sidebar_items_from_published_items,
 };
 use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
 use bootty_extension::{ModuleItem, PublishedSurfaceItem};
 use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
+    controller::SpaceId,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag, MuxWindow},
 };
 use bootty_render::{
@@ -95,18 +95,6 @@ fn sidebar_sessions(count: usize) -> Vec<MuxSession> {
         .collect()
 }
 
-fn sidebar_group(sessions: Vec<MuxSession>, selected_session: String) -> BindingSessionGroup {
-    BindingSessionGroup {
-        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
-        label: "Native".to_owned(),
-        sessions,
-        selected_session: Some(selected_session),
-        active: true,
-        can_return_to_last_session: false,
-        display_names: HashMap::new(),
-    }
-}
-
 fn usage_footer_items(name: &str) -> Vec<ModuleItem> {
     vec![
         ModuleItem {
@@ -120,6 +108,75 @@ fn usage_footer_items(name: &str) -> Vec<ModuleItem> {
             ..ModuleItem::default()
         },
     ]
+}
+
+/// The rows the built-in `sessions` module publishes for these sessions: a group header for every
+/// project holding more than one, then one row per session. Benchmarking the sidebar means
+/// benchmarking what the module actually hands it.
+fn published_session_items(sessions: &[MuxSession]) -> Vec<PublishedSurfaceItem> {
+    let group_of = |session: &MuxSession| {
+        session
+            .name
+            .split_once('/')
+            .map_or("", |(group, _)| group)
+            .to_owned()
+    };
+    let mut counts = HashMap::<String, usize>::new();
+    for session in sessions {
+        *counts.entry(group_of(session)).or_default() += 1;
+    }
+    let publish = |item: ModuleItem| PublishedSurfaceItem {
+        module: "sessions.luau".to_owned(),
+        generation: 1,
+        surface: "sessions".to_owned(),
+        item,
+    };
+
+    let mut items = Vec::with_capacity(sessions.len() + counts.len());
+    let mut last_group = String::new();
+    for (ordinal, session) in sessions.iter().enumerate() {
+        let group = group_of(session);
+        let grouped = !group.is_empty() && counts[&group] > 1;
+        let last_in_group = grouped
+            && sessions
+                .get(ordinal + 1)
+                .is_none_or(|next| group_of(next) != group);
+        if grouped && group != last_group {
+            items.push(publish(ModuleItem {
+                text: group.clone(),
+                kind: Some("group".to_owned()),
+                reorder_anchor: Some(session.name.clone()),
+                selectable: Some(false),
+                ..ModuleItem::default()
+            }));
+        }
+        let label = if grouped {
+            session.name.split_once('/').map_or("", |(_, leaf)| leaf)
+        } else {
+            group.as_str()
+        };
+        items.push(publish(ModuleItem {
+            text: label.to_owned(),
+            number: Some(ordinal + 1),
+            indent: Some(if grouped { 2 } else { 0 }),
+            tree: Some(
+                if !grouped {
+                    "none"
+                } else if last_in_group {
+                    "last"
+                } else {
+                    "middle"
+                }
+                .to_owned(),
+            ),
+            kind: Some("session".to_owned()),
+            session_id: Some(session.id.clone()),
+            reorder_anchor: Some(session.name.clone()),
+            ..ModuleItem::default()
+        }));
+        last_group = group;
+    }
+    items
 }
 
 fn default_native_keybinds() -> Vec<String> {
@@ -566,9 +623,17 @@ fn bench_sidebar_items(c: &mut Criterion) {
             .get(count / 2)
             .map(|session| session.id.clone())
             .unwrap_or_else(|| "$1".to_owned());
-        let groups = [sidebar_group(sessions, selected)];
+        let published = published_session_items(&sessions);
         c.bench_function(&format!("sidebar_items_{count}_rich_sessions"), |b| {
-            b.iter(|| black_box(build_binding_sidebar_items(black_box(&groups))).len())
+            b.iter(|| {
+                black_box(build_sidebar_items_from_published_items(
+                    black_box(&published),
+                    SpaceId::from_persistence(1),
+                    Some(&selected),
+                    false,
+                ))
+                .len()
+            })
         });
     }
 }
@@ -580,8 +645,13 @@ fn bench_sidebar_ui(c: &mut Criterion) {
             .get(count / 2)
             .map(|session| session.id.clone())
             .unwrap_or_else(|| "$1".to_owned());
-        let group = sidebar_group(sessions, selected);
-        let items = build_binding_sidebar_items(std::slice::from_ref(&group));
+        let published = published_session_items(&sessions);
+        let items = build_sidebar_items_from_published_items(
+            &published,
+            SpaceId::from_persistence(1),
+            Some(&selected),
+            false,
+        );
         let context = egui::Context::default();
         icons::install_icon_fonts(&context);
         let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 900.0));
@@ -601,10 +671,9 @@ fn bench_sidebar_ui(c: &mut Criterion) {
                                 bootty_ui::ThemePalette::default(),
                                 900.0,
                                 SidebarModel {
-                                    move_targets: &[],
                                     items: black_box(&items),
                                     footer_items: &[],
-                                    session_count: group.sessions.len(),
+                                    session_count: sessions.len(),
                                     title_visible: true,
                                     reserve_titlebar_buttons: true,
                                     title_icon: None,
@@ -636,8 +705,13 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
         .get(count / 2)
         .map(|session| session.id.clone())
         .unwrap_or_else(|| "$1".to_owned());
-    let group = sidebar_group(sessions, selected);
-    let items = build_binding_sidebar_items(std::slice::from_ref(&group));
+    let published = published_session_items(&sessions);
+    let items = build_sidebar_items_from_published_items(
+        &published,
+        SpaceId::from_persistence(1),
+        Some(&selected),
+        false,
+    );
     let screen_rect = Rect::from_min_size(Pos2::ZERO, egui::vec2(280.0, 900.0));
 
     for name in ["plain_usage_footer", "compact_usage_footer"] {
@@ -667,10 +741,9 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
                                 bootty_ui::ThemePalette::default(),
                                 900.0,
                                 SidebarModel {
-                                    move_targets: &[],
                                     items: black_box(&items),
                                     footer_items: black_box(&footer_items),
-                                    session_count: group.sessions.len(),
+                                    session_count: sessions.len(),
                                     title_visible: true,
                                     reserve_titlebar_buttons: true,
                                     title_icon: None,
@@ -702,8 +775,8 @@ fn bench_session_picker_ui(c: &mut Criterion) {
         .map(|session| session.id.clone())
         .unwrap_or_else(|| "$1".to_owned());
     let groups = [BindingSessionGroup {
-        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
-        label: "Default Binding".to_owned(),
+        scope: SpaceId::from_persistence(1),
+        label: "Default Space".to_owned(),
         sessions,
         selected_session: Some(selected),
         active: true,

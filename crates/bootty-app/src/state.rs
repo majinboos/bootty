@@ -13,7 +13,7 @@ use bootty_config::{
 };
 use bootty_mux::{
     RepaintHandle,
-    controller::{MuxController, MuxScope, SpaceId},
+    controller::{MuxController, SpaceId},
     provider::{MuxBackendRegistry, selected_backend},
     snapshot::{MuxSession, MuxWindow},
     terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
@@ -185,15 +185,14 @@ pub struct AppState {
     window_chrome: WindowChromeFacts,
 }
 fn scoped_terminal_transition_key(
-    scope: MuxScope,
+    scope: SpaceId,
     backend: MultiplexerBackendConfig,
     session_id: &str,
     pane_id: Option<&str>,
 ) -> String {
     format!(
-        "{}:{}:{backend:?}:{session_id}:{}",
-        scope.space_id().persistence_value(),
-        scope.binding_id().persistence_value(),
+        "{}:{backend:?}:{session_id}:{}",
+        scope.persistence_value(),
         pane_id.unwrap_or_default(),
     )
 }
@@ -479,11 +478,8 @@ impl AppState {
     pub fn mux(&self) -> &MuxController {
         &self.workspace.active.binding.mux
     }
-    pub fn mux_scope(&self) -> MuxScope {
+    pub fn mux_scope(&self) -> SpaceId {
         self.workspace.active.binding.scope
-    }
-    pub fn binding_count(&self) -> usize {
-        self.workspace.binding_count()
     }
     pub fn active_space_id(&self) -> SpaceId {
         self.workspace.active_space_id()
@@ -727,27 +723,9 @@ impl AppState {
     }
     pub fn activate_scoped_session_from_ui(&mut self, target: &ScopedSessionTarget) -> bool {
         // A session that belongs to another Space is switched to there, not dragged over here: its
-        // binding, terminal, and pane layout all live in that Space.
-        if target.scope.space_id() != self.workspace.active.id
-            && !self.activate_space_from_ui(target.scope.space_id())
-        {
+        // connection, terminal, and pane layout all live in that Space.
+        if target.scope != self.workspace.active.id && !self.activate_space_from_ui(target.scope) {
             return false;
-        }
-        if target.scope != self.workspace.active.binding.scope {
-            let Some(backend) = self.workspace.binding_backend(target.scope) else {
-                return false;
-            };
-            let app_key_bindings = self.config_runtime.prepare_backend_keybindings(backend);
-            let config = self.config().clone();
-            if !self.workspace.activate_binding(
-                target.scope,
-                &config,
-                self.active_appearance_variant,
-                &self.repaint,
-            ) {
-                return false;
-            }
-            self.publish_backend_transition(app_key_bindings);
         }
         if let Err(error) =
             self.workspace
@@ -916,6 +894,67 @@ impl AppState {
             (self.repaint)();
         }
         changed
+    }
+
+    /// Sessions on the active Space's multiplexer that no Space claims.
+    ///
+    /// Membership is explicit, so these would otherwise be invisible: ones started outside bootty,
+    /// and ones a deleted Space left running.
+    pub fn unclaimed_sessions(&self) -> Vec<crate::ui::sidebar::UnclaimedSession> {
+        let claimed = self
+            .workspace
+            .all_bindings()
+            .flat_map(|binding| binding.sessions.sessions())
+            .map(|session| session.identity.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        self.workspace
+            .active
+            .binding
+            .mux
+            .all_sessions()
+            .iter()
+            .filter(|session| {
+                session
+                    .tag
+                    .identity
+                    .as_deref()
+                    .is_none_or(|identity| !claimed.contains(identity))
+            })
+            .map(|session| crate::ui::sidebar::UnclaimedSession {
+                session_id: session.id.clone(),
+                name: session.name.clone(),
+            })
+            .collect()
+    }
+
+    /// Claim a session into the active Space and open it.
+    pub fn adopt_and_activate_scoped_session(&mut self, target: &ScopedSessionTarget) -> bool {
+        let adopted = self.workspace.adopt_session_into_binding(
+            target.scope,
+            &target.session_id,
+            &self.repaint,
+        );
+        if !self.apply_workspace_change(adopted) {
+            return false;
+        }
+        self.activate_scoped_session_from_ui(target)
+    }
+
+    /// What bootty calls `target`, or `None` if the backend no longer has it.
+    pub fn session_display_name(&self, target: &ScopedSessionTarget) -> Option<String> {
+        let binding = self.workspace.binding(target.scope)?;
+        let session = binding
+            .mux
+            .backend_session_by_id_or_name(&target.session_id)?;
+        Some(
+            session
+                .tag
+                .identity
+                .as_deref()
+                .and_then(|identity| binding.sessions.get(identity))
+                .map_or(session.name.as_str(), |claimed| claimed.label())
+                .to_owned(),
+        )
     }
 
     /// The Spaces `target` could move to, in switcher order, for the sidebar's move menu.

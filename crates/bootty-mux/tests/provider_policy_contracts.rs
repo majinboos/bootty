@@ -13,7 +13,7 @@ use bootty_mux::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation, BindingOperationOutcome},
     command::{MuxCommand, MuxSplitDirection},
-    controller::{BindingId, MuxController, MuxScope, RepaintHandle, SpaceId},
+    controller::{MuxController, RepaintHandle, SpaceId},
     provider::{
         GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider, MuxBackendProvider,
         MuxBackendRegistry, MuxCommandDispatch, PaneBehavior, PaneTopology, PersistedSessionPolicy,
@@ -117,7 +117,7 @@ impl MuxAppBackendProvider for DynamicProvider {
         unimplemented!()
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor {
         BindingCapabilityDescriptor::new(scope, [BindingOperation::SplitPane])
     }
 }
@@ -166,7 +166,7 @@ impl MuxAppBackendProvider for FakeProvider {
         unimplemented!()
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor {
         BindingCapabilityDescriptor::new(scope, [BindingOperation::SplitPane])
     }
 }
@@ -184,7 +184,7 @@ fn unsupported_command_does_not_reach_backend() {
         backend: MuxBackendKind::Tmux,
         ..Default::default()
     };
-    let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1));
+    let scope = SpaceId::from_persistence(1);
     let mut backend = FakeBackend {
         execute_calls: Arc::clone(&execute_calls),
     };
@@ -296,7 +296,7 @@ impl MuxAppBackendProvider for StatefulProvider {
         }
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor {
         BindingCapabilityDescriptor::new(scope, [BindingOperation::SplitPane])
     }
 }
@@ -337,7 +337,7 @@ fn refresh_outcome_reports_one_applied_snapshot_without_latching_completion() {
         backend: MuxBackendKind::Tmux,
         ..Default::default()
     };
-    let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1));
+    let scope = SpaceId::from_persistence(1);
     let repaint: RepaintHandle = Arc::new(|| {});
     let mut controller = MuxController::new(scope, registry, None);
 
@@ -380,7 +380,7 @@ fn refresh_outcome_keeps_applied_and_error_as_independent_fields() {
         backend: MuxBackendKind::Tmux,
         ..Default::default()
     };
-    let scope = MuxScope::new(SpaceId::from_persistence(2), BindingId::from_persistence(2));
+    let scope = SpaceId::from_persistence(2);
     let repaint: RepaintHandle = Arc::new(|| {});
     let mut controller = MuxController::new(scope, registry, None);
 
@@ -422,7 +422,7 @@ fn caller_thread_snapshot_failure_executes_once_and_surfaces_error() {
         backend: MuxBackendKind::Tmux,
         ..Default::default()
     };
-    let scope = MuxScope::new(SpaceId::from_persistence(3), BindingId::from_persistence(3));
+    let scope = SpaceId::from_persistence(3);
     let repaint: RepaintHandle = Arc::new(|| {});
     let mut controller = MuxController::new(scope, registry, None);
 
