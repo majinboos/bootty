@@ -658,7 +658,7 @@ fn bench_sidebar_ui(c: &mut Criterion) {
 
         c.bench_function(&format!("sidebar_ui_{count}_rich_sessions"), |b| {
             b.iter(|| {
-                let output = context.run_ui(
+                let mut output = context.run_ui(
                     egui::RawInput {
                         screen_rect: Some(screen_rect),
                         events: vec![egui::Event::PointerMoved(Pos2::new(32.0, 180.0))],
@@ -692,6 +692,7 @@ fn bench_sidebar_ui(c: &mut Criterion) {
                         });
                     },
                 );
+                output.textures_delta.clear();
                 black_box(output.shapes.len())
             })
         });
@@ -728,7 +729,7 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
         icons::install_icon_fonts(&context);
         c.bench_function(&format!("sidebar_ui_96_rich_sessions_{name}"), |b| {
             b.iter(|| {
-                let output = context.run_ui(
+                let mut output = context.run_ui(
                     egui::RawInput {
                         screen_rect: Some(screen_rect),
                         events: vec![egui::Event::PointerMoved(Pos2::new(32.0, 180.0))],
@@ -762,6 +763,7 @@ fn bench_sidebar_ui_usage_footer(c: &mut Criterion) {
                         });
                     },
                 );
+                output.textures_delta.clear();
                 black_box(output.shapes.len())
             })
         });
@@ -791,7 +793,7 @@ fn bench_session_picker_ui(c: &mut Criterion) {
     c.bench_function("session_picker_ui_384_sessions_unfiltered", |b| {
         b.iter(|| {
             let mut dialog = SessionPickerDialog::open();
-            let output = context.run_ui(
+            let mut output = context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(screen_rect),
                     events: vec![egui::Event::PointerMoved(Pos2::new(600.0, 450.0))],
@@ -801,6 +803,7 @@ fn bench_session_picker_ui(c: &mut Criterion) {
                     black_box(dialog.show(ui.ctx(), black_box(theme), black_box(&groups)));
                 },
             );
+            output.textures_delta.clear();
             black_box(output.shapes.len())
         })
     });

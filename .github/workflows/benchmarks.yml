@@ -64,7 +64,7 @@ jobs:
         run: cargo clean -p libghostty-vt-sys
 
       - name: Run full benchmark reproduction suite
-        run: mise run bench:overnight
+        run: mise run bench -- --quick --output artifacts/benchmark-reproduction/overnight
 
       - name: Upload benchmark evidence
         if: always()

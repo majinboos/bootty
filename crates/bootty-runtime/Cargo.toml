@@ -1,6 +1,7 @@
 [package]
 name = "bootty-runtime"
 edition.workspace = true
+autobenches = false
 
 [dependencies]
 anyhow.workspace = true

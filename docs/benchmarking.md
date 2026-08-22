@@ -34,7 +34,7 @@ metadata/dashboard helpers and compile-checks the core `paint_plan` harness.
 Local repro:
 
 ```bash
-scripts/run-benchmark-suite.sh --ci-smoke --output artifacts/benchmark-reproduction/ci
+mise run bench -- --ci-smoke --output artifacts/benchmark-reproduction/ci
 ```
 
 The full benchmark reproduction suite runs in the nightly benchmark workflow.
@@ -42,7 +42,7 @@ It compile-checks all checked-in benchmark targets and runs the short measured
 subset that used to block push CI:
 
 ```bash
-scripts/run-benchmark-suite.sh --quick --output artifacts/benchmark-reproduction/overnight
+mise run bench -- --quick --output artifacts/benchmark-reproduction/overnight
 ```
 
 Run task-specific compile-only checks when touching those surfaces. Keep measured

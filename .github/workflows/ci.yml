@@ -116,7 +116,7 @@ jobs:
           test "$size" -le 13631488
 
       - name: Compile and smoke benchmark suite
-        run: mise run bench:ci
+        run: mise run bench -- --ci-smoke --output artifacts/benchmark-reproduction/ci
 
       - name: Upload benchmark evidence
         if: always()

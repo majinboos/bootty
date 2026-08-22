@@ -516,7 +516,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
         b.iter(|| {
             tick = tick.wrapping_add(1);
             terminal.write_agent_frame(tick, 109, 39);
-            let output = context.run_ui(
+            let mut output = context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(FRAME_RECT),
                     events: vec![egui::Event::PointerMoved(egui::Pos2::new(600.0, 400.0))],
@@ -528,13 +528,14 @@ fn bench_egui_app_frames(c: &mut Criterion) {
                     });
                 },
             );
+            output.textures_delta.clear();
             black_box(output.shapes.len())
         })
     });
 
     c.bench_function("egui_frame_sidebar_status_384_sessions", |b| {
         b.iter(|| {
-            let output = context.run_ui(
+            let mut output = context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(FRAME_RECT),
                     events: vec![egui::Event::PointerMoved(egui::Pos2::new(42.0, 220.0))],
@@ -547,6 +548,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
                     });
                 },
             );
+            output.textures_delta.clear();
             black_box(output.shapes.len())
         })
     });
@@ -561,7 +563,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
             b.iter(|| {
                 combined_tick = combined_tick.wrapping_add(1);
                 combined_terminal.write_agent_frame(combined_tick, 109, 39);
-                let output = context.run_ui(
+                let mut output = context.run_ui(
                     egui::RawInput {
                         screen_rect: Some(FRAME_RECT),
                         events: vec![egui::Event::PointerMoved(egui::Pos2::new(600.0, 400.0))],
@@ -575,6 +577,7 @@ fn bench_egui_app_frames(c: &mut Criterion) {
                         });
                     },
                 );
+                output.textures_delta.clear();
                 black_box(output.shapes.len())
             })
         },

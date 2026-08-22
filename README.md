@@ -66,11 +66,10 @@ Run the same source build locally with `mise run site:build`.
 ## Validation
 
 ```sh
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -W clippy::all
-cargo test --workspace
-cargo bench --workspace --no-run
-cargo bench -p bootty-app --bench paint_plan -- --noplot
+mise run fmt
+mise run clippy
+mise run test
+mise run bench -- --ci-smoke
 ```
 
 ## Docs
