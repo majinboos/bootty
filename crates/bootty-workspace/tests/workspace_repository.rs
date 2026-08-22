@@ -1,5 +1,6 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 
+use assert_fs::{TempDir, prelude::*};
 use bootty_config::config::{MultiplexerBackendConfig, SshRemoteConfig};
 use bootty_mux::{controller::SpaceId, membership::BackendMembership};
 use bootty_workspace::{
@@ -7,8 +8,9 @@ use bootty_workspace::{
     SpaceMuxOverride, SpaceRemoteOverride, WorkspaceRepository, WorkspaceSession,
     WorkspaceSnapshot,
 };
+use pretty_assertions::assert_eq;
+use rstest::{fixture, rstest};
 use rusqlite::Connection;
-use tempfile::TempDir;
 
 struct LoadedRepository {
     repository: WorkspaceRepository,
@@ -78,8 +80,9 @@ impl std::ops::DerefMut for LoadedRepository {
     }
 }
 
+#[fixture]
 fn repository() -> (TempDir, LoadedRepository) {
-    let directory = tempfile::tempdir().expect("temporary workspace");
+    let directory = TempDir::new().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
     let repository = LoadedRepository::open(&config_path);
     (directory, repository)
@@ -87,20 +90,21 @@ fn repository() -> (TempDir, LoadedRepository) {
 
 #[test]
 fn an_invalid_database_is_reported_instead_of_becoming_an_empty_workspace() {
-    let directory = tempfile::tempdir().expect("temporary workspace");
+    let directory = TempDir::new().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
-    std::fs::write(
-        directory.path().join("session-order.sqlite3"),
-        "not a sqlite database",
-    )
-    .expect("write invalid database");
+    directory
+        .child("session-order.sqlite3")
+        .write_str("not a sqlite database")
+        .expect("write invalid database");
 
     assert!(WorkspaceRepository::open(&config_path).is_err());
 }
 
-#[test]
-fn an_invalid_current_snapshot_is_rejected_instead_of_repaired() {
-    let (directory, repository) = repository();
+#[rstest]
+fn an_invalid_current_snapshot_is_rejected_instead_of_repaired(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (directory, repository) = repository;
     drop(repository);
     let database = directory.path().join("session-order.sqlite3");
     let connection = Connection::open(database).expect("open workspace database");
@@ -116,72 +120,31 @@ fn an_invalid_current_snapshot_is_rejected_instead_of_repaired() {
 
 #[test]
 fn the_single_binding_schema_migration_preserves_binding_and_restore_state() {
-    let directory = tempfile::tempdir().expect("temporary workspace");
+    let directory = TempDir::new().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
     let database = directory.path().join("session-order.sqlite3");
     let connection = Connection::open(&database).expect("open legacy workspace database");
     connection
         .execute_batch(
             r#"
-            CREATE TABLE workspace_spaces (
-                id INTEGER PRIMARY KEY,
-                remote_id TEXT UNIQUE,
-                name TEXT NOT NULL,
-                icon TEXT NOT NULL,
-                color TEXT NOT NULL,
-                tint_sidebar INTEGER NOT NULL,
-                position INTEGER NOT NULL UNIQUE
-            );
-            CREATE TABLE workspace_bindings (
-                id INTEGER PRIMARY KEY,
-                space_id INTEGER NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                hide_tmux_status INTEGER NOT NULL,
-                remote TEXT,
-                unavailable INTEGER NOT NULL DEFAULT 0,
-                selected_session_id TEXT,
-                selected_window_id TEXT
-            );
-            CREATE TABLE workspace_session_groups (
-                id INTEGER PRIMARY KEY,
-                binding_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                position INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_sessions (
-                binding_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                group_id INTEGER NOT NULL,
-                position INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_session_name_metadata (
-                binding_id INTEGER NOT NULL,
-                session_id TEXT NOT NULL,
-                cwd TEXT NOT NULL,
-                generated_name TEXT NOT NULL,
-                session_name TEXT NOT NULL,
-                display_name TEXT NOT NULL,
-                explicit INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_window_state (
-                window_key TEXT PRIMARY KEY,
-                selected_space_id INTEGER NOT NULL
-            );
-            INSERT INTO workspace_spaces
-                (id, remote_id, name, icon, color, tint_sidebar, position)
+            CREATE TABLE workspace_spaces (id INTEGER PRIMARY KEY, remote_id TEXT UNIQUE, name TEXT NOT NULL, icon TEXT NOT NULL, color TEXT NOT NULL, tint_sidebar INTEGER NOT NULL, position INTEGER NOT NULL UNIQUE);
+            CREATE TABLE workspace_bindings (id INTEGER PRIMARY KEY, space_id INTEGER NOT NULL UNIQUE, name TEXT NOT NULL, backend TEXT NOT NULL, hide_tmux_status INTEGER NOT NULL, remote TEXT, unavailable INTEGER NOT NULL DEFAULT 0, selected_session_id TEXT, selected_window_id TEXT);
+            CREATE TABLE workspace_session_groups (id INTEGER PRIMARY KEY, binding_id INTEGER NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL);
+            CREATE TABLE workspace_sessions (binding_id INTEGER NOT NULL, name TEXT NOT NULL, group_id INTEGER NOT NULL, position INTEGER NOT NULL);
+            CREATE TABLE workspace_session_name_metadata (binding_id INTEGER NOT NULL, session_id TEXT NOT NULL, cwd TEXT NOT NULL, generated_name TEXT NOT NULL, session_name TEXT NOT NULL, display_name TEXT NOT NULL, explicit INTEGER NOT NULL);
+            CREATE TABLE workspace_window_state (window_key TEXT PRIMARY KEY, selected_space_id INTEGER NOT NULL);
+            INSERT INTO workspace_spaces (id, remote_id, name, icon, color, tint_sidebar, position)
             VALUES (7, 'remote-7', 'Legacy Space', 'star', '#010203', 1, 0);
-            INSERT INTO workspace_bindings
-                (id, space_id, name, backend, hide_tmux_status, remote, unavailable,
-                 selected_session_id, selected_window_id)
+            INSERT INTO workspace_bindings (id, space_id, name, backend, hide_tmux_status, remote,
+                unavailable, selected_session_id, selected_window_id)
             VALUES (9, 7, 'Legacy Binding', 'tmux', 1, '{"source":"local"}', 1,
                     'session-1', 'window-1');
             INSERT INTO workspace_session_groups (id, binding_id, name, position)
             VALUES (11, 9, 'work', 0);
             INSERT INTO workspace_sessions (binding_id, name, group_id, position)
             VALUES (9, 'session-1', 11, 0);
-            INSERT INTO workspace_session_name_metadata
-                (binding_id, session_id, cwd, generated_name, session_name, display_name, explicit)
+            INSERT INTO workspace_session_name_metadata (binding_id, session_id, cwd,
+                generated_name, session_name, display_name, explicit)
             VALUES (9, 'session-1', '/worktree', 'generated', 'session-1', 'Display', 1);
             INSERT INTO workspace_window_state (window_key, selected_space_id)
             VALUES ('main', 7);
@@ -209,8 +172,6 @@ fn the_single_binding_schema_migration_preserves_binding_and_restore_state() {
             .map(|selection| (selection.session_id(), selection.window_id(),)),
         Some(("session-1", Some("window-1")))
     );
-    // Sessions come across under a provisional identity. Nothing in any multiplexer carries that
-    // value, so the first successful refresh finds each one by its name and stamps a real id.
     let claimed = binding.sessions().sessions();
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].identity, "legacy:9:session-1");
@@ -220,9 +181,9 @@ fn the_single_binding_schema_migration_preserves_binding_and_restore_state() {
     assert_eq!(claimed[0].cwd, "/worktree");
 }
 
-#[test]
-fn a_space_update_that_fails_leaves_every_field_as_it_was() {
-    let (directory, mut repository) = repository();
+#[rstest]
+fn a_space_update_that_fails_leaves_every_field_as_it_was(repository: (TempDir, LoadedRepository)) {
+    let (directory, mut repository) = repository;
     let space = &repository.spaces()[0];
     let space_id = space.id();
     let original_remote_id = space.remote_id().to_owned();
@@ -280,12 +241,9 @@ fn a_space_update_that_fails_leaves_every_field_as_it_was() {
     assert!(!stored_binding.hide_tmux_status());
 }
 
-/// A Space is one connection, so the fold has to decide what a database holding two of them
-/// means. It keeps the first and every session claimed through either, rather than losing a Space
-/// or half its sessions to a shape no release ever produced on purpose.
 #[test]
 fn folding_a_space_that_held_two_connections_keeps_the_first_and_every_session() {
-    let directory = tempfile::tempdir().expect("temporary workspace directory");
+    let directory = TempDir::new().expect("temporary workspace directory");
     let config_path = directory.path().join("config.toml");
     let database = directory.path().join("session-order.sqlite3");
     let connection = Connection::open(&database).expect("open workspace database");
@@ -293,48 +251,16 @@ fn folding_a_space_that_held_two_connections_keeps_the_first_and_every_session()
         .execute_batch(
             r#"
             PRAGMA user_version = 4;
-            CREATE TABLE workspace_spaces (
-                id INTEGER PRIMARY KEY,
-                remote_id TEXT UNIQUE,
-                name TEXT NOT NULL,
-                icon TEXT NOT NULL,
-                color TEXT NOT NULL,
-                tint_sidebar INTEGER NOT NULL,
-                position INTEGER NOT NULL UNIQUE
-            );
-            CREATE TABLE workspace_bindings (
-                id INTEGER PRIMARY KEY,
-                space_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                hide_tmux_status INTEGER NOT NULL,
-                remote TEXT,
-                unavailable INTEGER NOT NULL DEFAULT 0,
-                selected_session_id TEXT,
-                selected_window_id TEXT
-            );
-            CREATE TABLE workspace_sessions (
-                identity TEXT PRIMARY KEY,
-                binding_id INTEGER NOT NULL,
-                backend_name TEXT NOT NULL,
-                display_name TEXT NOT NULL DEFAULT '',
-                explicit INTEGER NOT NULL DEFAULT 0,
-                cwd TEXT NOT NULL DEFAULT '',
-                position INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_window_state (
-                window_key TEXT PRIMARY KEY,
-                selected_space_id INTEGER NOT NULL
-            );
-            INSERT INTO workspace_spaces
-                (id, remote_id, name, icon, color, tint_sidebar, position)
+            CREATE TABLE workspace_spaces (id INTEGER PRIMARY KEY, remote_id TEXT UNIQUE, name TEXT NOT NULL, icon TEXT NOT NULL, color TEXT NOT NULL, tint_sidebar INTEGER NOT NULL, position INTEGER NOT NULL UNIQUE);
+            CREATE TABLE workspace_bindings (id INTEGER PRIMARY KEY, space_id INTEGER NOT NULL, name TEXT NOT NULL, backend TEXT NOT NULL, hide_tmux_status INTEGER NOT NULL, remote TEXT, unavailable INTEGER NOT NULL DEFAULT 0, selected_session_id TEXT, selected_window_id TEXT);
+            CREATE TABLE workspace_sessions (identity TEXT PRIMARY KEY, binding_id INTEGER NOT NULL, backend_name TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '', explicit INTEGER NOT NULL DEFAULT 0, cwd TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL);
+            CREATE TABLE workspace_window_state (window_key TEXT PRIMARY KEY, selected_space_id INTEGER NOT NULL);
+            INSERT INTO workspace_spaces (id, remote_id, name, icon, color, tint_sidebar, position)
             VALUES (3, 'remote-3', 'Doubled Space', 'star', '#010203', 0, 0);
-            INSERT INTO workspace_bindings
-                (id, space_id, name, backend, hide_tmux_status, remote)
+            INSERT INTO workspace_bindings (id, space_id, name, backend, hide_tmux_status, remote)
             VALUES (5, 3, 'First', 'tmux', 1, '{"source":"local"}'),
                    (6, 3, 'Second', 'rmux', 0, NULL);
-            INSERT INTO workspace_sessions
-                (identity, binding_id, backend_name, position)
+            INSERT INTO workspace_sessions (identity, binding_id, backend_name, position)
             VALUES ('id-1', 5, 'first', 0),
                    ('id-2', 6, 'second', 0);
             "#,
@@ -359,9 +285,11 @@ fn folding_a_space_that_held_two_connections_keeps_the_first_and_every_session()
     );
 }
 
-#[test]
-fn a_two_space_commit_is_atomic_when_the_second_space_fails() {
-    let (directory, mut repository) = repository();
+#[rstest]
+fn a_two_space_commit_is_atomic_when_the_second_space_fails(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (directory, mut repository) = repository;
     let first_binding = repository.spaces()[0].binding().clone();
     let second_space = repository
         .create_space(
@@ -429,9 +357,11 @@ fn a_two_space_commit_is_atomic_when_the_second_space_fails() {
     );
 }
 
-#[test]
-fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
-    let (directory, mut repository) = repository();
+#[rstest]
+fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (directory, mut repository) = repository;
     let binding = repository.spaces()[0].binding().clone();
     let scope = binding.mux_scope();
     let mutation = BindingMembershipMutation::Create {
@@ -476,7 +406,6 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
         .execute("DROP TRIGGER fail_remote_metadata_commit", [])
         .expect("remove metadata failure");
     drop(connection);
-    // The backend renamed the session on its way in, which the identity makes irrelevant.
     assert!(
         repository
             .reconcile_binding_membership_mutations(
@@ -502,9 +431,11 @@ fn a_remote_backend_success_is_recovered_after_its_metadata_commit_fails() {
     );
 }
 
-#[test]
-fn remote_rename_and_ditch_mutations_commit_binding_membership() {
-    let (_directory, mut repository) = repository();
+#[rstest]
+fn remote_rename_and_ditch_mutations_commit_binding_membership(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (_directory, mut repository) = repository;
     let binding = repository.spaces()[0].binding().clone();
     let scope = binding.mux_scope();
     let mut sessions = binding.sessions().clone();
@@ -544,37 +475,11 @@ fn remote_rename_and_ditch_mutations_commit_binding_membership() {
         .commit_binding_membership_mutation(scope, &ditch, &mut sessions)
         .expect("commit ditch");
     assert!(sessions.is_empty());
-}
-
-/// A ditched session takes its name with it. Leaving the record behind is what used to make the
-/// next session started in the same directory come back wearing a dead session's name.
-#[test]
-fn a_ditched_session_leaves_no_name_behind_for_the_next_one_in_that_directory() {
-    let (_directory, mut repository) = repository();
-    let binding = repository.spaces()[0].binding().clone();
-    let scope = binding.mux_scope();
-    let mut sessions = binding.sessions().clone();
-    sessions.claim(session("id-1", "bootty"));
-    sessions.set_display_name("id-1", "the name I picked", true);
-    repository
-        .commit_binding_state(scope, &sessions)
-        .expect("commit the named session");
-
-    let ditch = BindingMembershipMutation::Ditch {
-        identity: "id-1".to_owned(),
-        old_name: "bootty".to_owned(),
-    };
-    repository
-        .begin_binding_membership_mutation(scope, &ditch)
-        .expect("journal ditch");
-    repository
-        .commit_binding_membership_mutation(scope, &ditch, &mut sessions)
-        .expect("commit ditch");
 
     let replacement = BindingMembershipMutation::Create {
         identity: "id-2".to_owned(),
-        session_name: "bootty".to_owned(),
-        display_name: "bootty".to_owned(),
+        session_name: "new-name".to_owned(),
+        display_name: "new-name".to_owned(),
         explicit: false,
         cwd: "/worktree".to_owned(),
     };
@@ -587,68 +492,41 @@ fn a_ditched_session_leaves_no_name_behind_for_the_next_one_in_that_directory() 
 
     assert_eq!(
         sessions.get("id-2").map(|claimed| claimed.label()),
-        Some("bootty"),
-        "the new session is named for its directory, not for the one that was ditched"
+        Some("new-name"),
+        "the ditched session's display name is not reused"
     );
     assert!(sessions.get("id-1").is_none());
 }
 
-#[test]
-fn a_pending_operation_with_forbidden_fields_is_rejected_on_reopen() {
-    let (directory, repository) = repository();
+#[rstest]
+#[case::ditch_with_create_fields(
+    "INSERT INTO workspace_pending_binding_operations (space_id, operation, identity, old_name, new_name, cwd) VALUES (?1, 'ditch', 'id-1', 'old-name', 'forbidden', '/forbidden')"
+)]
+#[case::create_with_invalid_explicit(
+    "INSERT INTO workspace_pending_binding_operations (space_id, operation, identity, new_name, display_name, explicit, cwd) VALUES (?1, 'create', 'id-1', 'backend-name', 'display-name', 2, '/worktree')"
+)]
+fn malformed_pending_operations_are_rejected_on_reopen(
+    repository: (TempDir, LoadedRepository),
+    #[case] statement: &str,
+) {
+    let (directory, repository) = repository;
     let scope = repository.spaces()[0].binding().mux_scope();
     drop(repository);
     let database = directory.path().join("session-order.sqlite3");
     let connection = Connection::open(database).expect("open workspace database");
     connection
-        .execute(
-            "INSERT INTO workspace_pending_binding_operations
-                (space_id, operation, identity, old_name, new_name, cwd)
-             VALUES (?1, 'ditch', 'id-1', 'old-name', 'forbidden', '/forbidden')",
-            [scope.persistence_value()],
-        )
+        .execute(statement, [scope.persistence_value()])
         .expect("insert invalid pending operation");
     drop(connection);
 
     assert!(WorkspaceRepository::open(&directory.path().join("config.toml")).is_err());
 }
 
-#[test]
-fn a_pending_operation_with_a_non_boolean_explicit_value_is_rejected() {
-    let (directory, repository) = repository();
-    let scope = repository.spaces()[0].binding().mux_scope();
-    drop(repository);
-    let database = directory.path().join("session-order.sqlite3");
-    let connection = Connection::open(database).expect("open workspace database");
-    connection
-        .execute(
-            "INSERT INTO workspace_pending_binding_operations
-                (space_id, operation, identity, new_name,
-                 display_name, explicit, cwd)
-             VALUES (?1, 'create', 'id-1', 'backend-name',
-                     'display-name', 2, '/worktree')",
-            [scope.persistence_value()],
-        )
-        .expect("insert corrupt pending operation");
-    drop(connection);
-
-    assert!(WorkspaceRepository::open(&directory.path().join("config.toml")).is_err());
-}
-
-#[test]
-fn a_fresh_repository_has_one_default_space_and_connection() {
-    let (_directory, repository) = repository();
-
-    assert_eq!(repository.spaces().len(), 1);
-    assert_eq!(repository.spaces()[0].name(), "Default Space");
-    let binding = repository.spaces()[0].binding();
-    assert_eq!(binding.mux_scope(), repository.spaces()[0].id());
-    assert_eq!(binding.backend_override(), None);
-}
-
-#[test]
-fn spaces_preserve_identity_appearance_and_remote_placement() {
-    let (directory, mut repository) = repository();
+#[rstest]
+fn spaces_preserve_identity_appearance_and_remote_placement(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (directory, mut repository) = repository;
     let remote = SshRemoteConfig {
         host: "devbox".to_owned(),
         user: Some("dev".to_owned()),
@@ -671,6 +549,31 @@ fn spaces_preserve_identity_appearance_and_remote_placement() {
         )
         .expect("create space")
         .expect("valid space");
+    assert!(
+        repository
+            .create_space(
+                "   ",
+                DEFAULT_SPACE_ICON,
+                DEFAULT_SPACE_COLOR,
+                false,
+                SpaceMuxOverride::default(),
+                false,
+            )
+            .expect("reject blank name")
+            .is_none()
+    );
+    let duplicate = repository
+        .create_space(
+            "review",
+            DEFAULT_SPACE_ICON,
+            DEFAULT_SPACE_COLOR,
+            false,
+            SpaceMuxOverride::default(),
+            false,
+        )
+        .expect("create duplicate")
+        .expect("valid duplicate");
+    assert_eq!(duplicate.name(), "review 2");
 
     let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
     let stored = reopened
@@ -688,52 +591,9 @@ fn spaces_preserve_identity_appearance_and_remote_placement() {
     );
 }
 
-#[test]
-fn space_creation_rejects_blank_values_and_uniquifies_names() {
-    let (_directory, mut repository) = repository();
-
-    assert!(
-        repository
-            .create_space(
-                "   ",
-                DEFAULT_SPACE_ICON,
-                DEFAULT_SPACE_COLOR,
-                false,
-                SpaceMuxOverride::default(),
-                false,
-            )
-            .expect("reject blank name")
-            .is_none()
-    );
-    repository
-        .create_space(
-            "Review",
-            DEFAULT_SPACE_ICON,
-            DEFAULT_SPACE_COLOR,
-            false,
-            SpaceMuxOverride::default(),
-            false,
-        )
-        .expect("create first space")
-        .expect("valid first space");
-    let duplicate = repository
-        .create_space(
-            "review",
-            DEFAULT_SPACE_ICON,
-            DEFAULT_SPACE_COLOR,
-            false,
-            SpaceMuxOverride::default(),
-            false,
-        )
-        .expect("create duplicate space")
-        .expect("valid duplicate space");
-
-    assert_eq!(duplicate.name(), "review 2");
-}
-
-#[test]
-fn session_membership_is_binding_scoped_and_persists() {
-    let (directory, mut repository) = repository();
+#[rstest]
+fn session_membership_is_binding_scoped_and_persists(repository: (TempDir, LoadedRepository)) {
+    let (directory, mut repository) = repository;
     let first_binding = repository.default_space().expect("default Space");
     let second_space = repository
         .create_space(
@@ -762,6 +622,8 @@ fn session_membership_is_binding_scoped_and_persists() {
     }
     second.claim(session("id-5", "other"));
     assert!(first.move_before("id-3", Some("id-1")));
+    first.set_display_name("id-1", "agents/main", true);
+    assert!(!first.retain_alive(&std::collections::HashSet::new()));
 
     let first_scope = first_binding;
     repository
@@ -772,13 +634,17 @@ fn session_membership_is_binding_scoped_and_persists() {
         .expect("commit second binding");
 
     repository = LoadedRepository::open(&directory.path().join("config.toml"));
+    let first = repository
+        .sessions(first_binding)
+        .expect("reopened first binding");
     assert_eq!(
-        backend_names(
-            &repository
-                .sessions(first_binding)
-                .expect("reopened first binding")
-        ),
+        backend_names(&first),
         vec!["agents", "arc/migrations", "arc/readiness", "bootty"]
+    );
+    let named = first.get("id-1").expect("named session");
+    assert_eq!(
+        (named.label(), named.backend_name.as_str(), named.explicit),
+        ("agents/main", "arc/migrations", true)
     );
     assert_eq!(
         backend_names(
@@ -791,54 +657,11 @@ fn session_membership_is_binding_scoped_and_persists() {
     );
 }
 
-/// A backend that answers with nothing has not told us the Space emptied, only that it has not
-/// answered yet.
-#[test]
-fn an_empty_backend_refresh_does_not_erase_the_claimed_sessions() {
-    let (directory, mut repository) = repository();
-    let binding = repository.default_space().expect("default Space");
-    let mut sessions = repository.sessions(binding).expect("binding membership");
-    sessions.claim(session("id-1", "first"));
-    sessions.claim(session("id-2", "second"));
-    assert!(sessions.move_before("id-2", Some("id-1")));
-    assert!(!sessions.retain_alive(&std::collections::HashSet::new()));
-    let scope = binding;
-    repository
-        .commit_binding_state(scope, &sessions)
-        .expect("commit membership");
-
-    let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
-    assert_eq!(
-        backend_names(&reopened.sessions(binding).expect("reopened binding")),
-        vec!["second", "first"]
-    );
-}
-
-/// The name bootty shows is stored against the identity, so a backend that had to add a uniqueness
-/// suffix does not push that suffix into the sidebar.
-#[test]
-fn the_shown_name_survives_a_backend_name_the_server_had_to_uniquify() {
-    let (directory, mut repository) = repository();
-    let binding = repository.default_space().expect("default Space");
-    let mut sessions = repository.sessions(binding).expect("binding membership");
-    sessions.claim(session("id-1", "agents/main-2"));
-    sessions.set_display_name("id-1", "agents/main", true);
-    let scope = binding;
-    repository
-        .commit_binding_state(scope, &sessions)
-        .expect("commit membership");
-
-    let reopened = LoadedRepository::open(&directory.path().join("config.toml"));
-    let sessions = reopened.sessions(binding).expect("reopened binding");
-    let claimed = sessions.get("id-1").expect("the claimed session");
-    assert_eq!(claimed.label(), "agents/main");
-    assert_eq!(claimed.backend_name, "agents/main-2");
-    assert!(claimed.explicit);
-}
-
-#[test]
-fn a_failed_binding_commit_keeps_the_committed_snapshot_and_database() {
-    let (directory, mut repository) = repository();
+#[rstest]
+fn a_failed_binding_commit_keeps_the_committed_snapshot_and_database(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (directory, mut repository) = repository;
     let binding = repository.default_space().expect("default Space");
     let scope = binding;
     let mut committed = repository.sessions(binding).expect("binding membership");
@@ -864,9 +687,11 @@ fn a_failed_binding_commit_keeps_the_committed_snapshot_and_database() {
     assert_eq!(reopened.sessions(binding), Some(committed));
 }
 
-#[test]
-fn a_stranded_mutation_does_not_block_a_change_to_another_session() {
-    let (_directory, mut repository) = repository();
+#[rstest]
+fn a_stranded_mutation_does_not_block_a_change_to_another_session(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (_directory, mut repository) = repository;
     let scope = repository.spaces()[0].binding().mux_scope();
     let stranded = BindingMembershipMutation::Create {
         identity: "stranded-id".to_owned(),
@@ -889,62 +714,31 @@ fn a_stranded_mutation_does_not_block_a_change_to_another_session() {
     repository
         .begin_binding_membership_mutation(scope, &next)
         .expect("a stranded entry does not block the next change");
-
+    let replacement = BindingMembershipMutation::Create {
+        identity: "next-id".to_owned(),
+        session_name: "replacement".to_owned(),
+        display_name: "replacement".to_owned(),
+        explicit: true,
+        cwd: String::new(),
+    };
+    repository
+        .begin_binding_membership_mutation(scope, &replacement)
+        .unwrap();
     let pending = repository
         .pending_binding_membership_mutations(scope)
         .expect("read the pending mutations");
     assert_eq!(
         pending
             .iter()
-            .map(|pending| pending.mutation().clone())
+            .map(|entry| entry.mutation())
             .collect::<Vec<_>>(),
-        [next, stranded],
-        "operations on different sessions do not collide"
+        [&replacement, &stranded],
     );
 }
 
-/// A second operation on the *same* session replaces the first rather than erroring: the older one
-/// is exactly what reconciliation would discard.
-#[test]
-fn a_second_mutation_on_one_session_supersedes_the_first() {
-    let (_directory, mut repository) = repository();
-    let scope = repository.spaces()[0].binding().mux_scope();
-    for name in ["first-name", "second-name"] {
-        repository
-            .begin_binding_membership_mutation(
-                scope,
-                &BindingMembershipMutation::Create {
-                    identity: "one-session".to_owned(),
-                    session_name: name.to_owned(),
-                    display_name: name.to_owned(),
-                    explicit: true,
-                    cwd: String::new(),
-                },
-            )
-            .expect("journal the mutation");
-    }
-
-    let pending = repository
-        .pending_binding_membership_mutations(scope)
-        .expect("read the pending mutations");
-    assert_eq!(pending.len(), 1);
-    assert!(matches!(
-        pending[0].mutation(),
-        BindingMembershipMutation::Create { session_name, .. } if session_name == "second-name"
-    ));
-}
-
-/// A journal left over from an older shape is rebuilt, not carried.
-///
-/// The intent journal gained its identity key in one revision and lost its `binding_id` in another,
-/// but `CREATE TABLE IF NOT EXISTS` leaves whatever is already there. A database that kept the old
-/// shape still had a foreign key into `workspace_bindings`, so folding that table away turned every
-/// membership change — every ditch, every rename — into
-/// `no such table: main.workspace_bindings`. Opening the database has to repair it, because a user
-/// cannot.
 #[test]
 fn a_journal_from_an_older_shape_is_rebuilt_on_open() {
-    let directory = tempfile::tempdir().expect("temporary workspace");
+    let directory = TempDir::new().expect("temporary workspace");
     let config_path = directory.path().join("config.toml");
     let database = directory.path().join("session-order.sqlite3");
     let connection = Connection::open(&database).expect("open workspace database");
@@ -952,51 +746,12 @@ fn a_journal_from_an_older_shape_is_rebuilt_on_open() {
         .execute_batch(
             r"
             PRAGMA user_version = 4;
-            CREATE TABLE workspace_spaces (
-                id INTEGER PRIMARY KEY,
-                remote_id TEXT UNIQUE,
-                name TEXT NOT NULL,
-                icon TEXT NOT NULL,
-                color TEXT NOT NULL,
-                tint_sidebar INTEGER NOT NULL,
-                position INTEGER NOT NULL UNIQUE
-            );
-            CREATE TABLE workspace_bindings (
-                id INTEGER PRIMARY KEY,
-                space_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                hide_tmux_status INTEGER NOT NULL,
-                remote TEXT
-            );
-            CREATE TABLE workspace_sessions (
-                identity TEXT PRIMARY KEY,
-                binding_id INTEGER NOT NULL,
-                backend_name TEXT NOT NULL,
-                display_name TEXT NOT NULL DEFAULT '',
-                explicit INTEGER NOT NULL DEFAULT 0,
-                cwd TEXT NOT NULL DEFAULT '',
-                position INTEGER NOT NULL
-            );
-            CREATE TABLE workspace_window_state (
-                window_key TEXT PRIMARY KEY,
-                selected_space_id INTEGER NOT NULL
-            );
-            -- The shape that survived: keyed by identity, but still carrying the binding it was
-            -- written against.
-            CREATE TABLE workspace_pending_binding_operations (
-                identity TEXT PRIMARY KEY,
-                space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
-                binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
-                operation TEXT NOT NULL,
-                old_name TEXT,
-                new_name TEXT,
-                display_name TEXT,
-                explicit INTEGER,
-                cwd TEXT
-            );
-            INSERT INTO workspace_spaces
-                (id, remote_id, name, icon, color, tint_sidebar, position)
+            CREATE TABLE workspace_spaces (id INTEGER PRIMARY KEY, remote_id TEXT UNIQUE, name TEXT NOT NULL, icon TEXT NOT NULL, color TEXT NOT NULL, tint_sidebar INTEGER NOT NULL, position INTEGER NOT NULL UNIQUE);
+            CREATE TABLE workspace_bindings (id INTEGER PRIMARY KEY, space_id INTEGER NOT NULL, name TEXT NOT NULL, backend TEXT NOT NULL, hide_tmux_status INTEGER NOT NULL, remote TEXT);
+            CREATE TABLE workspace_sessions (identity TEXT PRIMARY KEY, binding_id INTEGER NOT NULL, backend_name TEXT NOT NULL, display_name TEXT NOT NULL DEFAULT '', explicit INTEGER NOT NULL DEFAULT 0, cwd TEXT NOT NULL DEFAULT '', position INTEGER NOT NULL);
+            CREATE TABLE workspace_window_state (window_key TEXT PRIMARY KEY, selected_space_id INTEGER NOT NULL);
+            CREATE TABLE workspace_pending_binding_operations (identity TEXT PRIMARY KEY, space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE, binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE, operation TEXT NOT NULL, old_name TEXT, new_name TEXT, display_name TEXT, explicit INTEGER, cwd TEXT);
+            INSERT INTO workspace_spaces (id, remote_id, name, icon, color, tint_sidebar, position)
             VALUES (1, 'remote-1', 'Work', 'star', '#010203', 0, 0);
             INSERT INTO workspace_bindings (id, space_id, name, backend, hide_tmux_status, remote)
             VALUES (1, 1, 'Default Binding', 'tmux', 0, NULL);
@@ -1011,7 +766,6 @@ fn a_journal_from_an_older_shape_is_rebuilt_on_open() {
         WorkspaceRepository::open(&config_path).expect("migrate workspace");
     let scope = snapshot.spaces()[0].binding().mux_scope();
 
-    // A ditch journals before it calls the backend, which is where this failed.
     repository
         .begin_binding_membership_mutation(
             scope,

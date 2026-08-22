@@ -13,24 +13,16 @@ use bootty_mux::{
     controller::SpaceId,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
-use egui::{Color32, Event, Key, Modifiers};
+use egui::{Color32, Key, Modifiers};
+use pretty_assertions::{assert_eq, assert_ne};
+use proptest::prelude::*;
+use rstest::rstest;
 
 #[cfg(windows)]
 use bootty_app::strings::home_dir;
 
-fn key_event(key: Key) -> Event {
-    Event::Key {
-        key,
-        physical_key: None,
-        pressed: true,
-        repeat: false,
-        modifiers: Modifiers::NONE,
-    }
-}
-
-fn scope(space_id: i64) -> SpaceId {
-    SpaceId::from_persistence(space_id)
-}
+#[path = "support/events.rs"]
+mod events;
 
 fn session(id: &str, name: &str) -> MuxSession {
     MuxSession {
@@ -47,61 +39,89 @@ fn session(id: &str, name: &str) -> MuxSession {
     }
 }
 
-#[test]
-fn csv_fields_quote_only_values_that_require_it() {
-    assert_eq!(csv_field("arc/dblclick"), "arc/dblclick");
-    assert_eq!(csv_field("a,b"), "\"a,b\"");
-    assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
-    assert_eq!(csv_field("a\nb"), "\"a\nb\"");
+fn opaque(r: u8, g: u8, b: u8) -> Color {
+    Color { r, g, b, a: 0xff }
 }
 
-#[test]
-fn truncated_labels_append_exact_truncated_and_zero_width_values() {
-    let mut exact = String::from("prefix ");
-    push_truncated_label(&mut exact, "abcd", 4);
-    assert_eq!(exact, "prefix abcd");
-
-    let mut truncated = String::new();
-    push_truncated_label(&mut truncated, "abcde", 4);
-    assert_eq!(truncated, "abc…");
-
-    let mut zero = String::from("prefix");
-    push_truncated_label(&mut zero, "abc", 0);
-    assert_eq!(zero, "prefix");
+#[derive(Debug, proptest_derive::Arbitrary)]
+struct SessionNameInput {
+    #[proptest(regex = "[a-z]{1,8}(/[a-z]{1,8})?")]
+    base: String,
+    #[proptest(strategy = "0usize..32")]
+    collision_count: usize,
 }
 
-#[test]
-fn session_names_suffix_only_real_collisions() {
-    assert_eq!(
-        unique_session_name("bootty/review", ["bootty/review", "bootty/review-2"]),
-        "bootty/review-3"
-    );
-    assert_eq!(unique_session_name("scratch", ["scratch"]), "scratch-2");
-    assert_eq!(
-        unique_session_name("bootty/main", ["other/main"]),
-        "bootty/main"
-    );
+#[derive(Debug, proptest_derive::Arbitrary)]
+struct SessionNameRecognitionInput {
+    #[proptest(regex = "[a-z]{1,8}(/[a-z]{1,8})?")]
+    base: String,
+    suffix: u16,
+    #[proptest(regex = "[a-z]{1,8}")]
+    invalid_suffix: String,
 }
 
-#[test]
-fn generated_session_names_require_a_numeric_suffix_on_the_same_leaf() {
-    assert!(is_uniquified_session_name("bootty/main", "bootty/main"));
-    assert!(is_uniquified_session_name("bootty/main-2", "bootty/main"));
-    assert!(is_uniquified_session_name("bootty/main-13", "bootty/main"));
-    assert!(is_uniquified_session_name("scratch-2", "scratch"));
+#[rstest]
+#[case::exact("prefix ", "abcd", 4, "prefix abcd")]
+#[case::truncated("", "abcde", 4, "abc…")]
+#[case::zero_width("prefix", "abc", 0, "prefix")]
+fn truncated_labels_append_the_value_within_the_width(
+    #[case] prefix: &str,
+    #[case] value: &str,
+    #[case] width: usize,
+    #[case] expected: &str,
+) {
+    let mut output = prefix.to_owned();
+    push_truncated_label(&mut output, value, width);
+    assert_eq!(output, expected);
+}
 
-    assert!(!is_uniquified_session_name("bootty/release", "bootty/main"));
-    assert!(!is_uniquified_session_name(
-        "bootty/main-next",
-        "bootty/main"
-    ));
-    assert!(!is_uniquified_session_name("bootty/main-", "bootty/main"));
-    assert!(!is_uniquified_session_name("other/main-2", "bootty/main"));
-    assert!(!is_uniquified_session_name("bootty/main", "bootty/main-2"));
-    assert!(!is_uniquified_session_name(
-        "bootty/mainline-2",
-        "bootty/main"
-    ));
+proptest! {
+    /// Property: CSV escaping is identity for safe fields and otherwise quotes exactly once while
+    /// doubling every embedded quote.
+    #[test]
+    fn csv_fields_escape_only_csv_metacharacters(value in "(?s).{0,64}") {
+        let expected = if value.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", value.replace('"', "\"\""))
+        } else {
+            value.clone()
+        };
+        prop_assert_eq!(csv_field(&value), expected);
+    }
+
+    /// Property: contiguous collisions choose the first available numeric suffix on the same leaf.
+    #[test]
+    fn generated_session_name_chooses_the_first_available_suffix(input in any::<SessionNameInput>()) {
+        let SessionNameInput { base, collision_count } = input;
+        let existing = (0..collision_count)
+            .map(|index| if index == 0 { base.clone() } else { format!("{base}-{}", index + 1) })
+            .collect::<Vec<_>>();
+        let expected = if collision_count == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{}", collision_count + 1)
+        };
+
+        prop_assert_eq!(unique_session_name(&base, existing.iter().map(String::as_str)), expected);
+    }
+
+    /// Property: only the base or a numeric suffix on the same complete leaf is recognized.
+    #[test]
+    fn generated_session_name_recognition_matches_the_leaf_grammar(
+        input in any::<SessionNameRecognitionInput>(),
+    ) {
+        let SessionNameRecognitionInput { base, suffix, invalid_suffix } = input;
+        let valid_suffix = format!("{base}-{suffix}");
+        let invalid_suffix = format!("{base}-{invalid_suffix}");
+        let other_path = format!("elsewhere/{base}-2");
+        let suffixed_base = format!("{base}-2");
+        let different_leaf = format!("{base}line-2");
+        prop_assert!(is_uniquified_session_name(&base, &base));
+        prop_assert!(is_uniquified_session_name(&valid_suffix, &base));
+        prop_assert!(!is_uniquified_session_name(&invalid_suffix, &base));
+        prop_assert!(!is_uniquified_session_name(&other_path, &base));
+        prop_assert!(!is_uniquified_session_name(&base, &suffixed_base));
+        prop_assert!(!is_uniquified_session_name(&different_leaf, &base));
+    }
 }
 
 #[cfg(windows)]
@@ -117,83 +137,41 @@ fn home_expansion_accepts_the_windows_separator() {
     );
 }
 
-#[test]
-fn sidebar_focus_routes_navigation_away_from_the_terminal() {
+#[rstest]
+#[case(InputFocus::Sidebar, 0, 4)]
+#[case(InputFocus::Terminal, 4, 0)]
+fn focus_routes_keyboard_input_to_one_owner(
+    #[case] focus: InputFocus,
+    #[case] terminal_events: usize,
+    #[case] ui_events: usize,
+) {
     let routed = route_events(
-        InputFocus::Sidebar,
+        focus,
         vec![
-            key_event(Key::J),
-            key_event(Key::K),
-            key_event(Key::ArrowDown),
-            key_event(Key::ArrowUp),
+            events::key_event(Key::J, Modifiers::NONE),
+            events::key_event(Key::K, Modifiers::NONE),
+            events::key_event(Key::ArrowDown, Modifiers::NONE),
+            events::key_event(Key::ArrowUp, Modifiers::NONE),
         ],
     );
 
-    assert!(routed.terminal_events.is_empty());
-    assert_eq!(routed.ui_events.len(), 4);
-}
-
-#[test]
-fn terminal_focus_routes_input_to_the_terminal() {
-    let routed = route_events(InputFocus::Terminal, vec![key_event(Key::J)]);
-
-    assert_eq!(routed.terminal_events.len(), 1);
-    assert!(routed.ui_events.is_empty());
+    assert_eq!(routed.terminal_events.len(), terminal_events);
+    assert_eq!(routed.ui_events.len(), ui_events);
 }
 
 #[test]
 fn configured_terminal_colors_drive_the_ui_palette() {
     let mut config = BoottyConfig::default();
     let colors = &mut config.appearance.dark.colors;
-    colors.background = Some(Color {
-        r: 1,
-        g: 2,
-        b: 3,
-        a: 0xff,
-    });
-    colors.foreground = Some(Color {
-        r: 240,
-        g: 241,
-        b: 242,
-        a: 0xff,
-    });
+    colors.background = Some(opaque(1, 2, 3));
+    colors.foreground = Some(opaque(240, 241, 242));
     colors.palette = vec![
-        Color {
-            r: 0,
-            g: 0,
-            b: 0,
-            a: 0xff,
-        },
-        Color {
-            r: 100,
-            g: 0,
-            b: 0,
-            a: 0xff,
-        },
-        Color {
-            r: 0,
-            g: 100,
-            b: 0,
-            a: 0xff,
-        },
-        Color {
-            r: 100,
-            g: 80,
-            b: 0,
-            a: 0xff,
-        },
-        Color {
-            r: 0,
-            g: 0,
-            b: 100,
-            a: 0xff,
-        },
-        Color {
-            r: 80,
-            g: 0,
-            b: 100,
-            a: 0xff,
-        },
+        opaque(0, 0, 0),
+        opaque(100, 0, 0),
+        opaque(0, 100, 0),
+        opaque(100, 80, 0),
+        opaque(0, 0, 100),
+        opaque(80, 0, 100),
     ];
 
     let palette = theme_palette_from_colors(colors);
@@ -209,7 +187,7 @@ fn configured_terminal_colors_drive_the_ui_palette() {
 #[test]
 fn colliding_backend_session_ids_remain_scoped_navigation_targets() {
     let local = BindingSessionGroup {
-        scope: scope(10),
+        scope: SpaceId::from_persistence(10),
         label: "Local".to_owned(),
         sessions: vec![session("$1", "work")],
         selected_session: Some("$1".to_owned()),
@@ -218,7 +196,7 @@ fn colliding_backend_session_ids_remain_scoped_navigation_targets() {
         display_names: HashMap::new(),
     };
     let remote = BindingSessionGroup {
-        scope: scope(20),
+        scope: SpaceId::from_persistence(20),
         label: "Remote".to_owned(),
         sessions: vec![session("$1", "work")],
         selected_session: Some("$1".to_owned()),

@@ -28,5 +28,10 @@ bootty-surface = { path = "../bootty-surface", optional = true }
 bootty-terminal = { path = "../bootty-terminal", optional = true }
 
 [dev-dependencies]
+assert_fs.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true
+rstest.workspace = true
 serde_json.workspace = true
-tempfile.workspace = true
+static_assertions.workspace = true

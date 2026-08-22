@@ -1,5 +1,6 @@
 use bootty_ui::{ThemePalette, keycaps::trigger_galley};
 use eframe::egui::{self, Color32, RawInput};
+use pretty_assertions::assert_eq;
 
 #[test]
 fn public_keycap_layout_normalizes_named_and_single_character_keys() {

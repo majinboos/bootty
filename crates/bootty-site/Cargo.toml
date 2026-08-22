@@ -14,3 +14,8 @@ serde-wasm-bindgen.workspace = true
 syntect.workspace = true
 tuirealm.workspace = true
 wasm-bindgen.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+proptest.workspace = true
+rstest.workspace = true

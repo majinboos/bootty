@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use pretty_assertions::assert_eq;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -17,11 +18,20 @@ const ONE_PIXEL_PNG_APC: &str = concat!(
 );
 
 fn test_terminal_engine() -> Result<TerminalEngine> {
+    image_terminal_engine(10, 4, 8, 16)
+}
+
+fn image_terminal_engine(
+    cols: u16,
+    rows: u16,
+    cell_width: u32,
+    cell_height: u32,
+) -> Result<TerminalEngine> {
     TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 4,
-        cell_width: 8,
-        cell_height: 16,
+        cols,
+        rows,
+        cell_width,
+        cell_height,
     })
 }
 
@@ -168,8 +178,6 @@ struct TempFixture {
     path: PathBuf,
 }
 
-impl TempFixture {}
-
 impl AsRef<std::path::Path> for TempFixture {
     fn as_ref(&self) -> &std::path::Path {
         &self.path
@@ -225,12 +233,7 @@ fn file_payload(path: impl AsRef<std::path::Path>) -> Result<String> {
 }
 
 fn storage_test_engine() -> Result<TerminalEngine> {
-    TerminalEngine::new(TerminalGeometry {
-        cols: 100,
-        rows: 100,
-        cell_width: 1,
-        cell_height: 1,
-    })
+    image_terminal_engine(100, 100, 1, 1)
 }
 
 fn image_placement_ids(frame: &RenderFrame) -> Vec<(u32, u32)> {
@@ -380,12 +383,7 @@ fn terminal_engine_decodes_kitty_png_payloads_into_image_frame() -> Result<()> {
 
 #[test]
 fn terminal_engine_direct_kitty_image_uses_full_intrinsic_height() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(80, 24, 10, 20)?;
     engine.write_vt(raw_rgb_command_dimensions_with_options(90, 1, 400, 66, "q=1").as_bytes());
 
     let frame = engine.extract_frame()?;
@@ -404,12 +402,7 @@ fn terminal_engine_direct_kitty_image_uses_full_intrinsic_height() -> Result<()>
 
 #[test]
 fn terminal_engine_direct_kitty_image_scales_intrinsic_pixels_to_logical_points() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(80, 24, 10, 20)?;
     engine.set_display_scale(2.0);
     engine.write_vt(raw_rgb_command_dimensions_with_options(91, 1, 30, 40, "q=1").as_bytes());
 
@@ -625,12 +618,7 @@ fn terminal_engine_ports_kitty_storage_delete_by_cursor_column_and_row() -> Resu
 
 #[test]
 fn terminal_engine_ports_kitty_storage_single_axis_aspect_ratio() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 100,
-        rows: 100,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(100, 100, 10, 20)?;
     let bytes = vec![0xff; 16 * 9 * 4];
     let payload = base64_encode_bytes(&bytes);
 
@@ -1020,12 +1008,7 @@ fn terminal_engine_exposes_kitty_virtual_placement_metadata() -> Result<()> {
 #[test]
 fn terminal_engine_resolves_palette_colored_virtual_placeholder_when_storage_is_unique()
 -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 3,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(10, 3, 10, 20)?;
     let image_id = 525_626_113;
 
     engine.write_vt(
@@ -1048,12 +1031,7 @@ fn terminal_engine_resolves_palette_colored_virtual_placeholder_when_storage_is_
 
 #[test]
 fn terminal_engine_reports_only_rows_with_actual_virtual_placeholder_cells() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 3,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(10, 3, 10, 20)?;
 
     engine.write_vt(raw_rgb_transmit_command(93, 10, 20).as_bytes());
     engine.write_vt(b"\x1b_Ga=p,U=1,i=93,c=1,r=1,q=1\x1b\\");
@@ -1076,12 +1054,7 @@ fn terminal_engine_reports_only_rows_with_actual_virtual_placeholder_cells() -> 
 
 #[test]
 fn terminal_engine_keeps_timg_sized_virtual_image_out_of_following_text_row() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 213,
-        rows: 51,
-        cell_width: 8,
-        cell_height: 16,
-    })?;
+    let mut engine = image_terminal_engine(213, 51, 8, 16)?;
     let image_id = 94;
     let placeholder_row = unicode_placeholder_row(121);
 
@@ -1129,12 +1102,7 @@ fn terminal_engine_keeps_timg_sized_virtual_image_out_of_following_text_row() ->
 
 #[test]
 fn terminal_engine_keeps_real_timg_tmux_canvas_out_of_two_line_prompt() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 213,
-        rows: 52,
-        cell_width: 7,
-        cell_height: 23,
-    })?;
+    let mut engine = image_terminal_engine(213, 52, 7, 23)?;
     let image_id = 95;
     let placeholder_row = unicode_placeholder_row(123);
 
@@ -1190,12 +1158,7 @@ fn terminal_engine_keeps_real_timg_tmux_canvas_out_of_two_line_prompt() -> Resul
 
 #[test]
 fn terminal_engine_virtual_wide_image_slices_merge_to_full_source_height() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(80, 24, 10, 20)?;
     let image_id = 96;
 
     engine.write_vt(
@@ -1229,12 +1192,7 @@ fn terminal_engine_virtual_wide_image_slices_merge_to_full_source_height() -> Re
 
 #[test]
 fn terminal_engine_merges_adjacent_virtual_image_rows() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 4,
-        rows: 3,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(4, 3, 10, 20)?;
 
     let row0 = format!(
         "{}{}",
@@ -1270,12 +1228,7 @@ fn terminal_engine_merges_adjacent_virtual_image_rows() -> Result<()> {
 
 #[test]
 fn native_kitty_image_disappears_after_screen_clear() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 4, 10, 20)?;
 
     engine.write_vt(
         raw_rgb_command_dimensions_with_options(99, 1, 40, 60, "c=4,r=3,C=1,q=1").as_bytes(),
@@ -1306,12 +1259,7 @@ fn native_kitty_image_disappears_after_screen_clear() -> Result<()> {
 
 #[test]
 fn native_kitty_image_survives_reserved_rows_before_first_frame() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 4, 10, 20)?;
 
     engine.write_vt(
         raw_rgb_command_dimensions_with_options(101, 1, 40, 40, "c=4,r=2,C=1,q=1").as_bytes(),
@@ -1333,12 +1281,7 @@ fn native_kitty_image_survives_reserved_rows_before_first_frame() -> Result<()> 
 
 #[test]
 fn native_kitty_image_survives_preceding_command_text_and_reserved_rows() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 6,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 6, 10, 20)?;
 
     engine.write_vt(b"clear; show-image\r\n");
     engine.write_vt(
@@ -1357,12 +1300,7 @@ fn native_kitty_image_survives_preceding_command_text_and_reserved_rows() -> Res
 
 #[test]
 fn native_kitty_image_excludes_marker_after_declared_reserved_rows() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 40,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(80, 40, 10, 20)?;
 
     engine.write_vt(
         raw_rgb_command_dimensions_with_options(105, 1, 600, 480, "c=60,r=24,C=1,q=1").as_bytes(),
@@ -1384,12 +1322,7 @@ fn native_kitty_image_excludes_marker_after_declared_reserved_rows() -> Result<(
 }
 #[test]
 fn native_kitty_image_survives_blank_reserved_rows_after_first_frame() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 4, 10, 20)?;
 
     engine.write_vt(
         raw_rgb_command_dimensions_with_options(102, 1, 40, 40, "c=4,r=2,C=1,q=1").as_bytes(),
@@ -1419,12 +1352,7 @@ fn native_kitty_image_survives_blank_reserved_rows_after_first_frame() -> Result
 }
 #[test]
 fn native_kitty_image_reappears_after_temporary_text_overlap() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 4, 10, 20)?;
 
     engine.write_vt(
         raw_rgb_command_dimensions_with_options(100, 1, 40, 60, "c=4,r=3,C=1,q=1").as_bytes(),
@@ -1467,12 +1395,7 @@ fn native_kitty_image_reappears_after_temporary_text_overlap() -> Result<()> {
 
 #[test]
 fn native_kitty_image_survives_same_row_text_outside_declared_columns() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 4, 10, 20)?;
 
     engine.write_vt(
         raw_rgb_command_dimensions_with_options(101, 1, 40, 40, "c=4,r=2,C=1,q=1").as_bytes(),
@@ -1729,12 +1652,7 @@ fn tmux_style_virtual_image_transmit_tracks_scrollback_viewport_rows() -> Result
 
 #[test]
 fn tmux_style_virtual_image_clears_when_placeholder_cells_are_removed() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 3,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 3, 10, 20)?;
     let image_id = 99;
     let first_row = unicode_placeholder_grid_row(0, 2);
     let second_row = unicode_placeholder_grid_row(1, 2);
@@ -1766,12 +1684,7 @@ fn tmux_style_virtual_image_clears_when_placeholder_cells_are_removed() -> Resul
 
 #[test]
 fn virtual_image_reuses_cached_pixels_across_dirty_frames() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 12,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(12, 4, 10, 20)?;
 
     engine.write_vt(raw_rgb_transmit_command(104, 20, 20).as_bytes());
     engine.write_vt(b"\x1b_Ga=p,U=1,i=104,c=2,r=1,q=1\x1b\\");
@@ -1807,12 +1720,7 @@ fn virtual_image_reuses_cached_pixels_across_dirty_frames() -> Result<()> {
 
 #[test]
 fn terminal_engine_virtual_image_infers_grid_from_logical_image_size() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(10, 4, 10, 20)?;
     engine.set_display_scale(2.0);
 
     engine.write_vt(raw_rgb_transmit_command(105, 20, 40).as_bytes());
@@ -1839,12 +1747,7 @@ fn terminal_engine_virtual_image_infers_grid_from_logical_image_size() -> Result
 
 #[test]
 fn terminal_engine_virtual_image_uses_render_cell_metrics_for_destination() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 120,
-        rows: 4,
-        cell_width: 5,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(120, 4, 5, 20)?;
     engine.set_render_cell_metrics(CellMetrics::new(4.5, 20.0));
 
     engine.write_vt(raw_rgb_transmit_command(106, 18, 20).as_bytes());
@@ -1874,12 +1777,7 @@ fn terminal_engine_virtual_image_uses_render_cell_metrics_for_destination() -> R
 
 #[test]
 fn terminal_engine_virtual_cover_image_uses_full_grid_width_for_centered_rows() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 8,
-        cell_height: 22,
-    })?;
+    let mut engine = image_terminal_engine(80, 24, 8, 22)?;
     engine.set_render_cell_metrics(CellMetrics::new(8.125, 22.3125));
 
     engine.write_vt(raw_rgb_transmit_command(107, 512, 512).as_bytes());
@@ -1912,12 +1810,7 @@ fn terminal_engine_virtual_cover_image_uses_full_grid_width_for_centered_rows() 
 
 #[test]
 fn terminal_engine_virtual_square_image_keeps_full_grid_square() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 8,
-        cell_height: 22,
-    })?;
+    let mut engine = image_terminal_engine(80, 24, 8, 22)?;
     engine.set_render_cell_metrics(CellMetrics::new(22.3125, 22.28125));
 
     engine.write_vt(raw_rgb_transmit_command(108, 512, 512).as_bytes());
@@ -1947,12 +1840,7 @@ fn terminal_engine_virtual_square_image_keeps_full_grid_square() -> Result<()> {
 
 #[test]
 fn terminal_engine_virtual_square_icon_keeps_two_column_row_square() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 8,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(80, 24, 8, 20)?;
 
     engine.write_vt(raw_rgb_transmit_command(109, 24, 24).as_bytes());
     engine.write_vt(b"\x1b_Ga=p,U=1,i=109,c=2,r=1,q=1\x1b\\");
@@ -1978,12 +1866,7 @@ fn terminal_engine_virtual_square_icon_keeps_two_column_row_square() -> Result<(
 
 #[test]
 fn terminal_engine_ports_kitty_unicode_placeholder_runs() -> Result<()> {
-    let mut engine = TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 4,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut engine = image_terminal_engine(10, 4, 10, 20)?;
 
     engine.write_vt(raw_rgb_transmit_command(90, 40, 40).as_bytes());
     engine.write_vt(b"\x1b_Ga=p,U=1,i=90,c=4,r=2,q=1\x1b\\");
@@ -2057,12 +1940,7 @@ fn terminal_engine_ports_kitty_unicode_high_bits_and_placement_id() -> Result<()
 
 #[test]
 fn terminal_engine_ports_kitty_unicode_continuation_edges() -> Result<()> {
-    let mut continued = TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 2,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut continued = image_terminal_engine(10, 2, 10, 20)?;
     continued.write_vt(raw_rgb_transmit_command(91, 100, 20).as_bytes());
     continued.write_vt(b"\x1b_Ga=p,U=1,i=91,c=10,r=1,q=1\x1b\\");
     continued.write_vt("\x1b[38;5;91m\u{10EEEE}\u{10EEEE}\u{10EEEE}\x1b[39m".as_bytes());
@@ -2077,12 +1955,7 @@ fn terminal_engine_ports_kitty_unicode_continuation_edges() -> Result<()> {
     assert_eq!(placement.source.width, 30);
     assert_eq!(placement.destination.width(), 30.0);
 
-    let mut broken = TerminalEngine::new(TerminalGeometry {
-        cols: 10,
-        rows: 2,
-        cell_width: 10,
-        cell_height: 20,
-    })?;
+    let mut broken = image_terminal_engine(10, 2, 10, 20)?;
     broken.write_vt(raw_rgb_transmit_command(92, 100, 20).as_bytes());
     broken.write_vt(b"\x1b_Ga=p,U=1,i=92,c=10,r=1,q=1\x1b\\");
     broken.write_vt(

@@ -1,5 +1,5 @@
 use super::support::*;
-
+use pretty_assertions::assert_eq;
 #[test]
 fn terminal_engine_encodes_focus_reports_only_when_enabled() {
     let mut engine = test_terminal_engine().expect("terminal engine");

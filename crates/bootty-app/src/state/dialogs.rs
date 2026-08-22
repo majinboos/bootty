@@ -108,12 +108,12 @@ impl AppState {
     /// Opens the Space picker for a session, or reports why it cannot move.
     pub fn open_space_picker_for(&mut self, target: &ScopedSessionTarget) -> bool {
         let Some(name) = self.session_display_name(target) else {
-            self.last_error = Some("this session is no longer available".to_owned());
+            self.record_notice(crate::error_catalog::ErrorNotice::SessionUnavailable);
             return false;
         };
         let spaces = self.session_move_targets(target);
         if spaces.iter().all(|space| space.current) {
-            self.last_error = Some("there is nowhere else to move it yet".to_owned());
+            self.record_notice(crate::error_catalog::ErrorNotice::NoSpaceToMoveSession);
             return false;
         }
         self.open_overlay(ModalDialog::SpacePicker(SpacePickerDialog::open(
@@ -134,7 +134,7 @@ impl AppState {
                     &target.session_id,
                     &self.repaint,
                 ) {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                     return;
                 }
                 self.activate_scoped_session_from_ui(&target);
@@ -147,7 +147,7 @@ impl AppState {
             RenameSessionEvent::Rename { session_id, name } => {
                 let name = name.trim().to_owned();
                 if name.is_empty() {
-                    self.last_error = Some("session name cannot be empty".to_owned());
+                    self.record_notice(crate::error_catalog::ErrorNotice::SessionNameEmpty);
                     return;
                 }
                 match self
@@ -157,7 +157,7 @@ impl AppState {
                     Ok(RenameSessionOutcome::Missing | RenameSessionOutcome::Started) => {}
                     Ok(RenameSessionOutcome::Pending) => return,
                     Err(error) => {
-                        self.last_error = Some(error.to_string());
+                        self.record_error(error);
                         return;
                     }
                 }
@@ -199,14 +199,18 @@ impl AppState {
                 match run_ditch_cleanup(cwd.as_deref(), &action) {
                     DitchCleanupOutcome::NoAction(error) => {
                         // Git cleanup failed before any destructive action. Keep the session alive.
-                        self.last_error = Some(format!("ditch: {error}"));
+                        self.record_notice(crate::error_catalog::ErrorNotice::Ditch(format!(
+                            "ditch: {error}"
+                        )));
                         self.workspace
                             .defer_binding_membership_reconciliation(prepared.0);
                         return;
                     }
                     DitchCleanupOutcome::Partial { branch, error } => {
-                        self.last_error = Some(format!(
-                            "ditch warning: worktree removed; branch '{branch}' remains: {error}"
+                        self.record_notice(crate::error_catalog::ErrorNotice::DitchPartial(
+                            format!(
+                                "ditch warning: worktree removed; branch '{branch}' remains: {error}"
+                            ),
                         ));
                     }
                     DitchCleanupOutcome::Complete => {}
@@ -234,7 +238,9 @@ impl AppState {
                     let Some(target) = self.current_command_target_for(&invocation.command, kind)
                     else {
                         self.commands.clear_queue();
-                        self.last_error = Some(format!("no current {kind:?} target is available"));
+                        self.record_notice(crate::error_catalog::ErrorNotice::NoCurrentTarget(
+                            format!("no current {kind:?} target is available"),
+                        ));
                         return;
                     };
                     invocation.target = Some(target);
@@ -275,7 +281,7 @@ impl AppState {
         match event {
             NewSessionPickerEvent::Close => self.dismiss_modal_dialog(),
             NewSessionPickerEvent::Error(error) => {
-                self.last_error = Some(error);
+                self.record_error(error);
             }
             NewSessionPickerEvent::CreateWorktree { repo, branch } => {
                 match bootty_mux::project::add_worktree(&repo, &branch) {
@@ -284,7 +290,9 @@ impl AppState {
                         self.dismiss_modal_dialog();
                     }
                     Err(error) => {
-                        self.last_error = Some(format!("worktree: {error}"));
+                        self.record_notice(crate::error_catalog::ErrorNotice::Worktree(format!(
+                            "worktree: {error}"
+                        )));
                     }
                 }
             }

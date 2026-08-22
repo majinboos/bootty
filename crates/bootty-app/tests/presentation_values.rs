@@ -1,3 +1,4 @@
+use bootty_app::ui::extension_window::filtered;
 use bootty_app::ui::sidebar::{
     build_sidebar_items_from_published_items, session_group, sidebar_session_colors,
 };
@@ -9,9 +10,29 @@ use bootty_mux::{
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag},
 };
 use egui::Color32;
+use pretty_assertions::assert_eq;
+use proptest::prelude::*;
+use rstest::rstest;
 
-fn scope(space_id: i64) -> SpaceId {
-    SpaceId::from_persistence(space_id)
+fn extension_item(key: &str, text: &str) -> ModuleItem {
+    ModuleItem {
+        text: text.to_owned(),
+        key: Some(key.to_owned()),
+        ..ModuleItem::default()
+    }
+}
+
+#[rstest]
+#[case::text("logs", &[1])]
+#[case::key("a", &[0])]
+#[case::empty("", &[0, 1])]
+#[case::missing("zzz", &[])]
+fn extension_filter_matches_item_text_or_key(#[case] query: &str, #[case] expected: &[usize]) {
+    let items = vec![
+        extension_item("a", "Restart server"),
+        extension_item("b", "Open logs"),
+    ];
+    assert_eq!(filtered(&items, query), expected);
 }
 
 fn session(id: &str, name: &str, process: &str) -> MuxSession {
@@ -75,7 +96,12 @@ fn extension_session_rows_keep_identity_style_and_selection() {
             item,
         })
         .collect::<Vec<_>>();
-    let rows = build_sidebar_items_from_published_items(&published, scope(0), Some("$1"), true);
+    let rows = build_sidebar_items_from_published_items(
+        &published,
+        SpaceId::from_persistence(0),
+        Some("$1"),
+        true,
+    );
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].session_id, Some("$1"));
@@ -96,21 +122,26 @@ fn extension_session_rows_keep_identity_style_and_selection() {
     assert_eq!(rows[0].primitives.len(), 1);
 }
 
-#[test]
-fn ungrouped_sessions_receive_distinct_accent_colors() {
-    let sessions = vec![
-        session("local", "local", "zsh"),
-        session("project", "project", "fish"),
-    ];
+proptest! {
+    /// Property: grouping returns exactly the prefix before the first slash.
+    #[test]
+    fn session_grouping_splits_only_at_the_first_slash(
+        segments in proptest::collection::vec("[a-z]{1,12}", 1..8),
+    ) {
+        let name = segments.join("/");
+        prop_assert_eq!(session_group(&name), segments[0].as_str());
+    }
 
-    let colors = sidebar_session_colors(&sessions, &[] as &[String]);
+    /// Property: different ungrouped sessions receive different bright and dim accents.
+    #[test]
+    fn different_ungrouped_sessions_receive_distinct_accents(
+        (first, second) in ("[a-z]{1,12}", "[a-z]{1,12}")
+            .prop_filter("session names differ", |(first, second)| first != second),
+    ) {
+        let sessions = [session("first", &first, "zsh"), session("second", &second, "fish")];
+        let colors = sidebar_session_colors(&sessions, &[] as &[String]);
 
-    assert_eq!(colors.len(), 2);
-    assert_ne!(colors[0].0, colors[1].0);
-    assert_ne!(colors[0].1, colors[1].1);
-}
-
-#[test]
-fn session_grouping_splits_only_at_the_first_slash() {
-    assert_eq!(session_group("a/b/c"), "a");
+        prop_assert_ne!(colors[0].0, colors[1].0);
+        prop_assert_ne!(colors[0].1, colors[1].1);
+    }
 }

@@ -21,6 +21,8 @@ use bootty_workspace::{
     WorkspaceBinding, WorkspaceRepository,
 };
 
+use crate::error_catalog::ErrorNotice;
+
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
 
 pub(crate) enum RemoteCatalogResult {
@@ -43,9 +45,9 @@ impl RemoteCatalogTask {
         profile_id: String,
         profile: SshProfileConfig,
         create: Option<(String, MultiplexerBackendConfig)>,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, String> {
         let permit = RemoteWorkerPermit::acquire()
-            .ok_or("the previous remote Space operation is still stopping")?;
+            .ok_or_else(|| ErrorNotice::RemoteSpaceOperationStopping.to_string())?;
         let (sender, receiver) = mpsc::channel();
         let cancellation = CommandCancellation::default();
         let runner = CancellableCommandRunner::new(cancellation.clone());
@@ -76,7 +78,9 @@ impl RemoteCatalogTask {
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err("remote Space task stopped".to_owned())),
+            Err(TryRecvError::Disconnected) => {
+                Some(Err(ErrorNotice::RemoteSpaceTaskStopped.to_string()))
+            }
         }
     }
 }
@@ -135,7 +139,7 @@ pub fn create(
     backend: MultiplexerBackendConfig,
 ) -> Result<RemoteSpaceSummary> {
     if !backend.supports_remote() {
-        bail!("remote Spaces need tmux or rmux")
+        bail!(ErrorNotice::RemoteSpaceBackendUnsupported.to_string())
     }
     let (mut repository, _) = WorkspaceRepository::open(&config.config_path)?;
     let space = repository
@@ -150,7 +154,7 @@ pub fn create(
             },
             config.multiplexer.hide_tmux_status,
         )?
-        .ok_or_else(|| anyhow::anyhow!("remote Space name cannot be empty"))?;
+        .ok_or_else(|| anyhow::anyhow!(ErrorNotice::RemoteSpaceNameEmpty.to_string()))?;
     Ok(RemoteSpaceSummary {
         catalog_version: REMOTE_SPACE_CATALOG_VERSION,
         id: space.remote_id().to_owned(),
@@ -201,9 +205,14 @@ pub fn execute(
             .sessions
             .iter()
             .find(|session| bootty_mux::snapshot::session_matches(session, session_id))
-            .ok_or_else(|| anyhow::anyhow!("session is unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!(ErrorNotice::SessionUnavailable.to_string()))?;
         if session.tag.space.as_deref() != Some(space_id) {
-            bail!("session does not belong to remote Space {space_id}")
+            bail!(
+                ErrorNotice::SessionDoesNotBelongToRemoteSpace(format!(
+                    "session does not belong to remote Space {space_id}"
+                ))
+                .raw_message()
+            )
         }
     }
     runtime.backend.execute(command)
@@ -224,21 +233,32 @@ fn remote_space_runtime(
         .spaces()
         .iter()
         .find(|space| space.remote_id() == space_id)
-        .ok_or_else(|| anyhow::anyhow!("remote Space {space_id} is unavailable"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                ErrorNotice::RemoteSpaceUnavailable(format!(
+                    "remote Space {space_id} is unavailable"
+                ))
+                .raw_message()
+            )
+        })?;
     let binding = space.binding();
     if !binding_is_local(binding, config) {
-        bail!("remote Space {space_id} points to another SSH host")
+        bail!(
+            ErrorNotice::RemoteSpacePointsToAnotherHost(format!(
+                "remote Space {space_id} points to another SSH host"
+            ))
+            .raw_message()
+        )
     }
     let mut multiplexer = config.multiplexer.clone();
     multiplexer.backend = binding
         .backend_override()
         .unwrap_or(config.multiplexer.backend);
     if multiplexer.backend != expected_backend {
-        bail!(
-            "Remote Space now uses {} instead of {}. Edit this Space and select it again.",
-            backend_name(multiplexer.backend),
-            backend_name(expected_backend)
-        )
+        bail!(ErrorNotice::RemoteSpaceBackendChanged {
+            actual: backend_name(multiplexer.backend).to_owned(),
+            expected: backend_name(expected_backend).to_owned(),
+        })
     }
     multiplexer.remote = None;
     multiplexer.remote_space_id = None;
@@ -372,7 +392,9 @@ fn create_remote_with_runner<R: CommandRunner>(
     let backend = match backend {
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
-        MultiplexerBackendConfig::Native => bail!("remote Spaces need tmux or rmux"),
+        MultiplexerBackendConfig::Native => {
+            bail!(ErrorNotice::RemoteSpaceBackendUnsupported.to_string())
+        }
     };
     let output = run_remote(
         profile,
@@ -430,8 +452,11 @@ fn validate_versions(spaces: &[RemoteSpaceSummary]) -> Result<()> {
         .find(|space| space.catalog_version != REMOTE_SPACE_CATALOG_VERSION)
     {
         bail!(
-            "remote Space catalog version {} is not supported",
-            space.catalog_version
+            ErrorNotice::RemoteSpaceCatalogVersionUnsupported(format!(
+                "remote Space catalog version {} is not supported",
+                space.catalog_version
+            ))
+            .raw_message()
         )
     }
     Ok(())

@@ -14,6 +14,7 @@ use bootty_mux::controller::SpaceId;
 use crate::{
     action_catalog::Command,
     app_actions::{KeybindAction, SidebarAction, keybind_action_for_name},
+    error_catalog::ErrorNotice,
 };
 
 mod runtime;
@@ -123,7 +124,11 @@ impl CommandRegistry {
         let Some(registered) = self.commands.get(&invocation.command) else {
             return Err(CommandOutcome::Failed {
                 code: "unknown_command".to_owned(),
-                message: format!("unknown command {}", invocation.command),
+                message: ErrorNotice::UnknownCommand(format!(
+                    "unknown command {}",
+                    invocation.command
+                ))
+                .raw_message(),
             });
         };
         let descriptor = registered.descriptor.clone();
@@ -132,7 +137,11 @@ impl CommandRegistry {
             CommandExecutorResolver::Keybind => {
                 let Some(action) = keybind_action_for_name(&invocation.action_name()) else {
                     return Err(CommandOutcome::Unsupported {
-                        message: format!("command {} has no app executor", invocation.command),
+                        message: ErrorNotice::CommandHasNoAppExecutor(format!(
+                            "command {} has no app executor",
+                            invocation.command
+                        ))
+                        .raw_message(),
                     });
                 };
                 CoreCommandExecutor::Keybind(action)
@@ -413,12 +422,13 @@ fn validate_arguments(
     if arguments.len() < required || arguments.len() > descriptor.arguments.arguments.len() {
         return Err(CommandOutcome::Failed {
             code: "invalid_arguments".to_owned(),
-            message: format!(
+            message: ErrorNotice::InvalidCommandArguments(format!(
                 "command {} expects {} argument(s), got {}",
                 descriptor.id,
                 descriptor.arguments.arguments.len(),
                 arguments.len()
-            ),
+            ))
+            .raw_message(),
         });
     }
     for (schema, value) in descriptor.arguments.arguments.iter().zip(arguments) {
@@ -441,7 +451,11 @@ fn validate_arguments(
         if !valid {
             return Err(CommandOutcome::Failed {
                 code: "invalid_arguments".to_owned(),
-                message: format!("invalid {} argument for {}", schema.name, descriptor.id),
+                message: ErrorNotice::InvalidCommandArguments(format!(
+                    "invalid {} argument for {}",
+                    schema.name, descriptor.id
+                ))
+                .raw_message(),
             });
         }
     }

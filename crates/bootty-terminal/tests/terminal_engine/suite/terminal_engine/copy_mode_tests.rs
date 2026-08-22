@@ -1,5 +1,6 @@
 use super::super::super::*;
 use super::support::*;
+use pretty_assertions::assert_eq;
 
 fn small_terminal_engine(cols: u16, rows: u16) -> Result<TerminalEngine> {
     TerminalEngine::new_with_scrollback(

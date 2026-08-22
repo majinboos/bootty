@@ -1,6 +1,25 @@
 use bootty_app::ui::settings::surface::SettingsSurface;
+use bootty_app::ui::settings::surface::keybinds::{action_title, humanize_action};
 use bootty_config::settings_schema::SettingsSchema;
 use pretty_assertions::assert_eq;
+use rstest::rstest;
+
+#[rstest]
+#[case::catalog_title("reload_config", "Reload Config")]
+#[case::short_catalog_title("paste_from_clipboard", "Paste")]
+#[case::parameter("decrease_font_size:1", "Decrease Font Size: 1")]
+#[case::choice_title("change_appearance:dark", "Use Dark Appearance")]
+fn action_titles_prefer_catalog_titles_and_keep_params(
+    #[case] action: &str,
+    #[case] expected: &str,
+) {
+    assert_eq!(action_title(action), expected);
+}
+
+#[test]
+fn humanize_action_sentence_cases_names_off_the_catalog() {
+    assert_eq!(humanize_action("focus_terminal"), "Focus terminal");
+}
 
 /// A nav row draws its icon from a slug, and an unresolved slug paints nothing at all -- which is
 /// how the nav quietly lost every icon once before.

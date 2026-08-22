@@ -9,6 +9,7 @@
 
 use bootty_terminal::geometry::TerminalGeometry;
 use bootty_terminal::terminal::TerminalEngine;
+use pretty_assertions::assert_eq;
 
 fn engine(cols: u16, rows: u16) -> TerminalEngine {
     TerminalEngine::new(TerminalGeometry {

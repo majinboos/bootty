@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use super::recorded_chord::normalize_recorded_chord;
 use super::{AppEffect, AppState, ViewportSnapshot};
 use crate::app_actions::{SidebarAction, builtin_app_invocation_for_direct_key};
+use crate::error_catalog::ErrorNotice;
 use crate::input::{
     InputSnapshot, TerminalInputCommand,
     focus::InputFocus,
@@ -18,7 +19,7 @@ use crate::ui::terminal_find::TerminalFindDialog;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LocalFileHandoff {
     Ready(String),
-    Rejected(&'static str),
+    Rejected(ErrorNotice),
 }
 
 impl AppState {
@@ -231,18 +232,18 @@ impl AppState {
             return 0;
         }
         if self.workspace.active.binding.multiplexer.remote.is_some() {
-            self.last_error = Some("File handoff to remote Spaces is not supported.".to_owned());
+            self.record_notice(crate::error_catalog::ErrorNotice::RemoteFileHandoffUnsupported);
             return 0;
         }
         let text = match local_file_handoff(&paths) {
             LocalFileHandoff::Ready(text) => text,
-            LocalFileHandoff::Rejected(message) => {
-                self.last_error = Some(message.to_owned());
+            LocalFileHandoff::Rejected(notice) => {
+                self.record_notice(notice);
                 return 0;
             }
         };
         if let Err(error) = self.workspace.active.binding.terminal.write_paste(&text) {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
             return 0;
         }
         1
@@ -272,7 +273,7 @@ impl AppState {
         {
             Ok(active) => active,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 false
             }
         };
@@ -426,7 +427,7 @@ impl AppState {
             } => (terminal.handle_mouse_wheel(input, scroll_delta), false),
         };
         if let Err(error) = result {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
         } else if hides_pointer {
             self.hide_mouse_pointer_for_terminal_typing(effects);
         }
@@ -478,11 +479,15 @@ fn event_is_terminal_pointer(event: &egui::Event) -> bool {
 
 fn local_file_handoff(paths: &[PathBuf]) -> LocalFileHandoff {
     if paths.iter().any(|path| !path.exists()) {
-        return LocalFileHandoff::Rejected("file handoff rejected: local path is unavailable");
+        return LocalFileHandoff::Rejected(ErrorNotice::FileHandoffRejected(
+            "file handoff rejected: local path is unavailable".to_owned(),
+        ));
     }
     bootty_winit::file_paths::format_file_paths_for_paste(paths.iter().map(PathBuf::as_path))
         .map(LocalFileHandoff::Ready)
         .unwrap_or(LocalFileHandoff::Rejected(
-            "file handoff rejected: unsupported local path",
+            ErrorNotice::FileHandoffRejected(
+                "file handoff rejected: unsupported local path".to_owned(),
+            ),
         ))
 }

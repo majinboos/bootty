@@ -21,7 +21,8 @@ tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync", "t
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 
 [dev-dependencies]
-tempfile.workspace = true
+assert_fs.workspace = true
+pretty_assertions.workspace = true
 
 [lints]
 workspace = true

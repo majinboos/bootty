@@ -6,26 +6,38 @@ use std::{
     process::{Command, Output},
 };
 
+use assert_fs::{TempDir, fixture::PathChild};
 use bootty_cli::align_shell_env;
+use pretty_assertions::assert_eq;
+use rstest::{fixture, rstest};
 
-const CHILD_MODE: &str = "BOOTTY_SHELL_CONTRACT_CHILD";
+const CHILD_MODE: &str = "BOOTTY_SHELL_TEST_CHILD";
 const ALIGN_MODE: &str = "align";
+const SHELL_OUTPUT_PREFIX: &str = "BOOTTY_SHELL_TEST_VALUE=";
 
-#[test]
-fn align_shell_env_advertises_bootty_shell_in_a_fresh_process() {
-    let directory = tempfile::tempdir().expect("temporary shell directory");
-    let shell = directory.path().join("login-shell");
-    let output = run_child(ALIGN_MODE, &shell);
+#[fixture]
+fn shell_dir() -> TempDir {
+    TempDir::new().expect("temporary shell directory")
+}
 
-    assert!(output.status.success(), "child failed: {output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(&format!(
-            "BOOTTY_SHELL_CONTRACT_SHELL={}\n",
-            shell.display()
-        )),
-        "child output did not contain the advertised shell: {}",
-        stdout
+#[rstest]
+fn align_shell_env_advertises_the_configured_shell(shell_dir: TempDir) {
+    let shell = shell_dir.child("login-shell");
+    let output = run_child(ALIGN_MODE, shell.path());
+    let stdout = String::from_utf8(output.stdout).expect("child output is UTF-8");
+    let advertised = stdout
+        .lines()
+        .find(|line| line.starts_with(SHELL_OUTPUT_PREFIX))
+        .map(str::to_owned);
+
+    assert_eq!(
+        (output.status.code(), advertised),
+        (
+            Some(0),
+            Some(format!("{SHELL_OUTPUT_PREFIX}{}", shell.path().display()))
+        ),
+        "child stdout: {stdout:?}; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -34,7 +46,7 @@ fn shell_environment_child() {
     if let Ok(ALIGN_MODE) = env::var(CHILD_MODE).as_deref() {
         align_shell_env();
         println!(
-            "BOOTTY_SHELL_CONTRACT_SHELL={}",
+            "{SHELL_OUTPUT_PREFIX}{}",
             env::var("SHELL").expect("align_shell_env must set SHELL")
         );
     }
@@ -47,5 +59,5 @@ fn run_child(mode: &str, shell: &Path) -> Output {
         .env("BOOTTY_SHELL", shell)
         .env("SHELL", "/bin/sh")
         .output()
-        .expect("run isolated shell environment contract")
+        .expect("run isolated shell environment child")
 }

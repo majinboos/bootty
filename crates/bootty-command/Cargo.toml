@@ -8,5 +8,10 @@ bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+pretty_assertions.workspace = true
+proptest.workspace = true
+proptest-derive.workspace = true
+
 [lints]
 workspace = true

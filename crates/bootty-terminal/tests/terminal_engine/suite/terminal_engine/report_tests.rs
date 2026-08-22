@@ -2,6 +2,7 @@ use super::super::super::*;
 #[cfg(unix)]
 use super::super::{SharedMemoryFixture, is_shared_memory_unavailable};
 use super::support::*;
+use pretty_assertions::assert_eq;
 
 #[test]
 fn terminal_engine_answers_size_queries_from_current_geometry() -> Result<()> {

@@ -10,6 +10,7 @@ use std::{
 use crate::{
     app_actions::{AppAction, KeybindAction, MuxKeyAction},
     commands::{CommandCatalog, CommandExecutor, CoreCommandExecutor, ExactMuxTarget},
+    error_catalog::ErrorNotice,
     state::{AppEffect, AppState, ViewportSnapshot},
     workspace_runtime::WorkspaceRuntime,
 };
@@ -41,7 +42,7 @@ fn command_outcome_message(outcome: &CommandOutcome) -> Option<String> {
         | CommandOutcome::StaleTarget { message }
         | CommandOutcome::Failed { message, .. } => Some(message.clone()),
         CommandOutcome::ConfirmationRequired { .. } => {
-            Some("command requires confirmation".to_owned())
+            Some(ErrorNotice::CommandRequiresConfirmation.to_string())
         }
     }
 }
@@ -52,13 +53,13 @@ fn command_outcome_for_binding_operation(
     match outcome {
         BindingOperationOutcome::Supported(()) => None,
         BindingOperationOutcome::Unsupported => Some(CommandOutcome::Unsupported {
-            message: "mux operation is unsupported".to_owned(),
+            message: ErrorNotice::MuxOperationUnsupported.to_string(),
         }),
         BindingOperationOutcome::Unavailable => Some(CommandOutcome::Unavailable {
-            message: "mux operation is unavailable".to_owned(),
+            message: ErrorNotice::MuxOperationUnavailable.to_string(),
         }),
         BindingOperationOutcome::Stale => Some(CommandOutcome::StaleTarget {
-            message: "mux operation capability is stale".to_owned(),
+            message: ErrorNotice::MuxOperationCapabilityStale.to_string(),
         }),
     }
 }
@@ -165,7 +166,9 @@ impl CommandRuntime {
 
 impl AppState {
     fn reject_command(&mut self, outcome: CommandOutcome) -> CommandDispatch {
-        self.last_error = command_outcome_message(&outcome);
+        if let Some(message) = command_outcome_message(&outcome) {
+            self.record_error(message);
+        }
         CommandDispatch::Complete(outcome)
     }
 
@@ -269,7 +272,7 @@ impl AppState {
                             defer_membership(&mut self.workspace);
                             CommandOutcome::Failed {
                                 code: "backend_worker_stopped".to_owned(),
-                                message: "mux command worker stopped".to_owned(),
+                                message: ErrorNotice::MuxCommandWorkerStopped.to_string(),
                             }
                         }
                     },
@@ -281,7 +284,7 @@ impl AppState {
                         }
                         Err(mpsc::TryRecvError::Disconnected) => CommandOutcome::Failed {
                             code: "command_worker_stopped".to_owned(),
-                            message: "command worker stopped".to_owned(),
+                            message: ErrorNotice::CommandWorkerStopped.to_string(),
                         },
                     },
                 }
@@ -289,7 +292,7 @@ impl AppState {
             if let Some(response) = pending.response {
                 let _ = response.send(outcome);
             } else if let Some(message) = command_outcome_message(&outcome) {
-                self.last_error = Some(message);
+                self.record_error(message);
             }
         }
     }
@@ -411,13 +414,16 @@ impl AppState {
                 Ok((None, None))
             } else {
                 Err(CommandOutcome::Denied {
-                    message: "command does not accept a target".to_owned(),
+                    message: ErrorNotice::CommandDoesNotAcceptTarget.to_string(),
                 })
             };
         };
         if supplied.is_some_and(|target| target.kind != expected) {
             return Err(CommandOutcome::Denied {
-                message: format!("command requires a {expected:?} target"),
+                message: ErrorNotice::CommandRequiresTarget(format!(
+                    "command requires a {expected:?} target"
+                ))
+                .raw_message(),
             });
         }
         if let Some(supplied) = supplied {
@@ -434,12 +440,18 @@ impl AppState {
                 return Ok((Some(supplied.clone()), Some(exact)));
             }
             return Err(CommandOutcome::StaleTarget {
-                message: format!("the {expected:?} target is stale"),
+                message: ErrorNotice::StaleCommandTarget(format!(
+                    "the {expected:?} target is stale"
+                ))
+                .raw_message(),
             });
         }
         let Some(current) = self.current_command_target_for(command, expected) else {
             return Err(CommandOutcome::Unavailable {
-                message: format!("no current {expected:?} target is available"),
+                message: ErrorNotice::NoCurrentTarget(format!(
+                    "no current {expected:?} target is available"
+                ))
+                .raw_message(),
             });
         };
         // The opaque handle is only an equality token. Build the typed target from current mux
@@ -796,7 +808,10 @@ impl AppState {
                     self.last_error
                         .clone()
                         .map_or_else(CommandOutcome::success, |warning| {
-                            CommandOutcome::success_with_warning("configuration_warning", warning)
+                            CommandOutcome::success_with_warning(
+                                "configuration_warning",
+                                warning.raw_message(),
+                            )
                         })
                 } else {
                     CommandOutcome::Failed {
@@ -804,7 +819,8 @@ impl AppState {
                         message: self
                             .last_error
                             .clone()
-                            .unwrap_or_else(|| "configuration reload failed".to_owned()),
+                            .map(|error| error.raw_message())
+                            .unwrap_or_else(|| ErrorNotice::ConfigurationReloadFailed.to_string()),
                     }
                 };
                 CommandDispatch::Complete(outcome)
@@ -816,7 +832,10 @@ impl AppState {
             CoreCommandExecutor::CurrentResource(kind) => {
                 let outcome = self.current_command_target(kind).map_or_else(
                     || CommandOutcome::Unavailable {
-                        message: format!("no current {kind:?} target is available"),
+                        message: ErrorNotice::NoCurrentTarget(format!(
+                            "no current {kind:?} target is available"
+                        ))
+                        .raw_message(),
                     },
                     |target| CommandOutcome::Success {
                         value: serde_json::json!({"target": target}),
@@ -836,9 +855,9 @@ impl AppState {
                         self.last_error = previous_error;
                         CommandOutcome::success()
                     },
-                    |message| CommandOutcome::Failed {
+                    |notice| CommandOutcome::Failed {
                         code: "execution_failed".to_owned(),
-                        message,
+                        message: notice.raw_message(),
                     },
                 );
                 CommandDispatch::Complete(outcome)
@@ -861,9 +880,9 @@ impl AppState {
                         self.last_error = previous_error;
                         CommandOutcome::success()
                     },
-                    |message| CommandOutcome::Failed {
+                    |notice| CommandOutcome::Failed {
                         code: "execution_failed".to_owned(),
-                        message,
+                        message: notice.raw_message(),
                     },
                 );
                 CommandDispatch::Complete(outcome)
@@ -928,7 +947,9 @@ impl AppState {
                     code: "persistence_failed".to_owned(),
                     message: error.to_string(),
                 };
-                self.last_error = command_outcome_message(&outcome);
+                if let Some(message) = command_outcome_message(&outcome) {
+                    self.record_error(message);
+                }
                 outcome
             })
     }
@@ -940,7 +961,9 @@ impl AppState {
         let command = MuxCommand::DitchSession { session_id };
         let scope = self.workspace.active.binding.scope;
         if let Some(outcome) = self.preflight_mux_command(&command) {
-            self.last_error = command_outcome_message(&outcome);
+            if let Some(message) = command_outcome_message(&outcome) {
+                self.record_error(message);
+            }
             return Err(outcome);
         }
         let membership = self.begin_authoritative_membership(&command)?;
@@ -1000,9 +1023,9 @@ impl AppState {
         let previous_error = self.last_error.take();
         self.apply_resolved_keybind_action(action, planned_mux_command, viewport, effects);
         let outcome = match self.last_error.clone() {
-            Some(message) => CommandOutcome::Failed {
+            Some(notice) => CommandOutcome::Failed {
                 code: "execution_failed".to_owned(),
-                message,
+                message: notice.raw_message(),
             },
             None => {
                 self.last_error = previous_error;
@@ -1058,7 +1081,7 @@ impl AppState {
             .complete_binding_membership_command(scope, membership, &result)
         {
             let message = error.to_string();
-            self.last_error = Some(message.clone());
+            self.record_error(message.clone());
             return CommandOutcome::Failed {
                 code: "persistence_failed".to_owned(),
                 message,
@@ -1066,16 +1089,18 @@ impl AppState {
         }
         let (completion, sync_error) = self.workspace.complete_authoritative_command(scope, result);
         if let Some(error) = sync_error {
-            self.last_error = Some(error);
+            self.record_error(error);
         }
         match completion {
             Ok(completion) => {
                 let Some(value) = self.mux_command_completion_value(scope, command, &completion)
                 else {
                     let outcome = CommandOutcome::StaleTarget {
-                        message: "mux operation capability is stale".to_owned(),
+                        message: ErrorNotice::MuxOperationCapabilityStale.to_string(),
                     };
-                    self.last_error = command_outcome_message(&outcome);
+                    if let Some(message) = command_outcome_message(&outcome) {
+                        self.record_error(message);
+                    }
                     return outcome;
                 };
                 CommandOutcome::Success {
@@ -1094,15 +1119,23 @@ impl AppState {
                         code: "deadline_exceeded".to_owned(),
                         message,
                     },
-                    MuxCommandError::Unsupported => CommandOutcome::Unsupported { message },
-                    MuxCommandError::Unavailable => CommandOutcome::Unavailable { message },
-                    MuxCommandError::Stale => CommandOutcome::StaleTarget { message },
+                    MuxCommandError::Unsupported => CommandOutcome::Unsupported {
+                        message: ErrorNotice::MuxOperationUnsupported.to_string(),
+                    },
+                    MuxCommandError::Unavailable => CommandOutcome::Unavailable {
+                        message: ErrorNotice::MuxOperationUnavailable.to_string(),
+                    },
+                    MuxCommandError::Stale => CommandOutcome::StaleTarget {
+                        message: ErrorNotice::MuxOperationCapabilityStale.to_string(),
+                    },
                     MuxCommandError::Failed(_) => CommandOutcome::Failed {
                         code: "execution_failed".to_owned(),
                         message,
                     },
                 };
-                self.last_error = command_outcome_message(&outcome);
+                if let Some(message) = command_outcome_message(&outcome) {
+                    self.record_error(message);
+                }
                 outcome
             }
         }

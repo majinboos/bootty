@@ -5,6 +5,7 @@ mod chrome_frame;
 pub mod commands;
 mod config_runtime;
 pub mod diagnostics;
+pub mod error_catalog;
 mod host;
 pub mod input;
 pub mod layout;

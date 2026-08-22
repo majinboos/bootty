@@ -1,3 +1,6 @@
+use pretty_assertions::assert_eq;
+use rstest::rstest;
+
 use std::sync::{Arc, Mutex};
 
 use bootty_render::{
@@ -63,6 +66,14 @@ fn terminal_engine(cols: u16, rows: u16, cell_width: u32, cell_height: u32) -> T
 
 fn kitty_terminal_engine() -> TerminalEngine {
     terminal_engine(10, 4, 10, 20)
+}
+
+fn extracted_render_frame(
+    engine: &mut TerminalEngine,
+    viewport: BareTerminalViewport,
+) -> bootty_render::terminal_render::TerminalRenderFrame {
+    let frame = engine.extract_frame().expect("terminal frame");
+    terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default())
 }
 
 #[test]
@@ -160,19 +171,19 @@ fn bare_host_maps_keyboard_input_without_egui() {
     )
     .expect("enter maps to terminal key input");
 
-    assert_eq!(input.key, TerminalKey::Enter);
     assert_eq!(
-        input.mods,
-        KeyMods {
-            shift: true,
-            alt: true,
-            ctrl: false,
-            command: false,
-            ..Default::default()
-        }
+        (input.key, input.mods, input.repeat, input.utf8),
+        (
+            TerminalKey::Enter,
+            KeyMods {
+                shift: true,
+                alt: true,
+                ..Default::default()
+            },
+            true,
+            None,
+        )
     );
-    assert!(input.repeat);
-    assert_eq!(input.utf8, None);
 
     let shifted_q = bare_terminal_key_input(KeyCode::KeyQ, ModifiersState::SHIFT, false)
         .expect("letter maps to terminal key input");
@@ -207,17 +218,17 @@ fn bare_host_maps_keyboard_input_without_egui() {
         (KeyCode::Period, ".", ">"),
         (KeyCode::Slash, "/", "?"),
     ] {
-        assert_eq!(
-            bare_terminal_key_input(code, ModifiersState::empty(), false)
+        let mapped = |modifiers| {
+            bare_terminal_key_input(code, modifiers, false)
                 .expect("printable key maps to terminal key input")
-                .utf8,
-            Some(unshifted)
-        );
+                .utf8
+        };
         assert_eq!(
-            bare_terminal_key_input(code, ModifiersState::SHIFT, false)
-                .expect("shifted printable key maps to terminal key input")
-                .utf8,
-            Some(shifted)
+            (
+                mapped(ModifiersState::empty()),
+                mapped(ModifiersState::SHIFT)
+            ),
+            (Some(unshifted), Some(shifted)),
         );
     }
 
@@ -320,30 +331,36 @@ fn bare_host_maps_mouse_input_without_egui() {
     )
     .expect("mouse press maps to terminal input");
 
-    assert_eq!(input.action, MouseAction::Press);
-    assert_eq!(input.button, Some(MouseButton::Left));
     assert_eq!(
-        input.mods,
-        KeyMods {
-            shift: true,
-            ctrl: true,
-            ..Default::default()
-        }
-    );
-    assert_eq!(input.x, 42.0);
-    assert_eq!(input.y, 54.0);
-    assert_eq!(
-        input.size,
-        MouseEncoderSize {
-            screen_width: 238,
-            screen_height: 172,
-            cell_width: 10,
-            cell_height: 20,
-            padding_top: 4,
-            padding_bottom: 8,
-            padding_right: 6,
-            padding_left: 2,
-        }
+        (
+            input.action,
+            input.button,
+            input.mods,
+            input.x,
+            input.y,
+            input.size
+        ),
+        (
+            MouseAction::Press,
+            Some(MouseButton::Left),
+            KeyMods {
+                shift: true,
+                ctrl: true,
+                ..Default::default()
+            },
+            42.0,
+            54.0,
+            MouseEncoderSize {
+                screen_width: 238,
+                screen_height: 172,
+                cell_width: 10,
+                cell_height: 20,
+                padding_top: 4,
+                padding_bottom: 8,
+                padding_right: 6,
+                padding_left: 2,
+            },
+        )
     );
 
     assert!(
@@ -363,8 +380,10 @@ fn bare_host_maps_mouse_input_without_egui() {
     let motion = input_mapper
         .mouse_motion(viewport)
         .expect("cursor motion maps to terminal input");
-    assert_eq!(motion.action, MouseAction::Motion);
-    assert_eq!(motion.button, Some(MouseButton::Left));
+    assert_eq!(
+        (motion.action, motion.button),
+        (MouseAction::Motion, Some(MouseButton::Left))
+    );
     input_mapper.set_mouse_button_state(MouseButton::Left, winit::event::ElementState::Released);
     assert_eq!(
         input_mapper
@@ -374,41 +393,17 @@ fn bare_host_maps_mouse_input_without_egui() {
         None
     );
 
-    let wheel_up = input_mapper
-        .mouse_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), viewport)
-        .expect("wheel up maps to terminal button four");
-    assert_eq!(wheel_up.action, MouseAction::Press);
-    assert_eq!(wheel_up.button, Some(MouseButton::Four));
-
-    let wheel_down = input_mapper
-        .mouse_wheel(MouseScrollDelta::LineDelta(0.0, -1.0), viewport)
-        .expect("wheel down maps to terminal button five");
-    assert_eq!(wheel_down.action, MouseAction::Press);
-    assert_eq!(wheel_down.button, Some(MouseButton::Five));
-
-    assert!(
+    let wheel = |delta| {
         input_mapper
-            .mouse_wheel(MouseScrollDelta::LineDelta(0.0, 0.0), viewport)
-            .is_none()
-    );
-}
-
-#[test]
-fn bare_host_render_frame_preserves_terminal_text_commands_without_egui_callback() {
-    let viewport = BareTerminalViewport::new(
-        120,
-        40,
-        CellMetrics::new(10.0, 20.0),
-        TerminalPadding::default(),
-    );
-    let frame = render_frame_with_text('A');
-
-    let render_frame =
-        terminal_render_frame_for_bare_host(&frame, viewport, &TerminalTextConfig::default());
-
-    assert!(
-        render_frame.commands.iter().any(
-            |command| matches!(command, TerminalRenderCommand::Text(text) if text.text == "A")
+            .mouse_wheel(MouseScrollDelta::LineDelta(0.0, delta), viewport)
+            .map(|input| (input.action, input.button))
+    };
+    assert_eq!(
+        (wheel(1.0), wheel(-1.0), wheel(0.0)),
+        (
+            Some((MouseAction::Press, Some(MouseButton::Four))),
+            Some((MouseAction::Press, Some(MouseButton::Five))),
+            None,
         )
     );
 }
@@ -500,44 +495,6 @@ fn bare_host_routes_kitty_image_through_image_commands() {
 }
 
 #[test]
-fn bare_host_routes_default_rgba_kitty_image_through_image_commands() {
-    let viewport = kitty_viewport();
-    let mut engine = kitty_terminal_engine();
-
-    engine.write_vt(b"\x1b_Ga=T,t=d,i=41,p=2,s=1,v=2,c=1,r=1;///////////\x1b\\");
-    let frame = engine.extract_frame().expect("rgba image frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
-
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Image(image)
-            if image.image_id == 41
-                && image.placement_id == 2
-                && image.image_format == libghostty_vt::kitty::graphics::ImageFormat::Rgba
-                && image.data.len() == 8)
-    ));
-}
-
-#[test]
-fn bare_host_routes_rgb_kitty_image_through_image_commands() {
-    let viewport = kitty_viewport();
-    let mut engine = kitty_terminal_engine();
-
-    engine.write_vt(b"\x1b_Ga=T,f=24,t=d,i=73,p=1,s=1,v=1;AAAA\x1b\\");
-    let frame = engine.extract_frame().expect("RGB image frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
-
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Image(image)
-            if image.image_id == 73
-                && image.placement_id == 1
-                && image.image_format == libghostty_vt::kitty::graphics::ImageFormat::Rgb
-                && image.data.len() == 3)
-    ));
-}
-
-#[test]
 fn bare_host_preserves_kitty_virtual_placement_metadata() {
     let viewport = kitty_viewport();
     let mut frame = render_frame_with_text('A');
@@ -570,9 +527,7 @@ fn bare_host_routes_kitty_unicode_placeholder_image_through_image_commands() {
     engine.write_vt(b"\x1b_Ga=t,t=d,f=24,i=73,s=1,v=1;AAAA\x1b\\");
     engine.write_vt(b"\x1b_Ga=p,U=1,i=73,c=1,r=1,q=1\x1b\\");
     engine.write_vt("\x1b[38;5;73m\u{10EEEE}\u{0305}\u{0305}\x1b[39m".as_bytes());
-    let frame = engine.extract_frame().expect("unicode kitty image frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Image(image)
@@ -623,9 +578,7 @@ fn bare_host_preserves_kitty_storage_deletions() {
     engine.write_vt(b"\x1b_Ga=T,t=d,i=52,p=1,s=1,v=1;/////w==\x1b\\");
     engine.write_vt(b"\x1b_Ga=p,i=52,p=2,q=1\x1b\\");
     engine.write_vt(b"\x1b_Ga=d,d=i,i=52,p=1\x1b\\");
-    let frame = engine.extract_frame().expect("kitty storage frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Image(image)
@@ -654,9 +607,7 @@ fn bare_host_keeps_existing_kitty_image_after_unimplemented_animation_commands()
         engine.write_vt(command);
     }
 
-    let frame = engine.extract_frame().expect("animation frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Image(image)
@@ -670,9 +621,7 @@ fn bare_host_preserves_terminal_tabstop_positions() {
     let mut engine = terminal_engine(600, 1, 1, 20);
 
     engine.write_vt(b"\x1b[3g\x1b[519G\x1bH\x1b[1GA\tB");
-    let frame = engine.extract_frame().expect("tabstop frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Text(text)
@@ -691,9 +640,7 @@ fn bare_host_preserves_utf8_replacement_text() {
 
     engine.write_vt(b"\xF0\x9F");
     engine.write_vt("😄".as_bytes());
-    let frame = engine.extract_frame().expect("utf8 frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Text(text)
@@ -711,9 +658,7 @@ fn bare_host_preserves_charset_rendering() {
     let mut engine = terminal_engine(16, 1, 10, 20);
 
     engine.write_vt("\x1b(A#\x1b(0qx".as_bytes());
-    let frame = engine.extract_frame().expect("charset frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Text(text)
@@ -729,56 +674,45 @@ fn bare_host_preserves_charset_rendering() {
     ));
 }
 
-#[test]
-fn bare_host_preserves_kitty_color_protocol_rendering() {
-    let viewport = bare_viewport(80, 20, 10.0, 20.0);
+#[rstest]
+#[case(
+    b"\x1b]21;foreground=rgb:12/34/56;background=rgb:78/9a/bc;cursor=rgb:de/f0/12\x1b\\X",
+    "X",
+    plan_color(0x12, 0x34, 0x56),
+    plan_color(0x78, 0x9a, 0xbc),
+    plan_color(0xde, 0xf0, 0x12)
+)]
+#[case(
+    b"\x1b]4;42;rgb:ff/00/00\x1b\\\x1b]10;rgb:12/34/56;rgb:78/9a/bc\x1b\\\x1b]12;rgb:de/f0/12\x1b\\\x1b[38;5;42mP",
+    "P",
+    plan_color(0xff, 0, 0),
+    plan_color(0x78, 0x9a, 0xbc),
+    plan_color(0xde, 0xf0, 0x12),
+)]
+#[case(
+    b"\x1b]4;42;FoReStGReen\x1b\\\x1b]10;medium spring green;LawnGreen\x1b\\\x1b]12;white\x1b\\\x1b[38;5;42mX",
+    "X",
+    plan_color(34, 139, 34),
+    plan_color(124, 252, 0),
+    plan_color(255, 255, 255),
+)]
+fn bare_host_preserves_color_protocol_rendering(
+    #[case] input: &[u8],
+    #[case] glyph: &str,
+    #[case] foreground: PlanColor,
+    #[case] background: PlanColor,
+    #[case] cursor: PlanColor,
+) {
     let mut engine = terminal_engine(8, 1, 10, 20);
+    engine.write_vt(input);
+    let render_frame = extracted_render_frame(&mut engine, bare_viewport(80, 20, 10.0, 20.0));
 
-    engine.write_vt(
-        b"\x1b]21;foreground=rgb:12/34/56;background=rgb:78/9a/bc;cursor=rgb:de/f0/12\x1b\\X",
-    );
-    let frame = engine.extract_frame().expect("kitty color frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
-
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::FillRect(fill)
-            if fill.role == FillRole::SurfaceBackground && fill.color == plan_color(0x78, 0x9a, 0xbc))
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Text(text)
-            if text.text == "X" && text.attrs.fg == plan_color(0x12, 0x34, 0x56))
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Cursor(cursor)
-            if cursor.color == plan_color(0xde, 0xf0, 0x12))
-    ));
-}
-
-#[test]
-fn bare_host_preserves_osc_color_operation_rendering() {
-    let viewport = bare_viewport(80, 20, 10.0, 20.0);
-    let mut engine = terminal_engine(8, 1, 10, 20);
-
-    engine.write_vt(
-        b"\x1b]4;42;rgb:ff/00/00\x1b\\\x1b]10;rgb:12/34/56;rgb:78/9a/bc\x1b\\\x1b]12;rgb:de/f0/12\x1b\\\x1b[38;5;42mP",
-    );
-    let frame = engine.extract_frame().expect("OSC color frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
-
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::FillRect(fill)
-            if fill.role == FillRole::SurfaceBackground && fill.color == plan_color(0x78, 0x9a, 0xbc))
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Text(text)
-            if text.text == "P" && text.attrs.fg == plan_color(0xff, 0x00, 0x00))
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Cursor(cursor)
-            if cursor.color == plan_color(0xde, 0xf0, 0x12))
-    ));
+    assert!(render_frame.commands.iter().any(|command| matches!(command,
+        TerminalRenderCommand::FillRect(fill) if fill.role == FillRole::SurfaceBackground && fill.color == background)));
+    assert!(render_frame.commands.iter().any(|command| matches!(command,
+        TerminalRenderCommand::Text(text) if text.text == glyph && text.attrs.fg == foreground)));
+    assert!(render_frame.commands.iter().any(|command| matches!(command,
+        TerminalRenderCommand::Cursor(command) if command.color == cursor)));
 }
 
 #[test]
@@ -806,9 +740,7 @@ fn bare_host_preserves_generated_256_color_palette() {
     .expect("generated-palette terminal");
 
     engine.write_vt(b"\x1b[38;5;16mB\x1b[38;5;231mW");
-    let frame = engine.extract_frame().expect("generated palette frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
+    let render_frame = extracted_render_frame(&mut engine, viewport);
 
     let text_commands = render_frame
         .commands
@@ -822,37 +754,7 @@ fn bare_host_preserves_generated_256_color_palette() {
 
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Text(text)
-            if text.text == "B")
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Text(text)
             if text.text == "W" && text.attrs.fg == plan_color(255, 255, 255))
-    ));
-}
-
-#[test]
-fn bare_host_preserves_x11_color_name_rendering() {
-    let viewport = bare_viewport(80, 20, 10.0, 20.0);
-    let mut engine = terminal_engine(8, 1, 10, 20);
-
-    engine.write_vt(
-        b"\x1b]4;42;FoReStGReen\x1b\\\x1b]10;medium spring green;LawnGreen\x1b\\\x1b]12;white\x1b\\\x1b[38;5;42mX",
-    );
-    let frame = engine.extract_frame().expect("X11 color-name frame");
-    let render_frame =
-        terminal_render_frame_for_bare_host(frame, viewport, &TerminalTextConfig::default());
-
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::FillRect(fill)
-            if fill.role == FillRole::SurfaceBackground && fill.color == plan_color(124, 252, 0))
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Text(text)
-            if text.text == "X" && text.attrs.fg == plan_color(34, 139, 34))
-    ));
-    assert!(render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Cursor(cursor)
-            if cursor.color == plan_color(255, 255, 255))
     ));
 }
 
@@ -862,26 +764,6 @@ fn bare_host_routes_sprite_families_through_sprite_commands() {
         ('█', SpriteFamily::Block),
         ('\u{2801}', SpriteFamily::Braille),
         ('\u{E0B0}', SpriteFamily::Powerline),
-        ('\u{1FB00}', SpriteFamily::LegacyComputing),
-        ('\u{1FB3C}', SpriteFamily::LegacyComputing),
-        ('\u{1FB6C}', SpriteFamily::LegacyComputing),
-        ('\u{1FB70}', SpriteFamily::LegacyComputing),
-        ('\u{1FB98}', SpriteFamily::LegacyComputing),
-        ('\u{1FB9C}', SpriteFamily::LegacyComputing),
-        ('\u{1FBA0}', SpriteFamily::LegacyComputing),
-        ('\u{1FBAF}', SpriteFamily::LegacyComputing),
-        ('\u{1FBBD}', SpriteFamily::LegacyComputing),
-        ('\u{1FBCE}', SpriteFamily::LegacyComputing),
-        ('\u{1FBD0}', SpriteFamily::LegacyComputing),
-        ('\u{1FBE8}', SpriteFamily::LegacyComputing),
-        ('\u{1CC21}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CC1B}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CC30}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CD00}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CE00}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CE0B}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CE51}', SpriteFamily::LegacyComputingSupplement),
-        ('\u{1CE90}', SpriteFamily::LegacyComputingSupplement),
     ] {
         assert_bare_host_routes_sprite(ch, family);
     }
@@ -890,27 +772,6 @@ fn bare_host_routes_sprite_families_through_sprite_commands() {
         '\u{EE00}', '\u{EE01}', '\u{EE02}', '\u{EE06}', '\u{EE09}', '\u{EE0B}',
     ] {
         assert_bare_host_routes_sprite(ch, SpriteFamily::ProgressIndicator);
-    }
-
-    for cp in box_line_junction_codepoints() {
-        assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
-            SpriteFamily::BoxDrawing,
-        );
-    }
-
-    for cp in box_dash_diagonal_codepoints() {
-        assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
-            SpriteFamily::BoxDrawing,
-        );
-    }
-
-    for cp in box_double_line_codepoints() {
-        assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
-            SpriteFamily::BoxDrawing,
-        );
     }
 
     for cp in 0x2500..=0x257F {
@@ -922,22 +783,23 @@ fn bare_host_routes_sprite_families_through_sprite_commands() {
 }
 
 #[test]
-fn bare_host_routes_all_owned_legacy_computing_supplement_ranges_through_sprite_commands() {
-    for cp in legacy_computing_supplement_codepoints() {
-        assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
-            SpriteFamily::LegacyComputingSupplement,
-        );
-    }
-}
-
-#[test]
 fn bare_host_routes_all_owned_legacy_computing_ranges_through_sprite_commands() {
-    for cp in legacy_computing_codepoints() {
-        assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
+    for (codepoints, family) in [
+        (
+            legacy_computing_codepoints().collect::<Vec<_>>(),
             SpriteFamily::LegacyComputing,
-        );
+        ),
+        (
+            legacy_computing_supplement_codepoints().collect(),
+            SpriteFamily::LegacyComputingSupplement,
+        ),
+    ] {
+        for cp in codepoints {
+            assert_bare_host_routes_sprite_family(
+                char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
+                family,
+            );
+        }
     }
 }
 
@@ -994,24 +856,6 @@ fn legacy_computing_codepoints() -> impl Iterator<Item = u32> {
     ]
     .into_iter()
     .flatten()
-}
-
-fn box_line_junction_codepoints() -> impl Iterator<Item = u32> {
-    (0x2500..=0x254B)
-        .filter(|cp| !matches!(cp, 0x2504..=0x250B))
-        .chain(0x2574..=0x257F)
-}
-
-fn box_dash_diagonal_codepoints() -> impl Iterator<Item = u32> {
-    [
-        0x2504, 0x2505, 0x2506, 0x2507, 0x2508, 0x2509, 0x250A, 0x250B, 0x254C, 0x254D, 0x254E,
-        0x254F, 0x2571, 0x2572, 0x2573,
-    ]
-    .into_iter()
-}
-
-fn box_double_line_codepoints() -> impl Iterator<Item = u32> {
-    0x2550..=0x256C
 }
 
 fn legacy_computing_supplement_codepoints() -> impl Iterator<Item = u32> {

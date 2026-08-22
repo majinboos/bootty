@@ -1,5 +1,6 @@
 use bootty_ui::*;
 use eframe::egui::Color32;
+use pretty_assertions::assert_eq;
 
 #[test]
 fn palette_uses_configured_base_foreground_and_ansi_accents() {

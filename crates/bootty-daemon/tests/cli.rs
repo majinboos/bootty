@@ -1,6 +1,21 @@
 use std::process::Command;
 
+use assert_fs::prelude::*;
+use pretty_assertions::assert_eq;
 use rusqlite::{Connection, params};
+
+fn create_fixture_dir(
+    path: impl AsRef<std::path::Path>,
+) -> std::result::Result<(), assert_fs::fixture::FixtureError> {
+    assert_fs::fixture::ChildPath::new(path.as_ref().to_path_buf()).create_dir_all()
+}
+
+fn write_fixture(
+    path: impl AsRef<std::path::Path>,
+    contents: impl AsRef<[u8]>,
+) -> std::result::Result<(), assert_fs::fixture::FixtureError> {
+    assert_fs::fixture::ChildPath::new(path.as_ref().to_path_buf()).write_binary(contents.as_ref())
+}
 
 fn run_daemon(
     daemon: &str,
@@ -23,6 +38,14 @@ fn run_daemon(
     command.args(args).output().expect("run daemon")
 }
 
+fn assert_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn seed_legacy_catalog(
     path: &std::path::Path,
     remote_id: &str,
@@ -30,7 +53,7 @@ fn seed_legacy_catalog(
     stored_backend: &str,
     session_name: &str,
 ) {
-    std::fs::create_dir_all(path.parent().expect("legacy catalog parent")).expect("legacy parent");
+    create_fixture_dir(path.parent().expect("legacy catalog parent")).expect("legacy parent");
     let connection = Connection::open(path).expect("legacy catalog");
     connection
         .execute_batch(
@@ -117,7 +140,7 @@ fn ping_reports_the_compatible_protocol_and_release() {
         .output()
         .expect("ping daemon");
 
-    assert!(output.status.success());
+    assert_success(&output);
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8"),
         format!(
@@ -130,7 +153,7 @@ fn ping_reports_the_compatible_protocol_and_release() {
 
 #[test]
 fn cli_rejects_malformed_options_and_application_identities() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -184,7 +207,7 @@ fn cli_rejects_malformed_options_and_application_identities() {
 
 #[test]
 fn daemon_owns_a_persistent_remote_space_catalog() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let state = directory.path().join("daemon.sqlite");
     let config = directory.path().join("config");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -202,11 +225,7 @@ fn daemon_owns_a_persistent_remote_space_catalog() {
         ])
         .output()
         .expect("create remote Space");
-    assert!(
-        created.status.success(),
-        "{}",
-        String::from_utf8_lossy(&created.stderr)
-    );
+    assert_success(&created);
 
     let listed = Command::new(daemon)
         .env("BOOTTY_DAEMON_STATE", &state)
@@ -214,11 +233,7 @@ fn daemon_owns_a_persistent_remote_space_catalog() {
         .args(["remote-space", "list"])
         .output()
         .expect("list remote Spaces");
-    assert!(
-        listed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&listed.stderr)
-    );
+    assert_success(&listed);
     let spaces: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("catalog JSON");
 
     assert_eq!(spaces[0]["catalog_version"], 3);
@@ -228,7 +243,7 @@ fn daemon_owns_a_persistent_remote_space_catalog() {
 
 #[test]
 fn production_and_development_catalogs_use_separate_default_state_paths() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -251,11 +266,7 @@ fn production_and_development_catalogs_use_separate_default_state_paths() {
                 "tmux",
             ],
         );
-        assert!(
-            created.status.success(),
-            "{}",
-            String::from_utf8_lossy(&created.stderr)
-        );
+        assert_success(&created);
     }
 
     let production = state.join("bootty/daemon.sqlite");
@@ -265,7 +276,7 @@ fn production_and_development_catalogs_use_separate_default_state_paths() {
     assert_ne!(production, development);
 
     let production_list = run_daemon(daemon, &config, &state, None, &["remote-space", "list"]);
-    assert!(production_list.status.success());
+    assert_success(&production_list);
     let production_spaces: serde_json::Value =
         serde_json::from_slice(&production_list.stdout).expect("production catalog JSON");
     assert_eq!(production_spaces[0]["name"], "Production");
@@ -277,7 +288,7 @@ fn production_and_development_catalogs_use_separate_default_state_paths() {
         Some("bootty-dev"),
         &["remote-space", "list"],
     );
-    assert!(development_list.status.success());
+    assert_success(&development_list);
     let development_spaces: serde_json::Value =
         serde_json::from_slice(&development_list.stdout).expect("development catalog JSON");
     assert_eq!(development_spaces[0]["name"], "Development");
@@ -285,7 +296,7 @@ fn production_and_development_catalogs_use_separate_default_state_paths() {
 
 #[test]
 fn inherited_local_identity_does_not_change_a_remote_command() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -306,18 +317,14 @@ fn inherited_local_identity_does_not_change_a_remote_command() {
         .output()
         .expect("run remote command with inherited local identity");
 
-    assert!(
-        created.status.success(),
-        "{}",
-        String::from_utf8_lossy(&created.stderr)
-    );
+    assert_success(&created);
     assert!(state.join("bootty/daemon.sqlite").is_file());
     assert!(!state.join("bootty-dev/daemon.sqlite").exists());
 }
 
 #[test]
 fn explicit_daemon_state_override_is_exact_and_ignores_identity_namespace() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let override_path = directory.path().join("custom/catalog.sqlite");
@@ -339,11 +346,7 @@ fn explicit_daemon_state_override_is_exact_and_ignores_identity_namespace() {
         ])
         .output()
         .expect("create overridden remote Space");
-    assert!(
-        created.status.success(),
-        "{}",
-        String::from_utf8_lossy(&created.stderr)
-    );
+    assert_success(&created);
     assert!(override_path.is_file());
     assert!(!state.join("bootty-dev/daemon.sqlite").exists());
 
@@ -359,7 +362,7 @@ fn explicit_daemon_state_override_is_exact_and_ignores_identity_namespace() {
         ])
         .output()
         .expect("list overridden remote Spaces");
-    assert!(listed.status.success());
+    assert_success(&listed);
     let spaces: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("catalog JSON");
     assert_eq!(spaces[0]["name"], "Override");
 
@@ -370,7 +373,7 @@ fn explicit_daemon_state_override_is_exact_and_ignores_identity_namespace() {
         .args(["remote-space", "list"])
         .output()
         .expect("list override with default Production identity");
-    assert!(production.status.success());
+    assert_success(&production);
     let spaces: serde_json::Value =
         serde_json::from_slice(&production.stdout).expect("production override JSON");
     assert_eq!(spaces[0]["name"], "Override");
@@ -378,19 +381,19 @@ fn explicit_daemon_state_override_is_exact_and_ignores_identity_namespace() {
 
 #[test]
 fn legacy_config_and_session_order_are_isolated_by_application_identity() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
 
-    std::fs::create_dir_all(config.join("bootty")).expect("production config");
-    std::fs::create_dir_all(config.join("bootty-dev")).expect("development config");
-    std::fs::write(
+    create_fixture_dir(config.join("bootty")).expect("production config");
+    create_fixture_dir(config.join("bootty-dev")).expect("development config");
+    write_fixture(
         config.join("bootty/config.toml"),
         "[multiplexer]\nbackend = \"tmux\"\n",
     )
     .expect("production config file");
-    std::fs::write(
+    write_fixture(
         config.join("bootty-dev/config.toml"),
         "[multiplexer]\nbackend = \"rmux\"\n",
     )
@@ -411,11 +414,7 @@ fn legacy_config_and_session_order_are_isolated_by_application_identity() {
     );
 
     let production = run_daemon(daemon, &config, &state, None, &["remote-space", "list"]);
-    assert!(
-        production.status.success(),
-        "{}",
-        String::from_utf8_lossy(&production.stderr)
-    );
+    assert_success(&production);
     let production_spaces: serde_json::Value =
         serde_json::from_slice(&production.stdout).expect("production legacy JSON");
     assert_eq!(production_spaces[0]["name"], "Production legacy");
@@ -432,11 +431,7 @@ fn legacy_config_and_session_order_are_isolated_by_application_identity() {
         Some("bootty-dev"),
         &["remote-space", "list"],
     );
-    assert!(
-        development.status.success(),
-        "{}",
-        String::from_utf8_lossy(&development.stderr)
-    );
+    assert_success(&development);
     let development_spaces: serde_json::Value =
         serde_json::from_slice(&development.stdout).expect("development legacy JSON");
     assert_eq!(development_spaces[0]["name"], "Development legacy");
@@ -452,7 +447,7 @@ fn legacy_config_and_session_order_are_isolated_by_application_identity() {
 
 #[test]
 fn corrupt_config_keeps_legacy_import_retryable_until_repaired() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -460,8 +455,8 @@ fn corrupt_config_keeps_legacy_import_retryable_until_repaired() {
     let legacy_path = config.join("bootty/session-order.sqlite3");
     let destination = state.join("bootty/daemon.sqlite");
 
-    std::fs::create_dir_all(config_path.parent().expect("config parent")).expect("config dir");
-    std::fs::write(&config_path, "[multiplexer\nbackend = \"tmux\"\n").expect("corrupt config");
+    create_fixture_dir(config_path.parent().expect("config parent")).expect("config dir");
+    write_fixture(&config_path, "[multiplexer\nbackend = \"tmux\"\n").expect("corrupt config");
     seed_legacy_catalog(
         &legacy_path,
         "retry-id",
@@ -476,13 +471,9 @@ fn corrupt_config_keeps_legacy_import_retryable_until_repaired() {
     assert_eq!(destination_space_count(&destination), 0);
     assert_eq!(migration_marker(&destination), 0);
 
-    std::fs::write(&config_path, "[multiplexer]\nbackend = \"tmux\"\n").expect("repair config");
+    write_fixture(&config_path, "[multiplexer]\nbackend = \"tmux\"\n").expect("repair config");
     let repaired = run_daemon(daemon, &config, &state, None, &["remote-space", "list"]);
-    assert!(
-        repaired.status.success(),
-        "{}",
-        String::from_utf8_lossy(&repaired.stderr)
-    );
+    assert_success(&repaired);
     let spaces: serde_json::Value = serde_json::from_slice(&repaired.stdout).expect("catalog JSON");
     assert_eq!(spaces[0]["name"], "Retry legacy");
     assert_eq!(spaces[0]["backend"], "tmux");
@@ -491,15 +482,15 @@ fn corrupt_config_keeps_legacy_import_retryable_until_repaired() {
 
 #[test]
 fn importer_selects_a_later_explicit_local_binding() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
     let legacy_path = config.join("bootty/session-order.sqlite3");
     let destination = state.join("bootty/daemon.sqlite");
 
-    std::fs::create_dir_all(config.join("bootty")).expect("config dir");
-    std::fs::write(
+    create_fixture_dir(config.join("bootty")).expect("config dir");
+    write_fixture(
         config.join("bootty/config.toml"),
         "[multiplexer]\nbackend = \"tmux\"\n",
     )
@@ -534,11 +525,7 @@ fn importer_selects_a_later_explicit_local_binding() {
         .expect("later local session");
 
     let imported = run_daemon(daemon, &config, &state, None, &["remote-space", "list"]);
-    assert!(
-        imported.status.success(),
-        "{}",
-        String::from_utf8_lossy(&imported.stderr)
-    );
+    assert_success(&imported);
     let spaces: serde_json::Value = serde_json::from_slice(&imported.stdout).expect("catalog JSON");
     assert_eq!(spaces[0]["backend"], "rmux");
     let id = spaces[0]["id"].as_str().expect("Space id");
@@ -550,15 +537,15 @@ fn importer_selects_a_later_explicit_local_binding() {
 
 #[test]
 fn importer_rejects_ambiguous_supported_local_bindings_without_a_marker() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
     let legacy_path = config.join("bootty/session-order.sqlite3");
     let destination = state.join("bootty/daemon.sqlite");
 
-    std::fs::create_dir_all(config.join("bootty")).expect("config dir");
-    std::fs::write(
+    create_fixture_dir(config.join("bootty")).expect("config dir");
+    write_fixture(
         config.join("bootty/config.toml"),
         "[multiplexer]\nbackend = \"tmux\"\n",
     )
@@ -588,7 +575,7 @@ fn importer_rejects_ambiguous_supported_local_bindings_without_a_marker() {
 
 #[test]
 fn production_state_reopens_with_and_without_the_explicit_production_identity() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -607,7 +594,7 @@ fn production_state_reopens_with_and_without_the_explicit_production_identity() 
             "tmux",
         ],
     );
-    assert!(created.status.success());
+    assert_success(&created);
 
     let reopened = run_daemon(
         daemon,
@@ -616,7 +603,7 @@ fn production_state_reopens_with_and_without_the_explicit_production_identity() 
         Some("bootty"),
         &["remote-space", "list"],
     );
-    assert!(reopened.status.success());
+    assert_success(&reopened);
     let spaces: serde_json::Value = serde_json::from_slice(&reopened.stdout).expect("catalog JSON");
     assert_eq!(spaces[0]["name"], "Reopen");
     assert!(state.join("bootty/daemon.sqlite").is_file());
@@ -624,7 +611,7 @@ fn production_state_reopens_with_and_without_the_explicit_production_identity() 
 
 #[test]
 fn development_does_not_fall_back_to_a_production_legacy_catalog() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
@@ -643,11 +630,7 @@ fn development_does_not_fall_back_to_a_production_legacy_catalog() {
         Some("bootty-dev"),
         &["remote-space", "list"],
     );
-    assert!(
-        development.status.success(),
-        "{}",
-        String::from_utf8_lossy(&development.stderr)
-    );
+    assert_success(&development);
     let spaces: serde_json::Value =
         serde_json::from_slice(&development.stdout).expect("development catalog JSON");
     assert_eq!(spaces, serde_json::json!([]));
@@ -657,11 +640,11 @@ fn development_does_not_fall_back_to_a_production_legacy_catalog() {
 
 #[test]
 fn daemon_discovers_remote_projects_with_the_shared_heuristics() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let home = directory.path();
-    std::fs::create_dir_all(home.join("src/project")).expect("project");
-    std::fs::create_dir_all(home.join("src/.hidden")).expect("hidden");
-    std::fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
+    create_fixture_dir(home.join("src/project")).expect("project");
+    create_fixture_dir(home.join("src/.hidden")).expect("hidden");
+    create_fixture_dir(home.join("dotfiles")).expect("dotfiles");
 
     let output = Command::new(env!("CARGO_BIN_EXE_bootty-daemon"))
         .env("HOME", home)
@@ -670,11 +653,7 @@ fn daemon_discovers_remote_projects_with_the_shared_heuristics() {
         .output()
         .expect("list remote projects");
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let projects: Vec<bootty_mux::project::ProjectPickerEntry> =
         serde_json::from_slice(&output.stdout).expect("project JSON");
     assert!(
@@ -696,9 +675,9 @@ fn daemon_discovers_remote_projects_with_the_shared_heuristics() {
 
 #[test]
 fn daemon_marks_canonical_worktree_aliases_as_occupied() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let project = directory.path().join("project");
-    std::fs::create_dir(&project).expect("project");
+    create_fixture_dir(&project).expect("project");
     let alias = project.join("..").join("project");
 
     let output = Command::new(env!("CARGO_BIN_EXE_bootty-daemon"))
@@ -709,17 +688,12 @@ fn daemon_marks_canonical_worktree_aliases_as_occupied() {
         .output()
         .expect("list remote worktrees");
 
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_success(&output);
     let worktrees: Vec<bootty_mux::project::WorktreePickerEntry> =
         serde_json::from_slice(&output.stdout).expect("worktree JSON");
     assert!(worktrees[0].occupied);
 }
 
-/// A workspace where the connection lives on the Space itself, as revision 5 stores it.
 fn seed_folded_catalog(
     path: &std::path::Path,
     remote_id: &str,
@@ -727,7 +701,7 @@ fn seed_folded_catalog(
     stored_backend: &str,
     session_names: &[&str],
 ) {
-    std::fs::create_dir_all(path.parent().expect("folded catalog parent")).expect("folded parent");
+    create_fixture_dir(path.parent().expect("folded catalog parent")).expect("folded parent");
     let connection = Connection::open(path).expect("folded catalog");
     connection
         .execute_batch(
@@ -766,16 +740,14 @@ fn seed_folded_catalog(
     }
 }
 
-/// The importer reads the connection off the Space once it has been folded in, so upgrading bootty
-/// on the workstation does not make its Spaces invisible to the daemon on the next ssh call.
 #[test]
 fn a_folded_workspace_imports_its_spaces_and_sessions() {
-    let directory = tempfile::tempdir().expect("tempdir");
+    let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");
     let state = directory.path().join("state");
 
-    std::fs::create_dir_all(config.join("bootty")).expect("config directory");
-    std::fs::write(
+    create_fixture_dir(config.join("bootty")).expect("config directory");
+    write_fixture(
         config.join("bootty/config.toml"),
         "[multiplexer]\nbackend = \"rmux\"\n",
     )
@@ -795,11 +767,7 @@ fn a_folded_workspace_imports_its_spaces_and_sessions() {
         None,
         &["remote-space", "list"],
     );
-    assert!(
-        listed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&listed.stderr)
-    );
+    assert_success(&listed);
 
     let spaces: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("listed JSON");
     assert_eq!(spaces[0]["name"], "Folded legacy");

@@ -689,6 +689,7 @@ name = "bootty"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-app",
  "bootty-cli",
  "bootty-command",
@@ -706,8 +707,9 @@ dependencies = [
  "clap",
  "egui",
  "embed-resource",
+ "pretty_assertions",
+ "rstest",
  "serde_json",
- "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -717,6 +719,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "assert_fs",
  "bootty-command",
  "bootty-config",
  "bootty-control",
@@ -745,10 +748,11 @@ dependencies = [
  "png",
  "pollster 0.4.0",
  "pretty_assertions",
+ "proptest",
+ "proptest-derive",
  "rstest",
  "rusqlite",
  "serde_json",
- "tempfile",
  "thiserror 2.0.20",
  "wgpu",
  "winit",
@@ -759,6 +763,7 @@ name = "bootty-cli"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-config",
  "bootty-font",
  "bootty-identity",
@@ -767,8 +772,10 @@ dependencies = [
  "bootty-terminal",
  "bootty-workspace-hack",
  "clap",
+ "pretty_assertions",
+ "proptest",
+ "rstest",
  "self_update",
- "tempfile",
 ]
 
 [[package]]
@@ -776,6 +783,9 @@ name = "bootty-command"
 version = "0.4.0"
 dependencies = [
  "bootty-workspace-hack",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
  "serde",
  "serde_json",
 ]
@@ -793,7 +803,6 @@ dependencies = [
  "pretty_assertions",
  "rstest",
  "serde",
- "tempfile",
  "thiserror 2.0.20",
  "toml_edit 0.25.13+spec-1.1.0",
 ]
@@ -803,17 +812,18 @@ name = "bootty-control"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-command",
  "bootty-extension",
  "bootty-identity",
  "bootty-workspace-hack",
  "getrandom 0.4.3",
+ "pretty_assertions",
  "rmux-ipc",
  "rmux-os",
  "serde",
  "serde_json",
  "sysinfo",
- "tempfile",
  "tokio",
 ]
 
@@ -822,17 +832,18 @@ name = "bootty-daemon"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-config",
  "bootty-identity",
  "bootty-mux",
  "bootty-remote",
  "bootty-rmux",
  "bootty-tmux",
+ "pretty_assertions",
  "rmux-server",
  "rusqlite",
  "serde",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
@@ -840,6 +851,7 @@ dependencies = [
 name = "bootty-extension"
 version = "0.4.0"
 dependencies = [
+ "assert_fs",
  "bootty-command",
  "bootty-config",
  "bootty-item",
@@ -847,12 +859,15 @@ dependencies = [
  "bootty-write",
  "mlua",
  "notify",
+ "pretty_assertions",
  "process-wrap",
+ "proptest",
+ "rstest",
  "serde",
  "serde_json",
  "starship-battery",
+ "static_assertions",
  "sysinfo",
- "tempfile",
 ]
 
 [[package]]
@@ -860,6 +875,9 @@ name = "bootty-font"
 version = "0.0.0"
 dependencies = [
  "bootty-workspace-hack",
+ "pretty_assertions",
+ "proptest",
+ "rstest",
 ]
 
 [[package]]
@@ -882,6 +900,7 @@ name = "bootty-mux"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-command",
  "bootty-mux-model",
  "bootty-runtime",
@@ -891,10 +910,14 @@ dependencies = [
  "derive_more",
  "getrandom 0.4.3",
  "inventory",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
  "serde",
  "serde_json",
+ "static_assertions",
  "strum",
- "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -903,6 +926,10 @@ name = "bootty-mux-model"
 version = "0.4.0"
 dependencies = [
  "bootty-workspace-hack",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
  "serde",
  "serde_json",
  "strum",
@@ -925,16 +952,20 @@ name = "bootty-remote"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "base64 0.22.1",
  "bootty-mux",
  "bootty-mux-model",
  "bootty-runtime",
  "bootty-workspace-hack",
  "getrandom 0.4.3",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "tempfile",
+ "static_assertions",
  "ureq",
 ]
 
@@ -950,8 +981,13 @@ dependencies = [
  "fontdb",
  "libghostty-vt",
  "png",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
  "rustybuzz",
  "smallvec",
+ "static_assertions",
  "unicode-width 0.2.2",
  "wgpu",
  "windows-sys 0.61.2",
@@ -962,6 +998,7 @@ name = "bootty-rmux"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "base64 0.22.1",
  "bootty-identity",
  "bootty-mux",
@@ -972,14 +1009,18 @@ dependencies = [
  "bootty-terminal",
  "bootty-workspace-hack",
  "inventory",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
  "rmux-client",
  "rmux-ipc",
  "rmux-proto",
  "rmux-sdk",
  "rmux-server",
+ "rstest",
  "serde",
  "serde_json",
- "tempfile",
+ "static_assertions",
  "tokio",
 ]
 
@@ -988,11 +1029,14 @@ name = "bootty-runtime"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-surface",
  "bootty-terminal",
  "criterion",
  "portable-pty",
- "tempfile",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
 ]
 
 [[package]]
@@ -1001,6 +1045,9 @@ version = "0.4.0"
 dependencies = [
  "bootty-surface",
  "egui",
+ "pretty_assertions",
+ "proptest",
+ "rstest",
  "serde",
  "serde-wasm-bindgen",
  "syntect",
@@ -1012,7 +1059,9 @@ dependencies = [
 name = "bootty-surface"
 version = "0.0.0"
 dependencies = [
+ "pretty_assertions",
  "proptest",
+ "rstest",
 ]
 
 [[package]]
@@ -1026,7 +1075,9 @@ dependencies = [
  "libghostty-vt",
  "memchr",
  "png",
+ "pretty_assertions",
  "proptest",
+ "proptest-derive",
  "rstest",
  "unicode-width 0.2.2",
 ]
@@ -1035,15 +1086,14 @@ dependencies = [
 name = "bootty-tests"
 version = "0.4.0"
 dependencies = [
- "bootty-app",
- "bootty-command",
  "bootty-config",
  "bootty-identity",
- "bootty-mux",
  "bootty-rmux",
  "bootty-workspace-hack",
- "serde_json",
- "tempfile",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
 ]
 
 [[package]]
@@ -1051,13 +1101,17 @@ name = "bootty-tmux"
 version = "0.4.0"
 dependencies = [
  "anyhow",
+ "assert_fs",
  "bootty-identity",
  "bootty-mux",
  "bootty-mux-model",
  "bootty-remote",
  "bootty-workspace-hack",
  "inventory",
- "tempfile",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
 ]
 
 [[package]]
@@ -1069,6 +1123,9 @@ dependencies = [
  "eframe",
  "egui_code_editor",
  "iconflow",
+ "pretty_assertions",
+ "proptest",
+ "rstest",
 ]
 
 [[package]]
@@ -1087,6 +1144,7 @@ dependencies = [
  "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "pollster 0.4.0",
+ "pretty_assertions",
  "thiserror 2.0.20",
  "wgpu",
  "winit",
@@ -1096,13 +1154,18 @@ dependencies = [
 name = "bootty-workspace"
 version = "0.4.0"
 dependencies = [
+ "assert_fs",
  "bootty-config",
  "bootty-mux",
  "bootty-workspace-hack",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
  "rusqlite",
  "serde",
  "serde_json",
- "tempfile",
+ "static_assertions",
  "thiserror 2.0.20",
 ]
 
@@ -1215,7 +1278,12 @@ dependencies = [
 name = "bootty-write"
 version = "0.0.0"
 dependencies = [
+ "assert_fs",
  "bootty-workspace-hack",
+ "pretty_assertions",
+ "proptest",
+ "proptest-derive",
+ "rstest",
  "tempfile",
  "winsafe",
 ]
@@ -5230,6 +5298,17 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "proptest-derive"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c57924a81864dddafba92e1bf92f9bf82f97096c44489548a60e888e1547549b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

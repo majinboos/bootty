@@ -1,6 +1,19 @@
 use std::collections::HashSet;
 
 use bootty_workspace::{SessionMembership, WorkspaceSession};
+use pretty_assertions::assert_eq;
+use proptest::prelude::*;
+use proptest_derive::Arbitrary;
+
+static_assertions::assert_impl_all!(WorkspaceSession: Clone, Eq, Send, Sync);
+static_assertions::assert_impl_all!(SessionMembership: Clone, Eq, Send, Sync);
+
+#[derive(Arbitrary, Clone, Copy, Debug)]
+struct SessionSeed {
+    identity: u16,
+    backend_name: u16,
+    cwd: u16,
+}
 
 fn session(identity: &str, name: &str) -> WorkspaceSession {
     WorkspaceSession {
@@ -20,8 +33,6 @@ fn labels(membership: &SessionMembership) -> Vec<&str> {
         .collect()
 }
 
-/// The point of the whole redesign: a rename is not a membership change. The backend hands out
-/// a new name, the claim does not move, and the display name is untouched.
 #[test]
 fn a_rename_from_anywhere_leaves_the_claim_and_the_display_name_alone() {
     let mut membership = SessionMembership::default();
@@ -35,8 +46,6 @@ fn a_rename_from_anywhere_leaves_the_claim_and_the_display_name_alone() {
     assert_eq!(claimed.label(), "agents/main");
 }
 
-/// Two Spaces on one server can both hold what bootty calls `agents/main`; only the backend
-/// name has to be unique, and it is not what anything is keyed on.
 #[test]
 fn two_sessions_can_share_a_display_name_when_the_backend_had_to_uniquify_one() {
     let mut membership = SessionMembership::default();
@@ -95,27 +104,35 @@ fn a_session_reorders_inside_its_group_and_carries_the_group_across_one() {
     );
 }
 
-/// An empty snapshot is a backend that has not answered yet, not a Space that emptied.
 #[test]
-fn pruning_ignores_an_empty_snapshot_and_drops_sessions_that_really_went_away() {
+fn pruning_ignores_empty_snapshots_and_drops_sessions_that_went_away() {
     let mut membership = SessionMembership::default();
     membership.claim(session("id-1", "one"));
     membership.claim(session("id-2", "two"));
 
     assert!(!membership.retain_alive(&HashSet::new()));
     assert_eq!(membership.sessions().len(), 2);
-
     assert!(membership.retain_alive(&HashSet::from(["id-1"])));
     assert_eq!(labels(&membership), ["one"]);
 }
 
-#[test]
-fn releasing_a_session_hands_it_back_so_another_space_can_claim_it() {
-    let mut membership = SessionMembership::default();
-    membership.claim(session("id-1", "one"));
+proptest! {
+    /// Property: claim followed by release returns the same public session value.
+    #[test]
+    fn claim_then_release_round_trips_session(seed in any::<SessionSeed>()) {
+        let mut expected = session(
+            &format!("id-{}", seed.identity),
+            &format!("session-{}", seed.backend_name),
+        );
+        expected.cwd = format!("/worktree/{}", seed.cwd);
+        let identity = expected.identity.clone();
+        let mut membership = SessionMembership::default();
 
-    let released = membership.release("id-1").expect("the claimed session");
-    assert_eq!(released.backend_name, "one");
-    assert!(membership.is_empty());
-    assert!(membership.release("id-1").is_none());
+        prop_assert!(membership.claim(expected.clone()));
+        let released = membership.release(&identity);
+
+        prop_assert_eq!(released, Some(expected));
+        prop_assert!(membership.is_empty());
+        prop_assert_eq!(membership.release(&identity), None);
+    }
 }

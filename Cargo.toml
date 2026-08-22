@@ -1,16 +1,6 @@
-[package]
-name = "bootty-tests"
-version.workspace = true
-edition.workspace = true
-publish = false
-autolib = false
-autobins = false
-autoexamples = false
-autobenches = false
-
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "tests"]
 
 [workspace.package]
 version = "0.4.0"
@@ -97,6 +87,7 @@ process-wrap = { version = "9.1", default-features = false, features = [
 portable-pty = { git = "https://github.com/wezterm/wezterm.git", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
 pretty_assertions = "1.4.1"
 proptest = "1"
+proptest-derive = "0.8.0"
 rmux-client = "0.10"
 rmux-sdk = "0.10"
 keepawake = "0.6"
@@ -113,6 +104,7 @@ serde-wasm-bindgen = "0.6"
 serde_json = "1"
 smallvec = "1"
 starship-battery = "0.11"
+static_assertions = "1.1.0"
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
@@ -180,16 +172,3 @@ codegen-units = 16
 [profile.dev.package."*"]
 opt-level = 2
 debug = false
-
-[dev-dependencies]
-bootty-app = { path = "crates/bootty-app" }
-bootty-command = { path = "crates/bootty-command" }
-bootty-config = { path = "crates/bootty-config" }
-bootty-identity = { path = "crates/bootty-identity" }
-bootty-mux = { path = "crates/bootty-mux" }
-bootty-rmux = { path = "crates/bootty-rmux" }
-serde_json.workspace = true
-tempfile.workspace = true
-
-[dependencies]
-bootty-workspace-hack = { version = "0.1", path = "crates/bootty-workspace-hack" }

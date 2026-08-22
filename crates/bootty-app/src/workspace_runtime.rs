@@ -46,6 +46,7 @@ pub(crate) use binding_windows::terminal_cwd_for_mux_command;
 pub use space_summary::SpaceSummary;
 
 use crate::{
+    error_catalog::ErrorNotice,
     layout::{PaneLayout, SplitDirection},
     renderer::TerminalWidget,
     terminal_config::terminal_session_config_with_side_effects,
@@ -325,9 +326,9 @@ impl BindingRuntime {
         // binding that was merely unreachable once could never refresh, never succeed, and never
         // clear the flag. A runtime error clears itself the moment a refresh works.
         if workspace_binding.unavailable() && binding.mux.unavailable_reason().is_none() {
-            binding.mux.set_availability_error(Some(
-                "binding unavailable; reconnect to restore it".to_owned(),
-            ));
+            binding
+                .mux
+                .set_availability_error(Some(ErrorNotice::BindingUnavailable.to_string()));
         }
         binding.restore_persisted_sessions(&repaint, false);
         if let Some(selection) = workspace_binding.selection() {
@@ -753,7 +754,9 @@ impl WorkspaceRuntime {
                     variant,
                     repaint.clone(),
                 )
-                .ok_or_else(|| anyhow::anyhow!("persisted Space has no backend binding"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(ErrorNotice::PersistedSpaceHasNoBackendBinding.to_string())
+                })?;
                 for binding in runtime.bindings_mut() {
                     if snapshot.has_pending_binding_operation(binding.scope) {
                         binding.membership_reconciliation_waiting_for_refresh = true;
@@ -826,9 +829,12 @@ impl WorkspaceRuntime {
             if let Some(live_config) = live_config
                 && let Err(error) = owner.terminal.apply_live_config(live_config.clone())
             {
-                warnings.push(format!(
-                    "terminal config publication failed for parked native terminal: {error}"
-                ));
+                warnings.push(
+                    ErrorNotice::TerminalConfigPublicationFailed(format!(
+                        "terminal config publication failed for parked native terminal: {error}"
+                    ))
+                    .raw_message(),
+                );
             }
         }
         for binding in self.bindings_mut() {
@@ -843,10 +849,13 @@ impl WorkspaceRuntime {
             if let Some(live_config) = live_config
                 && let Err(error) = binding.terminal.apply_live_config(live_config.clone())
             {
-                warnings.push(format!(
-                    "terminal config publication failed for {:?}: {error}",
-                    binding.scope
-                ));
+                warnings.push(
+                    ErrorNotice::TerminalConfigPublicationFailed(format!(
+                        "terminal config publication failed for {:?}: {error}",
+                        binding.scope
+                    ))
+                    .raw_message(),
+                );
             }
         }
         warnings
@@ -1625,9 +1634,12 @@ impl WorkspaceRuntime {
                 }),
             MuxCommand::RenameSession { session_id, name } => {
                 let identity = self.active_session_identity(session_id).ok_or_else(|| {
-                    WorkspacePersistenceError::operation(format!(
-                        "rename session {session_id}: this Space does not hold it"
-                    ))
+                    WorkspacePersistenceError::operation(
+                        ErrorNotice::SessionNotHeldBySpace(format!(
+                            "rename session {session_id}: this Space does not hold it"
+                        ))
+                        .raw_message(),
+                    )
                 })?;
                 let old_name = self
                     .active

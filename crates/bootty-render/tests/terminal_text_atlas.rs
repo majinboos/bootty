@@ -6,10 +6,37 @@ use bootty_render::{
     terminal_text::{FontFeature, FontStyle, ResolvedFontFace},
     terminal_text_atlas::{
         GlyphAtlas, GlyphAtlasError, GlyphAtlasFaceKey, GlyphAtlasFormat, GlyphAtlasKey,
-        GlyphAtlasTextKey, TerminalTextShaper, TextAtlasBuilder, TexturedGlyphQuad,
+        GlyphAtlasTextKey, ShapedCluster, TerminalTextShaper, TextAtlasBuilder, TexturedGlyphQuad,
     },
 };
 use bootty_surface::geometry::{DEFAULT_FONT_SIZE, SurfaceRect};
+use pretty_assertions::assert_eq;
+use rstest::rstest;
+
+fn cluster_layout(clusters: &[ShapedCluster]) -> Vec<(&str, u16, u16, bool)> {
+    clusters
+        .iter()
+        .map(|cluster| {
+            (
+                cluster.text.as_str(),
+                cluster.cell,
+                cluster.cells,
+                cluster.is_whitespace,
+            )
+        })
+        .collect()
+}
+
+fn text_command(text: &str, width: f32) -> TextCommand {
+    TextCommand {
+        rect: SurfaceRect::from_min_size(0.0, 0.0, width, 20.0),
+        text: text.to_owned(),
+        attrs: attrs(),
+        face: Arc::new(face()),
+        font_size: DEFAULT_FONT_SIZE,
+        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
+    }
+}
 
 #[test]
 fn text_shaper_groups_combining_emoji_and_variation_clusters() {
@@ -37,24 +64,6 @@ fn text_shaper_groups_combining_emoji_and_variation_clusters() {
 }
 
 #[test]
-fn text_shaper_maps_codepoints_to_cells() {
-    let shaper = TerminalTextShaper;
-
-    let clusters = shaper.shape("A界e\u{301}", 4);
-
-    assert_eq!(clusters.len(), 3);
-    assert_eq!(clusters[0].text, "A");
-    assert_eq!(clusters[0].cell, 4);
-    assert_eq!(clusters[0].cells, 1);
-    assert_eq!(clusters[1].text, "界");
-    assert_eq!(clusters[1].cell, 5);
-    assert_eq!(clusters[1].cells, 2);
-    assert_eq!(clusters[2].text, "e\u{301}");
-    assert_eq!(clusters[2].cell, 7);
-    assert_eq!(clusters[2].cells, 1);
-}
-
-#[test]
 fn text_shaper_shape_into_replaces_previous_clusters() {
     let shaper = TerminalTextShaper;
     let mut clusters = shaper.shape("stale", 0);
@@ -62,11 +71,14 @@ fn text_shaper_shape_into_replaces_previous_clusters() {
     let total_cells = shaper.shape_into("A界e\u{301}", 4, &mut clusters);
 
     assert_eq!(total_cells, 4);
-    assert_eq!(clusters, shaper.shape("A界e\u{301}", 4));
-    assert_eq!(clusters.len(), 3);
-    assert_eq!(clusters[0].text, "A");
-    assert_eq!(clusters[1].text, "界");
-    assert_eq!(clusters[2].text, "e\u{301}");
+    assert_eq!(
+        cluster_layout(&clusters),
+        vec![
+            ("A", 4, 1, false),
+            ("界", 5, 2, false),
+            ("e\u{301}", 7, 1, false),
+        ]
+    );
 
     let total_cells = shaper.shape_into("fi", 0, &mut clusters);
 
@@ -76,33 +88,29 @@ fn text_shaper_shape_into_replaces_previous_clusters() {
     assert_eq!(clusters[1].text, "i");
 }
 
-#[test]
-fn text_shaper_ports_backend_complex_script_cell_cases() {
+#[rstest]
+#[case::arabic("مَرْحَبًا")]
+#[case::devanagari("कर्म")]
+#[case::tai_tham("ᨠᩣ")]
+#[case::tibetan("བོད")]
+#[case::javanese("ꦲꦤ")]
+#[case::chakma("𑄇𑄧")]
+#[case::bengali("কিরণ")]
+fn complex_scripts_produce_ordered_nonzero_terminal_cells(#[case] text: &str) {
     let shaper = TerminalTextShaper;
-    let samples = [
-        ("arabic forced LTR", "مَرْحَبًا"),
-        ("devanagari", "कर्म"),
-        ("tai tham vowels", "ᨠᩣ"),
-        ("tibetan", "བོད"),
-        ("javanese", "ꦲꦤ"),
-        ("chakma", "𑄇𑄧"),
-        ("bengali", "কিরণ"),
-    ];
+    let clusters = shaper.shape(text, 0);
 
-    for (name, text) in samples {
-        let clusters = shaper.shape(text, 0);
-        assert!(!clusters.is_empty(), "{name} produced no clusters");
-        assert_eq!(clusters[0].cell, 0, "{name} did not start at cell zero");
-        assert!(
-            clusters.iter().all(|cluster| cluster.cells >= 1),
-            "{name} produced a zero-width terminal cluster"
-        );
-        assert_cells_are_monotonic(&clusters, name);
-    }
+    assert!(!clusters.is_empty(), "{text:?} produced no clusters");
+    assert_eq!(clusters[0].cell, 0, "{text:?} did not start at cell zero");
+    assert!(
+        clusters.iter().all(|cluster| cluster.cells >= 1),
+        "{text:?} produced a zero-width terminal cluster"
+    );
+    assert_cells_are_monotonic(&clusters, text);
 }
 
 #[test]
-fn text_shaper_ports_backend_boundary_and_symbol_cases() {
+fn text_shaper_preserves_spaces_emoji_variants_and_symbols() {
     let shaper = TerminalTextShaper;
 
     let clusters = shaper.shape("a  b", 3);
@@ -125,11 +133,11 @@ fn text_shaper_ports_backend_boundary_and_symbol_cases() {
     assert_eq!(box_glyph[1].text, "─");
     assert_eq!(box_glyph[1].cell, 1);
 
-    let symbol_boundary = shaper.shape("a|b", 0);
-    assert_eq!(symbol_boundary[0].text, "a");
-    assert_eq!(symbol_boundary[1].text, "|");
-    assert_eq!(symbol_boundary[2].text, "b");
-    assert_cells_are_monotonic(&symbol_boundary, "symbol boundary");
+    let symbols = shaper.shape("a|b", 0);
+    assert_eq!(symbols[0].text, "a");
+    assert_eq!(symbols[1].text, "|");
+    assert_eq!(symbols[2].text, "b");
+    assert_cells_are_monotonic(&symbols, "symbols");
 }
 
 #[test]
@@ -249,27 +257,12 @@ fn glyph_atlas_ports_ghostty_bgr_write_and_grow_semantics() {
         ],
     );
 
-    assert_eq!(atlas.atlas_pixel_channel(1, 1, 0), Some(10));
-    assert_eq!(atlas.atlas_pixel_channel(1, 1, 1), Some(11));
-    assert_eq!(atlas.atlas_pixel_channel(1, 1, 2), Some(12));
-    assert_eq!(atlas.atlas_pixel_channel(2, 1, 0), Some(13));
-    assert_eq!(atlas.atlas_pixel_channel(2, 1, 1), Some(14));
-    assert_eq!(atlas.atlas_pixel_channel(2, 1, 2), Some(15));
-    assert_eq!(atlas.atlas_pixel_channel(3, 1, 0), Some(0));
-    assert_eq!(atlas.atlas_pixel_channel(1, 2, 0), Some(20));
-    assert_eq!(atlas.atlas_pixel_channel(2, 2, 2), Some(25));
+    let expected = [10, 11, 12, 13, 14, 15, 0, 20, 25].map(Some);
+    assert_eq!(bgr_samples(&atlas), expected);
 
     atlas.grow(5, 5);
 
-    assert_eq!(atlas.atlas_pixel_channel(1, 1, 0), Some(10));
-    assert_eq!(atlas.atlas_pixel_channel(1, 1, 1), Some(11));
-    assert_eq!(atlas.atlas_pixel_channel(1, 1, 2), Some(12));
-    assert_eq!(atlas.atlas_pixel_channel(2, 1, 0), Some(13));
-    assert_eq!(atlas.atlas_pixel_channel(2, 1, 1), Some(14));
-    assert_eq!(atlas.atlas_pixel_channel(2, 1, 2), Some(15));
-    assert_eq!(atlas.atlas_pixel_channel(3, 1, 0), Some(0));
-    assert_eq!(atlas.atlas_pixel_channel(1, 2, 0), Some(20));
-    assert_eq!(atlas.atlas_pixel_channel(2, 2, 2), Some(25));
+    assert_eq!(bgr_samples(&atlas), expected);
     assert!(atlas.reserve(1, 3).is_some());
     assert!(atlas.reserve(2, 1).is_some());
     assert!(atlas.reserve(1, 1).is_none());
@@ -317,35 +310,8 @@ fn glyph_atlas_saturation_memo_still_admits_smaller_glyphs() {
 }
 
 #[test]
-fn text_atlas_builder_emits_one_textured_quad_per_shaped_cluster() {
-    let command = TextCommand {
-        rect: SurfaceRect::from_min_size(0.0, 0.0, 40.0, 20.0),
-        text: "A界".to_owned(),
-        attrs: attrs(),
-        face: Arc::new(face()),
-        font_size: DEFAULT_FONT_SIZE,
-        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
-    };
-    let mut builder = TextAtlasBuilder::new(128, 128);
-
-    let quads = builder.prepare_text_command(&command, 1.0);
-
-    assert_eq!(quads.len(), 2);
-    assert!(quads[0].uv.min_x < quads[0].uv.max_x);
-    assert_eq!(quads[0].color, attrs().fg);
-    assert_eq!(builder.atlas_len(), 2);
-}
-
-#[test]
 fn text_atlas_builder_appends_textured_quads_without_replacing_existing_batch() {
-    let command = TextCommand {
-        rect: SurfaceRect::from_min_size(0.0, 0.0, 20.0, 20.0),
-        text: "AB".to_owned(),
-        attrs: attrs(),
-        face: Arc::new(face()),
-        font_size: DEFAULT_FONT_SIZE,
-        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
-    };
+    let command = text_command("A界", 40.0);
     let sentinel = TexturedGlyphQuad {
         rect: SurfaceRect::from_min_size(99.0, 99.0, 1.0, 1.0),
         uv: SurfaceRect::from_min_size(0.0, 0.0, 1.0, 1.0),
@@ -358,19 +324,14 @@ fn text_atlas_builder_appends_textured_quads_without_replacing_existing_batch() 
 
     assert_eq!(quads.len(), 3);
     assert_eq!(quads[0], sentinel);
+    assert!(quads[1].uv.min_x < quads[1].uv.max_x);
+    assert_eq!(quads[1].color, attrs().fg);
     assert_eq!(builder.atlas_len(), 2);
 }
 
 #[test]
 fn atlas_keys_separate_same_glyph_at_different_pixel_scales() {
-    let command = TextCommand {
-        rect: SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0),
-        text: "A".to_owned(),
-        attrs: attrs(),
-        face: Arc::new(face()),
-        font_size: DEFAULT_FONT_SIZE,
-        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
-    };
+    let command = text_command("A", 10.0);
     let mut builder = TextAtlasBuilder::new(128, 128);
 
     builder.prepare_text_command(&command, 1.0);
@@ -381,14 +342,7 @@ fn atlas_keys_separate_same_glyph_at_different_pixel_scales() {
 
 #[test]
 fn whitespace_clusters_do_not_create_invisible_quads_or_atlas_entries() {
-    let command = TextCommand {
-        rect: SurfaceRect::from_min_size(0.0, 0.0, 30.0, 20.0),
-        text: "A B".to_owned(),
-        attrs: attrs(),
-        face: Arc::new(face()),
-        font_size: DEFAULT_FONT_SIZE,
-        font_features: Arc::from(vec![FontFeature::new(*b"liga", 1)]),
-    };
+    let command = text_command("A B", 30.0);
     let mut builder = TextAtlasBuilder::new(64, 64);
 
     let quads = builder.prepare_text_command(&command, 1.0);
@@ -433,4 +387,19 @@ fn assert_atlas_pixels(atlas: &GlyphAtlas, expected: &[(u32, u32, u8)]) {
     for (x, y, value) in expected {
         assert_eq!(atlas.atlas_pixel(*x, *y), Some(*value), "pixel {x},{y}");
     }
+}
+
+fn bgr_samples(atlas: &GlyphAtlas) -> [Option<u8>; 9] {
+    [
+        (1, 1, 0),
+        (1, 1, 1),
+        (1, 1, 2),
+        (2, 1, 0),
+        (2, 1, 1),
+        (2, 1, 2),
+        (3, 1, 0),
+        (1, 2, 0),
+        (2, 2, 2),
+    ]
+    .map(|(x, y, channel)| atlas.atlas_pixel_channel(x, y, channel))
 }

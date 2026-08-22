@@ -33,3 +33,6 @@ winit = { workspace = true, features = ["wayland", "x11"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { workspace = true, features = ["dx12"], optional = true }
+
+[dev-dependencies]
+pretty_assertions.workspace = true

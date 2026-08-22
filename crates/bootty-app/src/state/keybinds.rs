@@ -99,29 +99,23 @@ impl AppState {
             }
             KeybindAction::App(AppAction::CloseSpace) => {
                 if !self.close_space_from_ui(self.workspace.active.id) {
-                    self.last_error = Some("the last space cannot be closed".to_owned());
+                    self.record_notice(crate::error_catalog::ErrorNotice::LastSpaceCannotClose);
                 }
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::NextSpace) => {
                 if self.activate_relative_space(1) {
                     effects.push(AppEffect::RequestRepaint);
-                } else {
-                    self.last_error = Some("no other space is available".to_owned());
                 }
             }
             KeybindAction::App(AppAction::PreviousSpace) => {
                 if self.activate_relative_space(-1) {
                     effects.push(AppEffect::RequestRepaint);
-                } else {
-                    self.last_error = Some("no other space is available".to_owned());
                 }
             }
             KeybindAction::App(AppAction::SelectSpace(index)) => {
                 if self.select_space(index) {
                     effects.push(AppEffect::RequestRepaint);
-                } else {
-                    self.last_error = Some(format!("space {index} is unavailable"));
                 }
             }
             KeybindAction::App(AppAction::ShowKeybinds) => {
@@ -188,7 +182,7 @@ impl AppState {
             KeybindAction::Scroll(action) => self.apply_terminal_scroll_action(action),
             KeybindAction::Write(bytes) => {
                 if let Err(error) = self.workspace.active.binding.terminal.write_input(&bytes) {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                 } else {
                     self.hide_mouse_pointer_for_terminal_typing(effects);
                 }
@@ -204,11 +198,11 @@ impl AppState {
             KeybindAction::PasteFromClipboard => match read_clipboard_text() {
                 Ok(Some(text)) => {
                     if let Err(error) = self.workspace.active.binding.terminal.write_paste(&text) {
-                        self.last_error = Some(error.to_string());
+                        self.record_error(error);
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.last_error = Some(error.to_string()),
+                Err(error) => self.record_error(error),
             },
         }
     }
@@ -217,7 +211,7 @@ impl AppState {
             .terminal_interaction
             .enter_copy_mode(&mut self.workspace.active.binding.terminal);
         if let Some(error) = outcome.last_error {
-            self.last_error = Some(error);
+            self.record_error(error);
         }
         effects.extend(outcome.effects);
     }
@@ -230,7 +224,7 @@ impl AppState {
             .terminal_interaction
             .copy_selection_or_request(&mut self.workspace.active.binding.terminal, format);
         if let Some(error) = outcome.last_error {
-            self.last_error = Some(error);
+            self.record_error(error);
         }
         effects.extend(outcome.effects);
     }
@@ -266,7 +260,7 @@ impl AppState {
                 None,
                 &self.repaint,
             ) {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
             } else {
                 self.sync_native_layout_terminal_now();
             }
@@ -325,7 +319,7 @@ impl AppState {
             .terminal
             .scroll_viewport_delta(delta)
         {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
         }
     }
     fn apply_font_size_action(&mut self, action: FontSizeAction, effects: &mut Vec<AppEffect>) {

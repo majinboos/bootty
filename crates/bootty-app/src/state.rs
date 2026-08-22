@@ -45,6 +45,7 @@ mod spaces;
 
 use crate::commands::{CommandRuntime, ExactMuxTarget};
 use crate::config_runtime::AppConfigRuntime;
+use crate::error_catalog::ErrorNotice;
 use crate::terminal_config::terminal_live_config;
 use crate::terminal_interaction::{TerminalFocusIntent, TerminalInteractionRuntime};
 use crate::ui::DialogRuntime;
@@ -145,7 +146,7 @@ pub struct AppState {
     pub(super) commands: CommandRuntime,
     pub(super) workspace: WorkspaceRuntime,
     repaint_scheduler: RepaintScheduler,
-    pub(super) last_error: Option<String>,
+    pub(super) last_error: Option<ErrorNotice>,
     last_drain: DrainStats,
     terminal_surface: Option<TerminalSurface>,
     /// The full terminal area the panes were last laid out within, for geometric neighbor lookup.
@@ -357,10 +358,11 @@ impl AppState {
         let mut effects = Vec::new();
         self.apply_accepted_config(change, &mut effects);
         if let Some(warning) = &warning {
-            self.last_error = Some(match self.last_error.take() {
-                Some(existing) => format!("{existing}; {warning}"),
+            let message = match self.last_error.take() {
+                Some(existing) => format!("{}; {warning}", existing.raw_message()),
                 None => warning.clone(),
-            });
+            };
+            self.record_error(message);
         }
         Ok((document, warning, effects))
     }
@@ -372,12 +374,12 @@ impl AppState {
     ) {
         let mut document = self.config_runtime.document().clone();
         if let Err(error) = mutate(&mut document) {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
             return;
         }
         match self.commit_settings_document(document) {
             Ok((_, _, accepted_effects)) => effects.extend(accepted_effects),
-            Err(error) => self.last_error = Some(error.to_string()),
+            Err(error) => self.record_error(error),
         }
     }
 
@@ -424,7 +426,7 @@ impl AppState {
         let resolved = match bootty_config::config::resolve_theme(theme, config_dir) {
             Ok(theme) => theme,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 return;
             }
         };
@@ -456,7 +458,7 @@ impl AppState {
             .workspace
             .publish_terminal_config(&config, variant, Some(&live_config));
         if !warnings.is_empty() {
-            self.last_error = Some(warnings.join("; "));
+            self.record_error(warnings.join("; "));
         }
     }
     pub fn theme_picker_preview_active(&self) -> bool {
@@ -516,13 +518,29 @@ impl AppState {
                 )
             })
     }
-    pub fn last_error(&self) -> Option<&str> {
+    pub fn last_error(&self) -> Option<String> {
         self.workspace
             .active
             .binding
             .mux
             .last_error()
-            .or(self.last_error.as_deref())
+            .map(str::to_owned)
+            .or_else(|| self.last_error.as_ref().map(ErrorNotice::raw_message))
+    }
+    pub(crate) fn error_notice(&self) -> Option<ErrorNotice> {
+        self.workspace
+            .active
+            .binding
+            .mux
+            .last_error()
+            .map(ErrorNotice::from_text)
+            .or_else(|| self.last_error.clone())
+    }
+    pub(crate) fn record_error(&mut self, error: impl ToString) {
+        self.last_error = Some(ErrorNotice::from_text(error.to_string()));
+    }
+    pub(crate) fn record_notice(&mut self, notice: ErrorNotice) {
+        self.last_error = Some(notice);
     }
     pub fn clear_last_error(&mut self) {
         self.workspace.active.binding.mux.set_error(None);
@@ -578,7 +596,7 @@ impl AppState {
         self.terminal_surface = Some(surface);
     }
     pub fn record_render_error(&mut self, error: impl ToString) {
-        self.last_error = Some(error.to_string());
+        self.record_error(error);
     }
 
     pub fn keep_awake_active(&self) -> bool {
@@ -632,7 +650,7 @@ impl AppState {
 
     fn sync_terminal_panes_or_record_error(&mut self) {
         if let Err(error) = self.sync_terminal_panes() {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
         }
     }
     pub fn native_multi_pane(&self) -> bool {
@@ -731,7 +749,7 @@ impl AppState {
             self.workspace
                 .activate_target(target.scope, &target.session_id, None, &self.repaint)
         {
-            self.last_error = Some(error.to_string());
+            self.record_error(error);
             return false;
         }
         self.sync_native_layout_terminal_now();
@@ -791,7 +809,7 @@ impl AppState {
                     Some(&window_id),
                     &self.repaint,
                 ) {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                     return false;
                 }
                 self.sync_native_layout_terminal_now();
@@ -861,7 +879,7 @@ impl AppState {
         match result {
             Ok(changed) => changed,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 false
             }
         }
@@ -999,7 +1017,7 @@ impl AppState {
         focus_intent: TerminalFocusIntent,
     ) {
         if let Some(error) = last_error {
-            self.last_error = Some(error);
+            self.record_error(error);
         }
         self.apply_terminal_focus_intent(focus_intent);
     }
@@ -1057,7 +1075,7 @@ impl AppState {
             TerminalSideEffect::Bell => effects.push(AppEffect::Bell),
             TerminalSideEffect::ClipboardWrite(text) => {
                 if let Err(error) = write_clipboard_text(&text) {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                 }
             }
             TerminalSideEffect::ClipboardQuery { selection } => match read_clipboard_text() {
@@ -1069,11 +1087,11 @@ impl AppState {
                         .terminal
                         .write_input(&encode_osc52_response(&selection, &text))
                     {
-                        self.last_error = Some(error.to_string());
+                        self.record_error(error);
                     }
                 }
                 Ok(None) => {}
-                Err(error) => self.last_error = Some(error.to_string()),
+                Err(error) => self.record_error(error),
             },
             TerminalSideEffect::WindowTitle(title) => {
                 self.apply_terminal_window_title(source_pane_id.as_deref(), title, effects);
@@ -1081,7 +1099,7 @@ impl AppState {
             TerminalSideEffect::WindowIcon(_) => {}
             TerminalSideEffect::DesktopNotification { title, body } => {
                 if let Err(error) = show_desktop_notification(&title, &body) {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                 }
             }
             TerminalSideEffect::MouseShape(shape) => {
@@ -1107,7 +1125,7 @@ impl AppState {
                     .terminal
                     .write_input(&response)
                 {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                 }
             }
             TerminalSideEffect::ReportVariable(name) => {
@@ -1121,7 +1139,7 @@ impl AppState {
                     .terminal
                     .write_input(&response)
                 {
-                    self.last_error = Some(error.to_string());
+                    self.record_error(error);
                 }
             }
             TerminalSideEffect::ConEmuProgress { state, value } => {
@@ -1214,7 +1232,7 @@ impl AppState {
         }
         self.hot_reload_config_if_changed(&mut effects, now);
         for error in workspace_frame.errors {
-            self.last_error = Some(error);
+            self.record_error(error);
         }
         self.terminal_view_transform = terminal_view_transform;
         self.restore_mouse_pointer_after_pointer_moved(&events, hover_pos, &mut effects);
@@ -1233,6 +1251,7 @@ impl AppState {
         self.sample_window_chrome(viewport);
         let pending_pty_bytes = self.workspace.active.binding.terminal.pending_pty_len();
         let (cols, rows) = self.workspace.active.binding.terminal.grid_size();
+        let last_error = self.last_error.as_ref().map(ErrorNotice::raw_message);
         self.config_runtime.record_stability(StabilityTraceSample {
             selected_session: self.workspace.active.binding.mux.selected_session(),
             cols,
@@ -1241,7 +1260,7 @@ impl AppState {
             drain_bytes: self.last_drain.bytes,
             drain_elapsed_us: self.last_drain.elapsed_us,
             text_runs: renderer_metrics.text_runs,
-            last_error: self.last_error.as_deref(),
+            last_error: last_error.as_deref(),
         });
         let repaint = self.repaint_scheduler.recommend(RepaintSignal {
             drained_bytes: self.last_drain.bytes,
@@ -1274,7 +1293,7 @@ impl AppState {
         ) {
             Ok(change) => change,
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.record_error(error);
                 return false;
             }
         };
@@ -1336,7 +1355,8 @@ impl AppState {
         if let Some(warning) = change.compatibility_warning {
             warnings.push(warning);
         }
-        self.last_error = (!warnings.is_empty()).then(|| warnings.join("; "));
+        self.last_error =
+            (!warnings.is_empty()).then(|| ErrorNotice::from_text(warnings.join("; ")));
         effects.push(AppEffect::RequestRepaint);
     }
     fn hot_reload_config_if_changed(&mut self, effects: &mut Vec<AppEffect>, now: Instant) {

@@ -1,5 +1,6 @@
 use bootty_render::font_database::{system_font_database, ui_font_definitions};
 use eframe::egui::FontFamily;
+use pretty_assertions::assert_eq;
 
 #[test]
 fn ui_fonts_preserve_configured_family_order() {

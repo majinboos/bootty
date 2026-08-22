@@ -5,6 +5,8 @@ use bootty_config::config::{
 };
 use bootty_workspace::SpaceRemoteOverride;
 
+use crate::error_catalog::ErrorNotice;
+
 /// The binding value that the app hands to the mux controller.
 ///
 /// The product config owns the initial validated value. This module applies the placement policy
@@ -66,10 +68,13 @@ pub(super) fn realize_binding_from(
                 None
             } else {
                 clear_remote(&mut config);
-                Some(format!(
-                    "SSH profile '{}' is unavailable",
-                    remote.profile_id
-                ))
+                Some(
+                    ErrorNotice::SshProfileUnavailable(format!(
+                        "SSH profile '{}' is unavailable",
+                        remote.profile_id
+                    ))
+                    .raw_message(),
+                )
             }
         }
         SpaceRemoteOverride::Inline(remote) => {

@@ -5,6 +5,7 @@ use bootty_ui::{
     },
 };
 use eframe::egui::{self, Event, Modifiers, PointerButton, Pos2, RawInput, Rect};
+use pretty_assertions::assert_eq;
 
 fn run_frame(context: &egui::Context, events: Vec<Event>, mut show: impl FnMut(&mut egui::Ui)) {
     context
@@ -19,6 +20,15 @@ fn run_frame(context: &egui::Context, events: Vec<Event>, mut show: impl FnMut(&
             },
         )
         .drop_without_applying_deltas();
+}
+
+fn pointer_button(pos: Pos2, pressed: bool) -> Event {
+    Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: Modifiers::NONE,
+    }
 }
 
 #[test]
@@ -47,30 +57,12 @@ fn segmented_selection_reports_the_clicked_segment() {
     run_frame(&context, vec![Event::PointerMoved(position)], |ui| {
         changed = settings_segmented(ui, ThemePalette::default(), &["Left", "Right"], 0);
     });
-    run_frame(
-        &context,
-        vec![Event::PointerButton {
-            pos: position,
-            button: PointerButton::Primary,
-            pressed: true,
-            modifiers: Modifiers::NONE,
-        }],
-        |ui| {
-            changed = settings_segmented(ui, ThemePalette::default(), &["Left", "Right"], 0);
-        },
-    );
-    run_frame(
-        &context,
-        vec![Event::PointerButton {
-            pos: position,
-            button: PointerButton::Primary,
-            pressed: false,
-            modifiers: Modifiers::NONE,
-        }],
-        |ui| {
-            changed = settings_segmented(ui, ThemePalette::default(), &["Left", "Right"], 0);
-        },
-    );
+    run_frame(&context, vec![pointer_button(position, true)], |ui| {
+        changed = settings_segmented(ui, ThemePalette::default(), &["Left", "Right"], 0);
+    });
+    run_frame(&context, vec![pointer_button(position, false)], |ui| {
+        changed = settings_segmented(ui, ThemePalette::default(), &["Left", "Right"], 0);
+    });
 
     assert_eq!(changed, Some(1));
 }
@@ -79,7 +71,7 @@ fn segmented_selection_reports_the_clicked_segment() {
 fn number_edit_formats_value_with_precision_and_suffix() {
     let context = egui::Context::default();
     let spec = || NumberEditSpec {
-        id_salt: &["settings-contract", "number"],
+        id_salt: &["settings", "number"],
         range: 0.0..=1.0,
         suffix: " %",
         precision: 2,
@@ -90,7 +82,7 @@ fn number_edit_formats_value_with_precision_and_suffix() {
     let mut edit_id = None;
 
     run_frame(&context, Vec::new(), |ui| {
-        edit_id = Some(ui.make_persistent_id(("settings-number-edit", "settings-contract.number")));
+        edit_id = Some(ui.make_persistent_id(("settings-number-edit", "settings.number")));
         changed = settings_number_edit(ui, ThemePalette::default(), &mut value, spec());
     });
 
@@ -117,12 +109,7 @@ fn toggle_reports_a_click_and_flips_the_value() {
     );
     run_frame(
         &context,
-        vec![Event::PointerButton {
-            pos: Pos2::new(23.0, 13.0),
-            button: PointerButton::Primary,
-            pressed: true,
-            modifiers: egui::Modifiers::NONE,
-        }],
+        vec![pointer_button(Pos2::new(23.0, 13.0), true)],
         |ui| {
             let _ = settings_toggle(ui, ThemePalette::default(), &mut value);
         },
@@ -130,12 +117,7 @@ fn toggle_reports_a_click_and_flips_the_value() {
     let mut changed = false;
     run_frame(
         &context,
-        vec![Event::PointerButton {
-            pos: Pos2::new(23.0, 13.0),
-            button: PointerButton::Primary,
-            pressed: false,
-            modifiers: egui::Modifiers::NONE,
-        }],
+        vec![pointer_button(Pos2::new(23.0, 13.0), false)],
         |ui| {
             changed = settings_toggle(ui, ThemePalette::default(), &mut value);
         },

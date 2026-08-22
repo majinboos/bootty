@@ -1,5 +1,5 @@
 use bootty_ui::icons::{has_slug, icon_glyph, resolve_slug};
-
+use pretty_assertions::assert_eq;
 #[test]
 fn public_chrome_icon_slugs_resolve_to_drawable_glyphs() {
     for slug in [
@@ -39,5 +39,13 @@ fn public_chrome_icon_slugs_resolve_to_drawable_glyphs() {
         );
         assert!(icon_glyph(slug).is_some(), "undrawable public icon {slug}");
     }
-    assert!(!has_slug("not-a-real-lucide-icon"));
+}
+
+#[test]
+fn unknown_icon_slug_is_rejected() {
+    let slug = "not-a-real-lucide-icon";
+    assert_eq!(
+        (has_slug(slug), resolve_slug(slug), icon_glyph(slug)),
+        (false, None, None)
+    );
 }

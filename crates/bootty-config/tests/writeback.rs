@@ -11,10 +11,11 @@ use bootty_config::config::{
     SegmentAlign, SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment,
     commit_config_document, load_config_document, load_config_from_path, update_config_document,
 };
+use pretty_assertions::assert_eq;
 
 #[test]
 fn document_readers_answer_what_the_document_holds() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     fs::write(
         &path,
@@ -50,7 +51,7 @@ fn document_readers_answer_what_the_document_holds() {
 
 #[test]
 fn atomic_writeback_preserves_structure_and_unix_mode() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     let source = "# user comment\ninclude = [\"?local.toml\"]\n\n[window]\ntitle = \"Keep\"\n\n[chrome]\nsidebar = true\n";
     fs::write(&path, source).expect("write initial config");
@@ -89,7 +90,7 @@ fn atomic_writeback_preserves_structure_and_unix_mode() {
 
 #[test]
 fn a_new_config_is_private_and_loadable() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("nested/config.toml");
 
     update_config_document(&path, |document| {
@@ -120,7 +121,7 @@ fn a_new_config_is_private_and_loadable() {
 
 #[test]
 fn ssh_profile_writeback_replaces_and_removes_only_the_named_profile() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     fs::write(
         &path,
@@ -194,7 +195,7 @@ fn ssh_profile_writeback_replaces_and_removes_only_the_named_profile() {
 
 #[test]
 fn a_pre_replacement_error_keeps_the_existing_file() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     let original = "[window]\ntitle = \"old\"\n";
     fs::write(&path, original).expect("write initial config");
@@ -208,7 +209,7 @@ fn a_pre_replacement_error_keeps_the_existing_file() {
 
 #[test]
 fn whole_document_commit_validates_before_replacement() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     let original = "# keep me\n[window]\ntitle = \"old\"\n";
     fs::write(&path, original).expect("write initial config");
@@ -263,7 +264,7 @@ fn whole_document_commit_validates_before_replacement() {
 
 #[test]
 fn status_bar_writeback_preserves_segments_legacy_cleanup_comments_and_order() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     fs::write(
         &path,
@@ -351,7 +352,7 @@ fn status_bar_writeback_preserves_segments_legacy_cleanup_comments_and_order() {
 fn writeback_preserves_a_relative_final_symlink() {
     use std::os::unix::fs::symlink;
 
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let target = directory.path().join("target.toml");
     let link = directory.path().join("config.toml");
     fs::write(&target, "[window]\ntitle = \"old\"\n").expect("write target");
@@ -380,7 +381,7 @@ fn writeback_preserves_a_relative_final_symlink() {
 fn writeback_creates_a_dangling_symlink_target_without_replacing_the_link() {
     use std::os::unix::fs::symlink;
 
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let target = directory.path().join("created.toml");
     let link = directory.path().join("config.toml");
     symlink("created.toml", &link).expect("create dangling symlink");
@@ -404,7 +405,7 @@ fn writeback_creates_a_dangling_symlink_target_without_replacing_the_link() {
 fn a_config_symlink_cycle_is_rejected() {
     use std::os::unix::fs::symlink;
 
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let first = directory.path().join("first.toml");
     let second = directory.path().join("second.toml");
     symlink("second.toml", &first).expect("create first link");
@@ -417,7 +418,7 @@ fn a_config_symlink_cycle_is_rejected() {
 
 #[test]
 fn bootty_processes_serialize_config_updates() {
-    let directory = tempfile::tempdir().expect("temporary config directory");
+    let directory = assert_fs::TempDir::new().expect("temporary config directory");
     let path = directory.path().join("config.toml");
     fs::write(&path, "[window]\ntitle = \"base\"\n").expect("write initial config");
     let entered = directory.path().join("entered");
