@@ -3,7 +3,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use bootty_config::config::{SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig};
+use bootty_config::config::{
+    SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, SshRemoteConfig,
+};
 use eframe::egui;
 
 use super::{
@@ -15,11 +17,59 @@ pub(super) type RemoteTest = (SshProfileConfig, mpsc::Sender<Result<(), String>>
 
 #[derive(Default)]
 pub(super) struct EditorState {
+    default_remote: Option<DefaultRemoteDraft>,
     selected_id: Option<String>,
     draft: Option<ProfileDraft>,
     message: Option<(bool, String)>,
     test: Option<mpsc::Receiver<Result<(), String>>>,
     test_request: Option<SshProfileConfig>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DefaultRemoteDraft {
+    host: String,
+    user: String,
+    port: String,
+    program: String,
+    args: Vec<String>,
+}
+
+impl DefaultRemoteDraft {
+    fn from_remote(remote: Option<&SshRemoteConfig>) -> Self {
+        let Some(remote) = remote else {
+            return Self {
+                program: "ssh".to_owned(),
+                ..Self::default()
+            };
+        };
+        Self {
+            host: remote.host.clone(),
+            user: remote.user.clone().unwrap_or_default(),
+            port: remote.port.map(|port| port.to_string()).unwrap_or_default(),
+            program: remote.program.clone(),
+            args: remote.args.clone(),
+        }
+    }
+
+    fn remote(&self) -> Result<SshRemoteConfig, String> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("Default remote needs a host name.".to_owned());
+        }
+        let port = super::nonempty(&self.port)
+            .map(|port| {
+                port.parse::<u16>()
+                    .map_err(|_| "Port must be between 1 and 65535.".to_owned())
+            })
+            .transpose()?;
+        Ok(SshRemoteConfig {
+            host: host.to_owned(),
+            user: super::nonempty(&self.user),
+            port,
+            program: super::nonempty(&self.program).unwrap_or_else(|| "ssh".to_owned()),
+            args: clean_args(&self.args),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -98,7 +148,7 @@ impl ProfileDraft {
             identity_file,
             proxy_jump: super::nonempty(&self.proxy_jump),
             program: super::nonempty(&self.program).unwrap_or_else(|| "ssh".to_owned()),
-            args: self.args.clone(),
+            args: clean_args(&self.args),
         })
     }
 }
@@ -113,6 +163,69 @@ impl EditorState {
     fn show(&mut self, win: &mut SettingsSurface, ui: &mut egui::Ui) {
         self.poll_test();
         self.ensure_selection(win);
+
+        if self.default_remote.is_none() {
+            self.default_remote = Some(DefaultRemoteDraft::from_remote(
+                win.config.multiplexer.remote.as_ref(),
+            ));
+        }
+        let mut default_remote = self
+            .default_remote
+            .take()
+            .unwrap_or_else(|| DefaultRemoteDraft::from_remote(None));
+        section(ui, win.palette, "DEFAULT REMOTE");
+        settings_notice(
+            ui,
+            win.palette.muted,
+            "Used by new remote Spaces when no per-space override is selected.",
+        );
+        field(
+            ui,
+            win,
+            "Host name",
+            "host or SSH config alias",
+            &mut default_remote.host,
+        );
+        field(
+            ui,
+            win,
+            "Port",
+            "22 or from SSH config",
+            &mut default_remote.port,
+        );
+        field(
+            ui,
+            win,
+            "User name",
+            "local user or SSH config",
+            &mut default_remote.user,
+        );
+        field(ui, win, "SSH client", "ssh", &mut default_remote.program);
+        args_editor(ui, win, "Extra SSH arguments", &mut default_remote.args);
+        ui.horizontal(|ui| {
+            if settings_button(ui, win.palette, "Save default remote").clicked() {
+                match default_remote.remote() {
+                    Ok(remote) if win.config.multiplexer.backend.supports_remote() => {
+                        save_default_remote(win, remote);
+                        self.message = Some((true, "Default remote saved.".to_owned()));
+                    }
+                    Ok(_) => {
+                        self.message = Some((
+                            false,
+                            "Choose rmux or tmux before enabling a default remote.".to_owned(),
+                        ));
+                    }
+                    Err(error) => self.message = Some((false, error)),
+                }
+            }
+            if win.config.multiplexer.remote.is_some()
+                && settings_button(ui, win.palette, "Clear default remote").clicked()
+            {
+                clear_default_remote(win);
+                default_remote = DefaultRemoteDraft::from_remote(None);
+                self.message = Some((true, "Default remote cleared.".to_owned()));
+            }
+        });
 
         section(ui, win.palette, "SSH PROFILES");
         ui.horizontal_wrapped(|ui| {
@@ -141,6 +254,7 @@ impl EditorState {
         });
 
         let Some(id) = self.selected_id.clone() else {
+            self.default_remote = Some(default_remote);
             settings_notice(
                 ui,
                 win.palette.muted,
@@ -227,6 +341,7 @@ impl EditorState {
             &mut draft.proxy_jump,
         );
         field(ui, win, "SSH client", "ssh", &mut draft.program);
+        args_editor(ui, win, "Extra SSH arguments", &mut draft.args);
 
         if let Some((success, message)) = &self.message {
             settings_notice(
@@ -279,6 +394,7 @@ impl EditorState {
         if !deleted {
             self.draft = Some(draft);
         }
+        self.default_remote = Some(default_remote);
     }
 
     fn ensure_selection(&mut self, win: &SettingsSurface) {
@@ -328,6 +444,39 @@ impl EditorState {
     }
 }
 
+fn args_editor(ui: &mut egui::Ui, win: &mut SettingsSurface, label: &str, args: &mut Vec<String>) {
+    section(ui, win.palette, label);
+    settings_notice(
+        ui,
+        win.palette.muted,
+        "Arguments are passed to the SSH client before the destination.",
+    );
+    let mut remove = None;
+    for (index, arg) in args.iter_mut().enumerate() {
+        super::settings_row(ui, win.palette, "Argument", "-o or -i", |ui| {
+            settings_text_edit(ui, win.palette, arg, "-o");
+            if ui.small_button("Remove").clicked() {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        args.remove(index);
+    }
+    if settings_button(ui, win.palette, "+ Add argument").clicked() {
+        args.push(String::new());
+    }
+}
+
+fn clean_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|arg| !arg.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn field(
     ui: &mut egui::Ui,
     win: &mut SettingsSurface,
@@ -345,15 +494,37 @@ fn save_profile(win: &mut SettingsSurface, id: &str, profile: SshProfileConfig) 
         .ssh_profiles
         .insert(id.to_owned(), profile.clone());
     let id = id.to_owned();
+    let path_id = id.clone();
     win.writeback
-        .mutate(move |document| document.set_ssh_profile(&id, &profile));
+        .mutate_setting(&["ssh-profiles", &path_id], move |document| {
+            document.set_ssh_profile(&id, &profile)
+        });
+}
+
+fn save_default_remote(win: &mut SettingsSurface, remote: SshRemoteConfig) {
+    win.config.multiplexer.remote = Some(remote.clone());
+    win.writeback
+        .mutate_setting(&["multiplexer", "remote"], move |document| {
+            document.set_multiplexer_remote(&remote)
+        });
+}
+
+fn clear_default_remote(win: &mut SettingsSurface) {
+    win.config.multiplexer.remote = None;
+    win.writeback
+        .mutate_setting(&["multiplexer", "remote"], |document| {
+            document.remove_multiplexer_remote()
+        });
 }
 
 fn delete_profile(win: &mut SettingsSurface, id: &str) {
     win.config.ssh_profiles.remove(id);
     let id = id.to_owned();
+    let path_id = id.clone();
     win.writeback
-        .mutate(move |document| document.remove_ssh_profile(&id));
+        .mutate_setting(&["ssh-profiles", &path_id], move |document| {
+            document.remove_ssh_profile(&id)
+        });
 }
 
 fn new_profile_id() -> String {

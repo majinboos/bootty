@@ -10,52 +10,54 @@ Hide pointer while typing
 Temporarily hide the mouse pointer while you type.
 
 Remotes
-Option as Alt
+Copy on select
 
+Text
+Copy a completed terminal selection to the system clipboard.
+
+Appearance
+Option as Alt
 none
 left
 right
 both
-Text
-How macOS treats the Option key inside the terminal.
-
-Appearance
-MODIFIER REMAPS
 
 Window
-Rewrite one physical modifier to another before shortcuts are matched.
+How macOS treats the Option key inside the terminal.
 
 Sidebar
-Add remap
+MODIFIER REMAPS
+Rewrite one physical modifier to another before shortcuts are matched.
 
 Status Bar
-PRESET
+Add remap
 Terminal
+PRESET
+
+Shell
 Keybinding preset
+
+Keys
 Ghostty
 Bootty
 Tmux
 Built-in defaults to start from. Your own binding rows stay unchanged.
-
-Shell
-
-Keys
+Advanced
 KEYBINDINGS
+
+Config
 Scope
 Global
 Native
 Rmux
 Tmux
 Sidebar
-Advanced
-
-Config
-Use built-in defaults
 
 Diagnostics
-Keep Bootty's default shortcuts for this scope alongside your own.
 
 Extensions
+Use built-in defaults
+Keep Bootty's default shortcuts for this scope alongside your own.
 Search keybindings
 
 No conflicts

@@ -89,3 +89,7 @@ Uses text-style numerals when available.
 +ss02  Stylistic set 2
 Enables the font's first stylistic alternate set.
 Enables the font's second stylistic alternate set.
+Block
+Bar
+Underline
+Hollow block

@@ -1,4 +1,6 @@
 use bootty_app::ui::settings::surface::SettingsSurface;
+use bootty_config::settings_schema::SettingsSchema;
+use pretty_assertions::assert_eq;
 
 /// A nav row draws its icon from a slug, and an unresolved slug paints nothing at all -- which is
 /// how the nav quietly lost every icon once before.
@@ -25,4 +27,19 @@ fn every_page_is_reachable_exactly_once_from_the_nav() {
     labels.dedup();
     assert_eq!(labels.len(), listed, "a page is listed twice in the nav");
     assert!(!pages.is_empty());
+}
+
+#[test]
+fn every_registered_setting_has_a_visible_settings_page() {
+    let pages = SettingsSurface::pages()
+        .map(|page| page.id())
+        .collect::<Vec<_>>();
+    for spec in SettingsSchema::builtin().specs() {
+        assert!(
+            pages.contains(&spec.page.as_ref()),
+            "{} points at settings page {:?}, but the page is not in the surface",
+            spec.id(),
+            spec.page
+        );
+    }
 }

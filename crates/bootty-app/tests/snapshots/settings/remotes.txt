@@ -2,33 +2,47 @@ Bootty Settings
   Back to terminal
 Remotes
 Search settings...
-SSH PROFILES
+DEFAULT REMOTE
 Core
-Add Remote
+Used by new remote Spaces when no per-space override is selected.
 
 General
-Add an SSH profile to connect a Space to another machine.
+Host name
+host or SSH config alias
 
 Remotes
 
 Text
+Port
+22 or from SSH config
 
 Appearance
 
 Window
+User name
+local user or SSH config
 
 Sidebar
+SSH client
+ssh
 
 Status Bar
 Terminal
+Extra SSH arguments
 
+Arguments are passed to the SSH client before the destination.
 Shell
+Add argument
 
 Keys
+Save default remote
 Advanced
+SSH PROFILES
 
 Config
+Add Remote
 
 Diagnostics
+Add an SSH profile to connect a Space to another machine.
 
 Extensions

@@ -37,6 +37,50 @@ pub struct SettingSpec {
     pub default: SettingDefault,
 }
 
+/// The path/page projection of one [`SettingSpec`]. The settings registry derives these values;
+/// callers do not author a second declaration list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingDeclaration {
+    /// TOML path. A `*` segment matches one dynamic table key; a trailing `*` matches the rest of
+    /// a path, which is used for extension-owned settings.
+    pub path: Vec<Cow<'static, str>>,
+    /// Settings page that owns the editor for this value.
+    pub page: Cow<'static, str>,
+}
+
+impl SettingDeclaration {
+    #[must_use]
+    pub fn path_parts(&self) -> Vec<&str> {
+        self.path.iter().map(Cow::as_ref).collect()
+    }
+
+    #[must_use]
+    pub fn matches_path(&self, path: &[&str]) -> bool {
+        let pattern = self.path_parts();
+        let trailing_wildcard = pattern.last() == Some(&"*");
+        if !trailing_wildcard && pattern.len() != path.len() {
+            return false;
+        }
+        if trailing_wildcard && path.len() < pattern.len().saturating_sub(1) {
+            return false;
+        }
+        pattern
+            .iter()
+            .zip(path)
+            .all(|(expected, actual)| *expected == "*" || *expected == *actual)
+    }
+
+    #[must_use]
+    fn matches_prefix(&self, path: &[&str]) -> bool {
+        let pattern = self.path_parts();
+        path.len() <= pattern.len()
+            && pattern
+                .iter()
+                .zip(path)
+                .all(|(expected, actual)| *expected == "*" || *expected == *actual)
+    }
+}
+
 impl SettingSpec {
     /// Stable identity: the TOML path joined with `.`.
     #[must_use]
@@ -56,6 +100,9 @@ impl SettingSpec {
         match &self.default {
             SettingDefault::Field(read) => read(defaults),
             SettingDefault::Literal(value) => value.clone(),
+            SettingDefault::Unused => {
+                panic!("custom setting {} has no schema default", self.id())
+            }
         }
     }
 
@@ -78,6 +125,8 @@ pub enum SettingDefault {
     Field(fn(&BoottyConfig) -> SettingValue),
     /// Extension-declared: no typed field exists, so the declaration carries the value.
     Literal(SettingValue),
+    /// A hand-written editor owns the value and reads its typed config field directly.
+    Unused,
 }
 
 /// What the setting holds, and how to edit it.
@@ -101,6 +150,47 @@ pub enum SettingKind {
     Choice {
         options: Vec<SettingOption>,
     },
+    /// A non-scalar setting whose editor is owned by a settings-surface module. It is still in
+    /// this registry so the path cannot be accepted by the loader without an editor owner.
+    Custom(SettingEditor),
+}
+
+/// The hand-written editor responsible for a non-scalar setting.
+///
+/// This is deliberately closed. Adding a new editor family requires adding a named owner here
+/// and handling it in the settings surface, rather than silently creating another unregistered
+/// path list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingEditor {
+    Appearance,
+    Text,
+    General,
+    Status,
+    Sidebar,
+    Remotes,
+    Keys,
+    Shell,
+    Window,
+    Extensions,
+}
+
+impl SettingEditor {
+    /// Stable owner name used in diagnostics and exhaustive editor dispatch.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Appearance => "appearance",
+            Self::Text => "text",
+            Self::General => "general",
+            Self::Status => "status",
+            Self::Sidebar => "sidebar",
+            Self::Remotes => "remotes",
+            Self::Keys => "keys",
+            Self::Shell => "shell",
+            Self::Window => "window",
+            Self::Extensions => "extensions",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +347,7 @@ impl ExtensionSetting {
 #[derive(Debug, Default)]
 pub struct SettingsSchema {
     specs: Vec<SettingSpec>,
+    declarations: Vec<SettingDeclaration>,
     by_id: BTreeMap<String, usize>,
 }
 
@@ -268,7 +359,18 @@ impl SettingsSchema {
             .enumerate()
             .map(|(index, spec)| (spec.id(), index))
             .collect();
-        Self { specs, by_id }
+        let declarations = specs
+            .iter()
+            .map(|spec| SettingDeclaration {
+                path: spec.path.clone(),
+                page: spec.page.clone(),
+            })
+            .collect();
+        Self {
+            specs,
+            declarations,
+            by_id,
+        }
     }
 
     /// The built-ins plus one spec per extension-declared setting. Extension settings all land on
@@ -277,7 +379,8 @@ impl SettingsSchema {
     #[must_use]
     pub fn with_extensions(declarations: &[ExtensionSetting]) -> Self {
         let mut specs = builtin::specs();
-        specs.extend(declarations.iter().map(ExtensionSetting::to_spec));
+        let extension_specs = declarations.iter().map(ExtensionSetting::to_spec);
+        specs.extend(extension_specs);
         Self::new(specs)
     }
 
@@ -293,6 +396,41 @@ impl SettingsSchema {
         &self.specs
     }
 
+    #[must_use]
+    pub fn declarations(&self) -> &[SettingDeclaration] {
+        &self.declarations
+    }
+
+    /// Whether a TOML path is a declared user setting.
+    #[must_use]
+    pub fn allows_path(&self, path: &[&str]) -> bool {
+        (path == ["version"])
+            || self
+                .declarations
+                .iter()
+                .any(|declaration| declaration.matches_path(path))
+            || builtin::compatibility_paths()
+                .iter()
+                .any(|pattern| path_matches(pattern, path))
+    }
+
+    /// Whether a write may target this path or a declared table below it.
+    ///
+    /// Hand-written editors sometimes serialize a complete table (for example one SSH profile)
+    /// instead of setting each leaf independently. The table is allowed only when the registry
+    /// declares at least one supported leaf below it.
+    #[must_use]
+    pub fn allows_write_path(&self, path: &[&str]) -> bool {
+        self.allows_path(path)
+            || self
+                .declarations
+                .iter()
+                .any(|declaration| declaration.matches_prefix(path))
+            || builtin::compatibility_paths()
+                .iter()
+                .any(|pattern| path_matches_prefix(pattern, path))
+    }
+
     /// The settings on one page, in declaration order.
     pub fn page<'a>(&'a self, page: &'a str) -> impl Iterator<Item = &'a SettingSpec> + 'a {
         self.specs.iter().filter(move |spec| spec.page == page)
@@ -302,4 +440,26 @@ impl SettingsSchema {
     pub fn get(&self, id: &str) -> Option<&SettingSpec> {
         self.by_id.get(id).map(|index| &self.specs[*index])
     }
+}
+
+fn path_matches(pattern: &[&str], path: &[&str]) -> bool {
+    let trailing_wildcard = pattern.last() == Some(&"*");
+    if !trailing_wildcard && pattern.len() != path.len() {
+        return false;
+    }
+    if trailing_wildcard && path.len() < pattern.len().saturating_sub(1) {
+        return false;
+    }
+    pattern
+        .iter()
+        .zip(path)
+        .all(|(expected, actual)| *expected == "*" || *expected == *actual)
+}
+
+fn path_matches_prefix(pattern: &[&str], path: &[&str]) -> bool {
+    path.len() <= pattern.len()
+        && pattern
+            .iter()
+            .zip(path)
+            .all(|(expected, actual)| *expected == "*" || *expected == *actual)
 }

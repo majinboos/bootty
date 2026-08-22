@@ -8,7 +8,7 @@ use super::load::{
     validate_config_document,
 };
 use super::model::BoottyConfig;
-use super::model::{SegmentAlign, SshProfileConfig, StatusSegment};
+use super::model::{SegmentAlign, SshProfileConfig, SshRemoteConfig, StatusSegment};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigWriteOutcome {
@@ -104,6 +104,20 @@ impl ConfigDocument {
 
     pub fn remove_ssh_profile(&mut self, id: &str) -> ConfigResult<()> {
         self.remove(&["ssh-profiles", id])
+    }
+
+    pub fn set_multiplexer_remote(&mut self, remote: &SshRemoteConfig) -> ConfigResult<()> {
+        let serialized = toml_edit::ser::to_document(remote).map_err(|error| {
+            ConfigLoadError::new(format!("failed to serialize default remote: {error}"))
+        })?;
+        self.set_item(
+            &["multiplexer", "remote"],
+            Item::Table(serialized.as_table().clone()),
+        )
+    }
+
+    pub fn remove_multiplexer_remote(&mut self) -> ConfigResult<()> {
+        self.remove(&["multiplexer", "remote"])
     }
 }
 

@@ -1,13 +1,14 @@
 use bootty_config::{
     color::Color,
     config::{ConfigDocument, ConfigResult},
-    settings_schema::{SettingKind, SettingSpec, SettingValue},
+    settings_schema::{SettingKind, SettingSpec, SettingValue, SettingsSchema},
 };
+use std::sync::Arc;
 
 macro_rules! draft_setter {
     ($method:ident($value:ident: $type:ty)) => {
         pub(super) fn $method(&mut self, path: &[&str], $value: $type) {
-            self.mutate(|document| document.$method(path, $value));
+            self.mutate_setting(path, |document| document.$method(path, $value));
         }
     };
 }
@@ -17,16 +18,22 @@ pub(super) struct SettingsWriteback {
     dirty: bool,
     submit: bool,
     last_error: Option<String>,
+    schema: Arc<SettingsSchema>,
 }
 
 impl SettingsWriteback {
-    pub(super) fn new(document: ConfigDocument) -> Self {
+    pub(super) fn new(document: ConfigDocument, schema: Arc<SettingsSchema>) -> Self {
         Self {
             document,
             dirty: false,
             submit: false,
             last_error: None,
+            schema,
         }
+    }
+
+    pub(super) fn set_schema(&mut self, schema: Arc<SettingsSchema>) {
+        self.schema = schema;
     }
 
     pub(super) fn last_error(&self) -> Option<&str> {
@@ -71,6 +78,21 @@ impl SettingsWriteback {
         }
     }
 
+    pub(super) fn mutate_setting(
+        &mut self,
+        path: &[&str],
+        mutation: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>,
+    ) {
+        if !self.schema.allows_write_path(path) {
+            self.set_error(format!(
+                "settings UI attempted to write undeclared config path {}",
+                path.join(".")
+            ));
+            return;
+        }
+        self.mutate(mutation);
+    }
+
     draft_setter!(set_f32(value: f32));
     draft_setter!(set_bool(value: bool));
     draft_setter!(set_str(value: &str));
@@ -91,7 +113,7 @@ impl SettingsWriteback {
 
     pub(super) fn set_color_value(&mut self, path: &[&str], color: Color) {
         let hex = color_hex(color);
-        self.mutate(move |document| document.set_str(path, &hex));
+        self.mutate_setting(path, move |document| document.set_str(path, &hex));
     }
 
     draft_setter!(set_strings(value: &[String]));
@@ -115,6 +137,7 @@ impl SettingsWriteback {
                 .document
                 .str_at(&path)
                 .map(|value| SettingValue::Token(value.to_owned())),
+            SettingKind::Custom(_) => None,
         }
     }
 
@@ -147,7 +170,7 @@ impl SettingsWriteback {
     }
 
     pub(super) fn remove(&mut self, path: &[&str]) {
-        self.mutate(|document| document.remove(path));
+        self.mutate_setting(path, |document| document.remove(path));
     }
 }
 
