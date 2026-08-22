@@ -1,0 +1,91 @@
+Bootty Settings
+  Back to terminal
+Text
+Search settings...
+UI FONT
+Core
+
+General
+Use terminal font
+Share the terminal font stack for Bootty's UI chrome.
+
+Remotes
+Add UI fallback
+
+Text
+TERMINAL FONT
+
+Appearance
+Primary font
+
+
+monospace
+
+Window
+Bootty tries this font first for terminal cells.
+
+Sidebar
+Add terminal fallback
+
+Status Bar
+TERMINAL METRICS
+Terminal
+Font size
+15.7pt
+
+Shell
+Main terminal text size.
+
+Keys
+Cell width
+Auto
+10.0px
+Advanced
+Leave automatic unless glyphs look too tight or too loose.
+
+Config
+Cell height
+Auto
+22.0px
+Leave automatic unless lines look clipped or too airy.
+
+Diagnostics
+
+Extensions
+Fit rows to window
+Stretch row spacing so terminal content fills available height.
+Fit columns to window
+Stretch column spacing so terminal content fills available width (avoids a gap on the right, common with split panes).
+GLYPH BEHAVIOR
+Baseline adjustment
+3.0px
+Move glyphs up or down inside each cell.
+Underline position
+2.0px
+Tune where underline decoration is drawn.
+Underline thickness
+1.0px
+Tune underline stroke thickness.
+Font features
+Clear
+OpenType feature tags written to font.features.
++liga  Standard ligatures
+-liga  Disable ligatures
+Combines common glyph sequences such as fi and fl.
+Keeps all characters separate when a font enables ligatures.
++calt  Contextual alternates
++dlig  Discretionary ligatures
+Allows glyphs to adapt based on neighboring characters.
+Enables optional decorative ligatures when the font has them.
++kern  Kerning
++zero  Slashed zero
+Applies pair spacing supplied by the font.
+Distinguishes zero from capital O when supported.
++tnum  Tabular numbers
++onum  Oldstyle numbers
+Uses equal-width digits for aligned columns.
+Uses text-style numerals when available.
++ss01  Stylistic set 1
++ss02  Stylistic set 2
+Enables the font's first stylistic alternate set.
+Enables the font's second stylistic alternate set.

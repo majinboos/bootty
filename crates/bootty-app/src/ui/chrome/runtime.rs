@@ -399,10 +399,19 @@ impl ChromeView<'_> {
                 .iter()
                 .flat_map(|name| published_surface_items(&sidebar_surfaces, name))
                 .partition(|item| item.item.kind.as_deref() == Some("footer"));
+            // A user's own `sessions` module publishes its rows itself. Layering the built-in
+            // session components over it duplicates every detail row, so they only apply when the
+            // user either kept the built-in module or listed session modules explicitly.
+            let session_modules: &[String] = if self.extensions.is_user_owned("sessions")
+                && !sidebar_cfg.session_modules_configured
+            {
+                &[]
+            } else {
+                &sidebar_cfg.session_modules
+            };
             let sidebar_module_items = compose_session_module_items(
                 sidebar_module_items,
-                sidebar_cfg
-                    .session_modules
+                session_modules
                     .iter()
                     .flat_map(|name| published_surface_items(&session_surfaces, name)),
             );
@@ -674,7 +683,7 @@ fn published_surface_items<'a>(
         .flat_map(|surface| surface.items())
 }
 
-fn compose_session_module_items(
+pub(crate) fn compose_session_module_items(
     base: Vec<PublishedSurfaceItem>,
     components: impl IntoIterator<Item = PublishedSurfaceItem>,
 ) -> Vec<PublishedSurfaceItem> {

@@ -1,0 +1,77 @@
+Bootty Settings
+  Back to terminal
+Window
+Search settings...
+WINDOW
+Core
+
+General
+Title
+Bootty
+Shown in native window chrome.
+
+Remotes
+Titlebar style
+
+System titlebar
+Transparent
+Hidden
+Text
+macOS window chrome treatment.
+
+Appearance
+Decoration
+Automatic
+
+Window
+Choose who draws the outer window border.
+
+Sidebar
+Fullscreen mode
+Disabled
+Controls native fullscreen and notch-aware non-native modes.
+
+Status Bar
+DEFAULT SIZE
+Terminal
+
+Shell
+Width
+1220.0 px
+Applies to newly created windows.
+
+Keys
+Height
+Advanced
+760.0 px
+Applies to newly created windows.
+
+Config
+FULLSCREEN NOTCH
+
+Diagnostics
+Tabs in notch band
+
+Extensions
+Allow terminal chrome to occupy the notch/menu-bar band.
+Top offset
+0.0 px
+Auto
+Leave automatic unless a notched display needs an exact override.
+CHROME
+Chrome gap
+1.0 px
+Spacing between sidebar, status, and terminal content.
+Inactive sidebar dim
+16.0%
+Opacity reduction when the window is not focused.
+Inactive terminal dim
+8.0%
+Opacity reduction when the window is not focused.
+SPLIT PANES
+Divider width
+3.0 px
+Thickness of the divider between split panes.
+Focus border width
+1.0 px
+Border drawn around the focused split pane (0 hides it).

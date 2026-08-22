@@ -1,3 +1,3 @@
 mod surface;
 
-pub use surface::{SettingsAction, SettingsSurface};
+pub use surface::{SettingsAction, SettingsPage, SettingsSurface};

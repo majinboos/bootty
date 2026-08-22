@@ -1,0 +1,72 @@
+Bootty Settings
+  Back to terminal
+Appearance
+Search settings...
+APPEARANCE
+Core
+
+General
+Mode
+System
+Light
+Dark
+Follow the system appearance or force a light/dark branch.
+
+Remotes
+Edit branch
+
+Text
+Light
+Dark
+Theme and color choices are stored separately for light and dark.
+
+Appearance
+THEME
+
+Window
+Theme
+Catppuccin Mocha
+
+Sidebar
+Built-in or config-directory theme.
+
+Status Bar
+TERMINAL COLORS
+Terminal
+Background
+
+Shell
+Terminal background override.
+
+Keys
+Foreground
+Primary terminal text override.
+Advanced
+
+Config
+Cursor
+Cursor fill color.
+
+Diagnostics
+Cursor text
+
+Extensions
+Text drawn under the cursor.
+Selection
+Selection background and foreground.
+Selection text
+Selected text foreground.
+Highlight
+Search or match highlight background.
+Highlight text
+Search or match highlight foreground.
+Pointer foreground
+Pointer text/foreground override.
+Pointer background
+Pointer background override.
+SIDEBAR COLORS
+Unset colors inherit from the active theme.
+Background
+Use standard 16
+Use xterm 256
+Add empty slot

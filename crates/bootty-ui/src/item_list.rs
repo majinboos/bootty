@@ -139,6 +139,7 @@ pub fn paint_group_item(
             respect_color: true,
             keep: 1.0,
             round_end: false,
+            time: 0.0,
             hover: None,
         },
     );
@@ -201,6 +202,7 @@ pub fn paint_session_item(
             respect_color: true,
             keep,
             round_end: false,
+            time: 0.0,
             hover: None,
         },
     );
@@ -227,6 +229,7 @@ pub fn paint_generic_sidebar_item(
             respect_color: true,
             keep,
             round_end: false,
+            time: 0.0,
             hover: None,
         },
     );

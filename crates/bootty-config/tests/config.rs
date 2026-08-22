@@ -149,7 +149,10 @@ fn defaults_put_current_status_modules_in_visible_top_bar() {
 #[test]
 fn sidebar_modules_default_and_override_in_order() {
     let defaults = load_config_source("");
-    assert_eq!(defaults.sidebar.modules, ["sessions", "codexbar"]);
+    assert_eq!(
+        defaults.sidebar.modules,
+        ["sessions", "codexbar", "agents.pi", "agents.codex"]
+    );
     assert_eq!(
         defaults.sidebar.session_modules,
         [
@@ -175,6 +178,20 @@ fn sidebar_modules_default_and_override_in_order() {
         configured.sidebar.session_modules,
         ["directory", "progress"]
     );
+
+    // An empty list keeps the defaults: a sidebar with no modules has no session list at all, so
+    // an empty one only ever means the file was damaged.
+    let emptied = load_config_source(indoc! {r#"
+        [sidebar]
+        modules = []
+        session-modules = []
+    "#});
+    assert_eq!(emptied.sidebar.modules, defaults.sidebar.modules);
+    assert_eq!(
+        emptied.sidebar.session_modules,
+        defaults.sidebar.session_modules
+    );
+    assert!(!emptied.sidebar.session_modules_configured);
 }
 
 #[test]

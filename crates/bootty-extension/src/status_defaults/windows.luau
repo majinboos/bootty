@@ -78,11 +78,6 @@ return {
 			end
 			if window.progress then
 				local width = if window.progress_indeterminate then 0.25 else window.progress / 100
-				local offset = 0
-				if window.progress_indeterminate then
-					local phase = (bootty.time() % 1.5) / 1.5
-					offset = (1 - width) * (1 - math.abs(2 * phase - 1))
-				end
 				name_primitives[#name_primitives + 1] = {
 					type = "rect",
 					fill = bootty.theme.border,
@@ -96,12 +91,15 @@ return {
 				name_primitives[#name_primitives + 1] = {
 					type = "rect",
 					fill = accent,
-					x = offset,
+					x = 0,
 					y = 1,
 					y_px = -progress_height,
 					w = width,
 					h = 0,
 					h_px = progress_height,
+					-- The host sweeps an indeterminate bar off the frame clock, so it animates
+					-- smoothly instead of stepping at this module's render interval.
+					sweep = window.progress_indeterminate,
 				}
 			end
 

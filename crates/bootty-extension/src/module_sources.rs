@@ -10,7 +10,10 @@ use crate::identity::ModuleIdentity;
 use crate::module_runtime::preview_module_surfaces;
 use crate::surfaces::SurfacePlacement;
 
-const MODULE_LIMIT: usize = 32;
+/// A runaway backstop on how many modules the extension root may load, not a budget: each one costs
+/// a worker thread and a Lua VM for as long as it stays loaded. Set far above any real extension
+/// directory, and overflow sheds the excess rather than refusing the whole set.
+const MODULE_LIMIT: usize = 256;
 const MODULE_SOURCE_LIMIT: u64 = 1024 * 1024;
 
 pub(crate) struct ModuleSource {
@@ -18,6 +21,9 @@ pub(crate) struct ModuleSource {
     pub(crate) namespace: String,
     pub(crate) source: String,
     pub(crate) fingerprint: u64,
+    /// True when this came from a file in the extension root rather than from the built-in set. A
+    /// built-in is always discovered, so "exists" says nothing about whether the user owns it.
+    pub(crate) from_user_file: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,10 +36,50 @@ pub struct EditableModuleSource {
 }
 
 /// The editable module set, borrowed for one settings frame.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct ModuleSources<'a> {
     pub identities: &'a [ModuleIdentity],
     pub legacy: &'a [LegacyExtensionModule],
+    /// Surface ids the loaded modules declared for `placement`, so a picker offers only what could
+    /// actually render there. A file stem is not a surface id — a module names its own surfaces,
+    /// and one file may publish several.
+    pub declared: Vec<(crate::SurfacePlacement, String)>,
+    /// Why the last scan of the extension root failed, if it did. A failed scan reconciles nothing,
+    /// so every module keeps its last state — which looks like modules randomly vanishing unless
+    /// the reason is on screen.
+    pub scan_error: Option<String>,
+    /// Modules that failed to load or publish, with why. A broken module is skipped so the rest
+    /// still load, which means nothing renders it and nothing says why unless this is shown.
+    pub failures: Vec<(ModuleIdentity, String)>,
+    /// What the loaded modules are publishing right now. A preview of an unedited module shows this
+    /// instead of a sandbox render, so a module that reads the machine previews as itself.
+    pub live: Vec<crate::PublishedSurfaceSnapshot>,
+}
+
+impl ModuleSources<'_> {
+    /// What `module` is publishing right now, in declaration order.
+    #[must_use]
+    pub fn live_for(&self, module: &str) -> Vec<crate::SurfaceSnapshot> {
+        self.live
+            .iter()
+            .filter(|surface| surface.module == module)
+            .map(|surface| surface.snapshot.clone())
+            .collect()
+    }
+
+    /// The declared surface ids for `placement`, sorted and deduplicated.
+    #[must_use]
+    pub fn declared_for(&self, placement: crate::SurfacePlacement) -> Vec<String> {
+        let mut ids = self
+            .declared
+            .iter()
+            .filter(|(declared, _)| *declared == placement)
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
 }
 
 /// One module-source edit requested by the settings editor. The extension host owns the
@@ -73,7 +119,7 @@ pub struct LegacyExtensionModule {
 }
 
 pub fn module_identities(root: &Path) -> Result<Vec<ModuleIdentity>, String> {
-    discover_modules(root).map(|modules| modules.into_keys().collect())
+    discover_modules(root).map(|scan| scan.modules.into_keys().collect())
 }
 
 pub fn legacy_extension_modules(config_dir: &Path) -> Result<Vec<LegacyExtensionModule>, String> {
@@ -228,6 +274,13 @@ pub fn editable_module_source(
     })
 }
 
+/// Whether `source` is exactly the built-in for `identity`, in which case saving it would create an
+/// override that changes nothing — and would shadow future updates to the built-in.
+#[must_use]
+pub fn matches_builtin(identity: &ModuleIdentity, source: &str) -> bool {
+    builtin_source(identity).is_some_and(|builtin| builtin.trim_end() == source.trim_end())
+}
+
 pub fn save_module_source(
     root: &Path,
     identity: &ModuleIdentity,
@@ -259,11 +312,9 @@ pub fn create_module_source(root: &Path, value: &str) -> Result<ModuleIdentity, 
 
 /// Starter source for a new module: one registered sidebar surface that renders its own name.
 pub fn module_template(identity: &ModuleIdentity) -> String {
-    let id = identity
-        .as_ref()
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("extension");
+    // The namespace, not the file stem: a nested module declaring a bare `thing` would collide with
+    // a top-level `thing.luau`, and every built-in already names itself by namespace.
+    let id = identity.namespace();
     format!(
         "--!strict\nbootty.ui.register({{ id = \"{id}\", placement = \"sidebar\" }}, function()\n\treturn {{ {{ text = \"{id}\" }} }}\nend)\n"
     )
@@ -278,6 +329,12 @@ pub fn reset_module_source(root: &Path, identity: &ModuleIdentity) -> std::io::R
     }
 }
 
+/// The built-in source for `identity`, wrapped and ready to load. Used to fall back when a user's
+/// override will not load, so a typo in one file cannot take a built-in feature down with it.
+pub(crate) fn builtin_module(identity: &ModuleIdentity) -> Option<ModuleSource> {
+    builtin_source(identity).map(|source| module_source_from_text(identity.clone(), source))
+}
+
 fn builtin_source(identity: &ModuleIdentity) -> Option<String> {
     if let Some(builtin) =
         builtins::agent_modules().find(|builtin| identity.as_str() == builtin.identity)
@@ -290,9 +347,14 @@ fn builtin_source(identity: &ModuleIdentity) -> Option<String> {
         .map(|builtin| builtin_module_source(builtin.identity, builtin.placement, builtin.source))
 }
 
-pub(crate) fn discover_modules(
-    root: &Path,
-) -> Result<BTreeMap<ModuleIdentity, Result<ModuleSource, String>>, String> {
+/// The outcome of one scan of the extension root.
+pub(crate) struct ModuleScan {
+    pub(crate) modules: BTreeMap<ModuleIdentity, Result<ModuleSource, String>>,
+    /// Set when the scan loaded less than the root holds, with the reason.
+    pub(crate) warning: Option<String>,
+}
+
+pub(crate) fn discover_modules(root: &Path) -> Result<ModuleScan, String> {
     let mut modules = builtins::modules()
         .into_iter()
         .map(|builtin| {
@@ -312,7 +374,10 @@ pub(crate) fn discover_modules(
         (identity, loaded)
     }));
     if !root.exists() {
-        return Ok(modules);
+        return Ok(ModuleScan {
+            modules,
+            warning: None,
+        });
     }
     let mut paths = Vec::new();
     collect_module_paths(root, &mut paths)?;
@@ -325,17 +390,20 @@ pub(crate) fn discover_modules(
         }
         canonical_paths.insert(canonical_path);
     }
-    if canonical_paths.len() + modules.len() > MODULE_LIMIT {
-        return Err(format!(
-            "extension module count exceeds the limit of {MODULE_LIMIT}"
-        ));
-    }
-    for path in canonical_paths {
+    // Bound what the user added; the built-ins are ours and fixed. Over the backstop, load the
+    // first `MODULE_LIMIT` in path order and say what was left out — refusing the whole scan would
+    // leave every module frozen at its last published state instead.
+    let dropped = canonical_paths.len().saturating_sub(MODULE_LIMIT);
+    for path in canonical_paths.into_iter().take(MODULE_LIMIT) {
         let identity = module_identity(&canonical_root, &path)?;
         let loaded = load_module_source(identity.clone(), &path);
         modules.insert(identity, loaded);
     }
-    Ok(modules)
+    Ok(ModuleScan {
+        modules,
+        warning: (dropped > 0)
+            .then(|| format!("{dropped} modules past the limit of {MODULE_LIMIT} were not loaded")),
+    })
 }
 
 fn builtin_module_source(identity: &str, placement: &str, source: &str) -> String {
@@ -388,7 +456,10 @@ fn load_module_source(identity: ModuleIdentity, path: &Path) -> Result<ModuleSou
         ));
     }
     let source = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    Ok(module_source_from_text(identity, source))
+    Ok(ModuleSource {
+        from_user_file: true,
+        ..module_source_from_text(identity, source)
+    })
 }
 
 fn module_source_from_text(identity: ModuleIdentity, source: String) -> ModuleSource {
@@ -401,5 +472,6 @@ fn module_source_from_text(identity: ModuleIdentity, source: String) -> ModuleSo
         namespace,
         source,
         fingerprint: hasher.finish(),
+        from_user_file: false,
     }
 }

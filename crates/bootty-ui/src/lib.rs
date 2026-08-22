@@ -1,3 +1,4 @@
+pub mod code_editor;
 pub mod font_stack;
 pub mod icons;
 pub mod item_list;

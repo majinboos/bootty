@@ -169,6 +169,20 @@ struct ModuleHost {
     facts: ExtensionFacts,
 }
 
+/// Preview a built-in module by name, so a caller can show a draft module composed over the
+/// built-in surface it decorates rather than on its own.
+pub fn preview_builtin_surfaces(
+    name: &str,
+    theme: Vec<(String, String)>,
+) -> Result<Vec<SurfaceSnapshot>, String> {
+    let identity = ModuleIdentity::parse(format!("{name}.luau"))?;
+    // The wrapped source, not the bare file: a built-in declares its surface through the wrapper
+    // the host loads it with, so previewing the raw text registers nothing at all.
+    let builtin = crate::module_sources::builtin_module(&identity)
+        .ok_or_else(|| format!("no built-in module named `{name}`"))?;
+    preview_module_surfaces(&identity, &builtin.source, theme)
+}
+
 pub fn preview_module_surfaces(
     identity: &ModuleIdentity,
     source: &str,
@@ -654,6 +668,9 @@ fn install_surface_interface(
                         placement,
                         order,
                         interval,
+                        title: spec.get::<Option<String>>("title")?,
+                        icon: spec.get::<Option<String>>("icon")?,
+                        hint: spec.get::<Option<String>>("hint")?,
                     });
                 Ok(())
             },

@@ -258,6 +258,10 @@ bootty.ui.register({
 	interval = 0.1,
 }, function()
 	drain()
+	-- Nothing has started or reported a Codex session yet, so the sidebar stays quiet.
+	if state.source == "none" then
+		return {}
+	end
 	local text = "Codex " .. state.status
 	if state.thread_id then
 		text ..= " · " .. state.thread_id

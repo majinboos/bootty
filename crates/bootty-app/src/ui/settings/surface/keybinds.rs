@@ -1,4 +1,5 @@
-use bootty_ui::settings::{ComboStyle, described_combo};
+use bootty_ui::keycaps;
+use bootty_ui::settings::{ComboStyle, IconButtonState, described_combo};
 use eframe::egui;
 
 mod model;
@@ -175,18 +176,23 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         .fold((0, 0), |(complete, invalid), valid| {
             (complete + 1, invalid + usize::from(!valid))
         });
-    ui.label(
-        egui::RichText::new(format!(
-            "{complete_count} complete, {invalid_count} invalid"
-        ))
-        .color(if invalid_count == 0 {
-            palette.muted
+    bootty_ui::settings::status_banner(
+        ui,
+        palette,
+        invalid_count == 0,
+        if invalid_count == 0 {
+            "No conflicts"
         } else {
-            palette.destructive
-        })
-        .size(12.0),
+            "Needs attention"
+        },
+        &if invalid_count == 0 {
+            format!(
+                "{complete_count} complete binding rows; no conflicts or invalid actions detected."
+            )
+        } else {
+            format!("{invalid_count} invalid binding rows need attention.")
+        },
     );
-    ui.add_space(8.0);
 
     let mut remove: Option<usize> = None;
     let mut toggle_capture: Option<usize> = None;
@@ -261,13 +267,154 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         commit_draft(win);
     }
 
-    egui::CollapsingHeader::new("Resolved shortcuts")
-        .default_open(false)
-        .show(ui, |ui| {
-            for entry in effective_bindings(&win.config, scope) {
-                ui.monospace(entry);
+    resolved_shortcuts_panel(win, ui, scope);
+}
+
+/// Everything actually in force for `scope`, as searchable keycap-and-title pairs. Raw
+/// `trigger=action` lines are unreadable at this length — a few hundred entries with the built-in
+/// defaults on.
+fn resolved_shortcuts_panel(win: &SettingsSurface, ui: &mut egui::Ui, scope: KeybindScope) {
+    let palette = win.palette;
+    ui.add_space(10.0);
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Resolved shortcuts")
+            .color(palette.subtext)
+            .size(12.0),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        let search_id = ui.make_persistent_id(("settings_resolved_keybind_search", scope));
+        let mut search: String =
+            ui.memory(|memory| memory.data.get_temp(search_id).unwrap_or_default());
+        if super::settings_text_edit_width(
+            ui,
+            palette,
+            &mut search,
+            "Search resolved shortcuts",
+            320.0,
+        )
+        .changed()
+        {
+            ui.memory_mut(|memory| memory.data.insert_temp(search_id, search.clone()));
+        }
+        let needle = search.trim().to_ascii_lowercase();
+        ui.add_space(8.0);
+        // Rows render inline, with no nested scroll area: a nested scroll collapsed the panel to a
+        // couple of rows instead of letting the page's own scroll take the overflow.
+        egui::Frame::NONE
+            .fill(palette.pane)
+            .stroke(egui::Stroke::new(1.0, palette.border))
+            .corner_radius(egui::CornerRadius::same(palette.radius))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                let entries = resolved_entries(&win.config, scope, &needle);
+                if entries.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No matching shortcuts.")
+                            .color(palette.muted)
+                            .size(12.0),
+                    );
+                    return;
+                }
+                let cols = ((ui.available_width() / 280.0).floor() as usize).clamp(1, 6);
+                // A Grid keeps columns aligned to their widest cell; packing each cell to its own
+                // content width staggered the rows.
+                egui::Grid::new(("resolved_shortcuts_grid", scope))
+                    .num_columns(cols)
+                    .spacing([28.0, 12.0])
+                    .show(ui, |ui| {
+                        for (index, (combo, title, tags)) in entries.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                keycaps::chip(ui, palette, combo);
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new(title).color(palette.subtext));
+                                if !tags.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(format!("· {}", tags.join(" · ")))
+                                            .color(palette.muted)
+                                            .size(11.0),
+                                    );
+                                }
+                            });
+                            if (index + 1) % cols == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+    });
+}
+
+/// The resolved entries matching `needle`, as (combo, human title, active flag names).
+fn resolved_entries(
+    config: &bootty_config::config::BoottyConfig,
+    scope: KeybindScope,
+    needle: &str,
+) -> Vec<(String, String, Vec<&'static str>)> {
+    effective_bindings(config, scope)
+        .iter()
+        .filter_map(|entry| {
+            let (trigger, action) = bootty_config::config::split_keybind_entry(entry)?;
+            if !needle.is_empty()
+                && !format!("{trigger} {action}")
+                    .to_ascii_lowercase()
+                    .contains(needle)
+            {
+                return None;
             }
-        });
+            let (flags, combo) = parse_trigger_flags(trigger);
+            let tags = TRIGGER_FLAGS
+                .iter()
+                .zip(flags)
+                .filter(|(_, set)| *set)
+                .map(|((name, _, _), _)| *name)
+                .collect();
+            Some((combo, action_title(action), tags))
+        })
+        .collect()
+}
+
+/// The label the command palette would show for `action`, so the same command reads the same in
+/// both places. A trailing `:param` is kept.
+fn action_title(action: &str) -> String {
+    if let Some(command) = crate::action_catalog::Command::from_action(action) {
+        return command.title().to_owned();
+    }
+    let (base, param) = match action.split_once(':') {
+        Some((base, param)) => (base, Some(param)),
+        None => (action, None),
+    };
+    let mut title = crate::action_catalog::Command::from_action(base)
+        .map(|command| command.title().to_owned())
+        .unwrap_or_else(|| humanize_action(base));
+    if let Some(param) = param {
+        title.push_str(": ");
+        title.push_str(param);
+    }
+    title
+}
+
+/// Sentence-case a snake_case action the catalog does not carry (sidebar actions, `text`, `csi`).
+fn humanize_action(name: &str) -> String {
+    let mut title = String::with_capacity(name.len());
+    for (index, word) in name.split('_').filter(|word| !word.is_empty()).enumerate() {
+        if index > 0 {
+            title.push(' ');
+            title.push_str(word);
+        } else {
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                title.extend(first.to_uppercase());
+                title.push_str(chars.as_str());
+            }
+        }
+    }
+    if title.is_empty() {
+        name.to_owned()
+    } else {
+        title
+    }
 }
 
 pub(super) fn commit_draft(win: &mut SettingsSurface) {
@@ -389,7 +536,9 @@ fn preset_options(win: &mut SettingsSurface, ui: &mut egui::Ui, direct_chords: &
         "Leader combo for prefixed shortcuts: press it, then the bound key.",
         |ui| {
             let capture_text = "Press a combo… Esc to cancel";
-            if record_button(ui, &prefix, recording, capture_text).clicked() {
+            if keycaps::record_cell(ui, palette, &prefix, recording, capture_text).clicked()
+                || keycaps::record_dot(ui, palette, recording).clicked()
+            {
                 toggle_recording = true;
             }
             if win.config.input.prefix.is_some()
@@ -539,7 +688,7 @@ fn modifier_combo(
 }
 
 /// Shared control height for the trigger cell and the value field so they line up exactly.
-const ROW_CONTROL_HEIGHT: f32 = 36.0;
+const ROW_CONTROL_HEIGHT: f32 = keycaps::RECORD_CELL_HEIGHT;
 
 fn binding_editor_row(
     ui: &mut egui::Ui,
@@ -612,11 +761,16 @@ fn binding_editor_row(
                     }
                 }
 
-                if record_button(ui, &combo, recording, &capture_text).clicked() {
+                if keycaps::record_cell(ui, palette, &combo, recording, &capture_text).clicked()
+                    || keycaps::record_dot(ui, palette, recording).clicked()
+                {
                     *ctx.toggle_capture = Some(ctx.index);
                 }
 
-                ui.label(egui::RichText::new("→").color(palette.muted));
+                if let Some(arrow) = bootty_ui::icons::icon_text("arrow-right", 14.0, palette.muted)
+                {
+                    ui.label(arrow);
+                }
 
                 // Title + description picker, drawn from the shared action catalog.
                 let (base, params) = split_action_for_editor(&row.action, ctx.action_options);
@@ -682,8 +836,17 @@ fn binding_editor_row(
                     } else {
                         "Binding options"
                     };
-                    if super::settings_icon_button(ui, palette, "sliders-horizontal", options_tip)
-                        .clicked()
+                    if bootty_ui::settings::settings_icon_toggle(
+                        ui,
+                        palette,
+                        "sliders-horizontal",
+                        options_tip,
+                        IconButtonState {
+                            active: any_flag,
+                            open: flags_open,
+                        },
+                    )
+                    .clicked()
                     {
                         flags_open = !flags_open;
                         ui.memory_mut(|memory| memory.data.insert_temp(flags_open_id, flags_open));
@@ -709,27 +872,38 @@ fn binding_flags_editor(
     row: &mut BindingRow,
     changed: &mut bool,
 ) {
-    for (index, (_, label, help)) in TRIGGER_FLAGS.iter().enumerate() {
-        if binding_option(ui, palette, &mut flags[index], label, help) {
-            row.trigger = join_trigger_flags(flags, combo);
-            *changed = true;
-        }
-    }
-    if binding_option(
-        ui,
-        palette,
-        &mut row.side_sensitive,
-        "Modifier side",
-        "Require the same physical left/right modifier side that was recorded.",
-    ) {
-        let combo = if row.side_sensitive {
-            add_default_modifier_sides(combo)
-        } else {
-            strip_modifier_sides(combo)
-        };
-        row.trigger = join_trigger_flags(flags, &combo);
-        *changed = true;
-    }
+    // Inset from the striped row it expands out of, so the panel reads as belonging to that row.
+    egui::Frame::NONE
+        .inner_margin(egui::Margin {
+            left: 10,
+            right: 10,
+            top: 4,
+            bottom: 8,
+        })
+        .show(ui, |ui| {
+            for (index, (_, label, help)) in TRIGGER_FLAGS.iter().enumerate() {
+                if binding_option(ui, palette, &mut flags[index], label, help) {
+                    row.trigger = join_trigger_flags(flags, combo);
+                    *changed = true;
+                }
+                ui.add_space(2.0);
+            }
+            if binding_option(
+                ui,
+                palette,
+                &mut row.side_sensitive,
+                "Modifier side",
+                "Require the same physical left/right modifier side that was recorded.",
+            ) {
+                let combo = if row.side_sensitive {
+                    add_default_modifier_sides(combo)
+                } else {
+                    strip_modifier_sides(combo)
+                };
+                row.trigger = join_trigger_flags(flags, &combo);
+                *changed = true;
+            }
+        });
 }
 
 fn binding_option(
@@ -743,33 +917,16 @@ fn binding_option(
     ui.horizontal(|ui| {
         changed = super::settings_toggle(ui, palette, value);
         ui.vertical(|ui| {
-            ui.label(egui::RichText::new(label).color(palette.text).strong());
-            ui.label(egui::RichText::new(help).color(palette.muted).small());
+            ui.label(
+                egui::RichText::new(label)
+                    .color(palette.text)
+                    .strong()
+                    .size(12.0),
+            );
+            ui.label(egui::RichText::new(help).color(palette.muted).size(11.0));
         });
     });
     changed
-}
-
-/// The shortcut recorder is one ordinary button; capture behavior lives in `handle_capture`.
-fn record_button(
-    ui: &mut egui::Ui,
-    trigger: &str,
-    recording: bool,
-    capture_text: &str,
-) -> egui::Response {
-    let text = if recording {
-        capture_text
-    } else if trigger.trim().is_empty() {
-        "Click to record"
-    } else {
-        trigger
-    };
-    ui.add_sized([220.0, ROW_CONTROL_HEIGHT], egui::Button::new(text))
-        .on_hover_text(if recording {
-            "Recording — press keys or scroll, Esc cancels"
-        } else {
-            "Click to record a shortcut"
-        })
 }
 
 fn binding_status(
@@ -778,10 +935,16 @@ fn binding_status(
     row: &BindingRow,
     scope: KeybindScope,
 ) {
+    // A healthy row should read as a tick, not as another word competing with the action text.
+    if let Some(true) = row.validity(scope) {
+        if let Some(icon) = bootty_ui::icons::icon_text("check", 16.0, palette.success) {
+            ui.label(icon);
+        }
+        return;
+    }
     let (status, color) = match row.validity(scope) {
-        None => ("incomplete", palette.muted),
-        Some(true) => ("valid", palette.success),
         Some(false) => ("invalid", palette.destructive),
+        _ => ("incomplete", palette.muted),
     };
     ui.label(egui::RichText::new(status).color(color).small());
 }
@@ -942,5 +1105,29 @@ fn split_action_for_editor(
     match action.split_once(':') {
         Some((base, params)) => (base.to_owned(), params.to_owned()),
         None => (action.to_owned(), String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn action_titles_prefer_catalog_titles_and_keep_params() {
+        assert_eq!(action_title("reload_config"), "Reload Config");
+        assert_eq!(action_title("paste_from_clipboard"), "Paste");
+        assert_eq!(
+            action_title("decrease_font_size:1"),
+            "Decrease Font Size: 1"
+        );
+        assert_eq!(
+            action_title("change_appearance:dark"),
+            "Use Dark Appearance"
+        );
+    }
+
+    #[test]
+    fn humanize_action_sentence_cases_names_off_the_catalog() {
+        assert_eq!(humanize_action("focus_terminal"), "Focus terminal");
     }
 }

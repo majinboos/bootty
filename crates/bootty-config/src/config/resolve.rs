@@ -182,11 +182,22 @@ fn apply_partial_sidebar(sidebar: &mut SidebarConfig, partial: SidebarPatch) {
     apply_present(&mut sidebar.selected, partial.selected);
     apply_present(&mut sidebar.hover, partial.hover);
     apply_present(&mut sidebar.border, partial.border);
-    if let Some(modules) = partial.session_modules {
+    // An empty module list keeps the defaults. A sidebar with no modules has no session list at
+    // all, and a session list with no components is a row of bare names — neither is a state anyone
+    // configures on purpose, and the editor refuses to write one. Reaching it means a file was
+    // damaged, so repair it rather than rendering an unusable sidebar.
+    // Limit: an explicit "show nothing" needs its own affordance if anyone ever wants it.
+    if let Some(modules) = partial
+        .session_modules
+        .filter(|modules| !modules.is_empty())
+    {
         sidebar.session_modules = modules;
         sidebar.session_modules_configured = true;
     }
-    apply_value(&mut sidebar.modules, partial.modules);
+    apply_value(
+        &mut sidebar.modules,
+        partial.modules.filter(|modules| !modules.is_empty()),
+    );
 }
 
 fn apply_partial_multiplexer(

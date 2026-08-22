@@ -1,6 +1,7 @@
 pub mod chrome;
 pub mod command_palette;
 pub mod ditch;
+pub mod extension_window;
 pub mod keybind_help;
 mod keybind_source;
 pub mod new_session_picker;

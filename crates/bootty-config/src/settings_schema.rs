@@ -92,6 +92,8 @@ pub enum SettingKind {
     Number {
         range: RangeInclusive<f32>,
         control: NumberControl,
+        /// Decimal places shown. A count reads wrong as `3.0`.
+        precision: usize,
         suffix: Cow<'static, str>,
         /// Multiplier applied for display only: a 0.0-1.0 fraction shown as a percentage uses 100.
         display_scale: f32,
@@ -113,6 +115,9 @@ pub struct SettingOption {
     /// The token written to `config.toml`.
     pub token: Cow<'static, str>,
     pub label: Cow<'static, str>,
+    /// One line saying what picking this option does. When any option on a setting carries one, the
+    /// setting renders as a described list rather than a row of bare labels.
+    pub description: Option<Cow<'static, str>>,
 }
 
 impl SettingOption {
@@ -128,6 +133,23 @@ impl SettingOption {
                 .expect("a setting option must be a unit variant")
                 .into(),
             label: label.into(),
+            description: None,
+        }
+    }
+
+    /// An option that explains itself.
+    ///
+    /// # Panics
+    /// If `value` is not a unit variant, which cannot be a config token.
+    #[must_use]
+    pub fn described<T: Serialize>(
+        value: &T,
+        label: &'static str,
+        description: &'static str,
+    ) -> Self {
+        Self {
+            description: Some(description.into()),
+            ..Self::of(value, label)
         }
     }
 }
@@ -188,9 +210,12 @@ impl ExtensionSetting {
             Value::Bool(value) => (SettingKind::Bool, SettingValue::Bool(*value)),
             Value::Number(value) => (
                 SettingKind::Number {
-                    // An extension declares no range, so the editor accepts what TOML can hold.
-                    range: f32::MIN..=f32::MAX,
+                    // An extension declares no range. Bound it to what a setting plausibly holds
+                    // so the field sizes to its own contents rather than to f32's extremes.
+                    range: -1_000_000.0..=1_000_000.0,
                     control: NumberControl::Edit,
+                    // Keep a whole number whole; only show a decimal if the default has one.
+                    precision: usize::from(value.fract() != 0.0),
                     suffix: String::new().into(),
                     display_scale: 1.0,
                 },
@@ -216,7 +241,11 @@ impl ExtensionSetting {
             },
             help: self.help.clone().into(),
             page: Self::PAGE.into(),
-            section: self.module.clone().to_uppercase().into(),
+            section: self
+                .module
+                .replace(['-', '_', '.'], " ")
+                .to_uppercase()
+                .into(),
             kind,
             supersedes: Vec::new(),
             default: SettingDefault::Literal(default),

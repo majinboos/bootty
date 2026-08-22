@@ -1,0 +1,40 @@
+Bootty Settings
+  Back to terminal
+Diagnostics
+Search settings...
+TRACE
+Core
+
+General
+Stability trace
+path to trace log
+Writes frame-timing diagnostics to this file. Leave empty to disable.
+
+Remotes
+
+Text
+STATE
+
+Appearance
+Config file
+<config-dir>/config.toml
+Read-only location.
+
+Window
+No settings write errors recorded.
+
+Sidebar
+
+Status Bar
+Terminal
+
+Shell
+
+Keys
+Advanced
+
+Config
+
+Diagnostics
+
+Extensions

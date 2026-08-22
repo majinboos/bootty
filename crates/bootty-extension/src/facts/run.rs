@@ -165,21 +165,46 @@ pub(super) fn preview_run_cache() -> Arc<RunCache> {
     cache.preview_branch = Some("feature/module-previews".to_owned());
     let cache = Arc::new(cache);
     cache.set_mode(RunMode::Cached);
-    let commands = [(
-        RunCommand::Exec(
-            [
-                "git",
-                "-C",
-                "/Users/demo/src/bootty",
-                "diff",
-                "HEAD",
-                "--numstat",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+    // Example output for the commands the built-ins query, so each one previews with something
+    // representative instead of rendering nothing. Add an entry when a built-in learns a new query.
+    let usage = |used_primary: u32, used_secondary: u32| {
+        format!(
+            r#"[{{"usage":{{"primary":{{"usedPercent":{used_primary},"windowMinutes":300}},"secondary":{{"usedPercent":{used_secondary},"windowMinutes":10080}}}}}}]"#
+        )
+    };
+    let commands = [
+        (
+            RunCommand::Exec(
+                [
+                    "git",
+                    "-C",
+                    "/Users/demo/src/bootty",
+                    "diff",
+                    "HEAD",
+                    "--numstat",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            ),
+            "12\t3\tcrates/bootty-app/src/ui/settings/surface.rs".to_owned(),
         ),
-        "12\t3\tcrates/bootty-app/src/ui/settings/surface.rs".to_owned(),
-    )];
+        (
+            RunCommand::Exec(
+                ["codexbar", "usage", "--json", "--provider", "codex"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
+            usage(42, 68),
+        ),
+        (
+            RunCommand::Exec(
+                ["codexbar", "usage", "--json", "--provider", "claude"]
+                    .map(str::to_owned)
+                    .to_vec(),
+            ),
+            usage(17, 31),
+        ),
+    ];
     if let Ok(mut entries) = cache.entries.lock() {
         for (command, output) in commands {
             entries.insert(

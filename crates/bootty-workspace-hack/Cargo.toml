@@ -113,6 +113,7 @@ wgpu-hal = { version = "30", default-features = false, features = ["metal", "por
 [target.aarch64-unknown-linux-gnu.dependencies]
 ahash = { version = "0.8" }
 arboard = { version = "3" }
+bstr = { version = "1", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 fastrand = { version = "2" }
 futures-core = { version = "0.3" }
@@ -229,6 +230,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 [target.x86_64-unknown-linux-gnu.dependencies]
 ahash = { version = "0.8" }
 arboard = { version = "3" }
+bstr = { version = "1", features = ["serde"] }
 crossbeam-utils = { version = "0.8" }
 fastrand = { version = "2" }
 futures-core = { version = "0.3" }

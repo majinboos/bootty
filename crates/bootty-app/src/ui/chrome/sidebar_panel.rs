@@ -156,7 +156,10 @@ pub fn show_sidebar(
         &model.footer_items[..model.footer_items.len().min(SIDEBAR_MAX_FOOTER_ITEMS)];
     let footer_h =
         SIDEBAR_FOOTER_BASE_HEIGHT + footer_items.len() as f32 * SIDEBAR_FOOTER_ITEM_HEIGHT;
-    if model.session_count == 0 {
+    // Gate the placeholder on the rows that were actually built, not on the count in the header:
+    // the count comes from the mux while the rows come from the sessions module, and the two can
+    // disagree while a module is still catching up.
+    if !model.items.iter().any(|item| item.session_id.is_some()) {
         painter.text(
             Pos2::new(rect.center().x, list_top + 42.0),
             egui::Align2::CENTER_CENTER,
@@ -365,9 +368,15 @@ pub fn sidebar_drop_target<'a>(
     dragged_anchor: &str,
 ) -> Option<(Option<&'a str>, f32)> {
     let pos = pos?;
-    // A sidebar drop needs the pointer over a row; off the rows is not a drop.
-    let lane = item_list::hovered_row(pos, left, top, width, items.len()).map(|_| 0);
+    // A sidebar drop needs the pointer over a row that belongs to a reorderable block; off the rows,
+    // or over a row nothing can be dropped against, is not a drop.
+    let row = item_list::hovered_row(pos, left, top, width, items.len())?;
     let blocks = sidebar_blocks(items, top);
+    let row_top = top + row as f32 * ROW_HEIGHT;
+    let lane = blocks
+        .iter()
+        .any(|block| block.start <= row_top && row_top < block.end)
+        .then_some(0);
     let target = bootty_ui::reorder::drop_target(&blocks, dragged_anchor, pos.y, lane, true)?;
     Some((target.before, target.indicator))
 }

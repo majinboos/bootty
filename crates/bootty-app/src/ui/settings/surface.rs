@@ -22,11 +22,11 @@ use bootty_config::{
     config::{BoottyConfig, ConfigDocument, MultiplexerBackendConfig},
 };
 use bootty_ui::settings::{
-    DragHandle, NumberEditSpec, apply_reorder, path_row, reorderable_list, searchable_combo,
-    section, settings_button, settings_color_picker, settings_icon_button, settings_notice,
-    settings_number_edit, settings_page_header, settings_row, settings_segmented,
-    settings_segmented_ltr, settings_slider_with_edit, settings_text_edit,
-    settings_text_edit_width, settings_toggle, settings_toggle_row,
+    DragHandle, NumberEditSpec, apply_reorder, icon_text_button, nav_row, path_row,
+    reorderable_list, searchable_combo, section, settings_button, settings_color_picker,
+    settings_icon_button, settings_notice, settings_number_edit, settings_page_header,
+    settings_row, settings_segmented, settings_segmented_ltr, settings_slider_with_edit,
+    settings_text_edit, settings_text_edit_width, settings_toggle, settings_toggle_row,
 };
 use bootty_ui::{Theme, ThemePalette, readable_color};
 use bootty_winit::direct_input::ModifierSideState;
@@ -77,15 +77,18 @@ struct PageMeta {
     page: SettingsPage,
     group: &'static str,
     label: &'static str,
+    /// Lucide slug drawn in the nav row.
+    icon: &'static str,
     terms: &'static str,
 }
 
 macro_rules! page {
-    ($page:ident, $group:literal, $label:literal, $terms:literal) => {
+    ($page:ident, $group:literal, $label:literal, $icon:literal, $terms:literal) => {
         PageMeta {
             page: SettingsPage::$page,
             group: $group,
             label: $label,
+            icon: $icon,
             terms: $terms,
         }
     };
@@ -93,18 +96,18 @@ macro_rules! page {
 
 #[rustfmt::skip]
 const PAGE_META: [PageMeta; 12] = [
-    page!(General, "Core", "General", "default profile|multiplexer|backend|sidebar|status bar|new windows|terminal preview"),
-    page!(Remotes, "Core", "Remotes", "ssh|remote|profile|host|port|user|authentication|private key|proxy|test connection"),
-    page!(Text, "Core", "Text", "font|family|fallback|size|cell width|cell height|baseline|underline|glyph|features"),
-    page!(Appearance, "Core", "Appearance", "theme|colors|background|foreground|cursor|selection|ansi|palette|sidebar colors"),
-    page!(Window, "Core", "Window", "window|title|titlebar|decoration|fullscreen|size|width|height|sidebar|chrome|dim"),
-    page!(Sidebar, "Core", "Sidebar", "sidebar|session|navigation|position|width|background|foreground|selected|hover|border|modules|luau|source"),
-    page!(Status, "Core", "Status Bar", "status|modules|segments|clock|sysinfo|alignment|icon|foreground|background|luau|source"),
-    page!(Shell, "Terminal", "Shell", "shell|working directory|environment|env|term|colorterm|scrollback|glyph protocol"),
-    page!(Keys, "Terminal", "Keys", "keybindings|shortcuts|scope|global|native|tmux|sidebar|modifier remap|option as alt|record shortcut"),
-    page!(Config, "Advanced", "Config", "config|path|directory|themes|status modules|reload|last write error"),
-    page!(Diagnostics, "Advanced", "Diagnostics", "diagnostics|stability trace|trace|reload|errors"),
-    page!(Extensions, "Advanced", "Extensions", "extension|module|luau|setting|option"),
+    page!(General, "Core", "General", "sliders-horizontal", "default profile|multiplexer|backend|sidebar|status bar|new windows|terminal preview"),
+    page!(Remotes, "Core", "Remotes", "server", "ssh|remote|profile|host|port|user|authentication|private key|proxy|test connection"),
+    page!(Text, "Core", "Text", "case-sensitive", "font|family|fallback|size|cell width|cell height|baseline|underline|glyph|features"),
+    page!(Appearance, "Core", "Appearance", "palette", "theme|colors|background|foreground|cursor|selection|ansi|palette|sidebar colors"),
+    page!(Window, "Core", "Window", "panel-top", "window|title|titlebar|decoration|fullscreen|size|width|height|sidebar|chrome|dim"),
+    page!(Sidebar, "Core", "Sidebar", "panel-left", "sidebar|session|navigation|position|width|background|foreground|selected|hover|border|modules|luau|source"),
+    page!(Status, "Core", "Status Bar", "activity", "status|modules|segments|clock|sysinfo|alignment|icon|foreground|background|luau|source"),
+    page!(Shell, "Terminal", "Shell", "terminal", "shell|working directory|environment|env|term|colorterm|scrollback|glyph protocol"),
+    page!(Keys, "Terminal", "Keys", "keyboard", "keybindings|shortcuts|scope|global|native|tmux|sidebar|modifier remap|option as alt|record shortcut"),
+    page!(Config, "Advanced", "Config", "file-cog", "config|path|directory|themes|status modules|reload|last write error"),
+    page!(Diagnostics, "Advanced", "Diagnostics", "bug", "diagnostics|stability trace|trace|reload|errors"),
+    page!(Extensions, "Advanced", "Extensions", "puzzle", "extension|module|luau|setting|option"),
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -255,8 +258,25 @@ impl SettingsSurface {
     /// palette's "configure this command's keybinding" chord.
     pub fn focus_keybinding(&mut self, action: &str) {
         self.page = SettingsPage::Keys;
-        self.keybinds
-            .focus_action(keybinds::KeybindScope::Global, Some(action));
+        self.focus_keybind_scope(keybinds::KeybindScope::Global, Some(action));
+    }
+
+    /// Move the keybind editor to `scope`. Commits the current scope's draft first: focusing drops
+    /// the loaded rows so they reload, which would otherwise discard whatever is being edited.
+    fn focus_keybind_scope(&mut self, scope: keybinds::KeybindScope, action: Option<&str>) {
+        keybinds::commit_draft(self);
+        self.keybinds.focus_action(scope, action);
+    }
+
+    /// Open a specific page. The nav does this on click; callers use it to deep-link.
+    pub fn set_page(&mut self, page: SettingsPage) {
+        self.page = page;
+        self.keybinds.cancel_capture();
+    }
+
+    /// Every page, in nav order — so a caller can walk the whole surface.
+    pub fn pages() -> impl Iterator<Item = SettingsPage> {
+        PAGE_META.iter().map(|meta| meta.page)
     }
 
     pub fn show(
@@ -356,6 +376,8 @@ impl SettingsSurface {
         });
         if action == SettingsAction::Close {
             keybinds::commit_draft(self);
+            // The editor persists on blur, so closing with the caret still in it must flush.
+            modules::flush_selected_source(&mut self.module_editor);
         }
         action
     }
@@ -379,7 +401,8 @@ impl SettingsSurface {
                 bottom: 16,
             })
             .show(ui, |ui| {
-                let close = settings_button(ui, self.palette, "Back to terminal").clicked();
+                let close =
+                    icon_text_button(ui, self.palette, "arrow-left", "Back to terminal").clicked();
 
                 ui.add_space(10.0);
                 ui.scope(|ui| {
@@ -422,16 +445,15 @@ impl SettingsSurface {
     }
 
     fn sidebar_page_button(&mut self, ui: &mut egui::Ui, meta: PageMeta) {
-        let selected = self.page == meta.page;
-        let tint = if selected {
-            self.palette.text
-        } else {
-            self.palette.subtext
-        };
-        let button = egui::Button::new(RichText::new(meta.label).color(tint))
-            .selected(selected)
-            .corner_radius(self.palette.radius);
-        if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
+        if nav_row(
+            ui,
+            self.palette,
+            meta.icon,
+            meta.label,
+            self.page == meta.page,
+        )
+        .clicked()
+        {
             self.page = meta.page;
             self.keybinds.cancel_capture();
         }
@@ -648,8 +670,7 @@ impl SettingsSurface {
         );
         if settings_button(ui, self.palette, "Edit sidebar shortcuts").clicked() {
             self.page = SettingsPage::Keys;
-            self.keybinds
-                .focus_action(keybinds::KeybindScope::Sidebar, None);
+            self.focus_keybind_scope(keybinds::KeybindScope::Sidebar, None);
         }
         modules::sidebar_ui(self, ui, sources);
     }
@@ -697,7 +718,12 @@ fn page_meta(page: SettingsPage) -> PageMeta {
 fn fullscreen_top_offset_row(ui: &mut egui::Ui, ctx: &mut schema_page::SettingsRenderContext<'_>) {
     const PATH: [&str; 2] = ["window", "fullscreen-top-offset"];
     let palette = ctx.palette;
-    let current = ctx.draft.f32_at(&PATH);
+    // The draft first, then the effective config: a value arriving from an `include`d file must
+    // show itself rather than read as "Auto".
+    let current = ctx
+        .draft
+        .f32_at(&PATH)
+        .or(ctx.accepted.window.fullscreen_top_offset);
     settings_row(
         ui,
         palette,
@@ -933,4 +959,54 @@ fn chrome_color_row_with_alpha(
             }
         }
     });
+}
+
+/// The human name for a module id. Built-ins get a written name; anything else has its separators
+/// opened up, which is better than showing a slug where a title belongs.
+pub(super) fn module_display_name(module: &str) -> String {
+    match module {
+        "sessions" => "Sessions".to_owned(),
+        "agents.codex" => "Codex".to_owned(),
+        "agents.pi" => "Pi".to_owned(),
+        "codexbar" => "Usage footer".to_owned(),
+        "diffs" => "Diffs".to_owned(),
+        "process" => "Process".to_owned(),
+        "agent" => "Agent".to_owned(),
+        "directory" => "Directory".to_owned(),
+        "branch" => "Git branch".to_owned(),
+        "ports" => "Ports".to_owned(),
+        "progress" => "Progress".to_owned(),
+        "session" => "Session".to_owned(),
+        "windows" => "Windows".to_owned(),
+        "sysinfo" => "System info".to_owned(),
+        "clock" => "Clock".to_owned(),
+        other => other.replace(['-', '_'], " "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A nav row draws its icon from a slug. An unresolved slug paints nothing at all, which is how
+    /// the nav quietly lost every icon once before.
+    #[test]
+    fn every_settings_page_names_a_drawable_icon() {
+        for meta in PAGE_META {
+            assert!(
+                bootty_ui::icons::has_slug(meta.icon),
+                "the {} page's icon slug `{}` does not resolve",
+                meta.label,
+                meta.icon
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_exists_for_every_nav_entry_and_the_reverse() {
+        for page in SettingsSurface::pages() {
+            assert_eq!(page_meta(page).page, page);
+        }
+        assert_eq!(PAGE_META.len(), SettingsSurface::pages().count());
+    }
 }

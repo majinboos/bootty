@@ -318,3 +318,35 @@ fn word_boundary_match(candidate: &str, pattern: &str) -> bool {
         .match_indices(pattern)
         .any(|(index, _)| index == 0 || !candidate.as_bytes()[index - 1].is_ascii_alphanumeric())
 }
+
+/// A compact icon button for an overlay strip: 22px, borderless, on the panel fill. The settings
+/// icon button is 30px with a frame, which is out of scale inside a one-line bar.
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    palette: crate::ThemePalette,
+    slug: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::click());
+    let fill = if response.hovered() {
+        palette.hover
+    } else {
+        palette.pane
+    };
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(palette.radius), fill);
+    // A missing slug shows its own name rather than an empty square, so a typo is visible.
+    if !crate::icons::paint_icon_slug(ui.painter(), slug, rect.center(), 14.0, palette.text) {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            slug,
+            egui::FontId::monospace(11.0),
+            palette.text,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text(tooltip)
+}

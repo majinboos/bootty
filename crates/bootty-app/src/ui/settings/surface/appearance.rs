@@ -52,9 +52,10 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         ("Hover row", "Hovered session fill.", "hover", palette.hover, |s| &mut s.hover),
         ("Border", "Separator between sidebar and terminal content.", "border", palette.border, |s| &mut s.border),
     ];
-    for &(label, help, key, seed, field) in sidebar_colors {
+    for &(label, help, key, seed, field) in &sidebar_colors[..1] {
         super::sidebar_color_row(win, ui, label, help, &["sidebar", key], seed, field);
     }
+    // Sits beside the sidebar background it defaults to, not at the end of the list.
     super::chrome_color_row(
         win,
         ui,
@@ -64,6 +65,9 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         palette.mantle,
         |chrome| &mut chrome.status_background,
     );
+    for &(label, help, key, seed, field) in &sidebar_colors[1..] {
+        super::sidebar_color_row(win, ui, label, help, &["sidebar", key], seed, field);
+    }
 
     super::section(ui, palette, "FULLSCREEN NOTCH");
     super::settings_toggle_row(

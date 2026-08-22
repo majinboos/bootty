@@ -4,6 +4,7 @@ edition.workspace = true
 
 [dependencies]
 eframe.workspace = true
+egui_code_editor.workspace = true
 iconflow.workspace = true
 bootty-item = { path = "../bootty-item" }
 bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }

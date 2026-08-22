@@ -11,6 +11,7 @@ use bootty_config::settings_schema::{
     NumberControl, SettingKind, SettingSpec, SettingValue, SettingsSchema,
 };
 use bootty_ui::ThemePalette;
+use bootty_ui::settings::{ComboStyle, described_combo};
 use eframe::egui;
 
 use super::writeback::SettingsWriteback;
@@ -97,6 +98,7 @@ pub(super) fn render_setting(
         SettingKind::Number {
             range,
             control,
+            precision,
             suffix,
             display_scale,
         } => {
@@ -106,7 +108,7 @@ pub(super) fn render_setting(
                     id_salt: &path,
                     range: range.clone(),
                     suffix,
-                    precision: 1,
+                    precision: *precision,
                     display_scale: *display_scale,
                 };
                 let changed = match control {
@@ -131,8 +133,35 @@ pub(super) fn render_setting(
                     ui.label(egui::RichText::new(&token).color(palette.muted));
                     return;
                 };
-                // Short lists read better as segments; longer ones need the filterable combo.
-                let next = if labels.len() <= 5 {
+                // Options that explain themselves need the room a described list gives them; short
+                // lists of bare labels read better as segments; long ones need the filterable combo.
+                let next = if options.iter().any(|option| option.description.is_some()) {
+                    let described = options
+                        .iter()
+                        .enumerate()
+                        .map(|(index, option)| {
+                            (
+                                index,
+                                option.label.as_ref(),
+                                option.description.as_deref().unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let mut chosen = selected;
+                    described_combo(
+                        ui,
+                        palette,
+                        &spec.id(),
+                        &mut chosen,
+                        &described,
+                        ComboStyle {
+                            width: 260.0,
+                            searchable: false,
+                            placeholder: "",
+                        },
+                    )
+                    .then_some(chosen)
+                } else if labels.len() <= 5 {
                     settings_segmented(ui, palette, &labels, selected)
                 } else {
                     searchable_combo(

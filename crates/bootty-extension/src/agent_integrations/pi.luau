@@ -206,6 +206,10 @@ end)
 
 bootty.ui.register({ id = "agents.pi", placement = "sidebar", order = 900, interval = 0.1 }, function()
 	drain()
+	-- Nothing has started or reported a Pi session yet, so the sidebar stays quiet.
+	if state.source == "none" then
+		return {}
+	end
 	local text = "Pi " .. state.status
 	if state.session_name then
 		text ..= " · " .. state.session_name
