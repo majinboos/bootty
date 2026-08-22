@@ -9,9 +9,10 @@ use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
 use crate::{
-    action_catalog::Command, commands::CommandRegistry, ui::keybind_source::parse_keybind,
+    action_catalog::Command,
+    commands::CommandRegistry,
+    ui::overlay::{self, FloatingWindow, ListRow, ListView, list},
 };
-use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 
 #[derive(Clone, Debug)]
 pub struct CommandPaletteDialog {

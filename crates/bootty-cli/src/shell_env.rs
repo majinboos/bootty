@@ -36,7 +36,10 @@ pub fn align_shell_env() {
 /// The value `$SHELL` should advertise: an explicit override, then the login
 /// shell, taking the first that is an absolute path. `None` leaves `$SHELL` as
 /// inherited (e.g. non-macOS, where no account shell is resolved).
-fn advertised_shell(override_shell: Option<String>, login_shell: Option<String>) -> Option<String> {
+pub fn advertised_shell(
+    override_shell: Option<String>,
+    login_shell: Option<String>,
+) -> Option<String> {
     [override_shell, login_shell]
         .into_iter()
         .flatten()
@@ -79,7 +82,7 @@ fn login_shell() -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn selected_login_shell(configured: Option<String>, inherited: Option<String>) -> String {
+pub fn selected_login_shell(configured: Option<String>, inherited: Option<String>) -> String {
     [configured, inherited]
         .into_iter()
         .flatten()
@@ -112,7 +115,7 @@ fn capture_login_env(shell: &str) -> Option<Vec<(String, String)>> {
 }
 
 #[cfg(target_os = "macos")]
-fn parse_login_environment(raw: &str) -> Vec<(String, String)> {
+pub fn parse_login_environment(raw: &str) -> Vec<(String, String)> {
     raw.split('\0')
         .filter_map(|entry| {
             let (key, value) = entry.split_once('=')?;
@@ -141,6 +144,6 @@ fn apply_env(vars: Vec<(String, String)>) {
 }
 
 #[cfg(target_os = "macos")]
-fn should_apply_login_environment(key: &str, current_present: bool) -> bool {
+pub fn should_apply_login_environment(key: &str, current_present: bool) -> bool {
     key == "PATH" || !current_present
 }

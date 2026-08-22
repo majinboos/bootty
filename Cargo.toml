@@ -179,13 +179,12 @@ opt-level = 2
 debug = false
 
 [dev-dependencies]
+anyhow.workspace = true
 bootty-app = { path = "crates/bootty-app" }
-bootty-command = { path = "crates/bootty-command" }
-bootty-config = { path = "crates/bootty-config" }
-bootty-identity = { path = "crates/bootty-identity" }
 bootty-mux = { path = "crates/bootty-mux" }
-bootty-rmux = { path = "crates/bootty-rmux" }
+egui.workspace = true
 serde_json.workspace = true
+rusqlite.workspace = true
 tempfile.workspace = true
 
 [dependencies]
