@@ -488,8 +488,12 @@ fn integration_status(host: &ExtensionHost) -> IntegrationStatus {
 }
 
 fn install_request(install: bool) -> ModuleSourceRequest {
+    install_request_for("hooks", install)
+}
+
+fn install_request_for(id: &str, install: bool) -> ModuleSourceRequest {
     let module = "probe".to_owned();
-    let id = "hooks".to_owned();
+    let id = id.to_owned();
     if install {
         ModuleSourceRequest::InstallIntegration { module, id }
     } else {
@@ -736,4 +740,120 @@ fn every_builtin_agent_module_declares_an_installable_integration() {
             "{module} declares no integration; declared: {declared:?}"
         );
     }
+}
+
+/// An adapter for a tool that loads extensions from a directory of its own has to land in that
+/// directory. Writing it only into bootty's own integrations directory installs nothing the tool
+/// will ever read, which is what happened to the Pi extension: the file was written, the status
+/// said installed, and Pi never saw it.
+#[test]
+fn a_placed_file_lands_where_the_tool_reads_it_and_is_taken_back_on_uninstall() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let home = tempfile::tempdir().expect("temporary home directory");
+    let placed = home
+        .path()
+        .join("agent")
+        .join("extensions")
+        .join("probe.ts");
+    let module = format!(
+        r#"bootty.integration.register({{
+    id = "extension",
+    title = "Probe extension",
+    files = {{
+        {{ path = "probe/adapter.ts", contents = "export const bootty = 1;\n" }},
+    }},
+    place = {{
+        {{ path = "{}", file = "probe/adapter.ts" }},
+    }},
+}})
+"#,
+        placed.display()
+    );
+
+    let mut host = integration_host(config.path(), &module);
+    assert_eq!(
+        integration_status(&host),
+        IntegrationStatus::Missing,
+        "the adapter is not in the tool's directory yet"
+    );
+
+    let outcome = host.apply_module_source_request(install_request_for("extension", true));
+    assert!(
+        matches!(outcome, ModuleSourceOutcome::Integration(Ok(()))),
+        "install answers with an outcome: {outcome:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&placed).expect("the placed adapter"),
+        "export const bootty = 1;\n",
+        "the tool's own directory holds the adapter"
+    );
+    assert_eq!(integration_status(&host), IntegrationStatus::Installed);
+
+    let outcome = host.apply_module_source_request(install_request_for("extension", false));
+    assert!(matches!(outcome, ModuleSourceOutcome::Integration(Ok(()))));
+    assert!(!placed.exists(), "uninstall takes back the copy it placed");
+}
+
+/// A file the user replaced with their own is theirs, so uninstall leaves it alone rather than
+/// deleting whatever happens to sit at that path.
+#[test]
+fn uninstall_leaves_a_placed_file_the_user_replaced() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let home = tempfile::tempdir().expect("temporary home directory");
+    let placed = home.path().join("probe.ts");
+    let module = format!(
+        r#"bootty.integration.register({{
+    id = "extension",
+    files = {{
+        {{ path = "probe/adapter.ts", contents = "ours\n" }},
+    }},
+    place = {{
+        {{ path = "{}", file = "probe/adapter.ts" }},
+    }},
+}})
+"#,
+        placed.display()
+    );
+
+    let mut host = integration_host(config.path(), &module);
+    host.apply_module_source_request(install_request_for("extension", true));
+    fs::write(&placed, "mine\n").expect("replace the adapter");
+
+    host.apply_module_source_request(install_request_for("extension", false));
+    assert_eq!(
+        fs::read_to_string(&placed).expect("the user's file"),
+        "mine\n",
+        "uninstall removes only a copy that is still ours"
+    );
+}
+
+/// The Pi adapter has to reach Pi's own extensions directory; nothing else installs it.
+#[test]
+fn the_pi_agent_places_its_adapter_in_pis_extension_directory() {
+    let config = tempfile::tempdir().expect("temporary config directory");
+    let root = config.path().join("extensions");
+    fs::create_dir_all(&root).expect("create the extension root");
+    let (sender, _receiver) = app_command_channel(4, std::sync::Arc::new(|| {}));
+    let host = ExtensionHost::load(
+        &root,
+        std::sync::Arc::new(ExtensionCatalog::default()),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+    let sources = host.module_sources();
+    let pi = sources
+        .integrations
+        .iter()
+        .find(|integration| integration.declaration.module == "agents.pi")
+        .expect("the pi agent declares an integration");
+
+    assert_eq!(
+        pi.declaration
+            .place
+            .iter()
+            .map(|placement| placement.path.as_str())
+            .collect::<Vec<_>>(),
+        ["~/.pi/agent/extensions/bootty.ts"],
+        "the adapter goes where Pi loads extensions from"
+    );
 }
