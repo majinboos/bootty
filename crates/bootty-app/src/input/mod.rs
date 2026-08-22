@@ -1,3 +1,4 @@
+pub mod bindings;
 mod config;
 pub mod focus;
 pub mod router;

@@ -1,16 +1,14 @@
 use std::collections::HashSet;
 
-use anyhow::{Result, bail};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     config::{BoottyConfig, MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig},
     workspace::{
-        BackendSessionMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR,
-        DEFAULT_SPACE_ICON, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
-        SpaceRemoteOverride, WorkspaceBinding, WorkspaceRepository,
+        BackendMembership, BindingMembershipMutation, DEFAULT_SPACE_COLOR, DEFAULT_SPACE_ICON,
+        SessionNameStore, SessionOrderStore, SpaceMuxOverride, SpaceRemoteOverride,
+        WorkspaceBinding, WorkspaceRepository,
     },
 };
+use anyhow::{Result, bail};
 pub use bootty_mux::RemoteSpaceSummary;
 use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
@@ -210,7 +208,7 @@ impl RemoteSpaceRuntime {
         let memberships = snapshot
             .sessions
             .iter()
-            .map(|session| BackendSessionMembership {
+            .map(|session| BackendMembership {
                 id: session.id.clone(),
                 name: session.name.clone(),
             })

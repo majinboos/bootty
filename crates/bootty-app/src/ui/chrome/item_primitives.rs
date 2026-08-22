@@ -2,7 +2,10 @@ use bootty_extension::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModulePrimi
 use bootty_ui::{icons::paint_icon_slug, readable_color};
 use eframe::egui::{self, Pos2, Rect, Stroke, StrokeKind};
 
-use crate::theme::module_color32;
+use crate::{
+    command_extensions::{ModuleCoord, ModulePrimitive},
+    ui::icons::paint_icon_slug,
+};
 
 fn coord_x(rect: Rect, coord: ModuleCoord) -> f32 {
     rect.min.x + rect.width() * coord.frac + coord.px

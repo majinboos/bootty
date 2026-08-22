@@ -11,21 +11,29 @@ app = [
   "dep:bootty-terminal",
   "dep:derive_more",
 ]
+remote-install = ["app", "dep:getrandom", "dep:sha2", "dep:ureq"]
 
 [dependencies]
-bootty-command = { path = "../bootty-command" }
+bootty-identity = { path = "../bootty-identity" }
 bootty-mux-model = { path = "../bootty-mux-model" }
-bootty-write = { path = "../bootty-write" }
 anyhow.workspace = true
 derive_more = { workspace = true, optional = true }
-inventory.workspace = true
+libghostty-vt = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+rmux-client.workspace = true
+rmux-ipc.workspace = true
+rmux-proto.workspace = true
+rmux-sdk.workspace = true
+rmux-server.workspace = true
 serde.workspace = true
-strum.workspace = true
-thiserror.workspace = true
+sha2 = { workspace = true, optional = true }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync"] }
+ureq = { workspace = true, optional = true }
 bootty-runtime = { path = "../bootty-runtime", optional = true }
 bootty-surface = { path = "../bootty-surface", optional = true }
 bootty-terminal = { path = "../bootty-terminal", optional = true }
-
-[dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

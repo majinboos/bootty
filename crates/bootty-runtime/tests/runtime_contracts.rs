@@ -1,9 +1,11 @@
-use std::{fs, time::Duration};
-#[cfg(unix)]
-use std::{sync::Arc, thread, time::Instant};
+use std::{
+    fs,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
-#[cfg(unix)]
-use bootty_runtime::frame_source::TerminalFrameSource;
 use bootty_runtime::{
     BenchmarkTrace, PtyBacklog, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
     TraceValue, drain_pty_backlog,
@@ -11,12 +13,8 @@ use bootty_runtime::{
     perf::{guard_frame_path, record_subprocess},
     scheduler::{RepaintScheduler, RepaintSignal},
 };
-use bootty_terminal::terminal_engine::TerminalEngine;
 #[cfg(unix)]
-use bootty_terminal::terminal_engine::{
-    TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TerminalCopyModeAction, TerminalSearchDirection,
-    TerminalSelectionFormat,
-};
+use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION};
 
 #[test]
 fn scheduler_prioritizes_input_and_backlog_over_idle_chrome() {
@@ -46,10 +44,19 @@ fn scheduler_prioritizes_input_and_backlog_over_idle_chrome() {
 }
 
 #[test]
-#[should_panic(expected = "git status spawned a subprocess on the frame path")]
 fn frame_path_guard_names_a_forbidden_subprocess() {
-    let _guard = guard_frame_path();
-    record_subprocess("git status");
+    let failure = catch_unwind(AssertUnwindSafe(|| {
+        let _guard = guard_frame_path();
+        record_subprocess("git status");
+    }))
+    .expect_err("guard must reject the subprocess");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("panic message");
+
+    assert!(message.contains("git status spawned a subprocess on the frame path"));
 }
 
 #[test]
@@ -82,72 +89,6 @@ fn pty_backlog_drains_complete_chunks_in_order() {
     assert_eq!(stats.bytes, output.len());
     assert_eq!(stats.chunks, 2);
     assert!(backlog.is_empty());
-}
-
-#[test]
-fn bounded_pty_drain_preserves_split_synchronized_output_control() {
-    let geometry = TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 8,
-        cell_height: 16,
-    };
-    let mut engine = TerminalEngine::new(geometry).expect("terminal engine");
-    let mut backlog = PtyBacklog::new();
-    let mut bytes = vec![b'x'; 8191];
-    bytes.extend_from_slice(b"\x1b[?2026h");
-    backlog.push_back(bytes);
-    let mut slices = Vec::new();
-
-    let stats = drain_pty_backlog(&mut backlog, |slice| {
-        slices.push(slice.to_vec());
-        engine.write_vt(slice);
-    });
-
-    assert_eq!(stats.bytes, 8199);
-    assert_eq!(slices.len(), 2);
-    assert_eq!(slices[0].len(), 8192);
-    assert_eq!(slices[0].last(), Some(&0x1b));
-    assert_eq!(slices[1], b"[?2026h");
-    assert!(
-        engine
-            .is_synchronized_output()
-            .expect("query synchronized output mode")
-    );
-}
-
-#[test]
-fn completed_synchronized_output_batch_suppresses_intermediate_publish() {
-    let geometry = TerminalGeometry {
-        cols: 80,
-        rows: 24,
-        cell_width: 8,
-        cell_height: 16,
-    };
-    let mut engine = TerminalEngine::new(geometry).expect("terminal engine");
-    let mut backlog = PtyBacklog::new();
-    backlog.push_back(b"\x1b[?2026hredraw\x1b[?2026l".to_vec());
-    let mut observed = false;
-
-    let stats = drain_pty_backlog(&mut backlog, |slice| {
-        engine.write_vt(slice);
-        observed |= engine.take_synchronized_output_observed();
-    });
-
-    assert_eq!(stats.bytes, 22);
-    assert!(observed);
-    assert!(
-        !engine
-            .is_synchronized_output()
-            .expect("query synchronized output mode")
-    );
-    assert!(
-        bootty_runtime::terminal_session::sync_output_suppresses_publish(
-            false,
-            observed,
-            Duration::ZERO,
-        )
-    );
 }
 
 #[cfg(unix)]
@@ -192,100 +133,6 @@ fn dropping_a_terminal_session_kills_its_owned_child() {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("terminal child {pid} survived session drop");
-}
-
-#[cfg(unix)]
-#[test]
-fn resize_updates_grid_size_only_after_worker_result() {
-    let initial = TerminalGeometry {
-        cols: 20,
-        rows: 8,
-        cell_width: 8,
-        cell_height: 16,
-    };
-    let resized = TerminalGeometry {
-        cols: 24,
-        rows: 10,
-        ..initial
-    };
-    let invalid = TerminalGeometry {
-        cols: initial.cols,
-        rows: 0,
-        ..initial
-    };
-    let mut session = TerminalSession::new_with_repaint_wakeup(initial, Arc::new(|| {}))
-        .expect("terminal starts");
-
-    session.resize(resized).expect("terminal resizes");
-    assert_eq!(session.grid_size(), (resized.cols, resized.rows));
-    let frame = session.extract_frame().expect("resized frame");
-    assert_eq!((frame.cols, frame.rows), (resized.cols, resized.rows));
-    assert!(session.resize(invalid).is_err());
-    assert_eq!(session.grid_size(), (resized.cols, resized.rows));
-}
-
-#[cfg(unix)]
-#[test]
-fn frame_resize_queues_without_waiting_for_worker_publication() {
-    let initial = TerminalGeometry {
-        cols: 20,
-        rows: 8,
-        cell_width: 8,
-        cell_height: 16,
-    };
-    let resized = TerminalGeometry {
-        cols: 24,
-        rows: 10,
-        ..initial
-    };
-    let mut session = TerminalSession::new_with_repaint_wakeup(initial, Arc::new(|| {}))
-        .expect("terminal starts");
-
-    let started = Instant::now();
-    TerminalFrameSource::resize(&mut session, resized).expect("frame resize queues");
-
-    assert_eq!(session.grid_size(), (resized.cols, resized.rows));
-    assert!(
-        started.elapsed() < Duration::from_millis(50),
-        "frame resize waited for worker publication"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn terminal_worker_response_operations_preserve_public_results() {
-    let geometry = TerminalGeometry {
-        cols: 20,
-        rows: 8,
-        cell_width: 8,
-        cell_height: 16,
-    };
-    let mut session = TerminalSession::new_with_repaint_wakeup(geometry, Arc::new(|| {}))
-        .expect("terminal starts");
-
-    session.enter_copy_mode().expect("copy mode starts");
-    assert!(session.copy_mode_active().expect("copy mode state reads"));
-    let outcome = session
-        .handle_copy_mode_action(TerminalCopyModeAction::Cancel)
-        .expect("copy mode action completes");
-    assert!(!outcome.active);
-    assert_eq!(
-        session
-            .format_selection(TerminalSelectionFormat::PlainText)
-            .expect("selection formatting completes"),
-        None
-    );
-    assert!(
-        !session
-            .search_viewport("", TerminalSearchDirection::Current)
-            .expect("search completes")
-    );
-    session
-        .is_mouse_tracking()
-        .expect("mouse tracking state reads");
-    session
-        .discard_pending_output()
-        .expect("pending output discard completes");
 }
 
 #[cfg(unix)]

@@ -317,7 +317,7 @@ fn remove_branch_config_value(
     super::reload_settings_config(win);
 }
 
-fn theme_row(win: &mut SettingsSurface, ui: &mut egui::Ui, variant: AppearanceVariant) {
+fn theme_row(win: &mut SettingsWindow, ui: &mut egui::Ui, variant: AppearanceVariant) {
     let config_path = win.writeback.path().to_path_buf();
     let themes = win
         .theme_names

@@ -1,7 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
     },
     time::Instant,
@@ -14,6 +15,7 @@ use serde_json::Value;
 use crate::{
     action_catalog::Command,
     app_actions::{KeybindAction, SidebarAction, keybind_action_for_name},
+    command_extensions::{ModuleIdentity, PublishedSurfaceSnapshot, SurfaceSnapshot},
     mux::RepaintHandle,
 };
 
@@ -141,6 +143,16 @@ pub struct CommandInvocation {
 }
 
 impl CommandInvocation {
+    pub fn new(command: impl Into<String>, arguments: Vec<String>, caller: Caller) -> Self {
+        Self {
+            command: command.into(),
+            arguments,
+            caller,
+            target: None,
+            confirmation: None,
+        }
+    }
+
     // ponytail: action-string arguments bridge existing keybindings; replace them with schema values
     // when the external command parser lands.
     pub fn from_action(action: &str, caller: Caller) -> Self {
@@ -149,13 +161,7 @@ impl CommandInvocation {
             .map_or((action, Vec::new()), |(command, arguments)| {
                 (command, vec![arguments.to_owned()])
             });
-        Self {
-            command: command.to_owned(),
-            arguments,
-            caller,
-            target: None,
-            confirmation: None,
-        }
+        Self::new(command, arguments, caller)
     }
 
     pub fn from_catalog(command: Command, caller: Caller) -> Option<Self> {
@@ -253,14 +259,8 @@ impl CommandOutcome {
 pub enum CoreCommandExecutor {
     Keybind(KeybindAction),
     Sidebar(SidebarAction),
+    CurrentResource(ResourceKind),
     ReadTerminal,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedCommandInvocation {
-    pub descriptor: CommandDescriptor,
-    pub executor: CoreCommandExecutor,
-    pub invocation: CommandInvocation,
 }
 
 #[derive(Clone, Debug)]
@@ -273,6 +273,7 @@ struct RegisteredCommand {
 enum CommandExecutorResolver {
     Keybind,
     Sidebar(SidebarAction),
+    CurrentResource,
     ReadTerminal,
     WriteTerminal,
 }
@@ -331,6 +332,10 @@ impl CommandRegistry {
                 CoreCommandExecutor::Keybind(action)
             }
             CommandExecutorResolver::Sidebar(action) => CoreCommandExecutor::Sidebar(action),
+            CommandExecutorResolver::CurrentResource => CoreCommandExecutor::CurrentResource(
+                resource_kind(&invocation.arguments[0])
+                    .expect("validated resource kind has a runtime value"),
+            ),
             CommandExecutorResolver::ReadTerminal => CoreCommandExecutor::ReadTerminal,
             CommandExecutorResolver::WriteTerminal => CoreCommandExecutor::Keybind(
                 KeybindAction::Write(invocation.arguments[0].as_bytes().to_vec()),
@@ -338,7 +343,7 @@ impl CommandRegistry {
         };
         Ok(ResolvedCommandInvocation {
             descriptor,
-            executor,
+            executor: CommandExecutor::Core(executor),
             invocation,
         })
     }
@@ -378,7 +383,40 @@ impl CommandRegistry {
                 },
             );
         }
+        let resource_kind_choices = [
+            "instance",
+            "application_window",
+            "binding",
+            "session",
+            "mux_window",
+            "pane",
+            "terminal",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
         for (descriptor, executor) in [
+            (
+                CommandDescriptor {
+                    id: "resource.current".to_owned(),
+                    title: "Current Resource".to_owned(),
+                    description: "Return the current opaque resource target.".to_owned(),
+                    mutation: MutationClass::Read,
+                    arguments: CompactSchema {
+                        arguments: vec![ArgumentSchema {
+                            name: "kind".to_owned(),
+                            value_type: ValueType::String,
+                            required: true,
+                            choices: resource_kind_choices,
+                            minimum: None,
+                            maximum: None,
+                        }],
+                    },
+                    target: None,
+                    palette: false,
+                },
+                CommandExecutorResolver::CurrentResource,
+            ),
             (
                 CommandDescriptor {
                     id: "terminal.read".to_owned(),
@@ -425,17 +463,84 @@ pub type ExtensionCommandHandler = Arc<
         + 'static,
 >;
 
+#[derive(Clone, Debug)]
+pub struct ExtensionGenerationToken(Arc<AtomicBool>);
+
+impl ExtensionGenerationToken {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn retire(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Default for ExtensionGenerationToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone)]
-pub struct ResolvedExtensionCommand {
+struct ExtensionCommand {
+    module: String,
+    generation: u64,
+    descriptor: CommandDescriptor,
+    handler: ExtensionCommandHandler,
+}
+
+#[derive(Clone)]
+struct ExtensionTopic {
+    module: String,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct ExtensionSurface {
+    module: String,
+    generation: u64,
+    snapshot: SurfaceSnapshot,
+}
+
+#[derive(Default)]
+struct ExtensionCatalog {
+    commands: BTreeMap<String, ExtensionCommand>,
+    topics: BTreeMap<String, ExtensionTopic>,
+    surfaces: BTreeMap<(String, String), ExtensionSurface>,
+    generations: BTreeMap<String, (u64, ExtensionGenerationToken)>,
+}
+
+#[derive(Clone)]
+pub enum CommandExecutor {
+    Core(CoreCommandExecutor),
+    Extension(ExtensionCommandHandler),
+}
+
+#[derive(Clone)]
+pub struct ResolvedCommandInvocation {
     pub descriptor: CommandDescriptor,
     pub invocation: CommandInvocation,
-    pub handler: ExtensionCommandHandler,
+    pub executor: CommandExecutor,
 }
 
 #[derive(Clone)]
 pub struct CommandCatalog {
     core: &'static CommandRegistry,
-    extensions: Arc<RwLock<BTreeMap<String, (CommandDescriptor, ExtensionCommandHandler)>>>,
+    extensions: Arc<RwLock<ExtensionCatalog>>,
+}
+
+pub struct ExtensionGenerationCandidate {
+    pub identity: ModuleIdentity,
+    pub generation: u64,
+    pub token: ExtensionGenerationToken,
+    pub commands: Vec<(CommandDescriptor, ExtensionCommandHandler)>,
+    pub topics: Vec<String>,
+    pub surfaces: Vec<SurfaceSnapshot>,
 }
 
 impl std::fmt::Debug for CommandCatalog {
@@ -462,8 +567,9 @@ impl CommandCatalog {
         if let Ok(extensions) = self.extensions.read() {
             commands.extend(
                 extensions
+                    .commands
                     .values()
-                    .map(|(descriptor, _)| descriptor.clone()),
+                    .map(|command| command.descriptor.clone()),
             );
         }
         commands.sort_by(|left, right| left.id.cmp(&right.id));
@@ -472,10 +578,12 @@ impl CommandCatalog {
 
     pub fn describe(&self, id: &str) -> Option<CommandDescriptor> {
         self.core.describe(id).cloned().or_else(|| {
-            self.extensions
-                .read()
-                .ok()
-                .and_then(|commands| commands.get(id).map(|(descriptor, _)| descriptor.clone()))
+            self.extensions.read().ok().and_then(|catalog| {
+                catalog
+                    .commands
+                    .get(id)
+                    .map(|command| command.descriptor.clone())
+            })
         })
     }
 
@@ -483,63 +591,308 @@ impl CommandCatalog {
         &self,
         invocation: CommandInvocation,
     ) -> Result<ResolvedCommandInvocation, CommandOutcome> {
-        self.core.resolve(invocation)
-    }
-
-    pub fn resolve_extension(
-        &self,
-        invocation: CommandInvocation,
-    ) -> Result<Option<ResolvedExtensionCommand>, CommandOutcome> {
         let command = self
             .extensions
             .read()
             .ok()
-            .and_then(|commands| commands.get(&invocation.command).cloned());
-        let Some((descriptor, handler)) = command else {
-            return Ok(None);
-        };
-        validate_arguments(&descriptor, &invocation.arguments)?;
-        Ok(Some(ResolvedExtensionCommand {
-            descriptor,
-            invocation,
-            handler,
-        }))
+            .and_then(|catalog| catalog.commands.get(&invocation.command).cloned());
+        if let Some(command) = command {
+            validate_arguments(&command.descriptor, &invocation.arguments)?;
+            return Ok(ResolvedCommandInvocation {
+                descriptor: command.descriptor,
+                invocation,
+                executor: CommandExecutor::Extension(command.handler),
+            });
+        }
+        self.core.resolve(invocation)
     }
 
-    pub fn register_extension(
+    pub fn publish_extension_generation(
         &self,
-        package: &str,
-        descriptor: CommandDescriptor,
-        handler: ExtensionCommandHandler,
+        candidate: ExtensionGenerationCandidate,
     ) -> Result<(), String> {
-        if package.is_empty() || !is_namespaced(&descriptor.id, package) {
-            return Err("extension command must be namespaced by its package".to_owned());
+        let ExtensionGenerationCandidate {
+            identity,
+            generation,
+            token,
+            commands,
+            topics,
+            surfaces,
+        } = candidate;
+        let module = identity.as_str();
+        let namespace = identity.namespace();
+        let mut command_ids = BTreeSet::new();
+        for (descriptor, _) in &commands {
+            if !is_namespaced(&descriptor.id, &namespace) {
+                return Err("extension command must be namespaced by its module".to_owned());
+            }
+            if self.core.describe(&descriptor.id).is_some() {
+                return Err("extension command cannot replace a built-in command".to_owned());
+            }
+            if !command_ids.insert(descriptor.id.clone()) {
+                return Err(format!(
+                    "command {} is registered more than once",
+                    descriptor.id
+                ));
+            }
         }
-        if self.core.describe(&descriptor.id).is_some() {
-            return Err("extension command cannot replace a built-in command".to_owned());
+        let mut topic_ids = BTreeSet::new();
+        for topic in &topics {
+            if !is_namespaced(topic, &namespace) {
+                return Err("extension event topic must be namespaced by its module".to_owned());
+            }
+            if !topic_ids.insert(topic.clone()) {
+                return Err(format!("event topic {topic} is registered more than once"));
+            }
         }
-        let mut extensions = self
+        let mut surface_ids = BTreeSet::new();
+        for surface in &surfaces {
+            if surface.declaration.id.is_empty() {
+                return Err("extension surface identity is invalid".to_owned());
+            }
+            if !surface_ids.insert(surface.declaration.id.clone()) {
+                return Err(format!(
+                    "surface {} is registered more than once",
+                    surface.declaration.id
+                ));
+            }
+        }
+
+        let mut catalog = self
             .extensions
             .write()
             .map_err(|_| "command catalog is unavailable".to_owned())?;
-        if extensions.contains_key(&descriptor.id) {
-            return Err(format!("command {} is already registered", descriptor.id));
+        for command in &command_ids {
+            if catalog
+                .commands
+                .get(command)
+                .is_some_and(|registered| registered.module != module)
+            {
+                return Err(format!("command {command} is already registered"));
+            }
         }
-        extensions.insert(descriptor.id.clone(), (descriptor, handler));
+        for topic in &topic_ids {
+            if catalog
+                .topics
+                .get(topic)
+                .is_some_and(|registered| registered.module != module)
+            {
+                return Err(format!("event topic {topic} is already registered"));
+            }
+        }
+        for surface in &surfaces {
+            if catalog.surfaces.values().any(|registered| {
+                registered.module != module
+                    && registered.snapshot.declaration.placement == surface.declaration.placement
+                    && registered.snapshot.declaration.id == surface.declaration.id
+            }) {
+                return Err(format!(
+                    "surface {} is already registered for {:?}",
+                    surface.declaration.id, surface.declaration.placement
+                ));
+            }
+        }
+
+        if let Some((_, previous)) = catalog.generations.get(module) {
+            previous.retire();
+        }
+        catalog
+            .commands
+            .retain(|_, command| command.module != module);
+        catalog.topics.retain(|_, topic| topic.module != module);
+        catalog
+            .surfaces
+            .retain(|_, surface| surface.module != module);
+        for (descriptor, handler) in commands {
+            catalog.commands.insert(
+                descriptor.id.clone(),
+                ExtensionCommand {
+                    module: module.to_owned(),
+                    generation,
+                    descriptor,
+                    handler,
+                },
+            );
+        }
+        for topic in topics {
+            catalog.topics.insert(
+                topic,
+                ExtensionTopic {
+                    module: module.to_owned(),
+                    generation,
+                },
+            );
+        }
+        for snapshot in surfaces {
+            catalog.surfaces.insert(
+                (module.to_owned(), snapshot.declaration.id.clone()),
+                ExtensionSurface {
+                    module: module.to_owned(),
+                    generation,
+                    snapshot,
+                },
+            );
+        }
+        catalog
+            .generations
+            .insert(module.to_owned(), (generation, token));
         Ok(())
     }
 
-    pub fn clear_extensions(&self) {
-        if let Ok(mut extensions) = self.extensions.write() {
-            extensions.clear();
+    pub fn remove_extension_generation(&self, module: &str, generation: u64) {
+        if let Ok(mut catalog) = self.extensions.write() {
+            let matches = catalog
+                .generations
+                .get(module)
+                .is_some_and(|(active, _)| *active == generation);
+            if !matches {
+                return;
+            }
+            if let Some((_, token)) = catalog.generations.remove(module) {
+                token.retire();
+            }
+            catalog
+                .commands
+                .retain(|_, command| command.module != module || command.generation != generation);
+            catalog
+                .topics
+                .retain(|_, topic| topic.module != module || topic.generation != generation);
+            catalog
+                .surfaces
+                .retain(|_, surface| surface.module != module || surface.generation != generation);
         }
+    }
+
+    pub fn extension_topics(&self) -> BTreeSet<String> {
+        self.extensions
+            .read()
+            .map(|catalog| catalog.topics.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn extension_surfaces(&self) -> Vec<PublishedSurfaceSnapshot> {
+        self.extensions
+            .read()
+            .map(|catalog| {
+                catalog
+                    .surfaces
+                    .values()
+                    .map(|surface| PublishedSurfaceSnapshot {
+                        module: surface.module.clone(),
+                        generation: surface.generation,
+                        snapshot: surface.snapshot.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn publish_extension_surfaces(
+        &self,
+        module: &str,
+        generation: u64,
+        surfaces: Vec<SurfaceSnapshot>,
+    ) -> Result<(), String> {
+        let mut surface_ids = BTreeSet::new();
+        for surface in &surfaces {
+            if surface.declaration.id.is_empty() {
+                return Err("extension surface identity is invalid".to_owned());
+            }
+            if !surface_ids.insert(surface.declaration.id.clone()) {
+                return Err(format!(
+                    "surface {} is registered more than once",
+                    surface.declaration.id
+                ));
+            }
+        }
+        let mut catalog = self
+            .extensions
+            .write()
+            .map_err(|_| "command catalog is unavailable".to_owned())?;
+        let generation_is_active = catalog
+            .generations
+            .get(module)
+            .is_some_and(|(active, token)| *active == generation && token.is_active());
+        if !generation_is_active {
+            return Err("extension generation is not active".to_owned());
+        }
+        for surface in &surfaces {
+            if catalog.surfaces.values().any(|registered| {
+                registered.module != module
+                    && registered.snapshot.declaration.placement == surface.declaration.placement
+                    && registered.snapshot.declaration.id == surface.declaration.id
+            }) {
+                return Err(format!(
+                    "surface {} is already registered for {:?}",
+                    surface.declaration.id, surface.declaration.placement
+                ));
+            }
+        }
+        catalog
+            .surfaces
+            .retain(|_, surface| surface.module != module);
+        for snapshot in surfaces {
+            catalog.surfaces.insert(
+                (module.to_owned(), snapshot.declaration.id.clone()),
+                ExtensionSurface {
+                    module: module.to_owned(),
+                    generation,
+                    snapshot,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_active_extension_topic<T>(
+        &self,
+        module: &str,
+        generation: u64,
+        topic: &str,
+        publish: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let catalog = self
+            .extensions
+            .read()
+            .map_err(|_| "command catalog is unavailable".to_owned())?;
+        let generation_is_active = catalog
+            .generations
+            .get(module)
+            .is_some_and(|(active, token)| *active == generation && token.is_active());
+        let topic_is_active = catalog.topics.get(topic).is_some_and(|registered| {
+            registered.module == module && registered.generation == generation
+        });
+        if !generation_is_active || !topic_is_active {
+            return Err("extension event topic is not active".to_owned());
+        }
+        Ok(publish())
+    }
+
+    pub(crate) fn with_active_extension_generation<T>(
+        &self,
+        module: &str,
+        generation: u64,
+        action: impl FnOnce() -> T,
+    ) -> Result<T, String> {
+        let catalog = self
+            .extensions
+            .read()
+            .map_err(|_| "command catalog is unavailable".to_owned())?;
+        let generation_is_active = catalog
+            .generations
+            .get(module)
+            .is_some_and(|(active, token)| *active == generation && token.is_active());
+        if !generation_is_active {
+            return Err("extension generation is not active".to_owned());
+        }
+        Ok(action())
     }
 }
 
-/// Whether `id` is `package` followed by a dot and a leaf, the namespacing every
+/// Whether `id` is `namespace` followed by a dot and a leaf, the namespacing every
 /// extension-supplied command id and event topic must satisfy.
-pub fn is_namespaced(id: &str, package: &str) -> bool {
-    id.starts_with(package) && id[package.len()..].starts_with('.')
+pub fn is_namespaced(id: &str, namespace: &str) -> bool {
+    id.starts_with(namespace) && id[namespace.len()..].starts_with('.')
 }
 
 fn descriptor_metadata(id: &str, command: Command) -> (&str, &str) {
@@ -701,6 +1054,20 @@ fn choice(name: &str, required: bool, choices: &[&str]) -> ArgumentSchema {
         maximum: None,
     }
 }
+
+fn resource_kind(value: &str) -> Option<ResourceKind> {
+    match value {
+        "instance" => Some(ResourceKind::Instance),
+        "application_window" => Some(ResourceKind::ApplicationWindow),
+        "binding" => Some(ResourceKind::Binding),
+        "session" => Some(ResourceKind::Session),
+        "mux_window" => Some(ResourceKind::MuxWindow),
+        "pane" => Some(ResourceKind::Pane),
+        "terminal" => Some(ResourceKind::Terminal),
+        _ => None,
+    }
+}
+
 fn mutation_for(id: &str) -> MutationClass {
     const DESTRUCTIVE: &[&str] = &[
         "close_space",
@@ -845,6 +1212,22 @@ impl AppCommandSender {
 }
 
 impl BoundAppCommandSender {
+    pub fn submit(
+        &self,
+        invocation: CommandInvocation,
+        deadline: Instant,
+        cancellation: CommandCancellation,
+    ) -> Result<Receiver<CommandOutcome>, AppCommandSendError> {
+        let (response, receiver) = mpsc::channel();
+        self.try_send(AppCommandRequest {
+            invocation,
+            deadline,
+            cancellation,
+            response,
+        })?;
+        Ok(receiver)
+    }
+
     pub fn try_send(&self, mut request: AppCommandRequest) -> Result<(), AppCommandSendError> {
         let open = self.open.lock().unwrap_or_else(|error| error.into_inner());
         if !*open {

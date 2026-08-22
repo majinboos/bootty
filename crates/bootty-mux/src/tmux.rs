@@ -21,6 +21,15 @@ const TMUX_FIELD_SEPARATOR: char = '\x1f';
 const TMUX_SESSION_LINE_TAG: char = 's';
 const TMUX_PANE_LINE_TAG: char = 'p';
 
+pub(crate) fn local_server_args(identity: bootty_identity::ApplicationIdentity) -> Vec<String> {
+    match identity {
+        bootty_identity::ApplicationIdentity::Production => Vec::new(),
+        bootty_identity::ApplicationIdentity::Development => {
+            vec!["-L".to_owned(), identity.namespace().to_owned()]
+        }
+    }
+}
+
 #[cfg(feature = "app")]
 pub type DefaultTmuxRunner = TmuxControlRunner;
 #[cfg(not(feature = "app"))]
@@ -36,6 +45,10 @@ pub struct TmuxBackend<R = DefaultTmuxRunner> {
 impl TmuxBackend<DefaultTmuxRunner> {
     pub fn new() -> Self {
         Self::with_runner("tmux", TmuxControlRunner::default())
+    }
+
+    pub fn for_identity(identity: bootty_identity::ApplicationIdentity) -> Self {
+        Self::with_runner("tmux", TmuxControlRunner::for_identity(identity))
     }
 }
 

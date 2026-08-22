@@ -1,20 +1,22 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, path::Path, time::Duration};
 
 use bootty_app::{
+    color::Color,
+    config::BoottyConfig,
+    diagnostics::{STATUS_METRICS_SAMPLE_INTERVAL, should_sample_status_metrics},
     input::{focus::InputFocus, router::route_events},
-    strings::{csv_field, is_uniquified_session_name, push_truncated_label, unique_session_name},
+    mux::{
+        controller::{BindingId, MuxScope, SpaceId},
+        snapshot::{MuxPaneAnchor, MuxSession},
+    },
+    strings::{
+        csv_field, display_path, home_dir, is_uniquified_session_name, push_truncated_label,
+        unique_session_name,
+    },
     theme::theme_palette_from_colors,
     ui::session_navigation::BindingSessionGroup,
 };
-use bootty_config::{color::Color, config::BoottyConfig};
-use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession},
-};
 use egui::{Color32, Event, Key, Modifiers};
-
-#[cfg(windows)]
-use bootty_app::strings::home_dir;
 
 fn key_event(key: Key) -> Event {
     Event::Key {
@@ -102,6 +104,24 @@ fn generated_session_names_require_a_numeric_suffix_on_the_same_leaf() {
         "bootty/mainline-2",
         "bootty/main"
     ));
+}
+
+#[test]
+fn display_paths_contract_home_without_contracting_lookalikes() {
+    let Some(home) = home_dir() else {
+        return;
+    };
+    let child = home.join("src");
+    let lookalike = std::path::PathBuf::from(format!("{}-backup", home.display()));
+
+    assert_eq!(
+        display_path(&child.to_string_lossy()),
+        Path::new("~").join("src").display().to_string()
+    );
+    assert_eq!(
+        display_path(&lookalike.to_string_lossy()),
+        lookalike.display().to_string()
+    );
 }
 
 #[cfg(windows)]
@@ -203,6 +223,14 @@ fn configured_terminal_colors_drive_the_ui_palette() {
     assert_eq!(palette.accent, Color32::from_rgb(0, 0, 100));
     assert_eq!(palette.warning, Color32::from_rgb(100, 80, 0));
     assert_eq!(palette.success, Color32::from_rgb(0, 100, 0));
+}
+
+#[test]
+fn status_metrics_sample_at_four_hertz() {
+    assert!(!should_sample_status_metrics(
+        STATUS_METRICS_SAMPLE_INTERVAL - Duration::from_millis(1)
+    ));
+    assert!(should_sample_status_metrics(STATUS_METRICS_SAMPLE_INTERVAL));
 }
 
 #[test]

@@ -452,7 +452,7 @@ fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
         ("cursor-only", cursor_frame(CursorShape::Block)),
     ] {
         let shape = terminal_render_callback_for_renderer(
-            renderer_id.clone(),
+            TerminalRendererId::unique(),
             &frame,
             eframe::wgpu::TextureFormat::Rgba8Unorm,
             ViewTransform::IDENTITY,

@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex, mpsc::Sender};
 
 use base64::{Engine as _, engine::general_purpose};
-use memchr::memmem::find;
 
-use crate::terminal_engine::write_ingress::{find_osc_terminator, split_osc_payload};
+use crate::terminal_engine::write_ingress::{
+    find_osc_terminator, find_subslice, split_osc_payload,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalSideEffect {
@@ -97,7 +98,7 @@ impl TerminalSideEffectCollector {
         self.osc_pending.clear();
 
         let mut search_start = 0;
-        while let Some(relative_start) = find(&bytes[search_start..], b"\x1b]") {
+        while let Some(relative_start) = find_subslice(&bytes[search_start..], b"\x1b]") {
             let start = search_start + relative_start;
             if start > search_start {
                 self.append_iterm_copy_text(&bytes[search_start..start]);

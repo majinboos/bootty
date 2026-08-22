@@ -1,7 +1,7 @@
 use crate::{
     geometry::{CellMetrics, DEFAULT_FONT_SIZE},
     paint_plan::{TerminalPaintPlan, TextAttrs, TextRun},
-    terminal_sprite::SpriteGlyph,
+    terminal_sprite::{SpriteGlyph, SpriteRegistry},
 };
 pub use bootty_font::FontFeature;
 use std::sync::Arc;
@@ -314,6 +314,7 @@ pub struct TerminalTextContract {
     pub(crate) font_features: Arc<[FontFeature]>,
     pub(crate) resolver: FontResolver,
     pub(crate) native_symbol_policy: NativeSymbolPolicy,
+    pub(crate) sprite_registry: SpriteRegistry,
 }
 
 impl TerminalTextContract {
@@ -353,7 +354,7 @@ impl TerminalTextContract {
 
     pub fn native_symbol_glyph(&self, ch: char) -> Option<SpriteGlyph> {
         self.native_symbol_policy.classify(ch)?;
-        SpriteGlyph::from_char(ch)
+        self.sprite_registry.glyph_for(ch)
     }
 }
 

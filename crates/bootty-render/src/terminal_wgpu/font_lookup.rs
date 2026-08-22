@@ -3,7 +3,7 @@ use crate::{
     geometry::CellMetrics,
     terminal_text::ResolvedFontFace,
 };
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont};
+use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont};
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
