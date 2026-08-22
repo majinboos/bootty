@@ -109,56 +109,9 @@ pub(crate) struct PublishedFrame {
     latest: Mutex<Arc<RenderFrame>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalWorkerOperation {
-    Resize,
-    ApplyLiveConfig,
-    EncodeKey,
-    EncodeFocus,
-    EncodeMouse,
-    MouseTrackingForWheel,
-    EncodeMouseWheel,
-    EncodePaste,
-    EnterCopyMode,
-    SelectionBegin,
-    SelectionUpdate,
-    SelectionEnd,
-    SynchronizedOutput,
-    ExtractFrame,
-    PublishFrame,
-    PtyWriteLock,
-    PtyWriteAll,
-    PtyFlush,
-}
-
-impl TerminalWorkerOperation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Resize => "resize",
-            Self::ApplyLiveConfig => "apply_live_config",
-            Self::EncodeKey => "encode_key",
-            Self::EncodeFocus => "encode_focus",
-            Self::EncodeMouse => "encode_mouse",
-            Self::MouseTrackingForWheel => "mouse_tracking_for_wheel",
-            Self::EncodeMouseWheel => "encode_mouse_wheel",
-            Self::EncodePaste => "encode_paste",
-            Self::EnterCopyMode => "enter_copy_mode",
-            Self::SelectionBegin => "selection_begin",
-            Self::SelectionUpdate => "selection_update",
-            Self::SelectionEnd => "selection_end",
-            Self::SynchronizedOutput => "synchronized_output",
-            Self::ExtractFrame => "extract_frame",
-            Self::PublishFrame => "publish_frame",
-            Self::PtyWriteLock => "pty_write_lock",
-            Self::PtyWriteAll => "pty_write_all",
-            Self::PtyFlush => "pty_flush",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TerminalWorkerFailure {
-    operation: TerminalWorkerOperation,
+    operation: &'static str,
     source: String,
 }
 
@@ -167,8 +120,7 @@ impl Display for TerminalWorkerFailure {
         write!(
             formatter,
             "terminal worker {}: {}",
-            self.operation.as_str(),
-            self.source
+            self.operation, self.source
         )
     }
 }
@@ -179,7 +131,7 @@ struct WorkerHealth {
 }
 
 impl WorkerHealth {
-    fn record(&self, operation: TerminalWorkerOperation, source: impl Display) {
+    fn record(&self, operation: &'static str, source: impl Display) {
         let mut latest = self
             .latest
             .lock()
@@ -220,18 +172,6 @@ impl PublishedFrame {
         *latest = Arc::new(frame.clone());
         Ok(())
     }
-}
-
-fn search_and_publish_frame(
-    engine: &mut TerminalEngine,
-    latest_frame: &PublishedFrame,
-    query: &str,
-    direction: TerminalSearchDirection,
-) -> Result<bool> {
-    let found = engine.search_viewport(query, direction)?;
-    let frame = engine.extract_frame()?;
-    latest_frame.publish(frame)?;
-    Ok(found)
 }
 
 type SelectionFormatResponse = std::result::Result<Option<Vec<u8>>, String>;
@@ -814,16 +754,15 @@ impl TerminalWorker {
 
             if did_work {
                 self.publish_drain(stats);
-                if self.should_publish_frame() {
-                    self.publish_frame();
-                    self.last_frame_publish = Instant::now();
-                }
-            } else {
-                if self.should_publish_frame() {
-                    self.publish_frame();
-                    self.last_frame_publish = Instant::now();
+            }
+            if self.should_publish_frame() {
+                self.publish_frame();
+                self.last_frame_publish = Instant::now();
+                if !did_work {
                     continue;
                 }
+            }
+            if !did_work {
                 if self.should_stop() {
                     break;
                 }
@@ -917,8 +856,7 @@ impl TerminalWorker {
                     }
                     let result = self.resize(geometry);
                     if let Err(error) = result {
-                        self.worker_health
-                            .record(TerminalWorkerOperation::Resize, error);
+                        self.worker_health.record("resize", error);
                         if let Some(done) = done {
                             done.send(());
                         }
@@ -930,9 +868,7 @@ impl TerminalWorker {
                 TerminalCommand::ApplyLiveConfig(config) => {
                     match self.engine.apply_live_config(config) {
                         Ok(()) => stats.terminal_changed = true,
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::ApplyLiveConfig, error),
+                        Err(error) => self.worker_health.record("apply_live_config", error),
                     }
                 }
                 TerminalCommand::Key(input) => {
@@ -941,9 +877,7 @@ impl TerminalWorker {
                     stats.terminal_changed = true;
                     match self.engine.encode_key_to_vec(input, &mut self.output_buf) {
                         Ok(()) => self.write_output_buf(),
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::EncodeKey, error),
+                        Err(error) => self.worker_health.record("encode_key", error),
                     }
                 }
                 TerminalCommand::Focus(gained) => {
@@ -953,18 +887,14 @@ impl TerminalWorker {
                         .encode_focus_to_vec(gained, &mut self.output_buf)
                     {
                         Ok(()) => self.write_output_buf(),
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::EncodeFocus, error),
+                        Err(error) => self.worker_health.record("encode_focus", error),
                     }
                 }
                 TerminalCommand::Mouse(input) => {
                     self.mark_input_fast_path();
                     match self.engine.encode_mouse_to_vec(input, &mut self.output_buf) {
                         Ok(()) => self.write_output_buf(),
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::EncodeMouse, error),
+                        Err(error) => self.worker_health.record("encode_mouse", error),
                     }
                 }
                 TerminalCommand::MouseWheel {
@@ -979,9 +909,7 @@ impl TerminalWorker {
                             &mut self.output_buf,
                         ) {
                             Ok(()) => self.write_output_buf(),
-                            Err(error) => self
-                                .worker_health
-                                .record(TerminalWorkerOperation::EncodeMouseWheel, error),
+                            Err(error) => self.worker_health.record("encode_mouse_wheel", error),
                         }
                     }
                     Ok(false) if scroll_delta != 0 => {
@@ -990,9 +918,7 @@ impl TerminalWorker {
                         stats.terminal_changed = true;
                     }
                     Ok(false) => {}
-                    Err(error) => self
-                        .worker_health
-                        .record(TerminalWorkerOperation::MouseTrackingForWheel, error),
+                    Err(error) => self.worker_health.record("mouse_tracking_for_wheel", error),
                 },
                 TerminalCommand::Paste(text) => {
                     self.mark_input_fast_path();
@@ -1000,9 +926,7 @@ impl TerminalWorker {
                     stats.terminal_changed = true;
                     match self.engine.encode_paste_to_vec(&text, &mut self.output_buf) {
                         Ok(()) => self.write_output_buf(),
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::EncodePaste, error),
+                        Err(error) => self.worker_health.record("encode_paste", error),
                     }
                 }
                 TerminalCommand::DiscardPendingOutput(done) => {
@@ -1027,36 +951,28 @@ impl TerminalWorker {
                     self.mark_input_fast_path();
                     match self.engine.enter_copy_mode() {
                         Ok(()) => stats.terminal_changed = true,
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::EnterCopyMode, error),
+                        Err(error) => self.worker_health.record("enter_copy_mode", error),
                     }
                 }
                 TerminalCommand::SelectionBegin(event) => {
                     self.mark_input_fast_path();
                     match self.engine.begin_selection(event) {
                         Ok(()) => stats.terminal_changed = true,
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::SelectionBegin, error),
+                        Err(error) => self.worker_health.record("selection_begin", error),
                     }
                 }
                 TerminalCommand::SelectionUpdate(event) => {
                     self.mark_input_fast_path();
                     match self.engine.update_selection(event) {
                         Ok(()) => stats.terminal_changed = true,
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::SelectionUpdate, error),
+                        Err(error) => self.worker_health.record("selection_update", error),
                     }
                 }
                 TerminalCommand::SelectionEnd(event) => {
                     self.mark_input_fast_path();
                     match self.engine.end_selection(event) {
                         Ok(()) => stats.terminal_changed = true,
-                        Err(error) => self
-                            .worker_health
-                            .record(TerminalWorkerOperation::SelectionEnd, error),
+                        Err(error) => self.worker_health.record("selection_end", error),
                     }
                 }
                 TerminalCommand::FormatSelection { format, done } => {
@@ -1094,13 +1010,15 @@ impl TerminalWorker {
                     if !done.try_claim() {
                         continue;
                     }
-                    let response = search_and_publish_frame(
-                        &mut self.engine,
-                        &self.latest_frame,
-                        &query,
-                        direction,
-                    )
-                    .map_err(|error| error.to_string());
+                    let response = self
+                        .engine
+                        .search_viewport(&query, direction)
+                        .and_then(|found| {
+                            let frame = self.engine.extract_frame()?;
+                            self.latest_frame.publish(frame)?;
+                            Ok(found)
+                        })
+                        .map_err(|error| error.to_string());
                     if response.is_ok() {
                         self.force_next_frame_publish = false;
                         self.has_unpublished_frame = false;
@@ -1306,8 +1224,7 @@ impl TerminalWorker {
         let frame = match self.engine.extract_frame() {
             Ok(frame) => frame,
             Err(error) => {
-                self.worker_health
-                    .record(TerminalWorkerOperation::ExtractFrame, error);
+                self.worker_health.record("extract_frame", error);
                 self.acknowledge_resize();
                 return;
             }
@@ -1343,8 +1260,7 @@ impl TerminalWorker {
             );
         }
         if let Err(error) = self.latest_frame.publish(frame) {
-            self.worker_health
-                .record(TerminalWorkerOperation::PublishFrame, error);
+            self.worker_health.record("publish_frame", error);
             self.acknowledge_resize();
             return;
         }
@@ -1383,7 +1299,7 @@ fn synchronized_output_state(engine: &TerminalEngine, health: &WorkerHealth) -> 
     match engine.is_synchronized_output() {
         Ok(active) => active,
         Err(error) => {
-            health.record(TerminalWorkerOperation::SynchronizedOutput, error);
+            health.record("synchronized_output", error);
             false
         }
     }
@@ -1393,19 +1309,16 @@ fn write_pty(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8], health: &
     let mut writer = match writer.lock() {
         Ok(writer) => writer,
         Err(_) => {
-            health.record(
-                TerminalWorkerOperation::PtyWriteLock,
-                "writer lock poisoned",
-            );
+            health.record("pty_write_lock", "writer lock poisoned");
             return;
         }
     };
     if let Err(error) = writer.write_all(bytes) {
-        health.record(TerminalWorkerOperation::PtyWriteAll, error);
+        health.record("pty_write_all", error);
         return;
     }
     if let Err(error) = writer.flush() {
-        health.record(TerminalWorkerOperation::PtyFlush, error);
+        health.record("pty_flush", error);
     }
 }
 

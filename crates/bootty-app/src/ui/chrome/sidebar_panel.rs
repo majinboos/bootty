@@ -1,18 +1,14 @@
-use std::collections::HashMap;
-
 use bootty_extension::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem};
 use bootty_mux::controller::{MuxScope, SpaceId};
-use bootty_ui::{ThemePalette, icons::paint_icon_slug, readable_color};
+use bootty_ui::{ThemePalette, icons::paint_icon_slug, mix, readable_color};
 use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
 use crate::{
     assets,
     strings::truncate_label,
     theme::module_color32,
-    ui::{
-        session_navigation::ScopedSessionTarget,
-        sidebar::{SidebarDisplay, SidebarItem, SidebarItemKind, SidebarTree},
-    },
+    ui::{session_navigation::ScopedSessionTarget, sidebar::SidebarItem},
+    workspace_runtime::SpaceSummary,
 };
 
 use super::{item_primitives::paint_item_primitives, start_window_drag_on_primary_press};
@@ -22,7 +18,6 @@ pub struct SidebarModel<'a> {
     pub items: &'a [SidebarItem<'a>],
     pub footer_items: &'a [PublishedSurfaceItem],
     pub session_count: usize,
-    pub has_sessions: bool,
     pub title_visible: bool,
     pub reserve_titlebar_buttons: bool,
     pub title_icon: Option<&'a TextureHandle>,
@@ -79,16 +74,6 @@ pub(crate) const SPACE_SWITCHER_HEIGHT: f32 = 44.0;
 const SPACE_SWITCHER_BUTTON_SIZE: f32 = 28.0;
 const SPACE_SWITCHER_BUTTON_GAP: f32 = 4.0;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SpaceSwitcherItem {
-    pub id: SpaceId,
-    pub name: String,
-    pub icon: String,
-    pub color: [u8; 3],
-    pub active: bool,
-    pub error: Option<String>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpaceSwitcherEvent {
     Activate(SpaceId),
@@ -98,46 +83,24 @@ pub enum SpaceSwitcherEvent {
     Close(SpaceId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SidebarSpaceSwipeDirection {
-    Negative,
-    Positive,
-}
-
-impl SidebarSpaceSwipeDirection {
-    fn from_delta(delta_x: f32) -> Option<Self> {
-        (delta_x != 0.0).then(|| {
-            if delta_x.is_sign_positive() {
-                Self::Positive
-            } else {
-                Self::Negative
-            }
-        })
-    }
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SidebarSpaceSwipeState {
+    phase: SidebarSpaceSwipePhase,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SidebarSpaceSwipePhase {
     #[default]
     Idle,
-    Active {
-        direction: SidebarSpaceSwipeDirection,
-    },
-    AwaitingMomentum {
-        direction: SidebarSpaceSwipeDirection,
-    },
+    Active(bool),
+    AwaitingMomentum(bool),
     Momentum,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SidebarSpaceSwipeState {
-    phase: SidebarSpaceSwipePhase,
 }
 
 pub fn take_sidebar_space_swipe(
     ui: &mut egui::Ui,
     sidebar_rect: Rect,
-    spaces: &[SpaceSwitcherItem],
+    spaces: &[SpaceSummary],
     state: &mut SidebarSpaceSwipeState,
 ) -> Option<SpaceId> {
     let hovered = ui
@@ -170,7 +133,7 @@ pub fn take_sidebar_space_swipe(
 }
 
 fn sidebar_space_swipe_target(
-    spaces: &[SpaceSwitcherItem],
+    spaces: &[SpaceSummary],
     delta_x: f32,
     phase: egui::TouchPhase,
     state: &mut SidebarSpaceSwipeState,
@@ -182,8 +145,8 @@ fn sidebar_space_swipe_target(
         }
         egui::TouchPhase::End => {
             state.phase = match state.phase {
-                SidebarSpaceSwipePhase::Active { direction } => {
-                    SidebarSpaceSwipePhase::AwaitingMomentum { direction }
+                SidebarSpaceSwipePhase::Active(direction) => {
+                    SidebarSpaceSwipePhase::AwaitingMomentum(direction)
                 }
                 SidebarSpaceSwipePhase::Momentum => SidebarSpaceSwipePhase::Idle,
                 phase => phase,
@@ -193,32 +156,28 @@ fn sidebar_space_swipe_target(
         egui::TouchPhase::Start | egui::TouchPhase::Move => {}
     }
 
-    let direction = SidebarSpaceSwipeDirection::from_delta(delta_x)?;
+    let positive = (delta_x != 0.0).then_some(delta_x.is_sign_positive())?;
     match (phase, state.phase) {
         (egui::TouchPhase::Start | egui::TouchPhase::Move, SidebarSpaceSwipePhase::Idle) => {
-            state.phase = SidebarSpaceSwipePhase::Active { direction };
+            state.phase = SidebarSpaceSwipePhase::Active(positive);
         }
-        (
-            egui::TouchPhase::Start,
-            SidebarSpaceSwipePhase::AwaitingMomentum {
-                direction: previous_direction,
-            },
-        ) if direction == previous_direction => {
+        (egui::TouchPhase::Start, SidebarSpaceSwipePhase::AwaitingMomentum(previous))
+            if positive == previous =>
+        {
             state.phase = SidebarSpaceSwipePhase::Momentum;
             return None;
         }
-        (egui::TouchPhase::Start, SidebarSpaceSwipePhase::AwaitingMomentum { .. }) => {
-            state.phase = SidebarSpaceSwipePhase::Active { direction };
+        (egui::TouchPhase::Start, SidebarSpaceSwipePhase::AwaitingMomentum(_)) => {
+            state.phase = SidebarSpaceSwipePhase::Active(positive);
         }
         _ => return None,
     }
 
     let active = spaces.iter().position(|space| space.active)?;
-    let target = match direction {
-        SidebarSpaceSwipeDirection::Positive => active.checked_sub(1),
-        SidebarSpaceSwipeDirection::Negative => {
-            active.checked_add(1).filter(|index| *index < spaces.len())
-        }
+    let target = if positive {
+        active.checked_sub(1)
+    } else {
+        active.checked_add(1).filter(|index| *index < spaces.len())
     }?;
     Some(spaces[target].id)
 }
@@ -226,7 +185,7 @@ fn sidebar_space_swipe_target(
 pub fn show_space_switcher(
     ui: &mut egui::Ui,
     palette: ThemePalette,
-    spaces: &[SpaceSwitcherItem],
+    spaces: &[SpaceSummary],
     transition: Option<(SpaceId, SpaceId, f32)>,
 ) -> Option<SpaceSwitcherEvent> {
     let width = ui.available_width().max(0.0);
@@ -235,6 +194,7 @@ pub fn show_space_switcher(
         egui::Sense::hover(),
     );
     let painter = ui.painter_at(rect);
+    let hover_color = mix(palette.base, palette.text, 0.045);
     let item_count = spaces.len() + 1;
     let group_width = item_count as f32 * SPACE_SWITCHER_BUTTON_SIZE
         + item_count.saturating_sub(1) as f32 * SPACE_SWITCHER_BUTTON_GAP;
@@ -244,16 +204,29 @@ pub fn show_space_switcher(
             + index as f32 * (SPACE_SWITCHER_BUTTON_SIZE + SPACE_SWITCHER_BUTTON_GAP)
             + SPACE_SWITCHER_BUTTON_SIZE * 0.5
     };
-    if let Some(dot) = space_indicator_dot(rect, spaces, transition, &item_center_x) {
-        painter.circle_filled(dot, 2.0, palette.primary);
+    let active = spaces.iter().position(|space| space.active);
+    let indicator_x = transition
+        .and_then(|(from, to, progress)| {
+            let from = spaces.iter().position(|space| space.id == from)?;
+            let to = spaces.iter().position(|space| space.id == to)?;
+            Some(egui::lerp(
+                item_center_x(from)..=item_center_x(to),
+                progress,
+            ))
+        })
+        .or_else(|| active.map(&item_center_x));
+    if let Some(x) = indicator_x {
+        painter.circle_filled(Pos2::new(x, rect.max.y - 4.0), 2.0, palette.primary);
     }
+    let button_rect = |index| {
+        Rect::from_center_size(
+            Pos2::new(item_center_x(index), rect.center().y),
+            egui::vec2(SPACE_SWITCHER_BUTTON_SIZE, SPACE_SWITCHER_BUTTON_SIZE),
+        )
+    };
     let mut event = None;
     for (index, space) in spaces.iter().enumerate() {
-        let item_rect = space_switcher_button_rect(rect, item_center_x(index));
-        let tooltip = match &space.error {
-            Some(error) => format!("{}\n\n{error}", space.name),
-            None => space.name.clone(),
-        };
+        let item_rect = button_rect(index);
         let response = ui
             .interact(
                 item_rect,
@@ -261,9 +234,15 @@ pub fn show_space_switcher(
                     .with(("space-switcher", space.id.persistence_value())),
                 egui::Sense::click(),
             )
-            .on_hover_text(tooltip);
+            .on_hover_ui(|ui| {
+                ui.label(&space.name);
+                if let Some(error) = &space.error {
+                    ui.separator();
+                    ui.label(error);
+                }
+            });
         if response.hovered() && !space.active {
-            painter.rect_filled(item_rect, 6.0, sidebar_hover_color(palette));
+            painter.rect_filled(item_rect, 6.0, hover_color);
         }
         paint_icon_slug(
             &painter,
@@ -296,7 +275,7 @@ pub fn show_space_switcher(
             }
         });
     }
-    let plus_rect = space_switcher_button_rect(rect, item_center_x(spaces.len()));
+    let plus_rect = button_rect(spaces.len());
     let response = ui
         .interact(
             plus_rect,
@@ -305,7 +284,7 @@ pub fn show_space_switcher(
         )
         .on_hover_text("New Space");
     if response.hovered() {
-        painter.rect_filled(plus_rect, 6.0, sidebar_hover_color(palette));
+        painter.rect_filled(plus_rect, 6.0, hover_color);
     }
     paint_icon_slug(&painter, "plus", plus_rect.center(), 16.0, palette.subtext);
     if event.is_none() && response.clicked_by(egui::PointerButton::Primary) {
@@ -314,98 +293,15 @@ pub fn show_space_switcher(
     event
 }
 
-fn space_switcher_button_rect(strip: Rect, center_x: f32) -> Rect {
-    Rect::from_center_size(
-        Pos2::new(center_x, strip.center().y),
-        egui::vec2(SPACE_SWITCHER_BUTTON_SIZE, SPACE_SWITCHER_BUTTON_SIZE),
-    )
-}
-
-fn space_indicator_center(
-    spaces: &[SpaceSwitcherItem],
-    transition: Option<(SpaceId, SpaceId, f32)>,
-    center_x: &impl Fn(usize) -> f32,
-) -> Option<f32> {
-    let active = spaces.iter().position(|space| space.active)?;
-    let Some((from, to, progress)) = transition else {
-        return Some(center_x(active));
-    };
-    let from = spaces.iter().position(|space| space.id == from);
-    let to = spaces.iter().position(|space| space.id == to);
-    match (from, to) {
-        (Some(from), Some(to)) => Some(egui::lerp(center_x(from)..=center_x(to), progress)),
-        _ => Some(center_x(active)),
-    }
-}
-
-fn space_indicator_dot(
-    rect: Rect,
-    spaces: &[SpaceSwitcherItem],
-    transition: Option<(SpaceId, SpaceId, f32)>,
-    center_x: &impl Fn(usize) -> f32,
-) -> Option<Pos2> {
-    Some(Pos2::new(
-        space_indicator_center(spaces, transition, center_x)?,
-        rect.max.y - 4.0,
-    ))
-}
 const MACOS_TITLEBAR_BUTTON_CENTER_Y: f32 = 16.0;
 /// Fraction of a color kept when dimming an unfocused session row; the rest blends to the row
 /// background, so each element fades in its own hue rather than washing toward white.
 const UNFOCUSED_ROW_KEEP: f32 = 0.5;
 
-/// A session row's identity, borrowed from the item so per-row lookups allocate nothing.
-type SidebarSessionKey<'a> = (MuxScope, &'a str);
-
 /// Every row a session owns — its title row plus the detail/progress rows beneath it — points at
 /// that session, so hovering or clicking anywhere in the block hits the whole session component.
-fn sidebar_session_key<'a>(item: &SidebarItem<'a>) -> Option<SidebarSessionKey<'a>> {
-    Some((item.session_scope?, item.session_id?))
-}
-
-fn sidebar_context_session_key<'a>(item: &SidebarItem<'a>) -> Option<SidebarSessionKey<'a>> {
-    item.selectable.then(|| sidebar_session_key(item)).flatten()
-}
-
-/// Where each session sits in its binding's ordered list, and how many sessions that binding has:
-/// the context menu needs both for every row it draws. One borrowed pass over the items keeps the
-/// sidebar linear — asking per row made it compare session id strings quadratically.
-fn sidebar_binding_target_positions<'a>(
-    items: &[SidebarItem<'a>],
-) -> HashMap<SidebarSessionKey<'a>, (usize, usize)> {
-    let mut positions = HashMap::new();
-    let mut binding_counts: HashMap<MuxScope, usize> = HashMap::new();
-    for item in items {
-        // Only title rows are ordered targets; detail rows share their session's context target.
-        if !matches!(&item.kind, SidebarItemKind::Session { .. }) {
-            continue;
-        }
-        let Some(key) = sidebar_session_key(item) else {
-            continue;
-        };
-        if positions.contains_key(&key) {
-            continue;
-        }
-        let count = binding_counts.entry(key.0).or_default();
-        positions.insert(key, (*count, 0));
-        *count += 1;
-    }
-    for (key, value) in &mut positions {
-        value.1 = binding_counts.get(&key.0).copied().unwrap_or_default();
-    }
-    positions
-}
-
-fn sidebar_title_drag_rect(rect: Rect, reserve_titlebar_buttons: bool) -> Rect {
-    let reserved = if reserve_titlebar_buttons {
-        MACOS_TITLEBAR_BUTTON_SAFE_WIDTH
-    } else {
-        0.0
-    };
-    Rect::from_min_max(
-        Pos2::new((rect.min.x + reserved).min(rect.max.x), rect.min.y),
-        rect.max,
-    )
+fn sidebar_session_key<'a>(item: &'a SidebarItem<'a>) -> Option<(MuxScope, &'a str)> {
+    Some((item.scope, item.session_id?))
 }
 
 pub fn show_sidebar(
@@ -419,17 +315,17 @@ pub fn show_sidebar(
     // has a visible, non-muddy hover state. Explicit hover override wins outright.
     let hover_color = model.hover_override.unwrap_or_else(|| {
         if model.fullscreen {
-            sidebar_fullscreen_hover_color(palette)
+            mix(palette.base, palette.text, 0.13)
         } else {
-            sidebar_hover_color(palette)
+            mix(palette.base, palette.text, 0.045)
         }
     });
     let current_color = model
         .current_override
-        .unwrap_or_else(|| sidebar_current_color(palette));
+        .unwrap_or_else(|| mix(palette.base, palette.text, 0.065));
     let border_color = model
         .border_override
-        .unwrap_or_else(|| subtle_border(palette));
+        .unwrap_or_else(|| mix(palette.base, palette.text, 0.09));
     let width = ui.max_rect().width().max(0.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -443,7 +339,11 @@ pub fn show_sidebar(
         }
     }
 
-    let header_h = sidebar_header_height(model.title_visible);
+    let header_h = if model.title_visible {
+        SIDEBAR_HEADER_HEIGHT
+    } else {
+        0.0
+    };
     let content_top = rect.min.y + model.top_inset;
     let title_rect = Rect::from_min_max(
         Pos2::new(rect.min.x, content_top),
@@ -451,7 +351,18 @@ pub fn show_sidebar(
     );
     if model.title_visible {
         paint_sidebar_title(ui, title_rect, palette, &model);
-        let drag_rect = sidebar_title_drag_rect(title_rect, model.reserve_titlebar_buttons);
+        let reserved = if model.reserve_titlebar_buttons {
+            MACOS_TITLEBAR_BUTTON_SAFE_WIDTH
+        } else {
+            0.0
+        };
+        let drag_rect = Rect::from_min_max(
+            Pos2::new(
+                (title_rect.min.x + reserved).min(title_rect.max.x),
+                title_rect.min.y,
+            ),
+            title_rect.max,
+        );
         let response = ui.interact(
             drag_rect,
             ui.id().with("sidebar-titlebar-drag"),
@@ -462,9 +373,11 @@ pub fn show_sidebar(
 
     let list_top = content_top + header_h;
 
-    let footer_items = sidebar_footer_items(model.footer_items);
-    let footer_h = sidebar_footer_height(footer_items.len());
-    if !model.has_sessions {
+    let footer_items =
+        &model.footer_items[..model.footer_items.len().min(SIDEBAR_MAX_FOOTER_ITEMS)];
+    let footer_h =
+        SIDEBAR_FOOTER_BASE_HEIGHT + footer_items.len() as f32 * SIDEBAR_FOOTER_ITEM_HEIGHT;
+    if model.session_count == 0 {
         painter.text(
             Pos2::new(rect.center().x, list_top + 42.0),
             egui::Align2::CENTER_CENTER,
@@ -474,14 +387,11 @@ pub fn show_sidebar(
         );
     }
 
-    let max_rows = visible_sidebar_row_capacity(height, model.top_inset, header_h, footer_h);
-    let items = model
-        .items
-        .iter()
-        .take(max_rows)
-        .cloned()
-        .collect::<Vec<_>>();
-    let binding_positions = sidebar_binding_target_positions(model.items);
+    let list_bottom = (height - footer_h).max(model.top_inset + header_h);
+    let max_rows = ((list_bottom - model.top_inset - header_h) / SIDEBAR_ROW_HEIGHT)
+        .floor()
+        .max(0.0) as usize;
+    let items = &model.items[..model.items.len().min(max_rows)];
     let drag_id = egui::Id::new("mux-sidebar-drag-anchor");
     let mut dragged = ui
         .ctx()
@@ -529,7 +439,10 @@ pub fn show_sidebar(
         {
             let state = SidebarDragState {
                 anchor: anchor.to_owned(),
-                preview: sidebar_drag_preview_label(&items, anchor),
+                preview: items
+                    .iter()
+                    .find(|item| item.reorder_anchor == Some(anchor))
+                    .map_or_else(|| anchor.to_owned(), |item| item.text.to_owned()),
             };
             ui.ctx()
                 .data_mut(|data| data.insert_persisted(drag_id, state.clone()));
@@ -537,26 +450,25 @@ pub fn show_sidebar(
             ui.ctx().request_repaint();
         }
 
-        if event.is_none()
-            && !suppress_click
-            && response.clicked_by(egui::PointerButton::Primary)
-            && let Some(action) = item.extension_action.clone()
-        {
-            event = Some(SidebarEvent::ExtensionAction(action));
+        let clicked = !suppress_click && response.clicked_by(egui::PointerButton::Primary);
+        if event.is_none() && clicked {
+            event = item
+                .extension_action
+                .clone()
+                .map(SidebarEvent::ExtensionAction);
+            if event.is_none()
+                && item.selectable
+                && let Some((scope, session_id)) = item_key
+            {
+                event = Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
+                    scope, session_id,
+                )));
+            }
         }
         if event.is_none()
-            && !suppress_click
-            && response.clicked_by(egui::PointerButton::Primary)
             && item.selectable
-            && let Some((scope, session_id)) = item_key
-        {
-            event = Some(SidebarEvent::ActivateSession(ScopedSessionTarget::new(
-                scope, session_id,
-            )));
-        }
-        if event.is_none()
-            && let Some(key) = sidebar_context_session_key(item)
-            && let Some(&(position, binding_session_count)) = binding_positions.get(&key)
+            && let Some(key) = item_key
+            && let Some((position, binding_session_count)) = item.context_position
             && let Some(action) = session_context_action(
                 &response,
                 !item.current,
@@ -575,7 +487,7 @@ pub fn show_sidebar(
 
     let drop = dragged.as_ref().and_then(|drag| {
         sidebar_drop_target(
-            &items,
+            items,
             pointer_pos,
             rect.min.x,
             list_top,
@@ -598,8 +510,13 @@ pub fn show_sidebar(
         if primary_down {
             ui.ctx().request_repaint();
         } else {
-            if event.is_none() {
-                event = sidebar_reorder_event(dragged.as_ref(), drop);
+            if event.is_none()
+                && let Some((target, _)) = drop
+            {
+                event = Some(SidebarEvent::Reorder {
+                    source: drag.anchor.clone(),
+                    before: target.map(str::to_owned),
+                });
             }
             ui.ctx()
                 .data_mut(|data| data.remove::<SidebarDragState>(drag_id));
@@ -615,10 +532,7 @@ pub fn show_sidebar(
         palette,
         border_color,
     );
-    if event.is_none() {
-        event = footer_action.map(SidebarEvent::ExtensionAction);
-    }
-    event
+    event.or_else(|| footer_action.map(SidebarEvent::ExtensionAction))
 }
 
 fn session_context_action(
@@ -629,73 +543,57 @@ fn session_context_action(
     can_navigate: bool,
     can_return_to_last_session: bool,
 ) -> Option<SessionContextAction> {
+    use SessionContextAction as A;
     let mut action = None;
     response.context_menu(|ui| {
-        if ui
-            .add_enabled(can_activate, egui::Button::new("Activate Session"))
-            .clicked()
-        {
-            action = Some(SessionContextAction::Activate);
-        }
+        pick(
+            ui,
+            &mut action,
+            can_activate,
+            "Activate Session",
+            A::Activate,
+        );
         ui.separator();
-        if action.is_none() && ui.button("New Session…").clicked() {
-            action = Some(SessionContextAction::NewSession);
-        }
-        if action.is_none() && ui.button("Switch Session…").clicked() {
-            action = Some(SessionContextAction::SwitchSession);
-        }
+        pick(ui, &mut action, true, "New Session…", A::NewSession);
+        pick(ui, &mut action, true, "Switch Session…", A::SwitchSession);
         if action.is_none() {
             ui.menu_button("Navigate Sessions", |ui| {
-                if ui
-                    .add_enabled(can_navigate, egui::Button::new("Previous Session"))
-                    .clicked()
-                {
-                    action = Some(SessionContextAction::PreviousSession);
-                }
-                if action.is_none()
-                    && ui
-                        .add_enabled(can_navigate, egui::Button::new("Next Session"))
-                        .clicked()
-                {
-                    action = Some(SessionContextAction::NextSession);
-                }
-                if action.is_none()
-                    && ui
-                        .add_enabled(
-                            can_return_to_last_session,
-                            egui::Button::new("Last Session"),
-                        )
-                        .clicked()
-                {
-                    action = Some(SessionContextAction::LastSession);
-                }
+                pick(
+                    ui,
+                    &mut action,
+                    can_navigate,
+                    "Previous Session",
+                    A::PreviousSession,
+                );
+                pick(
+                    ui,
+                    &mut action,
+                    can_navigate,
+                    "Next Session",
+                    A::NextSession,
+                );
+                pick(
+                    ui,
+                    &mut action,
+                    can_return_to_last_session,
+                    "Last Session",
+                    A::LastSession,
+                );
             });
         }
         ui.separator();
-        if action.is_none() && ui.button("Rename Session…").clicked() {
-            action = Some(SessionContextAction::Rename);
-        }
-        if action.is_none()
-            && ui
-                .add_enabled(can_move_up, egui::Button::new("Move Session Up"))
-                .clicked()
-        {
-            action = Some(SessionContextAction::MoveUp);
-        }
-        if action.is_none()
-            && ui
-                .add_enabled(can_move_down, egui::Button::new("Move Session Down"))
-                .clicked()
-        {
-            action = Some(SessionContextAction::MoveDown);
-        }
+        pick(ui, &mut action, true, "Rename Session…", A::Rename);
+        pick(ui, &mut action, can_move_up, "Move Session Up", A::MoveUp);
+        pick(
+            ui,
+            &mut action,
+            can_move_down,
+            "Move Session Down",
+            A::MoveDown,
+        );
         ui.separator();
-        if action.is_none() && ui.button("Detach from Space").clicked() {
-            action = Some(SessionContextAction::Detach);
-        }
-        if action.is_none() && ui.button("Ditch Session…").clicked() {
-            action = Some(SessionContextAction::Ditch);
-        }
+        pick(ui, &mut action, true, "Detach from Space", A::Detach);
+        pick(ui, &mut action, true, "Ditch Session…", A::Ditch);
         if action.is_some() {
             ui.close();
         }
@@ -703,30 +601,16 @@ fn session_context_action(
     action
 }
 
-fn visible_sidebar_row_capacity(
-    height: f32,
-    top_inset: f32,
-    header_h: f32,
-    footer_h: f32,
-) -> usize {
-    let list_top = top_inset + header_h;
-
-    let list_bottom = (height - footer_h).max(list_top);
-    ((list_bottom - list_top) / SIDEBAR_ROW_HEIGHT)
-        .floor()
-        .max(0.0) as usize
-}
-
-fn sidebar_hover_color(palette: ThemePalette) -> egui::Color32 {
-    mix_color(palette.base, palette.text, 0.045)
-}
-
-fn sidebar_fullscreen_hover_color(palette: ThemePalette) -> egui::Color32 {
-    mix_color(palette.base, palette.text, 0.13)
-}
-
-fn sidebar_current_color(palette: ThemePalette) -> egui::Color32 {
-    mix_color(palette.base, palette.text, 0.065)
+fn pick(
+    ui: &mut egui::Ui,
+    action: &mut Option<SessionContextAction>,
+    enabled: bool,
+    label: &str,
+    value: SessionContextAction,
+) {
+    if action.is_none() && ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+        *action = Some(value);
+    }
 }
 
 fn sidebar_hovered_row(
@@ -760,22 +644,6 @@ struct SidebarDragState {
     preview: String,
 }
 
-/// The label the drag preview carries, taken from the anchor's first row. Looked up when a drag
-/// starts rather than mapped every frame: nothing else reads it.
-fn sidebar_drag_preview_label(items: &[SidebarItem<'_>], anchor: &str) -> String {
-    items
-        .iter()
-        .find(|item| item.reorder_anchor == Some(anchor))
-        .map_or_else(|| anchor.to_owned(), sidebar_drag_label)
-}
-
-fn sidebar_drag_label(item: &SidebarItem<'_>) -> String {
-    match item.display {
-        SidebarDisplay::Text(text) => text.to_owned(),
-        SidebarDisplay::Numbered { label, .. } => label.to_owned(),
-    }
-}
-
 fn paint_sidebar_drag_preview(
     ui: &egui::Ui,
     pointer_pos: Option<Pos2>,
@@ -796,7 +664,7 @@ fn paint_sidebar_drag_preview(
         egui::Order::Tooltip,
         egui::Id::new("mux-sidebar-drag-preview"),
     ));
-    painter.rect_filled(rect, 6.0, mix_color(palette.base, palette.text, 0.12));
+    painter.rect_filled(rect, 6.0, mix(palette.base, palette.text, 0.12));
     painter.rect_stroke(
         rect,
         6.0,
@@ -812,12 +680,6 @@ fn paint_sidebar_drag_preview(
     );
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SidebarDropTarget<'a> {
-    Before(&'a str),
-    End,
-}
-
 fn sidebar_drop_target<'a>(
     items: &'a [SidebarItem<'a>],
     pos: Option<Pos2>,
@@ -825,7 +687,7 @@ fn sidebar_drop_target<'a>(
     top: f32,
     width: f32,
     dragged_anchor: &str,
-) -> Option<(SidebarDropTarget<'a>, f32)> {
+) -> Option<(Option<&'a str>, f32)> {
     let pos = pos?;
     let row = sidebar_hovered_row(pos, left, top, width, items.len())?;
     let blocks = sidebar_blocks(items);
@@ -841,56 +703,31 @@ fn sidebar_drop_target<'a>(
     let midpoint = (block_top + block_bottom) * 0.5;
 
     let (target, target_index, indicator_y) = if pos.y < midpoint {
-        (
-            SidebarDropTarget::Before(block.anchor),
-            Some(block_index),
-            block_top,
-        )
+        (Some(block.anchor), Some(block_index), block_top)
     } else if let Some(next_block) = blocks.get(block_index + 1) {
         (
-            SidebarDropTarget::Before(next_block.anchor),
+            Some(next_block.anchor),
             Some(block_index + 1),
             top + next_block.start_row as f32 * SIDEBAR_ROW_HEIGHT,
         )
     } else {
-        (SidebarDropTarget::End, None, block_bottom)
+        (None, None, block_bottom)
     };
 
-    if sidebar_drop_is_noop(source_index, target_index, blocks.len()) {
+    let noop = match target_index {
+        Some(target) if source_index < target => source_index + 1 == target,
+        Some(target) => source_index == target,
+        None => source_index + 1 == blocks.len(),
+    };
+    if noop {
         return None;
     }
 
     Some((target, indicator_y))
 }
 
-fn sidebar_reorder_event(
-    dragged: Option<&SidebarDragState>,
-    drop: Option<(SidebarDropTarget<'_>, f32)>,
-) -> Option<SidebarEvent> {
-    let (drag, (drop_target, _)) = (dragged?, drop?);
-    Some(SidebarEvent::Reorder {
-        source: drag.anchor.clone(),
-        before: match drop_target {
-            SidebarDropTarget::Before(target) => Some(target.to_owned()),
-            SidebarDropTarget::End => None,
-        },
-    })
-}
-
-fn sidebar_drop_is_noop(
-    source_index: usize,
-    target_index: Option<usize>,
-    block_count: usize,
-) -> bool {
-    match target_index {
-        Some(target_index) if source_index < target_index => source_index + 1 == target_index,
-        Some(target_index) => source_index == target_index,
-        None => source_index + 1 == block_count,
-    }
-}
-
 fn sidebar_blocks<'a>(items: &'a [SidebarItem<'a>]) -> Vec<SidebarBlock<'a>> {
-    let mut blocks: Vec<SidebarBlock<'a>> = Vec::new();
+    let mut blocks = Vec::<SidebarBlock<'a>>::with_capacity(items.len());
     for (row, item) in items.iter().enumerate() {
         let Some(anchor) = item.reorder_anchor else {
             continue;
@@ -910,19 +747,6 @@ fn sidebar_blocks<'a>(items: &'a [SidebarItem<'a>]) -> Vec<SidebarBlock<'a>> {
     blocks
 }
 
-fn subtle_border(palette: ThemePalette) -> egui::Color32 {
-    mix_color(palette.base, palette.text, 0.09)
-}
-
-fn mix_color(a: egui::Color32, b: egui::Color32, amount: f32) -> egui::Color32 {
-    let amount = amount.clamp(0.0, 1.0);
-    let inv = 1.0 - amount;
-    egui::Color32::from_rgb(
-        (f32::from(a.r()) * inv + f32::from(b.r()) * amount).round() as u8,
-        (f32::from(a.g()) * inv + f32::from(b.g()) * amount).round() as u8,
-        (f32::from(a.b()) * inv + f32::from(b.b()) * amount).round() as u8,
-    )
-}
 pub fn load_app_icon_texture(
     ctx: &egui::Context,
     texture: &mut Option<TextureHandle>,
@@ -940,49 +764,7 @@ pub fn load_app_icon_texture(
 
 fn paint_sidebar_title(ui: &egui::Ui, rect: Rect, palette: ThemePalette, model: &SidebarModel<'_>) {
     let painter = ui.painter_at(rect);
-    let layout = sidebar_title_layout(rect, model.reserve_titlebar_buttons);
-    if let Some(icon) = model.title_icon {
-        painter.image(
-            icon.id(),
-            layout.icon_rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
-    } else {
-        painter.circle_filled(layout.icon_rect.center(), 8.0, palette.primary);
-    }
-    painter.text(
-        layout.title_pos,
-        egui::Align2::LEFT_CENTER,
-        "Bootty",
-        egui::FontId::proportional(15.0),
-        palette.text,
-    );
-    painter.text(
-        Pos2::new(rect.max.x - SIDEBAR_PAD_X, layout.title_pos.y),
-        egui::Align2::RIGHT_CENTER,
-        model.session_count.to_string(),
-        egui::FontId::monospace(13.0),
-        palette.muted,
-    );
-}
-
-fn sidebar_header_height(title_visible: bool) -> f32 {
-    if title_visible {
-        SIDEBAR_HEADER_HEIGHT
-    } else {
-        0.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct SidebarTitleLayout {
-    icon_rect: Rect,
-    title_pos: Pos2,
-}
-
-fn sidebar_title_layout(rect: Rect, reserve_titlebar_buttons: bool) -> SidebarTitleLayout {
-    let (reserved, center_y) = if reserve_titlebar_buttons {
+    let (reserved, center_y) = if model.reserve_titlebar_buttons {
         (
             MACOS_TITLEBAR_BUTTON_SAFE_WIDTH,
             rect.min.y + MACOS_TITLEBAR_BUTTON_CENTER_Y,
@@ -990,16 +772,34 @@ fn sidebar_title_layout(rect: Rect, reserve_titlebar_buttons: bool) -> SidebarTi
     } else {
         (0.0, rect.min.y + SIDEBAR_HEADER_HEIGHT * 0.5)
     };
-    let icon_size = 18.0;
-    let left = rect.min.x + SIDEBAR_PAD_X + reserved;
     let icon_rect = Rect::from_min_size(
-        Pos2::new(left, center_y - icon_size * 0.5),
-        egui::vec2(icon_size, icon_size),
+        Pos2::new(rect.min.x + SIDEBAR_PAD_X + reserved, center_y - 9.0),
+        egui::vec2(18.0, 18.0),
     );
-    SidebarTitleLayout {
-        icon_rect,
-        title_pos: Pos2::new(icon_rect.max.x + 10.0, center_y),
+    if let Some(icon) = model.title_icon {
+        painter.image(
+            icon.id(),
+            icon_rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    } else {
+        painter.circle_filled(icon_rect.center(), 8.0, palette.primary);
     }
+    painter.text(
+        Pos2::new(icon_rect.max.x + 10.0, center_y),
+        egui::Align2::LEFT_CENTER,
+        "Bootty",
+        egui::FontId::proportional(15.0),
+        palette.text,
+    );
+    painter.text(
+        Pos2::new(rect.max.x - SIDEBAR_PAD_X, center_y),
+        egui::Align2::RIGHT_CENTER,
+        model.session_count,
+        egui::FontId::monospace(13.0),
+        palette.muted,
+    );
 }
 
 fn sidebar_item_row(
@@ -1017,7 +817,7 @@ fn sidebar_item_row(
     let clickable = item.extension_action.is_some() || item.selectable && item.session_id.is_some();
     let response = ui.interact(
         rect,
-        ui.make_persistent_id(("mux-sidebar-item", &item.id)),
+        ui.make_persistent_id(("mux-sidebar-item", item.scope, item.id, item.kind)),
         if draggable {
             egui::Sense::click_and_drag()
         } else if clickable {
@@ -1047,12 +847,10 @@ fn sidebar_item_row(
 
         paint_tree_guide(&painter, rect, item);
 
-        match &item.kind {
-            SidebarItemKind::Group => paint_group_item(&painter, rect, item, bg),
-            SidebarItemKind::Session { active } => {
-                paint_session_item(&painter, rect, item, *active, palette, bg)
-            }
-            SidebarItemKind::Row => paint_generic_sidebar_item(&painter, rect, item, palette, bg),
+        match item.kind {
+            "group" => paint_group_item(&painter, rect, item, bg),
+            "session" => paint_session_item(&painter, rect, item, item.active, palette, bg),
+            _ => paint_generic_sidebar_item(&painter, rect, item, palette, bg),
         }
     }
     response
@@ -1068,18 +866,15 @@ fn paint_tree_guide(painter: &egui::Painter, rect: Rect, item: &SidebarItem<'_>)
     let cy = rect.center().y;
     let stroke = Stroke::new(1.0, item.dim_color.gamma_multiply(0.8));
     match item.tree {
-        SidebarTree::None | SidebarTree::Blank => {}
-        SidebarTree::Middle => {
-            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], stroke);
+        Some(tree @ ("middle" | "last")) => {
+            let bottom = if tree == "middle" { rect.max.y } else { cy };
+            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, bottom)], stroke);
             painter.line_segment([Pos2::new(x, cy), Pos2::new(x + 5.0, cy)], stroke);
         }
-        SidebarTree::Last => {
-            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, cy)], stroke);
-            painter.line_segment([Pos2::new(x, cy), Pos2::new(x + 5.0, cy)], stroke);
-        }
-        SidebarTree::Pipe => {
+        Some("pipe") => {
             painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], stroke);
         }
+        _ => {}
     }
 }
 
@@ -1089,11 +884,6 @@ fn paint_group_item(
     item: &SidebarItem<'_>,
     background: egui::Color32,
 ) {
-    let SidebarDisplay::Text(text) = item.display else {
-        return;
-    };
-    // Tint the group title in its own group color (dim while inactive) rather than running
-    // palette.muted through readable_color, whose AAA gate flattened it to flat white.
     let title_color = if item.current {
         item.color
     } else {
@@ -1102,7 +892,7 @@ fn paint_group_item(
     painter.text(
         Pos2::new(item_text_x(rect, item), rect.center().y),
         egui::Align2::LEFT_CENTER,
-        truncate_label(text, 28),
+        truncate_label(item.text, 28),
         egui::FontId::monospace(12.0),
         title_color,
     );
@@ -1130,10 +920,7 @@ fn paint_session_item(
     let label_color = if active { item.color } else { item.dim_color };
     let x = item_text_x(rect, item);
     let cy = rect.center().y;
-    let (number, name) = match item.display {
-        SidebarDisplay::Numbered { number, label } => (Some(number), label),
-        SidebarDisplay::Text(text) => (None, text),
-    };
+    let number = item.number;
     let mut text_x = x;
     if let Some(number) = number {
         let badge = Rect::from_center_size(Pos2::new(x + 7.0, cy), egui::vec2(14.0, 14.0));
@@ -1150,7 +937,7 @@ fn paint_session_item(
         painter.text(
             badge.center(),
             egui::Align2::CENTER_CENTER,
-            (number % 100).to_string(),
+            number % 100,
             egui::FontId::monospace(10.0),
             if active {
                 readable_color(item.color, palette.base)
@@ -1163,7 +950,7 @@ fn paint_session_item(
     painter.text(
         Pos2::new(text_x, cy),
         egui::Align2::LEFT_CENTER,
-        truncate_label(name, 20),
+        truncate_label(item.text, 20),
         egui::FontId::monospace(13.0),
         label_color,
     );
@@ -1217,29 +1004,15 @@ fn paint_generic_sidebar_item(
     {
         text_x += 16.0;
     }
-    let text = match item.display {
-        SidebarDisplay::Text(text) => text,
-        SidebarDisplay::Numbered { label, .. } => label,
-    };
-    if !text.is_empty() {
+    if !item.text.is_empty() {
         painter.text(
             Pos2::new(text_x, cy),
             egui::Align2::LEFT_CENTER,
-            truncate_label(text, 28),
+            truncate_label(item.text, 28),
             egui::FontId::monospace(11.0),
             readable_color(background, palette.muted),
         );
     }
-}
-
-fn sidebar_footer_items(items: &[PublishedSurfaceItem]) -> &[PublishedSurfaceItem] {
-    let len = items.len().min(SIDEBAR_MAX_FOOTER_ITEMS);
-    &items[..len]
-}
-
-fn sidebar_footer_height(footer_item_count: usize) -> f32 {
-    let footer_count = footer_item_count.min(SIDEBAR_MAX_FOOTER_ITEMS);
-    SIDEBAR_FOOTER_BASE_HEIGHT + footer_count as f32 * SIDEBAR_FOOTER_ITEM_HEIGHT
 }
 
 fn paint_sidebar_footer(
@@ -1260,10 +1033,10 @@ fn paint_sidebar_footer(
         );
     }
 
-    let mut row_y = y + 18.0;
     let mut action = None;
     for (index, published) in footer_items.iter().enumerate() {
         let item = &published.item;
+        let row_y = y + 18.0 + index as f32 * SIDEBAR_FOOTER_ITEM_HEIGHT;
         let item_rect = Rect::from_min_size(
             Pos2::new(rect.min.x + 14.0, row_y - 10.0),
             egui::vec2(rect.width() - 28.0, 26.0),
@@ -1305,7 +1078,6 @@ fn paint_sidebar_footer(
         if item.primitives.is_empty() {
             paint_footer_fallback(&painter, item_rect, item, color, palette);
         }
-        row_y += SIDEBAR_FOOTER_ITEM_HEIGHT;
     }
     action
 }

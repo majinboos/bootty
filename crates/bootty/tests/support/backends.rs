@@ -6,7 +6,6 @@ pub fn backends() -> Arc<MuxBackendRegistry> {
     bootty_native::link();
     bootty_rmux::link();
     bootty_tmux::link();
-    bootty_zellij::link();
 
     Arc::new(MuxBackendRegistry::desktop().expect("complete executable backend registry"))
 }

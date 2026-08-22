@@ -23,7 +23,6 @@ bootty-native = { path = "../bootty-native" }
 bootty-remote = { path = "../bootty-remote" }
 bootty-rmux = { path = "../bootty-rmux" }
 bootty-tmux = { path = "../bootty-tmux" }
-bootty-zellij = { path = "../bootty-zellij" }
 serde_json.workspace = true
 clap.workspace = true
 thiserror.workspace = true

@@ -13,6 +13,11 @@ use crate::processes::{ManagedProcesses, ProcessEvent, ProcessStatus};
 
 const EXTENSION_UI_PRELUDE: &str = include_str!("../extension_ui.luau");
 const SIDEBAR_FACTS_PRELUDE: &str = include_str!("../sidebar_session_facts.luau");
+const STDERR_NULL: &str = if cfg!(windows) {
+    "2>nul"
+} else {
+    "2>/dev/null"
+};
 
 fn json_value_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
     lua.to_value_with(
@@ -136,28 +141,23 @@ fn process_status_table(lua: &Lua, status: ProcessStatus) -> mlua::Result<Table>
 
 fn process_event_table(lua: &Lua, event: ProcessEvent) -> mlua::Result<Table> {
     let table = lua.create_table()?;
-    match event {
-        ProcessEvent::Stdout(line) => {
-            table.set("stream", "stdout")?;
-            table.set("line", line)?;
-        }
-        ProcessEvent::Stderr(line) => {
-            table.set("stream", "stderr")?;
-            table.set("line", line)?;
-        }
-        ProcessEvent::Error(message) => {
-            table.set("stream", "error")?;
-            table.set("line", message)?;
-        }
+    let (stream, line) = match event {
+        ProcessEvent::Stdout(line) => ("stdout", line),
+        ProcessEvent::Stderr(line) => ("stderr", line),
+        ProcessEvent::Error(line) => ("error", line),
         ProcessEvent::Exit(code) => {
             table.set("stream", "exit")?;
             table.set("code", code)?;
+            return Ok(table);
         }
         ProcessEvent::Dropped(count) => {
             table.set("stream", "dropped")?;
             table.set("count", count)?;
+            return Ok(table);
         }
-    }
+    };
+    table.set("stream", stream)?;
+    table.set("line", line)?;
     Ok(table)
 }
 
@@ -228,14 +228,7 @@ fn install_ui_host_interface(
         "quote",
         lua.create_function(|_, value: String| Ok(platform_shell_quote(&value)))?,
     )?;
-    shell_table.set(
-        "stderr_null",
-        if cfg!(windows) {
-            "2>nul"
-        } else {
-            "2>/dev/null"
-        },
-    )?;
+    shell_table.set("stderr_null", STDERR_NULL)?;
     shell_table.set_readonly(true);
     bootty.set("shell", shell_table)?;
 
@@ -333,14 +326,12 @@ fn install_ui_host_interface(
                     entry.set("id", session.id.as_str())?;
                     entry.set("cache_key", format!("{}:{}", view.scope_key, session.id))?;
                     entry.set("name", session.name.as_str())?;
-                    entry.set(
-                        "display_name",
-                        if session.display_name.is_empty() {
-                            session.name.as_str()
-                        } else {
-                            session.display_name.as_str()
-                        },
-                    )?;
+                    let display_name = if session.display_name.is_empty() {
+                        session.name.as_str()
+                    } else {
+                        session.display_name.as_str()
+                    };
+                    entry.set("display_name", display_name)?;
                     entry.set("active", session.active)?;
                     entry.set("selected", session.selected)?;
                     entry.set("progress", session.progress)?;
@@ -489,14 +480,7 @@ fn install_ui_host_interface(
         "shell_quote",
         lua.create_function(|_, value: String| Ok(platform_shell_quote(&value)))?,
     )?;
-    ui_table.set(
-        "stderr_null",
-        if cfg!(windows) {
-            "2>nul"
-        } else {
-            "2>/dev/null"
-        },
-    )?;
+    ui_table.set("stderr_null", STDERR_NULL)?;
     bootty.set("ui", ui_table)?;
     let sidebar_table: Table = lua
         .load(SIDEBAR_FACTS_PRELUDE)

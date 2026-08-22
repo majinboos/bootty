@@ -309,14 +309,10 @@ impl SidebarKeyBindings {
 }
 
 fn sidebar_action(input: &str) -> Result<SidebarAction> {
-    match input {
-        "ignore" => Ok(SidebarAction::Ignore),
-        "previous_session" => Ok(SidebarAction::PreviousSession),
-        "next_session" => Ok(SidebarAction::NextSession),
-        "activate_session" => Ok(SidebarAction::ActivateSession),
-        "focus_terminal" => Ok(SidebarAction::FocusTerminal),
-        _ => anyhow::bail!("{input} has no Bootty sidebar behavior"),
-    }
+    SidebarAction::ALL
+        .into_iter()
+        .find(|action| action.command_id().strip_prefix("ui.sidebar.") == Some(input))
+        .ok_or_else(|| anyhow::anyhow!("{input} has no Bootty sidebar behavior"))
 }
 
 pub fn split_app_actions_for_bindings_with_modifier_sides(
@@ -379,26 +375,23 @@ pub fn builtin_app_invocation_for_key(
     key: egui::Key,
     modifiers: egui::Modifiers,
 ) -> Option<CommandInvocation> {
-    let matches = if cfg!(target_os = "macos") {
-        (modifiers.command || modifiers.mac_cmd)
-            && !modifiers.alt
-            && !modifiers.ctrl
-            && !modifiers.shift
-    } else {
-        // egui inflates `command` from `ctrl` off macOS, so it is not checked here.
-        modifiers.ctrl && modifiers.shift && !modifiers.alt
-    };
-    (key == egui::Key::N && matches)
-        .then(|| CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding))
+    builtin_new_session_invocation(
+        key == egui::Key::N,
+        key_mods_for_egui_binding(modifiers, ModifierSideState::default()),
+    )
 }
 
 pub fn builtin_app_invocation_for_direct_key(input: KeyInput) -> Option<CommandInvocation> {
-    let matches = if cfg!(target_os = "macos") {
-        input.mods.command && !input.mods.alt && !input.mods.ctrl && !input.mods.shift
+    builtin_new_session_invocation(input.key == TerminalKey::N, input.mods)
+}
+
+fn builtin_new_session_invocation(is_n: bool, mods: KeyMods) -> Option<CommandInvocation> {
+    let platform_modifiers = if cfg!(target_os = "macos") {
+        mods.command && !mods.ctrl && !mods.shift
     } else {
-        input.mods.ctrl && input.mods.shift && !input.mods.alt && !input.mods.command
+        mods.ctrl && mods.shift && !mods.command
     };
-    (input.key == TerminalKey::N && matches)
+    (is_n && platform_modifiers && !mods.alt)
         .then(|| CommandInvocation::from_action("new_mux_session", Caller::BuiltinKeybinding))
 }
 
@@ -410,97 +403,85 @@ pub fn keybind_action_for_name(name: &str) -> Option<KeybindAction> {
 }
 
 fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
-    match action {
-        BindingAction::ReloadConfig => Ok(KeybindAction::App(AppAction::ReloadConfig)),
-        BindingAction::Ignore => Ok(KeybindAction::App(AppAction::Ignore)),
-        BindingAction::NewWindow => Ok(KeybindAction::App(AppAction::NewWindow)),
-        BindingAction::NewMuxSession => Ok(KeybindAction::App(AppAction::NewMuxSession)),
-        BindingAction::SessionPicker => Ok(KeybindAction::App(AppAction::SessionPicker)),
-        BindingAction::CommandPalette => Ok(KeybindAction::App(AppAction::CommandPalette)),
-        BindingAction::CloseWindow => Ok(KeybindAction::App(AppAction::Close)),
-        BindingAction::Quit => Ok(KeybindAction::App(AppAction::Quit)),
-        BindingAction::CloseSurface => Ok(KeybindAction::Mux(MuxKeyAction::ClosePane)),
-        BindingAction::ToggleFullscreen => Ok(KeybindAction::App(AppAction::ToggleFullscreen)),
-        BindingAction::ToggleSidebarFocus => Ok(KeybindAction::App(AppAction::ToggleSidebarFocus)),
-        BindingAction::ToggleSidebarVisibility => {
-            Ok(KeybindAction::App(AppAction::ToggleSidebarVisibility))
+    use BindingAction as Binding;
+    use FontSizeAction as Font;
+    use KeybindAction as Keybind;
+    use MuxKeyAction as Mux;
+    use TerminalFindAction as Find;
+    use TerminalScrollAction as Scroll;
+
+    let action = match action {
+        Binding::ReloadConfig => Keybind::App(AppAction::ReloadConfig),
+        Binding::Ignore => Keybind::App(AppAction::Ignore),
+        Binding::NewWindow => Keybind::App(AppAction::NewWindow),
+        Binding::NewMuxSession => Keybind::App(AppAction::NewMuxSession),
+        Binding::SessionPicker => Keybind::App(AppAction::SessionPicker),
+        Binding::CommandPalette => Keybind::App(AppAction::CommandPalette),
+        Binding::CloseWindow => Keybind::App(AppAction::Close),
+        Binding::Quit => Keybind::App(AppAction::Quit),
+        Binding::CloseSurface => Keybind::Mux(Mux::ClosePane),
+        Binding::ToggleFullscreen => Keybind::App(AppAction::ToggleFullscreen),
+        Binding::ToggleSidebarFocus => Keybind::App(AppAction::ToggleSidebarFocus),
+        Binding::ToggleSidebarVisibility => Keybind::App(AppAction::ToggleSidebarVisibility),
+        Binding::OpenSettings => Keybind::App(AppAction::OpenSettings),
+        Binding::ChangeAppearance(choice) => {
+            Keybind::App(AppAction::ChangeAppearance(appearance_mode(choice)))
         }
-        BindingAction::OpenSettings => Ok(KeybindAction::App(AppAction::OpenSettings)),
-        BindingAction::ChangeAppearance(choice) => Ok(KeybindAction::App(
-            AppAction::ChangeAppearance(appearance_mode(choice)),
-        )),
-        BindingAction::SwitchTheme => Ok(KeybindAction::App(AppAction::SwitchTheme)),
-        BindingAction::RenameSession => Ok(KeybindAction::App(AppAction::RenameSession)),
-        BindingAction::RenameTab => Ok(KeybindAction::App(AppAction::RenameTab)),
-        BindingAction::NewTab => Ok(KeybindAction::Mux(MuxKeyAction::NewTab)),
-        BindingAction::NextTab => Ok(KeybindAction::Mux(MuxKeyAction::NextTab)),
-        BindingAction::PreviousTab => Ok(KeybindAction::Mux(MuxKeyAction::PreviousTab)),
-        BindingAction::LastTab => Ok(KeybindAction::Mux(MuxKeyAction::LastTab)),
-        BindingAction::SelectTab(index) => Ok(KeybindAction::Mux(MuxKeyAction::SelectTab(index))),
-        BindingAction::MoveTab(delta) => Ok(KeybindAction::Mux(MuxKeyAction::MoveTab(delta))),
-        BindingAction::SplitRight => Ok(KeybindAction::Mux(MuxKeyAction::SplitPane(
-            crate::layout::SplitDirection::Right,
-        ))),
-        BindingAction::SplitDown => Ok(KeybindAction::Mux(MuxKeyAction::SplitPane(
-            crate::layout::SplitDirection::Down,
-        ))),
-        BindingAction::SelectPane(direction) => Ok(KeybindAction::Mux(MuxKeyAction::SelectPane(
-            mux_direction(direction),
-        ))),
-        BindingAction::NextPane => Ok(KeybindAction::Mux(MuxKeyAction::NextPane)),
-        BindingAction::PreviousPane => Ok(KeybindAction::Mux(MuxKeyAction::PreviousPane)),
-        BindingAction::KillPane => Ok(KeybindAction::Mux(MuxKeyAction::KillPane)),
-        BindingAction::TogglePaneZoom => Ok(KeybindAction::Mux(MuxKeyAction::TogglePaneZoom)),
-        BindingAction::NextSession => Ok(KeybindAction::Mux(MuxKeyAction::NextSession)),
-        BindingAction::PreviousSession => Ok(KeybindAction::Mux(MuxKeyAction::PreviousSession)),
-        BindingAction::CreateSpace => Ok(KeybindAction::App(AppAction::CreateSpace)),
-        BindingAction::EditSpace => Ok(KeybindAction::App(AppAction::EditSpace)),
-        BindingAction::CloseSpace => Ok(KeybindAction::App(AppAction::CloseSpace)),
-        BindingAction::NextSpace => Ok(KeybindAction::App(AppAction::NextSpace)),
-        BindingAction::PreviousSpace => Ok(KeybindAction::App(AppAction::PreviousSpace)),
-        BindingAction::SelectSpace(index) => Ok(KeybindAction::App(AppAction::SelectSpace(index))),
-        BindingAction::LastSession => Ok(KeybindAction::Mux(MuxKeyAction::LastSession)),
-        BindingAction::SelectSession(index) => {
-            Ok(KeybindAction::Mux(MuxKeyAction::SelectSession(index)))
-        }
-        BindingAction::MoveSession(delta) => {
-            Ok(KeybindAction::Mux(MuxKeyAction::MoveSession(delta)))
-        }
-        BindingAction::DitchSession => Ok(KeybindAction::App(AppAction::DitchSession)),
-        BindingAction::ShowKeybinds => Ok(KeybindAction::App(AppAction::ShowKeybinds)),
-        BindingAction::ScrollToTop => Ok(KeybindAction::Scroll(TerminalScrollAction::Top)),
-        BindingAction::ScrollToBottom => Ok(KeybindAction::Scroll(TerminalScrollAction::Bottom)),
-        BindingAction::ScrollPageUp => Ok(KeybindAction::Scroll(TerminalScrollAction::PageUp)),
-        BindingAction::ScrollPageDown => Ok(KeybindAction::Scroll(TerminalScrollAction::PageDown)),
-        BindingAction::ScrollPageLines(lines) => {
-            Ok(KeybindAction::Scroll(TerminalScrollAction::Lines(lines)))
-        }
-        BindingAction::StartSearch => Ok(KeybindAction::Find(TerminalFindAction::Prompt)),
-        BindingAction::EndSearch => Ok(KeybindAction::Find(TerminalFindAction::Close)),
-        BindingAction::Search(value) => Ok(KeybindAction::Find(TerminalFindAction::Search(value))),
-        BindingAction::SearchSelection => {
-            Ok(KeybindAction::Find(TerminalFindAction::SearchSelection))
-        }
-        BindingAction::NavigateSearch(direction) => Ok(KeybindAction::Find(match direction {
-            NavigateSearch::Previous => TerminalFindAction::Previous,
-            NavigateSearch::Next => TerminalFindAction::Next,
-        })),
-        BindingAction::Csi(value) => Ok(KeybindAction::Write(csi_bytes(&value))),
-        BindingAction::Esc(value) => Ok(KeybindAction::Write(esc_bytes(&value))),
-        BindingAction::Text(value) => Ok(KeybindAction::Write(text_action_bytes(&value))),
-        BindingAction::IncreaseFontSize(delta) => {
-            Ok(KeybindAction::Font(FontSizeAction::Increase(delta)))
-        }
-        BindingAction::DecreaseFontSize(delta) => {
-            Ok(KeybindAction::Font(FontSizeAction::Decrease(delta)))
-        }
-        BindingAction::ResetFontSize => Ok(KeybindAction::Font(FontSizeAction::Reset)),
-        BindingAction::SetFontSize(size) => Ok(KeybindAction::Font(FontSizeAction::Set(size))),
-        BindingAction::CopyToClipboard(format) => Ok(KeybindAction::CopyToClipboard(format)),
-        BindingAction::CopyMode => Ok(KeybindAction::CopyMode),
-        BindingAction::PasteFromClipboard => Ok(KeybindAction::PasteFromClipboard),
+        Binding::SwitchTheme => Keybind::App(AppAction::SwitchTheme),
+        Binding::RenameSession => Keybind::App(AppAction::RenameSession),
+        Binding::RenameTab => Keybind::App(AppAction::RenameTab),
+        Binding::NewTab => Keybind::Mux(Mux::NewTab),
+        Binding::NextTab => Keybind::Mux(Mux::NextTab),
+        Binding::PreviousTab => Keybind::Mux(Mux::PreviousTab),
+        Binding::LastTab => Keybind::Mux(Mux::LastTab),
+        Binding::SelectTab(index) => Keybind::Mux(Mux::SelectTab(index)),
+        Binding::MoveTab(delta) => Keybind::Mux(Mux::MoveTab(delta)),
+        Binding::SplitRight => Keybind::Mux(Mux::SplitPane(crate::layout::SplitDirection::Right)),
+        Binding::SplitDown => Keybind::Mux(Mux::SplitPane(crate::layout::SplitDirection::Down)),
+        Binding::SelectPane(direction) => Keybind::Mux(Mux::SelectPane(mux_direction(direction))),
+        Binding::NextPane => Keybind::Mux(Mux::NextPane),
+        Binding::PreviousPane => Keybind::Mux(Mux::PreviousPane),
+        Binding::KillPane => Keybind::Mux(Mux::KillPane),
+        Binding::TogglePaneZoom => Keybind::Mux(Mux::TogglePaneZoom),
+        Binding::NextSession => Keybind::Mux(Mux::NextSession),
+        Binding::PreviousSession => Keybind::Mux(Mux::PreviousSession),
+        Binding::LastSession => Keybind::Mux(Mux::LastSession),
+        Binding::SelectSession(index) => Keybind::Mux(Mux::SelectSession(index)),
+        Binding::MoveSession(delta) => Keybind::Mux(Mux::MoveSession(delta)),
+        Binding::CreateSpace => Keybind::App(AppAction::CreateSpace),
+        Binding::EditSpace => Keybind::App(AppAction::EditSpace),
+        Binding::CloseSpace => Keybind::App(AppAction::CloseSpace),
+        Binding::NextSpace => Keybind::App(AppAction::NextSpace),
+        Binding::PreviousSpace => Keybind::App(AppAction::PreviousSpace),
+        Binding::SelectSpace(index) => Keybind::App(AppAction::SelectSpace(index)),
+        Binding::DitchSession => Keybind::App(AppAction::DitchSession),
+        Binding::ShowKeybinds => Keybind::App(AppAction::ShowKeybinds),
+        Binding::ScrollToTop => Keybind::Scroll(Scroll::Top),
+        Binding::ScrollToBottom => Keybind::Scroll(Scroll::Bottom),
+        Binding::ScrollPageUp => Keybind::Scroll(Scroll::PageUp),
+        Binding::ScrollPageDown => Keybind::Scroll(Scroll::PageDown),
+        Binding::ScrollPageLines(lines) => Keybind::Scroll(Scroll::Lines(lines)),
+        Binding::StartSearch => Keybind::Find(Find::Prompt),
+        Binding::EndSearch => Keybind::Find(Find::Close),
+        Binding::Search(value) => Keybind::Find(Find::Search(value)),
+        Binding::SearchSelection => Keybind::Find(Find::SearchSelection),
+        Binding::NavigateSearch(direction) => Keybind::Find(match direction {
+            NavigateSearch::Previous => Find::Previous,
+            NavigateSearch::Next => Find::Next,
+        }),
+        Binding::Csi(value) => Keybind::Write(csi_bytes(&value)),
+        Binding::Esc(value) => Keybind::Write(esc_bytes(&value)),
+        Binding::Text(value) => Keybind::Write(text_action_bytes(&value)),
+        Binding::IncreaseFontSize(delta) => Keybind::Font(Font::Increase(delta)),
+        Binding::DecreaseFontSize(delta) => Keybind::Font(Font::Decrease(delta)),
+        Binding::ResetFontSize => Keybind::Font(Font::Reset),
+        Binding::SetFontSize(size) => Keybind::Font(Font::Set(size)),
+        Binding::CopyToClipboard(format) => Keybind::CopyToClipboard(format),
+        Binding::CopyMode => Keybind::CopyMode,
+        Binding::PasteFromClipboard => Keybind::PasteFromClipboard,
         unsupported => anyhow::bail!("{} has no Bootty app behavior", unsupported.format_entry()),
-    }
+    };
+    Ok(action)
 }
 
 fn appearance_mode(choice: AppearanceChoice) -> bootty_config::config::AppearanceMode {

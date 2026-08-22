@@ -33,7 +33,6 @@ fn run() -> Result<()> {
     bootty_native::link();
     bootty_rmux::link();
     bootty_tmux::link();
-    bootty_zellij::link();
     let backends = Arc::new(bootty_mux::provider::MuxBackendRegistry::desktop()?);
     // Correct a stale `$SHELL` to the OS login shell before any child inherits
     // it; tmux otherwise bakes the wrong shell into the server's default-shell.

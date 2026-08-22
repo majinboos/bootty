@@ -2,7 +2,8 @@ use bootty_app::{
     theme::theme_from_config,
     ui::settings::{SettingsAction, SettingsSurface},
 };
-use bootty_config::config::{AppearanceVariant, BoottyConfig};
+use bootty_config::config::{AppearanceVariant, BoottyConfig, load_or_create_config_document};
+use bootty_extension::ModuleSources;
 use bootty_ui::icons::install_icon_fonts;
 use bootty_winit::direct_input::ModifierSideState;
 use egui::{Event, Key, Modifiers, RawInput};
@@ -18,9 +19,14 @@ fn key_event(key: Key) -> Event {
 }
 #[test]
 fn settings_close_when_escape_has_no_active_editor() {
-    let config = BoottyConfig::default();
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let config = BoottyConfig {
+        config_path: directory.path().join("config.toml"),
+        ..BoottyConfig::default()
+    };
     let theme = theme_from_config(&config, AppearanceVariant::Dark);
-    let mut settings = SettingsSurface::new(config);
+    let document = load_or_create_config_document(&config.config_path).expect("empty document");
+    let mut settings = SettingsSurface::new(config, document);
     let context = egui::Context::default();
     let mut action = SettingsAction::None;
 
@@ -31,7 +37,13 @@ fn settings_close_when_escape_has_no_active_editor() {
                 ..RawInput::default()
             },
             |ui| {
-                action = settings.show(ui, theme, Vec::new(), ModifierSideState::default());
+                action = settings.show(
+                    ui,
+                    theme,
+                    Vec::new(),
+                    ModifierSideState::default(),
+                    ModuleSources::default(),
+                );
             },
         )
         .drop_without_applying_deltas();
@@ -41,9 +53,14 @@ fn settings_close_when_escape_has_no_active_editor() {
 
 #[test]
 fn settings_restore_the_callers_global_style_after_close() {
-    let config = BoottyConfig::default();
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let config = BoottyConfig {
+        config_path: directory.path().join("config.toml"),
+        ..BoottyConfig::default()
+    };
     let theme = theme_from_config(&config, AppearanceVariant::Dark);
-    let mut settings = SettingsSurface::new(config);
+    let document = load_or_create_config_document(&config.config_path).expect("empty document");
+    let mut settings = SettingsSurface::new(config, document);
     let context = egui::Context::default();
     install_icon_fonts(&context);
     let original_interact_height = 51.0;
@@ -51,7 +68,13 @@ fn settings_restore_the_callers_global_style_after_close() {
 
     context
         .run_ui(RawInput::default(), |ui| {
-            let _ = settings.show(ui, theme, Vec::new(), ModifierSideState::default());
+            let _ = settings.show(
+                ui,
+                theme,
+                Vec::new(),
+                ModifierSideState::default(),
+                ModuleSources::default(),
+            );
         })
         .drop_without_applying_deltas();
     assert_eq!(context.global_style().spacing.interact_size.y, 34.0);

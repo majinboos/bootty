@@ -55,9 +55,17 @@ impl TerminalSelectionRouter {
 
         let mut terminal_events = Vec::with_capacity(events.len());
         let mut selection_actions = Vec::new();
+        let update_drag = |actions: &mut Vec<TerminalSelectionAction>, pos| {
+            if selection_drag_scroll_delta(surface, pos) == 0
+                && let Some(selection_event) =
+                    terminal_selection_event_clamped(surface, view, pos, frame_modifiers.alt)
+            {
+                actions.push(TerminalSelectionAction::Update(selection_event));
+            }
+        };
         for event in events {
             match event {
-                egui::Event::PointerButton {
+                event @ egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed: true,
@@ -82,25 +90,11 @@ impl TerminalSelectionRouter {
                         self.pending_start =
                             terminal_selection_event(surface, view, pos, rectangle);
                     }
-                    terminal_events.push(egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: true,
-                        modifiers,
-                    });
+                    terminal_events.push(event);
                 }
                 egui::Event::PointerMoved(pos) if self.active => {
                     self.drag_pos = Some(pos);
-                    if selection_drag_scroll_delta(surface, pos) == 0
-                        && let Some(selection_event) = terminal_selection_event_clamped(
-                            surface,
-                            view,
-                            pos,
-                            frame_modifiers.alt,
-                        )
-                    {
-                        selection_actions.push(TerminalSelectionAction::Update(selection_event));
-                    }
+                    update_drag(&mut selection_actions, pos);
                     if self.passthrough_active {
                         terminal_events.push(egui::Event::PointerMoved(pos));
                     }
@@ -114,21 +108,11 @@ impl TerminalSelectionRouter {
                         self.passthrough_active = true;
                         self.drag_pos = Some(pos);
                         selection_actions.push(TerminalSelectionAction::Begin(start));
-                        if selection_drag_scroll_delta(surface, pos) == 0
-                            && let Some(selection_event) = terminal_selection_event_clamped(
-                                surface,
-                                view,
-                                pos,
-                                frame_modifiers.alt,
-                            )
-                        {
-                            selection_actions
-                                .push(TerminalSelectionAction::Update(selection_event));
-                        }
+                        update_drag(&mut selection_actions, pos);
                         terminal_events.push(egui::Event::PointerMoved(pos));
                     }
                 }
-                egui::Event::PointerButton {
+                event @ egui::Event::PointerButton {
                     pos,
                     button: egui::PointerButton::Primary,
                     pressed: false,
@@ -144,29 +128,18 @@ impl TerminalSelectionRouter {
                     self.drag_pos = None;
                     self.pending_start = None;
                     if self.passthrough_active {
-                        terminal_events.push(egui::Event::PointerButton {
-                            pos,
-                            button: egui::PointerButton::Primary,
-                            pressed: false,
-                            modifiers,
-                        });
+                        terminal_events.push(event);
                     }
                     self.passthrough_active = false;
                     self.active = false;
                 }
-                egui::Event::PointerButton {
-                    pos,
+                event @ egui::Event::PointerButton {
                     button: egui::PointerButton::Primary,
                     pressed: false,
-                    modifiers,
+                    ..
                 } if self.pending_start.is_some() => {
                     self.pending_start = None;
-                    terminal_events.push(egui::Event::PointerButton {
-                        pos,
-                        button: egui::PointerButton::Primary,
-                        pressed: false,
-                        modifiers,
-                    });
+                    terminal_events.push(event);
                 }
                 event => terminal_events.push(event),
             }
@@ -184,10 +157,7 @@ impl TerminalSelectionRouter {
         if !self.active {
             return Vec::new();
         }
-        let Some(surface) = surface else {
-            return Vec::new();
-        };
-        let Some(pos) = self.drag_pos else {
+        let (Some(surface), Some(pos)) = (surface, self.drag_pos) else {
             return Vec::new();
         };
 

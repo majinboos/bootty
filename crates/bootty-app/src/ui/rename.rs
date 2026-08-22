@@ -12,7 +12,6 @@ pub struct RenameSessionDialog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenameSessionEvent {
-    None,
     Close,
     Rename { session_id: String, name: String },
 }
@@ -27,7 +26,6 @@ pub struct RenameTabDialog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RenameTabEvent {
-    None,
     Close,
     Rename {
         session_id: String,
@@ -45,7 +43,7 @@ impl RenameSessionDialog {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> RenameSessionEvent {
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> Option<RenameSessionEvent> {
         let normalized = normalized_name(&self.name);
         let validation = normalized.is_none().then_some("name cannot be empty");
 
@@ -65,15 +63,15 @@ impl RenameSessionDialog {
         if result.inner.submitted
             && let Some(name) = normalized
         {
-            return RenameSessionEvent::Rename {
+            return Some(RenameSessionEvent::Rename {
                 session_id: self.session_id.clone(),
                 name,
-            };
+            });
         }
         if result.escaped || result.clicked_outside {
-            return RenameSessionEvent::Close;
+            return Some(RenameSessionEvent::Close);
         }
-        RenameSessionEvent::None
+        None
     }
 }
 
@@ -87,7 +85,7 @@ impl RenameTabDialog {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> RenameTabEvent {
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> Option<RenameTabEvent> {
         let normalized = normalized_tab_name(&self.name);
 
         let result = FloatingWindow::new("rename-tab-dialog", "Rename Tab")
@@ -103,16 +101,16 @@ impl RenameTabDialog {
             });
 
         if result.inner.submitted {
-            return RenameTabEvent::Rename {
+            return Some(RenameTabEvent::Rename {
                 session_id: self.session_id.clone(),
                 window_id: self.window_id.clone(),
                 name: normalized,
-            };
+            });
         }
         if result.escaped || result.clicked_outside {
-            return RenameTabEvent::Close;
+            return Some(RenameTabEvent::Close);
         }
-        RenameTabEvent::None
+        None
     }
 }
 

@@ -34,7 +34,7 @@ impl Default for ControlState {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum TaskState {
     Running,
@@ -54,15 +54,10 @@ struct SubscriptionRecord {
     sequence: u64,
     cursor: u64,
     events: VecDeque<SubscriptionEvent>,
-    gap: Option<SubscriptionGap>,
+    gap: Option<u64>,
 }
 
-#[derive(Clone)]
-struct SubscriptionGap {
-    sequence: u64,
-}
-
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 struct SubscriptionEvent {
     sequence: u64,
     scope: String,
@@ -85,12 +80,7 @@ impl ControlState {
             };
             self.tasks.remove(&completed);
         }
-        let id = loop {
-            let candidate = capability_id("task")?;
-            if !self.tasks.contains_key(&candidate) {
-                break candidate;
-            }
-        };
+        let id = unique_capability_id("task", &self.tasks)?;
         self.tasks.insert(
             id.clone(),
             TaskRecord {
@@ -158,12 +148,7 @@ impl ControlState {
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
             return Err(RpcError::new(-32001, "subscription limit reached"));
         }
-        let id = loop {
-            let candidate = capability_id("subscription")?;
-            if !self.subscriptions.contains_key(&candidate) {
-                break candidate;
-            }
-        };
+        let id = unique_capability_id("subscription", &self.subscriptions)?;
         let revision = *self.revisions.get(scope).unwrap_or(&0);
         self.subscriptions.insert(
             id.clone(),
@@ -192,12 +177,12 @@ impl ControlState {
     ) -> Result<Value, RpcError> {
         let (scope, cursor, events) = {
             let record = self.subscription(subscription)?;
-            if let Some(gap) = &record.gap {
+            if let Some(gap) = record.gap {
                 return Err(rebase_error(
                     subscription,
                     &record.scope,
                     record.cursor,
-                    gap.sequence,
+                    gap,
                 ));
             }
             if cursor != record.cursor {
@@ -222,9 +207,7 @@ impl ControlState {
             }
             if events.is_empty() && !record.events.is_empty() {
                 record.events.clear();
-                record.gap = Some(SubscriptionGap {
-                    sequence: record.sequence,
-                });
+                record.gap = Some(record.sequence);
                 return Err(rebase_error(
                     subscription,
                     &record.scope,
@@ -295,9 +278,7 @@ impl ControlState {
             subscription.sequence += 1;
             if subscription.gap.is_some() || subscription.events.len() >= EVENT_QUEUE_LIMIT {
                 subscription.events.clear();
-                subscription.gap = Some(SubscriptionGap {
-                    sequence: subscription.sequence,
-                });
+                subscription.gap = Some(subscription.sequence);
                 continue;
             }
             subscription.events.push_back(SubscriptionEvent {
@@ -336,6 +317,18 @@ fn capability_id(prefix: &str) -> Result<String, RpcError> {
         token.push(digits[(byte & 0x0f) as usize] as char);
     }
     Ok(format!("{prefix}-{token}"))
+}
+
+fn unique_capability_id<T>(
+    prefix: &str,
+    existing: &BTreeMap<String, T>,
+) -> Result<String, RpcError> {
+    loop {
+        let id = capability_id(prefix)?;
+        if !existing.contains_key(&id) {
+            return Ok(id);
+        }
+    }
 }
 
 pub(crate) fn lock_control_state(

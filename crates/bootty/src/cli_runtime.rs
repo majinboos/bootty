@@ -106,14 +106,7 @@ fn invoke_control_command_on_instance(
     confirm: bool,
     detached: bool,
 ) -> Result<control::RpcResponse> {
-    let response = control_instance_request(
-        descriptor,
-        "command.invoke",
-        serde_json::json!({
-            "invocation": invocation,
-            "detached": detached && !confirm,
-        }),
-    )?;
+    let response = invoke_command_request(descriptor, &invocation, detached && !confirm)?;
     if !confirm {
         return Ok(response);
     }
@@ -125,13 +118,18 @@ fn invoke_control_command_on_instance(
         return Ok(response);
     };
     invocation.confirmation = Some(*confirmation);
+    invoke_command_request(descriptor, &invocation, detached)
+}
+
+fn invoke_command_request(
+    descriptor: &control::InstanceDescriptor,
+    invocation: &CommandInvocation,
+    detached: bool,
+) -> Result<control::RpcResponse> {
     control_instance_request(
         descriptor,
         "command.invoke",
-        serde_json::json!({
-            "invocation": invocation,
-            "detached": detached,
-        }),
+        serde_json::json!({"invocation": invocation, "detached": detached}),
     )
 }
 
@@ -215,11 +213,9 @@ fn parse_dynamic_arguments(
                     .get(arguments.len())
                     .context("too many command arguments")?;
                 let name = option.trim_start_matches("--");
-                if expected.name.replace('_', "-") != name {
-                    anyhow::bail!(
-                        "expected --{}, got {option}",
-                        expected.name.replace('_', "-")
-                    );
+                let expected_name = expected.name.replace('_', "-");
+                if expected_name != name {
+                    anyhow::bail!("expected --{expected_name}, got {option}");
                 }
                 arguments.push(
                     input
@@ -288,36 +284,20 @@ pub(crate) fn print_command_response(
         .map(|value| serde_json::from_value::<CommandOutcome>(value.clone()))
         .transpose()?;
     print_control_response(response, json_output)?;
-    match outcome {
-        None | Some(CommandOutcome::Success { .. }) => Ok(()),
+    let (code, message) = match outcome {
+        None | Some(CommandOutcome::Success { .. }) => return Ok(()),
         Some(CommandOutcome::Unsupported { message } | CommandOutcome::Unavailable { message }) => {
-            Err(CliFailure {
-                code: EXIT_UNAVAILABLE,
-                message,
-            }
-            .into())
+            (EXIT_UNAVAILABLE, message)
         }
-        Some(CommandOutcome::Denied { message }) => Err(CliFailure {
-            code: EXIT_DENIED,
-            message,
-        }
-        .into()),
-        Some(CommandOutcome::StaleTarget { message }) => Err(CliFailure {
-            code: EXIT_STALE_TARGET,
-            message,
-        }
-        .into()),
-        Some(CommandOutcome::Failed { message, .. }) => Err(CliFailure {
-            code: EXIT_COMMAND_FAILED,
-            message,
-        }
-        .into()),
-        Some(CommandOutcome::ConfirmationRequired { .. }) => Err(CliFailure {
-            code: EXIT_CONFIRMATION,
-            message: "command requires confirmation".to_owned(),
-        }
-        .into()),
-    }
+        Some(CommandOutcome::Denied { message }) => (EXIT_DENIED, message),
+        Some(CommandOutcome::StaleTarget { message }) => (EXIT_STALE_TARGET, message),
+        Some(CommandOutcome::Failed { message, .. }) => (EXIT_COMMAND_FAILED, message),
+        Some(CommandOutcome::ConfirmationRequired { .. }) => (
+            EXIT_CONFIRMATION,
+            "command requires confirmation".to_owned(),
+        ),
+    };
+    Err(CliFailure { code, message }.into())
 }
 
 pub(crate) fn print_control_response(
@@ -326,13 +306,12 @@ pub(crate) fn print_control_response(
 ) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string(&response)?);
-        if let Some(error) = response.error {
-            return Err(rpc_failure(&error));
-        }
-        return Ok(());
     }
     if let Some(error) = response.error {
         return Err(rpc_failure(&error));
+    }
+    if json_output {
+        return Ok(());
     }
     if let Some(result) = response.result {
         match result {

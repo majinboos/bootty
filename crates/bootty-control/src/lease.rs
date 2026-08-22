@@ -27,8 +27,6 @@ pub(crate) struct ControlInstanceLease {
     descriptor: InstanceDescriptor,
     descriptor_path: PathBuf,
     claim_lock: Option<File>,
-    published: bool,
-    released: bool,
 }
 
 impl ControlInstanceLease {
@@ -60,8 +58,6 @@ impl ControlInstanceLease {
             descriptor,
             descriptor_path: directory.join("control.json"),
             claim_lock: Some(claim_lock),
-            published: false,
-            released: false,
         })
     }
 
@@ -93,8 +89,6 @@ impl ControlInstanceLease {
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
-        } else {
-            self.published = true;
         }
         self.claim_lock.take();
         result
@@ -133,34 +127,27 @@ impl ControlInstanceLease {
         Ok(Some(descriptor))
     }
 
-    pub(crate) fn abort(mut self) {
-        self.cleanup();
+    pub(crate) fn abort(self) {
+        self.release();
     }
 
-    pub(crate) fn release(mut self) {
-        self.cleanup();
+    pub(crate) fn release(self) {
+        drop(self);
     }
 
     fn cleanup(&mut self) {
-        if self.released {
+        let claim_lock = self.claim_lock.take().or_else(|| {
+            self.descriptor_path
+                .parent()
+                .and_then(|directory| lock_instance(directory).ok())
+        });
+        let Some(_claim_lock) = claim_lock else {
             return;
+        };
+        if let Ok(expected) = serde_json::to_vec(&self.descriptor) {
+            remove_descriptor_if_matches(&self.descriptor_path, &expected);
         }
-        if self.claim_lock.is_none()
-            && let Some(directory) = self.descriptor_path.parent()
-            && let Ok(claim_lock) = lock_instance(directory)
-        {
-            self.claim_lock = Some(claim_lock);
-        }
-        if self.claim_lock.is_some() {
-            if self.published
-                && let Ok(expected) = serde_json::to_vec(&self.descriptor)
-            {
-                remove_descriptor_if_matches(&self.descriptor_path, &expected);
-            }
-            remove_endpoint(&self.descriptor.endpoint);
-        }
-        self.claim_lock.take();
-        self.released = true;
+        remove_endpoint(&self.descriptor.endpoint);
     }
 }
 
@@ -203,11 +190,8 @@ fn generation_token() -> Result<u64> {
 }
 
 fn current_process_started_at_ms() -> Result<u128> {
-    let system = sysinfo::System::new_all();
-    let process = system
-        .process(sysinfo::Pid::from_u32(std::process::id()))
-        .context("current process is missing from the process table")?;
-    Ok(u128::from(process.start_time()) * 1000)
+    process_started_at_ms(std::process::id())
+        .context("current process is missing from the process table")
 }
 
 fn endpoint_for_generation(generation: u64) -> Result<LocalEndpoint> {
@@ -252,10 +236,14 @@ fn instance_directory() -> Result<PathBuf> {
 }
 
 fn instance_process_is_dead(instance: &InstanceDescriptor) -> bool {
+    process_started_at_ms(instance.pid) != Some(instance.started_at_ms)
+}
+
+fn process_started_at_ms(pid: u32) -> Option<u128> {
     let system = sysinfo::System::new_all();
     system
-        .process(sysinfo::Pid::from_u32(instance.pid))
-        .is_none_or(|process| u128::from(process.start_time()) * 1000 != instance.started_at_ms)
+        .process(sysinfo::Pid::from_u32(pid))
+        .map(|process| u128::from(process.start_time()) * 1000)
 }
 
 #[cfg(unix)]

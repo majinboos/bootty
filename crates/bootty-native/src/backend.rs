@@ -93,17 +93,7 @@ impl NativeMuxState {
         }
     }
     fn rename_window(&mut self, session_id: &str, window_id: &str, name: String) {
-        if let Some(window) = self
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == session_id)
-            .and_then(|session| {
-                session
-                    .windows
-                    .iter_mut()
-                    .find(|window| window.id == window_id)
-            })
-        {
+        if let Some(window) = self.window_mut(session_id, window_id) {
             window.name = name;
         }
     }
@@ -132,6 +122,13 @@ impl NativeMuxState {
         self.sessions
             .iter_mut()
             .find(|session| session.id == session_id)
+    }
+
+    fn window_mut(&mut self, session_id: &str, window_id: &str) -> Option<&mut NativeWindow> {
+        self.active_session_mut(session_id)?
+            .windows
+            .iter_mut()
+            .find(|window| window.id == window_id)
     }
 
     fn new_window(&mut self, session_id: &str, cwd: Option<PathBuf>) {
@@ -205,10 +202,7 @@ impl NativeMuxState {
     fn active_window_mut(&mut self, session_id: &str) -> Option<&mut NativeWindow> {
         let session = self.active_session_mut(session_id)?;
         let active_window_id = session.active_window_id.clone();
-        session
-            .windows
-            .iter_mut()
-            .find(|window| window.id == active_window_id)
+        self.window_mut(session_id, &active_window_id)
     }
 
     fn split_pane(&mut self, session_id: &str, source_pane_id: Option<&str>) {
@@ -253,6 +247,13 @@ impl NativeMuxState {
         }
     }
 
+    fn select_pane(&mut self, session_id: &str, window_id: Option<&str>, delta: i32) {
+        if let Some(window_id) = window_id {
+            self.activate_window(session_id, window_id);
+        }
+        self.select_relative_pane(session_id, delta);
+    }
+
     fn kill_active_pane(&mut self, session_id: &str) {
         if let Some(window) = self.active_window_mut(session_id) {
             if window.panes.len() <= 1 {
@@ -274,8 +275,7 @@ impl NativeMuxState {
     // Close the requested pane; when it was the last pane in its window, cascade to remove that
     // window. The target can belong to an inactive tab, so never route through active_window_mut.
     fn close_pane(&mut self, session_id: &str, pane_id: Option<&str>) {
-        let mut changed_active_session = false;
-        {
+        let changed_active_session = {
             let Some(session) = self.active_session_mut(session_id) else {
                 return;
             };
@@ -295,8 +295,7 @@ impl NativeMuxState {
             let Some(window_index) = window_index else {
                 return;
             };
-            let target_window_id = session.windows[window_index].id.clone();
-            let target_was_active = target_window_id == session.active_window_id;
+            let target_was_active = session.windows[window_index].id == session.active_window_id;
             let pane_index = {
                 let window = &session.windows[window_index];
                 pane_id
@@ -324,17 +323,14 @@ impl NativeMuxState {
                         .windows
                         .get(window_index.min(session.windows.len().saturating_sub(1)))
                         .map_or_else(String::new, |window| window.id.clone());
-                    changed_active_session = true;
                 }
-            } else {
-                if removed_active_pane {
-                    window
-                        .active_pane_id
-                        .clone_from(&window.panes[pane_index.min(window.panes.len() - 1)].id);
-                }
-                changed_active_session = target_was_active;
+            } else if removed_active_pane {
+                window
+                    .active_pane_id
+                    .clone_from(&window.panes[pane_index.min(window.panes.len() - 1)].id);
             }
-        }
+            target_was_active
+        };
         if changed_active_session {
             session_id.clone_into(&mut self.active_session_id);
         }
@@ -416,21 +412,19 @@ fn anchor_for_window(session_id: &str, window: &NativeWindow) -> MuxPaneAnchor {
         .iter()
         .find(|pane| pane.id == window.active_pane_id)
         .or_else(|| window.panes.first());
+    anchor_for_optional_pane(session_id, pane)
+}
+
+fn anchor_for_pane(session_id: &str, pane: &NativePane) -> MuxPaneAnchor {
+    anchor_for_optional_pane(session_id, Some(pane))
+}
+
+fn anchor_for_optional_pane(session_id: &str, pane: Option<&NativePane>) -> MuxPaneAnchor {
     MuxPaneAnchor {
         session_id: session_id.to_owned(),
         pane_id: pane.map(|pane| pane.id.clone()),
         pane_pid: None,
         cwd: pane.map(|pane| pane.cwd.to_string_lossy().into_owned()),
-        process: Some("shell".to_owned()),
-    }
-}
-
-fn anchor_for_pane(session_id: &str, pane: &NativePane) -> MuxPaneAnchor {
-    MuxPaneAnchor {
-        session_id: session_id.to_owned(),
-        pane_id: Some(pane.id.clone()),
-        pane_pid: None,
-        cwd: Some(pane.cwd.to_string_lossy().into_owned()),
         process: Some("shell".to_owned()),
     }
 }
@@ -573,38 +567,22 @@ impl MuxBackend for NativeBackend {
                 window_id,
                 direction,
             } => {
-                if let Some(window_id) = window_id {
-                    state.activate_window(&session_id, &window_id);
-                }
-                match direction {
+                let delta = match direction {
                     bootty_mux::command::MuxDirection::Left
-                    | bootty_mux::command::MuxDirection::Up => {
-                        state.select_relative_pane(&session_id, -1);
-                    }
+                    | bootty_mux::command::MuxDirection::Up => -1,
                     bootty_mux::command::MuxDirection::Right
-                    | bootty_mux::command::MuxDirection::Down => {
-                        state.select_relative_pane(&session_id, 1);
-                    }
-                }
+                    | bootty_mux::command::MuxDirection::Down => 1,
+                };
+                state.select_pane(&session_id, window_id.as_deref(), delta);
             }
             MuxCommand::SelectNextPane {
                 session_id,
                 window_id,
-            } => {
-                if let Some(window_id) = window_id {
-                    state.activate_window(&session_id, &window_id);
-                }
-                state.select_relative_pane(&session_id, 1);
-            }
+            } => state.select_pane(&session_id, window_id.as_deref(), 1),
             MuxCommand::SelectPreviousPane {
                 session_id,
                 window_id,
-            } => {
-                if let Some(window_id) = window_id {
-                    state.activate_window(&session_id, &window_id);
-                }
-                state.select_relative_pane(&session_id, -1);
-            }
+            } => state.select_pane(&session_id, window_id.as_deref(), -1),
             MuxCommand::KillPane {
                 session_id,
                 pane_id,

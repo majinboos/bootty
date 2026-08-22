@@ -1,7 +1,7 @@
 //! Full-app settings surface for editing the user config.
 //!
-//! Edits are live-applied by writing the changed key straight into `config.toml`; the main
-//! window's `ConfigHotReload` watcher then re-reads the file and applies it.
+//! The surface edits an in-memory document. The app config owner validates, persists, and
+//! publishes each complete draft at the frame boundary.
 
 mod appearance;
 mod font;
@@ -15,18 +15,20 @@ mod writeback;
 
 use std::path::PathBuf;
 
+use bootty_extension::{ModuleSourceOutcome, ModuleSourceRequest, ModuleSources};
+
 use bootty_config::{
     color::Color,
-    config::{BoottyConfig, MultiplexerBackendConfig, SidebarPosition},
+    config::{BoottyConfig, ConfigDocument, MultiplexerBackendConfig, SidebarPosition},
 };
 use bootty_ui::settings::{
-    ComboStyle, DragHandle, NumberEditSpec, apply_reorder, described_combo, path_row,
-    reorderable_list, searchable_combo, section, settings_button, settings_color_picker,
-    settings_icon_button, settings_notice, settings_number_edit, settings_page_header,
-    settings_row, settings_segmented, settings_segmented_ltr, settings_slider_with_edit,
-    settings_text_edit, settings_text_edit_width, settings_toggle, settings_toggle_row,
+    DragHandle, NumberEditSpec, apply_reorder, path_row, reorderable_list, searchable_combo,
+    section, settings_button, settings_color_picker, settings_icon_button, settings_notice,
+    settings_number_edit, settings_page_header, settings_row, settings_segmented,
+    settings_segmented_ltr, settings_slider_with_edit, settings_text_edit,
+    settings_text_edit_width, settings_toggle, settings_toggle_row,
 };
-use bootty_ui::{Theme, ThemePalette, icons, readable_color};
+use bootty_ui::{Theme, ThemePalette, readable_color};
 use bootty_winit::direct_input::ModifierSideState;
 use eframe::egui::{self, Color32, Pos2, Rect, RichText, UiBuilder, Vec2};
 
@@ -53,213 +55,33 @@ struct PageMeta {
     page: SettingsPage,
     group: &'static str,
     label: &'static str,
-    icon: &'static str,
-    title: &'static str,
-    terms: &'static [&'static str],
+    terms: &'static str,
 }
 
+macro_rules! page {
+    ($page:ident, $group:literal, $label:literal, $terms:literal) => {
+        PageMeta {
+            page: SettingsPage::$page,
+            group: $group,
+            label: $label,
+            terms: $terms,
+        }
+    };
+}
+
+#[rustfmt::skip]
 const PAGE_META: [PageMeta; 11] = [
-    PageMeta {
-        page: SettingsPage::General,
-        group: "Core",
-        label: "General",
-        icon: "sliders-horizontal",
-        title: "General",
-        terms: &[
-            "default profile",
-            "multiplexer",
-            "backend",
-            "sidebar",
-            "status bar",
-            "new windows",
-            "terminal preview",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Remotes,
-        group: "Core",
-        label: "Remotes",
-        icon: "server",
-        title: "Remotes",
-        terms: &[
-            "ssh",
-            "remote",
-            "profile",
-            "host",
-            "port",
-            "user",
-            "authentication",
-            "private key",
-            "proxy",
-            "test connection",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Text,
-        group: "Core",
-        label: "Text",
-        icon: "case-sensitive",
-        title: "Text",
-        terms: &[
-            "font",
-            "family",
-            "fallback",
-            "size",
-            "cell width",
-            "cell height",
-            "baseline",
-            "underline",
-            "glyph",
-            "features",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Appearance,
-        group: "Core",
-        label: "Appearance",
-        icon: "palette",
-        title: "Appearance",
-        terms: &[
-            "theme",
-            "colors",
-            "background",
-            "foreground",
-            "cursor",
-            "selection",
-            "ansi",
-            "palette",
-            "sidebar colors",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Window,
-        group: "Core",
-        label: "Window",
-        icon: "panel-top",
-        title: "Window",
-        terms: &[
-            "window",
-            "title",
-            "titlebar",
-            "decoration",
-            "fullscreen",
-            "size",
-            "width",
-            "height",
-            "sidebar",
-            "chrome",
-            "dim",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Sidebar,
-        group: "Core",
-        label: "Sidebar",
-        icon: "panel-left",
-        title: "Sidebar",
-        terms: &[
-            "sidebar",
-            "session",
-            "navigation",
-            "position",
-            "width",
-            "background",
-            "foreground",
-            "selected",
-            "hover",
-            "border",
-            "modules",
-            "luau",
-            "source",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Status,
-        group: "Core",
-        label: "Status Bar",
-        icon: "activity",
-        title: "Status Bar",
-        terms: &[
-            "status",
-            "modules",
-            "segments",
-            "clock",
-            "sysinfo",
-            "alignment",
-            "icon",
-            "foreground",
-            "background",
-            "luau",
-            "source",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Shell,
-        group: "Terminal",
-        label: "Shell",
-        icon: "terminal",
-        title: "Shell",
-        terms: &[
-            "shell",
-            "working directory",
-            "environment",
-            "env",
-            "term",
-            "colorterm",
-            "scrollback",
-            "glyph protocol",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Keys,
-        group: "Terminal",
-        label: "Keys",
-        icon: "keyboard",
-        title: "Keys",
-        terms: &[
-            "keybindings",
-            "shortcuts",
-            "scope",
-            "global",
-            "native",
-            "tmux",
-            "zellij",
-            "sidebar",
-            "modifier remap",
-            "option as alt",
-            "record shortcut",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Config,
-        group: "Advanced",
-        label: "Config",
-        icon: "file-cog",
-        title: "Config",
-        terms: &[
-            "config",
-            "path",
-            "directory",
-            "themes",
-            "status modules",
-            "reload",
-            "last write error",
-        ],
-    },
-    PageMeta {
-        page: SettingsPage::Diagnostics,
-        group: "Advanced",
-        label: "Diagnostics",
-        icon: "bug",
-        title: "Diagnostics",
-        terms: &[
-            "diagnostics",
-            "stability trace",
-            "trace",
-            "reload",
-            "errors",
-        ],
-    },
+    page!(General, "Core", "General", "default profile|multiplexer|backend|sidebar|status bar|new windows|terminal preview"),
+    page!(Remotes, "Core", "Remotes", "ssh|remote|profile|host|port|user|authentication|private key|proxy|test connection"),
+    page!(Text, "Core", "Text", "font|family|fallback|size|cell width|cell height|baseline|underline|glyph|features"),
+    page!(Appearance, "Core", "Appearance", "theme|colors|background|foreground|cursor|selection|ansi|palette|sidebar colors"),
+    page!(Window, "Core", "Window", "window|title|titlebar|decoration|fullscreen|size|width|height|sidebar|chrome|dim"),
+    page!(Sidebar, "Core", "Sidebar", "sidebar|session|navigation|position|width|background|foreground|selected|hover|border|modules|luau|source"),
+    page!(Status, "Core", "Status Bar", "status|modules|segments|clock|sysinfo|alignment|icon|foreground|background|luau|source"),
+    page!(Shell, "Terminal", "Shell", "shell|working directory|environment|env|term|colorterm|scrollback|glyph protocol"),
+    page!(Keys, "Terminal", "Keys", "keybindings|shortcuts|scope|global|native|tmux|sidebar|modifier remap|option as alt|record shortcut"),
+    page!(Config, "Advanced", "Config", "config|path|directory|themes|status modules|reload|last write error"),
+    page!(Diagnostics, "Advanced", "Diagnostics", "diagnostics|stability trace|trace|reload|errors"),
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -275,70 +97,126 @@ pub struct SettingsSurface {
     page: SettingsPage,
     palette: ThemePalette,
     search: String,
-    font_families: Option<Vec<String>>,
-    theme_names: Option<Vec<String>>,
+    /// Environment catalogs the pages pick from, scanned by the owner when settings opens so no
+    /// page reads the font database or the themes directory while painting.
+    font_families: Vec<String>,
+    theme_names: Vec<String>,
     appearance_variant: bootty_config::config::AppearanceVariant,
     remote_editor: remotes::EditorState,
-    /// Which keybind list is being edited (global, or one of the per-backend lists).
-    keybind_scope: keybinds::KeybindScope,
-    /// Editable rows for the loaded scope: the user layer that sits on top of the built-in defaults.
-    keybind_rows: Option<Vec<keybinds::BindingRow>>,
-    /// Whether the loaded scope drops the built-in defaults (the `clear` sentinel).
-    keybind_clear: bool,
-    /// The scope `keybind_rows`/`keybind_clear` were loaded for; reloaded when the scope changes.
-    keybind_loaded_scope: Option<keybinds::KeybindScope>,
-    /// In-progress chord capture, if any.
-    keybind_capture: Option<keybinds::ChordCapture>,
-    /// Whether the preset-prefix recorder is capturing (single combo, commits on first step).
-    prefix_capture: bool,
-    /// Editable modifier-remap rows (`from`, `to`); loaded lazily so incomplete rows persist.
-    modifier_rows: Option<Vec<(String, String)>>,
+    keybinds: keybinds::EditorState,
+    /// Editable `NAME=value` rows. Loaded lazily and kept until settings reopens, so an
+    /// incomplete pair survives an accepted rebind instead of being dropped by the write filter.
+    session_env: Option<Vec<(String, String)>>,
     /// Binding-trigger chords captured this frame from the host's direct input path, fed in by the
     /// app so the recorder can capture cmd-modified combos egui drops (⌘V, ⌘⌥X, …).
     recorder_chords: Vec<String>,
     /// Which physical modifier keys are held right now, fed in by the app each frame. Wheel steps
     /// carry no key event, so this is the only source of left/right sides for a scroll recording.
     recorder_modifier_sides: ModifierSideState,
-    /// An action the keybind editor should focus (and add a row for) on its next
-    /// frame, set by "configure this command's keybinding" from the palette.
-    pending_keybind_focus: Option<String>,
     /// The global style captured when settings opened, restored on close so the
     /// settings-only widget overrides don't leak into the main UI's popups.
     base_style: Option<egui::Style>,
     module_editor: modules::EditorState,
+    /// The accepted-config revision `config` and the writeback document were taken from.
+    /// `None` until the first sync, so a freshly opened surface always refreshes once.
+    synced_revision: Option<u64>,
 }
 
 impl SettingsSurface {
     #[must_use]
-    pub fn new(config: BoottyConfig) -> Self {
-        let writeback = writeback::SettingsWriteback::new(config.config_path.clone());
+    pub fn new(config: BoottyConfig, document: ConfigDocument) -> Self {
+        let writeback = writeback::SettingsWriteback::new(document);
         Self {
             config,
             writeback,
             page: SettingsPage::default(),
             palette: ThemePalette::default(),
             search: String::new(),
-            font_families: None,
-            theme_names: None,
+            font_families: Vec::new(),
+            theme_names: Vec::new(),
             appearance_variant: bootty_config::config::AppearanceVariant::Dark,
             remote_editor: remotes::EditorState::default(),
-            keybind_scope: keybinds::KeybindScope::Global,
-            keybind_rows: None,
-            keybind_clear: false,
-            keybind_loaded_scope: None,
-            keybind_capture: None,
-            prefix_capture: false,
-            modifier_rows: None,
+            keybinds: keybinds::EditorState::default(),
+            session_env: None,
             recorder_chords: Vec::new(),
             recorder_modifier_sides: ModifierSideState::default(),
-            pending_keybind_focus: None,
             base_style: None,
             module_editor: modules::EditorState::default(),
+            synced_revision: None,
         }
     }
 
+    /// Install the font and theme catalogs for this settings session.
+    pub fn set_catalogs(&mut self, font_families: Vec<String>, theme_names: Vec<String>) {
+        self.font_families = font_families;
+        self.theme_names = theme_names;
+    }
+
     pub fn is_recording_keybind(&self) -> bool {
-        self.keybind_capture.is_some() || self.prefix_capture
+        self.keybinds.is_recording()
+    }
+
+    /// Refresh accepted settings without discarding explicit editor drafts.
+    pub fn rebind_accepted_config(
+        &mut self,
+        config: BoottyConfig,
+        document: ConfigDocument,
+        warning: Option<String>,
+    ) {
+        self.config = config;
+        self.writeback.accept(document, warning);
+    }
+
+    pub fn reset_accepted_config(&mut self, config: BoottyConfig, document: ConfigDocument) {
+        self.config = config;
+        self.session_env = None;
+        self.writeback.accept(document, None);
+        self.module_editor.discard_created();
+    }
+
+    pub fn take_document_submission(&mut self) -> Option<ConfigDocument> {
+        self.writeback.take_submission()
+    }
+
+    pub(crate) fn take_remote_test(&mut self) -> Option<remotes::RemoteTest> {
+        self.remote_editor.take_test()
+    }
+
+    /// Module-source edits collected while painting, for the extension host to run.
+    pub(crate) fn take_module_requests(&mut self) -> Vec<ModuleSourceRequest> {
+        self.module_editor.take_requests()
+    }
+
+    pub(crate) fn apply_module_outcome(&mut self, outcome: ModuleSourceOutcome) {
+        self.module_editor.apply(outcome);
+    }
+
+    /// Whether the accepted config at `revision` still has to be copied in. An unchanged
+    /// revision spares the caller a whole-config and document clone every frame.
+    pub fn needs_accepted_config(&self, revision: u64) -> bool {
+        // A dirty draft makes the sync a no-op, so the caller should not build the copy at all.
+        !self.writeback.is_dirty() && self.synced_revision != Some(revision)
+    }
+
+    pub fn sync_accepted_config(
+        &mut self,
+        config: BoottyConfig,
+        document: ConfigDocument,
+        revision: u64,
+    ) {
+        // An in-progress draft keeps its values; the sync retries once the owner accepts it.
+        if !self.writeback.is_dirty() {
+            self.config = config;
+            self.writeback.sync_accepted(document);
+            self.synced_revision = Some(revision);
+        }
+    }
+
+    /// The owner refused this submission. Keep the exact draft, show why, and re-arm the editors
+    /// that clear their dirty flag on submit so their Apply button comes back.
+    pub fn reject_submission(&mut self, error: impl ToString) {
+        self.writeback.set_error(error);
+        self.keybinds.rearm_after_rejected_submission();
     }
 
     /// Jump to the keybindings page focused on `action` (in the Global list),
@@ -346,10 +224,8 @@ impl SettingsSurface {
     /// palette's "configure this command's keybinding" chord.
     pub fn focus_keybinding(&mut self, action: &str) {
         self.page = SettingsPage::Keys;
-        self.keybind_scope = keybinds::KeybindScope::Global;
-        // Force a reload so the row set is fresh before we locate/add the row.
-        self.keybind_loaded_scope = None;
-        self.pending_keybind_focus = Some(action.to_owned());
+        self.keybinds
+            .focus_action(keybinds::KeybindScope::Global, Some(action));
     }
 
     pub fn show(
@@ -358,6 +234,7 @@ impl SettingsSurface {
         theme: Theme,
         captured_chords: Vec<String>,
         modifier_sides: ModifierSideState,
+        sources: ModuleSources<'_>,
     ) -> SettingsAction {
         self.recorder_chords = captured_chords;
         self.recorder_modifier_sides = modifier_sides;
@@ -397,8 +274,8 @@ impl SettingsSurface {
             .ctx()
             .memory(|memory| memory.has_focus(egui::Id::new(SEARCH_ID)));
         if escape {
-            if self.keybind_capture.is_some() {
-                self.keybind_capture = None;
+            if self.keybinds.capturing_chord() {
+                self.keybinds.cancel_capture();
                 return SettingsAction::None;
             }
             if search_focused {
@@ -409,6 +286,7 @@ impl SettingsSurface {
                 return SettingsAction::None;
             }
             if ui.ctx().memory(|memory| memory.focused().is_none()) {
+                keybinds::commit_draft(self);
                 return SettingsAction::Close;
             }
         }
@@ -442,9 +320,12 @@ impl SettingsSurface {
                 UiBuilder::new()
                     .max_rect(content_rect)
                     .layout(egui::Layout::top_down(egui::Align::Min)),
-                |ui| self.settings_content(ui),
+                |ui| self.settings_content(ui, sources),
             );
         });
+        if action == SettingsAction::Close {
+            keybinds::commit_draft(self);
+        }
         action
     }
 
@@ -467,43 +348,7 @@ impl SettingsSurface {
                 bottom: 16,
             })
             .show(ui, |ui| {
-                let mut close = false;
-                // The UI font has no "←" glyph (it rendered as tofu), so draw the arrow from the
-                // icon font and fall back to text-only if the slug is ever missing.
-                let mut back = egui::text::LayoutJob::default();
-                let back_color = readable_color(self.palette.mantle, self.palette.subtext);
-                if let Some((glyph, family)) = icons::icon_glyph("arrow-left") {
-                    back.append(
-                        &glyph.to_string(),
-                        0.0,
-                        egui::text::TextFormat {
-                            font_id: egui::FontId::new(14.0, egui::FontFamily::Name(family.into())),
-                            color: back_color,
-                            valign: egui::Align::Center,
-                            ..Default::default()
-                        },
-                    );
-                }
-                back.append(
-                    "  Back to terminal",
-                    0.0,
-                    egui::text::TextFormat {
-                        font_id: egui::FontId::proportional(13.0),
-                        color: back_color,
-                        valign: egui::Align::Center,
-                        ..Default::default()
-                    },
-                );
-                if ui
-                    .add(
-                        egui::Button::new(back)
-                            .fill(self.palette.mantle)
-                            .stroke(egui::Stroke::NONE),
-                    )
-                    .clicked()
-                {
-                    close = true;
-                }
+                let close = settings_button(ui, self.palette, "Back to terminal").clicked();
 
                 ui.add_space(10.0);
                 ui.scope(|ui| {
@@ -520,13 +365,12 @@ impl SettingsSurface {
                     .show(ui, |ui| {
                         ui.set_width((ui.available_width() - 14.0).max(0.0));
                         for group in ["Core", "Terminal", "Advanced"] {
-                            let visible_pages: Vec<PageMeta> = PAGE_META
+                            let visible_pages = PAGE_META
                                 .iter()
                                 .copied()
                                 .filter(|meta| meta.group == group)
-                                .filter(|meta| query.is_empty() || page_matches(*meta, &query))
-                                .collect();
-                            if visible_pages.is_empty() {
+                                .filter(|meta| query.is_empty() || page_matches(*meta, &query));
+                            if visible_pages.clone().next().is_none() {
                                 continue;
                             }
                             ui.label(
@@ -548,60 +392,21 @@ impl SettingsSurface {
 
     fn sidebar_page_button(&mut self, ui: &mut egui::Ui, meta: PageMeta) {
         let selected = self.page == meta.page;
-        let row_height = 34.0;
-        let (rect, response) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), row_height),
-            egui::Sense::click(),
-        );
-        let fill = if selected {
-            self.palette.surface
-        } else if response.hovered() {
-            self.palette.hover
+        let tint = if selected {
+            self.palette.text
         } else {
-            self.palette.mantle
+            self.palette.subtext
         };
-        let row_radius = if selected {
-            egui::CornerRadius {
-                nw: 0,
-                ne: self.palette.radius,
-                sw: 0,
-                se: self.palette.radius,
-            }
-        } else {
-            egui::CornerRadius::same(self.palette.radius)
-        };
-        ui.painter().rect_filled(rect, row_radius, fill);
-        if selected {
-            let accent = Rect::from_min_max(
-                Pos2::new(rect.min.x, rect.min.y),
-                Pos2::new(rect.min.x + 4.0, rect.max.y),
-            );
-            ui.painter().rect_filled(accent, 0.0, self.palette.accent);
-        }
-        let tint = readable_color(
-            fill,
-            if selected {
-                self.palette.text
-            } else {
-                self.palette.subtext
-            },
-        );
-        let icon_center = Pos2::new(rect.min.x + 17.0, rect.center().y);
-        icons::paint_icon_slug(ui.painter(), meta.icon, icon_center, 15.0, tint);
-        ui.painter().text(
-            Pos2::new(rect.min.x + 40.0, rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            meta.label,
-            egui::FontId::proportional(13.0),
-            tint,
-        );
-        if response.clicked() {
+        let button = egui::Button::new(RichText::new(meta.label).color(tint))
+            .selected(selected)
+            .corner_radius(self.palette.radius);
+        if ui.add_sized([ui.available_width(), 34.0], button).clicked() {
             self.page = meta.page;
-            self.keybind_capture = None;
+            self.keybinds.cancel_capture();
         }
     }
 
-    fn settings_content(&mut self, ui: &mut egui::Ui) {
+    fn settings_content(&mut self, ui: &mut egui::Ui, sources: ModuleSources<'_>) {
         egui::Frame::NONE.fill(self.palette.base).show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("settings_content")
@@ -617,7 +422,7 @@ impl SettingsSurface {
                         })
                         .show(ui, |ui| {
                             let meta = page_meta(self.page);
-                            settings_page_header(ui, self.palette, meta.title);
+                            settings_page_header(ui, self.palette, "Bootty Settings", meta.label);
                             if let Some(error) = self.writeback.last_error().map(str::to_owned) {
                                 settings_notice(
                                     ui,
@@ -645,12 +450,9 @@ impl SettingsSurface {
                                         SettingsPage::Text => font::ui(self, ui),
                                         SettingsPage::Appearance => appearance::ui(self, ui),
                                         SettingsPage::Window => window::ui(self, ui),
-                                        SettingsPage::Sidebar => self.sidebar_ui(ui),
+                                        SettingsPage::Sidebar => self.sidebar_ui(ui, sources),
                                         SettingsPage::Shell => session::ui(self, ui),
-                                        SettingsPage::Status => {
-                                            status_preview(ui, self.palette, &self.config);
-                                            status_bar::ui(self, ui);
-                                        }
+                                        SettingsPage::Status => status_bar::ui(self, ui, sources),
                                         SettingsPage::Keys => keybinds::ui(self, ui),
                                         SettingsPage::Config => self.config_ui(ui),
                                         SettingsPage::Diagnostics => self.diagnostics_ui(ui),
@@ -728,8 +530,8 @@ impl SettingsSurface {
 
     fn config_ui(&mut self, ui: &mut egui::Ui) {
         section(ui, self.palette, "LOCATIONS");
-        path_row(ui, self.palette, "Config file", self.writeback.path());
-        if let Some(parent) = self.writeback.path().parent() {
+        path_row(ui, self.palette, "Config file", &self.config.config_path);
+        if let Some(parent) = self.config.config_path.parent() {
             path_row(ui, self.palette, "Config directory", parent);
             path_row(ui, self.palette, "Themes directory", &parent.join("themes"));
             path_row(
@@ -747,7 +549,7 @@ impl SettingsSurface {
         settings_notice(ui, self.palette.muted, status);
     }
 
-    fn sidebar_ui(&mut self, ui: &mut egui::Ui) {
+    fn sidebar_ui(&mut self, ui: &mut egui::Ui, sources: ModuleSources<'_>) {
         section(ui, self.palette, "NAVIGATION");
         settings_row(
             ui,
@@ -776,30 +578,25 @@ impl SettingsSurface {
                 }
             },
         );
-        settings_row(
+        if number_row(
             ui,
             self.palette,
-            "Width",
-            "Width of the session sidebar.",
-            |ui| {
-                let mut width = self.config.chrome.sidebar_width;
-                if settings_slider_with_edit(
-                    ui,
-                    self.palette,
-                    &mut width,
-                    NumberEditSpec {
-                        id_salt: &["chrome", "sidebar-width"],
-                        range: 120.0..=600.0,
-                        suffix: " px",
-                        precision: 1,
-                        display_scale: 1.0,
-                    },
-                ) {
-                    self.config.chrome.sidebar_width = width;
-                    self.writeback.set_f32(&["chrome", "sidebar-width"], width);
-                }
+            &mut self.config.chrome.sidebar_width,
+            NumberRow {
+                label: "Width",
+                help: "Width of the session sidebar.",
+                path: &["chrome", "sidebar-width"],
+                range: 120.0..=600.0,
+                suffix: " px",
+                scale: 1.0,
+                control: NumberControl::Slider,
             },
-        );
+        ) {
+            self.writeback.set_f32(
+                &["chrome", "sidebar-width"],
+                self.config.chrome.sidebar_width,
+            );
+        }
         settings_notice(
             ui,
             self.palette.muted,
@@ -813,11 +610,10 @@ impl SettingsSurface {
         );
         if settings_button(ui, self.palette, "Edit sidebar shortcuts").clicked() {
             self.page = SettingsPage::Keys;
-            self.keybind_scope = keybinds::KeybindScope::Sidebar;
-            self.keybind_loaded_scope = None;
-            self.keybind_capture = None;
+            self.keybinds
+                .focus_action(keybinds::KeybindScope::Sidebar, None);
         }
-        modules::sidebar_ui(self, ui);
+        modules::sidebar_ui(self, ui, sources);
     }
 
     fn diagnostics_ui(&mut self, ui: &mut egui::Ui) {
@@ -836,19 +632,17 @@ impl SettingsSurface {
                     .map(|path| path.display().to_string())
                     .unwrap_or_default();
                 if settings_text_edit(ui, self.palette, &mut trace, "path to trace log").changed() {
-                    if trace.trim().is_empty() {
-                        self.config.diagnostics.stability_trace = None;
-                        self.writeback.remove(&["diagnostics", "stability-trace"]);
-                    } else {
-                        self.config.diagnostics.stability_trace = Some(PathBuf::from(&trace));
-                        self.writeback
-                            .set_str(&["diagnostics", "stability-trace"], &trace);
-                    }
+                    self.config.diagnostics.stability_trace = nonempty(&trace).map(PathBuf::from);
+                    write_optional_text(
+                        &mut self.writeback,
+                        &["diagnostics", "stability-trace"],
+                        &trace,
+                    );
                 }
             },
         );
         section(ui, self.palette, "STATE");
-        path_row(ui, self.palette, "Config file", self.writeback.path());
+        path_row(ui, self.palette, "Config file", &self.config.config_path);
         if let Some(error) = self.writeback.last_error().map(str::to_owned) {
             settings_notice(ui, self.palette.destructive, &error);
         } else {
@@ -873,14 +667,6 @@ impl SettingsSurface {
     }
 }
 
-/// Re-resolve `win.config` from the config file so read paths (resolved shortcuts, effective
-/// prefix, theme previews) reflect what was just written.
-fn reload_settings_config(win: &mut SettingsSurface) {
-    if let Some(config) = win.writeback.reload() {
-        win.config = config;
-    }
-}
-
 fn page_meta(page: SettingsPage) -> PageMeta {
     PAGE_META
         .iter()
@@ -892,11 +678,19 @@ fn page_meta(page: SettingsPage) -> PageMeta {
 fn page_matches(meta: PageMeta, query: &str) -> bool {
     meta.group.to_ascii_lowercase().contains(query)
         || meta.label.to_ascii_lowercase().contains(query)
-        || meta.title.to_ascii_lowercase().contains(query)
-        || meta
-            .terms
-            .iter()
-            .any(|term| term.to_ascii_lowercase().contains(query))
+        || meta.terms.split('|').any(|term| term.contains(query))
+}
+
+pub(super) fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn write_optional_text(writeback: &mut writeback::SettingsWriteback, path: &[&str], value: &str) {
+    match nonempty(value) {
+        Some(value) => writeback.set_str(path, &value),
+        None => writeback.remove(path),
+    }
 }
 
 #[cfg(windows)]
@@ -904,7 +698,6 @@ fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static 
     &[
         (MultiplexerBackendConfig::Native, "native"),
         (MultiplexerBackendConfig::Rmux, "rmux"),
-        (MultiplexerBackendConfig::Zellij, "zellij"),
     ]
 }
 
@@ -914,7 +707,6 @@ fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static 
         (MultiplexerBackendConfig::Native, "native"),
         (MultiplexerBackendConfig::Rmux, "rmux"),
         (MultiplexerBackendConfig::Tmux, "tmux"),
-        (MultiplexerBackendConfig::Zellij, "zellij"),
     ]
 }
 
@@ -923,118 +715,82 @@ fn backend_token(backend: MultiplexerBackendConfig) -> &'static str {
         MultiplexerBackendConfig::Native => "native",
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
-        MultiplexerBackendConfig::Zellij => "zellij",
     }
 }
 
-fn status_preview(ui: &mut egui::Ui, palette: ThemePalette, config: &BoottyConfig) {
-    egui::Frame::NONE
-        .fill(palette.mantle)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(10, 8))
-        .show(ui, |ui| {
-            let height = config.chrome.status_height.clamp(24.0, 40.0);
-            let status_background = config
-                .chrome
-                .status_background
-                .map_or(palette.mantle, color_to_egui);
-            let mut visible = false;
-            if config.chrome.top_bar {
-                status_preview_bar(
-                    ui,
-                    palette,
-                    height,
-                    status_background,
-                    &config.chrome.top_segments,
-                );
-                visible = true;
-            }
-            if config.chrome.bottom_bar {
-                if visible {
-                    ui.add_space(6.0);
-                }
-                status_preview_bar(
-                    ui,
-                    palette,
-                    height,
-                    status_background,
-                    &config.chrome.bottom_segments,
-                );
-                visible = true;
-            }
-            if !visible {
-                ui.label(RichText::new("Both module bars are hidden.").color(palette.muted));
-            }
-        });
-    ui.add_space(10.0);
+#[derive(Clone, Copy)]
+pub(super) enum NumberControl {
+    Edit,
+    Slider,
 }
 
-fn status_preview_bar(
+pub(super) struct NumberRow<'a> {
+    pub label: &'a str,
+    pub help: &'a str,
+    pub path: &'a [&'a str],
+    pub range: std::ops::RangeInclusive<f32>,
+    pub suffix: &'a str,
+    pub scale: f32,
+    pub control: NumberControl,
+}
+
+pub(super) fn number_row(
     ui: &mut egui::Ui,
     palette: ThemePalette,
-    height: f32,
-    status_background: Color32,
-    segments: &[bootty_config::config::StatusSegment],
-) {
-    let (bar, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), height),
-        egui::Sense::hover(),
-    );
-    ui.painter().rect_filled(
-        bar,
-        egui::CornerRadius::same(palette.radius),
-        status_background,
-    );
-
-    for (align, x_anchor) in [
-        (bootty_config::config::SegmentAlign::Left, bar.left() + 10.0),
-        (bootty_config::config::SegmentAlign::Center, bar.center().x),
-        (
-            bootty_config::config::SegmentAlign::Right,
-            bar.right() - 10.0,
-        ),
-    ] {
-        let modules: Vec<_> = segments
-            .iter()
-            .filter(|segment| segment.align == align)
-            .collect();
-        let width = modules.len() as f32 * 92.0;
-        let mut x = match align {
-            bootty_config::config::SegmentAlign::Left => x_anchor,
-            bootty_config::config::SegmentAlign::Center => x_anchor - width * 0.5,
-            bootty_config::config::SegmentAlign::Right => x_anchor - width,
+    value: &mut f32,
+    row: NumberRow<'_>,
+) -> bool {
+    let mut changed = false;
+    settings_row(ui, palette, row.label, row.help, |ui| {
+        let edit = NumberEditSpec {
+            id_salt: row.path,
+            range: row.range,
+            suffix: row.suffix,
+            precision: 1,
+            display_scale: row.scale,
         };
-        for segment in modules {
-            let bg = segment.bg.map_or(palette.hover, color_to_egui);
-            let fg = readable_color(bg, segment.fg.map_or(palette.text, color_to_egui));
-            let chip =
-                Rect::from_min_size(Pos2::new(x, bar.center().y - 12.0), Vec2::new(84.0, 24.0));
-            ui.painter()
-                .rect_filled(chip, egui::CornerRadius::same(5), bg);
-            ui.painter().rect_stroke(
-                chip,
-                egui::CornerRadius::same(5),
-                egui::Stroke::new(1.0, palette.border),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().text(
-                chip.center(),
-                egui::Align2::CENTER_CENTER,
-                segment
-                    .icon
-                    .as_ref()
-                    .map_or(segment.module.as_str(), String::as_str),
-                egui::FontId::monospace(12.0),
-                fg,
-            );
-            x += 92.0;
-        }
-    }
+        changed = match row.control {
+            NumberControl::Edit => settings_number_edit(ui, palette, value, edit),
+            NumberControl::Slider => settings_slider_with_edit(ui, palette, value, edit),
+        };
+    });
+    changed
 }
 
-fn color_to_egui(color: Color) -> Color32 {
-    Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+pub(super) fn optional_number_row(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    value: &mut Option<f32>,
+    default: f32,
+    row: NumberRow<'_>,
+) -> bool {
+    let current = *value;
+    let mut concrete = current.unwrap_or(default);
+    let mut changed = false;
+    settings_row(ui, palette, row.label, row.help, |ui| {
+        let edit = NumberEditSpec {
+            id_salt: row.path,
+            range: row.range,
+            suffix: row.suffix,
+            precision: 1,
+            display_scale: row.scale,
+        };
+        let edited = match row.control {
+            NumberControl::Edit => settings_number_edit(ui, palette, &mut concrete, edit),
+            NumberControl::Slider => settings_slider_with_edit(ui, palette, &mut concrete, edit),
+        };
+        if edited {
+            *value = Some(concrete);
+            changed = true;
+        }
+        let mut automatic = current.is_none();
+        if settings_toggle(ui, palette, &mut automatic) {
+            *value = (!automatic).then_some(concrete);
+            changed = true;
+        }
+        ui.label(RichText::new("Auto").color(palette.muted));
+    });
+    changed
 }
 
 fn sidebar_color_row(
@@ -1046,25 +802,15 @@ fn sidebar_color_row(
     seed: Color32,
     field: fn(&mut bootty_config::config::SidebarConfig) -> &mut Option<Color>,
 ) {
-    settings_row(ui, win.palette, label, help, |ui| {
-        let current = *field(&mut win.config.sidebar);
-        let mut rgb = current.map_or([seed.r(), seed.g(), seed.b()], |color| {
-            [color.r, color.g, color.b]
-        });
-        if settings_color_picker(ui, win.palette, &mut rgb).changed() {
-            *field(&mut win.config.sidebar) = Some(Color {
-                r: rgb[0],
-                g: rgb[1],
-                b: rgb[2],
-                a: 0xff,
-            });
-            win.writeback.set_color(path, rgb);
-        }
-        if current.is_some() && settings_button(ui, win.palette, "Reset").clicked() {
-            *field(&mut win.config.sidebar) = None;
-            win.writeback.remove(path);
-        }
-    });
+    let palette = win.palette;
+    optional_color_row(
+        &mut win.writeback,
+        ui,
+        palette,
+        (label, help),
+        (path, seed),
+        field(&mut win.config.sidebar),
+    );
 }
 
 fn chrome_color_row(
@@ -1076,25 +822,82 @@ fn chrome_color_row(
     seed: Color32,
     field: fn(&mut bootty_config::config::ChromeConfig) -> &mut Option<Color>,
 ) {
-    settings_row(ui, win.palette, label, help, |ui| {
-        let current = *field(&mut win.config.chrome);
-        let mut rgb = current.map_or([seed.r(), seed.g(), seed.b()], |color| {
-            [color.r, color.g, color.b]
-        });
-        if settings_color_picker(ui, win.palette, &mut rgb).changed() {
-            *field(&mut win.config.chrome) = Some(Color {
-                r: rgb[0],
-                g: rgb[1],
-                b: rgb[2],
-                a: 0xff,
-            });
-            win.writeback.set_color(path, rgb);
-        }
-        if current.is_some() && settings_button(ui, win.palette, "Reset").clicked() {
-            *field(&mut win.config.chrome) = None;
-            win.writeback.remove(path);
+    let palette = win.palette;
+    optional_color_row(
+        &mut win.writeback,
+        ui,
+        palette,
+        (label, help),
+        (path, seed),
+        field(&mut win.config.chrome),
+    );
+}
+
+fn optional_color_row(
+    writeback: &mut writeback::SettingsWriteback,
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    description: (&str, &str),
+    storage: (&[&str], Color32),
+    current: &mut Option<Color>,
+) {
+    let (label, help) = description;
+    let (path, seed) = storage;
+    settings_row(ui, palette, label, help, |ui| {
+        if optional_color_edit(ui, palette, current, seed, false, path) {
+            match *current {
+                Some(color) => writeback.set_color_value(path, color),
+                None => writeback.remove(path),
+            }
         }
     });
+}
+
+/// Edit an inherited color in place. `alpha` adds the opacity control used by pane focus borders.
+pub(super) fn optional_color_edit(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    color: &mut Option<Color>,
+    seed: Color32,
+    alpha: bool,
+    id_salt: &[&str],
+) -> bool {
+    let mut next = color.unwrap_or(Color {
+        r: seed.r(),
+        g: seed.g(),
+        b: seed.b(),
+        a: seed.a(),
+    });
+    let mut rgb = [next.r, next.g, next.b];
+    let mut changed = settings_color_picker(ui, palette, &mut rgb).changed();
+    next.r = rgb[0];
+    next.g = rgb[1];
+    next.b = rgb[2];
+    if alpha {
+        ui.label(RichText::new("Opacity").color(palette.muted));
+        let mut opacity = f32::from(next.a) / 255.0;
+        changed |= settings_number_edit(
+            ui,
+            palette,
+            &mut opacity,
+            NumberEditSpec {
+                id_salt,
+                range: 0.0..=1.0,
+                suffix: "%",
+                precision: 0,
+                display_scale: 100.0,
+            },
+        );
+        next.a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    if changed {
+        *color = Some(next);
+    }
+    if color.is_some() && settings_button(ui, palette, "Reset").clicked() {
+        *color = None;
+        changed = true;
+    }
+    changed
 }
 
 fn chrome_color_row_with_alpha(
@@ -1107,45 +910,12 @@ fn chrome_color_row_with_alpha(
     field: fn(&mut bootty_config::config::ChromeConfig) -> &mut Option<Color>,
 ) {
     settings_row(ui, win.palette, label, help, |ui| {
-        let current = *field(&mut win.config.chrome);
-        let mut next = current.unwrap_or(Color {
-            r: seed.r(),
-            g: seed.g(),
-            b: seed.b(),
-            a: seed.a(),
-        });
-        let mut rgb = [next.r, next.g, next.b];
-        let mut changed = false;
-        if settings_color_picker(ui, win.palette, &mut rgb).changed() {
-            next.r = rgb[0];
-            next.g = rgb[1];
-            next.b = rgb[2];
-            changed = true;
-        }
-        ui.label(RichText::new("Opacity").color(win.palette.muted));
-        let mut opacity = f32::from(next.a) / 255.0;
-        if settings_number_edit(
-            ui,
-            win.palette,
-            &mut opacity,
-            NumberEditSpec {
-                id_salt: path,
-                range: 0.0..=1.0,
-                suffix: "%",
-                precision: 0,
-                display_scale: 100.0,
-            },
-        ) {
-            next.a = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
-            changed = true;
-        }
-        if changed {
-            *field(&mut win.config.chrome) = Some(next);
-            win.writeback.set_color_value(path, next);
-        }
-        if current.is_some() && settings_button(ui, win.palette, "Reset").clicked() {
-            *field(&mut win.config.chrome) = None;
-            win.writeback.remove(path);
+        let color = field(&mut win.config.chrome);
+        if optional_color_edit(ui, win.palette, color, seed, true, path) {
+            match *color {
+                Some(color) => win.writeback.set_color_value(path, color),
+                None => win.writeback.remove(path),
+            }
         }
     });
 }

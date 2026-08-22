@@ -72,26 +72,29 @@ fn bootty_rmux_process_environment_with_terminfo(terminfo_dir: Option<&Path>) ->
     environment
 }
 
-fn apply_bootty_rmux_environment_to_window<'a>(
-    mut builder: rmux_sdk::NewWindowBuilder<'a>,
-) -> rmux_sdk::NewWindowBuilder<'a> {
-    for entry in bootty_rmux_process_environment() {
-        if let Some((name, value)) = entry.split_once('=') {
-            builder = builder.env(name, value);
+macro_rules! with_bootty_rmux_environment {
+    ($builder:expr) => {{
+        let mut builder = $builder;
+        for entry in bootty_rmux_process_environment() {
+            if let Some((name, value)) = entry.split_once('=') {
+                builder = builder.env(name, value);
+            }
         }
-    }
-    builder
+        builder
+    }};
 }
 
-fn apply_bootty_rmux_environment_to_split<'a>(
-    mut builder: rmux_sdk::PaneSplitBuilder<'a>,
-) -> rmux_sdk::PaneSplitBuilder<'a> {
-    for entry in bootty_rmux_process_environment() {
-        if let Some((name, value)) = entry.split_once('=') {
-            builder = builder.env(name, value);
+macro_rules! retry_rmux_operation {
+    ($state:ident, $first:expr, $retry:expr) => {{
+        match ($first).await {
+            Ok(value) => Ok(value),
+            Err(error) if should_retry_rmux_error(&error) => {
+                $state.rmux = None;
+                ($retry).await
+            }
+            Err(error) => Err(error),
         }
-    }
-    builder
+    }};
 }
 
 struct RmuxBridge {
@@ -368,15 +371,11 @@ impl RmuxBridgeState {
     }
 
     async fn snapshot(&mut self) -> Result<MuxSnapshot> {
-        let first = self.snapshot_current_sessions().await;
-        match first {
-            Ok(snapshot) => Ok(snapshot),
-            Err(error) if should_retry_rmux_error(&error) => {
-                self.rmux = None;
-                self.snapshot_current_sessions().await
-            }
-            Err(error) => Err(error),
-        }
+        retry_rmux_operation!(
+            self,
+            self.snapshot_current_sessions(),
+            self.snapshot_current_sessions()
+        )
     }
 
     async fn snapshot_current_sessions(&mut self) -> Result<MuxSnapshot> {
@@ -397,15 +396,11 @@ impl RmuxBridgeState {
     }
 
     async fn execute(&mut self, command: MuxCommand) -> Result<()> {
-        let first = self.execute_once(command.clone()).await;
-        match first {
-            Ok(()) => Ok(()),
-            Err(error) if should_retry_rmux_error(&error) => {
-                self.rmux = None;
-                self.execute_once(command).await
-            }
-            Err(error) => Err(error),
-        }
+        retry_rmux_operation!(
+            self,
+            self.execute_once(command.clone()),
+            self.execute_once(command)
+        )
     }
 
     async fn execute_once(&mut self, command: MuxCommand) -> Result<()> {
@@ -482,8 +477,7 @@ impl RmuxBridgeState {
             | MuxCommand::TogglePaneZoom { .. } => {
                 anyhow::bail!("rmux backend does not support mux command {command:?}")
             }
-        }?;
-        Ok(())
+        }
     }
 
     async fn ensure_session(&mut self, session_name: &str, cwd: &str) -> Result<()> {
@@ -548,9 +542,8 @@ impl RmuxBridgeState {
         let name = SessionName::new(session_name).context("invalid rmux session name")?;
         let window_index = append_window_index(&list_window_rows(rmux, &name).await?);
         let session = rmux.session(name).await?;
-        let mut builder = apply_bootty_rmux_environment_to_window(
-            session.new_window_with().at_index(window_index),
-        );
+        let mut builder =
+            with_bootty_rmux_environment!(session.new_window_with().at_index(window_index));
         if let Some(cwd) = cwd {
             builder = builder.cwd(cwd);
         }
@@ -637,7 +630,7 @@ impl RmuxBridgeState {
             MuxSplitDirection::Right => SdkSplitDirection::Right,
             MuxSplitDirection::Down => SdkSplitDirection::Down,
         };
-        apply_bootty_rmux_environment_to_split(pane.split_with(direction)).await?;
+        with_bootty_rmux_environment!(pane.split_with(direction)).await?;
         Ok(())
     }
 
@@ -656,15 +649,11 @@ impl RmuxBridgeState {
 
     #[cfg(feature = "app")]
     async fn resize_window(&mut self, window_id: &str, cols: u16, rows: u16) -> Result<()> {
-        let first = self.resize_window_once(window_id, cols, rows).await;
-        match first {
-            Ok(()) => Ok(()),
-            Err(error) if should_retry_rmux_error(&error) => {
-                self.rmux = None;
-                self.resize_window_once(window_id, cols, rows).await
-            }
-            Err(error) => Err(error),
-        }
+        retry_rmux_operation!(
+            self,
+            self.resize_window_once(window_id, cols, rows),
+            self.resize_window_once(window_id, cols, rows)
+        )
     }
 
     #[cfg(feature = "app")]

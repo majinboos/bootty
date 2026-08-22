@@ -9,10 +9,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 bootty-surface = { path = "../bootty-surface", default-features = false }
 egui.workspace = true
-png.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
 syntect.workspace = true
 tuirealm.workspace = true
 wasm-bindgen.workspace = true
-

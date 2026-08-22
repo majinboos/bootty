@@ -9,7 +9,7 @@ use std::{
 use bootty_config::color::Color;
 use bootty_config::config::{
     SegmentAlign, SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment,
-    load_config_from_path, update_config_document,
+    commit_config_document, load_config_document, load_config_from_path, update_config_document,
 };
 
 #[test]
@@ -168,6 +168,61 @@ fn a_pre_replacement_error_keeps_the_existing_file() {
 
     assert_eq!(error.to_string(), "config writeback path cannot be empty");
     assert_eq!(fs::read_to_string(&path).expect("read config"), original);
+}
+
+#[test]
+fn whole_document_commit_validates_before_replacement() {
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let path = directory.path().join("config.toml");
+    let original = "# keep me\n[window]\ntitle = \"old\"\n";
+    fs::write(&path, original).expect("write initial config");
+    let mut candidate = load_config_document(&path)
+        .expect("load candidate")
+        .expect("existing document");
+    candidate
+        .set_str(&["window", "fullscreen"], "invalid")
+        .expect("edit candidate");
+
+    commit_config_document(&path, candidate, |_| Ok(()))
+        .expect_err("reject invalid resolved config");
+
+    assert_eq!(fs::read_to_string(&path).expect("read config"), original);
+    assert_eq!(
+        load_config_from_path(&path)
+            .expect("live config remains valid")
+            .window
+            .title,
+        "old"
+    );
+
+    let mut candidate = load_config_document(&path)
+        .expect("reload candidate")
+        .expect("existing document");
+    candidate
+        .set_str(&["window", "title"], "rejected")
+        .expect("edit valid candidate");
+    commit_config_document(&path, candidate, |_| {
+        Err::<(), _>("app validation failed".into())
+    })
+    .expect_err("reject app-owned validation");
+    assert_eq!(fs::read_to_string(&path).expect("read config"), original);
+
+    let mut candidate = load_config_document(&path)
+        .expect("reload candidate")
+        .expect("existing document");
+    candidate
+        .set_str(&["window", "title"], "accepted")
+        .expect("edit accepted candidate");
+    let (accepted, marker) = commit_config_document(&path, candidate, |_| Ok("validated"))
+        .expect("commit whole document");
+    assert_eq!(marker, "validated");
+    assert_eq!(accepted.config.window.title, "accepted");
+    assert!(accepted.document.contains(&["window", "title"]));
+    assert!(
+        fs::read_to_string(&path)
+            .expect("read committed config")
+            .starts_with("# keep me")
+    );
 }
 
 #[test]

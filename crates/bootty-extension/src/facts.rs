@@ -272,6 +272,13 @@ impl ExtensionFacts {
         true
     }
 
+    pub(crate) fn theme(&self) -> Vec<(String, String)> {
+        self.theme
+            .read()
+            .map(|theme| theme.clone())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn set_theme(&self, theme: Vec<(String, String)>) -> bool {
         let Ok(mut current) = self.theme.write() else {
             return false;

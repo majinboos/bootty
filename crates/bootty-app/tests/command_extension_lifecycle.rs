@@ -108,12 +108,10 @@ fn wait_for_surface_text(catalog: &bootty_extension::ExtensionCatalog, expected:
 }
 
 fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction {
-    let published = host
+    let (footer_items, body_items): (Vec<_>, Vec<_>) = host
         .surface(SurfacePlacement::Sidebar, "actions")
         .expect("published sidebar surface")
-        .into_items();
-    let (footer_items, body_items): (Vec<_>, Vec<_>) = published
-        .into_iter()
+        .items()
         .partition(|item| item.item.kind.as_deref() == Some("footer"));
     let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1));
     let rows = build_sidebar_items_from_published_items(&body_items, scope, None, false);
@@ -145,7 +143,6 @@ fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction
                                     items: &rows,
                                     footer_items: &footer_items,
                                     session_count: 1,
-                                    has_sessions: true,
                                     title_visible: false,
                                     reserve_titlebar_buttons: false,
                                     title_icon: None,

@@ -6,7 +6,9 @@ use anyhow::Result;
 use bootty_command::{BoundAppCommandSender, Caller};
 use bootty_config::config::{AppearanceVariant, BoottyConfig};
 use bootty_control::ControlPlane;
-use bootty_extension::{ExtensionHost, ExtensionUiAction, ModuleItem, SurfacePlacement};
+use bootty_extension::{
+    ExtensionHost, ExtensionUiAction, ModuleItem, PublishedSurfaceSnapshot, SurfacePlacement,
+};
 use bootty_winit::direct_input::{
     DirectKeyInput, ModifierSideState, suppress_egui_events_for_direct_input,
 };
@@ -19,14 +21,11 @@ use crate::ui::chrome::ChromeRuntime;
 use crate::{
     menu::AppMenu,
     theme::theme_tokens,
-    ui::settings::{SettingsAction, SettingsSurface},
+    ui::{
+        ModalDialog, ModalKind,
+        settings::{SettingsAction, SettingsSurface},
+    },
 };
-
-fn sync_global_egui_style(ctx: &egui::Context, theme: bootty_ui::Theme) {
-    let mut style = (*ctx.global_style()).clone();
-    bootty_ui::configure_style(&mut style, theme);
-    ctx.set_global_style(style);
-}
 
 pub struct BoottyApp {
     state: AppState,
@@ -53,8 +52,6 @@ impl BoottyApp {
         modifier_side_rx: mpsc::Receiver<ModifierSideState>,
         control_plane: ControlPlane,
     ) -> Result<Self> {
-        let direct_input_rx = Some(direct_input_rx);
-        let modifier_side_rx = Some(modifier_side_rx);
         configure_egui_fonts(&cc.egui_ctx, config.font.ui_families());
         let repaint_ctx = cc.egui_ctx.clone();
         let repaint: bootty_mux::RepaintHandle =
@@ -70,31 +67,33 @@ impl BoottyApp {
         // user `.lua` / `.luau` files override same-named defaults per extension surface.
         let startup_variant = config.appearance.mode.variant(AppearanceVariant::Dark);
         let extension_theme = theme_tokens(&config, startup_variant);
-        let config_dir = config
+        let extension_root = config
             .config_path
             .parent()
-            .unwrap_or(std::path::Path::new("."));
+            .unwrap_or(std::path::Path::new("."))
+            .join("extensions");
         let state = AppState::new_for_window(
-            config.clone(),
+            config,
             window_state_key,
             backends,
             repaint,
-            direct_input_rx,
-            modifier_side_rx,
+            Some(direct_input_rx),
+            Some(modifier_side_rx),
         )?;
         let extensions = ExtensionHost::load_with_ui(
-            &config_dir.join("extensions"),
+            &extension_root,
             state.command_catalog().extensions_arc(),
             state.app_command_sender(Caller::Luau),
             control_plane.extension_event_sender(),
             extension_theme.clone(),
             bootty_config::config::default_working_directory(),
         );
+        let settings = SettingsSurface::new(state.config().clone(), state.config_document());
         Ok(Self {
             state,
             terminal_view,
             chrome: ChromeRuntime::default(),
-            settings: SettingsSurface::new(config.clone()),
+            settings,
             error_details_open: false,
             _menu: crate::menu::install(),
             extensions,
@@ -130,6 +129,16 @@ impl BoottyApp {
     }
 
     fn open_settings(&mut self, ctx: &egui::Context) {
+        if !self.state.settings_open() {
+            self.settings
+                .reset_accepted_config(self.state.config().clone(), self.state.config_document());
+            // Scanning the font database and the themes directory happens here, once per open,
+            // never from a page's paint.
+            self.settings.set_catalogs(
+                bootty_render::font_database::installed_family_names(),
+                bootty_config::config::available_theme_names(&self.state.config().config_path),
+            );
+        }
         self.state.set_settings_open(true);
         ctx.request_repaint();
     }
@@ -141,14 +150,59 @@ impl BoottyApp {
             self.settings.restore_global_style(ui.ctx());
             return;
         }
+        let revision = self.state.config_revision();
+        if self.settings.needs_accepted_config(revision) {
+            self.settings.sync_accepted_config(
+                self.state.config().clone(),
+                self.state.config_document(),
+                revision,
+            );
+        }
         let theme = self.state.ui_theme();
         let captured_chords = self.state.take_settings_capture_chords();
         let modifier_sides = self.state.modifier_sides();
-        if self
-            .settings
-            .show(ui, theme, captured_chords, modifier_sides)
-            == SettingsAction::Close
-        {
+        let action = self.settings.show(
+            ui,
+            theme,
+            captured_chords,
+            modifier_sides,
+            self.extensions.module_sources(),
+        );
+        for request in self.settings.take_module_requests() {
+            let outcome = self.extensions.apply_module_source_request(request);
+            self.settings.apply_module_outcome(outcome);
+            ui.ctx().request_repaint();
+        }
+        if let Some((profile, sender)) = self.settings.take_remote_test() {
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+                let result = crate::remote_catalog::list_remote(&profile)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(result);
+                ctx.request_repaint();
+            });
+        }
+        let accepted = if let Some(document) = self.settings.take_document_submission() {
+            match self.state.commit_settings_document(document) {
+                Ok((document, warning, effects)) => {
+                    self.apply_effects(ui.ctx(), effects);
+                    self.settings.rebind_accepted_config(
+                        self.state.config().clone(),
+                        document,
+                        warning,
+                    );
+                    true
+                }
+                Err(error) => {
+                    self.settings.reject_submission(&error);
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if action == SettingsAction::Close && accepted {
             self.state.set_settings_open(false);
             self.settings.restore_global_style(ui.ctx());
             ui.ctx().request_repaint();
@@ -158,9 +212,7 @@ impl BoottyApp {
     fn apply_effects(&mut self, ctx: &egui::Context, effects: Vec<AppEffect>) {
         for effect in effects {
             match effect {
-                AppEffect::CloseWindow => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                AppEffect::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                 AppEffect::QuitApplication => {
                     let viewport_ids =
                         ctx.input(|input| input.raw.viewports.keys().copied().collect::<Vec<_>>());
@@ -169,25 +221,23 @@ impl BoottyApp {
                     }
                 }
                 AppEffect::SetWindowTitle(title) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title))
                 }
                 AppEffect::SetFullscreen(fullscreen) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fullscreen))
                 }
                 AppEffect::SetMaximized(maximized) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(maximized))
                 }
                 AppEffect::SetDecorations(decorations) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(decorations));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(decorations))
                 }
-                AppEffect::RequestCopy => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy);
-                }
+                AppEffect::RequestCopy => ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy),
                 AppEffect::RequestRepaint => ctx.request_repaint(),
                 AppEffect::Bell => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                         egui::UserAttentionType::Informational,
-                    ));
+                    ))
                 }
                 AppEffect::RepaintAfter(after) => ctx.request_repaint_after(after),
                 AppEffect::SetTerminalTextConfig(text_config) => {
@@ -196,15 +246,9 @@ impl BoottyApp {
                 AppEffect::SetTerminalCursorIcon(icon) => {
                     self.terminal_view.set_cursor_icon(icon);
                 }
-                AppEffect::SetUiFonts(families) => {
-                    configure_egui_fonts(ctx, &families);
-                }
-                AppEffect::SetWindowFocus => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                AppEffect::OpenUrl(url) => {
-                    ctx.open_url(egui::OpenUrl::new_tab(url));
-                }
+                AppEffect::SetUiFonts(families) => configure_egui_fonts(ctx, &families),
+                AppEffect::SetWindowFocus => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+                AppEffect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
                 AppEffect::OpenSettings => self.open_settings(ctx),
                 AppEffect::ConfigureKeybind(action) => {
                     self.open_settings(ctx);
@@ -215,11 +259,12 @@ impl BoottyApp {
     }
 
     fn show_modal_dialog(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.state.take_modal_dialog() else {
+        let Some(kind) = self.state.modal_dialog().map(ModalDialog::kind) else {
             return;
         };
-        match dialog {
-            crate::ModalDialog::NewSession(mut dialog) => {
+        let theme = self.state.ui_theme();
+        match kind {
+            ModalKind::NewSession => {
                 let open_cwds = self
                     .state
                     .mux()
@@ -227,51 +272,95 @@ impl BoottyApp {
                     .iter()
                     .filter_map(|session| session.anchor.cwd.clone())
                     .collect::<Vec<_>>();
-                let event = dialog.show(ctx, self.state.ui_theme(), &open_cwds);
-                self.state.apply_picker_event(dialog, event);
-            }
-            crate::ModalDialog::SpaceEditor(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                self.state.apply_space_editor_event(dialog, event);
-            }
-            crate::ModalDialog::SessionPicker(mut dialog) => {
-                let groups = self.state.session_finder_groups();
-                let event = dialog.show(ctx, self.state.ui_theme(), &groups);
-                self.state.apply_session_picker_event(dialog, event);
-            }
-            crate::ModalDialog::RenameSession(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                self.state.apply_rename_session_event(dialog, event);
-            }
-            crate::ModalDialog::RenameTab(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                self.state.apply_rename_tab_event(dialog, event);
-            }
-            crate::ModalDialog::DitchSession(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                self.state.apply_ditch_session_event(dialog, event);
-            }
-            crate::ModalDialog::KeybindHelp(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                self.state.apply_keybind_help_event(dialog, event);
-            }
-            crate::ModalDialog::CommandPalette(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                let run = matches!(
-                    event,
-                    crate::ui::command_palette::CommandPaletteEvent::Run(_)
-                );
-                self.state.apply_command_palette_event(dialog, event);
-                if run {
-                    ctx.request_repaint();
+                let Some(ModalDialog::NewSession(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme, &open_cwds);
+                if let Some(event) = event {
+                    self.state.apply_picker_event(event);
                 }
             }
-            crate::ModalDialog::ThemePicker(mut dialog) => {
-                let event = dialog.show(ctx, self.state.ui_theme());
-                let mut effects = Vec::new();
-                self.state
-                    .apply_theme_picker_event(dialog, event, &mut effects);
-                self.apply_effects(ctx, effects);
+            ModalKind::SpaceEditor => {
+                let Some(ModalDialog::SpaceEditor(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let intent = dialog.show(ctx, theme);
+                if let Some(intent) = intent {
+                    self.state.apply_space_editor_intent(intent);
+                }
+            }
+            ModalKind::SessionPicker => {
+                let groups = self.state.session_finder_groups();
+                let Some(ModalDialog::SessionPicker(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme, &groups);
+                if let Some(event) = event {
+                    self.state.apply_session_picker_event(event);
+                }
+            }
+            ModalKind::RenameSession => {
+                let Some(ModalDialog::RenameSession(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme);
+                if let Some(event) = event {
+                    self.state.apply_rename_session_event(event);
+                }
+            }
+            ModalKind::RenameTab => {
+                let Some(ModalDialog::RenameTab(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme);
+                if let Some(event) = event {
+                    self.state.apply_rename_tab_event(event);
+                }
+            }
+            ModalKind::DitchSession => {
+                let Some(ModalDialog::DitchSession(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme);
+                if let Some(event) = event {
+                    self.state.apply_ditch_session_event(event);
+                }
+            }
+            ModalKind::KeybindHelp => {
+                let Some(ModalDialog::KeybindHelp(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                if dialog.show(ctx, theme) {
+                    self.state.dismiss_keybind_help();
+                }
+            }
+            ModalKind::CommandPalette => {
+                let Some(ModalDialog::CommandPalette(dialog)) = self.state.modal_dialog_mut()
+                else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme);
+                if let Some(event) = event {
+                    let run = matches!(
+                        event,
+                        crate::ui::command_palette::CommandPaletteEvent::Run(_)
+                    );
+                    self.state.apply_command_palette_event(event);
+                    if run {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            ModalKind::ThemePicker => {
+                let Some(ModalDialog::ThemePicker(dialog)) = self.state.modal_dialog_mut() else {
+                    return;
+                };
+                let event = dialog.show(ctx, theme);
+                if let Some(event) = event {
+                    let mut effects = Vec::new();
+                    self.state.apply_theme_picker_event(event, &mut effects);
+                    self.apply_effects(ctx, effects);
+                }
             }
         }
     }
@@ -292,7 +381,6 @@ impl BoottyApp {
     }
 
     fn show_extension_surfaces(&mut self, ctx: &egui::Context) {
-        let mut actions = Vec::new();
         for surface in self.extensions.surfaces(SurfacePlacement::Floating) {
             let mut action = None;
             egui::Window::new(surface.snapshot.declaration.id.clone())
@@ -306,7 +394,7 @@ impl BoottyApp {
                     action = show_extension_surface_items(ui, &surface.snapshot.items);
                 });
             if let Some(action) = action {
-                actions.push((surface, action));
+                self.submit_extension_action(surface, action);
             }
         }
         for surface in self.extensions.surfaces(SurfacePlacement::Docked) {
@@ -325,18 +413,19 @@ impl BoottyApp {
                 });
             });
             if let Some(action) = action {
-                actions.push((surface, action));
+                self.submit_extension_action(surface, action);
             }
         }
-        for (surface, action) in actions {
-            let _ = self.extensions.submit_ui_action(ExtensionUiAction {
-                module: surface.module,
-                generation: surface.generation,
-                surface: surface.snapshot.declaration.id,
-                action,
-                payload: serde_json::Value::Null,
-            });
-        }
+    }
+
+    fn submit_extension_action(&mut self, surface: PublishedSurfaceSnapshot, action: String) {
+        let _ = self.extensions.submit_ui_action(ExtensionUiAction {
+            module: surface.module,
+            generation: surface.generation,
+            surface: surface.snapshot.declaration.id,
+            action,
+            payload: serde_json::Value::Null,
+        });
     }
 }
 
@@ -355,16 +444,6 @@ fn show_extension_surface_items(ui: &mut egui::Ui, items: &[ModuleItem]) -> Opti
         }
     }
     selected
-}
-
-fn suppress_settings_recorder_duplicates(
-    events: &mut Vec<egui::Event>,
-    direct_inputs: &[bootty_winit::direct_input::DirectKeyInput],
-    recording: bool,
-) {
-    if recording {
-        suppress_egui_events_for_direct_input(events, direct_inputs);
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,18 +474,15 @@ fn error_toast_text(error: &str) -> ErrorToastText {
 impl eframe::App for BoottyApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.state.drain_direct_input();
-        self.state.set_extension_overlay_open(
-            !self
-                .extensions
-                .surfaces(SurfacePlacement::Floating)
-                .is_empty(),
-        );
+        self.state
+            .set_extension_overlay_open(self.extensions.has_surfaces(SurfacePlacement::Floating));
         if self.state.settings_open() {
-            suppress_settings_recorder_duplicates(
-                &mut raw_input.events,
-                self.state.pending_direct_input(),
-                self.settings.is_recording_keybind(),
-            );
+            if self.settings.is_recording_keybind() {
+                suppress_egui_events_for_direct_input(
+                    &mut raw_input.events,
+                    self.state.pending_direct_input(),
+                );
+            }
             return;
         }
         if self.state.direct_input_suppresses_egui_events() {
@@ -447,16 +523,15 @@ impl eframe::App for BoottyApp {
                 input.zoom_delta(),
             )
         });
-        if self.state.settings_open() {
-            suppress_terminal_payload_for_settings(&mut events, &mut dropped_file_paths);
+        let settings_open = self.state.settings_open();
+        if settings_open {
+            events.clear();
+            dropped_file_paths.clear();
         }
 
-        let terminal_view = self.terminal_view.update_input(
-            !self.state.settings_open(),
-            zoom_delta,
-            hover_pos,
-            &mut events,
-        );
+        let terminal_view =
+            self.terminal_view
+                .update_input(!settings_open, zoom_delta, hover_pos, &mut events);
 
         let now = Instant::now();
         self.extensions.refresh(now);
@@ -498,18 +573,52 @@ impl eframe::App for BoottyApp {
         self.state.set_appearance_variant(variant);
         self.sync_extension_theme(ui.ctx());
         let theme = self.state.ui_theme();
-        sync_global_egui_style(ui.ctx(), theme);
+        let mut style = (*ui.ctx().global_style()).clone();
+        bootty_ui::configure_style(&mut style, theme);
+        ui.ctx().set_global_style(style);
         let palette = theme.palette;
         egui::Frame::NONE.fill(palette.mantle).show(ui, |ui| {
             if self.state.settings_open() {
                 self.show_settings(ui);
             } else {
-                self.chrome.show(
+                // Apply session-order changes any extension module requested via
+                // `bootty.reorder_session` before publishing the snapshot, so the reordered
+                // sessions render on the next tick.
+                for reorder in self.extensions.take_session_reorders() {
+                    self.state
+                        .reorder_session_before(&reorder.source, reorder.before.as_deref());
+                }
+                let projection = crate::chrome_frame::prepare(
+                    &self.state,
+                    self.state.config().chrome.sidebar,
+                    self.window_focused,
+                );
+                self.extensions.update_mux(projection.mux);
+                let frame = self.chrome.show(
                     ui,
+                    &self.state,
+                    &self.extensions,
+                    projection.tab_context.as_ref(),
+                    self.terminal_view.cell_height(),
+                );
+                // Chrome interactions land before the terminal is painted, so a session or Space
+                // switch shows its own terminal in the same frame.
+                let effects = crate::chrome_frame::apply(
+                    ui.ctx(),
                     &mut self.state,
                     &mut self.extensions,
-                    &mut self.terminal_view,
-                    self.window_focused,
+                    frame.events,
+                );
+                self.apply_effects(ui.ctx(), effects);
+                self.state.set_chrome_handles(frame.handles);
+                let terminal = frame.terminal;
+                self.terminal_view.show(
+                    &mut self.state,
+                    ui,
+                    terminal.rect,
+                    terminal.palette,
+                    terminal.pane_backing_color,
+                    terminal.notch_chrome_color,
                 );
             }
         });
@@ -577,14 +686,6 @@ impl eframe::App for BoottyApp {
         let cursor_icon = ui.ctx().output(|output| output.cursor_icon);
         bootty_winit::window::set_macos_cursor_icon(cursor_icon);
     }
-}
-
-fn suppress_terminal_payload_for_settings(
-    events: &mut Vec<egui::Event>,
-    dropped_file_paths: &mut Vec<PathBuf>,
-) {
-    events.clear();
-    dropped_file_paths.clear();
 }
 
 fn configure_egui_fonts(ctx: &egui::Context, families: &[String]) {

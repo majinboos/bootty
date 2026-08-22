@@ -40,7 +40,6 @@ struct PaneBounds {
 enum MuxEquivalent {
     Native,
     Tmux,
-    Zellij,
 }
 
 impl MuxEquivalent {
@@ -48,7 +47,6 @@ impl MuxEquivalent {
         match self {
             Self::Native => "native",
             Self::Tmux => "tmux",
-            Self::Zellij => "zellij",
         }
     }
 
@@ -56,16 +54,11 @@ impl MuxEquivalent {
         match self {
             Self::Native => "bootty",
             Self::Tmux => "tmux",
-            Self::Zellij => "zellij",
         }
     }
 }
 
-const MUX_EQUIVALENTS: [MuxEquivalent; 3] = [
-    MuxEquivalent::Native,
-    MuxEquivalent::Tmux,
-    MuxEquivalent::Zellij,
-];
+const MUX_EQUIVALENTS: [MuxEquivalent; 2] = [MuxEquivalent::Native, MuxEquivalent::Tmux];
 
 fn pane_grid_for(count: usize) -> (usize, usize) {
     match count {
@@ -260,26 +253,6 @@ fn write_mux_equivalent_chrome(
                 &format!(
                     "\x1b[48;5;236;38;5;252m {prefix}: panes={pane_count} ctrl-b passthrough tick={tick:08x} {}\x1b[0m",
                     " ".repeat(PANE_COLS.saturating_sub(64) as usize)
-                ),
-            );
-        }
-        MuxEquivalent::Zellij => {
-            write_at(
-                engine,
-                1,
-                1,
-                &format!(
-                    "\x1b[48;5;55;38;5;231m zellij mode tabs={tab_count} active={active_tab:02} resize=locked {}\x1b[0m",
-                    " ".repeat(PANE_COLS.saturating_sub(58) as usize)
-                ),
-            );
-            write_at(
-                engine,
-                PANE_ROWS,
-                1,
-                &format!(
-                    "\x1b[48;5;238;38;5;252m Alt-n new-pane Alt-hjkl focus tick={tick:08x} panes={pane_count} {}\x1b[0m",
-                    " ".repeat(PANE_COLS.saturating_sub(72) as usize)
                 ),
             );
         }

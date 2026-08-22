@@ -9,14 +9,14 @@ use std::{
 
 use crate::{
     app_actions::{AppAction, KeybindAction, MuxKeyAction},
-    commands::{CommandCatalog, CommandExecutor, CoreCommandExecutor},
+    commands::{CommandCatalog, CommandExecutor, CoreCommandExecutor, ExactMuxTarget},
     state::{AppEffect, AppState, ViewportSnapshot},
     workspace_runtime::WorkspaceRuntime,
 };
 use bootty_command::{
-    AppCommandReceiver, AppCommandRequest, AppCommandSender, BoundAppCommandSender, Caller,
-    CommandCancellation, CommandInvocation, CommandOutcome, CommandTarget, MutationClass,
-    ResourceKind, app_command_channel,
+    AppCommandReceiver, AppCommandSender, BoundAppCommandSender, Caller, CommandCancellation,
+    CommandInvocation, CommandOutcome, CommandTarget, MutationClass, ResourceKind,
+    app_command_channel,
 };
 use bootty_mux::{
     RepaintHandle,
@@ -57,6 +57,18 @@ fn command_outcome_for_binding_operation(
             message: "mux operation capability is stale".to_owned(),
         }),
     }
+}
+
+fn command_target_value(target: CommandTarget) -> serde_json::Value {
+    serde_json::to_value(target).expect("serialize command target")
+}
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn command_execution(
+    execution: Option<(Instant, CommandCancellation)>,
+) -> (Instant, CommandCancellation) {
+    execution.unwrap_or_else(|| (Instant::now() + COMMAND_TIMEOUT, CommandCancellation::new()))
 }
 
 static NEXT_WINDOW_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -122,18 +134,6 @@ impl CommandRuntime {
         }
     }
 
-    pub(crate) fn sender(&self, caller: Caller) -> BoundAppCommandSender {
-        self.sender.for_caller(caller)
-    }
-
-    pub(crate) fn catalog(&self) -> &Arc<CommandCatalog> {
-        &self.catalog
-    }
-
-    pub(crate) fn try_recv(&self) -> Result<AppCommandRequest, mpsc::TryRecvError> {
-        self.receiver.try_recv()
-    }
-
     pub(crate) fn queue(&mut self, invocation: CommandInvocation) {
         self.queued = Some(invocation);
     }
@@ -142,16 +142,12 @@ impl CommandRuntime {
         self.queued = None;
     }
 
+    pub(crate) fn target_kind(&self, command: &str) -> Option<ResourceKind> {
+        self.catalog.describe(command)?.target
+    }
+
     pub(crate) fn take_queued(&mut self) -> Option<CommandInvocation> {
         self.queued.take()
-    }
-
-    pub(crate) fn push_pending(&mut self, pending: PendingAppCommand) {
-        self.pending.push(pending);
-    }
-
-    pub(crate) fn take_pending(&mut self) -> Vec<PendingAppCommand> {
-        std::mem::take(&mut self.pending)
     }
 
     pub(crate) fn target_identity(&self) -> (&str, u64, u64) {
@@ -164,15 +160,20 @@ impl CommandRuntime {
 }
 
 impl AppState {
+    fn reject_command(&mut self, outcome: CommandOutcome) -> CommandDispatch {
+        self.last_error = command_outcome_message(&outcome);
+        CommandDispatch::Complete(outcome)
+    }
+
     /// Returns a non-blocking sender for producers outside the UI-owner call stack.
     ///
     /// UI code dispatches directly and must not synchronously wait on this channel's response.
     pub fn app_command_sender(&self, caller: Caller) -> BoundAppCommandSender {
-        self.commands.sender(caller)
+        self.commands.sender.for_caller(caller)
     }
 
     pub fn command_catalog(&self) -> Arc<CommandCatalog> {
-        Arc::clone(self.commands.catalog())
+        Arc::clone(&self.commands.catalog)
     }
 
     pub(crate) fn drain_app_commands(
@@ -183,7 +184,7 @@ impl AppState {
         self.drain_pending_app_commands(Instant::now());
         let mut drained = 0;
         for _ in 0..32 {
-            let request = match self.commands.try_recv() {
+            let request = match self.commands.receiver.try_recv() {
                 Ok(request) => request,
                 Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
             };
@@ -207,7 +208,7 @@ impl AppState {
                     let _ = request.response.send(outcome);
                 }
                 CommandDispatch::Pending(result) => {
-                    self.commands.push_pending(PendingAppCommand {
+                    self.commands.pending.push(PendingAppCommand {
                         deadline: request.deadline,
                         cancellation: request.cancellation,
                         response: Some(request.response),
@@ -222,7 +223,7 @@ impl AppState {
     }
 
     fn drain_pending_app_commands(&mut self, now: Instant) {
-        for pending in self.commands.take_pending() {
+        for pending in std::mem::take(&mut self.commands.pending) {
             let membership_scope = match &pending.result {
                 PendingCommandResult::Mux {
                     scope,
@@ -257,7 +258,7 @@ impl AppState {
                             result,
                         ),
                         Err(mpsc::TryRecvError::Empty) => {
-                            self.commands.push_pending(pending);
+                            self.commands.pending.push(pending);
                             continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => {
@@ -271,7 +272,7 @@ impl AppState {
                     PendingCommandResult::Outcome(result) => match result.try_recv() {
                         Ok(outcome) => outcome,
                         Err(mpsc::TryRecvError::Empty) => {
-                            self.commands.push_pending(pending);
+                            self.commands.pending.push(pending);
                             continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => CommandOutcome::Failed {
@@ -310,23 +311,17 @@ impl AppState {
         effects: &mut Vec<AppEffect>,
         execution: Option<(Instant, CommandCancellation)>,
     ) -> CommandDispatch {
-        let mut resolved = match self.commands.catalog().resolve(invocation) {
+        let mut resolved = match self.commands.catalog.resolve(invocation) {
             Ok(resolved) => resolved,
-            Err(outcome) => {
-                self.last_error = command_outcome_message(&outcome);
-                return CommandDispatch::Complete(outcome);
-            }
+            Err(outcome) => return self.reject_command(outcome),
         };
-        let target = match self.resolve_command_target(
+        let (target, exact_target) = match self.resolve_command_target(
             &resolved.invocation.command,
             resolved.descriptor.target,
             resolved.invocation.target.as_ref(),
         ) {
             Ok(target) => target,
-            Err(outcome) => {
-                self.last_error = command_outcome_message(&outcome);
-                return CommandDispatch::Complete(outcome);
-            }
+            Err(outcome) => return self.reject_command(outcome),
         };
         resolved.invocation.target = target;
         if resolved.descriptor.mutation == MutationClass::Destructive
@@ -343,21 +338,14 @@ impl AppState {
         }
         let planned_mux_command = match &resolved.executor {
             CommandExecutor::Core(CoreCommandExecutor::Keybind(KeybindAction::Mux(action))) => {
-                match self.mux_command_for_action(*action, resolved.invocation.target.as_ref()) {
-                    Ok(command) => command,
-                    Err(outcome) => {
-                        self.last_error = command_outcome_message(&outcome);
-                        return CommandDispatch::Complete(outcome);
-                    }
-                }
+                self.plan_mux_key_action(*action, exact_target.as_ref())
             }
             _ => None,
         };
         if let Some(command) = planned_mux_command.as_ref()
             && let Some(outcome) = self.preflight_mux_command(command)
         {
-            self.last_error = command_outcome_message(&outcome);
-            return CommandDispatch::Complete(outcome);
+            return self.reject_command(outcome);
         }
         let caller = resolved.invocation.caller;
         match resolved.executor {
@@ -370,12 +358,7 @@ impl AppState {
                 execution,
             ),
             CommandExecutor::Extension(handler) => {
-                let (deadline, cancellation) = execution.unwrap_or_else(|| {
-                    (
-                        Instant::now() + Duration::from_secs(10),
-                        CommandCancellation::new(),
-                    )
-                });
+                let (deadline, cancellation) = command_execution(execution);
                 CommandDispatch::Pending(PendingCommandResult::Outcome(handler.invoke(
                     resolved.invocation,
                     deadline,
@@ -402,10 +385,10 @@ impl AppState {
         command: &str,
         expected: Option<ResourceKind>,
         supplied: Option<&CommandTarget>,
-    ) -> Result<Option<CommandTarget>, CommandOutcome> {
+    ) -> Result<(Option<CommandTarget>, Option<ExactMuxTarget>), CommandOutcome> {
         let Some(expected) = expected else {
             return if supplied.is_none() {
-                Ok(None)
+                Ok((None, None))
             } else {
                 Err(CommandOutcome::Denied {
                     message: "command does not accept a target".to_owned(),
@@ -427,7 +410,35 @@ impl AppState {
                 message: format!("the {expected:?} target is stale"),
             });
         }
-        Ok(Some(current))
+        // The opaque handle is only an equality token. Build the typed target from current mux
+        // state after the complete wire target (kind, handle, and generation) has matched.
+        let exact = self.current_exact_mux_target_for(command, expected);
+        Ok((Some(current), exact))
+    }
+
+    pub(crate) fn current_exact_mux_target_for(
+        &self,
+        command: &str,
+        kind: ResourceKind,
+    ) -> Option<ExactMuxTarget> {
+        let scope = self.workspace.active.binding.scope;
+        let (session_id, window_id, pane_id) = self.selected_mux_resource_path();
+        match kind {
+            ResourceKind::Binding => Some(ExactMuxTarget::Binding(scope)),
+            ResourceKind::Session => session_id
+                .map(|session_id| ExactMuxTarget::Session(scope, session_id))
+                .or_else(|| (command == "new_tab").then_some(ExactMuxTarget::Binding(scope))),
+            ResourceKind::MuxWindow => Some(ExactMuxTarget::Window(scope, session_id?, window_id?)),
+            ResourceKind::Pane => Some(ExactMuxTarget::Pane(
+                scope,
+                session_id?,
+                window_id?,
+                pane_id?,
+            )),
+            ResourceKind::Instance | ResourceKind::ApplicationWindow | ResourceKind::Terminal => {
+                None
+            }
+        }
     }
 
     pub(crate) fn current_command_target_for(
@@ -549,7 +560,9 @@ impl AppState {
         Some(target)
     }
 
-    fn selected_mux_resource_path(&self) -> (Option<String>, Option<String>, Option<String>) {
+    pub(crate) fn selected_mux_resource_path(
+        &self,
+    ) -> (Option<String>, Option<String>, Option<String>) {
         let Some(anchor) = self.workspace.active.binding.mux.selected_session_anchor() else {
             return (None, None, None);
         };
@@ -622,11 +635,26 @@ impl AppState {
         effects: &mut Vec<AppEffect>,
         execution: Option<(Instant, CommandCancellation)>,
     ) -> CommandDispatch {
+        let executor = match executor {
+            executor
+            @ CoreCommandExecutor::Keybind(KeybindAction::App(AppAction::ReloadConfig)) => executor,
+            CoreCommandExecutor::Keybind(action) => {
+                return self.dispatch_resolved_keybind_command(
+                    action,
+                    planned_mux_command,
+                    caller,
+                    viewport,
+                    effects,
+                    execution,
+                );
+            }
+            executor => executor,
+        };
+        if let Err(outcome) = Self::begin_synchronous_command(execution) {
+            return CommandDispatch::Complete(outcome);
+        }
         match executor {
             CoreCommandExecutor::Keybind(KeybindAction::App(AppAction::ReloadConfig)) => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
                 let reloaded = self.reload_config(effects);
                 let outcome = if reloaded {
                     self.last_error
@@ -645,25 +673,11 @@ impl AppState {
                 };
                 CommandDispatch::Complete(outcome)
             }
-            CoreCommandExecutor::Keybind(action) => self.dispatch_resolved_keybind_command(
-                action,
-                planned_mux_command,
-                caller,
-                viewport,
-                effects,
-                execution,
-            ),
             CoreCommandExecutor::Sidebar(action) => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
                 self.apply_sidebar_action(action);
                 CommandDispatch::Complete(CommandOutcome::success())
             }
             CoreCommandExecutor::CurrentResource(kind) => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
                 let outcome = self.current_command_target(kind).map_or_else(
                     || CommandOutcome::Unavailable {
                         message: format!("no current {kind:?} target is available"),
@@ -676,11 +690,9 @@ impl AppState {
                 CommandDispatch::Complete(outcome)
             }
             CoreCommandExecutor::ReadTerminal => {
-                if let Err(outcome) = Self::begin_synchronous_command(execution) {
-                    return CommandDispatch::Complete(outcome);
-                }
                 CommandDispatch::Complete(self.read_active_terminal())
             }
+            CoreCommandExecutor::Keybind(_) => unreachable!("keybind executors return above"),
         }
     }
 
@@ -707,10 +719,7 @@ impl AppState {
     ) -> PendingCommandResult {
         let scope = self.workspace.active.binding.scope;
         let config = self.active_multiplexer().clone();
-        let (deadline, cancellation) = execution.unwrap_or((
-            Instant::now() + Duration::from_secs(10),
-            CommandCancellation::new(),
-        ));
+        let (deadline, cancellation) = command_execution(execution);
         let result = self
             .workspace
             .active
@@ -772,14 +781,13 @@ impl AppState {
         ),
     ) {
         debug_assert_eq!(scope, self.workspace.active.binding.scope);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let cancellation = CommandCancellation::new();
+        let (deadline, cancellation) = command_execution(None);
         let result = self.submit_authoritative_mux_command(
             command,
             membership,
             Some((deadline, cancellation.clone())),
         );
-        self.commands.push_pending(PendingAppCommand {
+        self.commands.pending.push(PendingAppCommand {
             deadline,
             cancellation,
             response: None,
@@ -943,13 +951,12 @@ impl AppState {
         } {
             value.insert(
                 "created".to_owned(),
-                serde_json::to_value(self.mux_resource_target(
+                command_target_value(self.mux_resource_target(
                     scope,
                     ResourceKind::Session,
                     session_id,
                     None,
-                )?)
-                .expect("serialize command target"),
+                )?),
             );
         }
         if let (Some(session_id), Some(window_id)) = (
@@ -958,13 +965,12 @@ impl AppState {
         ) {
             value.insert(
                 "focused".to_owned(),
-                serde_json::to_value(self.mux_resource_target(
+                command_target_value(self.mux_resource_target(
                     scope,
                     ResourceKind::MuxWindow,
                     session_id,
                     Some(window_id),
-                )?)
-                .expect("serialize command target"),
+                )?),
             );
         }
         if !value.contains_key("focused")
@@ -972,13 +978,12 @@ impl AppState {
         {
             value.insert(
                 "focused".to_owned(),
-                serde_json::to_value(self.mux_resource_target(
+                command_target_value(self.mux_resource_target(
                     scope,
                     ResourceKind::Session,
                     session_id,
                     None,
-                )?)
-                .expect("serialize command target"),
+                )?),
             );
         }
         Some(serde_json::Value::Object(value))
@@ -993,29 +998,32 @@ impl AppState {
     ) -> Option<CommandTarget> {
         let binding_runtime = self.workspace.binding(scope)?;
         let binding = self.binding_target_handle(scope, binding_runtime.mux.binding_generation());
-        match kind {
-            ResourceKind::Session => Some(CommandTarget {
-                kind,
-                handle: serde_json::to_string(&[&binding, session_id]).expect("serialize target"),
-                generation: binding_runtime
+        let (handle, generation) = match kind {
+            ResourceKind::Session => (
+                serde_json::to_string(&[&binding, session_id]).expect("serialize target"),
+                binding_runtime
                     .mux
                     .session_generation(session_id)
                     .unwrap_or(1),
-            }),
+            ),
             ResourceKind::MuxWindow => {
                 let window_id = window_id.expect("mux window target requires a window id");
-                Some(CommandTarget {
-                    kind,
-                    handle: serde_json::to_string(&[&binding, session_id, window_id])
+                (
+                    serde_json::to_string(&[&binding, session_id, window_id])
                         .expect("serialize target"),
-                    generation: binding_runtime
+                    binding_runtime
                         .mux
                         .window_generation(session_id, window_id)
                         .unwrap_or(1),
-                })
+                )
             }
             _ => unreachable!("mux completion only returns session and window targets"),
-        }
+        };
+        Some(CommandTarget {
+            kind,
+            handle,
+            generation,
+        })
     }
 
     fn binding_target_handle(&self, scope: MuxScope, generation: u64) -> String {

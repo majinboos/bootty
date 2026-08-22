@@ -2,7 +2,7 @@
 #![allow(clippy::match_same_arms)]
 #![allow(clippy::wildcard_imports)]
 
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -317,10 +317,8 @@ impl WorkspaceRepository {
         mux: SpaceMuxOverride,
         hide_tmux_status: bool,
     ) -> WorkspaceResult<Option<WorkspaceSpace>> {
-        let space = self
-            .create_space_db(name, icon, color, tint_sidebar, mux, hide_tmux_status)
-            .map_err(|error| self.database_error("create space", error))?;
-        Ok(space)
+        self.create_space_db(name, icon, color, tint_sidebar, mux, hide_tmux_status)
+            .map_err(|error| self.database_error("create space", error))
     }
 
     fn create_space_db(
@@ -427,7 +425,7 @@ impl WorkspaceRepository {
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
     ) -> WorkspaceResult<bool> {
-        self.update_space_and_binding_db(scope, name, icon, color, tint_sidebar, mux.clone())
+        self.update_space_and_binding_db(scope, name, icon, color, tint_sidebar, mux)
             .map_err(|error| self.database_error("update space", error))
     }
 
@@ -497,14 +495,11 @@ impl WorkspaceRepository {
         if space_count <= 1 {
             return Ok(false);
         }
-        if conn.execute(
+        conn.execute(
             "DELETE FROM workspace_spaces WHERE id = ?1",
             [id.persistence_value()],
-        )? == 0
-        {
-            return Ok(false);
-        }
-        Ok(true)
+        )
+        .map(|deleted| deleted != 0)
     }
 
     pub fn set_selected_space(
@@ -513,8 +508,7 @@ impl WorkspaceRepository {
         space_id: SpaceId,
     ) -> WorkspaceResult<()> {
         self.set_selected_space_db(window_key, space_id)
-            .map_err(|error| self.database_error("select space", error))?;
-        Ok(())
+            .map_err(|error| self.database_error("select space", error))
     }
 
     fn set_selected_space_db(&self, window_key: &str, space_id: SpaceId) -> rusqlite::Result<()> {
@@ -618,16 +612,10 @@ impl WorkspaceRepository {
         &mut self,
         scope: MuxScope,
     ) -> WorkspaceResult<Option<PendingBindingMembershipMutation>> {
-        let mut conn = open_db(&self.path).map_err(|error| {
+        let conn = open_db(&self.path).map_err(|error| {
             self.database_error("open database to read binding membership", error)
         })?;
-        let tx = conn
-            .transaction()
-            .map_err(|error| self.database_error("begin binding membership read", error))?;
-        let pending = self.load_pending_binding_membership_mutation(&tx, scope)?;
-        tx.commit()
-            .map_err(|error| self.database_error("commit binding membership read", error))?;
-        Ok(pending)
+        self.load_pending_binding_membership_mutation(&conn, scope)
     }
 
     /// Apply a completed remote mutation and clear its journal row in one transaction.
@@ -708,18 +696,7 @@ impl WorkspaceRepository {
     }
 
     fn validate_binding_scope(&self, tx: &Transaction<'_>, scope: MuxScope) -> WorkspaceResult<()> {
-        let exists = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM workspace_bindings
-                     WHERE id = ?1 AND space_id = ?2
-                 )",
-                params![
-                    scope.binding_id().persistence_value(),
-                    scope.space_id().persistence_value()
-                ],
-                |row| row.get::<_, bool>(0),
-            )
+        let exists = binding_scope_exists(tx, scope)
             .map_err(|error| self.database_error("validate binding membership scope", error))?;
         if !exists {
             return Err(WorkspacePersistenceError::new(format!(
@@ -733,10 +710,10 @@ impl WorkspaceRepository {
 
     fn load_pending_binding_membership_mutation(
         &self,
-        tx: &Transaction<'_>,
+        conn: &Connection,
         scope: MuxScope,
     ) -> WorkspaceResult<Option<PendingBindingMembershipMutation>> {
-        tx.query_row(
+        conn.query_row(
             "SELECT operation, session_id, old_name, new_name, display_name, explicit, cwd
              FROM workspace_pending_binding_operations
              WHERE space_id = ?1 AND binding_id = ?2",
@@ -745,24 +722,8 @@ impl WorkspaceRepository {
                 scope.binding_id().persistence_value()
             ],
             |row| {
-                let operation = row.get::<_, String>(0)?;
-                let session_id = row.get::<_, String>(1)?;
-                let old_name = row.get::<_, Option<String>>(2)?;
-                let new_name = row.get::<_, Option<String>>(3)?;
-                let display_name = row.get::<_, Option<String>>(4)?;
-                let explicit = row.get::<_, Option<i64>>(5)?;
-                let cwd = row.get::<_, Option<String>>(6)?;
-                binding_membership_mutation_from_storage(
-                    &operation,
-                    session_id,
-                    old_name,
-                    new_name,
-                    display_name,
-                    explicit,
-                    cwd,
-                )
-                .map(|mutation| PendingBindingMembershipMutation { mutation })
-                .map_err(|_| rusqlite::Error::InvalidQuery)
+                binding_membership_mutation_from_row(row, 0)
+                    .map(|mutation| PendingBindingMembershipMutation { mutation })
             },
         )
         .optional()
@@ -891,18 +852,7 @@ impl WorkspaceRepository {
         session_order: &SessionOrderStore,
         session_names: &SessionNameStore,
     ) -> WorkspaceResult<()> {
-        let binding_exists = tx
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM workspace_bindings
-                     WHERE id = ?1 AND space_id = ?2
-                 )",
-                params![
-                    scope.binding_id().persistence_value(),
-                    scope.space_id().persistence_value()
-                ],
-                |row| row.get::<_, bool>(0),
-            )
+        let binding_exists = binding_scope_exists(tx, scope)
             .map_err(|error| self.database_error("validate binding state scope", error))?;
         if !binding_exists {
             return Err(WorkspacePersistenceError::new(format!(
@@ -1086,26 +1036,10 @@ fn validate_pending_binding_operations(
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-            row.get::<_, Option<String>>(6)?,
-            row.get::<_, Option<i64>>(7)?,
-            row.get::<_, Option<String>>(8)?,
+            binding_membership_mutation_from_row(row, 2)?,
         ))
     })? {
-        let (
-            space_id,
-            binding_id,
-            operation,
-            session_id,
-            old_name,
-            new_name,
-            display_name,
-            explicit,
-            cwd,
-        ) = row?;
+        let (space_id, binding_id, _mutation) = row?;
         if space_id <= 0 || binding_id <= 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
@@ -1113,19 +1047,7 @@ fn validate_pending_binding_operations(
             SpaceId::from_persistence(space_id),
             BindingId::from_persistence(binding_id),
         );
-        if !scopes.contains(&scope)
-            || !pending_scopes.insert(scope)
-            || binding_membership_mutation_from_storage(
-                &operation,
-                session_id,
-                old_name,
-                new_name,
-                display_name,
-                explicit,
-                cwd,
-            )
-            .is_err()
-        {
+        if !scopes.contains(&scope) || !pending_scopes.insert(scope) {
             return Err(rusqlite::Error::InvalidQuery);
         }
     }
@@ -1298,6 +1220,37 @@ fn binding_membership_mutation_from_storage(
     };
     validate_binding_membership_mutation(&mutation)?;
     Ok(mutation)
+}
+
+fn binding_membership_mutation_from_row(
+    row: &Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<BindingMembershipMutation> {
+    let operation = row.get::<_, String>(offset)?;
+    binding_membership_mutation_from_storage(
+        &operation,
+        row.get(offset + 1)?,
+        row.get(offset + 2)?,
+        row.get(offset + 3)?,
+        row.get(offset + 4)?,
+        row.get(offset + 5)?,
+        row.get(offset + 6)?,
+    )
+    .map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
+fn binding_scope_exists(tx: &Transaction<'_>, scope: MuxScope) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM workspace_bindings
+             WHERE id = ?1 AND space_id = ?2
+         )",
+        params![
+            scope.binding_id().persistence_value(),
+            scope.space_id().persistence_value()
+        ],
+        |row| row.get(0),
+    )
 }
 
 fn apply_binding_membership_mutation(

@@ -10,304 +10,93 @@ use super::{
 use crate::geometry::{SurfaceRect, TerminalSurface};
 
 const PLACEHOLDER: char = '\u{10EEEE}';
-const DIACRITICS: &[char] = &[
-    '\u{0305}',
-    '\u{030D}',
-    '\u{030E}',
-    '\u{0310}',
-    '\u{0312}',
-    '\u{033D}',
-    '\u{033E}',
-    '\u{033F}',
-    '\u{0346}',
-    '\u{034A}',
-    '\u{034B}',
-    '\u{034C}',
-    '\u{0350}',
-    '\u{0351}',
-    '\u{0352}',
-    '\u{0357}',
-    '\u{035B}',
-    '\u{0363}',
-    '\u{0364}',
-    '\u{0365}',
-    '\u{0366}',
-    '\u{0367}',
-    '\u{0368}',
-    '\u{0369}',
-    '\u{036A}',
-    '\u{036B}',
-    '\u{036C}',
-    '\u{036D}',
-    '\u{036E}',
-    '\u{036F}',
-    '\u{0483}',
-    '\u{0484}',
-    '\u{0485}',
-    '\u{0486}',
-    '\u{0487}',
-    '\u{0592}',
-    '\u{0593}',
-    '\u{0594}',
-    '\u{0595}',
-    '\u{0597}',
-    '\u{0598}',
-    '\u{0599}',
-    '\u{059C}',
-    '\u{059D}',
-    '\u{059E}',
-    '\u{059F}',
-    '\u{05A0}',
-    '\u{05A1}',
-    '\u{05A8}',
-    '\u{05A9}',
-    '\u{05AB}',
-    '\u{05AC}',
-    '\u{05AF}',
-    '\u{05C4}',
-    '\u{0610}',
-    '\u{0611}',
-    '\u{0612}',
-    '\u{0613}',
-    '\u{0614}',
-    '\u{0615}',
-    '\u{0616}',
-    '\u{0617}',
-    '\u{0657}',
-    '\u{0658}',
-    '\u{0659}',
-    '\u{065A}',
-    '\u{065B}',
-    '\u{065D}',
-    '\u{065E}',
-    '\u{06D6}',
-    '\u{06D7}',
-    '\u{06D8}',
-    '\u{06D9}',
-    '\u{06DA}',
-    '\u{06DB}',
-    '\u{06DC}',
-    '\u{06DF}',
-    '\u{06E0}',
-    '\u{06E1}',
-    '\u{06E2}',
-    '\u{06E4}',
-    '\u{06E7}',
-    '\u{06E8}',
-    '\u{06EB}',
-    '\u{06EC}',
-    '\u{0730}',
-    '\u{0732}',
-    '\u{0733}',
-    '\u{0735}',
-    '\u{0736}',
-    '\u{073A}',
-    '\u{073D}',
-    '\u{073F}',
-    '\u{0740}',
-    '\u{0741}',
-    '\u{0743}',
-    '\u{0745}',
-    '\u{0747}',
-    '\u{0749}',
-    '\u{074A}',
-    '\u{07EB}',
-    '\u{07EC}',
-    '\u{07ED}',
-    '\u{07EE}',
-    '\u{07EF}',
-    '\u{07F0}',
-    '\u{07F1}',
-    '\u{07F3}',
-    '\u{0816}',
-    '\u{0817}',
-    '\u{0818}',
-    '\u{0819}',
-    '\u{081B}',
-    '\u{081C}',
-    '\u{081D}',
-    '\u{081E}',
-    '\u{081F}',
-    '\u{0820}',
-    '\u{0821}',
-    '\u{0822}',
-    '\u{0823}',
-    '\u{0825}',
-    '\u{0826}',
-    '\u{0827}',
-    '\u{0829}',
-    '\u{082A}',
-    '\u{082B}',
-    '\u{082C}',
-    '\u{082D}',
-    '\u{0951}',
-    '\u{0953}',
-    '\u{0954}',
-    '\u{0F82}',
-    '\u{0F83}',
-    '\u{0F86}',
-    '\u{0F87}',
-    '\u{135D}',
-    '\u{135E}',
-    '\u{135F}',
-    '\u{17DD}',
-    '\u{193A}',
-    '\u{1A17}',
-    '\u{1A75}',
-    '\u{1A76}',
-    '\u{1A77}',
-    '\u{1A78}',
-    '\u{1A79}',
-    '\u{1A7A}',
-    '\u{1A7B}',
-    '\u{1A7C}',
-    '\u{1B6B}',
-    '\u{1B6D}',
-    '\u{1B6E}',
-    '\u{1B6F}',
-    '\u{1B70}',
-    '\u{1B71}',
-    '\u{1B72}',
-    '\u{1B73}',
-    '\u{1CD0}',
-    '\u{1CD1}',
-    '\u{1CD2}',
-    '\u{1CDA}',
-    '\u{1CDB}',
-    '\u{1CE0}',
-    '\u{1DC0}',
-    '\u{1DC1}',
-    '\u{1DC3}',
-    '\u{1DC4}',
-    '\u{1DC5}',
-    '\u{1DC6}',
-    '\u{1DC7}',
-    '\u{1DC8}',
-    '\u{1DC9}',
-    '\u{1DCB}',
-    '\u{1DCC}',
-    '\u{1DD1}',
-    '\u{1DD2}',
-    '\u{1DD3}',
-    '\u{1DD4}',
-    '\u{1DD5}',
-    '\u{1DD6}',
-    '\u{1DD7}',
-    '\u{1DD8}',
-    '\u{1DD9}',
-    '\u{1DDA}',
-    '\u{1DDB}',
-    '\u{1DDC}',
-    '\u{1DDD}',
-    '\u{1DDE}',
-    '\u{1DDF}',
-    '\u{1DE0}',
-    '\u{1DE1}',
-    '\u{1DE2}',
-    '\u{1DE3}',
-    '\u{1DE4}',
-    '\u{1DE5}',
-    '\u{1DE6}',
-    '\u{1DFE}',
-    '\u{20D0}',
-    '\u{20D1}',
-    '\u{20D4}',
-    '\u{20D5}',
-    '\u{20D6}',
-    '\u{20D7}',
-    '\u{20DB}',
-    '\u{20DC}',
-    '\u{20E1}',
-    '\u{20E7}',
-    '\u{20E9}',
-    '\u{20F0}',
-    '\u{2CEF}',
-    '\u{2CF0}',
-    '\u{2CF1}',
-    '\u{2DE0}',
-    '\u{2DE1}',
-    '\u{2DE2}',
-    '\u{2DE3}',
-    '\u{2DE4}',
-    '\u{2DE5}',
-    '\u{2DE6}',
-    '\u{2DE7}',
-    '\u{2DE8}',
-    '\u{2DE9}',
-    '\u{2DEA}',
-    '\u{2DEB}',
-    '\u{2DEC}',
-    '\u{2DED}',
-    '\u{2DEE}',
-    '\u{2DEF}',
-    '\u{2DF0}',
-    '\u{2DF1}',
-    '\u{2DF2}',
-    '\u{2DF3}',
-    '\u{2DF4}',
-    '\u{2DF5}',
-    '\u{2DF6}',
-    '\u{2DF7}',
-    '\u{2DF8}',
-    '\u{2DF9}',
-    '\u{2DFA}',
-    '\u{2DFB}',
-    '\u{2DFC}',
-    '\u{2DFD}',
-    '\u{2DFE}',
-    '\u{2DFF}',
-    '\u{A66F}',
-    '\u{A67C}',
-    '\u{A67D}',
-    '\u{A6F0}',
-    '\u{A6F1}',
-    '\u{A8E0}',
-    '\u{A8E1}',
-    '\u{A8E2}',
-    '\u{A8E3}',
-    '\u{A8E4}',
-    '\u{A8E5}',
-    '\u{A8E6}',
-    '\u{A8E7}',
-    '\u{A8E8}',
-    '\u{A8E9}',
-    '\u{A8EA}',
-    '\u{A8EB}',
-    '\u{A8EC}',
-    '\u{A8ED}',
-    '\u{A8EE}',
-    '\u{A8EF}',
-    '\u{A8F0}',
-    '\u{A8F1}',
-    '\u{AAB0}',
-    '\u{AAB2}',
-    '\u{AAB3}',
-    '\u{AAB7}',
-    '\u{AAB8}',
-    '\u{AABE}',
-    '\u{AABF}',
-    '\u{AAC1}',
-    '\u{FE20}',
-    '\u{FE21}',
-    '\u{FE22}',
-    '\u{FE23}',
-    '\u{FE24}',
-    '\u{FE25}',
-    '\u{FE26}',
-    '\u{10A0F}',
-    '\u{10A38}',
-    '\u{1D185}',
-    '\u{1D186}',
-    '\u{1D187}',
-    '\u{1D188}',
-    '\u{1D189}',
-    '\u{1D1AA}',
-    '\u{1D1AB}',
-    '\u{1D1AC}',
-    '\u{1D1AD}',
-    '\u{1D242}',
-    '\u{1D243}',
-    '\u{1D244}',
+const DIACRITIC_RANGES: &[(char, char, u32)] = &[
+    ('\u{305}', '\u{305}', 0),
+    ('\u{30D}', '\u{30E}', 1),
+    ('\u{310}', '\u{310}', 3),
+    ('\u{312}', '\u{312}', 4),
+    ('\u{33D}', '\u{33F}', 5),
+    ('\u{346}', '\u{346}', 8),
+    ('\u{34A}', '\u{34C}', 9),
+    ('\u{350}', '\u{352}', 12),
+    ('\u{357}', '\u{357}', 15),
+    ('\u{35B}', '\u{35B}', 16),
+    ('\u{363}', '\u{36F}', 17),
+    ('\u{483}', '\u{487}', 30),
+    ('\u{592}', '\u{595}', 35),
+    ('\u{597}', '\u{599}', 39),
+    ('\u{59C}', '\u{5A1}', 42),
+    ('\u{5A8}', '\u{5A9}', 48),
+    ('\u{5AB}', '\u{5AC}', 50),
+    ('\u{5AF}', '\u{5AF}', 52),
+    ('\u{5C4}', '\u{5C4}', 53),
+    ('\u{610}', '\u{617}', 54),
+    ('\u{657}', '\u{65B}', 62),
+    ('\u{65D}', '\u{65E}', 67),
+    ('\u{6D6}', '\u{6DC}', 69),
+    ('\u{6DF}', '\u{6E2}', 76),
+    ('\u{6E4}', '\u{6E4}', 80),
+    ('\u{6E7}', '\u{6E8}', 81),
+    ('\u{6EB}', '\u{6EC}', 83),
+    ('\u{730}', '\u{730}', 85),
+    ('\u{732}', '\u{733}', 86),
+    ('\u{735}', '\u{736}', 88),
+    ('\u{73A}', '\u{73A}', 90),
+    ('\u{73D}', '\u{73D}', 91),
+    ('\u{73F}', '\u{741}', 92),
+    ('\u{743}', '\u{743}', 95),
+    ('\u{745}', '\u{745}', 96),
+    ('\u{747}', '\u{747}', 97),
+    ('\u{749}', '\u{74A}', 98),
+    ('\u{7EB}', '\u{7F1}', 100),
+    ('\u{7F3}', '\u{7F3}', 107),
+    ('\u{816}', '\u{819}', 108),
+    ('\u{81B}', '\u{823}', 112),
+    ('\u{825}', '\u{827}', 121),
+    ('\u{829}', '\u{82D}', 124),
+    ('\u{951}', '\u{951}', 129),
+    ('\u{953}', '\u{954}', 130),
+    ('\u{F82}', '\u{F83}', 132),
+    ('\u{F86}', '\u{F87}', 134),
+    ('\u{135D}', '\u{135F}', 136),
+    ('\u{17DD}', '\u{17DD}', 139),
+    ('\u{193A}', '\u{193A}', 140),
+    ('\u{1A17}', '\u{1A17}', 141),
+    ('\u{1A75}', '\u{1A7C}', 142),
+    ('\u{1B6B}', '\u{1B6B}', 150),
+    ('\u{1B6D}', '\u{1B73}', 151),
+    ('\u{1CD0}', '\u{1CD2}', 158),
+    ('\u{1CDA}', '\u{1CDB}', 161),
+    ('\u{1CE0}', '\u{1CE0}', 163),
+    ('\u{1DC0}', '\u{1DC1}', 164),
+    ('\u{1DC3}', '\u{1DC9}', 166),
+    ('\u{1DCB}', '\u{1DCC}', 173),
+    ('\u{1DD1}', '\u{1DE6}', 175),
+    ('\u{1DFE}', '\u{1DFE}', 197),
+    ('\u{20D0}', '\u{20D1}', 198),
+    ('\u{20D4}', '\u{20D7}', 200),
+    ('\u{20DB}', '\u{20DC}', 204),
+    ('\u{20E1}', '\u{20E1}', 206),
+    ('\u{20E7}', '\u{20E7}', 207),
+    ('\u{20E9}', '\u{20E9}', 208),
+    ('\u{20F0}', '\u{20F0}', 209),
+    ('\u{2CEF}', '\u{2CF1}', 210),
+    ('\u{2DE0}', '\u{2DFF}', 213),
+    ('\u{A66F}', '\u{A66F}', 245),
+    ('\u{A67C}', '\u{A67D}', 246),
+    ('\u{A6F0}', '\u{A6F1}', 248),
+    ('\u{A8E0}', '\u{A8F1}', 250),
+    ('\u{AAB0}', '\u{AAB0}', 268),
+    ('\u{AAB2}', '\u{AAB3}', 269),
+    ('\u{AAB7}', '\u{AAB8}', 271),
+    ('\u{AABE}', '\u{AABF}', 273),
+    ('\u{AAC1}', '\u{AAC1}', 275),
+    ('\u{FE20}', '\u{FE26}', 276),
+    ('\u{10A0F}', '\u{10A0F}', 283),
+    ('\u{10A38}', '\u{10A38}', 284),
+    ('\u{1D185}', '\u{1D189}', 285),
+    ('\u{1D1AA}', '\u{1D1AD}', 290),
+    ('\u{1D242}', '\u{1D244}', 294),
 ];
 
 pub(super) fn append_virtual_image_placements(
@@ -323,22 +112,35 @@ pub(super) fn append_virtual_image_placements(
     let placement_start = frame.placements.len();
     let mut rendered_rows = Vec::new();
     let mut run: Option<IncompletePlacement> = None;
+    let mut finish_run = |run| -> Result<()> {
+        if let Some((row, next)) = render_run(
+            surface,
+            &graphics,
+            &storage,
+            display_scale,
+            image_cache,
+            run,
+        )? {
+            // Native placements before this call are outside the virtual-row merge chain.
+            if frame.placements.len() > placement_start
+                && let Some(previous) = frame.placements.last_mut()
+                && can_merge_virtual_image_rows(previous, &next)
+            {
+                previous.source.height += next.source.height;
+                previous.destination.max_y = next.destination.max_y;
+            } else {
+                frame.placements.push(next);
+            }
+            rendered_rows.push(row);
+        }
+        Ok(())
+    };
 
     for cell in cells {
         let current = IncompletePlacement::from_cell(cell);
         let Some(current) = current else {
-            if let Some(done) = run.take()
-                && let Some(row) = append_run(
-                    surface,
-                    frame,
-                    &graphics,
-                    &storage,
-                    display_scale,
-                    image_cache,
-                    done,
-                )?
-            {
-                rendered_rows.push(row);
+            if let Some(done) = run.take() {
+                finish_run(done)?;
             }
             continue;
         };
@@ -348,36 +150,14 @@ pub(super) fn append_virtual_image_placements(
                 continue;
             }
             let done = run.take().expect("run exists");
-            if let Some(row) = append_run(
-                surface,
-                frame,
-                &graphics,
-                &storage,
-                display_scale,
-                image_cache,
-                done,
-            )? {
-                rendered_rows.push(row);
-            }
+            finish_run(done)?;
         }
         run = Some(current.with_default_origin());
     }
 
-    if let Some(done) = run
-        && let Some(row) = append_run(
-            surface,
-            frame,
-            &graphics,
-            &storage,
-            display_scale,
-            image_cache,
-            done,
-        )?
-    {
-        rendered_rows.push(row);
+    if let Some(done) = run {
+        finish_run(done)?;
     }
-
-    merge_adjacent_virtual_image_rows(&mut frame.placements, placement_start);
 
     rendered_rows.sort_unstable();
     rendered_rows.dedup();
@@ -394,15 +174,14 @@ fn virtual_storage(
         .collect()
 }
 
-fn append_run(
+fn render_run(
     surface: TerminalSurface,
-    frame: &mut KittyImageFrame,
     graphics: &libghostty_vt::kitty::graphics::Graphics<'_>,
     storage: &HashMap<(u32, u32), KittyVirtualPlacement>,
     display_scale: f32,
     image_cache: &mut KittyImageDataCache,
     run: IncompletePlacement,
-) -> Result<Option<u16>> {
+) -> Result<Option<(u16, KittyImagePlacement)>> {
     let placement = run.complete();
     let Some(storage_placement) = find_storage_placement(storage, &placement) else {
         return Ok(None);
@@ -411,59 +190,37 @@ fn append_run(
     let Some(image) = graphics.image(image_id) else {
         return Ok(None);
     };
+    let image_width = image.width()?;
+    let image_height = image.height()?;
+    let image_format = image.format()?;
+    let image_generation = image.generation()?;
     let grid = placement.grid(
         storage_placement,
-        image.width()?,
-        image.height()?,
+        image_width,
+        image_height,
         surface,
         display_scale,
-    )?;
-    let Some(rendered) = placement.render(grid, image.width()?, image.height()?, surface) else {
+    );
+    let Some(rendered) = placement.render(grid, image_width, image_height, surface) else {
         return Ok(None);
     };
     let Some(image_bytes) = image.data()? else {
         return Ok(None);
     };
-    let data = image_cache.data_for_image(
-        image_id,
-        image.number()?,
-        image.width()?,
-        image.height()?,
-        image.format()?,
-        image_bytes,
-    );
+    let data = image_cache.data_for_image(image_id, image_generation, image_bytes);
 
-    frame.placements.push(KittyImagePlacement {
+    let next = KittyImagePlacement {
         image_id,
         placement_id: placement.placement_id,
         layer: KittyImageLayer::from_z(storage_placement.z),
-        image_width: image.width()?,
-        image_height: image.height()?,
-        image_format: image.format()?,
+        image_width,
+        image_height,
+        image_format,
         source: rendered.source,
         destination: rendered.destination,
         data,
-    });
-    Ok(Some(placement.y))
-}
-
-fn merge_adjacent_virtual_image_rows(placements: &mut Vec<KittyImagePlacement>, start: usize) {
-    if placements.len().saturating_sub(start) < 2 {
-        return;
-    }
-
-    let mut merged = Vec::with_capacity(placements.len() - start);
-    for placement in placements.drain(start..) {
-        if let Some(previous) = merged.last_mut()
-            && can_merge_virtual_image_rows(previous, &placement)
-        {
-            previous.source.height += placement.source.height;
-            previous.destination.max_y = placement.destination.max_y;
-            continue;
-        }
-        merged.push(placement);
-    }
-    placements.extend(merged);
+    };
+    Ok(Some((placement.y, next)))
 }
 
 fn can_merge_virtual_image_rows(
@@ -497,15 +254,14 @@ fn find_storage_placement(
     placement: &Placement,
 ) -> Option<KittyVirtualPlacement> {
     if placement.placement_id > 0 {
-        if let Some(stored) = storage
+        return storage
             .get(&(placement.image_id, placement.placement_id))
             .copied()
-        {
-            return Some(stored);
-        }
-        return unique_storage_placement(storage, |stored| {
-            stored.placement_id == placement.placement_id
-        });
+            .or_else(|| {
+                unique_storage_placement(storage, |stored| {
+                    stored.placement_id == placement.placement_id
+                })
+            });
     }
     storage
         .values()
@@ -518,14 +274,9 @@ fn unique_storage_placement(
     storage: &HashMap<(u32, u32), KittyVirtualPlacement>,
     mut matches: impl FnMut(&KittyVirtualPlacement) -> bool,
 ) -> Option<KittyVirtualPlacement> {
-    let mut found = None;
-    for stored in storage.values().filter(|stored| matches(stored)) {
-        if found.is_some() {
-            return None;
-        }
-        found = Some(*stored);
-    }
-    found
+    let mut found = storage.values().copied().filter(|stored| matches(stored));
+    let placement = found.next()?;
+    found.next().is_none().then_some(placement)
 }
 
 #[derive(Clone, Debug)]
@@ -567,12 +318,8 @@ impl IncompletePlacement {
     }
 
     fn with_default_origin(mut self) -> Self {
-        if self.row.is_none() {
-            self.row = Some(0);
-        }
-        if self.col.is_none() {
-            self.col = Some(0);
-        }
+        self.row.get_or_insert(0);
+        self.col.get_or_insert(0);
         self
     }
 
@@ -626,7 +373,7 @@ impl Placement {
         image_height: u32,
         surface: TerminalSurface,
         display_scale: f32,
-    ) -> Result<GridSize> {
+    ) -> GridSize {
         let mut rows = storage.rows;
         let mut columns = storage.columns;
         let display_scale = if display_scale.is_finite() && display_scale > 0.0 {
@@ -640,7 +387,7 @@ impl Placement {
         if columns == 0 {
             columns = logical_pixel_cells(image_width, display_scale, surface.cell.width);
         }
-        Ok(GridSize { rows, columns })
+        GridSize { rows, columns }
     }
 
     fn render(
@@ -779,8 +526,9 @@ fn color_to_id(color: StyleColor) -> Option<u32> {
 }
 
 fn diacritic_index(ch: char) -> Option<u32> {
-    DIACRITICS
-        .binary_search(&ch)
-        .ok()
-        .and_then(|index| u32::try_from(index).ok())
+    let index = DIACRITIC_RANGES.partition_point(|(_, end, _)| *end < ch);
+    let &(start, end, base) = DIACRITIC_RANGES.get(index)?;
+    (start..=end)
+        .contains(&ch)
+        .then_some(base + u32::from(ch) - u32::from(start))
 }

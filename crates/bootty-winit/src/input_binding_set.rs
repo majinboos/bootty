@@ -45,10 +45,10 @@ impl BindingSet {
         if leaders.is_empty() {
             self.put(binding);
         } else {
-            let mut path = leaders.clone();
-            path.push(binding.trigger.clone());
+            let trigger = binding.trigger.clone();
             self.put_sequence(&leaders, binding);
-            self.chain_parent = Some(path);
+            leaders.push(trigger);
+            self.chain_parent = Some(leaders);
         }
         Ok(())
     }
@@ -63,31 +63,20 @@ impl BindingSet {
     }
 
     pub fn get(&self, trigger: &BindingTrigger) -> Option<&InputBinding> {
-        self.entries
-            .iter()
-            .find_map(|(candidate, entry)| match entry {
-                BindingEntry::Leaf(binding) if candidate == trigger => Some(binding),
-                BindingEntry::Chained { binding, .. } if candidate == trigger => Some(binding),
-                BindingEntry::Leaf(_) | BindingEntry::Chained { .. } | BindingEntry::Leader(_) => {
-                    None
-                }
-            })
+        self.entries.iter().find_map(|(candidate, entry)| {
+            (candidate == trigger)
+                .then_some(entry)
+                .and_then(BindingEntry::binding)
+        })
     }
 
     pub fn get_trigger(&self, action: &BindingAction) -> Option<&BindingTrigger> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|(trigger, entry)| match entry {
-                BindingEntry::Leaf(binding)
-                    if !binding.flags.performable && binding.action == *action =>
-                {
-                    Some(trigger)
-                }
-                BindingEntry::Leaf(_) | BindingEntry::Chained { .. } | BindingEntry::Leader(_) => {
-                    None
-                }
-            })
+        self.entries.iter().rev().find_map(|(trigger, entry)| {
+            let BindingEntry::Leaf(binding) = entry else {
+                return None;
+            };
+            (!binding.flags.performable && binding.action == *action).then_some(trigger)
+        })
     }
 
     pub fn get_event(&self, input: KeyInput) -> Option<&InputBinding> {
@@ -133,28 +122,14 @@ impl BindingSet {
             .unshifted
             .or_else(|| input.utf8.and_then(single_char))?;
         mod_candidates.iter().find_map(|mods| {
-            self.entries.iter().find_map(|(_, entry)| match entry {
-                BindingEntry::Leaf(binding)
-                    if binding.trigger.mods == *mods
-                        && matches!(
-                            binding.trigger.key,
-                            BindingKey::Unicode(ch) if char_matches_case_folded(ch, codepoint)
-                        ) =>
-                {
-                    Some(binding)
-                }
-                BindingEntry::Chained { binding, .. }
-                    if binding.trigger.mods == *mods
-                        && matches!(
-                            binding.trigger.key,
-                            BindingKey::Unicode(ch) if char_matches_case_folded(ch, codepoint)
-                        ) =>
-                {
-                    Some(binding)
-                }
-                BindingEntry::Leaf(_) | BindingEntry::Chained { .. } | BindingEntry::Leader(_) => {
-                    None
-                }
+            self.entries.iter().find_map(|(_, entry)| {
+                let binding = entry.binding()?;
+                (binding.trigger.mods == *mods
+                    && matches!(
+                        binding.trigger.key,
+                        BindingKey::Unicode(ch) if char_matches_case_folded(ch, codepoint)
+                    ))
+                .then_some(binding)
             })
         })
     }
@@ -206,7 +181,8 @@ impl BindingSet {
         };
         if rest.is_empty() {
             child.remove(leaf);
-        } else if let Some((next, remaining)) = rest.split_first() {
+        } else {
+            let (next, remaining) = rest.split_first().expect("rest is not empty");
             child.remove_sequence(next, remaining, leaf);
         }
         if child.entries.is_empty() {
@@ -225,10 +201,7 @@ impl BindingSet {
                 self.entries.len() - 1
             }
         };
-        if matches!(self.entries[index].1, BindingEntry::Leaf(_)) {
-            self.entries[index].1 = BindingEntry::Leader(Box::<BindingSet>::default());
-        }
-        if matches!(self.entries[index].1, BindingEntry::Chained { .. }) {
+        if !matches!(self.entries[index].1, BindingEntry::Leader(_)) {
             self.entries[index].1 = BindingEntry::Leader(Box::<BindingSet>::default());
         }
         let BindingEntry::Leader(child) = &mut self.entries[index].1 else {
@@ -256,14 +229,13 @@ impl BindingSet {
                     binding: binding.clone(),
                     actions,
                 };
-                Ok(())
             }
             BindingEntry::Chained { actions, .. } => {
                 actions.push(action);
-                Ok(())
             }
-            BindingEntry::Leader(_) => Err(BindingParseError::InvalidFormat),
+            BindingEntry::Leader(_) => return Err(BindingParseError::InvalidFormat),
         }
+        Ok(())
     }
 
     fn entry_mut_at_path(&mut self, path: &[BindingTrigger]) -> Option<&mut BindingEntry> {
@@ -295,13 +267,14 @@ impl BindingSet {
                     out.push(format!("{trigger_text}={}", binding.action.format_entry()));
                 }
                 BindingEntry::Chained { actions, .. } => {
-                    if let Some((first, rest)) = actions.split_first() {
-                        out.push(format!("{trigger_text}={}", first.format_entry()));
-                        out.extend(
-                            rest.iter()
-                                .map(|action| format!("chain={}", action.format_entry())),
-                        );
-                    }
+                    let Some((first, rest)) = actions.split_first() else {
+                        continue;
+                    };
+                    out.push(format!("{trigger_text}={}", first.format_entry()));
+                    out.extend(
+                        rest.iter()
+                            .map(|action| format!("chain={}", action.format_entry())),
+                    );
                 }
                 BindingEntry::Leader(child) => {
                     child.format_entries_with_prefix(Some(&trigger_text), out);
@@ -312,6 +285,13 @@ impl BindingSet {
 }
 
 impl BindingEntry {
+    fn binding(&self) -> Option<&InputBinding> {
+        match self {
+            Self::Leaf(binding) | Self::Chained { binding, .. } => Some(binding),
+            Self::Leader(_) => None,
+        }
+    }
+
     fn clone_for_config(&self) -> Self {
         match self {
             Self::Leaf(binding) => Self::Leaf(binding.clone()),

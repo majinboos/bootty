@@ -299,11 +299,8 @@ impl AppState {
             action,
             focused_pane_id.as_deref(),
         );
-        if let Some(error) = outcome.last_error {
-            self.last_error = Some(error);
-        }
         effects.extend(outcome.effects);
-        self.apply_terminal_focus_intent(outcome.focus_intent);
+        self.apply_terminal_outcome(outcome.last_error, outcome.focus_intent);
     }
     fn apply_terminal_scroll_action(&mut self, action: TerminalScrollAction) {
         let delta = match action {

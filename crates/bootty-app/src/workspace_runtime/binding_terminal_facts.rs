@@ -30,7 +30,6 @@ impl TerminalProgress {
             "error" => TerminalProgressState::Error,
             "indeterminate" => TerminalProgressState::Indeterminate,
             "warning" => TerminalProgressState::Warning,
-            "inactive" => return None,
             _ => return None,
         };
         Some(Self { state, value })
@@ -71,43 +70,23 @@ impl BindingRuntime {
             .map(str::to_owned)
             .or_else(|| {
                 self.mux
-                    .sessions()
-                    .iter()
-                    .find(|candidate| candidate.id == session || candidate.name == session)
-                    .and_then(|candidate| candidate.active_window_id.clone())
+                    .session_by_id_or_name(&session)
+                    .and_then(|session| session.active_window_id.clone())
             })
             .unwrap_or_default();
         self.window_id(session, window)
     }
 
+    /// The window that currently holds `pane_id`. Window titles are per window, so this searches
+    /// the topology; it runs on a title event, never per frame.
     fn window_id_for_pane(&self, pane_id: &str) -> Option<ScopedWindowId> {
         self.mux.sessions().iter().find_map(|session| {
-            session.windows.iter().find_map(|window| {
-                let anchor_matches = window.anchor.pane_id.as_deref() == Some(pane_id);
-                let pane_matches = window
-                    .panes
-                    .iter()
-                    .any(|pane| pane.pane_id.as_deref() == Some(pane_id));
-                (anchor_matches || pane_matches)
-                    .then(|| self.window_id(session.id.clone(), window.id.clone()))
-            })
+            session
+                .windows
+                .iter()
+                .find(|window| Self::window_pane_ids(window).any(|id| id == pane_id))
+                .map(|window| self.window_id(session.id.clone(), window.id.clone()))
         })
-    }
-
-    fn terminal_pane_id(&self, pane_id: &str) -> ScopedPaneId {
-        let window = self
-            .window_id_for_pane(pane_id)
-            .unwrap_or_else(|| self.current_window_id());
-        self.pane_id(window, pane_id)
-    }
-
-    fn mark_custom_window_name(&mut self, key: ScopedWindowId) {
-        self.terminal_facts.custom_window_names.insert(key);
-    }
-
-    fn clear_custom_window_name(&mut self, key: &ScopedWindowId) -> Option<String> {
-        self.terminal_facts.custom_window_names.remove(key);
-        self.terminal_facts.window_titles.get(key).cloned()
     }
 
     pub(crate) fn apply_window_title(
@@ -123,11 +102,10 @@ impl BindingRuntime {
         let Some(key) = key else {
             return;
         };
-        self.terminal_facts.window_titles.insert(key.clone(), title);
         if !self.terminal_facts.custom_window_names.contains(&key) {
-            let title = self.terminal_facts.window_titles[&key].clone();
             self.rename_window_if_changed(&key.session_id, &key.window_id, &title, repaint);
         }
+        self.terminal_facts.window_titles.insert(key, title);
     }
 
     pub(crate) fn set_custom_window_name(
@@ -139,11 +117,12 @@ impl BindingRuntime {
     ) {
         let key = self.window_id(session_id.to_owned(), window_id.to_owned());
         if name.is_empty() {
-            if let Some(title) = self.clear_custom_window_name(&key) {
+            self.terminal_facts.custom_window_names.remove(&key);
+            if let Some(title) = self.terminal_facts.window_titles.get(&key).cloned() {
                 self.rename_window_if_changed(session_id, window_id, &title, repaint);
             }
         } else {
-            self.mark_custom_window_name(key);
+            self.terminal_facts.custom_window_names.insert(key);
             self.rename_window_if_changed(session_id, window_id, name, repaint);
         }
     }
@@ -183,7 +162,7 @@ impl BindingRuntime {
             return;
         }
         let progress = TerminalProgress::from_conemu(state, value);
-        match source_pane_id.map(|pane_id| self.terminal_pane_id(pane_id)) {
+        match source_pane_id.map(|pane_id| self.pane_id(pane_id)) {
             Some(pane) => match progress {
                 Some(progress) => {
                     self.terminal_facts.pane_progress.insert(pane, progress);
@@ -197,7 +176,7 @@ impl BindingRuntime {
     }
 
     pub(crate) fn record_terminal_ports(&mut self, source_pane_id: Option<&str>, ports: Vec<u16>) {
-        match source_pane_id.map(|pane_id| self.terminal_pane_id(pane_id)) {
+        match source_pane_id.map(|pane_id| self.pane_id(pane_id)) {
             Some(pane) => {
                 self.terminal_facts.pane_ports.insert(pane, ports);
             }
@@ -232,14 +211,14 @@ impl BindingRuntime {
     pub(crate) fn pane_progress(&self, pane_id: &str) -> Option<TerminalProgress> {
         self.terminal_facts
             .pane_progress
-            .get(&self.terminal_pane_id(pane_id))
+            .get(&self.pane_id(pane_id))
             .copied()
     }
 
     fn pane_ports(&self, pane_id: &str) -> Option<&[u16]> {
         self.terminal_facts
             .pane_ports
-            .get(&self.terminal_pane_id(pane_id))
+            .get(&self.pane_id(pane_id))
             .map(Vec::as_slice)
     }
 
@@ -251,12 +230,7 @@ impl BindingRuntime {
             } else {
                 Vec::new()
             };
-        for pane in session
-            .windows
-            .iter()
-            .flat_map(|window| window.panes.iter().chain(std::iter::once(&window.anchor)))
-            .filter_map(|pane| pane.pane_id.as_deref())
-        {
+        for pane in session.windows.iter().flat_map(Self::window_pane_ids) {
             if let Some(reported) = self.pane_ports(pane) {
                 for port in reported {
                     if !ports.contains(port) {
@@ -275,38 +249,44 @@ impl BindingRuntime {
             .chain(self.terminal_facts.unscoped_progress.iter())
             .any(|progress| progress.state == TerminalProgressState::Indeterminate)
             || self.mux.sessions().iter().any(|session| {
-                session
-                    .windows
-                    .iter()
-                    .any(|window| self.window_has_indeterminate_progress(window))
+                session.windows.iter().any(|window| {
+                    Self::backend_window_progress(window).is_some_and(|progress| {
+                        progress.state == TerminalProgressState::Indeterminate
+                    })
+                })
             })
     }
 
     pub(crate) fn window_has_indeterminate_progress(&self, window: &MuxWindow) -> bool {
-        if let Some(progress) = Self::backend_window_progress(window) {
-            return progress.state == TerminalProgressState::Indeterminate;
-        }
-        window
-            .panes
-            .iter()
-            .chain(std::iter::once(&window.anchor))
-            .filter_map(|pane| pane.pane_id.as_deref())
-            .filter_map(|pane_id| self.pane_progress(pane_id))
+        self.window_terminal_progresses(window)
             .any(|progress| progress.state == TerminalProgressState::Indeterminate)
     }
 
     pub(crate) fn window_progress(&self, window: &MuxWindow) -> Option<u8> {
-        if let Some(progress) = Self::backend_window_progress(window) {
-            return progress.percent();
-        }
+        self.window_terminal_progresses(window)
+            .filter_map(TerminalProgress::percent)
+            .max()
+    }
+
+    fn window_terminal_progresses<'a>(
+        &'a self,
+        window: &'a MuxWindow,
+    ) -> impl Iterator<Item = TerminalProgress> + 'a {
+        let backend = Self::backend_window_progress(window);
+        let panes = backend
+            .is_none()
+            .then(|| Self::window_pane_ids(window).filter_map(|id| self.pane_progress(id)))
+            .into_iter()
+            .flatten();
+        backend.into_iter().chain(panes)
+    }
+
+    fn window_pane_ids(window: &MuxWindow) -> impl Iterator<Item = &str> {
         window
             .panes
             .iter()
             .chain(std::iter::once(&window.anchor))
             .filter_map(|pane| pane.pane_id.as_deref())
-            .filter_map(|pane_id| self.pane_progress(pane_id))
-            .filter_map(TerminalProgress::percent)
-            .max()
     }
 
     fn backend_window_progress(window: &MuxWindow) -> Option<TerminalProgress> {

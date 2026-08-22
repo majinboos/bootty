@@ -4,6 +4,8 @@ use bootty_config::{
 };
 use eframe::egui::{self, RichText};
 
+use bootty_extension::ModuleSources;
+
 use super::SettingsSurface;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -15,32 +17,37 @@ pub(super) enum StatusBarPosition {
 impl StatusBarPosition {
     const ALL: [Self; 2] = [Self::Top, Self::Bottom];
 
-    pub(super) fn label(self) -> &'static str {
+    fn metadata(self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
-            Self::Top => "Top",
-            Self::Bottom => "Bottom",
+            Self::Top => (
+                "Top",
+                "top-segment",
+                "top_status_segments",
+                "settings_top_status_selected_segment",
+            ),
+            Self::Bottom => (
+                "Bottom",
+                "bottom-segment",
+                "bottom_status_segments",
+                "settings_bottom_status_selected_segment",
+            ),
         }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        self.metadata().0
     }
 
     pub(super) fn segment_key(self) -> &'static str {
-        match self {
-            Self::Top => "top-segment",
-            Self::Bottom => "bottom-segment",
-        }
+        self.metadata().1
     }
 
     fn list_id(self) -> &'static str {
-        match self {
-            Self::Top => "top_status_segments",
-            Self::Bottom => "bottom_status_segments",
-        }
+        self.metadata().2
     }
 
     fn selection_id(self) -> &'static str {
-        match self {
-            Self::Top => "settings_top_status_selected_segment",
-            Self::Bottom => "settings_bottom_status_selected_segment",
-        }
+        self.metadata().3
     }
 
     pub(super) fn segments(self, chrome: &ChromeConfig) -> &[StatusSegment] {
@@ -58,7 +65,7 @@ impl StatusBarPosition {
     }
 }
 
-pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
+pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui, sources: ModuleSources<'_>) {
     let palette = win.palette;
 
     super::section(ui, palette, "BARS");
@@ -86,24 +93,25 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     );
 
     super::section(ui, palette, "STATUS BARS");
-    super::settings_row(ui, palette, "Height", "Module strip height.", |ui| {
-        let mut height = win.config.chrome.status_height;
-        if super::settings_slider_with_edit(
-            ui,
-            palette,
-            &mut height,
-            super::NumberEditSpec {
-                id_salt: &["chrome", "status-height"],
-                range: 20.0..=80.0,
-                suffix: " px",
-                precision: 1,
-                display_scale: 1.0,
-            },
-        ) {
-            win.config.chrome.status_height = height;
-            win.writeback.set_f32(&["chrome", "status-height"], height);
-        }
-    });
+    if super::number_row(
+        ui,
+        palette,
+        &mut win.config.chrome.status_height,
+        super::NumberRow {
+            label: "Height",
+            help: "Module strip height.",
+            path: &["chrome", "status-height"],
+            range: 20.0..=80.0,
+            suffix: " px",
+            scale: 1.0,
+            control: super::NumberControl::Slider,
+        },
+    ) {
+        win.writeback.set_f32(
+            &["chrome", "status-height"],
+            win.config.chrome.status_height,
+        );
+    }
     super::settings_toggle_row(
         ui,
         palette,
@@ -137,24 +145,17 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let position = StatusBarPosition::ALL[selected_bar];
     ui.add_space(8.0);
 
-    let mut available = win
-        .writeback
-        .path()
-        .parent()
-        .and_then(|parent| bootty_extension::module_identities(&parent.join("extensions")).ok())
-        .map(|identities| {
-            identities
-                .into_iter()
-                .filter_map(|identity| {
-                    identity
-                        .as_ref()
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .map(str::to_owned)
-                })
-                .collect::<Vec<_>>()
+    let mut available = sources
+        .identities
+        .iter()
+        .filter_map(|identity| {
+            identity
+                .as_ref()
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
         })
-        .unwrap_or_default();
+        .collect::<Vec<_>>();
     available.sort();
     available.dedup();
     let selected_id = ui.make_persistent_id(position.selection_id());
@@ -278,11 +279,7 @@ fn segment_list_row(
 ) {
     let palette = win.palette;
     let segment = &position.segments(&win.config.chrome)[ctx.index];
-    let label = format!(
-        "{} · {}",
-        module_label(segment.module.as_str()),
-        align_label(segment.align)
-    );
+    let label = format!("{} · {:?}", segment.module, segment.align);
     let response = super::modules::module_selector_row(
         ui,
         palette,
@@ -424,24 +421,6 @@ struct SegmentDetailContext<'a> {
     changed: &'a mut bool,
 }
 
-fn module_label(module: &str) -> &str {
-    match module {
-        "session" => "Session",
-        "windows" => "Windows",
-        "sysinfo" => "System info",
-        "clock" => "Clock",
-        other => other,
-    }
-}
-
-fn align_label(align: SegmentAlign) -> &'static str {
-    match align {
-        SegmentAlign::Left => "Left",
-        SegmentAlign::Center => "Center",
-        SegmentAlign::Right => "Right",
-    }
-}
-
 fn optional_color(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
@@ -450,25 +429,6 @@ fn optional_color(
     seed: egui::Color32,
 ) -> bool {
     ui.label(RichText::new(label).size(11.0));
-    let mut rgb = slot.map_or([seed.r(), seed.g(), seed.b()], |color| {
-        [color.r, color.g, color.b]
-    });
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        if super::settings_color_picker(ui, palette, &mut rgb).changed() {
-            *slot = Some(Color {
-                r: rgb[0],
-                g: rgb[1],
-                b: rgb[2],
-                a: 0xff,
-            });
-            changed = true;
-        }
-        if slot.is_some() && super::settings_icon_button(ui, palette, "x", "Clear color").clicked()
-        {
-            *slot = None;
-            changed = true;
-        }
-    });
-    changed
+    ui.horizontal(|ui| super::optional_color_edit(ui, palette, slot, seed, false, &[label]))
+        .inner
 }

@@ -1,5 +1,6 @@
 use crate::{geometry::SurfaceRect, terminal_image::KittyImagePlacement};
 use eframe::wgpu;
+use libghostty_vt::kitty::graphics::ImageFormat;
 use std::borrow::Cow;
 
 const MAX_IMAGE_UPLOAD_BYTES: u64 = 64 * 1024 * 1024;
@@ -33,8 +34,8 @@ pub(super) fn source_uv_rect(image: &KittyImagePlacement) -> Option<SurfaceRect>
     if max_x > image.image_width || max_y > image.image_height {
         return None;
     }
-    let inv_width = 1.0 / image.image_width.max(1) as f32;
-    let inv_height = 1.0 / image.image_height.max(1) as f32;
+    let inv_width = 1.0 / image.image_width as f32;
+    let inv_height = 1.0 / image.image_height as f32;
     Some(SurfaceRect {
         min_x: (image.source.x as f32 + 0.5) * inv_width,
         min_y: (image.source.y as f32 + 0.5) * inv_height,
@@ -45,54 +46,46 @@ pub(super) fn source_uv_rect(image: &KittyImagePlacement) -> Option<SurfaceRect>
 
 pub(super) fn rgba_image_pixels(image: &KittyImagePlacement) -> Option<Cow<'_, [u8]>> {
     let pixels = image.image_width.checked_mul(image.image_height)? as usize;
-    match image.image_format {
-        libghostty_vt::kitty::graphics::ImageFormat::Rgba => {
-            let expected = pixels.checked_mul(4)?;
-            if image.data.len() < expected {
-                return None;
-            }
-            Some(Cow::Borrowed(&image.data[..expected]))
-        }
-        libghostty_vt::kitty::graphics::ImageFormat::Rgb => {
-            let expected = pixels.checked_mul(3)?;
-            if image.data.len() < expected {
-                return None;
-            }
-            let mut rgba = Vec::with_capacity(pixels * 4);
-            for rgb in image.data[..expected].as_chunks::<3>().0 {
-                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-            }
-            Some(Cow::Owned(rgba))
-        }
-        libghostty_vt::kitty::graphics::ImageFormat::GrayAlpha => {
-            let expected = pixels.checked_mul(2)?;
-            if image.data.len() < expected {
-                return None;
-            }
-            let mut rgba = Vec::with_capacity(pixels * 4);
-            for gray_alpha in image.data[..expected].as_chunks::<2>().0 {
-                rgba.extend_from_slice(&[
-                    gray_alpha[0],
-                    gray_alpha[0],
-                    gray_alpha[0],
-                    gray_alpha[1],
-                ]);
-            }
-            Some(Cow::Owned(rgba))
-        }
-        libghostty_vt::kitty::graphics::ImageFormat::Gray => {
-            if image.data.len() < pixels {
-                return None;
-            }
-            let mut rgba = Vec::with_capacity(pixels * 4);
-            for gray in &image.data[..pixels] {
-                rgba.extend_from_slice(&[*gray, *gray, *gray, 255]);
-            }
-            Some(Cow::Owned(rgba))
-        }
-        libghostty_vt::kitty::graphics::ImageFormat::Png => decode_png_rgba(image),
+    let channels = match image.image_format {
+        ImageFormat::Rgba => 4,
+        ImageFormat::Rgb => 3,
+        ImageFormat::GrayAlpha => 2,
+        ImageFormat::Gray => 1,
+        ImageFormat::Png => return decode_png_rgba(image),
+        _ => return None,
+    };
+    expand_rgba(&image.data, pixels, channels)
+}
+
+fn expand_rgba(data: &[u8], pixels: usize, channels: usize) -> Option<Cow<'_, [u8]>> {
+    match channels {
+        4 => Some(Cow::Borrowed(data.get(..pixels.checked_mul(4)?)?)),
+        3 => Some(Cow::Owned(expand_pixels::<3>(
+            data,
+            pixels,
+            |[r, g, b]| [r, g, b, 255],
+        )?)),
+        2 => Some(Cow::Owned(expand_pixels::<2>(data, pixels, |[g, a]| {
+            [g, g, g, a]
+        })?)),
+        1 => Some(Cow::Owned(expand_pixels::<1>(data, pixels, |[g]| {
+            [g, g, g, 255]
+        })?)),
         _ => None,
     }
+}
+
+fn expand_pixels<const N: usize>(
+    data: &[u8],
+    pixels: usize,
+    convert: impl Fn([u8; N]) -> [u8; 4],
+) -> Option<Vec<u8>> {
+    let data = data.get(..pixels.checked_mul(N)?)?;
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for pixel in data.as_chunks::<N>().0 {
+        rgba.extend_from_slice(&convert(*pixel));
+    }
+    Some(rgba)
 }
 
 pub(super) fn rgba_image_texture_pixels(image: &KittyImagePlacement) -> Option<Cow<'_, [u8]>> {
@@ -134,34 +127,18 @@ fn decode_png_rgba(image: &KittyImagePlacement) -> Option<Cow<'_, [u8]>> {
         return None;
     }
     let data = &buffer[..info.buffer_size()];
-    match (info.color_type, info.bit_depth) {
-        (png::ColorType::Rgba, png::BitDepth::Eight) => Some(Cow::Owned(data.to_vec())),
-        (png::ColorType::Rgb, png::BitDepth::Eight) => {
-            let mut rgba = Vec::with_capacity(data.len() / 3 * 4);
-            for rgb in data.as_chunks::<3>().0 {
-                rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-            }
-            Some(Cow::Owned(rgba))
-        }
-        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
-            let mut rgba = Vec::with_capacity(data.len() / 2 * 4);
-            for gray_alpha in data.as_chunks::<2>().0 {
-                rgba.extend_from_slice(&[
-                    gray_alpha[0],
-                    gray_alpha[0],
-                    gray_alpha[0],
-                    gray_alpha[1],
-                ]);
-            }
-            Some(Cow::Owned(rgba))
-        }
-        (png::ColorType::Grayscale, png::BitDepth::Eight) => {
-            let mut rgba = Vec::with_capacity(data.len() * 4);
-            for gray in data {
-                rgba.extend_from_slice(&[*gray, *gray, *gray, 255]);
-            }
-            Some(Cow::Owned(rgba))
-        }
-        _ => None,
+    if info.bit_depth != png::BitDepth::Eight {
+        return None;
     }
+    let channels = match info.color_type {
+        png::ColorType::Rgba => 4,
+        png::ColorType::Rgb => 3,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Grayscale => 1,
+        _ => return None,
+    };
+    let pixels = image.image_width.checked_mul(image.image_height)? as usize;
+    Some(Cow::Owned(
+        expand_rgba(data, pixels, channels)?.into_owned(),
+    ))
 }

@@ -23,8 +23,10 @@ pub use identity::ModuleIdentity;
 pub use items::error_item;
 pub use module_runtime::preview_module_surfaces;
 pub use module_sources::{
-    editable_module_source, import_legacy_extension_module, legacy_extension_modules,
-    module_identities, reset_module_source, save_module_source,
+    EditableModuleSource, LegacyExtensionModule, ModuleSourceOutcome, ModuleSourceRequest,
+    ModuleSources, create_module_source, editable_module_source, import_legacy_extension_module,
+    legacy_extension_modules, module_identities, module_template, reset_module_source,
+    save_module_source,
 };
 pub use queue::{
     EVENT_QUEUE_LIMIT, ExtensionEventReceiver, ExtensionEventRequest, ExtensionEventSender,

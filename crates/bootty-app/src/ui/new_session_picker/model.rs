@@ -12,12 +12,13 @@ pub(super) enum NewMuxSessionStep {
     BranchName,
 }
 
-pub(super) fn filtered_project_entries(
+pub(super) fn project_entries_for_filter(
     entries: &[ProjectPickerEntry],
     filter: &str,
 ) -> Vec<ProjectPickerEntry> {
-    let filter = filter.trim().to_ascii_lowercase();
-    entries
+    let raw_filter = filter.trim();
+    let filter = raw_filter.to_ascii_lowercase();
+    let mut filtered = entries
         .iter()
         .filter(|entry| {
             filter.is_empty()
@@ -26,15 +27,8 @@ pub(super) fn filtered_project_entries(
                     .contains(&filter)
         })
         .cloned()
-        .collect()
-}
-
-pub(super) fn project_entries_for_filter(
-    entries: &[ProjectPickerEntry],
-    filter: &str,
-) -> Vec<ProjectPickerEntry> {
-    let mut filtered = filtered_project_entries(entries, filter);
-    if let Some(entry) = direct_project_entry(filter)
+        .collect::<Vec<_>>();
+    if let Some(entry) = direct_project_entry(raw_filter)
         && !filtered
             .iter()
             .any(|existing| same_project_path(&existing.path, &entry.path))
@@ -61,17 +55,10 @@ fn looks_like_directory_path(filter: &str) -> bool {
         || filter.starts_with("~/")
         || filter.starts_with("./")
         || filter.starts_with("../")
-        || looks_like_windows_relative_path(filter)
-}
-
-#[cfg(windows)]
-fn looks_like_windows_relative_path(filter: &str) -> bool {
-    filter.starts_with(r"~\") || filter.starts_with(r".\") || filter.starts_with(r"..\")
-}
-
-#[cfg(not(windows))]
-fn looks_like_windows_relative_path(_filter: &str) -> bool {
-    false
+        || cfg!(windows)
+            && (filter.starts_with(r"~\")
+                || filter.starts_with(r".\")
+                || filter.starts_with(r"..\"))
 }
 
 fn normalize_path_for_session(path: &Path) -> String {
@@ -82,22 +69,21 @@ fn normalize_path_for_session(path: &Path) -> String {
 }
 
 fn same_project_path(a: &str, b: &str) -> bool {
-    let a = PathBuf::from(a);
-    let b = PathBuf::from(b);
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
+    let normalize = |path: &str| {
+        PathBuf::from(path)
+            .canonicalize()
+            .unwrap_or_else(|_| path.into())
+    };
+    normalize(a) == normalize(b)
 }
 
-pub(super) fn filtered_worktree_entries(
-    entries: &[WorktreePickerEntry],
+pub(super) fn filtered_worktree_entries<'a>(
+    entries: &'a [WorktreePickerEntry],
     filter: &str,
-) -> Vec<WorktreePickerEntry> {
+) -> Vec<&'a WorktreePickerEntry> {
     let filter = filter.trim().to_ascii_lowercase();
     entries
         .iter()
         .filter(|entry| filter.is_empty() || entry.label.to_ascii_lowercase().contains(&filter))
-        .cloned()
         .collect()
 }

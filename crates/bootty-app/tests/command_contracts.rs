@@ -11,13 +11,13 @@ use bootty_app::{
     AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     renderer::RendererMetrics,
     ui::{
-        ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
+        ditch::{DitchAction, DitchSessionEvent},
         new_session_picker::NewSessionPickerEvent,
     },
 };
 use bootty_command::{
     AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandCancellation,
-    CommandInvocation, CommandOutcome, CommandTarget, MutationClass, ResourceKind,
+    CommandInvocation, CommandOutcome, CommandTarget, MutationClass, ResourceKind, ValueType,
     app_command_channel as command_channel,
 };
 use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
@@ -93,6 +93,63 @@ fn core_commands_share_one_typed_catalog_contract() {
         )),
         Err(CommandOutcome::Failed { code, .. }) if code == "unknown_command"
     ));
+}
+
+#[test]
+fn command_specs_keep_presentation_policy_and_arguments_together() {
+    let catalog = CommandCatalog::default();
+
+    let appearance = catalog
+        .describe("change_appearance")
+        .expect("appearance command");
+    assert_eq!(appearance.title, "Change Appearance");
+    assert_eq!(appearance.mutation, MutationClass::Write);
+    assert_eq!(appearance.target, Some(ResourceKind::ApplicationWindow));
+    let [appearance_argument] = appearance.arguments.arguments.as_slice() else {
+        panic!("appearance argument schema: {:?}", appearance.arguments);
+    };
+    assert_eq!(appearance_argument.name, "appearance");
+    assert_eq!(appearance_argument.value_type, ValueType::String);
+    assert!(appearance_argument.required);
+    assert_eq!(appearance_argument.choices, ["system", "light", "dark"]);
+
+    let clipboard = catalog
+        .describe("copy_to_clipboard")
+        .expect("clipboard command");
+    let [clipboard_argument] = clipboard.arguments.arguments.as_slice() else {
+        panic!("clipboard argument schema: {:?}", clipboard.arguments);
+    };
+    assert!(!clipboard_argument.required);
+    assert_eq!(clipboard_argument.choices, ["plain", "vt", "html", "mixed"]);
+
+    assert!(catalog.describe("move_tab").expect("move tab").palette);
+    assert!(!catalog.describe("select_tab").expect("select tab").palette);
+    assert_eq!(
+        catalog
+            .describe("close_surface")
+            .expect("close pane")
+            .mutation,
+        MutationClass::Destructive
+    );
+    assert!(matches!(
+        catalog.resolve(CommandInvocation::from_action(
+            "change_appearance:sepia",
+            Caller::Socket,
+        )),
+        Err(CommandOutcome::Failed { code, .. }) if code == "invalid_arguments"
+    ));
+    assert!(matches!(
+        catalog.resolve(CommandInvocation::from_action("select_tab:0", Caller::Socket)),
+        Err(CommandOutcome::Failed { code, .. }) if code == "invalid_arguments"
+    ));
+    assert!(
+        catalog
+            .resolve(CommandInvocation::from_action(
+                "copy_to_clipboard",
+                Caller::Socket,
+            ))
+            .is_ok()
+    );
 }
 
 #[test]
@@ -215,16 +272,13 @@ fn native_split_command_publishes_the_binding_owned_layout() {
         started,
     );
     assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
-    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
-    else {
-        panic!("expected new session dialog");
-    };
-    state.apply_picker_event(
-        dialog,
-        NewSessionPickerEvent::CreateSession {
-            cwd: directory.path().to_string_lossy().into_owned(),
-        },
-    );
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::NewSession(_))
+    ));
+    state.apply_picker_event(NewSessionPickerEvent::CreateSession {
+        cwd: directory.path().to_string_lossy().into_owned(),
+    });
     for tick in 1..5 {
         state.update_frame(frame(started + Duration::from_millis(tick)));
     }
@@ -334,17 +388,15 @@ fn ditch_session_commits_membership_after_authoritative_command() {
         .clone();
 
     assert!(state.open_ditch_session_dialog_for(&target.session_id));
-    let ModalDialog::DitchSession(dialog) = state.take_modal_dialog().expect("ditch dialog") else {
-        panic!("expected ditch dialog");
-    };
-    state.apply_ditch_session_event(
-        dialog,
-        DitchSessionEvent::Ditch {
-            session_id: target.session_id.clone(),
-            cwd: None,
-            action: DitchAction::KillOnly,
-        },
-    );
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::DitchSession(_))
+    ));
+    state.apply_ditch_session_event(DitchSessionEvent::Ditch {
+        session_id: target.session_id.clone(),
+        cwd: None,
+        action: DitchAction::KillOnly,
+    });
 
     let removed = (0..250).any(|tick| {
         state.update_frame(frame(started + Duration::from_millis(500 + tick)));
@@ -391,16 +443,13 @@ fn ditch_submits_after_worktree_removal_when_branch_deletion_fails() {
         started,
     );
     assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
-    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
-    else {
-        panic!("expected new session dialog");
-    };
-    state.apply_picker_event(
-        dialog,
-        NewSessionPickerEvent::CreateSession {
-            cwd: worktree.to_string_lossy().into_owned(),
-        },
-    );
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::NewSession(_))
+    ));
+    state.apply_picker_event(NewSessionPickerEvent::CreateSession {
+        cwd: worktree.to_string_lossy().into_owned(),
+    });
     for tick in 1..5 {
         state.update_frame(frame(started + Duration::from_millis(tick)));
     }
@@ -421,23 +470,21 @@ fn ditch_submits_after_worktree_removal_when_branch_deletion_fails() {
     let lock = Connection::open(&database).expect("open lock connection");
     lock.execute_batch("BEGIN IMMEDIATE")
         .expect("hold workspace write lock");
-    state.apply_ditch_session_event(
-        DitchSessionDialog::open(session_id.clone(), Some(cwd.clone())),
-        ditch_event(),
-    );
+    assert!(state.open_ditch_session_dialog_for(&session_id));
+    state.apply_ditch_session_event(ditch_event());
     assert!(
         worktree.exists(),
         "failed Ditch preparation must not remove the worktree"
     );
-    let reopened = match state.take_modal_dialog() {
-        Some(ModalDialog::DitchSession(dialog)) => dialog,
-        _ => panic!("expected reopened Ditch dialog"),
-    };
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::DitchSession(_))
+    ));
     lock.execute_batch("ROLLBACK")
         .expect("release workspace write lock");
     drop(lock);
 
-    state.apply_ditch_session_event(reopened, ditch_event());
+    state.apply_ditch_session_event(ditch_event());
 
     assert!(!worktree.exists(), "ditch must remove the linked worktree");
     assert!(
@@ -544,23 +591,28 @@ fn native_window_actions_use_the_binding_owned_plan() {
         started,
     );
     assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
-    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
-    else {
-        panic!("expected new session dialog");
-    };
-    state.apply_picker_event(
-        dialog,
-        NewSessionPickerEvent::CreateSession {
-            cwd: directory.path().to_string_lossy().into_owned(),
-        },
-    );
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::NewSession(_))
+    ));
+    state.apply_picker_event(NewSessionPickerEvent::CreateSession {
+        cwd: directory.path().to_string_lossy().into_owned(),
+    });
     for tick in 1..5 {
         state.update_frame(frame(started + Duration::from_millis(tick)));
     }
 
     let session = state.mux().sessions()[0].clone();
     let first_window = session.windows[0].id.clone();
-    assert!(state.new_tab_for_window_from_ui(&session.id, &first_window));
+    let outcome = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_tab", Caller::Keybinding),
+        started + Duration::from_millis(5),
+    );
+    assert!(
+        matches!(outcome, CommandOutcome::Success { .. }),
+        "{outcome:?}"
+    );
     for tick in 5..10 {
         state.update_frame(frame(started + Duration::from_millis(tick)));
     }
@@ -579,14 +631,26 @@ fn native_window_actions_use_the_binding_owned_plan() {
         .expect("new window")
         .id
         .clone();
-    let session_id = session.id.clone();
-
-    assert!(state.activate_relative_window_from_ui(&session_id, &first_window, 1));
-    assert_eq!(state.mux().selected_window(), Some(second_window.as_str()));
-    assert!(state.activate_last_window_from_ui(&session_id));
+    let outcome = submit_command(
+        &mut state,
+        CommandInvocation::from_action("next_tab", Caller::Keybinding),
+        started + Duration::from_millis(10),
+    );
+    assert!(
+        matches!(outcome, CommandOutcome::Success { .. }),
+        "{outcome:?}"
+    );
     assert_eq!(state.mux().selected_window(), Some(first_window.as_str()));
-    assert!(state.move_window_from_ui(&session_id, &second_window, -1));
-    assert!(state.close_pane_for_window_from_ui(&session_id, &second_window));
+    let outcome = submit_command(
+        &mut state,
+        CommandInvocation::from_action("last_tab", Caller::Keybinding),
+        started + Duration::from_millis(11),
+    );
+    assert!(
+        matches!(outcome, CommandOutcome::Success { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(state.mux().selected_window(), Some(second_window.as_str()));
 }
 
 #[test]

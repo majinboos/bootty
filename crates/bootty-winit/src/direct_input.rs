@@ -61,11 +61,30 @@ pub fn direct_key_input_from_winit_code_with_remaps(
     modifier_remaps: &ModifierRemapSet,
 ) -> Option<DirectKeyInput> {
     let suppress_egui_key = collapsed_egui_key_for_direct_code(code)
-        .or_else(|| side_sensitive_egui_key_for_direct_code(code, modifiers, side_state))
-        .or_else(|| command_egui_key_for_direct_code(code, modifiers, side_state))
+        .or_else(|| {
+            (code == KeyCode::Tab && modifiers.shift_key() && side_state.has_right_shift())
+                .then_some(Some(egui::Key::Tab))
+        })
+        .or_else(|| {
+            (modifiers.super_key() || side_state.has_command())
+                .then(|| egui_key_for_direct_code(code))
+                .flatten()
+                .map(Some)
+        })
         .or_else(|| linux_terminal_shortcut_egui_key_for_direct_code(code, modifiers))
         .or_else(|| windows_terminal_shortcut_egui_key_for_direct_code(code, modifiers))
-        .or_else(|| modifier_egui_key_for_direct_code(code))?;
+        .or_else(|| {
+            matches!(
+                code,
+                KeyCode::ShiftLeft
+                    | KeyCode::ShiftRight
+                    | KeyCode::ControlLeft
+                    | KeyCode::ControlRight
+                    | KeyCode::AltLeft
+                    | KeyCode::AltRight
+            )
+            .then_some(None)
+        })?;
     let mut input = bare_terminal_key_input(code, modifiers, repeat)?;
     side_state.apply_to_key_input(&mut input);
     input.mods = modifier_remaps.apply(input.mods);
@@ -134,17 +153,6 @@ fn collapsed_egui_key_for_direct_code(code: KeyCode) -> Option<Option<egui::Key>
     Some(Some(key))
 }
 
-fn side_sensitive_egui_key_for_direct_code(
-    code: KeyCode,
-    modifiers: ModifiersState,
-    side_state: ModifierSideState,
-) -> Option<Option<egui::Key>> {
-    if code == KeyCode::Tab && modifiers.shift_key() && side_state.has_right_shift() {
-        return Some(Some(egui::Key::Tab));
-    }
-    None
-}
-
 #[cfg(target_os = "linux")]
 fn linux_terminal_shortcut_egui_key_for_direct_code(
     code: KeyCode,
@@ -161,25 +169,15 @@ fn linux_terminal_shortcut_egui_key_for_direct_code(
     None
 }
 
-fn command_egui_key_for_direct_code(
-    code: KeyCode,
-    modifiers: ModifiersState,
-    side_state: ModifierSideState,
-) -> Option<Option<egui::Key>> {
-    (modifiers.super_key() || side_state.has_command())
-        .then(|| egui_key_for_direct_code(code).map(Some))
-        .flatten()
-}
-
 #[cfg(windows)]
 fn windows_terminal_shortcut_egui_key_for_direct_code(
     code: KeyCode,
     modifiers: ModifiersState,
 ) -> Option<Option<egui::Key>> {
-    if modifiers.control_key() || (code == KeyCode::Insert && modifiers.shift_key()) {
-        return egui_key_for_direct_code(code).map(Some);
-    }
-    None
+    (modifiers.control_key() || (code == KeyCode::Insert && modifiers.shift_key()))
+        .then(|| egui_key_for_direct_code(code))
+        .flatten()
+        .map(Some)
 }
 
 #[cfg(not(windows))]
@@ -268,18 +266,6 @@ fn egui_key_for_direct_code(code: KeyCode) -> Option<egui::Key> {
     })
 }
 
-fn modifier_egui_key_for_direct_code(code: KeyCode) -> Option<Option<egui::Key>> {
-    match code {
-        KeyCode::ShiftLeft
-        | KeyCode::ShiftRight
-        | KeyCode::ControlLeft
-        | KeyCode::ControlRight
-        | KeyCode::AltLeft
-        | KeyCode::AltRight => Some(None),
-        _ => None,
-    }
-}
-
 fn increment_count<T: Eq>(counts: &mut Vec<(T, usize)>, value: T) {
     if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| *candidate == value) {
         *count += 1;
@@ -293,13 +279,12 @@ where
     C: Borrow<T>,
     T: Eq + ?Sized,
 {
-    if let Some((_, count)) = counts
+    let Some((_, count)) = counts
         .iter_mut()
         .find(|(candidate, count)| *count > 0 && candidate.borrow() == value)
-    {
-        *count -= 1;
-        true
-    } else {
-        false
-    }
+    else {
+        return false;
+    };
+    *count -= 1;
+    true
 }

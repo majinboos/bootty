@@ -6,7 +6,6 @@ fn backend_tokens_are_stable() {
         ("native", MuxBackendKind::Native),
         ("rmux", MuxBackendKind::Rmux),
         ("tmux", MuxBackendKind::Tmux),
-        ("zellij", MuxBackendKind::Zellij),
     ] {
         let decoded: MuxBackendKind = serde_json::from_str(&format!("\"{token}\""))
             .expect("backend token should deserialize");
@@ -19,7 +18,6 @@ fn remote_space_summary_wire_shape_is_stable() {
     for (backend, token) in [
         (MuxBackendKind::Rmux, "rmux"),
         (MuxBackendKind::Tmux, "tmux"),
-        (MuxBackendKind::Zellij, "zellij"),
     ] {
         let summary = RemoteSpaceSummary {
             catalog_version: 3,

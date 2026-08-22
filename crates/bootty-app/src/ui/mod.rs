@@ -15,5 +15,5 @@ pub mod theme_picker;
 
 mod dialog_runtime;
 
-pub(crate) use dialog_runtime::DialogRuntime;
 pub use dialog_runtime::ModalDialog;
+pub(crate) use dialog_runtime::{DialogRuntime, ModalKind};

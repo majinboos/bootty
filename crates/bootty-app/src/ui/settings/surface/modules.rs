@@ -1,9 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bootty_extension::{
-    ModuleIdentity, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot, editable_module_source,
-    error_item, import_legacy_extension_module, legacy_extension_modules, module_identities,
-    preview_module_surfaces, reset_module_source, save_module_source,
+    LegacyExtensionModule, ModuleIdentity, ModuleSourceOutcome, ModuleSourceRequest, ModuleSources,
+    SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot, error_item, preview_module_surfaces,
 };
 use bootty_ui::icons;
 use eframe::egui::{self, RichText};
@@ -12,12 +11,15 @@ use crate::theme::module_color32;
 
 use super::SettingsSurface;
 
+/// Editor-only state. Every filesystem decision belongs to the extension host: this holds the
+/// draft being edited plus the requests the host runs once painting is done.
 #[derive(Default)]
 pub(super) struct EditorState {
     selected: Option<ModuleIdentity>,
     creating: bool,
     new_identity: String,
     create_error: Option<String>,
+    /// The identity whose source is loaded in `source`; `None` until the host answers a load.
     loaded: Option<ModuleIdentity>,
     source: String,
     path: PathBuf,
@@ -27,31 +29,86 @@ pub(super) struct EditorState {
     preview_source: String,
     preview_theme: Vec<(String, String)>,
     preview: Vec<SurfaceSnapshot>,
+    /// Requests collected this frame, run by the host after painting.
+    requests: Vec<ModuleSourceRequest>,
+    /// A module the host just created, taken by the page whose button asked for it.
+    created: Option<ModuleIdentity>,
 }
 
-pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
+impl EditorState {
+    fn request(&mut self, request: ModuleSourceRequest) {
+        self.requests.push(request);
+    }
+
+    pub(super) fn take_requests(&mut self) -> Vec<ModuleSourceRequest> {
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Drop a create nobody consumed. The page that asked takes it on its next paint, so a
+    /// leftover means settings closed in between and no page still owes it a row.
+    pub(super) fn discard_created(&mut self) {
+        self.created = None;
+    }
+
+    /// Apply one host outcome. A create/reset/import success drops the loaded draft so the
+    /// next frame reloads the module from its owner.
+    pub(super) fn apply(&mut self, outcome: ModuleSourceOutcome) {
+        match outcome {
+            ModuleSourceOutcome::Loaded { source, exists } => {
+                self.loaded = Some(source.identity);
+                self.source = source.source;
+                self.path = source.path;
+                self.customized = source.customized;
+                self.has_builtin = source.has_builtin;
+                self.error =
+                    (!exists).then(|| "Module file does not exist; editing creates it.".to_owned());
+                self.preview_source.clear();
+            }
+            ModuleSourceOutcome::Created(Ok(identity)) => {
+                self.creating = false;
+                self.create_error = None;
+                self.loaded = None;
+                self.selected = Some(identity.clone());
+                self.created = Some(identity);
+            }
+            ModuleSourceOutcome::Created(Err(error)) => self.create_error = Some(error),
+            ModuleSourceOutcome::Saved(Ok(path)) => {
+                self.path = path;
+                self.customized = true;
+                self.error = None;
+            }
+            ModuleSourceOutcome::Saved(Err(error)) => {
+                self.error = Some(format!("Save failed: {error}"));
+            }
+            ModuleSourceOutcome::Reset(Ok(_)) => self.loaded = None,
+            ModuleSourceOutcome::Reset(Err(error)) => self.error = Some(error),
+            ModuleSourceOutcome::Imported(Ok(identity)) => {
+                self.loaded = None;
+                self.error = None;
+                self.selected = Some(identity);
+            }
+            ModuleSourceOutcome::Imported(Err(error)) => {
+                self.error = Some(format!("Import failed: {error}"));
+            }
+        }
+    }
+}
+
+pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui, sources: ModuleSources<'_>) {
     let palette = win.palette;
-    let Some(root) = extension_root(win) else {
-        return;
-    };
-    let identities = module_identities(&root).unwrap_or_default();
-    let legacy = root
-        .parent()
-        .and_then(|config_dir| legacy_extension_modules(config_dir).ok())
-        .unwrap_or_default();
     let mut selected = win
         .module_editor
         .selected
         .clone()
-        .filter(|identity| identities.contains(identity))
-        .or_else(|| identities.first().cloned());
+        .filter(|identity| sources.identities.contains(identity))
+        .or_else(|| sources.identities.first().cloned());
 
     settings_pane(
         win,
         ui,
         |win, ui| {
             super::section(ui, palette, "EXTENSIONS");
-            for identity in &identities {
+            for identity in sources.identities {
                 let active = selected.as_ref() == Some(identity);
                 let response =
                     module_selector_row(ui, palette, identity.as_str(), active, None, |_| {});
@@ -62,40 +119,15 @@ pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             if let Some(identity) = new_module_ui(win, ui) {
                 selected = Some(identity);
             }
-            if !legacy.is_empty() {
+            if !sources.legacy.is_empty() {
                 super::section(ui, palette, "LEGACY MODULES");
                 super::settings_notice(
                     ui,
                     palette.warning,
                     "These modules are inactive. Import one to validate and activate it.",
                 );
-                for module in &legacy {
-                    let label = format!(
-                        "{} · {}",
-                        module.placement.as_str(),
-                        module.source_path.display()
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(label).color(palette.subtext).size(10.0));
-                        if super::settings_button(ui, palette, "Import").clicked() {
-                            let variant =
-                                win.config.appearance.mode.variant(win.appearance_variant);
-                            let theme = crate::theme::theme_tokens(&win.config, variant);
-                            let config_dir =
-                                root.parent().expect("extension root has config parent");
-                            match import_legacy_extension_module(config_dir, module, theme) {
-                                Ok(identity) => {
-                                    win.module_editor.loaded = None;
-                                    win.module_editor.error = None;
-                                    selected = Some(identity);
-                                }
-                                Err(error) => {
-                                    win.module_editor.error =
-                                        Some(format!("Import failed: {error}"));
-                                }
-                            }
-                        }
-                    });
+                for module in sources.legacy {
+                    legacy_row(win, ui, module);
                 }
             }
             selected
@@ -105,6 +137,22 @@ pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             None => super::settings_notice(ui, palette.muted, "No extension modules found."),
         },
     );
+}
+
+fn legacy_row(win: &mut SettingsSurface, ui: &mut egui::Ui, module: &LegacyExtensionModule) {
+    let palette = win.palette;
+    let label = format!(
+        "{} · {}",
+        module.placement.as_str(),
+        module.source_path.display()
+    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(label).color(palette.subtext).size(10.0));
+        if super::settings_button(ui, palette, "Import").clicked() {
+            win.module_editor
+                .request(ModuleSourceRequest::ImportLegacy(module.clone()));
+        }
+    });
 }
 
 pub(super) fn settings_pane<T>(
@@ -149,13 +197,14 @@ pub(super) fn source_editor_for_surface(
 
 fn source_editor(win: &mut SettingsSurface, ui: &mut egui::Ui, identity: &ModuleIdentity) {
     let palette = win.palette;
-    let Some(root) = extension_root(win) else {
-        return;
-    };
-    if win.module_editor.loaded.as_ref() != Some(identity) {
-        load_editor(&mut win.module_editor, &root, identity);
-    }
     win.module_editor.selected = Some(identity.clone());
+    if win.module_editor.loaded.as_ref() != Some(identity) {
+        // The host owns the extension root; it answers with the source before the next frame.
+        win.module_editor
+            .request(ModuleSourceRequest::Load(identity.clone()));
+        super::settings_notice(ui, palette.muted, "Loading module source…");
+        return;
+    }
     let variant = win.config.appearance.mode.variant(win.appearance_variant);
     let theme = crate::theme::theme_tokens(&win.config, variant);
     let state = &mut win.module_editor;
@@ -172,12 +221,12 @@ fn source_editor(win: &mut SettingsSurface, ui: &mut egui::Ui, identity: &Module
         .corner_radius(egui::CornerRadius::same(palette.radius))
         .inner_margin(egui::Margin::same(12))
         .show(ui, |ui| {
-            module_toolbar(ui, palette, state, &root, identity);
+            module_toolbar(ui, palette, state, identity);
             if let Some(error) = &state.error {
                 ui.label(RichText::new(error).color(palette.destructive).size(11.0));
             }
             module_preview(ui, palette, &state.preview);
-            code_editor(ui, palette, state, &root, identity);
+            code_editor(ui, palette, state, identity);
         });
 }
 
@@ -192,9 +241,8 @@ pub(super) fn new_module_ui(
             win.module_editor.new_identity.clear();
             win.module_editor.create_error = None;
         }
-        return None;
+        return win.module_editor.created.take();
     }
-    let mut created = None;
     ui.horizontal(|ui| {
         super::settings_text_edit_width(
             ui,
@@ -204,32 +252,9 @@ pub(super) fn new_module_ui(
             (ui.available_width() - 150.0).max(180.0),
         );
         if super::settings_button(ui, palette, "Create").clicked() {
-            let value = win.module_editor.new_identity.trim().to_owned();
-            match ModuleIdentity::parse(value) {
-                Ok(identity) => {
-                    let Some(root) = extension_root(win) else {
-                        return;
-                    };
-                    if root.join(identity.as_ref()).exists() {
-                        win.module_editor.create_error =
-                            Some(format!("Module `{identity}` already exists."));
-                    } else {
-                        match save_module_source(&root, &identity, &module_template(&identity)) {
-                            Ok(_) => {
-                                win.module_editor.creating = false;
-                                win.module_editor.loaded = None;
-                                win.module_editor.create_error = None;
-                                created = Some(identity);
-                            }
-                            Err(error) => {
-                                win.module_editor.create_error =
-                                    Some(format!("Create failed: {error}"));
-                            }
-                        }
-                    }
-                }
-                Err(error) => win.module_editor.create_error = Some(error),
-            }
+            let value = win.module_editor.new_identity.clone();
+            win.module_editor
+                .request(ModuleSourceRequest::Create(value));
         }
         if super::settings_button(ui, palette, "Cancel").clicked() {
             win.module_editor.creating = false;
@@ -239,7 +264,7 @@ pub(super) fn new_module_ui(
     if let Some(error) = &win.module_editor.create_error {
         ui.label(RichText::new(error).color(palette.destructive).size(11.0));
     }
-    created
+    win.module_editor.created.take()
 }
 
 pub(super) fn module_selector_row(
@@ -312,32 +337,23 @@ fn module_preview(
     palette: bootty_ui::ThemePalette,
     surfaces: &[SurfaceSnapshot],
 ) {
-    ui.label(
-        RichText::new("PREVIEW · EXAMPLE DATA")
-            .color(palette.muted)
-            .strong()
-            .size(11.0),
-    );
+    ui.colored_label(palette.muted, "PREVIEW · EXAMPLE DATA");
     for surface in surfaces {
-        ui.label(
-            RichText::new(format!(
+        ui.colored_label(
+            palette.subtext,
+            format!(
                 "{} · {:?}",
                 surface.declaration.id, surface.declaration.placement
-            ))
-            .color(palette.subtext)
-            .size(10.0),
+            ),
         );
         for item in &surface.items {
             ui.horizontal_wrapped(|ui| {
                 if let Some(icon) = &item.icon {
-                    ui.label(
-                        RichText::new(icon)
-                            .color(item.fg.map(module_color32).unwrap_or(palette.text)),
-                    );
+                    ui.colored_label(item.fg.map(module_color32).unwrap_or(palette.text), icon);
                 }
-                ui.label(
-                    RichText::new(&item.text)
-                        .color(item.fg.map(module_color32).unwrap_or(palette.text)),
+                ui.colored_label(
+                    item.fg.map(module_color32).unwrap_or(palette.text),
+                    &item.text,
                 );
             });
         }
@@ -349,16 +365,10 @@ fn module_toolbar(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
     state: &mut EditorState,
-    root: &Path,
     identity: &ModuleIdentity,
 ) {
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(identity.as_str())
-                .color(palette.text)
-                .strong()
-                .size(15.0),
-        );
+        ui.colored_label(palette.text, identity.as_str());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if super::settings_icon_button(ui, palette, "copy", "Copy module path").clicked() {
                 ui.ctx()
@@ -368,10 +378,7 @@ fn module_toolbar(
                 && state.has_builtin
                 && super::settings_button(ui, palette, "Reset to default").clicked()
             {
-                match reset_module_source(root, identity) {
-                    Ok(()) => load_editor(state, root, identity),
-                    Err(error) => state.error = Some(error.to_string()),
-                }
+                state.request(ModuleSourceRequest::Reset(identity.clone()));
             }
         });
     });
@@ -381,7 +388,6 @@ fn code_editor(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
     state: &mut EditorState,
-    root: &Path,
     identity: &ModuleIdentity,
 ) {
     let response = egui::Frame::NONE
@@ -399,55 +405,12 @@ fn code_editor(
         })
         .inner;
     if response.changed() {
-        match save_module_source(root, identity, &state.source) {
-            Ok(path) => {
-                state.path = path;
-                state.customized = true;
-                state.error = None;
-            }
-            Err(error) => state.error = Some(format!("Save failed: {error}")),
-        }
+        let source = state.source.clone();
+        state.request(ModuleSourceRequest::Save {
+            identity: identity.clone(),
+            source,
+        });
     }
-}
-
-fn load_editor(state: &mut EditorState, root: &Path, identity: &ModuleIdentity) {
-    match editable_module_source(root, identity) {
-        Some(module) => {
-            state.loaded = Some(identity.clone());
-            state.source = module.source;
-            state.path = module.path;
-            state.customized = module.customized;
-            state.has_builtin = module.has_builtin;
-            state.error = None;
-        }
-        None => {
-            state.loaded = Some(identity.clone());
-            state.source = module_template(identity);
-            state.path = root.join(identity.as_ref());
-            state.customized = false;
-            state.has_builtin = false;
-            state.error = Some("Module file does not exist; editing creates it.".to_owned());
-        }
-    }
-    state.preview_source.clear();
-}
-
-fn extension_root(win: &SettingsSurface) -> Option<PathBuf> {
-    win.writeback
-        .path()
-        .parent()
-        .map(|path| path.join("extensions"))
-}
-
-fn module_template(identity: &ModuleIdentity) -> String {
-    let id = identity
-        .as_ref()
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("extension");
-    format!(
-        "--!strict\nbootty.ui.register({{ id = \"{id}\", placement = \"sidebar\" }}, function()\n\treturn {{ {{ text = \"{id}\" }} }}\nend)\n"
-    )
 }
 
 fn error_surface(error: String) -> SurfaceSnapshot {

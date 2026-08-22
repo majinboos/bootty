@@ -8,10 +8,11 @@ use bootty_app::{
         chrome::{self, SidebarModel, StatusBarModel},
         session_navigation::BindingSessionGroup,
         sidebar::build_binding_sidebar_items,
-        space::SpaceEditorEvent,
+        space::{SpaceDraft, SpaceEditorIntent},
     },
 };
 use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_extension::ModuleItem;
 use bootty_mux::{
     RepaintHandle,
     controller::{BindingId, MuxScope, SpaceId},
@@ -104,22 +105,20 @@ fn app_state_with_spaces(count: usize) -> AppState {
     let mut state = app_state(false);
     for index in 1..count {
         assert!(state.open_create_space_dialog_from_ui());
-        let ModalDialog::SpaceEditor(dialog) =
-            state.take_modal_dialog().expect("create Space dialog")
-        else {
-            panic!("expected Space editor dialog");
-        };
-        state.apply_space_editor_event(
-            dialog,
-            SpaceEditorEvent::Save {
-                space_id: None,
-                name: format!("Benchmark Space {index}"),
-                icon: "folder".to_owned(),
-                color: [0x7a, 0xa2, 0xf7],
-                tint_sidebar: false,
-                mux: SpaceMuxOverride::default(),
-            },
-        );
+        assert!(matches!(
+            state.modal_dialog(),
+            Some(ModalDialog::SpaceEditor(_))
+        ));
+        let mux = SpaceMuxOverride::default();
+        state.apply_space_editor_intent(SpaceEditorIntent::Save(SpaceDraft {
+            space_id: None,
+            name: format!("Benchmark Space {index}"),
+            icon: "folder".to_owned(),
+            color: [0x7a, 0xa2, 0xf7],
+            tint_sidebar: false,
+            backend: mux.backend,
+            remote_source: mux.remote,
+        }));
     }
     state
 }
@@ -233,7 +232,6 @@ fn sidebar_ui_frame(ui: &mut egui::Ui, group: &BindingSessionGroup) {
                     items: &items,
                     footer_items: &[],
                     session_count: group.sessions.len(),
-                    has_sessions: !group.sessions.is_empty(),
                     title_visible: true,
                     reserve_titlebar_buttons: true,
                     title_icon: None,
@@ -263,25 +261,37 @@ fn status_ui_frame(ui: &mut egui::Ui, selected: Option<&str>) {
             .max_rect(status_rect)
             .layout(egui::Layout::left_to_right(egui::Align::Center)),
         |ui| {
+            let item = ModuleItem {
+                text: selected.unwrap_or("session").to_owned(),
+                ..Default::default()
+            };
             let segments = [chrome::ResolvedSegment {
                 align: bootty_config::config::SegmentAlign::Left,
                 source_slot: 0,
                 items: vec![chrome::ResolvedItem {
-                    text: selected.unwrap_or("session").to_owned(),
-                    ..Default::default()
+                    item: &item,
+                    icon: None,
+                    fg: None,
+                    bg: None,
+                    stroke: None,
                 }],
+                ..Default::default()
             }];
+            let layout = chrome::status_bar_layout(
+                ui,
+                status_rect,
+                &segments,
+                chrome::STATUS_EDGE_PAD,
+                None,
+            );
             chrome::show_status_bar(
                 ui,
                 bootty_ui::ThemePalette::default(),
                 StatusBarModel {
-                    segments: &segments,
+                    layout: &layout,
                     tab_context: None,
                     background: bootty_ui::ThemePalette::default().base,
-                    left_padding: chrome::STATUS_EDGE_PAD,
                     row_height: 30.0,
-                    notch_x: None,
-                    tab_rows: 1,
                     interaction_id: "status-bar-bench",
                 },
             );

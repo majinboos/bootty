@@ -245,58 +245,45 @@ fn box_rounded_corner_spec(ch: char) -> Option<BoxRoundedCorner> {
 }
 
 fn box_dash_commands(dashes: BoxDashes, rect: SurfaceRect) -> Vec<SpriteCommand> {
-    match dashes.axis {
-        BoxDashAxis::Horizontal => box_horizontal_dash_commands(dashes, rect),
-        BoxDashAxis::Vertical => box_vertical_dash_commands(dashes, rect),
-    }
-}
-
-fn box_horizontal_dash_commands(dashes: BoxDashes, rect: SurfaceRect) -> Vec<SpriteCommand> {
     let count = f32::from(dashes.count);
-    let gap_width = box_line_width(dashes.desired_gap, rect)
+    let line_width = box_line_width(dashes.style, rect);
+    let (axis_length, start, cross_position) = match dashes.axis {
+        BoxDashAxis::Horizontal => (
+            rect.width(),
+            rect.min_x,
+            rect.min_y + (rect.height() - line_width) * 0.5,
+        ),
+        BoxDashAxis::Vertical => (
+            rect.height(),
+            rect.min_y,
+            rect.min_x + (rect.width() - line_width) * 0.5,
+        ),
+    };
+    let gap = box_line_width(dashes.desired_gap, rect)
         .max(dashes.min_gap)
-        .min((rect.width() / (2.0 * count)).floor());
-    let total_gap_width = count * gap_width;
-    let total_dash_width = rect.width() - total_gap_width;
-    let dash_width = (total_dash_width / count).floor();
-    let mut extra = total_dash_width % count;
-    let y = rect.min_y + (rect.height() - box_line_width(dashes.style, rect)) * 0.5;
-    let mut x = rect.min_x + (gap_width / 2.0).floor();
+        .min((axis_length / (2.0 * count)).floor());
+    let total_dash_length = axis_length - count * gap;
+    let dash_length = (total_dash_length / count).floor();
+    let mut extra = total_dash_length % count;
+    let mut position = start
+        + match dashes.axis {
+            BoxDashAxis::Horizontal => (gap / 2.0).floor(),
+            BoxDashAxis::Vertical => 0.0,
+        };
+    let fill_dash = |position, length| match dashes.axis {
+        BoxDashAxis::Horizontal => fill_rect(position, cross_position, length, line_width),
+        BoxDashAxis::Vertical => fill_rect(cross_position, position, line_width, length),
+    };
     let mut commands = Vec::with_capacity(usize::from(dashes.count));
 
     for _ in 0..dashes.count {
-        let mut width = dash_width;
+        let mut length = dash_length;
         if extra > 0.0 {
             extra -= 1.0;
-            width += 1.0;
+            length += 1.0;
         }
-        commands.push(fill_rect(x, y, width, box_line_width(dashes.style, rect)));
-        x += width + gap_width;
-    }
-    commands
-}
-
-fn box_vertical_dash_commands(dashes: BoxDashes, rect: SurfaceRect) -> Vec<SpriteCommand> {
-    let count = f32::from(dashes.count);
-    let gap_height = box_line_width(dashes.desired_gap, rect)
-        .max(dashes.min_gap)
-        .min((rect.height() / (2.0 * count)).floor());
-    let total_gap_height = count * gap_height;
-    let total_dash_height = rect.height() - total_gap_height;
-    let dash_height = (total_dash_height / count).floor();
-    let mut extra = total_dash_height % count;
-    let x = rect.min_x + (rect.width() - box_line_width(dashes.style, rect)) * 0.5;
-    let mut y = rect.min_y;
-    let mut commands = Vec::with_capacity(usize::from(dashes.count));
-
-    for _ in 0..dashes.count {
-        let mut height = dash_height;
-        if extra > 0.0 {
-            extra -= 1.0;
-            height += 1.0;
-        }
-        commands.push(fill_rect(x, y, box_line_width(dashes.style, rect), height));
-        y += height + gap_height;
+        commands.push(fill_dash(position, length));
+        position += length + gap;
     }
     commands
 }
@@ -336,61 +323,23 @@ fn box_rounded_corner_command(corner: BoxRoundedCorner, rect: SurfaceRect) -> Sp
     let radius = rect.width().min(rect.height()) * 0.5;
     let s = 0.25;
     let mut points = Vec::new();
-
-    match corner {
-        BoxRoundedCorner::UpperLeft => {
-            points.push(SpritePoint::new(center_x, rect.max_y));
-            points.push(SpritePoint::new(center_x, center_y + radius));
-            sample_cubic(
-                [
-                    SpritePoint::new(center_x, center_y + radius),
-                    SpritePoint::new(center_x, center_y + s * radius),
-                    SpritePoint::new(center_x + s * radius, center_y),
-                    SpritePoint::new(center_x + radius, center_y),
-                ],
-                &mut points,
-            );
-        }
-        BoxRoundedCorner::UpperRight => {
-            points.push(SpritePoint::new(center_x, rect.max_y));
-            points.push(SpritePoint::new(center_x, center_y + radius));
-            sample_cubic(
-                [
-                    SpritePoint::new(center_x, center_y + radius),
-                    SpritePoint::new(center_x, center_y + s * radius),
-                    SpritePoint::new(center_x - s * radius, center_y),
-                    SpritePoint::new(center_x - radius, center_y),
-                ],
-                &mut points,
-            );
-        }
-        BoxRoundedCorner::LowerRight => {
-            points.push(SpritePoint::new(center_x, rect.min_y));
-            points.push(SpritePoint::new(center_x, center_y - radius));
-            sample_cubic(
-                [
-                    SpritePoint::new(center_x, center_y - radius),
-                    SpritePoint::new(center_x, center_y - s * radius),
-                    SpritePoint::new(center_x - s * radius, center_y),
-                    SpritePoint::new(center_x - radius, center_y),
-                ],
-                &mut points,
-            );
-        }
-        BoxRoundedCorner::LowerLeft => {
-            points.push(SpritePoint::new(center_x, rect.min_y));
-            points.push(SpritePoint::new(center_x, center_y - radius));
-            sample_cubic(
-                [
-                    SpritePoint::new(center_x, center_y - radius),
-                    SpritePoint::new(center_x, center_y - s * radius),
-                    SpritePoint::new(center_x + s * radius, center_y),
-                    SpritePoint::new(center_x + radius, center_y),
-                ],
-                &mut points,
-            );
-        }
-    }
+    let (edge_y, y_sign, x_sign) = match corner {
+        BoxRoundedCorner::UpperLeft => (rect.max_y, 1.0, 1.0),
+        BoxRoundedCorner::UpperRight => (rect.max_y, 1.0, -1.0),
+        BoxRoundedCorner::LowerRight => (rect.min_y, -1.0, -1.0),
+        BoxRoundedCorner::LowerLeft => (rect.min_y, -1.0, 1.0),
+    };
+    points.push(SpritePoint::new(center_x, edge_y));
+    points.push(SpritePoint::new(center_x, center_y + y_sign * radius));
+    sample_cubic(
+        [
+            SpritePoint::new(center_x, center_y + y_sign * radius),
+            SpritePoint::new(center_x, center_y + y_sign * s * radius),
+            SpritePoint::new(center_x + x_sign * s * radius, center_y),
+            SpritePoint::new(center_x + x_sign * radius, center_y),
+        ],
+        &mut points,
+    );
 
     SpriteCommand::StrokePolyline {
         points: points_from_vec(points),
@@ -483,10 +432,11 @@ fn box_line_commands(lines: BoxLines, rect: SurfaceRect) -> Vec<SpriteCommand> {
     match lines.up {
         BoxLineStyle::None => {}
         BoxLineStyle::Light | BoxLineStyle::Heavy => {
+            let width = box_line_width(lines.up, rect);
             commands.push(fill_rect(
-                center_x - box_line_width(lines.up, rect) * 0.5,
+                center_x - width * 0.5,
                 rect.min_y,
-                box_line_width(lines.up, rect),
+                width,
                 up_bottom - rect.min_y,
             ));
         }
@@ -518,10 +468,11 @@ fn box_line_commands(lines: BoxLines, rect: SurfaceRect) -> Vec<SpriteCommand> {
     match lines.down {
         BoxLineStyle::None => {}
         BoxLineStyle::Light | BoxLineStyle::Heavy => {
+            let width = box_line_width(lines.down, rect);
             commands.push(fill_rect(
-                center_x - box_line_width(lines.down, rect) * 0.5,
+                center_x - width * 0.5,
                 down_top,
-                box_line_width(lines.down, rect),
+                width,
                 rect.max_y - down_top,
             ));
         }
@@ -554,11 +505,12 @@ fn box_line_commands(lines: BoxLines, rect: SurfaceRect) -> Vec<SpriteCommand> {
         BoxLineStyle::None => {}
         BoxLineStyle::Light | BoxLineStyle::Heavy => {
             let width = left_right - rect.min_x;
+            let height = box_line_width(lines.left, rect);
             commands.push(fill_rect(
                 rect.min_x,
-                center_y - box_line_width(lines.left, rect) * 0.5,
+                center_y - height * 0.5,
                 width,
-                box_line_width(lines.left, rect),
+                height,
             ));
         }
         BoxLineStyle::Double => {
@@ -589,11 +541,12 @@ fn box_line_commands(lines: BoxLines, rect: SurfaceRect) -> Vec<SpriteCommand> {
     match lines.right {
         BoxLineStyle::None => {}
         BoxLineStyle::Light | BoxLineStyle::Heavy => {
+            let height = box_line_width(lines.right, rect);
             commands.push(fill_rect(
                 right_left,
-                center_y - box_line_width(lines.right, rect) * 0.5,
+                center_y - height * 0.5,
                 rect.max_x - right_left,
-                box_line_width(lines.right, rect),
+                height,
             ));
         }
         BoxLineStyle::Double => {

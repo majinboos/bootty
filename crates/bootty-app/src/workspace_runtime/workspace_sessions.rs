@@ -55,31 +55,25 @@ impl WorkspaceRuntime {
     }
 
     pub(crate) fn session_finder_groups(&self) -> Vec<BindingSessionGroup> {
-        let mut spaces = vec![(
-            self.active.position,
-            self.active.name.as_str(),
-            self.active.bindings().collect::<Vec<_>>(),
-        )];
-        spaces.extend(self.inactive_spaces.iter().map(|space| {
-            (
-                space.position,
-                space.name.as_str(),
-                space.bindings().collect::<Vec<_>>(),
-            )
-        }));
+        let mut spaces = self
+            .spaces()
+            .map(|space| {
+                (
+                    space.position,
+                    space.name.as_str(),
+                    space.bindings().collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
         spaces.sort_by_key(|(position, ..)| *position);
 
-        let mut sessions_across_spaces = Vec::<&MuxSession>::new();
-        for binding in spaces.iter().flat_map(|(_, _, bindings)| bindings) {
-            for session in binding.mux.all_sessions() {
-                if !sessions_across_spaces
-                    .iter()
-                    .any(|known| known.name == session.name)
-                {
-                    sessions_across_spaces.push(session);
-                }
-            }
-        }
+        let mut seen = HashSet::new();
+        let sessions_across_spaces = spaces
+            .iter()
+            .flat_map(|(_, _, bindings)| bindings)
+            .flat_map(|binding| binding.mux.all_sessions())
+            .filter(|session| seen.insert(session.name.as_str()))
+            .collect::<Vec<_>>();
 
         let mut claimed = HashSet::new();
         let mut groups = Vec::new();

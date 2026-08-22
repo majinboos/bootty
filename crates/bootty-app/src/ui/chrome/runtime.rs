@@ -1,17 +1,15 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use eframe::egui::{self, Pos2, Rect, TextureHandle, UiBuilder};
 
 use crate::{
-    renderer::TerminalWorkspaceView,
     state::AppState,
     theme::{module_color32, theme_palette_from_config},
     ui::chrome::{self, SidebarModel, StatusBarModel},
-    workspace_runtime::TerminalProgressState,
 };
 use bootty_extension::{
-    ExtensionHost, ExtensionUiAction, ModulePrimitive, MuxView, PublishedSurfaceItem,
-    PublishedSurfaceSnapshot, SessionProgressView, SessionView, SurfacePlacement, WindowView,
+    ExtensionHost, ModulePrimitive, PublishedSurfaceItem, PublishedSurfaceSnapshot,
+    SurfacePlacement,
 };
 use bootty_workspace::DEFAULT_SPACE_COLOR;
 
@@ -21,28 +19,6 @@ const FALLBACK_NOTCH_LAYOUT_OFFSET: f32 = 24.0;
 const MACOS_NOTCH_MENU_BAR_OVERSHOOT: f32 = 7.0;
 const FULLSCREEN_NOTCH_TAB_ROW_CLEARANCE: f32 = 4.0;
 const SIDEBAR_RESIZE_HANDLE_WIDTH: f32 = 8.0;
-
-fn sidebar_content_height(sidebar_height: f32) -> f32 {
-    (sidebar_height - chrome::SPACE_SWITCHER_HEIGHT).max(0.0)
-}
-
-fn color_hex(color: egui::Color32) -> String {
-    format!("#{:02x}{:02x}{:02x}", color.r(), color.g(), color.b())
-}
-
-fn status_bar_background_color(
-    chrome_config: &bootty_config::config::ChromeConfig,
-    palette: bootty_ui::ThemePalette,
-    notch_chrome_color: Option<egui::Color32>,
-) -> egui::Color32 {
-    notch_chrome_color
-        .or_else(|| {
-            chrome_config
-                .status_background
-                .map(crate::theme::config_color32)
-        })
-        .unwrap_or(palette.mantle)
-}
 
 fn sidebar_background_color(
     palette: bootty_ui::ThemePalette,
@@ -70,6 +46,10 @@ fn fullscreen_notch_layout_offset(configured_offset: Option<f32>, measured_band:
     } else {
         FALLBACK_NOTCH_LAYOUT_OFFSET
     }
+}
+
+fn when<T: Default>(enabled: bool, value: impl FnOnce() -> T) -> T {
+    if enabled { value() } else { T::default() }
 }
 
 fn fullscreen_status_top_offset(
@@ -102,386 +82,122 @@ fn fullscreen_status_content_offset(
 #[derive(Default)]
 pub(crate) struct ChromeRuntime {
     app_icon_texture: Option<TextureHandle>,
-    keep_awake: Option<keepawake::KeepAwake>,
     sidebar_space_swipe: chrome::SidebarSpaceSwipeState,
 }
 
 impl ChromeRuntime {
+    /// Paint the chrome for one frame. Leaf interactions come back as their existing event types
+    /// for the owner to run; the terminal rect and colors come back so the shell paints the
+    /// terminal after those events have been applied.
     pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,
-        state: &mut AppState,
-        extensions: &mut ExtensionHost,
-        terminal_view: &mut TerminalWorkspaceView,
-        window_focused: bool,
-    ) {
+        state: &AppState,
+        extensions: &ExtensionHost,
+        tab_context: Option<&chrome::TabContext>,
+        terminal_cell_height: f32,
+    ) -> ChromeFrame {
         ChromeView {
             chrome: self,
             state,
             extensions,
-            terminal_view,
-            window_focused,
+            tab_context,
+            terminal_cell_height,
         }
-        .show_fixed_layout(ui);
+        .show_fixed_layout(ui)
     }
 }
 
 struct ChromeView<'a> {
     chrome: &'a mut ChromeRuntime,
-    state: &'a mut AppState,
-    extensions: &'a mut ExtensionHost,
-    terminal_view: &'a mut TerminalWorkspaceView,
-    window_focused: bool,
+    /// Read-only: every mutation this frame implies travels back as a [`ChromeEvents`] entry for
+    /// the owner to run.
+    state: &'a AppState,
+    /// Read-only: the frame's published surfaces. Submissions are owner work and happen after
+    /// this pass, from the collected leaf events.
+    extensions: &'a ExtensionHost,
+    /// Borrowed from the owner's projection for this frame.
+    tab_context: Option<&'a chrome::TabContext>,
+    terminal_cell_height: f32,
+}
+
+/// What the chrome pass produced: the interactions still to be applied, and where the terminal
+/// goes once they have been.
+pub(crate) struct ChromeFrame {
+    pub(crate) events: ChromeEvents,
+    /// Interactive chrome rects painted this frame; the owner installs them for the next input
+    /// pass, and the terminal pass appends its pane dividers.
+    pub(crate) handles: Vec<Rect>,
+    pub(crate) terminal: TerminalPaint,
+}
+
+/// Leaf events collected while chrome painted, in the order the owner must replay them.
+#[derive(Default)]
+pub(crate) struct ChromeEvents {
+    /// A trackpad swipe across the sidebar. Applied before a switcher click from the same frame,
+    /// matching the paint order: the swipe is read before the switcher is drawn.
+    pub(crate) swipe_space: Option<bootty_mux::controller::SpaceId>,
+    pub(crate) sidebar: Option<chrome::SidebarEvent>,
+    pub(crate) spaces: Option<chrome::SpaceSwitcherEvent>,
+    pub(crate) resize: Option<SidebarResize>,
+    /// One per painted bar, top before bottom.
+    pub(crate) status: Vec<chrome::StatusBarEvent>,
+}
+
+/// The sidebar resize drag: a live width while dragging, one config write on release.
+pub(crate) enum SidebarResize {
+    Live(f32),
+    Persist,
+}
+
+pub(crate) struct TerminalPaint {
+    pub(crate) rect: Rect,
+    pub(crate) palette: bootty_ui::ThemePalette,
+    pub(crate) pane_backing_color: egui::Color32,
+    pub(crate) notch_chrome_color: Option<egui::Color32>,
 }
 
 impl ChromeView<'_> {
-    fn resolve_status_segments(
-        &self,
-        segments: &[bootty_config::config::StatusSegment],
-    ) -> Vec<chrome::ResolvedSegment> {
+    fn resolve_status_segments<'a>(
+        segments: &'a [bootty_config::config::StatusSegment],
+        surfaces: &'a [PublishedSurfaceSnapshot],
+    ) -> Vec<chrome::ResolvedSegment<'a>> {
         segments
             .iter()
             .enumerate()
             .filter_map(|(source_slot, segment)| {
                 let seg_fg = segment.fg.map(crate::theme::config_color32);
                 let seg_bg = segment.bg.map(crate::theme::config_color32);
-                let surface = self
-                    .extensions
-                    .surface(SurfacePlacement::Status, &segment.module);
-                let items =
-                    surface
-                        .into_iter()
-                        .flat_map(|surface| {
-                            let module = surface.module;
-                            let generation = surface.generation;
-                            let surface_id = surface.snapshot.declaration.id;
-                            surface.snapshot.items.into_iter().map(move |item| {
-                                (item, module.clone(), generation, surface_id.clone())
-                            })
-                        })
-                        .map(|(item, module, generation, surface)| chrome::ResolvedItem {
-                            text: item.text,
-                            icon: item.icon.or_else(|| segment.icon.clone()),
-                            stroke: item.stroke.map(module_color32),
-                            fg: item.fg.map(module_color32).or(seg_fg),
-                            bg: item.bg.map(module_color32).or(seg_bg),
-                            gauge: item.gauge,
-                            primitives: item.primitives,
-                            pad_left: item.pad_left,
-                            pad_right: item.pad_right,
-                            join: item.join,
-                            gap: item.gap,
-                            action: item.action,
-                            reorder_anchor: item.reorder_anchor,
-                            module,
-                            generation,
-                            surface,
-                        })
-                        .collect::<Vec<_>>();
+                let surface = published_surface(surfaces, &segment.module)?;
+                let items = surface
+                    .snapshot
+                    .items
+                    .iter()
+                    .map(|item| chrome::ResolvedItem {
+                        item,
+                        icon: item.icon.as_deref().or(segment.icon.as_deref()),
+                        stroke: item.stroke.map(module_color32),
+                        fg: item.fg.map(module_color32).or(seg_fg),
+                        bg: item.bg.map(module_color32).or(seg_bg),
+                    })
+                    .collect::<Vec<_>>();
                 (!items.is_empty()).then_some(chrome::ResolvedSegment {
                     align: segment.align,
                     source_slot,
+                    module: &surface.module,
+                    generation: surface.generation,
+                    surface: &surface.snapshot.declaration.id,
                     items,
                 })
             })
             .collect()
     }
 
-    fn current_extension_mux_view(&self, sidebar_visible: bool) -> MuxView {
-        let selected = self.state.mux().selected_window();
-        let mut windows = self
-            .state
-            .mux()
-            .selected_session_windows()
-            .iter()
-            .map(|window| {
-                let active =
-                    selected == Some(window.id.as_str()) || (selected.is_none() && window.active);
-                let progress = (!active)
-                    .then(|| self.state.window_progress(window))
-                    .flatten();
-                WindowView {
-                    id: window.id.clone(),
-                    index: window.index,
-                    name: window.name.clone(),
-                    active,
-                    progress,
-                    progress_indeterminate: progress.is_some()
-                        && self.state.window_has_indeterminate_progress(window),
-                }
-            })
-            .collect::<Vec<_>>();
-        windows.sort_by_key(|window| window.index);
-        let sessions = self.current_extension_sessions();
-        let selected_session = self.state.mux().selected_session();
-        let selected = sessions.iter().find(|candidate| {
-            if let Some(selected) = selected_session {
-                candidate.id == selected || candidate.name == selected
-            } else {
-                candidate.active
-            }
-        });
-        // `bootty.session()` names the session for the status bar, so it reads the same name the
-        // sidebar shows rather than the backend's.
-        let session = selected.map(|session| {
-            if session.display_name.is_empty() {
-                session.name.clone()
-            } else {
-                session.display_name.clone()
-            }
-        });
-        let session_color = selected
-            .and_then(|session| session.color.clone())
-            .or_else(|| Some(color_hex(self.state.ui_theme().palette.accent)));
-        let scope = self.state.mux_scope();
-        MuxView {
-            windows,
-            sessions,
-            scope_key: format!(
-                "{}:{}",
-                scope.space_id().persistence_value(),
-                scope.binding_id().persistence_value()
-            ),
-            session,
-            sidebar_visible,
-            session_color,
-            keep_awake: self.chrome.keep_awake.is_some(),
-            focused: self.window_focused,
-        }
-    }
-
-    fn current_status_tab_context(&self) -> Option<chrome::TabContext> {
-        let selected_session = self.state.mux().selected_session()?;
-        let session = self.state.mux().session_by_id_or_name(selected_session)?;
-        let mut windows = session.windows.iter().collect::<Vec<_>>();
-        windows.sort_by_key(|window| window.index);
-        let active_window = self
-            .state
-            .mux()
-            .selected_window()
-            .or(session.active_window_id.as_deref());
-        Some(chrome::TabContext {
-            session_id: session.id.clone(),
-            targets: windows
-                .into_iter()
-                .map(|window| chrome::TabContextTarget {
-                    window_id: window.id.clone(),
-                    is_active: active_window == Some(window.id.as_str()),
-                    can_close_pane: window.anchor.pane_id.is_some(),
-                })
-                .collect(),
-        })
-    }
-
-    fn current_extension_sessions(&self) -> Vec<SessionView> {
-        let palette = self.state.ui_theme().palette;
-        let fallback_color = color_hex(palette.accent);
-        let fallback_dim_color = color_hex(palette.muted);
-        let selected_session = self.state.mux().selected_session();
-        let sessions = self.state.mux().sessions();
-        let display_names = self.state.session_display_names(sessions);
-        let session_colors = crate::ui::sidebar::sidebar_session_colors(
-            sessions,
-            &display_names.iter().map(String::as_str).collect::<Vec<_>>(),
-        )
-        .into_iter()
-        .map(|entry| {
-            (
-                entry.session_id.to_owned(),
-                (color_hex(entry.color), color_hex(entry.dim_color)),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-        sessions
-            .iter()
-            .zip(display_names)
-            .map(|(session, display_name)| {
-                let selected = if selected_session.is_some() {
-                    selected_session == Some(session.id.as_str())
-                        || selected_session == Some(session.name.as_str())
-                } else {
-                    session.active
-                };
-                let (color, dim_color) = session_colors
-                    .get(&session.id)
-                    .cloned()
-                    .unwrap_or_else(|| (fallback_color.clone(), fallback_dim_color.clone()));
-                let progress = session
-                    .windows
-                    .iter()
-                    .filter_map(|window| self.state.window_progress(window))
-                    .max();
-                let progress_indeterminate = progress.is_some()
-                    && session
-                        .windows
-                        .iter()
-                        .any(|window| self.state.window_has_indeterminate_progress(window));
-                let mut reported_panes = HashSet::new();
-                let mut progresses = Vec::new();
-                for window in &session.windows {
-                    for pane in window.panes.iter().chain(std::iter::once(&window.anchor)) {
-                        if let Some(pane_id) = pane.pane_id.as_deref()
-                            && reported_panes.insert(pane_id)
-                            && let Some(progress) = self.state.pane_progress(pane_id)
-                        {
-                            progresses.push(SessionProgressView {
-                                process: pane
-                                    .process
-                                    .clone()
-                                    .unwrap_or_else(|| "terminal".to_owned()),
-                                value: progress.value.unwrap_or(50),
-                                indeterminate: progress.state
-                                    == TerminalProgressState::Indeterminate,
-                            });
-                        }
-                    }
-                }
-                SessionView {
-                    id: session.id.clone(),
-                    name: session.name.clone(),
-                    display_name,
-                    active: session.active,
-                    selected,
-                    cwd: session.anchor.cwd.clone(),
-                    pane_id: session.anchor.pane_id.clone(),
-                    pane_pid: session.anchor.pane_pid,
-                    process: session.anchor.process.clone(),
-                    color: Some(color),
-                    dim_color: Some(dim_color),
-                    progress,
-                    progress_indeterminate,
-                    progresses,
-                    ports: self.state.session_ports(session),
-                }
-            })
-            .collect()
-    }
-
-    /// Pushes Bootty-owned mux/session state to extension workers so Luau modules can render it.
-    fn publish_extension_mux_view(&self, sidebar_visible: bool) {
-        let view = self.current_extension_mux_view(sidebar_visible);
-        self.extensions.update_mux(view);
-    }
-
-    fn toggle_keep_awake(&mut self) {
-        if self.chrome.keep_awake.take().is_some() {
-            self.publish_extension_mux_view(self.state.config().chrome.sidebar);
-            return;
-        }
-
-        match keepawake::Builder::default()
-            .display(true)
-            .idle(true)
-            .reason("Bootty status-bar toggle")
-            .app_name("Bootty")
-            .app_reverse_domain("dev.bootty")
-            .create()
-        {
-            Ok(guard) => self.chrome.keep_awake = Some(guard),
-            Err(error) => self.state.record_render_error(error),
-        }
-        self.publish_extension_mux_view(self.state.config().chrome.sidebar);
-    }
-    fn handle_status_bar_event(
-        &mut self,
-        ctx: &egui::Context,
-        status_event: Option<chrome::StatusBarEvent>,
-    ) {
-        match status_event {
-            Some(chrome::StatusBarEvent::Action {
-                module,
-                generation,
-                surface,
-                action,
-            }) => match action.as_str() {
-                "toggle-caffeinate" => self.toggle_keep_awake(),
-                other => {
-                    if let Some(window_id) = other.strip_prefix("activate-window:")
-                        && let Some(session_id) =
-                            self.state.mux().selected_session().map(str::to_owned)
-                    {
-                        self.state.activate_window_from_ui(&session_id, window_id);
-                    } else {
-                        let _ = self.extensions.submit_ui_action(ExtensionUiAction {
-                            module,
-                            generation,
-                            surface,
-                            action: other.to_owned(),
-                            payload: serde_json::Value::Null,
-                        });
-                    }
-                }
-            },
-            Some(chrome::StatusBarEvent::ContextAction {
-                session_id,
-                window_id,
-                action,
-            }) => {
-                let handled = match action {
-                    chrome::TabContextAction::Activate => {
-                        self.state.activate_window_from_ui(&session_id, &window_id);
-                        true
-                    }
-                    chrome::TabContextAction::NewTab => self
-                        .state
-                        .new_tab_for_window_from_ui(&session_id, &window_id),
-                    chrome::TabContextAction::PreviousTab => self
-                        .state
-                        .activate_relative_window_from_ui(&session_id, &window_id, -1),
-                    chrome::TabContextAction::NextTab => self
-                        .state
-                        .activate_relative_window_from_ui(&session_id, &window_id, 1),
-                    chrome::TabContextAction::LastTab => {
-                        self.state.activate_last_window_from_ui(&session_id)
-                    }
-                    chrome::TabContextAction::Rename => self
-                        .state
-                        .open_rename_tab_dialog_for(&session_id, &window_id),
-                    chrome::TabContextAction::MoveLeft => {
-                        self.state.move_window_from_ui(&session_id, &window_id, -1)
-                    }
-                    chrome::TabContextAction::MoveRight => {
-                        self.state.move_window_from_ui(&session_id, &window_id, 1)
-                    }
-                    chrome::TabContextAction::ClosePane => self
-                        .state
-                        .close_pane_for_window_from_ui(&session_id, &window_id),
-                };
-                if handled {
-                    ctx.request_repaint();
-                }
-            }
-            Some(chrome::StatusBarEvent::Reorder {
-                module,
-                generation,
-                surface,
-                source,
-                before,
-            }) => {
-                if module == "windows"
-                    && self
-                        .state
-                        .reorder_window_before_from_ui(&source, before.as_deref())
-                {
-                    ctx.request_repaint();
-                } else {
-                    let _ = self.extensions.submit_ui_action(ExtensionUiAction {
-                        module,
-                        generation,
-                        surface,
-                        action: "reorder".to_owned(),
-                        payload: serde_json::json!({ "source": source, "before": before }),
-                    });
-                }
-            }
-            None => {}
-        }
-    }
-
-    fn show_fixed_layout(&mut self, ui: &mut egui::Ui) {
-        // Chrome handles re-register their rects below; clearing here keeps the set to this frame's
-        // handles so the next frame's input pass suppresses selection only over live handles.
-        self.state.reset_chrome_handles();
+    fn show_fixed_layout(&mut self, ui: &mut egui::Ui) -> ChromeFrame {
+        let mut events = ChromeEvents::default();
+        // Collected, not registered: the owner installs this frame's set once chrome has painted,
+        // so the next input pass suppresses selection over live handles only.
+        let mut handles = Vec::new();
         let rect = ui.max_rect();
         let palette =
             theme_palette_from_config(self.state.config(), self.state.active_appearance_variant());
@@ -492,23 +208,13 @@ impl ChromeView<'_> {
         let configured_sidebar_width = chrome_config.sidebar_width;
         let status_height_config = chrome_config.status_height;
         let chrome_gap = chrome_config.gap;
-        let fullscreen_chrome = self.state.macos_non_native_fullscreen_active()
-            || ui
-                .ctx()
-                .input(|input| input.viewport().fullscreen.unwrap_or(false));
-        // Reserve a top offset in fullscreen to clear the notch. The explicit override applies
-        // whenever fullscreen so it works even when auto-detection can't read the notch (a hidden
-        // menu bar zeroes safeAreaInsets); the safe-area auto value only fills in when unset.
-        if fullscreen_chrome {
-            bootty_winit::window::macos_disable_titlebar_separator();
-        }
-        // Drop the window shadow in fullscreen; its rim otherwise reads as a border around the
-        // screen-filling window. Restored when windowed.
-        bootty_winit::window::macos_set_window_shadow(!fullscreen_chrome);
-        // Detect the notch by display name (stable across fullscreen/menu-bar state) rather than the
-        // safe-area inset, which zeroes out when the menu bar is hidden in non-native fullscreen.
-        let notch_context =
-            fullscreen_chrome && bootty_winit::window::macos_active_screen_is_notched();
+        // Window and notch facts were sampled by the owner before this pass. Reserve a top offset
+        // in fullscreen to clear the notch: the explicit override applies whenever fullscreen so it
+        // works even when auto-detection can't read the notch (a hidden menu bar zeroes
+        // safeAreaInsets); the measured value only fills in when unset.
+        let window_chrome = self.state.window_chrome_facts();
+        let fullscreen_chrome = window_chrome.fullscreen;
+        let notch_context = window_chrome.notched;
         let black_notch_chrome = notch_context
             && chrome_config.notched_fullscreen_black_chrome
             && self.state.active_appearance_variant()
@@ -516,108 +222,25 @@ impl ChromeView<'_> {
         let notch_chrome_color = black_notch_chrome.then_some(egui::Color32::BLACK);
         // Pixel height for the layout offset: the config override, else the measured macOS band
         // calibrated to the physical notch, else a fallback when the band is unreadable.
-        let measured_band = bootty_winit::window::macos_active_screen_notch_height();
-        let fullscreen_top_offset = if notch_context {
+        let measured_band = window_chrome.notch_band;
+        let fullscreen_top_offset = when(notch_context, || {
             fullscreen_notch_layout_offset(
                 self.state.config().window.fullscreen_top_offset,
                 measured_band,
             )
-        } else {
-            0.0
-        };
+        });
         // When enabled, the terminal/tab bar sits inside the notch band instead of being pushed
         // entirely below it.
         let tabs_in_notch = notch_context && self.state.config().window.fullscreen_tabs_in_notch;
         let notch_band_color = notch_chrome_color.unwrap_or(palette.base);
-        let sidebar_width = if sidebar {
-            configured_sidebar_width
-        } else {
-            0.0
-        };
-        let gap = if sidebar && sidebar_width > 0.0 && !fullscreen_chrome {
-            chrome_gap
-        } else {
-            0.0
-        };
-        // Apply session-order changes any extension module requested via `bootty.reorder_session`
-        // before publishing the snapshot, so the reordered sessions render on the next tick.
-        for reorder in self.extensions.take_session_reorders() {
-            self.state
-                .reorder_session_before(&reorder.source, reorder.before.as_deref());
-        }
-        self.publish_extension_mux_view(sidebar);
-        let (sidebar_module_items, sidebar_footer_items) = if sidebar {
-            let mut body = Vec::new();
-            let mut footer = Vec::new();
-            for name in &self.state.config().sidebar.modules {
-                for item in self
-                    .extensions
-                    .surface(SurfacePlacement::Sidebar, name)
-                    .into_iter()
-                    .flat_map(PublishedSurfaceSnapshot::into_items)
-                {
-                    if item.item.kind.as_deref() == Some("footer") {
-                        footer.push(item);
-                    } else {
-                        body.push(item);
-                    }
-                }
-            }
-            let session_modules = &self.state.config().sidebar.session_modules;
-            body = compose_session_module_items(
-                body,
-                session_modules.iter().flat_map(|name| {
-                    self.extensions
-                        .surface(SurfacePlacement::Session, name)
-                        .into_iter()
-                        .flat_map(PublishedSurfaceSnapshot::into_items)
-                }),
-            );
-            (body, footer)
-        } else {
-            (Vec::new(), Vec::new())
-        };
-        let spaces = self.state.space_summaries();
-        let active_space_appearance = spaces
-            .iter()
-            .find(|space| space.active)
-            .map(|space| (space.color, space.tint_sidebar))
-            .unwrap_or((DEFAULT_SPACE_COLOR, false));
-        let space_items = spaces
-            .into_iter()
-            .map(|space| chrome::SpaceSwitcherItem {
-                id: space.id,
-                name: space.name,
-                icon: space.icon,
-                color: space.color,
-                active: space.active,
-                error: space.error,
-            })
-            .collect::<Vec<_>>();
-        let space_transition = self.state.space_transition(std::time::Instant::now());
-        let space_switcher_height = chrome::SPACE_SWITCHER_HEIGHT;
-        let binding_groups = self.state.binding_session_groups();
-        let sidebar_items = if binding_groups.len() > 1 {
-            crate::ui::sidebar::build_binding_sidebar_items(&binding_groups)
-        } else {
-            crate::ui::sidebar::build_sidebar_items_from_published_items(
-                &sidebar_module_items,
-                self.state.mux_scope(),
-                self.state.mux().selected_session(),
-                self.state.mux().previous_selected_session().is_some(),
-            )
-        };
+        let sidebar_width = when(sidebar, || configured_sidebar_width);
+        let gap = when(sidebar_width > 0.0 && !fullscreen_chrome, || chrome_gap);
         let sidebar_on_right = matches!(
             self.state.config().sidebar.position,
             bootty_config::config::SidebarPosition::Right
         );
         let clamped_sidebar_width = sidebar_width.min(rect.width());
-        let (sidebar_rect, right_rect) = if !sidebar {
-            (
-                Rect::from_min_size(rect.min, egui::vec2(0.0, rect.height())),
-                rect,
-            )
-        } else if sidebar_on_right {
+        let (sidebar_rect, right_rect) = if sidebar_on_right {
             let split = (rect.max.x - clamped_sidebar_width).max(rect.min.x);
             (
                 Rect::from_min_max(Pos2::new(split, rect.min.y), rect.max),
@@ -638,41 +261,31 @@ impl ChromeView<'_> {
         };
         // When the sidebar is not on the left edge, macOS traffic-light buttons land over the
         // content's top-left instead of the sidebar, so inset the top bar to clear them.
-        let top_bar_left_inset = if (!sidebar || sidebar_on_right)
-            && self
-                .state
-                .config()
-                .window
-                .reserves_macos_titlebar_button_area()
-        {
-            chrome::MACOS_TITLEBAR_BUTTON_SAFE_WIDTH
-        } else {
-            0.0
-        };
+        let top_bar_left_inset = when(
+            (!sidebar || sidebar_on_right)
+                && self
+                    .state
+                    .config()
+                    .window
+                    .reserves_macos_titlebar_button_area(),
+            || chrome::MACOS_TITLEBAR_BUTTON_SAFE_WIDTH,
+        );
         let status_left_padding = chrome::STATUS_EDGE_PAD;
-        let top_segments = if top_bar {
-            self.resolve_status_segments(&chrome_config.top_segments)
-        } else {
-            Vec::new()
-        };
-        let bottom_segments = if bottom_bar {
-            self.resolve_status_segments(&chrome_config.bottom_segments)
-        } else {
-            Vec::new()
-        };
-        let tab_context = self.current_status_tab_context();
-        let top_base_status_height = if top_bar { status_height_config } else { 0.0 };
-        let bottom_base_status_height = if bottom_bar {
-            status_height_config
-        } else {
-            0.0
-        };
-        let notch_span = if tabs_in_notch {
-            bootty_winit::window::macos_active_screen_notch_span()
-                .map(|(left, right)| (rect.min.x + left, rect.min.x + right))
-        } else {
-            None
-        };
+        let status_surfaces = when(top_bar || bottom_bar, || {
+            self.extensions.surfaces(SurfacePlacement::Status)
+        });
+        let top_segments = when(top_bar, || {
+            Self::resolve_status_segments(&chrome_config.top_segments, &status_surfaces)
+        });
+        let bottom_segments = when(bottom_bar, || {
+            Self::resolve_status_segments(&chrome_config.bottom_segments, &status_surfaces)
+        });
+        let top_base_status_height = when(top_bar, || status_height_config);
+        let bottom_base_status_height = when(bottom_bar, || status_height_config);
+        let notch_span = tabs_in_notch
+            .then_some(window_chrome.notch_span)
+            .flatten()
+            .map(|(left, right)| (rect.min.x + left, rect.min.x + right));
         let candidate_top_status_rect = Rect::from_min_max(
             Pos2::new(
                 (right_rect.min.x + top_bar_left_inset).min(right_rect.max.x),
@@ -680,35 +293,34 @@ impl ChromeView<'_> {
             ),
             Pos2::new(right_rect.max.x, right_rect.min.y + top_base_status_height),
         );
-        let top_tab_row_count = if top_bar {
-            chrome::status_bar_window_tab_row_count(
-                ui,
-                candidate_top_status_rect,
-                &top_segments,
-                status_left_padding,
-                notch_span,
-            )
-        } else {
-            1
-        };
-        let candidate_bottom_status_rect = Rect::from_min_max(
+        let candidate_bottom_status_rect = Rect::from_min_size(
             right_rect.min,
-            Pos2::new(
-                right_rect.max.x,
-                right_rect.min.y + bottom_base_status_height,
-            ),
+            egui::vec2(right_rect.width(), bottom_base_status_height),
         );
-        let bottom_tab_row_count = if bottom_bar {
-            chrome::status_bar_window_tab_row_count(
-                ui,
+        let [top_status_layout, bottom_status_layout] = [
+            (
+                top_bar,
+                candidate_top_status_rect,
+                top_segments.as_slice(),
+                notch_span,
+            ),
+            (
+                bottom_bar,
                 candidate_bottom_status_rect,
-                &bottom_segments,
-                status_left_padding,
+                bottom_segments.as_slice(),
                 None,
-            )
-        } else {
-            1
-        };
+            ),
+        ]
+        .map(|(visible, rect, segments, notch)| {
+            visible
+                .then(|| chrome::status_bar_layout(ui, rect, segments, status_left_padding, notch))
+        });
+        let top_tab_row_count = top_status_layout
+            .as_ref()
+            .map_or(1, chrome::StatusBarLayout::row_count);
+        let bottom_tab_row_count = bottom_status_layout
+            .as_ref()
+            .map_or(1, chrome::StatusBarLayout::row_count);
         let extra_tab_rows_clear_notch = tabs_in_notch && top_tab_row_count > 1;
         let auto_fullscreen_top_offset = self.state.config().window.fullscreen_top_offset.is_none();
         let status_top_offset = fullscreen_status_top_offset(
@@ -732,7 +344,7 @@ impl ChromeView<'_> {
         // row less than the notch so the top bar's bottom edge lines up with the bottom of the
         // notch. The terminal default background is overridden to the band color below so a tmux
         // `bg=default` status line matches the chrome.
-        let terminal_cell_height = self.terminal_view.cell_height();
+        let terminal_cell_height = self.terminal_cell_height;
         let content_offset = fullscreen_status_content_offset(
             tabs_in_notch,
             status_top_offset,
@@ -763,6 +375,44 @@ impl ChromeView<'_> {
         );
 
         if sidebar {
+            let sidebar_cfg = self.state.config().sidebar.clone();
+            let sidebar_surfaces = self.extensions.surfaces(SurfacePlacement::Sidebar);
+            let session_surfaces = self.extensions.surfaces(SurfacePlacement::Session);
+            let (sidebar_footer_items, sidebar_module_items): (Vec<_>, Vec<_>) = sidebar_cfg
+                .modules
+                .iter()
+                .flat_map(|name| published_surface_items(&sidebar_surfaces, name))
+                .partition(|item| item.item.kind.as_deref() == Some("footer"));
+            let sidebar_module_items = compose_session_module_items(
+                sidebar_module_items,
+                sidebar_cfg
+                    .session_modules
+                    .iter()
+                    .flat_map(|name| published_surface_items(&session_surfaces, name)),
+            );
+            let space_items = self.state.space_summaries();
+            let active_space_appearance = space_items
+                .iter()
+                .find(|space| space.active)
+                .map(|space| (space.color, space.tint_sidebar))
+                .unwrap_or((DEFAULT_SPACE_COLOR, false));
+            let space_transition = self.state.space_transition(std::time::Instant::now());
+            let binding_groups =
+                (self.state.binding_count() > 1).then(|| self.state.binding_session_groups());
+            let sidebar_items = if let Some(groups) = &binding_groups {
+                crate::ui::sidebar::build_binding_sidebar_items(groups)
+            } else {
+                crate::ui::sidebar::build_sidebar_items_from_published_items(
+                    &sidebar_module_items,
+                    self.state.mux_scope(),
+                    self.state.mux().selected_session(),
+                    self.state.mux().previous_selected_session().is_some(),
+                )
+            };
+            let session_count = binding_groups.as_ref().map_or_else(
+                || self.state.mux().sessions().len(),
+                |groups| groups.iter().map(|group| group.sessions.len()).sum(),
+            );
             ui.scope_builder(
                 UiBuilder::new()
                     .max_rect(sidebar_rect)
@@ -782,7 +432,6 @@ impl ChromeView<'_> {
                     let top_inset = fullscreen_top_offset;
                     // Resolve `[sidebar]` color overrides on top of the theme. In dark notched
                     // fullscreen the shared notch chrome color overrides all panel backgrounds.
-                    let sidebar_cfg = self.state.config().sidebar.clone();
                     let sidebar_background = notch_chrome_color
                         .or_else(|| sidebar_cfg.background.map(crate::theme::config_color32));
                     let mut sidebar_palette = palette;
@@ -798,32 +447,23 @@ impl ChromeView<'_> {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.painter()
                         .rect_filled(sidebar_rect, 0.0, sidebar_palette.base);
-                    if let Some(space_id) = chrome::take_sidebar_space_swipe(
+                    events.swipe_space = chrome::take_sidebar_space_swipe(
                         ui,
                         sidebar_rect,
                         &space_items,
                         &mut self.chrome.sidebar_space_swipe,
-                    ) && self.state.activate_space_from_ui(space_id)
-                    {
-                        ui.ctx().request_repaint();
-                    }
+                    );
                     let title_icon = title_visible.then(|| {
                         chrome::load_app_icon_texture(ui.ctx(), &mut self.chrome.app_icon_texture)
                     });
-                    if let Some(event) = chrome::show_sidebar(
+                    let event = chrome::show_sidebar(
                         ui,
                         sidebar_palette,
-                        sidebar_content_height(sidebar_rect.height()),
+                        (sidebar_rect.height() - chrome::SPACE_SWITCHER_HEIGHT).max(0.0),
                         SidebarModel {
                             items: &sidebar_items,
                             footer_items: &sidebar_footer_items,
-                            session_count: binding_groups
-                                .iter()
-                                .map(|group| group.sessions.len())
-                                .sum(),
-                            has_sessions: binding_groups
-                                .iter()
-                                .any(|group| !group.sessions.is_empty()),
+                            session_count,
                             title_visible,
                             reserve_titlebar_buttons,
                             title_icon: title_icon.as_ref(),
@@ -840,96 +480,15 @@ impl ChromeView<'_> {
                                 .map(crate::theme::config_color32),
                             border_override: sidebar_cfg.border.map(crate::theme::config_color32),
                         },
-                    ) {
-                        match event {
-                            chrome::SidebarEvent::ExtensionAction(action) => {
-                                if self.extensions.submit_ui_action(action).is_ok() {
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                            chrome::SidebarEvent::ActivateSession(target) => {
-                                self.state.activate_scoped_session_from_ui(&target);
-                            }
-                            chrome::SidebarEvent::ContextAction { target, action } => {
-                                let handled = match action {
-                                    chrome::SessionContextAction::Activate => {
-                                        self.state.activate_scoped_session_from_ui(&target)
-                                    }
-                                    chrome::SessionContextAction::PreviousSession => self
-                                        .state
-                                        .activate_relative_scoped_session_from_ui(&target, -1),
-                                    chrome::SessionContextAction::NextSession => self
-                                        .state
-                                        .activate_relative_scoped_session_from_ui(&target, 1),
-                                    action => {
-                                        if !self.state.activate_scoped_session_from_ui(&target) {
-                                            false
-                                        } else {
-                                            match action {
-                                                chrome::SessionContextAction::NewSession => {
-                                                    self.state.open_new_session_dialog_from_ui()
-                                                }
-                                                chrome::SessionContextAction::SwitchSession => {
-                                                    self.state.open_session_picker_dialog_from_ui()
-                                                }
-                                                chrome::SessionContextAction::LastSession => {
-                                                    self.state.activate_last_session_from_ui()
-                                                }
-                                                chrome::SessionContextAction::Rename => {
-                                                    self.state.open_rename_session_dialog_for(
-                                                        &target.session_id,
-                                                    )
-                                                }
-                                                chrome::SessionContextAction::MoveUp => self
-                                                    .state
-                                                    .move_session_from_ui(&target.session_id, -1),
-                                                chrome::SessionContextAction::MoveDown => self
-                                                    .state
-                                                    .move_session_from_ui(&target.session_id, 1),
-                                                chrome::SessionContextAction::Detach => self
-                                                    .state
-                                                    .detach_scoped_session_from_space(&target),
-                                                chrome::SessionContextAction::Ditch => {
-                                                    self.state.open_ditch_session_dialog_for(
-                                                        &target.session_id,
-                                                    )
-                                                }
-                                                chrome::SessionContextAction::Activate
-                                                | chrome::SessionContextAction::PreviousSession
-                                                | chrome::SessionContextAction::NextSession => {
-                                                    unreachable!(
-                                                        "scoped session actions handled above"
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                };
-                                if handled {
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                            chrome::SidebarEvent::Reorder { source, before } => {
-                                // Session order is bootty-owned: commit it natively. The republished
-                                // mux forces the worker to re-render the sidebar, and that render
-                                // reuses cached shell-out results (a reorder changes only order, not
-                                // a session's facts), so it lands instantly with correct grouping.
-                                if self
-                                    .state
-                                    .reorder_session_before(&source, before.as_deref())
-                                {
-                                    ui.ctx().request_repaint();
-                                }
-                            }
-                        }
-                    }
+                    );
+                    events.sidebar = event;
                     if let Some((_, _, progress)) = space_transition {
                         let alpha = ((1.0 - progress) * 180.0) as u8;
                         let content_rect = Rect::from_min_max(
                             sidebar_rect.min,
                             Pos2::new(
                                 sidebar_rect.max.x,
-                                (sidebar_rect.max.y - space_switcher_height)
+                                (sidebar_rect.max.y - chrome::SPACE_SWITCHER_HEIGHT)
                                     .max(sidebar_rect.min.y),
                             ),
                         );
@@ -945,31 +504,12 @@ impl ChromeView<'_> {
                         );
                         ui.ctx().request_repaint();
                     }
-                    if let Some(event) = chrome::show_space_switcher(
+                    events.spaces = chrome::show_space_switcher(
                         ui,
                         sidebar_palette,
                         &space_items,
                         space_transition,
-                    ) {
-                        match event {
-                            chrome::SpaceSwitcherEvent::Activate(space_id) => {
-                                self.state.activate_space_from_ui(space_id);
-                            }
-                            chrome::SpaceSwitcherEvent::Create => {
-                                self.state.open_create_space_dialog_from_ui();
-                            }
-                            chrome::SpaceSwitcherEvent::Edit(space_id) => {
-                                self.state.open_edit_space_dialog_from_ui(space_id);
-                            }
-                            chrome::SpaceSwitcherEvent::Reconnect(space_id) => {
-                                self.state.reconnect_space_from_ui(space_id);
-                            }
-                            chrome::SpaceSwitcherEvent::Close(space_id) => {
-                                self.state.close_space_from_ui(space_id);
-                            }
-                        }
-                        ui.ctx().request_repaint();
-                    }
+                    );
                     if !self.state.sidebar_focused() {
                         let alpha = (self
                             .state
@@ -1000,7 +540,7 @@ impl ChromeView<'_> {
                     Pos2::new(handle_x, rect.center().y),
                     egui::vec2(SIDEBAR_RESIZE_HANDLE_WIDTH, rect.height()),
                 );
-                self.state.register_chrome_handle(handle_rect);
+                handles.push(handle_rect);
                 let response = egui::Area::new(egui::Id::new("bootty-sidebar-resize"))
                     .order(egui::Order::Foreground)
                     .fixed_pos(handle_rect.min)
@@ -1030,11 +570,10 @@ impl ChromeView<'_> {
                         pos.x - rect.min.x
                     };
                     let max = (rect.width() - 120.0).max(120.0);
-                    self.state.set_sidebar_width_live(raw.clamp(120.0, max));
+                    events.resize = Some(SidebarResize::Live(raw.clamp(120.0, max)));
                 }
                 if response.drag_stopped() {
-                    let width = self.state.config().chrome.sidebar_width;
-                    self.state.persist_sidebar_width(width);
+                    events.resize = Some(SidebarResize::Persist);
                 }
             }
         }
@@ -1043,72 +582,79 @@ impl ChromeView<'_> {
             // Tick once a second so the clock advances and module output refreshes when idle.
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_secs(1));
-            let status_background =
-                status_bar_background_color(&chrome_config, palette, notch_chrome_color);
+            let status_background = notch_chrome_color
+                .or_else(|| {
+                    chrome_config
+                        .status_background
+                        .map(crate::theme::config_color32)
+                })
+                .unwrap_or(palette.mantle);
 
-            if top_bar {
+            for (rect, layout, interaction_id) in [
+                (
+                    top_status_rect,
+                    top_status_layout.as_ref(),
+                    "bootty-top-status-bar-drag",
+                ),
+                (
+                    bottom_status_rect,
+                    bottom_status_layout.as_ref(),
+                    "bootty-bottom-status-bar-drag",
+                ),
+            ] {
+                let Some(layout) = layout else {
+                    continue;
+                };
                 let mut status_event = None;
                 ui.scope_builder(
                     UiBuilder::new()
-                        .max_rect(top_status_rect)
+                        .max_rect(rect)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     |ui| {
                         status_event = chrome::show_status_bar(
                             ui,
                             palette,
                             StatusBarModel {
-                                segments: &top_segments,
-                                tab_context: tab_context.as_ref(),
+                                layout,
+                                tab_context: self.tab_context,
                                 background: status_background,
-                                left_padding: status_left_padding,
                                 row_height: status_height_config,
-                                notch_x: notch_span.map(|(left, right)| left..right),
-                                tab_rows: top_tab_row_count,
-                                interaction_id: "bootty-top-status-bar-drag",
+                                interaction_id,
                             },
                         );
                     },
                 );
-                self.handle_status_bar_event(ui.ctx(), status_event);
-            }
-
-            if bottom_bar {
-                let mut status_event = None;
-                ui.scope_builder(
-                    UiBuilder::new()
-                        .max_rect(bottom_status_rect)
-                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                    |ui| {
-                        status_event = chrome::show_status_bar(
-                            ui,
-                            palette,
-                            StatusBarModel {
-                                segments: &bottom_segments,
-                                tab_context: tab_context.as_ref(),
-                                background: status_background,
-                                left_padding: status_left_padding,
-                                row_height: status_height_config,
-                                notch_x: None,
-                                tab_rows: bottom_tab_row_count,
-                                interaction_id: "bootty-bottom-status-bar-drag",
-                            },
-                        );
-                    },
-                );
-                self.handle_status_bar_event(ui.ctx(), status_event);
+                events.status.extend(status_event);
             }
         }
 
-        let pane_backing_color = notch_chrome_color.unwrap_or(palette.mantle);
-        self.terminal_view.show(
-            self.state,
-            ui,
-            terminal_rect,
-            palette,
-            pane_backing_color,
-            notch_chrome_color,
-        );
+        ChromeFrame {
+            events,
+            handles,
+            terminal: TerminalPaint {
+                rect: terminal_rect,
+                palette,
+                pane_backing_color: notch_chrome_color.unwrap_or(palette.mantle),
+                notch_chrome_color,
+            },
+        }
     }
+}
+
+fn published_surface<'a>(
+    surfaces: &'a [PublishedSurfaceSnapshot],
+    name: &str,
+) -> Option<&'a PublishedSurfaceSnapshot> {
+    surfaces.iter().find(|surface| surface.matches_name(name))
+}
+
+fn published_surface_items<'a>(
+    surfaces: &'a [PublishedSurfaceSnapshot],
+    name: &str,
+) -> impl Iterator<Item = PublishedSurfaceItem> + 'a {
+    published_surface(surfaces, name)
+        .into_iter()
+        .flat_map(|surface| surface.items())
 }
 
 fn compose_session_module_items(

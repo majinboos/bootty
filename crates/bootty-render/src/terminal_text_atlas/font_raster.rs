@@ -434,9 +434,9 @@ fn fallback_cluster_mask(cluster: &ShapedCluster, width: u32, height: u32) -> Ve
 }
 
 fn draw_fallback_arrow(alpha: &mut [u8], ch: char, width: u32, height: u32) -> bool {
-    let direction = match ch {
-        '\u{21e1}' | '\u{2191}' | '\u{21e7}' => ArrowDirection::Up,
-        '\u{21e3}' | '\u{2193}' | '\u{21e9}' => ArrowDirection::Down,
+    let up = match ch {
+        '\u{21e1}' | '\u{2191}' | '\u{21e7}' => true,
+        '\u{21e3}' | '\u{2193}' | '\u{21e9}' => false,
         _ => return false,
     };
     let stroke = (width / 6).max(1);
@@ -444,71 +444,26 @@ fn draw_fallback_arrow(alpha: &mut [u8], ch: char, width: u32, height: u32) -> b
     let top = height / 4;
     let bottom = height - height / 4;
 
-    match direction {
-        ArrowDirection::Up => {
-            fill_pixel_rect(
-                alpha,
-                width,
-                center_x.saturating_sub(stroke / 2),
-                top + height / 8,
-                stroke,
-                bottom.saturating_sub(top + height / 8),
-            );
-            for offset in 0..=(width / 4).max(1) {
-                fill_pixel_rect(
-                    alpha,
-                    width,
-                    center_x.saturating_sub(offset),
-                    top + offset,
-                    stroke,
-                    stroke,
-                );
-                fill_pixel_rect(
-                    alpha,
-                    width,
-                    center_x + offset,
-                    top + offset,
-                    stroke,
-                    stroke,
-                );
-            }
-        }
-        ArrowDirection::Down => {
-            fill_pixel_rect(
-                alpha,
-                width,
-                center_x.saturating_sub(stroke / 2),
-                top,
-                stroke,
-                bottom.saturating_sub(top + height / 8),
-            );
-            for offset in 0..=(width / 4).max(1) {
-                fill_pixel_rect(
-                    alpha,
-                    width,
-                    center_x.saturating_sub(offset),
-                    bottom.saturating_sub(offset),
-                    stroke,
-                    stroke,
-                );
-                fill_pixel_rect(
-                    alpha,
-                    width,
-                    center_x + offset,
-                    bottom.saturating_sub(offset),
-                    stroke,
-                    stroke,
-                );
-            }
+    let stem_y = if up { top + height / 8 } else { top };
+    fill_pixel_rect(
+        alpha,
+        width,
+        center_x.saturating_sub(stroke / 2),
+        stem_y,
+        stroke,
+        bottom.saturating_sub(top + height / 8),
+    );
+    for offset in 0..=(width / 4).max(1) {
+        let y = if up {
+            top + offset
+        } else {
+            bottom.saturating_sub(offset)
+        };
+        for x in [center_x.saturating_sub(offset), center_x + offset] {
+            fill_pixel_rect(alpha, width, x, y, stroke, stroke);
         }
     }
     true
-}
-
-#[derive(Clone, Copy)]
-enum ArrowDirection {
-    Up,
-    Down,
 }
 
 fn fill_pixel_rect(alpha: &mut [u8], width: u32, x: u32, y: u32, rect_width: u32, height: u32) {

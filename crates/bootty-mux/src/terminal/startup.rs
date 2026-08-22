@@ -124,6 +124,17 @@ impl StartingNativeTerminal {
             Ok(())
         }
     }
+
+    fn with_terminal<T>(
+        &mut self,
+        pending: T,
+        ready: impl FnOnce(&mut TerminalSession) -> Result<T>,
+    ) -> Result<T> {
+        match self.ready_terminal()? {
+            Some(terminal) => ready(terminal),
+            None => Ok(pending),
+        }
+    }
 }
 
 fn startup_placeholder_frame(geometry: TerminalGeometry) -> Arc<RenderFrame> {
@@ -168,26 +179,17 @@ impl TerminalFrameSource for StartingNativeTerminal {
             1.0
         };
         let display_scale = self.display_scale;
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.set_display_scale(display_scale)?;
-        }
-        Ok(())
+        self.with_terminal((), |terminal| terminal.set_display_scale(display_scale))
     }
 
     fn set_render_cell_metrics(&mut self, cell: CellMetrics) -> Result<()> {
         self.render_cell = cell;
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.set_render_cell_metrics(cell)?;
-        }
-        Ok(())
+        self.with_terminal((), |terminal| terminal.set_render_cell_metrics(cell))
     }
 
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
         self.geometry = geometry;
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.queue_resize(geometry)?;
-        }
-        Ok(())
+        self.with_terminal((), |terminal| terminal.queue_resize(geometry))
     }
 
     fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
@@ -210,16 +212,11 @@ impl TerminalRuntime for StartingNativeTerminal {
     fn pending_pty_len(&self) -> usize {
         self.terminal
             .as_ref()
-            .map(TerminalSession::pending_pty_len)
-            .unwrap_or_default()
+            .map_or(0, TerminalSession::pending_pty_len)
     }
 
     fn child_exited(&mut self) -> Result<bool> {
-        Ok(self
-            .ready_terminal()?
-            .map(TerminalSession::child_exited)
-            .transpose()?
-            .unwrap_or(false))
+        self.with_terminal(false, TerminalSession::child_exited)
     }
 
     fn tty_name(&self) -> Option<&str> {
@@ -228,10 +225,7 @@ impl TerminalRuntime for StartingNativeTerminal {
 
     fn discard_pending_output(&mut self) -> Result<()> {
         self.pending_commands.clear();
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.discard_pending_output()?;
-        }
-        Ok(())
+        self.with_terminal((), TerminalSession::discard_pending_output)
     }
 
     fn force_resize(&mut self) -> Result<()> {
@@ -239,17 +233,13 @@ impl TerminalRuntime for StartingNativeTerminal {
     }
 
     fn format_selection(&mut self, format: TerminalSelectionFormat) -> Result<Option<Vec<u8>>> {
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.format_selection(format)
-        } else {
-            Ok(None)
-        }
+        self.with_terminal(None, |terminal| terminal.format_selection(format))
     }
 
     fn current_working_directory(&mut self) -> Result<Option<String>> {
-        Ok(self
-            .ready_terminal()?
-            .and_then(|terminal| TerminalSession::current_working_directory(&*terminal)))
+        self.with_terminal(None, |terminal| {
+            Ok(TerminalSession::current_working_directory(&*terminal))
+        })
     }
 
     fn apply_live_config(&mut self, config: TerminalLiveConfig) -> Result<()> {
@@ -263,11 +253,7 @@ impl TerminalRuntime for StartingNativeTerminal {
     }
 
     fn is_mouse_tracking(&mut self) -> Result<bool> {
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.is_mouse_tracking()
-        } else {
-            Ok(false)
-        }
+        self.with_terminal(false, TerminalSession::is_mouse_tracking)
     }
 
     fn scroll_viewport_delta(&mut self, delta: isize) -> Result<()> {
@@ -279,30 +265,20 @@ impl TerminalRuntime for StartingNativeTerminal {
     }
 
     fn copy_mode_active(&mut self) -> Result<bool> {
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.copy_mode_active()
-        } else {
-            Ok(false)
-        }
+        self.with_terminal(false, TerminalSession::copy_mode_active)
     }
 
     fn handle_copy_mode_action(
         &mut self,
         action: TerminalCopyModeAction,
     ) -> Result<TerminalCopyModeOutcome> {
-        if let Some(terminal) = self.ready_terminal()? {
+        self.with_terminal(TerminalCopyModeOutcome::default(), |terminal| {
             terminal.handle_copy_mode_action(action)
-        } else {
-            Ok(TerminalCopyModeOutcome::default())
-        }
+        })
     }
 
     fn search_viewport(&mut self, query: &str, direction: TerminalSearchDirection) -> Result<bool> {
-        if let Some(terminal) = self.ready_terminal()? {
-            terminal.search_viewport(query, direction)
-        } else {
-            Ok(false)
-        }
+        self.with_terminal(false, |terminal| terminal.search_viewport(query, direction))
     }
 
     fn begin_selection(&mut self, event: TerminalSelectionEvent) -> Result<()> {

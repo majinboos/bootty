@@ -11,15 +11,18 @@ use super::{
     settings_text_edit,
 };
 
+pub(super) type RemoteTest = (SshProfileConfig, mpsc::Sender<Result<(), String>>);
+
 #[derive(Default)]
 pub(super) struct EditorState {
     selected_id: Option<String>,
     draft: Option<ProfileDraft>,
     message: Option<(bool, String)>,
-    test: ConnectionTest,
+    test: Option<mpsc::Receiver<Result<(), String>>>,
+    test_request: Option<SshProfileConfig>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProfileDraft {
     name: String,
     host: String,
@@ -59,15 +62,8 @@ impl ProfileDraft {
     fn new() -> Self {
         Self {
             name: "New Remote".to_owned(),
-            host: String::new(),
-            user: String::new(),
-            port: String::new(),
-            authentication: SshAuthenticationConfig::Auto,
-            host_key_policy: SshHostKeyPolicyConfig::Strict,
-            identity_file: String::new(),
-            proxy_jump: String::new(),
             program: "ssh".to_owned(),
-            args: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -77,17 +73,13 @@ impl ProfileDraft {
         if name.is_empty() || host.is_empty() {
             return Err("Profile name and host name are required.".to_owned());
         }
-        let port = if self.port.trim().is_empty() {
-            None
-        } else {
-            Some(
-                self.port
-                    .trim()
-                    .parse::<u16>()
-                    .map_err(|_| "Port must be between 1 and 65535.".to_owned())?,
-            )
-        };
-        let identity_file = nonempty(&self.identity_file).map(Into::into);
+        let port = super::nonempty(&self.port)
+            .map(|port| {
+                port.parse::<u16>()
+                    .map_err(|_| "Port must be between 1 and 65535.".to_owned())
+            })
+            .transpose()?;
+        let identity_file = super::nonempty(&self.identity_file).map(Into::into);
         if self.authentication != SshAuthenticationConfig::Auto && identity_file.is_none() {
             let credential = if self.authentication == SshAuthenticationConfig::Agent {
                 "public key file that identifies the SSH-agent key"
@@ -99,25 +91,16 @@ impl ProfileDraft {
         Ok(SshProfileConfig {
             name: name.to_owned(),
             host: host.to_owned(),
-            user: nonempty(&self.user),
+            user: super::nonempty(&self.user),
             port,
             authentication: self.authentication,
             host_key_policy: self.host_key_policy,
             identity_file,
-            proxy_jump: nonempty(&self.proxy_jump),
-            program: nonempty(&self.program).unwrap_or_else(|| "ssh".to_owned()),
+            proxy_jump: super::nonempty(&self.proxy_jump),
+            program: super::nonempty(&self.program).unwrap_or_else(|| "ssh".to_owned()),
             args: self.args.clone(),
         })
     }
-}
-
-#[derive(Default)]
-enum ConnectionTest {
-    #[default]
-    Idle,
-    Running(mpsc::Receiver<Result<(), String>>),
-    Passed,
-    Failed(String),
 }
 
 pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
@@ -133,26 +116,27 @@ impl EditorState {
 
         section(ui, win.palette, "SSH PROFILES");
         ui.horizontal_wrapped(|ui| {
-            let profiles = win
-                .config
-                .ssh_profiles
-                .iter()
-                .map(|(id, profile)| (id.clone(), profile.name.clone()))
-                .collect::<Vec<_>>();
-            for (id, name) in profiles {
+            let mut selected = None;
+            for (id, profile) in &win.config.ssh_profiles {
                 if ui
-                    .selectable_label(self.selected_id.as_deref() == Some(id.as_str()), name)
+                    .selectable_label(
+                        self.selected_id.as_deref() == Some(id.as_str()),
+                        &profile.name,
+                    )
                     .clicked()
                 {
-                    self.select(win, id);
+                    selected = Some(id.clone());
                 }
+            }
+            if let Some(id) = selected {
+                self.select(win, id);
             }
             if settings_button(ui, win.palette, "Add Remote").clicked() {
                 let id = new_profile_id();
                 self.selected_id = Some(id);
                 self.draft = Some(ProfileDraft::new());
                 self.message = None;
-                self.test = ConnectionTest::Idle;
+                self.test = None;
             }
         });
 
@@ -255,33 +239,27 @@ impl EditorState {
                 message,
             );
         }
-        match &self.test {
-            ConnectionTest::Idle => {}
-            ConnectionTest::Running(_) => {
-                settings_notice(ui, win.palette.muted, "Testing SSH connection…");
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(50));
-            }
-            ConnectionTest::Passed => {
-                settings_notice(ui, win.palette.success, "SSH connection succeeded.");
-            }
-            ConnectionTest::Failed(error) => {
-                settings_notice(ui, win.palette.destructive, error);
-            }
+        if self.test.is_some() {
+            settings_notice(ui, win.palette.muted, "Testing SSH connection…");
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
         }
 
         let mut deleted = false;
         ui.horizontal(|ui| {
             if settings_button(ui, win.palette, "Test Connection").clicked() {
                 match draft.profile() {
-                    Ok(profile) => self.start_test(ui.ctx(), profile),
-                    Err(error) => self.test = ConnectionTest::Failed(error),
+                    Ok(profile) => {
+                        self.test_request = Some(profile);
+                        self.message = None;
+                    }
+                    Err(error) => self.message = Some((false, error)),
                 }
             }
             if settings_button(ui, win.palette, "Save").clicked() {
                 match draft.profile() {
                     Ok(profile) => {
-                        save_profile(win, &id, &profile);
+                        save_profile(win, &id, profile);
                         self.message = Some((true, "Profile saved.".to_owned()));
                     }
                     Err(error) => self.message = Some((false, error)),
@@ -294,7 +272,7 @@ impl EditorState {
                 self.selected_id = None;
                 self.draft = None;
                 self.message = None;
-                self.test = ConnectionTest::Idle;
+                self.test = None;
                 deleted = true;
             }
         });
@@ -325,33 +303,28 @@ impl EditorState {
             .map(ProfileDraft::from_profile);
         self.selected_id = Some(id);
         self.message = None;
-        self.test = ConnectionTest::Idle;
+        self.test = None;
     }
 
-    fn start_test(&mut self, ctx: &egui::Context, profile: SshProfileConfig) {
+    pub(super) fn take_test(&mut self) -> Option<RemoteTest> {
+        let request = self.test_request.take()?;
         let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let result = crate::remote_catalog::list_remote(&profile)
-                .map(|_| ())
-                .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.test = ConnectionTest::Running(receiver);
+        self.test = Some(receiver);
+        Some((request, sender))
     }
 
     fn poll_test(&mut self) {
-        let ConnectionTest::Running(receiver) = &self.test else {
+        let Some(receiver) = &self.test else {
             return;
         };
         let Ok(result) = receiver.try_recv() else {
             return;
         };
-        self.test = match result {
-            Ok(()) => ConnectionTest::Passed,
-            Err(error) => ConnectionTest::Failed(error),
-        };
+        self.test = None;
+        self.message = Some(match result {
+            Ok(()) => (true, "SSH connection succeeded.".to_owned()),
+            Err(error) => (false, error),
+        });
     }
 }
 
@@ -367,12 +340,11 @@ fn field(
     });
 }
 
-fn save_profile(win: &mut SettingsSurface, id: &str, profile: &SshProfileConfig) {
+fn save_profile(win: &mut SettingsSurface, id: &str, profile: SshProfileConfig) {
     win.config
         .ssh_profiles
         .insert(id.to_owned(), profile.clone());
     let id = id.to_owned();
-    let profile = profile.clone();
     win.writeback
         .mutate(move |document| document.set_ssh_profile(&id, &profile));
 }
@@ -382,11 +354,6 @@ fn delete_profile(win: &mut SettingsSurface, id: &str) {
     let id = id.to_owned();
     win.writeback
         .mutate(move |document| document.remove_ssh_profile(&id));
-}
-
-fn nonempty(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn new_profile_id() -> String {

@@ -21,7 +21,6 @@ enum MuxStack {
     TerminalAlone,
     NativeMux,
     Tmux,
-    Zellij,
     Screen,
     TmuxOverSsh,
     NestedSshTmux,
@@ -33,7 +32,6 @@ impl MuxStack {
             Self::TerminalAlone => "terminal_alone",
             Self::NativeMux => "native_mux",
             Self::Tmux => "tmux",
-            Self::Zellij => "zellij",
             Self::Screen => "screen",
             Self::TmuxOverSsh => "tmux_over_ssh",
             Self::NestedSshTmux => "nested_ssh_tmux",
@@ -44,7 +42,6 @@ impl MuxStack {
         match self {
             Self::TerminalAlone | Self::NativeMux => "xterm-ghostty",
             Self::Tmux | Self::TmuxOverSsh | Self::NestedSshTmux => "tmux-256color",
-            Self::Zellij => "zellij",
             Self::Screen => "screen-256color",
         }
     }
@@ -73,11 +70,10 @@ impl MuxStack {
     }
 }
 
-const STACKS: [MuxStack; 7] = [
+const STACKS: [MuxStack; 6] = [
     MuxStack::TerminalAlone,
     MuxStack::NativeMux,
     MuxStack::Tmux,
-    MuxStack::Zellij,
     MuxStack::Screen,
     MuxStack::TmuxOverSsh,
     MuxStack::NestedSshTmux,

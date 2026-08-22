@@ -1,5 +1,7 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
+    rc::Rc,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -31,7 +33,6 @@ use serde_json::{Map, Value, json};
 
 const SETUP_EXECUTION_LIMIT: Duration = Duration::from_millis(100);
 const SETUP_RESPONSE_LIMIT: Duration = Duration::from_millis(250);
-const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MODULE_COMMAND_LIMIT: usize = 64;
 const MODULE_TOPIC_LIMIT: usize = 64;
 const MODULE_SURFACE_LIMIT: usize = 64;
@@ -94,6 +95,15 @@ struct SurfaceHandler {
     action: Option<RegistryKey>,
 }
 
+#[derive(Default)]
+struct ModuleRegistry {
+    handlers: RefCell<BTreeMap<String, RegistryKey>>,
+    descriptors: RefCell<Vec<CommandDescriptor>>,
+    topics: RefCell<Vec<String>>,
+    surface_handlers: RefCell<BTreeMap<String, SurfaceHandler>>,
+    surface_declarations: RefCell<Vec<SurfaceDeclaration>>,
+}
+
 #[derive(Clone)]
 struct ModuleHost {
     identity: ModuleIdentity,
@@ -118,16 +128,9 @@ pub fn preview_module_surfaces(
     facts
         .install(&lua, &bootty, None)
         .map_err(|error| error.to_string())?;
-    let handlers = Arc::new(Mutex::new(BTreeMap::new()));
-    let declarations = Arc::new(Mutex::new(Vec::new()));
-    install_surface_interface(
-        &lua,
-        &bootty,
-        Arc::clone(&handlers),
-        Arc::clone(&declarations),
-        None,
-    )
-    .map_err(|error| error.to_string())?;
+    let registry = Rc::new(ModuleRegistry::default());
+    install_surface_interface(&lua, &bootty, Rc::clone(&registry), None)
+        .map_err(|error| error.to_string())?;
     install_preview_noop_tables(&lua, &bootty).map_err(|error| error.to_string())?;
     bootty.set_readonly(true);
     lua.globals()
@@ -146,7 +149,7 @@ pub fn preview_module_surfaces(
         .set_name(identity.as_str())
         .exec()
         .map_err(|error| error.to_string())?;
-    initial_surface_snapshots(&lua, &handlers, &declarations)
+    initial_surface_snapshots(&lua, &registry)
 }
 
 fn install_preview_noop_tables(lua: &Lua, bootty: &Table) -> mlua::Result<()> {
@@ -227,31 +230,22 @@ pub(crate) fn prepare_module(
             return Err("extension worker stopped during load".to_owned());
         }
     };
-    if declarations.commands.len() > MODULE_COMMAND_LIMIT {
-        let _ = worker.retire();
-        return Err(format!(
-            "extension command count exceeds the limit of {MODULE_COMMAND_LIMIT}"
-        ));
-    }
-    if declarations.topics.len() > MODULE_TOPIC_LIMIT {
-        let _ = worker.retire();
-        return Err(format!(
-            "extension event topic count exceeds the limit of {MODULE_TOPIC_LIMIT}"
-        ));
-    }
-    if declarations.surfaces.len() > MODULE_SURFACE_LIMIT {
-        let _ = worker.retire();
-        return Err(format!(
-            "extension surface count exceeds the limit of {MODULE_SURFACE_LIMIT}"
-        ));
+    for (kind, count, limit) in [
+        ("command", declarations.commands.len(), MODULE_COMMAND_LIMIT),
+        ("event topic", declarations.topics.len(), MODULE_TOPIC_LIMIT),
+        ("surface", declarations.surfaces.len(), MODULE_SURFACE_LIMIT),
+    ] {
+        if count > limit {
+            let _ = worker.retire();
+            return Err(format!(
+                "extension {kind} count exceeds the limit of {limit}"
+            ));
+        }
     }
     let registrations = declarations
         .commands
         .into_iter()
-        .map(|descriptor| {
-            let sender = tx.invocation_sender();
-            (descriptor, sender)
-        })
+        .map(|descriptor| (descriptor, tx.invocation_sender()))
         .collect();
     Ok(PreparedModule {
         commands: registrations,
@@ -268,84 +262,53 @@ fn run_module_worker(
     ready: &mpsc::SyncSender<Result<ModuleDeclarations, String>>,
 ) {
     let lua = Lua::new();
-    let handlers = Arc::new(std::sync::Mutex::new(BTreeMap::<String, RegistryKey>::new()));
-    let descriptors = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let topics = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let surface_handlers = Arc::new(std::sync::Mutex::new(
-        BTreeMap::<String, SurfaceHandler>::new(),
-    ));
-    let surface_declarations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = Rc::new(ModuleRegistry::default());
     let interrupt_control = Arc::clone(&host.control);
     lua.set_interrupt(move |_| worker_interrupt(&interrupt_control));
-    let setup = install_host_interface(
-        &lua,
-        host,
-        Arc::clone(&handlers),
-        Arc::clone(&descriptors),
-        Arc::clone(&topics),
-        Arc::clone(&surface_handlers),
-        Arc::clone(&surface_declarations),
-    )
-    .and_then(|()| lua.sandbox(true))
-    .and_then(|()| lua.load(source).set_name(host.identity.as_str()).exec());
+    let setup = install_host_interface(&lua, host, Rc::clone(&registry))
+        .and_then(|()| lua.sandbox(true))
+        .and_then(|()| lua.load(source).set_name(host.identity.as_str()).exec());
     if let Err(error) = setup {
         let _ = ready.send(Err(error.to_string()));
         return;
     }
-    let commands = descriptors
-        .lock()
-        .map(|mut descriptors| std::mem::take(&mut *descriptors))
-        .map_err(|_| "extension descriptor lock poisoned".to_owned());
-    let topics = topics
-        .lock()
-        .map(|mut topics| std::mem::take(&mut *topics))
-        .map_err(|_| "extension topic lock poisoned".to_owned());
-    let surfaces = initial_surface_snapshots(&lua, &surface_handlers, &surface_declarations);
-    let registered = commands.and_then(|commands| {
-        topics.and_then(|topics| {
-            surfaces.map(|surfaces| ModuleDeclarations {
-                commands,
-                topics,
-                surfaces,
-            })
-        })
+    let surfaces = initial_surface_snapshots(&lua, &registry);
+    let registered = surfaces.map(|surfaces| ModuleDeclarations {
+        commands: std::mem::take(&mut *registry.descriptors.borrow_mut()),
+        topics: std::mem::take(&mut *registry.topics.borrow_mut()),
+        surfaces,
     });
     host.control.setup_complete.store(true, Ordering::Release);
     if ready.send(registered).is_err() {
         return;
     }
-    let render_interval = surface_declarations
-        .lock()
-        .ok()
-        .and_then(|declarations| declarations.iter().map(|surface| surface.interval).min());
+    let render_interval = registry
+        .surface_declarations
+        .borrow()
+        .iter()
+        .map(|surface| surface.interval)
+        .min();
     let mut next_render = render_interval.map(|interval| Instant::now() + interval);
     while host.control.generation.is_active() {
-        match rx.recv_timeout(WORKER_POLL_INTERVAL) {
-            Ok(ExtensionWorkerMessage::Invoke(work)) => {
+        match rx.recv_until(next_render) {
+            Ok(Some(ExtensionWorkerMessage::Invoke(work))) => {
                 let response = work.response.clone();
-                let _ = response.send(invoke_handler(&lua, &handlers, &host.control, work));
+                let _ = response.send(invoke_handler(&lua, &registry, &host.control, work));
             }
-            Ok(ExtensionWorkerMessage::Render) => {
-                render_and_publish_surfaces(&lua, host, &surface_handlers, &surface_declarations);
+            Ok(Some(ExtensionWorkerMessage::Render)) => {
+                render_and_publish_surfaces(&lua, host, &registry);
                 next_render = render_interval.map(|interval| Instant::now() + interval);
             }
-            Ok(ExtensionWorkerMessage::Action(action)) => {
-                run_surface_action(&lua, host, &surface_handlers, action);
-                render_and_publish_surfaces(&lua, host, &surface_handlers, &surface_declarations);
+            Ok(Some(ExtensionWorkerMessage::Action(action))) => {
+                run_surface_action(&lua, host, &registry, action);
+                render_and_publish_surfaces(&lua, host, &registry);
                 next_render = render_interval.map(|interval| Instant::now() + interval);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if next_render.is_some_and(|deadline| Instant::now() >= deadline) {
-                    render_and_publish_surfaces(
-                        &lua,
-                        host,
-                        &surface_handlers,
-                        &surface_declarations,
-                    );
-                    next_render = render_interval.map(|interval| Instant::now() + interval);
-                }
+            Ok(None) => {
+                render_and_publish_surfaces(&lua, host, &registry);
+                next_render = render_interval.map(|interval| Instant::now() + interval);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         }
     }
     rx.drain_shutdown();
@@ -378,11 +341,7 @@ fn worker_interrupt(control: &WorkerControl) -> mlua::Result<VmState> {
 fn install_host_interface(
     lua: &Lua,
     host: &ModuleHost,
-    handlers: Arc<std::sync::Mutex<BTreeMap<String, RegistryKey>>>,
-    descriptors: Arc<std::sync::Mutex<Vec<CommandDescriptor>>>,
-    topics: Arc<std::sync::Mutex<Vec<String>>>,
-    surface_handlers: Arc<std::sync::Mutex<BTreeMap<String, SurfaceHandler>>>,
-    surface_declarations: Arc<std::sync::Mutex<Vec<SurfaceDeclaration>>>,
+    registry: Rc<ModuleRegistry>,
 ) -> mlua::Result<()> {
     let bootty = lua.create_table()?;
     host.facts.install(
@@ -398,20 +357,18 @@ fn install_host_interface(
     let commands = lua.create_table()?;
     let command_namespace = host.namespace.clone();
     let command_setup = Arc::clone(&host.control);
+    let command_registry = Rc::clone(&registry);
     commands.set(
         "register",
         lua.create_function(move |lua, (spec, handler): (Table, Function)| {
             require_setup_phase(&command_setup)?;
             let descriptor = descriptor_from_table(&command_namespace, &spec)?;
             let key = lua.create_registry_value(handler)?;
-            handlers
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension handler lock poisoned"))?
+            command_registry
+                .handlers
+                .borrow_mut()
                 .insert(descriptor.id.clone(), key);
-            descriptors
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension descriptor lock poisoned"))?
-                .push(descriptor);
+            command_registry.descriptors.borrow_mut().push(descriptor);
             Ok(())
         })?,
     )?;
@@ -440,6 +397,7 @@ fn install_host_interface(
     let events = lua.create_table()?;
     let event_namespace = host.namespace.clone();
     let event_setup = Arc::clone(&host.control);
+    let event_registry = Rc::clone(&registry);
     events.set(
         "register",
         lua.create_function(move |_, topic: String| {
@@ -449,10 +407,7 @@ fn install_host_interface(
                     "extension event topic must be namespaced by its module",
                 ));
             }
-            topics
-                .lock()
-                .map_err(|_| mlua::Error::runtime("extension topic lock poisoned"))?
-                .push(topic);
+            event_registry.topics.borrow_mut().push(topic);
             Ok(())
         })?,
     )?;
@@ -488,13 +443,7 @@ fn install_host_interface(
     )?;
     bootty.set("events", events)?;
 
-    install_surface_interface(
-        lua,
-        &bootty,
-        surface_handlers,
-        surface_declarations,
-        Some(Arc::clone(&host.control)),
-    )?;
+    install_surface_interface(lua, &bootty, registry, Some(Arc::clone(&host.control)))?;
 
     let storage = lua.create_table()?;
     let read_storage = host.storage.clone();
@@ -557,8 +506,7 @@ fn install_host_interface(
 fn install_surface_interface(
     lua: &Lua,
     bootty: &Table,
-    surface_handlers: Arc<std::sync::Mutex<BTreeMap<String, SurfaceHandler>>>,
-    surface_declarations: Arc<std::sync::Mutex<Vec<SurfaceDeclaration>>>,
+    registry: Rc<ModuleRegistry>,
     setup: Option<Arc<WorkerControl>>,
 ) -> mlua::Result<()> {
     let ui = bootty.get::<Table>("ui")?;
@@ -590,13 +538,13 @@ fn install_surface_interface(
                 let action = on_action
                     .map(|handler| lua.create_registry_value(handler))
                     .transpose()?;
-                surface_handlers
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("extension surface handler lock poisoned"))?
+                registry
+                    .surface_handlers
+                    .borrow_mut()
                     .insert(id.clone(), SurfaceHandler { render, action });
-                surface_declarations
-                    .lock()
-                    .map_err(|_| mlua::Error::runtime("extension surface lock poisoned"))?
+                registry
+                    .surface_declarations
+                    .borrow_mut()
                     .push(SurfaceDeclaration {
                         id,
                         placement,
@@ -624,6 +572,28 @@ pub(crate) fn require_active(
         .ok_or_else(|| mlua::Error::runtime(message))
 }
 
+fn with_active<T>(
+    control: &WorkerControl,
+    invocation: ActiveInvocation,
+    run: impl FnOnce() -> T,
+) -> T {
+    if let Ok(mut active) = control.active.lock() {
+        *active = Some(invocation);
+    }
+    let result = run();
+    if let Ok(mut active) = control.active.lock() {
+        *active = None;
+    }
+    result
+}
+
+fn command_failure(code: &str, message: impl Into<String>) -> CommandOutcome {
+    CommandOutcome::Failed {
+        code: code.to_owned(),
+        message: message.into(),
+    }
+}
+
 fn require_setup_phase(control: &WorkerControl) -> mlua::Result<()> {
     if control.setup_complete.load(Ordering::Acquire) {
         Err(mlua::Error::runtime(
@@ -636,16 +606,10 @@ fn require_setup_phase(control: &WorkerControl) -> mlua::Result<()> {
 
 fn initial_surface_snapshots(
     lua: &Lua,
-    handlers: &std::sync::Mutex<BTreeMap<String, SurfaceHandler>>,
-    declarations: &std::sync::Mutex<Vec<SurfaceDeclaration>>,
+    registry: &ModuleRegistry,
 ) -> Result<Vec<SurfaceSnapshot>, String> {
-    let declarations = declarations
-        .lock()
-        .map_err(|_| "extension surface lock poisoned".to_owned())?
-        .clone();
-    let handlers = handlers
-        .lock()
-        .map_err(|_| "extension surface handler lock poisoned".to_owned())?;
+    let declarations = registry.surface_declarations.borrow().clone();
+    let handlers = registry.surface_handlers.borrow();
     declarations
         .into_iter()
         .map(|declaration| {
@@ -666,22 +630,15 @@ fn initial_surface_snapshots(
         .collect()
 }
 
-fn render_and_publish_surfaces(
-    lua: &Lua,
-    host: &ModuleHost,
-    handlers: &std::sync::Mutex<BTreeMap<String, SurfaceHandler>>,
-    declarations: &std::sync::Mutex<Vec<SurfaceDeclaration>>,
-) {
-    if let Ok(mut active) = host.control.active.lock() {
-        *active = Some(ActiveInvocation {
+fn render_and_publish_surfaces(lua: &Lua, host: &ModuleHost, registry: &ModuleRegistry) {
+    let snapshots = with_active(
+        &host.control,
+        ActiveInvocation {
             deadline: Instant::now() + Duration::from_millis(50),
             cancellation: CommandCancellation::new(),
-        });
-    }
-    let snapshots = initial_surface_snapshots(lua, handlers, declarations);
-    if let Ok(mut active) = host.control.active.lock() {
-        *active = None;
-    }
+        },
+        || initial_surface_snapshots(lua, registry),
+    );
     match snapshots {
         Ok(snapshots) => {
             let _ =
@@ -698,7 +655,7 @@ fn render_and_publish_surfaces(
 fn run_surface_action(
     lua: &Lua,
     host: &ModuleHost,
-    handlers: &std::sync::Mutex<BTreeMap<String, SurfaceHandler>>,
+    registry: &ModuleRegistry,
     action: ExtensionUiAction,
 ) {
     let result = (|| -> Result<(), String> {
@@ -708,9 +665,7 @@ fn run_surface_action(
         {
             return Err("extension generation is no longer active".to_owned());
         }
-        let handlers = handlers
-            .lock()
-            .map_err(|_| "extension surface handler lock poisoned".to_owned())?;
+        let handlers = registry.surface_handlers.borrow();
         let handler = handlers
             .get(&action.surface)
             .and_then(|handler| handler.action.as_ref())
@@ -721,19 +676,18 @@ fn run_surface_action(
         let payload = lua
             .to_value(&action.payload)
             .map_err(|error| error.to_string())?;
-        if let Ok(mut active) = host.control.active.lock() {
-            *active = Some(ActiveInvocation {
+        with_active(
+            &host.control,
+            ActiveInvocation {
                 deadline: Instant::now() + Duration::from_millis(50),
                 cancellation: CommandCancellation::new(),
-            });
-        }
-        let called = handler
-            .call::<()>((action.action, payload))
-            .map_err(|error| error.to_string());
-        if let Ok(mut active) = host.control.active.lock() {
-            *active = None;
-        }
-        called
+            },
+            || {
+                handler
+                    .call::<()>((action.action, payload))
+                    .map_err(|error| error.to_string())
+            },
+        )
     })();
     if let Err(error) = result {
         eprintln!(
@@ -745,38 +699,28 @@ fn run_surface_action(
 
 fn invoke_handler(
     lua: &Lua,
-    handlers: &std::sync::Mutex<BTreeMap<String, RegistryKey>>,
+    registry: &ModuleRegistry,
     control: &WorkerControl,
     work: ExtensionInvocationRequest,
 ) -> CommandOutcome {
     if !control.generation.is_active() {
-        CommandOutcome::Failed {
-            code: "stale_extension_generation".to_owned(),
-            message: "extension generation is no longer active".to_owned(),
-        }
+        command_failure(
+            "stale_extension_generation",
+            "extension generation is no longer active",
+        )
     } else if work.cancellation.is_cancelled() {
-        CommandOutcome::Failed {
-            code: "cancelled".to_owned(),
-            message: "extension command was cancelled".to_owned(),
-        }
+        command_failure("cancelled", "extension command was cancelled")
     } else if Instant::now() >= work.deadline {
-        CommandOutcome::Failed {
-            code: "deadline_exceeded".to_owned(),
-            message: "extension command deadline expired".to_owned(),
-        }
+        command_failure("deadline_exceeded", "extension command deadline expired")
     } else {
         let context = ActiveInvocation {
             deadline: work.deadline,
             cancellation: work.cancellation.clone(),
         };
-        if let Ok(mut active) = control.active.lock() {
-            *active = Some(context);
-        }
-        let result = if control.generation.is_active() {
-            handlers
-                .lock()
-                .map_err(|_| "extension handler lock poisoned".to_owned())
-                .and_then(|handlers| {
+        let result = with_active(control, context, || {
+            if control.generation.is_active() {
+                let handlers = registry.handlers.borrow();
+                (|| {
                     let key = handlers
                         .get(&work.invocation.command)
                         .ok_or_else(|| "extension command is not registered".to_owned())?;
@@ -793,14 +737,12 @@ fn invoke_handler(
                     handler
                         .call::<LuaValue>(context)
                         .map_err(|error| error.to_string())
-                })
-        } else {
-            let _ = work.cancellation.cancel();
-            Err("extension generation retired".to_owned())
-        };
-        if let Ok(mut active) = control.active.lock() {
-            *active = None;
-        }
+                })()
+            } else {
+                let _ = work.cancellation.cancel();
+                Err("extension generation retired".to_owned())
+            }
+        });
         if control.generation.is_active() {
             match result {
                 Ok(value) => match lua_value(value, 0) {
@@ -808,29 +750,21 @@ fn invoke_handler(
                         value,
                         warnings: Vec::new(),
                     },
-                    Err(error) => CommandOutcome::Failed {
-                        code: "extension_result_invalid".to_owned(),
-                        message: error.to_string(),
-                    },
+                    Err(error) => command_failure("extension_result_invalid", error.to_string()),
                 },
-                Err(_) if work.cancellation.is_cancelled() => CommandOutcome::Failed {
-                    code: "cancelled".to_owned(),
-                    message: "extension command was cancelled".to_owned(),
-                },
-                Err(_) if Instant::now() >= work.deadline => CommandOutcome::Failed {
-                    code: "deadline_exceeded".to_owned(),
-                    message: "extension command deadline expired".to_owned(),
-                },
-                Err(message) => CommandOutcome::Failed {
-                    code: "extension_failed".to_owned(),
-                    message,
-                },
+                Err(_) if work.cancellation.is_cancelled() => {
+                    command_failure("cancelled", "extension command was cancelled")
+                }
+                Err(_) if Instant::now() >= work.deadline => {
+                    command_failure("deadline_exceeded", "extension command deadline expired")
+                }
+                Err(message) => command_failure("extension_failed", message),
             }
         } else {
-            CommandOutcome::Failed {
-                code: "stale_extension_generation".to_owned(),
-                message: "extension generation is no longer active".to_owned(),
-            }
+            command_failure(
+                "stale_extension_generation",
+                "extension generation is no longer active",
+            )
         }
     }
 }
@@ -844,39 +778,28 @@ fn submit_app_command(
         Ok(receiver) => receiver,
         Err(error) => {
             return match error {
-                AppCommandSendError::Overloaded => CommandOutcome::Failed {
-                    code: "overloaded".to_owned(),
-                    message: "application command queue is overloaded".to_owned(),
-                },
-                AppCommandSendError::Shutdown => CommandOutcome::Failed {
-                    code: "shutdown".to_owned(),
-                    message: "application command channel shut down".to_owned(),
-                },
+                AppCommandSendError::Overloaded => {
+                    command_failure("overloaded", "application command queue is overloaded")
+                }
+                AppCommandSendError::Shutdown => {
+                    command_failure("shutdown", "application command channel shut down")
+                }
             };
         }
     };
     loop {
         if active.cancellation.is_cancelled() {
-            return CommandOutcome::Failed {
-                code: "cancelled".to_owned(),
-                message: "command was cancelled".to_owned(),
-            };
+            return command_failure("cancelled", "command was cancelled");
         }
         let remaining = active.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             active.cancellation.cancel();
-            return CommandOutcome::Failed {
-                code: "deadline_exceeded".to_owned(),
-                message: "command deadline expired".to_owned(),
-            };
+            return command_failure("deadline_exceeded", "command deadline expired");
         }
         match receiver.recv_timeout(remaining.min(Duration::from_millis(5))) {
             Ok(outcome) => return outcome,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return CommandOutcome::Failed {
-                    code: "shutdown".to_owned(),
-                    message: "application command response channel closed".to_owned(),
-                };
+                return command_failure("shutdown", "application command response channel closed");
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -973,7 +896,7 @@ pub(crate) fn lua_value(value: LuaValue, depth: usize) -> mlua::Result<Value> {
                     value => array.push(lua_value(value, depth + 1)?),
                 }
             }
-            if sequence && table.clone().pairs::<LuaValue, LuaValue>().count() == length {
+            if sequence && table.pairs::<LuaValue, LuaValue>().count() == length {
                 return Ok(Value::Array(array));
             }
             let mut object = Map::new();

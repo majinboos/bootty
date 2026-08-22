@@ -12,7 +12,7 @@ use eframe::{
 
 use crate::{
     layout::SplitDirection,
-    renderer::{RendererMetrics, TerminalWidget},
+    renderer::{RendererMetrics, TerminalWidget, TerminalWidgetOutput},
     state::AppState,
     workspace_runtime::{TerminalProgress, TerminalProgressState},
 };
@@ -123,34 +123,26 @@ impl TerminalWorkspaceView {
         }
 
         state.record_pane_area(area);
-        if native_layout {
-            if state.native_multi_pane() {
-                self.show_split_panes(state, ui, area, palette, background);
-                show_pane_dividers(state, ui, area, palette, divider_color_override);
-            } else {
+        if native_layout && state.native_multi_pane() {
+            self.show_split_panes(state, ui, area, palette, background);
+            show_pane_dividers(state, ui, area, palette, divider_color_override);
+        } else {
+            if native_layout {
                 if let Some(focused) = state.focused_pane() {
-                    let widget_key = state.pane_widget_key(&focused);
-                    self.focus_pane(&widget_key);
+                    self.focus_pane(&state.pane_widget_key(&focused));
                 }
-                self.focused
-                    .set_transition_key(state.terminal_transition_key());
+            } else {
+                self.focused_key = None;
+            }
+            self.focused
+                .set_transition_key(state.terminal_transition_key());
+            if native_layout {
                 let geometry = self.focused.geometry_for_rect(area);
                 if let Err(error) = state.resize_native_layout_window(geometry.cols, geometry.rows)
                 {
                     state.record_render_error(error);
                 }
-                self.show_single(
-                    state,
-                    ui,
-                    area,
-                    state.config().chrome.pane_corner_radius,
-                    background,
-                );
             }
-        } else {
-            self.focused_key = None;
-            self.focused
-                .set_transition_key(state.terminal_transition_key());
             self.show_single(
                 state,
                 ui,
@@ -191,6 +183,15 @@ impl TerminalWorkspaceView {
         }
     }
 
+    fn inactive_widget(&mut self, key: &str) -> &mut TerminalWidget {
+        let target_format = self.target_format;
+        let text_config = self.text_config.clone();
+        let cursor_icon = self.cursor_icon;
+        self.inactive
+            .entry(key.to_owned())
+            .or_insert_with(|| new_widget(target_format, text_config, cursor_icon))
+    }
+
     fn show_single(
         &mut self,
         state: &mut AppState,
@@ -199,22 +200,10 @@ impl TerminalWorkspaceView {
         corner_radius_px: f32,
         background: egui::Color32,
     ) {
-        match self
+        let result = self
             .focused
-            .show_at_rect(ui, rect, "primary-terminal", state.terminal_mut())
-        {
-            Ok(output) => {
-                if output.viewport_scroll_delta != 0
-                    && let Err(error) = state
-                        .terminal_mut()
-                        .scroll_viewport_delta(output.viewport_scroll_delta)
-                {
-                    state.record_render_error(error);
-                }
-                state.record_surface(output.surface);
-            }
-            Err(error) => state.record_render_error(error),
-        }
+            .show_at_rect(ui, rect, "primary-terminal", state.terminal_mut());
+        record_widget_result(state, result, true);
         paint_pane_corner_masks(ui.painter(), rect, corner_radius_px, background);
         if let Some(progress) = state.current_terminal_progress() {
             paint_terminal_progress(
@@ -260,80 +249,55 @@ impl TerminalWorkspaceView {
             self.focus_pane(focused_widget_key);
         }
 
-        let pane_geometries: Vec<(String, String, bootty_render::geometry::TerminalGeometry)> =
+        let pane_geometries: Vec<(String, bootty_render::geometry::TerminalGeometry)> = rects
+            .iter()
+            .map(|(pane_id, rect)| {
+                let widget_key = state.pane_widget_key(pane_id);
+                let is_focused = focused.as_deref() == Some(pane_id.as_str());
+                let geometry = if is_focused {
+                    self.focused.geometry_for_rect(*rect)
+                } else {
+                    self.inactive_widget(&widget_key).geometry_for_rect(*rect)
+                };
+                (widget_key, geometry)
+            })
+            .collect();
+        if let Some((cols, rows)) = state.pane_terminal_window_size(|pane| {
             rects
                 .iter()
-                .map(|(pane_id, rect)| {
-                    let widget_key = state.pane_widget_key(pane_id);
-                    let is_focused = focused.as_deref() == Some(pane_id.as_str());
-                    let geometry = if is_focused {
-                        self.focused.geometry_for_rect(*rect)
-                    } else {
-                        let target_format = self.target_format;
-                        let text_config = self.text_config.clone();
-                        let cursor_icon = self.cursor_icon;
-                        let widget = self
-                            .inactive
-                            .entry(widget_key.clone())
-                            .or_insert_with(|| new_widget(target_format, text_config, cursor_icon));
-                        widget.geometry_for_rect(*rect)
-                    };
-                    (pane_id.clone(), widget_key, geometry)
-                })
-                .collect();
-        if let Some((cols, rows)) = state.pane_terminal_window_size(|pane| {
-            pane_geometries
-                .iter()
-                .find(|(pane_id, _, _)| pane_id.as_str() == pane)
-                .map(|(_, _, geometry)| (geometry.cols, geometry.rows))
+                .zip(&pane_geometries)
+                .find(|((pane_id, _), _)| pane_id.as_str() == pane)
+                .map(|(_, (_, geometry))| (geometry.cols, geometry.rows))
         }) && let Err(error) = state.resize_native_layout_window(cols, rows)
         {
             state.record_render_error(error);
         }
-        let current_ids: HashSet<String> = pane_geometries
+        let current_ids: HashSet<&str> = pane_geometries
             .iter()
-            .map(|(_, key, _)| key.clone())
+            .map(|(key, _)| key.as_str())
             .collect();
-        for (pane_id, rect) in &rects {
-            let widget_key = state.pane_widget_key(pane_id);
+        for ((pane_id, rect), (widget_key, _)) in rects.iter().zip(&pane_geometries) {
             let is_focused = focused.as_deref() == Some(pane_id.as_str());
             let result = if is_focused {
                 Some(self.focused.show_at_rect(
                     ui,
                     *rect,
-                    ("native-pane", &widget_key),
+                    ("native-pane", widget_key),
                     state.terminal_mut(),
                 ))
             } else {
-                let target_format = self.target_format;
-                let text_config = self.text_config.clone();
-                let cursor_icon = self.cursor_icon;
-                let widget = self
-                    .inactive
-                    .entry(widget_key.clone())
-                    .or_insert_with(|| new_widget(target_format, text_config, cursor_icon));
+                let widget = self.inactive_widget(widget_key);
                 state.terminal_runtime_for_pane(pane_id).map(|source| {
                     let output =
-                        widget.show_at_rect(ui, *rect, ("native-pane", &widget_key), source)?;
+                        widget.show_at_rect(ui, *rect, ("native-pane", widget_key), source)?;
                     if output.viewport_scroll_delta != 0 {
                         source.scroll_viewport_delta(output.viewport_scroll_delta)?;
                     }
                     Ok(output)
                 })
             };
-            match result {
-                Some(Ok(output)) if is_focused => {
-                    if output.viewport_scroll_delta != 0
-                        && let Err(error) = state
-                            .terminal_mut()
-                            .scroll_viewport_delta(output.viewport_scroll_delta)
-                    {
-                        state.record_render_error(error);
-                    }
-                    state.record_surface(output.surface);
-                }
-                Some(Ok(_)) | None => {}
-                Some(Err(error)) => state.record_render_error(error),
+            if let Some(result) = result {
+                record_widget_result(state, result, is_focused);
             }
             let corner = pane_corner_radius(*rect, corner_radius_px);
             if !is_focused && inactive_dim > 0.0 {
@@ -362,7 +326,29 @@ impl TerminalWorkspaceView {
                 );
             }
         }
-        self.inactive.retain(|key, _| current_ids.contains(key));
+        self.inactive
+            .retain(|key, _| current_ids.contains(key.as_str()));
+    }
+}
+
+fn record_widget_result(
+    state: &mut AppState,
+    result: anyhow::Result<TerminalWidgetOutput>,
+    focused: bool,
+) {
+    match result {
+        Ok(output) if focused => {
+            if output.viewport_scroll_delta != 0
+                && let Err(error) = state
+                    .terminal_mut()
+                    .scroll_viewport_delta(output.viewport_scroll_delta)
+            {
+                state.record_render_error(error);
+            }
+            state.record_surface(output.surface);
+        }
+        Ok(_) => {}
+        Err(error) => state.record_render_error(error),
     }
 }
 

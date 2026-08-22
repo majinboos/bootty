@@ -67,14 +67,8 @@ impl AppState {
                 return false;
             }
         }
-        match self.workspace.delete_space(space_id) {
-            Ok(true) => true,
-            Ok(_) => false,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
-        }
+        let result = self.workspace.delete_space(space_id);
+        self.apply_workspace_change(result)
     }
     pub fn update_space_from_ui(
         &mut self,
@@ -108,13 +102,8 @@ impl AppState {
                     let app_key_bindings = self
                         .config_runtime
                         .prepare_backend_keybindings(self.workspace.multiplexer_backend());
-                    self.config_runtime
-                        .publish_backend_keybindings(app_key_bindings);
-                    self.terminal_surface = None;
-                    self.last_pane_area = None;
-                    if let Err(error) = self.sync_terminal_panes() {
-                        self.last_error = Some(error.to_string());
-                    }
+                    self.publish_backend_transition(app_key_bindings);
+                    self.sync_terminal_panes_or_record_error();
                 }
                 true
             }
@@ -159,16 +148,11 @@ impl AppState {
             self.last_error = Some(error.to_string());
             return false;
         }
-        self.config_runtime
-            .publish_backend_keybindings(app_key_bindings);
-        self.terminal_surface = None;
-        self.last_pane_area = None;
+        self.publish_backend_transition(app_key_bindings);
         self.clear_space_context_dialogs();
         self.input_focus = InputFocus::Terminal;
         let phase = crate::diagnostics::latency_start();
-        if let Err(error) = self.sync_terminal_panes() {
-            self.last_error = Some(error.to_string());
-        }
+        self.sync_terminal_panes_or_record_error();
         crate::diagnostics::trace_phase("space.sync_terminal_panes", phase);
         crate::diagnostics::trace_phase("space.TOTAL", switch_started);
         (self.repaint)();

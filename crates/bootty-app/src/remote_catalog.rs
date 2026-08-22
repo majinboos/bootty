@@ -1,4 +1,10 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, TryRecvError},
+    },
+};
 
 use anyhow::{Result, bail};
 use bootty_config::config::{
@@ -9,7 +15,7 @@ use bootty_mux::project::{ProjectPickerEntry, WorktreePickerEntry};
 use bootty_mux::{
     command::MuxCommand,
     membership::BackendMembership,
-    process::{CommandRunner, SystemCommandRunner},
+    process::{CancellableCommandRunner, CommandCancellation, CommandRunner, SystemCommandRunner},
     provider::MuxBackendRegistry,
     snapshot::{MuxSnapshot, session_matches},
 };
@@ -21,6 +27,89 @@ use bootty_workspace::{
 };
 
 pub const REMOTE_SPACE_CATALOG_VERSION: u32 = 3;
+
+pub(crate) enum RemoteCatalogResult {
+    Listed(Vec<RemoteSpaceSummary>),
+    Created {
+        selected: RemoteSpaceSummary,
+        refreshed: Result<Vec<RemoteSpaceSummary>, String>,
+    },
+}
+
+#[derive(Debug)]
+pub(crate) struct RemoteCatalogTask {
+    pub(crate) profile_id: String,
+    receiver: mpsc::Receiver<Result<RemoteCatalogResult, String>>,
+    cancellation: CommandCancellation,
+}
+
+impl RemoteCatalogTask {
+    pub(crate) fn start(
+        profile_id: String,
+        profile: SshProfileConfig,
+        create: Option<(String, MultiplexerBackendConfig)>,
+    ) -> Result<Self, &'static str> {
+        let permit = RemoteWorkerPermit::acquire()
+            .ok_or("the previous remote Space operation is still stopping")?;
+        let (sender, receiver) = mpsc::channel();
+        let cancellation = CommandCancellation::default();
+        let runner = CancellableCommandRunner::new(cancellation.clone());
+        std::thread::spawn(move || {
+            let _permit = permit;
+            let result = if let Some((name, backend)) = create {
+                create_remote_with_runner(&profile, &name, backend, &runner).map(|selected| {
+                    RemoteCatalogResult::Created {
+                        selected,
+                        refreshed: list_remote_with_runner(&profile, &runner)
+                            .map_err(|error| error.to_string()),
+                    }
+                })
+            } else {
+                list_remote_with_runner(&profile, &runner).map(RemoteCatalogResult::Listed)
+            }
+            .map_err(|error| error.to_string());
+            let _ = sender.send(result);
+        });
+        Ok(Self {
+            profile_id,
+            receiver,
+            cancellation,
+        })
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<Result<RemoteCatalogResult, String>> {
+        match self.receiver.try_recv() {
+            Ok(result) => Some(result),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err("remote Space task stopped".to_owned())),
+        }
+    }
+}
+
+impl Drop for RemoteCatalogTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+static REMOTE_CATALOG_WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct RemoteWorkerPermit;
+
+impl RemoteWorkerPermit {
+    fn acquire() -> Option<Self> {
+        REMOTE_CATALOG_WORKER_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for RemoteWorkerPermit {
+    fn drop(&mut self) {
+        REMOTE_CATALOG_WORKER_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 pub fn list(config: &BoottyConfig) -> Result<Vec<RemoteSpaceSummary>> {
     let (_, snapshot) = WorkspaceRepository::open(&config.config_path)?;
@@ -51,7 +140,7 @@ pub fn create(
     backend: MultiplexerBackendConfig,
 ) -> Result<RemoteSpaceSummary> {
     if !backend.supports_remote() {
-        bail!("remote Spaces need tmux, zellij, or rmux")
+        bail!("remote Spaces need tmux or rmux")
     }
     let (mut repository, _) = WorkspaceRepository::open(&config.config_path)?;
     let space = repository
@@ -338,7 +427,6 @@ fn backend_name(backend: MultiplexerBackendConfig) -> &'static str {
         MultiplexerBackendConfig::Native => "native",
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
-        MultiplexerBackendConfig::Zellij => "zellij",
     }
 }
 
@@ -352,14 +440,6 @@ fn binding_is_local(binding: &WorkspaceBinding, config: &BoottyConfig) -> bool {
 
 pub fn list_remote(profile: &SshProfileConfig) -> Result<Vec<RemoteSpaceSummary>> {
     list_remote_with_runner(profile, &SystemCommandRunner)
-}
-
-pub fn create_remote(
-    profile: &SshProfileConfig,
-    name: &str,
-    backend: MultiplexerBackendConfig,
-) -> Result<RemoteSpaceSummary> {
-    create_remote_with_runner(profile, name, backend, &SystemCommandRunner)
 }
 
 pub fn list_remote_projects_with_runner<R: CommandRunner>(
@@ -442,8 +522,7 @@ fn create_remote_with_runner<R: CommandRunner>(
     let backend = match backend {
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
-        MultiplexerBackendConfig::Zellij => "zellij",
-        MultiplexerBackendConfig::Native => bail!("remote Spaces need tmux, zellij, or rmux"),
+        MultiplexerBackendConfig::Native => bail!("remote Spaces need tmux or rmux"),
     };
     let output = run_remote(
         profile,

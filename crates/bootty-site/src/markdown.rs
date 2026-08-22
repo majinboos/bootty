@@ -61,24 +61,13 @@ fn markdown_line(raw: &'static str, accent: Color) -> Line<'static> {
         return Line::from("");
     }
     if let Some(text) = trimmed.strip_prefix("# ") {
-        return Line::from(Span::styled(
-            text.to_owned(),
-            Style::default()
-                .fg(accent)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        ));
+        return heading_line(text, accent, Modifier::BOLD | Modifier::UNDERLINED);
     }
     if let Some(text) = trimmed.strip_prefix("## ") {
-        return Line::from(Span::styled(
-            text.to_owned(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ));
+        return heading_line(text, accent, Modifier::BOLD);
     }
     if let Some(text) = trimmed.strip_prefix("### ") {
-        return Line::from(Span::styled(
-            text.to_owned(),
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ));
+        return heading_line(text, MUTED, Modifier::BOLD);
     }
     if let Some(text) = trimmed.strip_prefix("- ") {
         let mut spans = vec![Span::styled("  - ", Style::default().fg(accent))];
@@ -104,7 +93,14 @@ fn markdown_line(raw: &'static str, accent: Color) -> Line<'static> {
     Line::from(inline_spans(trimmed, Style::default().fg(TEXT)))
 }
 
-fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+fn heading_line(text: &'static str, color: Color, modifier: Modifier) -> Line<'static> {
+    Line::from(Span::styled(
+        text,
+        Style::default().fg(color).add_modifier(modifier),
+    ))
+}
+
+fn inline_spans(text: &'static str, base: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, part) in text.split('`').enumerate() {
         if part.is_empty() {
@@ -115,13 +111,13 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
         } else {
             base
         };
-        spans.push(Span::styled(part.to_owned(), style));
+        spans.push(Span::styled(part, style));
     }
     spans
 }
 
 fn highlighted_code_line(
-    line: &str,
+    line: &'static str,
     language: &str,
     highlighter: Option<&mut HighlightLines<'static>>,
     code_width: usize,
@@ -131,67 +127,56 @@ fn highlighted_code_line(
     }
 
     let mut spans = vec![Span::styled("  ", Style::default().bg(CODE_BG))];
-    let Some(highlighter) = highlighter else {
-        spans.push(Span::styled(
-            line.to_owned(),
-            Style::default().fg(YELLOW).bg(CODE_BG),
-        ));
-        return padded_code_line(spans, code_width);
-    };
-    let Ok(ranges) = highlighter.highlight_line(line, syntax_set()) else {
-        spans.push(Span::styled(
-            line.to_owned(),
-            Style::default().fg(YELLOW).bg(CODE_BG),
-        ));
-        return padded_code_line(spans, code_width);
-    };
-    spans.extend(
-        ranges
-            .into_iter()
-            .map(|(style, text)| Span::styled(text.to_owned(), syntect_style(style))),
-    );
+    if let Some(ranges) =
+        highlighter.and_then(|highlighter| highlighter.highlight_line(line, syntax_set()).ok())
+    {
+        spans.extend(
+            ranges
+                .into_iter()
+                .map(|(style, text)| Span::styled(text, syntect_style(style))),
+        );
+    } else {
+        spans.push(Span::styled(line, Style::default().fg(YELLOW).bg(CODE_BG)));
+    }
     padded_code_line(spans, code_width)
 }
 
-fn toml_code_line(line: &str, code_width: usize) -> Line<'static> {
+fn toml_code_line(line: &'static str, code_width: usize) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", Style::default().bg(CODE_BG))];
     let trimmed = line.trim_start();
     let leading = line.len().saturating_sub(trimmed.len());
     if leading > 0 {
-        spans.push(Span::styled(
-            line[..leading].to_owned(),
-            Style::default().bg(CODE_BG),
-        ));
+        spans.push(Span::styled(&line[..leading], Style::default().bg(CODE_BG)));
     }
     if trimmed.is_empty() {
         return padded_code_line(spans, code_width);
     }
     if trimmed.starts_with('#') {
-        spans.push(Span::styled(trimmed.to_owned(), code_style(MUTED)));
+        spans.push(Span::styled(trimmed, code_style(MUTED)));
         return padded_code_line(spans, code_width);
     }
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         spans.push(Span::styled(
-            trimmed.to_owned(),
+            trimmed,
             code_style(CYAN).add_modifier(Modifier::BOLD),
         ));
         return padded_code_line(spans, code_width);
     }
     let Some((key, value)) = trimmed.split_once('=') else {
-        spans.push(Span::styled(trimmed.to_owned(), code_style(TEXT)));
+        spans.push(Span::styled(trimmed, code_style(TEXT)));
         return padded_code_line(spans, code_width);
     };
-    spans.push(Span::styled(key.trim_end().to_owned(), code_style(BLUE)));
-    spans.push(Span::styled(" = ".to_owned(), code_style(MUTED)));
+    spans.push(Span::styled(key.trim_end(), code_style(BLUE)));
+    spans.push(Span::styled(" = ", code_style(MUTED)));
     spans.extend(toml_value_spans(value.trim_start()));
     padded_code_line(spans, code_width)
 }
 
-fn toml_value_spans(value: &str) -> Vec<Span<'static>> {
+fn toml_value_spans(value: &'static str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut token = String::new();
     let mut in_string = false;
-    for ch in value.chars() {
+    for (index, ch) in value.char_indices() {
         if ch == '"' {
             token.push(ch);
             if in_string {
@@ -208,10 +193,7 @@ fn toml_value_spans(value: &str) -> Vec<Span<'static>> {
             if !token.is_empty() {
                 spans.push(toml_value_token(&std::mem::take(&mut token)));
             }
-            spans.push(Span::styled(
-                value[value.find('#').unwrap_or(value.len())..].to_owned(),
-                code_style(MUTED),
-            ));
+            spans.push(Span::styled(&value[index..], code_style(MUTED)));
             return spans;
         }
         if matches!(ch, '[' | ']' | ',') {
@@ -270,16 +252,17 @@ fn code_highlighter(language: &str) -> Option<HighlightLines<'static>> {
         "text" => &["txt", "Plain Text"],
         other => &[other],
     };
+    let syntaxes = syntax_set();
     let syntax = candidates.iter().find_map(|candidate| {
-        syntax_set()
+        syntaxes
             .find_syntax_by_extension(candidate)
-            .or_else(|| syntax_set().find_syntax_by_token(candidate))
-            .or_else(|| syntax_set().find_syntax_by_name(candidate))
+            .or_else(|| syntaxes.find_syntax_by_token(candidate))
+            .or_else(|| syntaxes.find_syntax_by_name(candidate))
     })?;
-    let theme = theme_set()
-        .themes
+    let themes = &theme_set().themes;
+    let theme = themes
         .get("base16-ocean.dark")
-        .or_else(|| theme_set().themes.get("Solarized (dark)"))?;
+        .or_else(|| themes.get("Solarized (dark)"))?;
     Some(HighlightLines::new(syntax, theme))
 }
 

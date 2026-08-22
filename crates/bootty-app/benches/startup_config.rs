@@ -117,7 +117,6 @@ sidebar-keybind = ["j=next_session", "k=previous_session", "Enter=activate_sessi
 [input.backend-keybind]
 native = ["ctrl+space>c=new_tab", "ctrl+space>v=split_right", "alt+j=select_pane:down"]
 tmux = ["alt+j=esc:J", "cmd+c=csi:72~"]
-zellij = ["alt+n=next_tab"]
 
 [session]
 shell = "/bin/zsh"

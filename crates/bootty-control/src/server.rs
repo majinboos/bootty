@@ -271,13 +271,11 @@ async fn handle_request(
             ],
             "event_topics": available_event_topics(&state, &catalog)
                 .into_iter()
-                .map(|topic| (topic.clone(), json!({
-                    "snapshot": if topic == COMMAND_COMPLETED_TOPIC {
-                        Some("instance.describe")
-                    } else {
-                        None
-                    }
-                })))
+                .map(|topic| {
+                    let snapshot = (topic == COMMAND_COMPLETED_TOPIC)
+                        .then_some("instance.describe");
+                    (topic, json!({"snapshot": snapshot}))
+                })
                 .collect::<BTreeMap<_, _>>()
         })),
         "instance.describe" => {
@@ -306,12 +304,7 @@ async fn handle_request(
     };
     match result {
         Ok(result) => RpcResponse::success(request.id, result),
-        Err(error) => RpcResponse {
-            jsonrpc: "2.0".to_owned(),
-            id: request.id,
-            result: None,
-            error: Some(error),
-        },
+        Err(error) => RpcResponse::error(request.id, error.code, error.message, error.data),
     }
 }
 
@@ -422,10 +415,7 @@ fn wait_for_task(
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     loop {
         match response_rx.try_recv() {
-            Ok(outcome) => {
-                return serde_json::to_value(outcome)
-                    .unwrap_or_else(|error| internal_outcome(&error));
-            }
+            Ok(outcome) => return task_outcome(outcome),
             Err(mpsc::TryRecvError::Disconnected) => {
                 return failed_outcome("-32003", "command response channel closed");
             }
@@ -433,9 +423,7 @@ fn wait_for_task(
         }
         if cancellation.is_cancelled() {
             return match response_rx.try_recv() {
-                Ok(outcome) => {
-                    serde_json::to_value(outcome).unwrap_or_else(|error| internal_outcome(&error))
-                }
+                Ok(outcome) => task_outcome(outcome),
                 Err(_) => failed_outcome("-32003", "command was cancelled"),
             };
         }
@@ -445,16 +433,17 @@ fn wait_for_task(
             return failed_outcome("-32003", "command deadline expired");
         }
         match response_rx.recv_timeout(remaining.min(TASK_WAIT_INTERVAL)) {
-            Ok(outcome) => {
-                return serde_json::to_value(outcome)
-                    .unwrap_or_else(|error| internal_outcome(&error));
-            }
+            Ok(outcome) => return task_outcome(outcome),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return failed_outcome("-32003", "command response channel closed");
             }
         }
     }
+}
+
+fn task_outcome(outcome: bootty_command::CommandOutcome) -> Value {
+    serde_json::to_value(outcome).unwrap_or_else(|error| internal_outcome(&error))
 }
 
 fn command_send_error(error: AppCommandSendError) -> RpcError {
@@ -507,18 +496,15 @@ fn subscribe_events(
 }
 
 fn unsubscribe_events(params: &Value, state: &SharedControlState) -> Result<Value, RpcError> {
-    let subscription = subscription_id(params)?;
-    lock_control_state(state).unsubscribe(subscription)
+    lock_control_state(state).unsubscribe(subscription_id(params)?)
 }
 
 fn task_status(params: &Value, state: &SharedControlState) -> Result<Value, RpcError> {
-    let task = task_id(params)?;
-    lock_control_state(state).task_value(task)
+    lock_control_state(state).task_value(task_id(params)?)
 }
 
 fn task_cancel(params: &Value, state: &SharedControlState) -> Result<Value, RpcError> {
-    let task = task_id(params)?;
-    lock_control_state(state).cancel_task(task)
+    lock_control_state(state).cancel_task(task_id(params)?)
 }
 
 fn task_id(params: &Value) -> Result<&str, RpcError> {
@@ -572,22 +558,21 @@ fn available_event_topics(
     state: &SharedControlState,
     catalog: &ControlCatalog,
 ) -> BTreeSet<String> {
-    let extension_topics = catalog.extensions().topics();
     lock_control_state(state)
         .topics
         .iter()
         .cloned()
-        .chain(extension_topics)
+        .chain(catalog.extensions().topics())
         .collect()
 }
 
 fn event_scope(params: &Value, descriptor: &InstanceDescriptor) -> Result<String, RpcError> {
     let expected = instance_scope(descriptor);
-    let scope = params
+    if params
         .get("scope")
         .and_then(Value::as_str)
-        .unwrap_or(&expected);
-    if scope != expected {
+        .is_some_and(|scope| scope != expected)
+    {
         return Err(RpcError::new(-32602, "unsupported event scope"));
     }
     Ok(expected)

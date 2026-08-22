@@ -121,6 +121,8 @@ impl TerminalEngine {
             return Ok(TerminalCopyModeOutcome::default());
         }
 
+        let mut copied = None;
+        let mut search = None;
         match action {
             TerminalCopyModeAction::Cancel => self.cancel_copy_mode()?,
             TerminalCopyModeAction::CancelOrClearSelection => {
@@ -142,34 +144,16 @@ impl TerminalEngine {
             TerminalCopyModeAction::ToggleRectangle => self.toggle_copy_mode_rectangle()?,
             TerminalCopyModeAction::Search { query, direction } => {
                 let found = self.search_copy_mode_query(&query, direction)?;
-                return Ok(TerminalCopyModeOutcome {
-                    copied: None,
-                    search: Some(TerminalCopyModeSearchOutcome { query, found }),
-                    active: self.copy_mode.is_some(),
-                });
+                search = Some(TerminalCopyModeSearchOutcome { query, found });
             }
             TerminalCopyModeAction::SearchWord(direction) => {
-                let Some(query) = self.copy_mode_word_under_cursor()? else {
-                    return Ok(TerminalCopyModeOutcome {
-                        copied: None,
-                        search: None,
-                        active: self.copy_mode.is_some(),
-                    });
-                };
-                let found = self.search_copy_mode_query(&query, direction)?;
-                return Ok(TerminalCopyModeOutcome {
-                    copied: None,
-                    search: Some(TerminalCopyModeSearchOutcome { query, found }),
-                    active: self.copy_mode.is_some(),
-                });
+                if let Some(query) = self.copy_mode_word_under_cursor()? {
+                    let found = self.search_copy_mode_query(&query, direction)?;
+                    search = Some(TerminalCopyModeSearchOutcome { query, found });
+                }
             }
             TerminalCopyModeAction::CopySelectionAndCancel => {
-                let copied = self.copy_mode_selection_and_cancel()?;
-                return Ok(TerminalCopyModeOutcome {
-                    copied,
-                    search: None,
-                    active: false,
-                });
+                copied = self.copy_mode_selection_and_cancel()?;
             }
             TerminalCopyModeAction::CopyEndOfLineAndCancel => {
                 if !self
@@ -180,19 +164,14 @@ impl TerminalEngine {
                     self.begin_copy_mode_selection(false)?;
                 }
                 self.move_copy_mode_cursor(TerminalCopyModeMotion::EndOfLine)?;
-                let copied = self.copy_mode_selection_and_cancel()?;
-                return Ok(TerminalCopyModeOutcome {
-                    copied,
-                    search: None,
-                    active: false,
-                });
+                copied = self.copy_mode_selection_and_cancel()?;
             }
             TerminalCopyModeAction::Move(motion) => self.move_copy_mode_cursor(motion)?,
         }
 
         Ok(TerminalCopyModeOutcome {
-            copied: None,
-            search: None,
+            copied,
+            search,
             active: self.copy_mode.is_some(),
         })
     }
@@ -321,9 +300,7 @@ impl TerminalEngine {
     fn copy_mode_selection_and_cancel(&mut self) -> Result<Option<Vec<u8>>> {
         self.sync_copy_mode_selection()?;
         let copied = self.format_selection(TerminalSelectionFormat::PlainText)?;
-        self.copy_mode = None;
-        self.terminal.set_selection(None)?;
-        self.mark_content_changed();
+        self.cancel_copy_mode()?;
         Ok(copied)
     }
 
@@ -371,33 +348,27 @@ impl TerminalEngine {
                     next.x = 0;
                 }
             }
-            TerminalCopyModeMotion::Up => {
-                next.y = next.y.saturating_sub(1);
+            TerminalCopyModeMotion::Up
+            | TerminalCopyModeMotion::PageUp
+            | TerminalCopyModeMotion::HalfPageUp => {
+                let distance = match motion {
+                    TerminalCopyModeMotion::Up => 1,
+                    TerminalCopyModeMotion::PageUp => page,
+                    _ => half_page,
+                };
+                next.y = next.y.saturating_sub(distance);
                 next.x = desired_col.min(max_x);
                 update_desired_col = false;
             }
-            TerminalCopyModeMotion::Down => {
-                next.y = next.y.saturating_add(1).min(max_y);
-                next.x = desired_col.min(max_x);
-                update_desired_col = false;
-            }
-            TerminalCopyModeMotion::PageUp => {
-                next.y = next.y.saturating_sub(page);
-                next.x = desired_col.min(max_x);
-                update_desired_col = false;
-            }
-            TerminalCopyModeMotion::PageDown => {
-                next.y = next.y.saturating_add(page).min(max_y);
-                next.x = desired_col.min(max_x);
-                update_desired_col = false;
-            }
-            TerminalCopyModeMotion::HalfPageUp => {
-                next.y = next.y.saturating_sub(half_page);
-                next.x = desired_col.min(max_x);
-                update_desired_col = false;
-            }
-            TerminalCopyModeMotion::HalfPageDown => {
-                next.y = next.y.saturating_add(half_page).min(max_y);
+            TerminalCopyModeMotion::Down
+            | TerminalCopyModeMotion::PageDown
+            | TerminalCopyModeMotion::HalfPageDown => {
+                let distance = match motion {
+                    TerminalCopyModeMotion::Down => 1,
+                    TerminalCopyModeMotion::PageDown => page,
+                    _ => half_page,
+                };
+                next.y = next.y.saturating_add(distance).min(max_y);
                 next.x = desired_col.min(max_x);
                 update_desired_col = false;
             }
@@ -430,16 +401,14 @@ impl TerminalEngine {
             TerminalCopyModeMotion::NextWord => next = self.next_word_start(point)?,
             TerminalCopyModeMotion::PreviousWord => next = self.previous_word_start(point)?,
             TerminalCopyModeMotion::NextWordEnd => next = self.next_word_end(point)?,
-            TerminalCopyModeMotion::ScrollUp => {
+            TerminalCopyModeMotion::ScrollUp | TerminalCopyModeMotion::ScrollDown => {
                 let before_top = self.viewport_top_screen_row()?;
-                self.scroll_viewport_delta(-1);
-                let after_top = self.viewport_top_screen_row()?;
-                next.y = Self::shifted_screen_row(next.y, before_top, after_top, max_y);
-                update_desired_col = false;
-            }
-            TerminalCopyModeMotion::ScrollDown => {
-                let before_top = self.viewport_top_screen_row()?;
-                self.scroll_viewport_delta(1);
+                let delta = if motion == TerminalCopyModeMotion::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                self.scroll_viewport_delta(delta);
                 let after_top = self.viewport_top_screen_row()?;
                 next.y = Self::shifted_screen_row(next.y, before_top, after_top, max_y);
                 update_desired_col = false;
@@ -539,10 +508,10 @@ impl TerminalEngine {
         let mut logical = Vec::new();
         let mut positions = Vec::new();
         for y in 0..total_rows {
-            let chars = self.screen_row_chars(y)?;
-            for (x, ch) in chars.into_iter().enumerate() {
-                logical.push(normalize_search_char(ch));
-                positions.push(PointCoordinate { x: x as u16, y });
+            for x in 0..self.geometry.cols {
+                let point = PointCoordinate { x, y };
+                logical.push(normalize_search_char(self.screen_char(point)?));
+                positions.push(point);
             }
             if !self.screen_row_wrapped(y)? {
                 matches.extend(copy_mode_logical_search_matches(
@@ -640,11 +609,11 @@ impl TerminalEngine {
     }
 
     fn point_before(point: PointCoordinate, cursor: PointCoordinate) -> bool {
-        point.y < cursor.y || point.y == cursor.y && point.x < cursor.x
+        (point.y, point.x) < (cursor.y, cursor.x)
     }
 
     fn point_after(point: PointCoordinate, cursor: PointCoordinate) -> bool {
-        point.y > cursor.y || point.y == cursor.y && point.x > cursor.x
+        (point.y, point.x) > (cursor.y, cursor.x)
     }
 
     fn sync_copy_mode_selection(&mut self) -> Result<()> {
@@ -700,36 +669,33 @@ impl TerminalEngine {
     }
 
     fn screen_row_chars(&self, row: u32) -> Result<Vec<char>> {
-        let mut chars = Vec::with_capacity(usize::from(self.geometry.cols));
-        for x in 0..self.geometry.cols {
-            let cell = self
-                .terminal
-                .grid_ref(Point::Screen(PointCoordinate { x, y: row }))?
-                .cell()?;
-            let ch = if cell.has_text()? {
-                char::from_u32(cell.codepoint()?).unwrap_or(' ')
-            } else {
-                ' '
-            };
-            chars.push(ch);
-        }
-        Ok(chars)
+        (0..self.geometry.cols)
+            .map(|x| self.screen_char(PointCoordinate { x, y: row }))
+            .collect()
     }
 
     fn screen_row_end_col(&self, row: u32) -> Result<u16> {
-        let chars = self.screen_row_chars(row)?;
-        Ok(chars
-            .iter()
-            .rposition(|ch| !ch.is_whitespace())
-            .map_or(0, |index| index as u16))
+        for x in (0..self.geometry.cols).rev() {
+            if !self
+                .screen_char(PointCoordinate { x, y: row })?
+                .is_whitespace()
+            {
+                return Ok(x);
+            }
+        }
+        Ok(0)
     }
 
     fn screen_row_first_nonblank_col(&self, row: u32) -> Result<u16> {
-        let chars = self.screen_row_chars(row)?;
-        Ok(chars
-            .iter()
-            .position(|ch| !ch.is_whitespace())
-            .map_or(0, |index| index as u16))
+        for x in 0..self.geometry.cols {
+            if !self
+                .screen_char(PointCoordinate { x, y: row })?
+                .is_whitespace()
+            {
+                return Ok(x);
+            }
+        }
+        Ok(0)
     }
 
     fn screen_char(&self, point: PointCoordinate) -> Result<char> {
@@ -750,44 +716,44 @@ impl TerminalEngine {
             .unwrap_or(false))
     }
 
-    fn next_screen_point(&self, point: PointCoordinate) -> Result<Option<PointCoordinate>> {
+    fn next_screen_point(&self, point: PointCoordinate, max_y: u32) -> Option<PointCoordinate> {
         let max_x = self.geometry.cols.saturating_sub(1);
-        let max_y = (self.terminal.total_rows()?.max(1) as u32).saturating_sub(1);
         if point.x < max_x {
-            Ok(Some(PointCoordinate {
+            Some(PointCoordinate {
                 x: point.x + 1,
                 y: point.y,
-            }))
+            })
         } else if point.y < max_y {
-            Ok(Some(PointCoordinate {
+            Some(PointCoordinate {
                 x: 0,
                 y: point.y + 1,
-            }))
+            })
         } else {
-            Ok(None)
+            None
         }
     }
 
-    fn previous_screen_point(&self, point: PointCoordinate) -> Result<Option<PointCoordinate>> {
+    fn previous_screen_point(&self, point: PointCoordinate) -> Option<PointCoordinate> {
         if point.x > 0 {
-            Ok(Some(PointCoordinate {
+            Some(PointCoordinate {
                 x: point.x - 1,
                 y: point.y,
-            }))
+            })
         } else if point.y > 0 {
-            Ok(Some(PointCoordinate {
+            Some(PointCoordinate {
                 x: self.geometry.cols.saturating_sub(1),
                 y: point.y - 1,
-            }))
+            })
         } else {
-            Ok(None)
+            None
         }
     }
 
     fn next_word_start(&self, point: PointCoordinate) -> Result<PointCoordinate> {
         let mut current = point;
         let mut left_word = self.screen_char(current)?.is_whitespace();
-        while let Some(next) = self.next_screen_point(current)? {
+        let max_y = (self.terminal.total_rows()?.max(1) as u32).saturating_sub(1);
+        while let Some(next) = self.next_screen_point(current, max_y) {
             current = next;
             let is_word = !self.screen_char(current)?.is_whitespace();
             if left_word && is_word {
@@ -802,13 +768,13 @@ impl TerminalEngine {
 
     fn previous_word_start(&self, point: PointCoordinate) -> Result<PointCoordinate> {
         let mut current = point;
-        while let Some(previous) = self.previous_screen_point(current)? {
+        while let Some(previous) = self.previous_screen_point(current) {
             current = previous;
             if !self.screen_char(current)?.is_whitespace() {
                 break;
             }
         }
-        while let Some(previous) = self.previous_screen_point(current)? {
+        while let Some(previous) = self.previous_screen_point(current) {
             if self.screen_char(previous)?.is_whitespace() {
                 break;
             }
@@ -819,13 +785,14 @@ impl TerminalEngine {
 
     fn next_word_end(&self, point: PointCoordinate) -> Result<PointCoordinate> {
         let mut current = point;
-        while let Some(next) = self.next_screen_point(current)? {
+        let max_y = (self.terminal.total_rows()?.max(1) as u32).saturating_sub(1);
+        while let Some(next) = self.next_screen_point(current, max_y) {
             current = next;
             if !self.screen_char(current)?.is_whitespace() {
                 break;
             }
         }
-        while let Some(next) = self.next_screen_point(current)? {
+        while let Some(next) = self.next_screen_point(current, max_y) {
             if self.screen_char(next)?.is_whitespace() {
                 break;
             }

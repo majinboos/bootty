@@ -21,15 +21,7 @@ pub fn searchable_combo(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.set_min_width(width.max(260.0));
-            let mut filter: String =
-                ui.memory(|memory| memory.data.get_temp(filter_id).unwrap_or_default());
-            let response = settings_text_edit(ui, palette, &mut filter, "Search");
-            if !response.has_focus() {
-                response.request_focus();
-            }
-            ui.memory_mut(|memory| memory.data.insert_temp(filter_id, filter.clone()));
-            let needle = filter.to_ascii_lowercase();
-            ui.separator();
+            let needle = combo_filter(ui, palette, filter_id, true);
             // Size the list from the full option count, not the filtered subset, so a query that
             // matches nothing can't collapse the popup and leave it stuck small afterward.
             let list_height = (options.len() as f32 * 24.0).clamp(0.0, 300.0);
@@ -47,13 +39,8 @@ pub fn searchable_combo(
                             Vec2::new(ui.available_width(), 24.0),
                             egui::Sense::click(),
                         );
-                        let fill = if is_current {
-                            palette.accent
-                        } else if response.hovered() {
-                            palette.hover
-                        } else {
-                            palette.pane
-                        };
+                        let fill =
+                            combo_row_fill(palette, is_current, response.hovered(), palette.accent);
                         ui.painter().rect_filled(
                             rect,
                             egui::CornerRadius::same(palette.radius),
@@ -112,19 +99,7 @@ pub fn described_combo<T: Copy + PartialEq>(
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             ui.set_min_width(width.max(300.0));
-            let needle = if searchable {
-                let mut filter: String =
-                    ui.memory(|memory| memory.data.get_temp(filter_id).unwrap_or_default());
-                let response = settings_text_edit(ui, palette, &mut filter, "Search");
-                if !response.has_focus() {
-                    response.request_focus();
-                }
-                ui.memory_mut(|memory| memory.data.insert_temp(filter_id, filter.clone()));
-                ui.separator();
-                filter.to_ascii_lowercase()
-            } else {
-                String::new()
-            };
+            let needle = combo_filter(ui, palette, filter_id, searchable);
             // Size from the full option count so a query matching nothing can't collapse the popup.
             let list_height = (options.len() as f32 * 54.0).clamp(54.0, 320.0);
             egui::ScrollArea::vertical()
@@ -144,13 +119,12 @@ pub fn described_combo<T: Copy + PartialEq>(
                             Vec2::new(ui.available_width(), 52.0),
                             egui::Sense::click(),
                         );
-                        let fill = if is_current {
-                            palette.surface
-                        } else if response.hovered() {
-                            palette.hover
-                        } else {
-                            palette.pane
-                        };
+                        let fill = combo_row_fill(
+                            palette,
+                            is_current,
+                            response.hovered(),
+                            palette.surface,
+                        );
                         ui.painter().rect_filled(rect, palette.radius, fill);
                         ui.painter().text(
                             rect.left_top() + Vec2::new(12.0, 8.0),
@@ -185,6 +159,40 @@ pub fn described_combo<T: Copy + PartialEq>(
     changed
 }
 
+fn combo_filter(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    filter_id: egui::Id,
+    enabled: bool,
+) -> String {
+    if !enabled {
+        return String::new();
+    }
+    let mut filter = ui.memory(|memory| memory.data.get_temp(filter_id).unwrap_or_default());
+    let response = settings_text_edit(ui, palette, &mut filter, "Search");
+    if !response.has_focus() {
+        response.request_focus();
+    }
+    ui.memory_mut(|memory| memory.data.insert_temp(filter_id, filter.clone()));
+    ui.separator();
+    filter.to_ascii_lowercase()
+}
+
+fn combo_row_fill(
+    palette: ThemePalette,
+    current: bool,
+    hovered: bool,
+    current_fill: Color32,
+) -> Color32 {
+    if current {
+        current_fill
+    } else if hovered {
+        palette.hover
+    } else {
+        palette.pane
+    }
+}
+
 /// A text button with a constant 1px border in every state, so only its fill changes on hover.
 /// egui's default button reads its border in from `hovered`/`active` visuals, which makes the
 /// frame appear to grow under the pointer; this keeps the footprint fixed.
@@ -194,6 +202,24 @@ pub fn settings_button(ui: &mut egui::Ui, palette: ThemePalette, label: &str) ->
     let galley = settings_button_galley(ui, label, font, text_color);
     let padding = Vec2::new(14.0, 8.0);
     let size = Vec2::new(galley.size().x + padding.x * 2.0, 30.0);
+    let (rect, response, fill) = settings_button_surface(ui, palette, size);
+    let text_pos = Pos2::new(rect.center().x - galley.size().x * 0.5, rect.center().y);
+    ui.painter().galley(
+        Pos2::new(text_pos.x, text_pos.y - galley.size().y * 0.5),
+        galley,
+        readable_color(fill, text_color),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn settings_button_surface(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    size: Vec2,
+) -> (Rect, egui::Response, Color32) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     let fill = if response.hovered() {
         palette.hover
@@ -208,16 +234,7 @@ pub fn settings_button(ui: &mut egui::Ui, palette: ThemePalette, label: &str) ->
         egui::Stroke::new(1.0, palette.border),
         egui::StrokeKind::Inside,
     );
-    let text_pos = Pos2::new(rect.center().x - galley.size().x * 0.5, rect.center().y);
-    ui.painter().galley(
-        Pos2::new(text_pos.x, text_pos.y - galley.size().y * 0.5),
-        galley,
-        readable_color(fill, text_color),
-    );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    response
+    (rect, response, fill)
 }
 
 fn settings_button_galley(
@@ -329,13 +346,10 @@ pub fn reorderable_list(
         .map(|payload| payload.index)?;
     let pointer = ui.input(|input| input.pointer.interact_pos())?;
 
-    let mut slot = len;
-    for (index, rect) in rects.iter().enumerate() {
-        if pointer.y < rect.center().y {
-            slot = index;
-            break;
-        }
-    }
+    let slot = rects
+        .iter()
+        .position(|rect| pointer.y < rect.center().y)
+        .unwrap_or(len);
 
     let left = rects.iter().map(|r| r.left()).fold(f32::INFINITY, f32::min);
     let right = rects
@@ -379,21 +393,7 @@ pub fn settings_icon_button(
     slug: &str,
     tooltip: &str,
 ) -> egui::Response {
-    let size = Vec2::splat(30.0);
-    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-    let fill = if response.hovered() {
-        palette.hover
-    } else {
-        palette.surface
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(palette.radius), fill);
-    ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(palette.radius),
-        egui::Stroke::new(1.0, palette.border),
-        egui::StrokeKind::Inside,
-    );
+    let (rect, response, fill) = settings_button_surface(ui, palette, Vec2::splat(30.0));
     icons::paint_icon_slug(
         ui.painter(),
         slug,
@@ -404,9 +404,9 @@ pub fn settings_icon_button(
     response.on_hover_text(tooltip)
 }
 
-pub fn settings_page_header(ui: &mut egui::Ui, palette: ThemePalette, title: &str) {
+pub fn settings_page_header(ui: &mut egui::Ui, palette: ThemePalette, context: &str, title: &str) {
     ui.label(
-        RichText::new("Bootty Settings")
+        RichText::new(context)
             .color(readable_color(palette.base, palette.muted))
             .size(12.0),
     );
@@ -424,7 +424,7 @@ pub fn settings_page_header(ui: &mut egui::Ui, palette: ThemePalette, title: &st
 /// it. This makes row dividers act as separators *between* rows — the last row keeps no trailing
 /// border, which is what bleeds into a following framed block.
 fn section_first_row_id() -> egui::Id {
-    egui::Id::new("bootty::settings::section_first_row")
+    egui::Id::new("settings::section_first_row")
 }
 
 /// Section heading inside a page.
@@ -447,13 +447,14 @@ pub fn settings_row(
     help: &str,
     add_control: impl FnOnce(&mut egui::Ui),
 ) {
-    let first_in_section = ui.memory(|memory| {
-        memory
+    let first_in_section = ui.memory_mut(|memory| {
+        let first = memory
             .data
             .get_temp::<bool>(section_first_row_id())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        memory.data.insert_temp(section_first_row_id(), false);
+        first
     });
-    ui.memory_mut(|memory| memory.data.insert_temp(section_first_row_id(), false));
 
     let top = ui.cursor().top();
     ui.add_space(7.0);
@@ -527,26 +528,25 @@ pub fn settings_toggle(ui: &mut egui::Ui, palette: ThemePalette, value: &mut boo
     if changed {
         *value = !*value;
     }
-    let fill = if *value {
-        palette.accent
-    } else if response.hovered() {
-        palette.hover
+    let (fill, border, knob) = if *value {
+        (palette.accent, palette.accent, palette.base)
     } else {
-        palette.surface
+        (
+            if response.hovered() {
+                palette.hover
+            } else {
+                palette.surface
+            },
+            palette.border,
+            palette.subtext,
+        )
     };
     ui.painter()
         .rect_filled(rect, egui::CornerRadius::same(13), fill);
     ui.painter().rect_stroke(
         rect,
         egui::CornerRadius::same(13),
-        egui::Stroke::new(
-            1.0,
-            if *value {
-                palette.accent
-            } else {
-                palette.border
-            },
-        ),
+        egui::Stroke::new(1.0, border),
         egui::StrokeKind::Inside,
     );
     let knob_x = if *value {
@@ -557,14 +557,7 @@ pub fn settings_toggle(ui: &mut egui::Ui, palette: ThemePalette, value: &mut boo
     ui.painter().circle_filled(
         Pos2::new(knob_x, rect.center().y),
         9.0,
-        readable_color(
-            fill,
-            if *value {
-                palette.base
-            } else {
-                palette.subtext
-            },
-        ),
+        readable_color(fill, knob),
     );
     changed
 }
@@ -656,15 +649,6 @@ fn settings_segmented_unit(
             );
         }
         let pointer_hovered = response.hover_pos().is_some_and(|pos| item.contains(pos));
-        if pointer_hovered && index != selected {
-            ui.painter()
-                .rect_filled(item.shrink(3.0), egui::CornerRadius::same(5), palette.hover);
-        }
-        if index == selected {
-            let selected_rect = item.shrink(3.0);
-            ui.painter()
-                .rect_filled(selected_rect, egui::CornerRadius::same(5), palette.accent);
-        }
         let fill = if index == selected {
             palette.accent
         } else if pointer_hovered {
@@ -672,6 +656,10 @@ fn settings_segmented_unit(
         } else {
             palette.surface
         };
+        if fill != palette.surface {
+            ui.painter()
+                .rect_filled(item.shrink(3.0), egui::CornerRadius::same(5), fill);
+        }
         let color = if index == selected {
             readable_color(fill, palette.text)
         } else {
@@ -770,7 +758,7 @@ pub fn settings_slider_with_edit(
     spec: NumberEditSpec<'_>,
 ) -> bool {
     let edit_id = number_edit_id(ui, spec.id_salt);
-    let group_width = 190.0 + 8.0 + number_edit_outer_width(&spec);
+    let group_width = 214.0 + number_edit_inner_width(&spec);
     ui.allocate_ui_with_layout(
         Vec2::new(group_width, 34.0),
         egui::Layout::right_to_left(egui::Align::Center),
@@ -855,10 +843,6 @@ fn settings_number_edit_with_id(
         });
     }
     false
-}
-
-fn number_edit_outer_width(spec: &NumberEditSpec<'_>) -> f32 {
-    number_edit_inner_width(spec) + 16.0
 }
 
 fn number_edit_inner_width(spec: &NumberEditSpec<'_>) -> f32 {

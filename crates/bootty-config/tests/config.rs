@@ -120,7 +120,6 @@ fn missing_config_file_loads_with_selected_path() {
         config.appearance.dark.theme.as_deref(),
         Some("Catppuccin Mocha")
     );
-    assert_eq!(config.theme.as_deref(), Some("Catppuccin Mocha"));
 }
 
 #[test]
@@ -296,10 +295,13 @@ fn config_resolves_theme_and_color_overrides(
 ) {
     let config = load_config_source(source);
 
-    assert_eq!(config.theme.as_deref(), theme);
-    assert_eq!(config.colors.background, background);
-    assert_eq!(config.colors.foreground, foreground);
-    assert_eq!(config.colors.palette.len(), palette_len);
+    for variant in [AppearanceVariant::Light, AppearanceVariant::Dark] {
+        let colors = config.colors_for_appearance(variant);
+        assert_eq!(config.theme_for_appearance(variant), theme);
+        assert_eq!(colors.background, background);
+        assert_eq!(colors.foreground, foreground);
+        assert_eq!(colors.palette.len(), palette_len);
+    }
 }
 
 #[test]
@@ -350,8 +352,13 @@ fn legacy_theme_and_colors_seed_appearance_branches() {
             Some(Color::from_hex("#101112").unwrap())
         );
     }
-    assert_eq!(config.theme.as_deref(), Some("Catppuccin Mocha"));
-    assert_eq!(config.colors, config.appearance.dark.colors);
+
+    let colors_only = load_config_source("[colors]\nbackground = \"#101112\"\n");
+    assert_eq!(colors_only.appearance.light, colors_only.appearance.dark);
+    assert_eq!(
+        colors_only.appearance.dark.theme.as_deref(),
+        Some("Catppuccin Mocha")
+    );
 }
 
 #[test]
@@ -460,8 +467,11 @@ fn config_accepts_ghostty_palette_generation_settings() {
         palette-harmonious = true
     "##});
 
-    assert!(config.colors.palette_generate);
-    assert!(config.colors.palette_harmonious);
+    for variant in [AppearanceVariant::Light, AppearanceVariant::Dark] {
+        let colors = config.colors_for_appearance(variant);
+        assert!(colors.palette_generate);
+        assert!(colors.palette_harmonious);
+    }
 }
 
 #[test]
@@ -552,23 +562,25 @@ fn config_accepts_xterm_dynamic_color_slots() {
         highlight-foreground = "#131415"
     "##});
 
-    assert_eq!(
-        config.colors.pointer_foreground,
-        Some(Color::from_hex("#010203").unwrap())
-    );
-    assert_eq!(
-        config.colors.highlight_foreground,
-        Some(Color::from_hex("#131415").unwrap())
-    );
-
-    assert_eq!(
-        config.colors.pointer_background,
-        Some(Color::from_hex("#040506").unwrap())
-    );
-    assert_eq!(
-        config.colors.tektronix_cursor,
-        Some(Color::from_hex("#101112").unwrap())
-    );
+    for variant in [AppearanceVariant::Light, AppearanceVariant::Dark] {
+        let colors = config.colors_for_appearance(variant);
+        assert_eq!(
+            colors.pointer_foreground,
+            Some(Color::from_hex("#010203").unwrap())
+        );
+        assert_eq!(
+            colors.highlight_foreground,
+            Some(Color::from_hex("#131415").unwrap())
+        );
+        assert_eq!(
+            colors.pointer_background,
+            Some(Color::from_hex("#040506").unwrap())
+        );
+        assert_eq!(
+            colors.tektronix_cursor,
+            Some(Color::from_hex("#101112").unwrap())
+        );
+    }
 }
 
 #[test]
@@ -675,6 +687,31 @@ fn key_file_profile_requires_an_identity_file() {
 }
 
 #[test]
+fn theme_catalog_combines_builtin_and_user_themes() {
+    let sandbox = ConfigSandbox::new();
+    sandbox.write("themes/My Theme.toml", "");
+    sandbox.write("themes/ignored.txt", "");
+    sandbox.write("themes/catppuccin mocha.toml", "");
+
+    let names = available_theme_names(&sandbox.path);
+
+    assert!(names.iter().any(|name| name == "My Theme"));
+    assert!(!names.iter().any(|name| name == "ignored"));
+    assert!(
+        names.len() > 1,
+        "the builtin theme catalog must remain present"
+    );
+    // A user copy of a built-in name replaces it instead of listing the theme twice.
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.eq_ignore_ascii_case("catppuccin mocha"))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn user_theme_shadows_builtin_theme_name() {
     let sandbox = ConfigSandbox::with_config(indoc! {r#"
         theme = "Catppuccin Mocha"
@@ -695,15 +732,12 @@ fn user_theme_shadows_builtin_theme_name() {
 
     let config = sandbox.load().unwrap();
 
-    assert_eq!(
-        config.colors.background,
-        Some(Color::from_hex("#000102").unwrap())
-    );
-    assert_eq!(
-        config.colors.foreground,
-        Some(Color::from_hex("#030405").unwrap())
-    );
-    assert_eq!(config.colors.palette, Vec::new());
+    for variant in [AppearanceVariant::Light, AppearanceVariant::Dark] {
+        let colors = config.colors_for_appearance(variant);
+        assert_eq!(colors.background, Some(Color::from_hex("#000102").unwrap()));
+        assert_eq!(colors.foreground, Some(Color::from_hex("#030405").unwrap()));
+        assert_eq!(colors.palette, Vec::new());
+    }
 }
 
 #[test]
@@ -815,7 +849,12 @@ fn documented_sample_config_loads() {
 
     let config = load_config_from_path(&path).unwrap();
 
-    assert_eq!(config.theme.as_deref(), Some("Catppuccin Mocha"));
+    for variant in [AppearanceVariant::Light, AppearanceVariant::Dark] {
+        assert_eq!(
+            config.theme_for_appearance(variant),
+            Some("Catppuccin Mocha")
+        );
+    }
 }
 
 #[test]
@@ -1053,7 +1092,6 @@ fn config_accepts_every_multiplexer_backend_token() {
         ("native", MultiplexerBackendConfig::Native),
         ("rmux", MultiplexerBackendConfig::Rmux),
         ("tmux", MultiplexerBackendConfig::Tmux),
-        ("zellij", MultiplexerBackendConfig::Zellij),
     ] {
         let config = load_config_source(&format!("[multiplexer]\nbackend = \"{token}\"\n"));
         assert_eq!(config.multiplexer.backend, backend, "backend token {token}");
@@ -1125,12 +1163,7 @@ fn multiplexer_remote_carries_the_connection_details_ssh_config_would_hold() {
 /// the remote host's sessions.
 #[test]
 fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
-    for (backend, accepted) in [
-        ("tmux", true),
-        ("zellij", true),
-        ("rmux", true),
-        ("native", false),
-    ] {
+    for (backend, accepted) in [("tmux", true), ("rmux", true), ("native", false)] {
         let loaded = ConfigSandbox::with_config(&format!(
             "[multiplexer]\nbackend = \"{backend}\"\n\n[multiplexer.remote]\nhost = \"devbox\"\n"
         ))
@@ -1333,6 +1366,44 @@ fn bootty_preset_move_tab_defaults_bind_both_option_sides() {
             "missing resolved keybind {entry}"
         );
     }
+}
+
+#[rstest]
+#[case("bootty")]
+#[case("tmux")]
+fn prefixed_presets_use_alt_shift_for_direct_pane_bindings(#[case] preset: &str) {
+    let config = load_config_source(&format!("[input]\npreset = \"{preset}\"\n"));
+
+    for entry in [
+        "alt+shift+h=select_pane:left",
+        "alt+shift+j=select_pane:down",
+        "alt+shift+k=select_pane:up",
+        "alt+shift+l=select_pane:right",
+        "alt+shift+o=next_pane",
+        "alt+shift+x=kill_pane",
+        "alt+shift+z=toggle_pane_zoom",
+    ] {
+        assert!(
+            config.input.keybind.iter().any(|keybind| keybind == entry),
+            "missing {preset} preset keybind {entry}"
+        );
+    }
+
+    assert!(
+        !config.input.keybind.iter().any(|entry| {
+            [
+                "alt+h=select_pane:left",
+                "alt+j=select_pane:down",
+                "alt+k=select_pane:up",
+                "alt+l=select_pane:right",
+                "alt+o=next_pane",
+                "alt+x=kill_pane",
+                "alt+z=toggle_pane_zoom",
+            ]
+            .contains(&entry.as_str())
+        }),
+        "{preset} preset still contains a bare-alt pane binding"
+    );
 }
 
 // A remapped prefix must rebuild every prefixed chord and follow the external-tmux passthrough;

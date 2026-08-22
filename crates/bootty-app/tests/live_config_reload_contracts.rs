@@ -24,7 +24,7 @@ fn a_failed_app_write_keeps_the_error_visible() {
     std::fs::create_dir(&path).expect("replace config with directory");
 
     state.set_sidebar_width_live(444.0);
-    state.persist_sidebar_width(444.0);
+    state.persist_sidebar_width(444.0, &mut Vec::new());
 
     assert_eq!(state.config().chrome.sidebar_width, 444.0);
     assert!(
@@ -33,6 +33,30 @@ fn a_failed_app_write_keeps_the_error_visible() {
             .is_some_and(|error| error.contains("config file"))
     );
     assert!(path.is_dir());
+}
+
+#[test]
+fn every_accepted_config_change_advances_the_revision() {
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "[chrome]\nsidebar-width = 320\n").expect("write initial config");
+    let config = load_config_from_path(&path).expect("load initial config");
+    let mut state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("start app state");
+
+    let initial = state.config_revision();
+    assert_eq!(state.config_revision(), initial, "reads never advance it");
+
+    state.set_sidebar_width_live(444.0);
+    let after_live = state.config_revision();
+    assert_ne!(after_live, initial, "a live edit is a config change");
+
+    state.persist_sidebar_width(444.0, &mut Vec::new());
+    assert_ne!(
+        state.config_revision(),
+        after_live,
+        "an accepted document is a config change"
+    );
 }
 
 #[test]

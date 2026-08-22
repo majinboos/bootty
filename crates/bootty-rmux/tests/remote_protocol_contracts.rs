@@ -32,7 +32,6 @@ fn remote_rmux_protocol_preserves_pane_stream_and_resize_values() {
         RemoteRmuxRequest::PaneStream {
             session: "project".to_owned(),
             pane: "%7".to_owned(),
-            max_scrollback: 320_000,
         },
         RemoteRmuxRequest::PaneInput {
             session: "project".to_owned(),

@@ -1,28 +1,31 @@
-use std::path::{Path, PathBuf};
-
 use bootty_config::{
     color::Color,
-    config::{
-        BoottyConfig, ConfigDocument, ConfigResult, load_config_document, load_config_from_path,
-        update_config_document,
-    },
+    config::{ConfigDocument, ConfigResult},
 };
 
+macro_rules! draft_setter {
+    ($method:ident($value:ident: $type:ty)) => {
+        pub(super) fn $method(&mut self, path: &[&str], $value: $type) {
+            self.mutate(|document| document.$method(path, $value));
+        }
+    };
+}
+
 pub(super) struct SettingsWriteback {
-    path: PathBuf,
+    document: ConfigDocument,
+    dirty: bool,
+    submit: bool,
     last_error: Option<String>,
 }
 
 impl SettingsWriteback {
-    pub(super) fn new(path: PathBuf) -> Self {
+    pub(super) fn new(document: ConfigDocument) -> Self {
         Self {
-            path,
+            document,
+            dirty: false,
+            submit: false,
             last_error: None,
         }
-    }
-
-    pub(super) fn path(&self) -> &Path {
-        &self.path
     }
 
     pub(super) fn last_error(&self) -> Option<&str> {
@@ -33,13 +36,24 @@ impl SettingsWriteback {
         self.last_error = Some(error.to_string());
     }
 
-    pub(super) fn reload(&mut self) -> Option<BoottyConfig> {
-        match load_config_from_path(&self.path) {
-            Ok(config) => Some(config),
-            Err(error) => {
-                self.set_error(error);
-                None
-            }
+    pub(super) fn take_submission(&mut self) -> Option<ConfigDocument> {
+        std::mem::take(&mut self.submit).then(|| self.document.clone())
+    }
+
+    pub(super) fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub(super) fn accept(&mut self, document: ConfigDocument, warning: Option<String>) {
+        self.document = document;
+        self.dirty = false;
+        self.submit = false;
+        self.last_error = warning;
+    }
+
+    pub(super) fn sync_accepted(&mut self, document: ConfigDocument) {
+        if !self.dirty {
+            self.document = document;
         }
     }
 
@@ -47,31 +61,20 @@ impl SettingsWriteback {
         &mut self,
         mutation: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>,
     ) {
-        self.last_error = match update_config_document(&self.path, mutation) {
-            Ok(outcome) => outcome.durability_warning().map(str::to_owned),
-            Err(error) => Some(error.to_string()),
-        };
+        match mutation(&mut self.document) {
+            Ok(()) => {
+                self.dirty = true;
+                self.submit = true;
+            }
+            Err(error) => self.set_error(error),
+        }
     }
 
-    pub(super) fn set_f32(&mut self, path: &[&str], value: f32) {
-        self.mutate(|document| document.set_f32(path, value));
-    }
-
-    pub(super) fn set_bool(&mut self, path: &[&str], value: bool) {
-        self.mutate(|document| document.set_bool(path, value));
-    }
-
-    pub(super) fn set_str(&mut self, path: &[&str], value: &str) {
-        self.mutate(|document| document.set_str(path, value));
-    }
-
-    pub(super) fn set_i64(&mut self, path: &[&str], value: i64) {
-        self.mutate(|document| document.set_i64(path, value));
-    }
-
-    pub(super) fn set_env(&mut self, path: &[&str], entries: &[(String, String)]) {
-        self.mutate(move |document| document.set_env(path, entries));
-    }
+    draft_setter!(set_f32(value: f32));
+    draft_setter!(set_bool(value: bool));
+    draft_setter!(set_str(value: &str));
+    draft_setter!(set_i64(value: i64));
+    draft_setter!(set_env(value: &[(String, String)]));
 
     pub(super) fn set_color(&mut self, path: &[&str], rgb: [u8; 3]) {
         self.set_color_value(
@@ -90,22 +93,14 @@ impl SettingsWriteback {
         self.mutate(move |document| document.set_str(path, &hex));
     }
 
-    pub(super) fn set_strings(&mut self, path: &[&str], values: &[String]) {
-        self.mutate(|document| document.set_strings(path, values));
-    }
+    draft_setter!(set_strings(value: &[String]));
 
     pub(super) fn contains(&self, path: &[&str]) -> bool {
-        let Ok(Some(document)) = load_config_document(&self.path) else {
-            return false;
-        };
-        document.contains(path)
+        self.document.contains(path)
     }
 
     pub(super) fn string_array(&self, path: &[&str]) -> Option<Vec<String>> {
-        let Ok(Some(document)) = load_config_document(&self.path) else {
-            return None;
-        };
-        document.string_array(path)
+        self.document.string_array(path)
     }
 
     pub(super) fn remove(&mut self, path: &[&str]) {

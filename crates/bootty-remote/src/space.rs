@@ -78,6 +78,5 @@ fn backend_name(backend: MuxBackendKind) -> &'static str {
         MuxBackendKind::Native => "native",
         MuxBackendKind::Rmux => "rmux",
         MuxBackendKind::Tmux => "tmux",
-        MuxBackendKind::Zellij => "zellij",
     }
 }

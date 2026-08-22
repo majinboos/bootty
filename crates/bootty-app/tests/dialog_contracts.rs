@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs};
+use std::collections::HashMap;
 
 use bootty_app::{
     AppState, ModalDialog,
@@ -8,8 +8,8 @@ use bootty_app::{
         keybind_help::KeybindHelpDialog,
         session_navigation::BindingSessionGroup,
         session_picker::{SessionPickerDialog, SessionPickerEvent},
-        space::{SpaceEditorDialog, SpaceEditorEvent},
-        theme_picker::{ThemePickerDialog, ThemePickerEvent, available_themes},
+        space::{SpaceEditorDialog, SpaceEditorIntent},
+        theme_picker::{ThemePickerDialog, ThemePickerEvent},
     },
 };
 use bootty_config::config::{AppearanceVariant, BoottyConfig};
@@ -41,30 +41,11 @@ fn context() -> Context {
 }
 
 #[test]
-fn theme_catalog_combines_builtin_and_user_themes() {
-    let root = tempfile::tempdir().unwrap();
-    let config_path = root.path().join("bootty.toml");
-    let themes = root.path().join("themes");
-    fs::create_dir(&themes).unwrap();
-    fs::write(themes.join("My Theme.toml"), "").unwrap();
-    fs::write(themes.join("ignored.txt"), "").unwrap();
-
-    let names = available_themes(&config_path);
-
-    assert!(names.iter().any(|name| name == "My Theme"));
-    assert!(!names.iter().any(|name| name == "ignored"));
-    assert!(
-        names.len() > 1,
-        "the builtin theme catalog must remain present"
-    );
-}
-
-#[test]
 fn theme_picker_closes_on_escape() {
     let root = tempfile::tempdir().unwrap();
     let mut dialog = ThemePickerDialog::open(&root.path().join("bootty.toml"), None, "Dark");
     let context = context();
-    let mut event = ThemePickerEvent::None;
+    let mut event = None;
 
     context
         .run_ui(
@@ -84,7 +65,7 @@ fn theme_picker_closes_on_escape() {
         )
         .drop_without_applying_deltas();
 
-    assert_eq!(event, ThemePickerEvent::Close);
+    assert_eq!(event, Some(ThemePickerEvent::Close));
 }
 
 #[test]
@@ -125,7 +106,7 @@ fn session_picker_activates_the_selected_session() {
     }];
     let mut dialog = SessionPickerDialog::open();
     let context = context();
-    let mut event = SessionPickerEvent::None;
+    let mut event = None;
 
     context
         .run_ui(
@@ -148,7 +129,9 @@ fn session_picker_activates_the_selected_session() {
 
     assert_eq!(
         event,
-        SessionPickerEvent::ActivateSession(groups[0].target(&groups[0].sessions[0]))
+        Some(SessionPickerEvent::ActivateSession(
+            groups[0].target(&groups[0].sessions[0])
+        ))
     );
 }
 
@@ -158,7 +141,7 @@ fn ditch_dialog_defaults_to_safe_session_close_outside_git() {
     let cwd = root.path().to_string_lossy().into_owned();
     let mut dialog = DitchSessionDialog::open("session-1".to_owned(), Some(cwd.clone()));
     let context = context();
-    let mut event = DitchSessionEvent::None;
+    let mut event = None;
 
     context
         .run_ui(
@@ -180,11 +163,11 @@ fn ditch_dialog_defaults_to_safe_session_close_outside_git() {
 
     assert_eq!(
         event,
-        DitchSessionEvent::Ditch {
+        Some(DitchSessionEvent::Ditch {
             session_id: "session-1".to_owned(),
             cwd: Some(cwd),
             action: DitchAction::KillOnly,
-        }
+        })
     );
 }
 
@@ -192,7 +175,7 @@ fn ditch_dialog_defaults_to_safe_session_close_outside_git() {
 fn space_editor_closes_on_escape() {
     let mut dialog = SpaceEditorDialog::new_space("folder".to_owned(), SpaceMuxOverride::default());
     let context = context();
-    let mut event = SpaceEditorEvent::None;
+    let mut intent = None;
 
     context
         .run_ui(
@@ -204,7 +187,7 @@ fn space_editor_closes_on_escape() {
                 modifiers: egui::Modifiers::NONE,
             }),
             |ui| {
-                event = dialog.show(
+                intent = dialog.show(
                     ui.ctx(),
                     theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
                 );
@@ -212,7 +195,7 @@ fn space_editor_closes_on_escape() {
         )
         .drop_without_applying_deltas();
 
-    assert_eq!(event, SpaceEditorEvent::Close);
+    assert_eq!(intent, Some(SpaceEditorIntent::Close));
 }
 
 #[test]
@@ -235,7 +218,7 @@ fn opening_a_modal_replaces_the_previous_modal() {
     assert!(state.open_create_space_dialog_from_ui());
 
     assert!(matches!(
-        state.take_modal_dialog(),
+        state.modal_dialog(),
         Some(ModalDialog::SpaceEditor(_))
     ));
 }

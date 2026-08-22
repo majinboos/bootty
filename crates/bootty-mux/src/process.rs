@@ -93,8 +93,9 @@ fn cancellable_command_output(
         if cancellation.0.load(Ordering::Acquire) {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = join_pipe(stdout);
-            let _ = join_pipe(stderr);
+            for reader in [stdout, stderr] {
+                let _ = join_pipe(reader);
+            }
             bail!("command canceled")
         }
         if let Some(status) = child
@@ -152,7 +153,8 @@ fn disowned_command_output(program: &str, args: &[String]) -> Result<CommandOutp
     let shell = resolve_program("sh")?;
     let id = DISOWNED_COMMAND_COUNTER.fetch_add(1, Ordering::Relaxed);
     let label = format!("dev.bootty.disowned.{}.{}", std::process::id(), id);
-    let script = launchd_submit_script();
+    let mut script = macos_shell_environment_prelude();
+    script.push_str(LAUNCHD_SUBMIT_SCRIPT);
 
     let output = command_output(
         "launchctl",
@@ -171,13 +173,6 @@ fn disowned_command_output(program: &str, args: &[String]) -> Result<CommandOutp
         .with_context(|| format!("wait for disowned {program}"));
     let _ = Command::new(&launchctl).args(["remove", &label]).output();
     status.map(command_status_output)
-}
-
-#[cfg(target_os = "macos")]
-fn launchd_submit_script() -> String {
-    let mut script = macos_shell_environment_prelude();
-    script.push_str(LAUNCHD_SUBMIT_SCRIPT);
-    script
 }
 
 #[cfg(target_os = "macos")]
@@ -255,10 +250,11 @@ fn parse_launchd_exit_status(text: &str) -> Result<i32> {
 
 #[cfg(target_os = "macos")]
 fn command_status_output(status: i32) -> CommandOutput {
+    let success = status == 0;
     CommandOutput {
-        success: status == 0,
+        success,
         stdout: String::new(),
-        stderr: if status == 0 {
+        stderr: if success {
             String::new()
         } else {
             format!("process exited with status {status}")
@@ -276,15 +272,12 @@ fn resolve_program_with_path(program: &str, path: Option<&OsStr>) -> Result<Stri
     if Path::new(program).is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
         return Ok(program.to_owned());
     }
-    if let Some(found) = path
-        .into_iter()
+    path.into_iter()
         .flat_map(env::split_paths)
         .map(|dir| dir.join(program))
         .find(|candidate| candidate.is_file())
-    {
-        return Ok(found.to_string_lossy().into_owned());
-    }
-    bail!("program {program:?} not found in PATH")
+        .map(|found| found.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("program {program:?} not found in PATH"))
 }
 
 #[cfg(not(target_os = "macos"))]

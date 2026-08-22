@@ -1,6 +1,6 @@
 use bootty_extension::display_path;
 use bootty_mux::project::{self, WorktreeStatus};
-use bootty_ui::overlay::{ActionItem, ActionMenu, ActionRisk, FloatingWindow, StatusLine};
+use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 use bootty_ui::{Theme, ThemePalette, overlay};
 use eframe::egui;
 
@@ -37,7 +37,6 @@ pub struct DitchSessionDialog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DitchSessionEvent {
-    None,
     Close,
     Ditch {
         session_id: String,
@@ -62,16 +61,18 @@ impl DitchSessionDialog {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> DitchSessionEvent {
-        let lines = status_lines(&self.status, self.cwd.as_deref(), theme.palette);
-        let items = action_items(&self.actions);
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> Option<DitchSessionEvent> {
+        let rows = action_rows(&self.actions, theme.palette);
 
         let result = FloatingWindow::new("ditch-session-dialog", "Ditch Session")
             .icon("trash-2")
             .hint("Enter confirm   Esc cancel")
             .width(overlay::panel_width(ctx, 600.0, 420.0))
             .show(ctx, theme, |ui, palette| {
-                let outcome = ActionMenu::new(&lines, &items, self.selected).show(ui, palette);
+                show_status(ui, &self.status, self.cwd.as_deref(), palette);
+                let outcome = ListView::new("ditch-session-actions", &rows, self.selected)
+                    .row_height(46.0)
+                    .show(ui, palette);
                 self.selected = outcome.selected;
                 outcome.activated
             });
@@ -79,16 +80,16 @@ impl DitchSessionDialog {
         if let Some(index) = result.inner
             && let Some(action) = self.actions.get(index).cloned()
         {
-            return DitchSessionEvent::Ditch {
+            return Some(DitchSessionEvent::Ditch {
                 session_id: self.session_id.clone(),
                 cwd: self.cwd.clone(),
                 action,
-            };
+            });
         }
         if result.escaped || result.clicked_outside {
-            return DitchSessionEvent::Close;
+            return Some(DitchSessionEvent::Close);
         }
-        DitchSessionEvent::None
+        None
     }
 }
 
@@ -130,122 +131,117 @@ fn actions_for(
     actions
 }
 
-fn action_items(actions: &[DitchAction]) -> Vec<ActionItem> {
+fn action_rows(actions: &[DitchAction], palette: ThemePalette) -> Vec<ListRow> {
     actions
         .iter()
-        .map(|action| match action {
-            DitchAction::DetachWorktree => ActionItem {
-                icon: Some("unlink".to_owned()),
-                label: "Detach worktree".to_owned(),
-                description: Some(
+        .map(|action| {
+            let (icon, primary, secondary, tint) = match action {
+                DitchAction::DetachWorktree => (
+                    "unlink",
+                    "Detach worktree",
                     "Detach HEAD to free the branch; keep the worktree, branch, and commits"
                         .to_owned(),
+                    palette.success,
                 ),
-                risk: ActionRisk::Safe,
-            },
-            DitchAction::KillOnly => ActionItem {
-                icon: Some("x".to_owned()),
-                label: "Kill session".to_owned(),
-                description: Some("Close the session; keep the worktree and branch".to_owned()),
-                risk: ActionRisk::Safe,
-            },
-            DitchAction::RemoveWorktree { force } => ActionItem {
-                icon: Some("trash-2".to_owned()),
-                label: "Kill + remove worktree".to_owned(),
-                description: Some(if *force {
-                    "Discard uncommitted changes and remove the linked worktree".to_owned()
-                } else {
-                    "Remove the linked worktree".to_owned()
-                }),
-                risk: if *force {
-                    ActionRisk::Danger
-                } else {
-                    ActionRisk::Caution
-                },
-            },
-            DitchAction::RemoveWorktreeAndBranch { branch, .. } => ActionItem {
-                icon: Some("trash-2".to_owned()),
-                label: "Kill + remove worktree + delete branch".to_owned(),
-                // This force-removes the worktree, so warn about both losses:
-                // working-tree edits and any unmerged commits on the branch.
-                description: Some(format!(
-                    "Remove the worktree and delete branch '{branch}' (uncommitted changes and unmerged commits are lost)"
-                )),
-                risk: ActionRisk::Danger,
-            },
+                DitchAction::KillOnly => (
+                    "x",
+                    "Kill session",
+                    "Close the session; keep the worktree and branch".to_owned(),
+                    palette.success,
+                ),
+                DitchAction::RemoveWorktree { force } => (
+                    "trash-2",
+                    "Kill + remove worktree",
+                    if *force {
+                        "Discard uncommitted changes and remove the linked worktree".to_owned()
+                    } else {
+                        "Remove the linked worktree".to_owned()
+                    },
+                    if *force {
+                        palette.destructive
+                    } else {
+                        palette.warning
+                    },
+                ),
+                DitchAction::RemoveWorktreeAndBranch { branch, .. } => (
+                    "trash-2",
+                    "Kill + remove worktree + delete branch",
+                    // This force-removes the worktree, so warn about both losses:
+                    // working-tree edits and any unmerged commits on the branch.
+                    format!(
+                        "Remove the worktree and delete branch '{branch}' (uncommitted changes and unmerged commits are lost)"
+                    ),
+                    palette.destructive,
+                ),
+            };
+            ListRow {
+                icon: Some(icon.to_owned()),
+                icon_tint: Some(tint),
+                primary: primary.to_owned(),
+                primary_tint: Some(tint),
+                secondary: Some(secondary),
+                secondary_tint: Some(palette.muted),
+                selection_tint: Some(tint),
+                ..ListRow::default()
+            }
         })
         .collect()
 }
 
-fn status_lines(
+fn show_status(
+    ui: &mut egui::Ui,
     status: &WorktreeStatus,
     cwd: Option<&str>,
     palette: ThemePalette,
-) -> Vec<StatusLine> {
-    let mut lines = vec![StatusLine {
-        label: "path".to_owned(),
-        value: cwd.map_or_else(
-            || "(unknown)".to_owned(),
-            |cwd| display_path(cwd, home_dir().as_deref()),
-        ),
-        tint: None,
-    }];
+) {
+    let line = |ui: &mut egui::Ui, label: &str, value: &str, tint: Option<egui::Color32>| {
+        ui.horizontal(|ui| {
+            ui.monospace(
+                egui::RichText::new(format!("{label}:"))
+                    .size(12.0)
+                    .color(palette.muted),
+            );
+            ui.monospace(
+                egui::RichText::new(value)
+                    .size(12.0)
+                    .color(tint.unwrap_or(palette.text)),
+            );
+        });
+    };
+    let path = cwd.map_or_else(
+        || "(unknown)".to_owned(),
+        |cwd| display_path(cwd, home_dir().as_deref()),
+    );
+    line(ui, "path", &path, None);
     if !status.in_repo {
-        lines.push(StatusLine {
-            label: "git".to_owned(),
-            value: "not a git repository".to_owned(),
-            tint: Some(palette.muted),
-        });
-        return lines;
-    }
-    lines.push(StatusLine {
-        label: "branch".to_owned(),
-        value: status
-            .branch
-            .clone()
-            .unwrap_or_else(|| "detached".to_owned()),
-        tint: None,
-    });
-    lines.push(StatusLine {
-        label: "worktree".to_owned(),
-        value: if status.is_linked_worktree {
-            "linked".to_owned()
+        line(ui, "git", "not a git repository", Some(palette.muted));
+    } else {
+        line(
+            ui,
+            "branch",
+            status.branch.as_deref().unwrap_or("detached"),
+            None,
+        );
+        let (worktree, worktree_tint) = if status.is_linked_worktree {
+            ("linked", palette.accent)
         } else {
-            "main".to_owned()
-        },
-        tint: Some(if status.is_linked_worktree {
-            palette.accent
+            ("main", palette.muted)
+        };
+        line(ui, "worktree", worktree, Some(worktree_tint));
+        let (changes, change_tint) = if status.dirty {
+            ("uncommitted changes", palette.warning)
         } else {
-            palette.muted
-        }),
-    });
-    lines.push(StatusLine {
-        label: "changes".to_owned(),
-        value: if status.dirty {
-            "uncommitted changes".to_owned()
-        } else {
-            "clean".to_owned()
-        },
-        tint: Some(if status.dirty {
-            palette.warning
-        } else {
-            palette.success
-        }),
-    });
-    if status.has_upstream {
-        lines.push(StatusLine {
-            label: "unpushed".to_owned(),
-            value: if status.unpushed > 0 {
-                format!("{} commit(s)", status.unpushed)
+            ("clean", palette.success)
+        };
+        line(ui, "changes", changes, Some(change_tint));
+        if status.has_upstream {
+            let (unpushed, tint) = if status.unpushed > 0 {
+                (format!("{} commit(s)", status.unpushed), palette.warning)
             } else {
-                "up to date".to_owned()
-            },
-            tint: Some(if status.unpushed > 0 {
-                palette.warning
-            } else {
-                palette.success
-            }),
-        });
+                ("up to date".to_owned(), palette.success)
+            };
+            line(ui, "unpushed", &unpushed, Some(tint));
+        }
     }
-    lines
+    ui.add_space(8.0);
 }

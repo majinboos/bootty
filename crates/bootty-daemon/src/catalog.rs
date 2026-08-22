@@ -29,7 +29,6 @@ pub const CATALOG_VERSION: u32 = 3;
 pub enum Backend {
     Rmux,
     Tmux,
-    Zellij,
 }
 
 impl Backend {
@@ -37,24 +36,22 @@ impl Backend {
         match value {
             "rmux" => Ok(Self::Rmux),
             "tmux" => Ok(Self::Tmux),
-            "zellij" => Ok(Self::Zellij),
-            _ => bail!("remote Spaces need tmux, zellij, or rmux"),
+            _ => bail!("remote Spaces need tmux or rmux"),
         }
     }
 
     fn name(self) -> &'static str {
-        match self {
-            Self::Rmux => "rmux",
-            Self::Tmux => "tmux",
-            Self::Zellij => "zellij",
-        }
+        self.identity().0
     }
 
     fn wire_kind(self) -> MuxBackendKind {
+        self.identity().1
+    }
+
+    fn identity(self) -> (&'static str, MuxBackendKind) {
         match self {
-            Self::Rmux => MuxBackendKind::Rmux,
-            Self::Tmux => MuxBackendKind::Tmux,
-            Self::Zellij => MuxBackendKind::Zellij,
+            Self::Rmux => ("rmux", MuxBackendKind::Rmux),
+            Self::Tmux => ("tmux", MuxBackendKind::Tmux),
         }
     }
 }
@@ -294,8 +291,7 @@ impl Catalog {
     }
 
     pub fn snapshot(&mut self, space_id: &str, expected: Backend) -> Result<MuxSnapshot> {
-        let backend_kind = self.space_backend(space_id, expected)?;
-        let mut backend = self.backend(backend_kind);
+        let mut backend = self.backend(expected);
         self.snapshot_with_backend(space_id, expected, backend.as_mut())
     }
 
@@ -324,8 +320,7 @@ impl Catalog {
         expected: Backend,
         command: MuxCommand,
     ) -> Result<()> {
-        let backend_kind = self.space_backend(space_id, expected)?;
-        let mut backend = self.backend(backend_kind);
+        let mut backend = self.backend(expected);
         self.execute_with_backend(space_id, expected, command, backend.as_mut())
     }
 
@@ -340,7 +335,9 @@ impl Catalog {
         let _lease = self.backend_lease(backend_kind)?;
         let snapshot = backend.snapshot()?;
         let owned = self.reconcile_and_sync_sessions(space_id, &snapshot)?;
-        if let Some(session_id) = created_session_id(&command)
+        let owned_name = resolve_owned_session_name(&snapshot, &owned, &command, space_id)?;
+        let operation = membership_operation(&command, owned_name.as_deref())?;
+        if let Some(MembershipOperation::Create { session_id, .. }) = &operation
             && !owned.contains(session_id)
             && snapshot
                 .sessions
@@ -349,8 +346,6 @@ impl Catalog {
         {
             bail!("session already belongs to another remote Space")
         }
-        let owned_name = resolve_owned_session_name(&snapshot, &owned, &command, space_id)?;
-        let operation = membership_operation(&command, owned_name.as_deref())?;
         if let Some(operation) = operation.as_ref() {
             operation
                 .validate()
@@ -725,12 +720,4 @@ fn operation_from_storage(
         .validate()
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(operation)
-}
-
-fn created_session_id(command: &MuxCommand) -> Option<&str> {
-    match command {
-        MuxCommand::CreateProjectSession { session_id, .. }
-        | MuxCommand::CreateWorktreeSession { session_id, .. } => Some(session_id),
-        _ => None,
-    }
 }

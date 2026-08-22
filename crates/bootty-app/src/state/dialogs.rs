@@ -1,5 +1,5 @@
 use bootty_command::Caller;
-use bootty_config::config::AppearanceVariant;
+use bootty_config::config::{AppearanceVariant, SshProfileConfig};
 use bootty_mux::controller::SpaceId;
 use bootty_workspace::SpaceMuxOverride;
 
@@ -10,66 +10,89 @@ use crate::input::focus::InputFocus;
 use crate::ui::ModalDialog;
 use crate::ui::command_palette::{CommandPaletteDialog, CommandPaletteEvent};
 use crate::ui::ditch::{DitchSessionDialog, DitchSessionEvent};
-use crate::ui::keybind_help::{KeybindHelpDialog, KeybindHelpEvent};
+use crate::ui::keybind_help::KeybindHelpDialog;
 use crate::ui::new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent};
 use crate::ui::rename::{RenameSessionDialog, RenameSessionEvent, RenameTabDialog, RenameTabEvent};
 use crate::ui::session_picker::{SessionPickerDialog, SessionPickerEvent};
-use crate::ui::space::{SpaceEditorDialog, SpaceEditorEvent, default_space_icon};
+use crate::ui::space::{SpaceEditorDialog, SpaceEditorIntent, default_space_icon};
 use crate::ui::theme_picker::{ThemePickerDialog, ThemePickerEvent};
 use crate::workspace_runtime::RenameSessionOutcome;
 impl AppState {
-    pub fn take_modal_dialog(&mut self) -> Option<ModalDialog> {
-        self.dialogs.take()
+    fn show_overlay(&mut self, dialog: ModalDialog) {
+        self.dialogs.open(dialog);
+        self.input_focus = InputFocus::Picker;
     }
-    pub fn apply_space_editor_event(&mut self, dialog: SpaceEditorDialog, event: SpaceEditorEvent) {
-        match event {
-            SpaceEditorEvent::None => self.dialogs.open(ModalDialog::SpaceEditor(dialog)),
-            SpaceEditorEvent::Close => self.input_focus = InputFocus::Terminal,
-            SpaceEditorEvent::Save {
-                space_id,
-                name,
-                icon,
-                color,
-                tint_sidebar,
-                mux,
-            } => {
-                let saved = match space_id {
+
+    fn open_overlay(&mut self, dialog: ModalDialog) {
+        self.close_overlay_dialogs();
+        self.show_overlay(dialog);
+    }
+
+    fn ssh_profiles(&self) -> Vec<(String, SshProfileConfig)> {
+        self.config()
+            .ssh_profiles
+            .iter()
+            .map(|(id, profile)| (id.clone(), profile.clone()))
+            .collect()
+    }
+
+    fn selected_session_id(&self) -> Option<String> {
+        self.workspace
+            .active
+            .binding
+            .mux
+            .selected_session()
+            .map(str::to_owned)
+    }
+
+    pub fn modal_dialog(&self) -> Option<&ModalDialog> {
+        self.dialogs.current()
+    }
+
+    pub fn modal_dialog_mut(&mut self) -> Option<&mut ModalDialog> {
+        self.dialogs.current_mut()
+    }
+
+    fn dismiss_modal_dialog(&mut self) {
+        self.dialogs.clear();
+        self.input_focus = InputFocus::Terminal;
+    }
+    pub fn apply_space_editor_intent(&mut self, intent: SpaceEditorIntent) {
+        match intent {
+            SpaceEditorIntent::Close => self.dismiss_modal_dialog(),
+            SpaceEditorIntent::Save(draft) => {
+                let mux = SpaceMuxOverride {
+                    backend: draft.backend,
+                    remote: draft.remote_source,
+                };
+                let saved = match draft.space_id {
                     Some(space_id) => self.update_space_from_ui(
                         space_id,
-                        &name,
-                        &icon,
-                        color,
-                        tint_sidebar,
-                        mux.clone(),
+                        &draft.name,
+                        &draft.icon,
+                        draft.color,
+                        draft.tint_sidebar,
+                        mux,
                     ),
                     None => self.create_space_with_backend_from_ui(
-                        &name,
-                        &icon,
-                        color,
-                        tint_sidebar,
+                        &draft.name,
+                        &draft.icon,
+                        draft.color,
+                        draft.tint_sidebar,
                         mux,
                     ),
                 };
-                if !saved {
-                    self.dialogs.open(ModalDialog::SpaceEditor(dialog));
+                if saved {
+                    self.dismiss_modal_dialog();
                 }
             }
         }
     }
-    pub fn apply_session_picker_event(
-        &mut self,
-        dialog: SessionPickerDialog,
-        event: SessionPickerEvent,
-    ) {
+    pub fn apply_session_picker_event(&mut self, event: SessionPickerEvent) {
         match event {
-            SessionPickerEvent::None => {
-                self.dialogs.open(ModalDialog::SessionPicker(dialog));
-            }
-            SessionPickerEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
+            SessionPickerEvent::Close => self.dismiss_modal_dialog(),
             SessionPickerEvent::ActivateSession(target) => {
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
                 if let Err(error) = self
                     .workspace
                     .add_session_to_binding(target.scope, &target.session_id)
@@ -81,23 +104,13 @@ impl AppState {
             }
         }
     }
-    pub fn apply_rename_session_event(
-        &mut self,
-        dialog: RenameSessionDialog,
-        event: RenameSessionEvent,
-    ) {
+    pub fn apply_rename_session_event(&mut self, event: RenameSessionEvent) {
         match event {
-            RenameSessionEvent::None => {
-                self.dialogs.open(ModalDialog::RenameSession(dialog));
-            }
-            RenameSessionEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
+            RenameSessionEvent::Close => self.dismiss_modal_dialog(),
             RenameSessionEvent::Rename { session_id, name } => {
                 let name = name.trim().to_owned();
                 if name.is_empty() {
                     self.last_error = Some("session name cannot be empty".to_owned());
-                    self.dialogs.open(ModalDialog::RenameSession(dialog));
                     return;
                 }
                 match self
@@ -105,28 +118,19 @@ impl AppState {
                     .rename_active_session(&session_id, &name, &self.repaint)
                 {
                     Ok(RenameSessionOutcome::Missing | RenameSessionOutcome::Started) => {}
-                    Ok(RenameSessionOutcome::Pending) => {
-                        self.dialogs.open(ModalDialog::RenameSession(dialog));
-                        return;
-                    }
+                    Ok(RenameSessionOutcome::Pending) => return,
                     Err(error) => {
                         self.last_error = Some(error.to_string());
-                        self.dialogs.open(ModalDialog::RenameSession(dialog));
                         return;
                     }
                 }
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
             }
         }
     }
-    pub fn apply_rename_tab_event(&mut self, dialog: RenameTabDialog, event: RenameTabEvent) {
+    pub fn apply_rename_tab_event(&mut self, event: RenameTabEvent) {
         match event {
-            RenameTabEvent::None => {
-                self.dialogs.open(ModalDialog::RenameTab(dialog));
-            }
-            RenameTabEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
+            RenameTabEvent::Close => self.dismiss_modal_dialog(),
             RenameTabEvent::Rename {
                 session_id,
                 window_id,
@@ -139,22 +143,13 @@ impl AppState {
                     name,
                     &self.repaint,
                 );
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
             }
         }
     }
-    pub fn apply_ditch_session_event(
-        &mut self,
-        dialog: DitchSessionDialog,
-        event: DitchSessionEvent,
-    ) {
+    pub fn apply_ditch_session_event(&mut self, event: DitchSessionEvent) {
         match event {
-            DitchSessionEvent::None => {
-                self.dialogs.open(ModalDialog::DitchSession(dialog));
-            }
-            DitchSessionEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
+            DitchSessionEvent::Close => self.dismiss_modal_dialog(),
             DitchSessionEvent::Ditch {
                 session_id,
                 cwd,
@@ -162,10 +157,7 @@ impl AppState {
             } => {
                 let prepared = match self.prepare_ditch_session_command(session_id) {
                     Ok(prepared) => prepared,
-                    Err(_) => {
-                        self.dialogs.open(ModalDialog::DitchSession(dialog));
-                        return;
-                    }
+                    Err(_) => return,
                 };
                 match run_ditch_cleanup(cwd.as_deref(), &action) {
                     DitchCleanupOutcome::NoAction(error) => {
@@ -173,7 +165,6 @@ impl AppState {
                         self.last_error = Some(format!("ditch: {error}"));
                         self.workspace
                             .defer_binding_membership_reconciliation(prepared.0);
-                        self.dialogs.open(ModalDialog::DitchSession(dialog));
                         return;
                     }
                     DitchCleanupOutcome::Partial { branch, error } => {
@@ -184,46 +175,25 @@ impl AppState {
                     DitchCleanupOutcome::Complete => {}
                 }
                 self.submit_prepared_ditch_session_command(prepared);
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
             }
         }
     }
-    pub fn apply_keybind_help_event(&mut self, dialog: KeybindHelpDialog, event: KeybindHelpEvent) {
-        match event {
-            KeybindHelpEvent::None => {
-                self.dialogs.open(ModalDialog::KeybindHelp(dialog));
-            }
-            KeybindHelpEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
-        }
+    pub fn dismiss_keybind_help(&mut self) {
+        self.dismiss_modal_dialog();
     }
-    pub fn apply_command_palette_event(
-        &mut self,
-        dialog: CommandPaletteDialog,
-        event: CommandPaletteEvent,
-    ) {
+    pub fn apply_command_palette_event(&mut self, event: CommandPaletteEvent) {
         match event {
-            CommandPaletteEvent::None => {
-                self.dialogs.open(ModalDialog::CommandPalette(dialog));
-            }
-            CommandPaletteEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
+            CommandPaletteEvent::Close => self.dismiss_modal_dialog(),
             CommandPaletteEvent::Run(command) => {
                 // Resolve the user's current context before another queued caller can change it.
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
                 let Some(mut invocation) =
                     command_invocation_from_catalog(command, Caller::CommandPalette)
                 else {
                     return;
                 };
-                if let Some(kind) = self
-                    .commands
-                    .catalog()
-                    .describe(&invocation.command)
-                    .and_then(|descriptor| descriptor.target)
-                {
+                if let Some(kind) = self.commands.target_kind(&invocation.command) {
                     let Some(target) = self.current_command_target_for(&invocation.command, kind)
                     else {
                         self.commands.clear_queue();
@@ -238,16 +208,12 @@ impl AppState {
     }
     pub fn apply_theme_picker_event(
         &mut self,
-        dialog: ThemePickerDialog,
         event: ThemePickerEvent,
         effects: &mut Vec<AppEffect>,
     ) {
         match event {
-            ThemePickerEvent::None => {
-                self.dialogs.open(ModalDialog::ThemePicker(dialog));
-            }
             ThemePickerEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
                 if self.restore_theme_picker_preview() {
                     effects.push(AppEffect::RequestRepaint);
                 }
@@ -257,50 +223,37 @@ impl AppState {
                 if self.restore_theme_picker_preview() {
                     effects.push(AppEffect::RequestRepaint);
                 }
-                self.dialogs.open(ModalDialog::ThemePicker(dialog));
             }
             ThemePickerEvent::Preview(theme) => {
                 self.preview_active_theme(&theme, effects);
-                self.dialogs.open(ModalDialog::ThemePicker(dialog));
             }
             ThemePickerEvent::Select(theme) => {
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
                 self.theme_picker_restore_config = None;
                 self.persist_active_theme(&theme, effects);
             }
         }
     }
-    pub fn apply_picker_event(
-        &mut self,
-        dialog: NewMuxSessionDialog,
-        event: NewSessionPickerEvent,
-    ) {
+    pub fn apply_picker_event(&mut self, event: NewSessionPickerEvent) {
         match event {
-            NewSessionPickerEvent::None => {
-                self.dialogs.open(ModalDialog::NewSession(dialog));
-            }
-            NewSessionPickerEvent::Close => {
-                self.input_focus = InputFocus::Terminal;
-            }
+            NewSessionPickerEvent::Close => self.dismiss_modal_dialog(),
             NewSessionPickerEvent::Error(error) => {
                 self.last_error = Some(error);
-                self.dialogs.open(ModalDialog::NewSession(dialog));
             }
             NewSessionPickerEvent::CreateWorktree { repo, branch } => {
                 match bootty_mux::project::add_worktree(&repo, &branch) {
                     Ok(path) => {
                         self.create_project_session_for_cwd(path);
-                        self.input_focus = InputFocus::Terminal;
+                        self.dismiss_modal_dialog();
                     }
                     Err(error) => {
                         self.last_error = Some(format!("worktree: {error}"));
-                        self.dialogs.open(ModalDialog::NewSession(dialog));
                     }
                 }
             }
             NewSessionPickerEvent::CreateSession { cwd } => {
                 self.create_project_session_for_cwd(cwd);
-                self.input_focus = InputFocus::Terminal;
+                self.dismiss_modal_dialog();
             }
         }
     }
@@ -311,22 +264,18 @@ impl AppState {
         let outcome = self
             .terminal_interaction
             .close_overlay_dialogs(&mut self.workspace.active.binding.terminal);
-        if let Some(error) = outcome.last_error {
-            self.last_error = Some(error);
-        }
-        self.apply_terminal_focus_intent(outcome.focus_intent);
+        self.apply_terminal_outcome(outcome.last_error, outcome.focus_intent);
         restored_preview
     }
     pub(super) fn open_new_mux_session_dialog(&mut self) {
         self.close_overlay_dialogs();
-        self.dialogs.open(ModalDialog::NewSession(
+        self.show_overlay(ModalDialog::NewSession(
             self.active_multiplexer()
                 .remote
                 .clone()
                 .map(|remote| NewMuxSessionDialog::open_remote(remote, self.repaint.clone()))
                 .unwrap_or_else(NewMuxSessionDialog::open),
         ));
-        self.input_focus = InputFocus::Picker;
     }
     pub fn open_create_space_dialog_from_ui(&mut self) -> bool {
         self.close_overlay_dialogs();
@@ -335,20 +284,14 @@ impl AppState {
             .into_iter()
             .map(|space| space.icon)
             .collect::<Vec<_>>();
-        let profiles = self
-            .config()
-            .ssh_profiles
-            .iter()
-            .map(|(id, profile)| (id.clone(), profile.clone()))
-            .collect::<Vec<_>>();
-        self.dialogs.open(ModalDialog::SpaceEditor(
+        let profiles = self.ssh_profiles();
+        self.show_overlay(ModalDialog::SpaceEditor(
             SpaceEditorDialog::new_space(
                 default_space_icon(&existing_icons),
                 SpaceMuxOverride::default(),
             )
             .with_profiles(profiles.into_iter()),
         ));
-        self.input_focus = InputFocus::Picker;
         true
     }
     pub fn open_edit_space_dialog_from_ui(&mut self, space_id: SpaceId) -> bool {
@@ -362,13 +305,8 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
-        let profiles = self
-            .config()
-            .ssh_profiles
-            .iter()
-            .map(|(id, profile)| (id.clone(), profile.clone()))
-            .collect::<Vec<_>>();
-        self.dialogs.open(ModalDialog::SpaceEditor(
+        let profiles = self.ssh_profiles();
+        self.show_overlay(ModalDialog::SpaceEditor(
             SpaceEditorDialog::edit_space(
                 space.id,
                 space.name,
@@ -379,7 +317,6 @@ impl AppState {
             )
             .with_profiles(profiles.into_iter()),
         ));
-        self.input_focus = InputFocus::Picker;
         true
     }
     pub fn open_new_session_dialog_from_ui(&mut self) -> bool {
@@ -387,10 +324,7 @@ impl AppState {
         true
     }
     pub(super) fn open_session_picker_dialog(&mut self) {
-        self.close_overlay_dialogs();
-        self.dialogs
-            .open(ModalDialog::SessionPicker(SessionPickerDialog::open()));
-        self.input_focus = InputFocus::Picker;
+        self.open_overlay(ModalDialog::SessionPicker(SessionPickerDialog::open()));
     }
     pub fn open_session_picker_dialog_from_ui(&mut self) -> bool {
         self.open_session_picker_dialog();
@@ -405,14 +339,7 @@ impl AppState {
         }
     }
     pub(super) fn open_rename_session_dialog(&mut self) {
-        let Some(selected) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned)
-        else {
+        let Some(selected) = self.selected_session_id() else {
             return;
         };
         self.open_rename_session_dialog_for(&selected);
@@ -440,12 +367,9 @@ impl AppState {
         else {
             return false;
         };
-        self.close_overlay_dialogs();
-        self.dialogs
-            .open(ModalDialog::RenameSession(RenameSessionDialog::open(
-                session_id, name,
-            )));
-        self.input_focus = InputFocus::Picker;
+        self.open_overlay(ModalDialog::RenameSession(RenameSessionDialog::open(
+            session_id, name,
+        )));
         true
     }
     pub(super) fn open_rename_tab_dialog(&mut self) {
@@ -471,12 +395,9 @@ impl AppState {
         else {
             return false;
         };
-        self.close_overlay_dialogs();
-        self.dialogs
-            .open(ModalDialog::RenameTab(RenameTabDialog::open(
-                session_id, window_id, name,
-            )));
-        self.input_focus = InputFocus::Picker;
+        self.open_overlay(ModalDialog::RenameTab(RenameTabDialog::open(
+            session_id, window_id, name,
+        )));
         true
     }
     fn selected_window_for_rename(&self) -> Option<(String, String, String)> {
@@ -500,14 +421,7 @@ impl AppState {
         Some((session.id.clone(), window.id.clone(), window.name.clone()))
     }
     pub(super) fn open_ditch_session_dialog(&mut self) {
-        let Some(selected) = self
-            .workspace
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned)
-        else {
+        let Some(selected) = self.selected_session_id() else {
             return;
         };
         self.open_ditch_session_dialog_for(&selected);
@@ -523,12 +437,9 @@ impl AppState {
         else {
             return false;
         };
-        self.close_overlay_dialogs();
-        self.dialogs
-            .open(ModalDialog::DitchSession(DitchSessionDialog::open(
-                session_id, cwd,
-            )));
-        self.input_focus = InputFocus::Picker;
+        self.open_overlay(ModalDialog::DitchSession(DitchSessionDialog::open(
+            session_id, cwd,
+        )));
         true
     }
     pub(super) fn open_keybind_help_dialog(&mut self) {
@@ -536,22 +447,16 @@ impl AppState {
             .config()
             .input
             .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
-        self.close_overlay_dialogs();
-        self.dialogs
-            .open(ModalDialog::KeybindHelp(KeybindHelpDialog::open(&bindings)));
-        self.input_focus = InputFocus::Picker;
+        self.open_overlay(ModalDialog::KeybindHelp(KeybindHelpDialog::open(&bindings)));
     }
     pub(super) fn open_command_palette_dialog(&mut self) {
         let bindings = self
             .config()
             .input
             .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
-        self.close_overlay_dialogs();
-        self.dialogs
-            .open(ModalDialog::CommandPalette(CommandPaletteDialog::open(
-                &bindings,
-            )));
-        self.input_focus = InputFocus::Picker;
+        self.open_overlay(ModalDialog::CommandPalette(CommandPaletteDialog::open(
+            &bindings,
+        )));
     }
     pub(super) fn open_theme_picker_dialog(&mut self) {
         let config = self.config();
@@ -566,12 +471,10 @@ impl AppState {
         let restore_config = config.clone();
         self.close_overlay_dialogs();
         self.theme_picker_restore_config = Some(restore_config);
-        self.dialogs
-            .open(ModalDialog::ThemePicker(ThemePickerDialog::open(
-                &config_path,
-                current.as_deref(),
-                branch,
-            )));
-        self.input_focus = InputFocus::Picker;
+        self.show_overlay(ModalDialog::ThemePicker(ThemePickerDialog::open(
+            &config_path,
+            current.as_deref(),
+            branch,
+        )));
     }
 }

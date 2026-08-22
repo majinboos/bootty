@@ -1,109 +1,53 @@
-use bootty_command::{CommandOutcome, CommandTarget, ResourceKind};
 use bootty_mux::command::MuxCommand;
 
 use super::{AppEffect, AppState, ViewportSnapshot};
 use crate::{
     app_actions::{KeybindAction, MuxKeyAction},
+    commands::ExactMuxTarget,
     workspace_runtime::mux_split_direction,
 };
 
-fn malformed_target(message: impl Into<String>) -> CommandOutcome {
-    CommandOutcome::Denied {
-        message: message.into(),
-    }
-}
-
-fn target_path(target: &CommandTarget) -> Result<Vec<String>, CommandOutcome> {
-    serde_json::from_str(&target.handle)
-        .map_err(|_| malformed_target("mux command target is malformed"))
+#[derive(Clone, Copy)]
+pub(crate) enum ExactMuxAction {
+    Activate,
+    RelativeWindow(isize),
+    LastWindow,
+    NewTab,
+    MoveWindow(i32),
+    CloseWindowPane,
 }
 
 impl AppState {
-    /// Build the one backend command for a mux action. `None` means that Bootty owns the action.
-    pub(crate) fn mux_command_for_action(
+    pub(crate) fn plan_mux_key_action(
         &mut self,
         action: MuxKeyAction,
-        target: Option<&CommandTarget>,
-    ) -> Result<Option<MuxCommand>, CommandOutcome> {
-        if matches!(
-            action,
-            MuxKeyAction::NextSession
-                | MuxKeyAction::PreviousSession
-                | MuxKeyAction::LastSession
-                | MuxKeyAction::SelectSession(_)
-                | MuxKeyAction::MoveSession(_)
-        ) {
-            return Ok(None);
-        }
-
-        let path = target.map(target_path).transpose()?;
-        let selected_session = self.workspace.active.binding.mux.selected_session();
-        let creates_project_session = action == MuxKeyAction::NewTab
-            && (selected_session.is_none()
-                || path
-                    .as_ref()
-                    .is_some_and(|path| path.first().is_some_and(|part| part == "no-session")));
-        if creates_project_session {
-            let cwd = super::new_mux_session_request_with_name(self.config(), "").cwd;
-            return Ok(Some(self.workspace.project_session_command(&cwd)));
-        }
-
-        let session_id = path
-            .as_ref()
-            .and_then(|path| path.get(1))
-            .cloned()
-            .or_else(|| selected_session.map(str::to_owned))
-            .unwrap_or_else(|| "local".to_owned());
-        let window_id = match target.map(|target| target.kind) {
-            Some(ResourceKind::MuxWindow | ResourceKind::Pane) => Some(
-                path.as_ref()
-                    .and_then(|path| path.get(2))
-                    .cloned()
-                    .ok_or_else(|| malformed_target("mux command target has no window"))?,
-            ),
-            _ => None,
+        target: Option<&ExactMuxTarget>,
+    ) -> Option<MuxCommand> {
+        let exact = match action {
+            MuxKeyAction::NewTab => ExactMuxAction::NewTab,
+            MuxKeyAction::NextTab => ExactMuxAction::RelativeWindow(1),
+            MuxKeyAction::PreviousTab => ExactMuxAction::RelativeWindow(-1),
+            MuxKeyAction::LastTab => ExactMuxAction::LastWindow,
+            MuxKeyAction::MoveTab(delta) => ExactMuxAction::MoveWindow(delta),
+            MuxKeyAction::ClosePane => ExactMuxAction::CloseWindowPane,
+            _ => return self.plan_remaining_mux_key_action(action, target),
         };
-        let pane_id = match target.map(|target| target.kind) {
-            Some(ResourceKind::Pane) => Some(
-                path.as_ref()
-                    .and_then(|path| path.get(3))
-                    .cloned()
-                    .ok_or_else(|| malformed_target("mux command target has no pane"))?,
-            ),
-            _ => None,
-        };
-        let cwd = crate::workspace_runtime::terminal_cwd_for_mux_command(
-            self.workspace
-                .active
-                .binding
-                .terminal
-                .current_working_directory()
-                .ok()
-                .flatten(),
-            self.workspace
-                .active
-                .binding
-                .mux
-                .selected_session_anchor()
-                .and_then(|anchor| anchor.cwd.clone()),
-        );
-        let command = match action {
-            MuxKeyAction::NewTab => MuxCommand::NewWindow { session_id, cwd },
-            MuxKeyAction::NextTab => MuxCommand::ActivateNextWindow { session_id },
-            MuxKeyAction::PreviousTab => MuxCommand::ActivatePreviousWindow { session_id },
-            MuxKeyAction::LastTab => MuxCommand::ActivateLastWindow { session_id },
+        self.plan_exact_mux_action(exact, target?)
+    }
+
+    fn plan_remaining_mux_key_action(
+        &self,
+        action: MuxKeyAction,
+        target: Option<&ExactMuxTarget>,
+    ) -> Option<MuxCommand> {
+        let target =
+            target.filter(|target| target.scope() == self.workspace.active.binding.scope)?;
+        let (session, window_id, pane_id) = target.ids();
+        let session_id = session.unwrap_or("local").to_owned();
+        let window_id = window_id.map(str::to_owned);
+        let pane_id = pane_id.map(str::to_owned);
+        Some(match action {
             MuxKeyAction::SelectTab(index) => MuxCommand::ActivateWindowIndex { session_id, index },
-            MuxKeyAction::MoveTab(delta) => MuxCommand::MoveWindow {
-                session_id,
-                window_id: self
-                    .workspace
-                    .active
-                    .binding
-                    .mux
-                    .selected_window()
-                    .map(str::to_owned),
-                delta,
-            },
             MuxKeyAction::SplitPane(direction) => MuxCommand::SplitPane {
                 session_id,
                 pane_id,
@@ -134,13 +78,108 @@ impl AppState {
                 session_id,
                 pane_id,
             },
-            MuxKeyAction::NextSession
-            | MuxKeyAction::PreviousSession
-            | MuxKeyAction::LastSession
-            | MuxKeyAction::SelectSession(_)
-            | MuxKeyAction::MoveSession(_) => unreachable!("handled before command construction"),
-        };
-        Ok(Some(command))
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn plan_exact_mux_action(
+        &mut self,
+        action: ExactMuxAction,
+        target: &ExactMuxTarget,
+    ) -> Option<MuxCommand> {
+        if matches!(target, ExactMuxTarget::Binding(_)) {
+            return matches!(action, ExactMuxAction::NewTab).then(|| {
+                let cwd = super::new_mux_session_request_with_name(self.config(), "").cwd;
+                self.workspace.project_session_command(&cwd)
+            });
+        }
+        let binding = (target.scope() == self.workspace.active.binding.scope)
+            .then_some(&mut self.workspace.active.binding)?;
+        let (session_id, requested_window, requested_pane) = target.ids();
+        let session_id = session_id?.to_owned();
+        let requested_window = requested_window.map(str::to_owned);
+        let requested_pane = requested_pane.map(str::to_owned);
+        let session = binding.mux.session_by_id_or_name(&session_id)?;
+        let mut windows = session.windows.iter().collect::<Vec<_>>();
+        windows.sort_by_key(|window| window.index);
+        let window_id = requested_window
+            .or_else(|| binding.mux.selected_window().map(str::to_owned))
+            .or_else(|| session.active_window_id.clone());
+        let position = window_id
+            .as_ref()
+            .and_then(|window_id| windows.iter().position(|window| window.id == *window_id));
+        match action {
+            ExactMuxAction::Activate => Some(MuxCommand::ActivateWindow {
+                session_id,
+                window_id: window_id?,
+            }),
+            ExactMuxAction::RelativeWindow(delta) => {
+                let next = (position? as isize + delta).rem_euclid(windows.len() as isize) as usize;
+                Some(MuxCommand::ActivateWindow {
+                    session_id,
+                    window_id: windows[next].id.clone(),
+                })
+            }
+            ExactMuxAction::LastWindow if windows.len() > 1 => {
+                Some(MuxCommand::ActivateLastWindow { session_id })
+            }
+            ExactMuxAction::LastWindow => None,
+            ExactMuxAction::NewTab => {
+                let window = position.and_then(|position| windows.get(position).copied());
+                let selected = binding
+                    .mux
+                    .selected_session()
+                    .is_some_and(|selected| selected == session.id || selected == session.name)
+                    && binding
+                        .mux
+                        .selected_window()
+                        .map_or_else(|| session.active_window_id.as_deref(), Some)
+                        == window.map(|window| window.id.as_str());
+                let live = selected
+                    .then(|| binding.terminal.current_working_directory().ok().flatten())
+                    .flatten();
+                let anchor = window
+                    .and_then(|window| window.anchor.cwd.clone())
+                    .or_else(|| session.anchor.cwd.clone());
+                Some(MuxCommand::NewWindow {
+                    session_id,
+                    cwd: crate::workspace_runtime::terminal_cwd_for_mux_command(live, anchor),
+                })
+            }
+            ExactMuxAction::MoveWindow(delta) => {
+                let position = position?;
+                let target_position =
+                    (position as i32 + delta).clamp(0, windows.len() as i32 - 1) as usize;
+                (target_position != position).then(|| {
+                    let window_id = windows[position].id.clone();
+                    let selected_window_id = binding.mux.selected_window().map(str::to_owned);
+                    match selected_window_id {
+                        Some(selected_window_id) if selected_window_id != window_id => {
+                            MuxCommand::MoveWindowPreservingSelection {
+                                session_id,
+                                window_id,
+                                delta,
+                                selected_window_id,
+                            }
+                        }
+                        _ => MuxCommand::MoveWindow {
+                            session_id,
+                            window_id: Some(window_id),
+                            delta,
+                        },
+                    }
+                })
+            }
+            ExactMuxAction::CloseWindowPane => {
+                let pane_id = requested_pane.or_else(|| {
+                    position.and_then(|position| windows[position].anchor.pane_id.clone())
+                })?;
+                Some(MuxCommand::ClosePane {
+                    session_id,
+                    pane_id: Some(pane_id),
+                })
+            }
+        }
     }
 
     pub(crate) fn apply_resolved_keybind_action(
@@ -159,8 +198,21 @@ impl AppState {
     }
 
     pub(super) fn apply_mux_key_action(&mut self, action: MuxKeyAction) {
-        let command = self.mux_command_for_action(action, None).ok().flatten();
+        let target = self.current_exact_mux_target_for_action();
+        let command = self.plan_mux_key_action(action, Some(&target));
         self.apply_mux_key_action_to_target(action, command);
+    }
+
+    fn current_exact_mux_target_for_action(&self) -> ExactMuxTarget {
+        let scope = self.workspace.active.binding.scope;
+        match self.selected_mux_resource_path() {
+            (Some(session), Some(window), Some(pane)) => {
+                ExactMuxTarget::Pane(scope, session, window, pane)
+            }
+            (Some(session), Some(window), None) => ExactMuxTarget::Window(scope, session, window),
+            (Some(session), None, _) => ExactMuxTarget::Session(scope, session),
+            (None, _, _) => ExactMuxTarget::Binding(scope),
+        }
     }
 
     fn apply_mux_key_action_to_target(
@@ -180,21 +232,25 @@ impl AppState {
             MuxCommand::SplitPane { pane_id, .. }
             | MuxCommand::KillPane { pane_id, .. }
             | MuxCommand::ClosePane { pane_id, .. }
-            | MuxCommand::TogglePaneZoom { pane_id, .. } => pane_id.clone(),
+            | MuxCommand::TogglePaneZoom { pane_id, .. } => pane_id.as_deref(),
             _ => None,
         });
         if matches!(action, MuxKeyAction::ClosePane) {
-            self.close_target_pane(target_pane_id.as_deref(), planned_command.as_ref());
+            self.close_target_pane(target_pane_id, planned_command.as_ref());
             return;
         }
         // On the native engine, killing a pane means removing the focused split leaf and
         // collapsing the layout, same as closing it.
         if self.uses_native_terminal_layout() && matches!(action, MuxKeyAction::KillPane) {
-            self.close_target_pane(target_pane_id.as_deref(), planned_command.as_ref());
+            self.close_target_pane(target_pane_id, planned_command.as_ref());
             return;
         }
         if let MuxKeyAction::SplitPane(direction) = action {
-            self.split_focused_pane(direction, target_pane_id.as_deref());
+            self.workspace.active.binding.split_focused_pane(
+                &self.repaint,
+                direction,
+                target_pane_id,
+            );
             return;
         }
         // Native directional pane selection belongs to the local geometry.
@@ -211,14 +267,12 @@ impl AppState {
                 _ => None,
             };
             if let Some(delta) = delta {
-                self.focus_pane_relative(delta);
+                self.workspace.active.binding.focus_pane_relative(delta);
                 return;
             }
         }
 
-        let Some(command) =
-            planned_command.or_else(|| self.mux_command_for_action(action, None).ok().flatten())
-        else {
+        let Some(command) = planned_command else {
             return;
         };
         self.execute_mux_command(command);
@@ -234,30 +288,18 @@ impl AppState {
                 .map(str::to_owned)
                 .or_else(|| self.focused_pane())
             {
-                self.close_pane(&pane_id);
+                self.workspace
+                    .active
+                    .binding
+                    .close_focused_pane(&self.repaint, &pane_id);
             }
             return;
         }
-        let Some(command) = planned_command.cloned().or_else(|| {
-            self.mux_command_for_action(MuxKeyAction::ClosePane, None)
-                .ok()
-                .flatten()
-        }) else {
+        let Some(command) = planned_command.cloned() else {
             return;
         };
         self.execute_mux_command(command);
         self.workspace.active.binding.terminal.discard_active_pane();
-    }
-
-    fn split_focused_pane(
-        &mut self,
-        direction: crate::layout::SplitDirection,
-        target_pane_id: Option<&str>,
-    ) {
-        self.workspace
-            .active
-            .binding
-            .split_focused_pane(&self.repaint, direction, target_pane_id);
     }
 
     fn focus_pane_neighbor(&mut self, direction: bootty_mux::command::MuxDirection) {
@@ -269,18 +311,6 @@ impl AppState {
             .active
             .binding
             .focus_pane_neighbor(direction, area, gap);
-    }
-
-    fn focus_pane_relative(&mut self, delta: isize) {
-        self.workspace.active.binding.focus_pane_relative(delta);
-    }
-
-    /// Close a specific native pane and reactivate the surviving focused pane this frame.
-    fn close_pane(&mut self, pane_id: &str) {
-        self.workspace
-            .active
-            .binding
-            .close_focused_pane(&self.repaint, pane_id);
     }
 
     pub(super) fn execute_mux_command(&mut self, command: MuxCommand) {

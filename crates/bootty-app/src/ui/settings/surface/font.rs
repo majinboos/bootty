@@ -1,14 +1,11 @@
 use eframe::egui;
 
 use super::SettingsSurface;
-use bootty_font::{FontFeature, parse_font_features};
+use bootty_font::parse_font_features;
 
 pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
-    let installed = win
-        .font_families
-        .get_or_insert_with(installed_font_families)
-        .clone();
+    let installed = win.font_families.clone();
     let options: Vec<&str> = installed.iter().map(String::as_str).collect();
 
     super::section(ui, palette, "UI FONT");
@@ -355,183 +352,19 @@ fn font_feature_picker(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         .features
         .iter()
         .map(ToString::to_string)
-        .collect::<Vec<_>>();
-
-    egui::Frame::NONE
-        .fill(palette.pane)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Font features")
-                            .color(palette.text)
-                            .strong(),
-                    );
-                    ui.label(
-                        egui::RichText::new("OpenType feature tags written to font.features.")
-                            .color(palette.muted)
-                            .size(11.0),
-                    );
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear").clicked() {
-                        features.clear();
-                        write_feature_values(win, &features);
-                    }
-                });
-            });
-            ui.add_space(8.0);
-            let card_width = ((ui.available_width() - 14.0) * 0.5).clamp(220.0, 360.0);
-            for chunk in FONT_FEATURES.chunks(2) {
-                ui.horizontal(|ui| {
-                    for feature in chunk {
-                        feature_option(ui, win, &mut features, feature, card_width);
-                    }
-                });
+        .collect::<Vec<_>>()
+        .join(", ");
+    super::settings_row(
+        ui,
+        palette,
+        "OpenType features",
+        "Comma-separated tags such as +liga, -kern, +zero, or +ss01.",
+        |ui| {
+            if super::settings_text_edit(ui, palette, &mut features, "+liga, -kern").changed() {
+                write_features(win, &features);
             }
-            ui.add_space(8.0);
-            let mut raw = features.join(", ");
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Advanced").color(palette.muted));
-                if super::settings_text_edit_width(ui, palette, &mut raw, "+liga, -kern", 300.0)
-                    .changed()
-                {
-                    write_features(win, &raw);
-                }
-            });
-        });
-}
-
-fn feature_option(
-    ui: &mut egui::Ui,
-    win: &mut SettingsSurface,
-    features: &mut Vec<String>,
-    feature: &FontFeatureOption,
-    card_width: f32,
-) {
-    let palette = win.palette;
-    let Some(token) = normalized_feature(feature.token) else {
-        return;
-    };
-    let enabled = features
-        .iter()
-        .any(|value| normalized_feature(value).as_deref() == Some(token.as_str()));
-    let (rect, response) =
-        ui.allocate_exact_size(egui::Vec2::new(card_width, 58.0), egui::Sense::click());
-    let fill = if enabled {
-        palette.surface
-    } else if response.hovered() {
-        palette.hover
-    } else {
-        palette.pane
-    };
-    let stroke = egui::Stroke::new(
-        if enabled { 2.0 } else { 1.0 },
-        if enabled {
-            palette.primary
-        } else {
-            palette.border
         },
     );
-    ui.painter().rect_filled(rect, palette.radius, fill);
-    ui.painter()
-        .rect_stroke(rect, palette.radius, stroke, egui::StrokeKind::Inside);
-    ui.painter().text(
-        rect.left_top() + egui::vec2(10.0, 8.0),
-        egui::Align2::LEFT_TOP,
-        format!("{}  {}", feature.token, feature.label),
-        egui::TextStyle::Button.resolve(ui.style()),
-        palette.text,
-    );
-    ui.painter().text(
-        rect.left_top() + egui::vec2(10.0, 31.0),
-        egui::Align2::LEFT_TOP,
-        feature.description,
-        egui::TextStyle::Small.resolve(ui.style()),
-        palette.muted,
-    );
-    if response.clicked() {
-        if enabled {
-            features.retain(|value| normalized_feature(value).as_deref() != Some(token.as_str()));
-        } else {
-            features.push(token);
-        }
-        write_feature_values(win, features);
-    }
-}
-
-struct FontFeatureOption {
-    token: &'static str,
-    label: &'static str,
-    description: &'static str,
-}
-
-const FONT_FEATURES: &[FontFeatureOption] = &[
-    FontFeatureOption {
-        token: "+liga",
-        label: "Standard ligatures",
-        description: "Combines common glyph sequences such as fi and fl.",
-    },
-    FontFeatureOption {
-        token: "-liga",
-        label: "Disable ligatures",
-        description: "Keeps all characters separate when a font enables ligatures.",
-    },
-    FontFeatureOption {
-        token: "+calt",
-        label: "Contextual alternates",
-        description: "Allows glyphs to adapt based on neighboring characters.",
-    },
-    FontFeatureOption {
-        token: "+dlig",
-        label: "Discretionary ligatures",
-        description: "Enables optional decorative ligatures when the font has them.",
-    },
-    FontFeatureOption {
-        token: "+kern",
-        label: "Kerning",
-        description: "Applies pair spacing supplied by the font.",
-    },
-    FontFeatureOption {
-        token: "+zero",
-        label: "Slashed zero",
-        description: "Distinguishes zero from capital O when supported.",
-    },
-    FontFeatureOption {
-        token: "+tnum",
-        label: "Tabular numbers",
-        description: "Uses equal-width digits for aligned columns.",
-    },
-    FontFeatureOption {
-        token: "+onum",
-        label: "Oldstyle numbers",
-        description: "Uses text-style numerals when available.",
-    },
-    FontFeatureOption {
-        token: "+ss01",
-        label: "Stylistic set 1",
-        description: "Enables the font's first stylistic alternate set.",
-    },
-    FontFeatureOption {
-        token: "+ss02",
-        label: "Stylistic set 2",
-        description: "Enables the font's second stylistic alternate set.",
-    },
-];
-
-fn write_feature_values(win: &mut SettingsSurface, features: &[String]) {
-    let mut normalized = Vec::new();
-    for feature in features {
-        if let Some(value) = normalized_feature(feature)
-            && !normalized.iter().any(|existing| existing == &value)
-        {
-            normalized.push(value);
-        }
-    }
-    write_features(win, &normalized.join(", "));
 }
 
 fn write_features(win: &mut SettingsSurface, features: &str) {
@@ -550,29 +383,24 @@ fn write_features(win: &mut SettingsSurface, features: &str) {
     }
 }
 
-fn normalized_feature(value: &str) -> Option<String> {
-    FontFeature::parse(value).map(|feature| feature.to_string())
-}
-
 fn slider(ui: &mut egui::Ui, win: &mut SettingsSurface, row: MetricSliderRow<'_>) {
-    super::settings_row(ui, win.palette, row.label, row.help, |ui| {
-        let mut value = *(row.field)(&mut win.config.font);
-        if super::settings_slider_with_edit(
-            ui,
-            win.palette,
-            &mut value,
-            super::NumberEditSpec {
-                id_salt: row.path,
-                range: row.range,
-                suffix: row.suffix,
-                precision: 1,
-                display_scale: 1.0,
-            },
-        ) {
-            *(row.field)(&mut win.config.font) = value;
-            win.writeback.set_f32(row.path, value);
-        }
-    });
+    let value = (row.field)(&mut win.config.font);
+    if super::number_row(
+        ui,
+        win.palette,
+        value,
+        super::NumberRow {
+            label: row.label,
+            help: row.help,
+            path: row.path,
+            range: row.range,
+            suffix: row.suffix,
+            scale: 1.0,
+            control: super::NumberControl::Slider,
+        },
+    ) {
+        win.writeback.set_f32(row.path, *value);
+    }
 }
 
 struct MetricSliderRow<'a> {
@@ -595,48 +423,25 @@ struct MetricOverrideRow<'a> {
 }
 
 fn optional_slider(ui: &mut egui::Ui, win: &mut SettingsSurface, row: MetricOverrideRow<'_>) {
-    super::settings_row(ui, win.palette, row.label, row.help, |ui| {
-        let current = *(row.field)(&mut win.config.font);
-        let mut value = current.unwrap_or(row.default_value);
-        if super::settings_slider_with_edit(
-            ui,
-            win.palette,
-            &mut value,
-            super::NumberEditSpec {
-                id_salt: row.path,
-                range: row.range.clone(),
-                suffix: row.suffix,
-                precision: 1,
-                display_scale: 1.0,
-            },
-        ) {
-            *(row.field)(&mut win.config.font) = Some(value);
-            win.writeback.set_f32(row.path, value);
+    let value = (row.field)(&mut win.config.font);
+    if super::optional_number_row(
+        ui,
+        win.palette,
+        value,
+        row.default_value,
+        super::NumberRow {
+            label: row.label,
+            help: row.help,
+            path: row.path,
+            range: row.range,
+            suffix: row.suffix,
+            scale: 1.0,
+            control: super::NumberControl::Slider,
+        },
+    ) {
+        match *value {
+            Some(value) => win.writeback.set_f32(row.path, value),
+            None => win.writeback.remove(row.path),
         }
-        let mut automatic = current.is_none();
-        if super::settings_toggle(ui, win.palette, &mut automatic) {
-            if automatic {
-                *(row.field)(&mut win.config.font) = None;
-                win.writeback.remove(row.path);
-            } else {
-                // Turning auto off must write a concrete value; otherwise
-                // `automatic` re-derives to true next frame and the toggle snaps
-                // back, leaving the user unable to switch to manual.
-                *(row.field)(&mut win.config.font) = Some(value);
-                win.writeback.set_f32(row.path, value);
-            }
-        }
-        ui.label(egui::RichText::new("Auto").color(win.palette.muted));
-    });
-}
-
-fn installed_font_families() -> Vec<String> {
-    let database = bootty_render::font_database::system_font_database();
-    let mut names: Vec<String> = database
-        .faces()
-        .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    names
+    }
 }

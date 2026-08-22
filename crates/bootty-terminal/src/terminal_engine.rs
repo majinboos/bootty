@@ -1,8 +1,8 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
-    sync::{Arc, Mutex, Once},
+    sync::Once,
     time::{Duration, Instant},
 };
 
@@ -271,12 +271,16 @@ impl SizeReportState {
 }
 
 fn scaled_metric_size(cell_size: f32, display_scale: f32) -> u32 {
-    let display_scale = if display_scale.is_finite() && display_scale > 0.0 {
-        display_scale
-    } else {
-        1.0
-    };
+    let display_scale = positive_or(display_scale, 1.0);
     (cell_size * display_scale).round().max(1.0) as u32
+}
+
+fn positive_or(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        fallback
+    }
 }
 
 fn scaled_mouse_encoder_size(size: MouseEncoderSize, display_scale: f32) -> MouseEncoderSize {
@@ -294,10 +298,6 @@ fn scaled_mouse_encoder_size(size: MouseEncoderSize, display_scale: f32) -> Mous
 
 fn scaled_mouse_extent(value: u32, display_scale: f32) -> u32 {
     ((value as f32) * display_scale).round() as u32
-}
-
-fn scaled_mouse_position(value: f32, display_scale: f32) -> f32 {
-    value * display_scale
 }
 
 fn extract_render_row(
@@ -395,27 +395,23 @@ type PtyWriteCallback =
     Rc<RefCell<Option<Box<dyn libghostty_vt::terminal::PtyWriteFn<'static, 'static>>>>>;
 
 #[derive(Clone, Debug, Default)]
-struct XtermColorOverrides {
-    pointer_foreground: Option<RgbColor>,
-    pointer_background: Option<RgbColor>,
-    tektronix_foreground: Option<RgbColor>,
-    tektronix_background: Option<RgbColor>,
-    highlight_background: Option<RgbColor>,
-    tektronix_cursor: Option<RgbColor>,
-    highlight_foreground: Option<RgbColor>,
-}
+struct XtermColorOverrides([Option<RgbColor>; 7]);
 
 impl XtermColorOverrides {
+    fn slot(&mut self, code: u8) -> Option<&mut Option<RgbColor>> {
+        self.0.get_mut(usize::from(code.checked_sub(13)?))
+    }
+
+    fn get(&self, code: u8) -> Option<RgbColor> {
+        self.0
+            .get(usize::from(code.checked_sub(13)?))
+            .copied()
+            .flatten()
+    }
+
     fn set(&mut self, code: u8, color: RgbColor) -> bool {
-        let slot = match code {
-            13 => &mut self.pointer_foreground,
-            14 => &mut self.pointer_background,
-            15 => &mut self.tektronix_foreground,
-            16 => &mut self.tektronix_background,
-            17 => &mut self.highlight_background,
-            18 => &mut self.tektronix_cursor,
-            19 => &mut self.highlight_foreground,
-            _ => return false,
+        let Some(slot) = self.slot(code) else {
+            return false;
         };
         if *slot == Some(color) {
             false
@@ -426,17 +422,7 @@ impl XtermColorOverrides {
     }
 
     fn reset(&mut self, code: u8) -> bool {
-        let slot = match code {
-            13 => &mut self.pointer_foreground,
-            14 => &mut self.pointer_background,
-            15 => &mut self.tektronix_foreground,
-            16 => &mut self.tektronix_background,
-            17 => &mut self.highlight_background,
-            18 => &mut self.tektronix_cursor,
-            19 => &mut self.highlight_foreground,
-            _ => return false,
-        };
-        slot.take().is_some()
+        self.slot(code).and_then(Option::take).is_some()
     }
 }
 pub struct TerminalEngine {
@@ -464,8 +450,8 @@ pub struct TerminalEngine {
     mouse_encoder_options_dirty: bool,
     mouse_encoder_size: Option<MouseEncoderSize>,
     geometry: TerminalGeometry,
-    size_report_state: Arc<Mutex<SizeReportState>>,
-    current_working_directory_state: Arc<Mutex<String>>,
+    size_report_state: Rc<Cell<SizeReportState>>,
+    current_working_directory_state: Rc<RefCell<String>>,
     side_effects: TerminalSideEffectCollector,
     terminal_write_pending: Vec<u8>,
     synchronized_output_prefix_len: usize,
@@ -476,7 +462,7 @@ pub struct TerminalEngine {
     current_working_directory: String,
     colors: TerminalColorConfig,
     xterm_color_overrides: XtermColorOverrides,
-    color_scheme: Arc<Mutex<ColorScheme>>,
+    color_scheme: Rc<Cell<ColorScheme>>,
     search_query: String,
     search_active_index: usize,
     search_pulse: u64,
@@ -819,46 +805,41 @@ impl TerminalEngine {
         // presentation sequence (⚠️ ❤️) lands in a single cell — too narrow to render the color
         // glyph and inconsistent with how bootty measures the run.
         terminal.set_mode(Mode::GRAPHEME_CLUSTER, true)?;
-        let size_report_state = Arc::new(Mutex::new(SizeReportState {
+        let size_report_state = Rc::new(Cell::new(SizeReportState {
             geometry,
             display_scale: 1.0,
             render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
         }));
         let report_state = size_report_state.clone();
-        terminal.on_size(move |_terminal| {
-            let state = *report_state.lock().ok()?;
-            Some(state.size())
-        })?;
+        terminal.on_size(move |_terminal| Some(report_state.get().size()))?;
         terminal.on_device_attributes(|_terminal| Some(default_device_attributes()))?;
-        let color_scheme = Arc::new(Mutex::new(color_scheme_for_background(colors.background)));
+        let color_scheme = Rc::new(Cell::new(color_scheme_for_background(colors.background)));
         let report_color_scheme = color_scheme.clone();
-        terminal.on_color_scheme(move |_terminal| report_color_scheme.lock().ok().map(|s| *s))?;
+        terminal.on_color_scheme(move |_terminal| Some(report_color_scheme.get()))?;
         terminal.on_xtversion(|_terminal| Some(TERMINAL_XTVERSION))?;
         let side_effects = TerminalSideEffectCollector::new();
         let callback_side_effects = side_effects.callback_effects();
         let title_side_effects = callback_side_effects.clone();
         terminal.on_title_changed(move |terminal| {
-            if let Ok(title) = terminal.title()
-                && let Ok(mut effects) = title_side_effects.lock()
-            {
-                effects.push(TerminalSideEffect::WindowTitle(title.to_owned()));
+            if let Ok(title) = terminal.title() {
+                title_side_effects
+                    .borrow_mut()
+                    .push(TerminalSideEffect::WindowTitle(title.to_owned()));
             }
         })?;
-        let pwd_state = Arc::new(Mutex::new(String::new()));
+        let pwd_state = Rc::new(RefCell::new(String::new()));
         let callback_pwd_state = pwd_state.clone();
         terminal.on_pwd_changed(move |terminal| {
-            if let Ok(pwd) = terminal.pwd()
-                && let Ok(mut current) = callback_pwd_state.lock()
-            {
-                current.clear();
-                current.push_str(pwd);
+            if let Ok(pwd) = terminal.pwd() {
+                let mut current = callback_pwd_state.borrow_mut();
+                current.replace_range(.., pwd);
             }
         })?;
         let bell_side_effects = callback_side_effects.clone();
         terminal.on_bell(move |_terminal| {
-            if let Ok(mut effects) = bell_side_effects.lock() {
-                effects.push(TerminalSideEffect::Bell);
-            }
+            bell_side_effects
+                .borrow_mut()
+                .push(TerminalSideEffect::Bell);
         })?;
         let pty_write_callback: PtyWriteCallback = Rc::new(RefCell::new(None));
         let terminal_pty_write_callback = pty_write_callback.clone();
@@ -1158,39 +1139,39 @@ impl TerminalEngine {
         match code {
             13 => self
                 .xterm_color_overrides
-                .pointer_foreground
+                .get(13)
                 .or(self.colors.pointer_foreground)
                 .or(Some(self.colors.foreground)),
             14 => self
                 .xterm_color_overrides
-                .pointer_background
+                .get(14)
                 .or(self.colors.pointer_background)
                 .or(Some(self.colors.background)),
             15 => self
                 .xterm_color_overrides
-                .tektronix_foreground
+                .get(15)
                 .or(self.colors.tektronix_foreground)
                 .or(Some(self.colors.foreground)),
             16 => self
                 .xterm_color_overrides
-                .tektronix_background
+                .get(16)
                 .or(self.colors.tektronix_background)
                 .or(Some(self.colors.background)),
             17 => self
                 .xterm_color_overrides
-                .highlight_background
+                .get(17)
                 .or(self.colors.highlight_background)
                 .or(self.colors.selection_background)
                 .or(Some(self.colors.foreground)),
             18 => self
                 .xterm_color_overrides
-                .tektronix_cursor
+                .get(18)
                 .or(self.colors.tektronix_cursor)
                 .or(self.colors.cursor)
                 .or(Some(self.colors.foreground)),
             19 => self
                 .xterm_color_overrides
-                .highlight_foreground
+                .get(19)
                 .or(self.colors.highlight_foreground)
                 .or(self.colors.selection_foreground)
                 .or(Some(self.colors.background)),
@@ -1226,8 +1207,8 @@ impl TerminalEngine {
 
     fn set_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
         configure_default_colors(&mut self.terminal, &self.base_color_palette, &colors)?;
-        *self.color_scheme.lock().expect("color scheme lock") =
-            color_scheme_for_background(colors.background);
+        self.color_scheme
+            .set(color_scheme_for_background(colors.background));
         self.colors = colors;
         self.mark_content_changed();
         Ok(())
@@ -1240,16 +1221,14 @@ impl TerminalEngine {
 
         let previous = self.geometry;
         self.geometry = geometry;
-        if let Ok(mut report_state) = self.size_report_state.lock() {
-            report_state.geometry = geometry;
-        }
+        let mut report_state = self.size_report_state.get();
+        report_state.geometry = geometry;
         if !self.render_cell_explicit {
             self.render_cell =
                 CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32);
-            if let Ok(mut report_state) = self.size_report_state.lock() {
-                report_state.render_cell = self.render_cell;
-            }
+            report_state.render_cell = self.render_cell;
         }
+        self.size_report_state.set(report_state);
 
         if geometry.cols != previous.cols && geometry.rows < previous.rows {
             self.terminal.resize(
@@ -1271,16 +1250,12 @@ impl TerminalEngine {
     }
 
     pub fn set_display_scale(&mut self, display_scale: f32) {
-        let display_scale = if display_scale.is_finite() && display_scale > 0.0 {
-            display_scale
-        } else {
-            1.0
-        };
+        let display_scale = positive_or(display_scale, 1.0);
         if (self.display_scale - display_scale).abs() > f32::EPSILON {
             self.display_scale = display_scale;
-            if let Ok(mut report_state) = self.size_report_state.lock() {
-                report_state.display_scale = display_scale;
-            }
+            let mut report_state = self.size_report_state.get();
+            report_state.display_scale = display_scale;
+            self.size_report_state.set(report_state);
             if self.kitty_graphics_touched {
                 self.mark_content_changed();
             }
@@ -1288,22 +1263,14 @@ impl TerminalEngine {
     }
 
     pub fn set_render_cell_metrics(&mut self, cell: CellMetrics) {
-        let width = if cell.width.is_finite() && cell.width > 0.0 {
-            cell.width
-        } else {
-            self.geometry.cell_width as f32
-        };
-        let height = if cell.height.is_finite() && cell.height > 0.0 {
-            cell.height
-        } else {
-            self.geometry.cell_height as f32
-        };
+        let width = positive_or(cell.width, self.geometry.cell_width as f32);
+        let height = positive_or(cell.height, self.geometry.cell_height as f32);
         let cell = CellMetrics::new(width, height);
         if self.render_cell != cell {
             self.render_cell = cell;
-            if let Ok(mut report_state) = self.size_report_state.lock() {
-                report_state.render_cell = cell;
-            }
+            let mut report_state = self.size_report_state.get();
+            report_state.render_cell = cell;
+            self.size_report_state.set(report_state);
             if self.kitty_graphics_touched {
                 self.mark_content_changed();
             }
@@ -1358,7 +1325,7 @@ impl TerminalEngine {
     pub fn write_vt(&mut self, bytes: &[u8]) {
         self.observe_synchronized_output_start(bytes);
         let can_fast_write = self.terminal_write_pending.is_empty()
-            && !self.side_effects.has_pending_osc()
+            && !self.side_effects.needs_input()
             && !contains_tracked_streaming_control(bytes);
 
         if can_fast_write && self.try_write_repeated_cursor_home(bytes) {
@@ -1388,7 +1355,7 @@ impl TerminalEngine {
         }
 
         let mut features = terminal_write_features(write_bytes.as_ref());
-        if self.side_effects.has_pending_osc() {
+        if self.side_effects.needs_input() {
             features.osc_side_effect = true;
         }
         if !features.needs_sanitizing() {
@@ -1403,7 +1370,7 @@ impl TerminalEngine {
         let bytes = if features.tmux_passthrough {
             let unwrapped = unwrap_tmux_passthrough_commands(write_bytes.as_ref());
             features = terminal_write_features(unwrapped.as_ref());
-            if self.side_effects.has_pending_osc() {
+            if self.side_effects.needs_input() {
                 features.osc_side_effect = true;
             }
             unwrapped
@@ -1431,12 +1398,9 @@ impl TerminalEngine {
         self.sync_current_working_directory();
         if features.osc_side_effect {
             for action in self.side_effects.collect(sanitized.bytes.as_ref()) {
-                match action {
-                    TerminalHostAction::WriteVt(bytes) => {
-                        self.terminal.vt_write(bytes);
-                        self.mark_content_changed();
-                    }
-                }
+                let TerminalHostAction::WriteVt(bytes) = action;
+                self.terminal.vt_write(bytes);
+                self.mark_content_changed();
             }
         }
         self.mouse_encoder_options_dirty = true;
@@ -1444,9 +1408,8 @@ impl TerminalEngine {
     }
 
     fn sync_current_working_directory(&mut self) {
-        if let Ok(current) = self.current_working_directory_state.lock()
-            && self.current_working_directory.as_str() != current.as_str()
-        {
+        let current = self.current_working_directory_state.borrow();
+        if self.current_working_directory.as_str() != current.as_str() {
             self.current_working_directory.clear();
             self.current_working_directory.push_str(&current);
         }
@@ -1545,8 +1508,8 @@ impl TerminalEngine {
             .set_button(input.button.map(Into::into))
             .set_mods(input.mods.into())
             .set_position(mouse::Position {
-                x: scaled_mouse_position(input.x, display_scale),
-                y: scaled_mouse_position(input.y, display_scale),
+                x: input.x * display_scale,
+                y: input.y * display_scale,
             });
         if out.capacity() < 64 {
             out.reserve(64 - out.capacity());
@@ -1626,22 +1589,17 @@ impl TerminalEngine {
             self.mark_content_changed();
         }
 
-        let initial_offset = self.current_scroll_offset()?;
-        let visible_count = frame_search_matches(self.extract_frame()?, query).len();
+        let frame = self.extract_frame()?;
+        let initial_offset = frame.scrollbar.map_or(0, |scrollbar| scrollbar.offset);
+        let visible_count = frame.search_match_count;
         if visible_count > 0 {
             match direction {
                 TerminalSearchDirection::Current => return Ok(true),
                 TerminalSearchDirection::Next if self.search_active_index + 1 < visible_count => {
-                    self.search_active_index += 1;
-                    self.bump_search_pulse();
-                    let _ = self.extract_frame()?;
-                    return Ok(true);
+                    return self.select_search_match(self.search_active_index + 1, true);
                 }
                 TerminalSearchDirection::Previous if self.search_active_index > 0 => {
-                    self.search_active_index -= 1;
-                    self.bump_search_pulse();
-                    let _ = self.extract_frame()?;
-                    return Ok(true);
+                    return self.select_search_match(self.search_active_index - 1, true);
                 }
                 TerminalSearchDirection::Next | TerminalSearchDirection::Previous => {}
             }
@@ -1654,58 +1612,56 @@ impl TerminalEngine {
             TerminalSearchDirection::Next => self.geometry.rows.max(1) as isize,
         };
 
+        let mut current_offset = initial_offset;
         loop {
-            let before = self.current_scroll_offset()?;
+            let before = current_offset;
             self.scroll_viewport_delta(delta);
             let frame = self.extract_frame()?;
-            let after = frame.scrollbar.map_or(before, |scrollbar| scrollbar.offset);
-            if after == before {
+            current_offset = frame.scrollbar.map_or(before, |scrollbar| scrollbar.offset);
+            if current_offset == before {
                 break;
             }
-            let found_count = frame_search_matches(frame, query).len();
+            let found_count = frame.search_match_count;
             if found_count > 0 {
-                self.search_active_index = match direction {
+                let index = match direction {
                     TerminalSearchDirection::Previous => found_count - 1,
                     TerminalSearchDirection::Current | TerminalSearchDirection::Next => 0,
                 };
-                if direction != TerminalSearchDirection::Current {
-                    self.bump_search_pulse();
-                }
-                let _ = self.extract_frame()?;
-                return Ok(true);
+                return self
+                    .select_search_match(index, direction != TerminalSearchDirection::Current);
             }
         }
 
-        let current_offset = self.current_scroll_offset()?;
         let restore_delta = initial_offset as i128 - current_offset as i128;
-        if restore_delta != 0 {
+        let found = if restore_delta == 0 {
+            visible_count
+        } else {
             self.scroll_viewport_delta(
                 restore_delta.clamp(isize::MIN as i128, isize::MAX as i128) as isize
             );
-            let _ = self.extract_frame()?;
-        }
-        let found = frame_search_matches(self.extract_frame()?, query).len();
+            self.extract_frame()?.search_match_count
+        };
         if found > 0 {
-            self.search_active_index = self.search_active_index.min(found - 1);
-            if direction != TerminalSearchDirection::Current {
-                self.bump_search_pulse();
-                let _ = self.extract_frame()?;
-            }
-            return Ok(true);
+            return self.select_search_match(
+                self.search_active_index.min(found - 1),
+                direction != TerminalSearchDirection::Current,
+            );
         }
         Ok(false)
+    }
+
+    fn select_search_match(&mut self, index: usize, pulse: bool) -> Result<bool> {
+        self.search_active_index = index;
+        if pulse {
+            self.bump_search_pulse();
+            let _ = self.extract_frame()?;
+        }
+        Ok(true)
     }
 
     fn bump_search_pulse(&mut self) {
         self.search_pulse = self.search_pulse.wrapping_add(1);
         self.mark_content_changed();
-    }
-
-    fn current_scroll_offset(&mut self) -> Result<u64> {
-        Ok(self
-            .extract_frame()?
-            .scrollbar
-            .map_or(0, |scrollbar| scrollbar.offset))
     }
 
     pub fn is_mouse_tracking(&self) -> Result<bool> {
@@ -1733,7 +1689,6 @@ impl TerminalEngine {
         self.frame.active_search_match_index = None;
         self.frame.search_match_count = 0;
         self.frame.search_pulse = self.search_pulse;
-        self.frame.copy_mode = Self::copy_mode_frame_state(self.copy_mode.as_ref());
         self.frame.stats = FrameStats {
             render_state_update_us,
             ..FrameStats::default()
@@ -1804,11 +1759,15 @@ impl TerminalEngine {
             self.frame.images = images;
         }
 
-        let viewport_top = self.viewport_top_screen_row()?;
-        Self::apply_copy_mode_frame_cursor(&mut self.frame, self.copy_mode.as_ref(), viewport_top);
+        self.apply_copy_mode_frame(self.viewport_top_screen_row()?);
         self.frame.stats.extraction_us = extract_start.elapsed().as_micros() as u64;
         self.extracted_content_epoch = self.content_epoch;
         Ok(&self.frame)
+    }
+
+    fn apply_copy_mode_frame(&mut self, viewport_top: u32) {
+        self.frame.copy_mode = Self::copy_mode_frame_state(self.copy_mode.as_ref());
+        Self::apply_copy_mode_frame_cursor(&mut self.frame, self.copy_mode.as_ref(), viewport_top);
     }
 
     pub fn extract_frame(&mut self) -> Result<&RenderFrame> {
@@ -1842,12 +1801,12 @@ impl TerminalEngine {
             cursor_text: self.colors.cursor_text,
             selection_background: self
                 .xterm_color_overrides
-                .highlight_background
+                .get(17)
                 .or(self.colors.highlight_background)
                 .or(self.colors.selection_background),
             selection_foreground: self
                 .xterm_color_overrides
-                .highlight_foreground
+                .get(19)
                 .or(self.colors.highlight_foreground)
                 .or(self.colors.selection_foreground),
         };
@@ -1871,10 +1830,8 @@ impl TerminalEngine {
             offset: scrollbar.offset,
             len: scrollbar.len,
         });
-        let viewport_top = scrollbar.offset as u32;
-        self.frame.copy_mode = Self::copy_mode_frame_state(self.copy_mode.as_ref());
-        Self::apply_copy_mode_frame_cursor(&mut self.frame, self.copy_mode.as_ref(), viewport_top);
         if can_reuse_clean_frame {
+            self.apply_copy_mode_frame(scrollbar.offset as u32);
             self.frame.row_dirty.clear();
             self.frame
                 .row_dirty

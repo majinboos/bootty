@@ -473,7 +473,7 @@ fn bare_host_routes_cursor_and_decorations_through_structured_commands() {
             >= 3
     );
     assert!(!render_frame.commands.iter().any(
-        |command| matches!(command, TerminalRenderCommand::Sprite(sprite) if sprite.ch as u32 > 0x10FFFF)
+        |command| matches!(command, TerminalRenderCommand::Sprite(sprite) if sprite.glyph.ch as u32 > 0x10FFFF)
     ));
 }
 
@@ -725,11 +725,11 @@ fn bare_host_preserves_charset_rendering() {
     ));
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Sprite(sprite)
-                if sprite.ch == '─' && sprite.glyph.family == SpriteFamily::BoxDrawing)
+                if sprite.glyph.ch == '─' && sprite.glyph.family == SpriteFamily::BoxDrawing)
     ));
     assert!(render_frame.commands.iter().any(
         |command| matches!(command, TerminalRenderCommand::Sprite(sprite)
-                if sprite.ch == '│' && sprite.glyph.family == SpriteFamily::BoxDrawing)
+                if sprite.glyph.ch == '│' && sprite.glyph.family == SpriteFamily::BoxDrawing)
     ));
 }
 
@@ -972,9 +972,9 @@ fn assert_bare_host_routes_sprite_family(ch: char, family: SpriteFamily) -> usiz
         .iter()
         .find_map(|command| match command {
             TerminalRenderCommand::Sprite(sprite)
-                if sprite.ch == ch && sprite.glyph.family == family =>
+                if sprite.glyph.ch == ch && sprite.glyph.family == family =>
             {
-                Some(sprite.commands.len())
+                Some(sprite.glyph.commands_for(sprite.rect).len())
             }
             _ => None,
         })

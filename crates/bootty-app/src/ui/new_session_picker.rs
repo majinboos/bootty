@@ -1,13 +1,7 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, TryRecvError},
-};
-
 use bootty_config::config::SshRemoteConfig;
 use bootty_extension::display_path;
 use bootty_mux::{
     controller::RepaintHandle,
-    process::{CancellableCommandRunner, CommandCancellation},
     project::{
         ProjectPickerEntry, WorktreePickerEntry, discover_project_picker_entries,
         discover_worktree_picker_entries, home_dir as project_home_dir,
@@ -18,6 +12,7 @@ use bootty_ui::overlay::{FloatingWindow, ListRow, ListView};
 use bootty_ui::{Theme, overlay};
 use eframe::egui;
 
+use crate::new_session::{RemoteEffect, RemoteNewSession, RemoteOutcome};
 use crate::strings::home_dir;
 
 mod model;
@@ -35,50 +30,11 @@ pub struct NewMuxSessionDialog {
     selected_project: Option<ProjectPickerEntry>,
     focus_filter: bool,
     branch: String,
-    remote: Option<SshRemoteConfig>,
-    remote_task: Option<RemoteTask>,
-    repaint: Option<RepaintHandle>,
-}
-
-struct RemoteTask {
-    receiver: Receiver<Result<RemotePickerResult, String>>,
-    cancellation: CommandCancellation,
-}
-
-impl Drop for RemoteTask {
-    fn drop(&mut self) {
-        self.cancellation.cancel();
-    }
-}
-
-static REMOTE_PICKER_WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-struct RemoteWorkerPermit;
-
-impl RemoteWorkerPermit {
-    fn acquire() -> Option<Self> {
-        REMOTE_PICKER_WORKER_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            .then_some(Self)
-    }
-}
-
-impl Drop for RemoteWorkerPermit {
-    fn drop(&mut self) {
-        REMOTE_PICKER_WORKER_ACTIVE.store(false, Ordering::Release);
-    }
-}
-enum RemotePickerResult {
-    Projects(Vec<ProjectPickerEntry>),
-    Worktrees(Vec<WorktreePickerEntry>),
-    Favorite { path: String, favorite: bool },
-    CreatedWorktree(String),
+    remote: Option<RemoteNewSession>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NewSessionPickerEvent {
-    None,
     Close,
     Error(String),
     CreateWorktree { repo: String, branch: String },
@@ -87,41 +43,28 @@ pub enum NewSessionPickerEvent {
 
 impl NewMuxSessionDialog {
     pub fn open() -> Self {
+        Self::new(
+            discover_project_picker_entries(project_home_dir().as_deref()),
+            None,
+        )
+    }
+
+    pub fn open_remote(remote: SshRemoteConfig, repaint: RepaintHandle) -> Self {
+        Self::new(Vec::new(), Some(RemoteNewSession::new(remote, repaint)))
+    }
+
+    fn new(projects: Vec<ProjectPickerEntry>, remote: Option<RemoteNewSession>) -> Self {
         Self {
             step: NewMuxSessionStep::Project,
             filter: String::new(),
             selected: 0,
-            projects: discover_project_picker_entries(project_home_dir().as_deref()),
+            projects,
             worktrees: Vec::new(),
             selected_project: None,
             focus_filter: true,
             branch: String::new(),
-            remote: None,
-            remote_task: None,
-            repaint: None,
+            remote,
         }
-    }
-
-    pub fn open_remote(remote: SshRemoteConfig, repaint: RepaintHandle) -> Self {
-        let mut dialog = Self {
-            step: NewMuxSessionStep::Project,
-            filter: String::new(),
-            selected: 0,
-            projects: Vec::new(),
-            worktrees: Vec::new(),
-            selected_project: None,
-            focus_filter: true,
-            branch: String::new(),
-            remote: Some(remote),
-            remote_task: None,
-            repaint: Some(repaint),
-        };
-        dialog.start_remote_task(|remote, runner| {
-            crate::remote_catalog::list_remote_projects_with_runner(&remote, runner)
-                .map(RemotePickerResult::Projects)
-                .map_err(|error| error.to_string())
-        });
-        dialog
     }
 
     /// `open_cwds` lists the working directories of sessions already open, so the
@@ -131,9 +74,9 @@ impl NewMuxSessionDialog {
         ctx: &egui::Context,
         theme: Theme,
         open_cwds: &[String],
-    ) -> NewSessionPickerEvent {
+    ) -> Option<NewSessionPickerEvent> {
         if let Some(event) = self.poll_remote_task() {
-            return event;
+            return Some(event);
         }
         match self.step {
             NewMuxSessionStep::Project => self.show_project_step(ctx, theme, open_cwds),
@@ -146,27 +89,28 @@ impl NewMuxSessionDialog {
         ctx: &egui::Context,
         theme: Theme,
         open_cwds: &[String],
-    ) -> NewSessionPickerEvent {
+    ) -> Option<NewSessionPickerEvent> {
         let entries = project_entries_for_filter(&self.projects, &self.filter);
         self.selected = overlay::clamp_selection(self.selected, entries.len());
-        let busy = self.remote_task.is_some();
+        let busy = self.remote_busy();
         let favorite = (!busy && favorite_shortcut_pressed(ctx))
             .then(|| entries.get(self.selected).cloned())
             .flatten();
         let rows = project_rows(&entries, self.remote.is_some());
 
-        let empty_text = if self.remote_task.is_some() {
+        let empty_text = if busy {
             "loading remote projects..."
         } else {
             "no matching directories"
         };
         let result = self
-            .frame(ctx, "Directory", "folder", project_step_hint())
+            .frame(ctx, "Directory", "folder", PROJECT_STEP_HINT)
             .show(ctx, theme, |ui, palette| {
-                self.body(
+                Self::body(
                     ui,
                     palette,
                     theme,
+                    (&mut self.filter, &mut self.focus_filter, &mut self.selected),
                     "filter directories...",
                     &rows,
                     empty_text,
@@ -186,12 +130,16 @@ impl NewMuxSessionDialog {
         self.close_if_dismissed(&result)
     }
 
-    fn show_worktree_step(&mut self, ctx: &egui::Context, theme: Theme) -> NewSessionPickerEvent {
+    fn show_worktree_step(
+        &mut self,
+        ctx: &egui::Context,
+        theme: Theme,
+    ) -> Option<NewSessionPickerEvent> {
         let entries = filtered_worktree_entries(&self.worktrees, &self.filter);
         self.selected = overlay::clamp_selection(self.selected, entries.len());
         let rows = worktree_rows(&entries, theme);
 
-        let empty_text = if self.remote_task.is_some() {
+        let empty_text = if self.remote_busy() {
             "loading remote worktrees..."
         } else {
             "no matching worktrees"
@@ -199,25 +147,37 @@ impl NewMuxSessionDialog {
         let result = self
             .frame(ctx, "Worktree", "git-branch", WORKTREE_STEP_HINT)
             .show(ctx, theme, |ui, palette| {
-                self.body(ui, palette, theme, "filter worktrees...", &rows, empty_text)
+                Self::body(
+                    ui,
+                    palette,
+                    theme,
+                    (&mut self.filter, &mut self.focus_filter, &mut self.selected),
+                    "filter worktrees...",
+                    &rows,
+                    empty_text,
+                )
             });
 
-        if self.remote_task.is_none()
+        if !self.remote_busy()
             && let Some(index) = result.inner.activated
-            && let Some(entry) = entries.get(index).cloned()
+            && let Some(entry) = entries.get(index)
         {
-            return self.activate_worktree(entry);
+            return self.activate_worktree((*entry).clone());
         }
         self.close_if_dismissed(&result)
     }
 
-    fn show_branch_step(&mut self, ctx: &egui::Context, theme: Theme) -> NewSessionPickerEvent {
+    fn show_branch_step(
+        &mut self,
+        ctx: &egui::Context,
+        theme: Theme,
+    ) -> Option<NewSessionPickerEvent> {
         let Some(repo) = self
             .selected_project
             .as_ref()
             .map(|project| project.path.clone())
         else {
-            return NewSessionPickerEvent::Close;
+            return Some(NewSessionPickerEvent::Close);
         };
         let caption = format!(
             "new branch in {}",
@@ -231,23 +191,16 @@ impl NewMuxSessionDialog {
                 overlay::TextPrompt::new("new-worktree-branch")
                     .caption(&caption)
                     .hint("branch name...")
-                    .submit_disabled(branch.is_empty() || self.remote_task.is_some())
+                    .submit_disabled(branch.is_empty() || self.remote_busy())
                     .show(ui, theme, &mut self.branch, &mut self.focus_filter)
             });
 
-        if result.inner.submitted && !branch.is_empty() && self.remote_task.is_none() {
-            if self.remote.is_some() {
-                let project = repo.clone();
-                self.start_remote_task(move |remote, runner| {
-                    crate::remote_catalog::create_remote_worktree_with_runner(
-                        &remote, &project, &branch, runner,
-                    )
-                    .map(RemotePickerResult::CreatedWorktree)
-                    .map_err(|error| error.to_string())
-                });
-                return NewSessionPickerEvent::None;
+        if result.inner.submitted && !branch.is_empty() && !self.remote_busy() {
+            if let Some(remote) = &mut self.remote {
+                remote.start(RemoteEffect::CreateWorktree(repo, branch));
+                return None;
             }
-            return NewSessionPickerEvent::CreateWorktree { repo, branch };
+            return Some(NewSessionPickerEvent::CreateWorktree { repo, branch });
         }
         self.close_if_dismissed(&result)
     }
@@ -268,64 +221,63 @@ impl NewMuxSessionDialog {
     }
 
     fn body(
-        &mut self,
         ui: &mut egui::Ui,
         palette: bootty_ui::ThemePalette,
         theme: Theme,
+        state: (&mut String, &mut bool, &mut usize),
         hint: &str,
         rows: &[ListRow],
         empty_text: &str,
     ) -> overlay::ListOutcome {
+        let (filter_text, focus_filter, selected) = state;
         let filter = overlay::filter_field(
             ui,
             egui::Id::new("new-session-picker-filter"),
-            &mut self.filter,
+            filter_text,
             theme,
             hint,
         );
-        if self.focus_filter {
+        if *focus_filter {
             filter.request_focus();
-            self.focus_filter = false;
+            *focus_filter = false;
         }
         ui.add_space(8.0);
-        let outcome = ListView::new("new-session-picker-list", rows, self.selected)
+        let outcome = ListView::new("new-session-picker-list", rows, *selected)
             .max_height(overlay::list_max_height(ui.ctx(), 150.0, 520.0))
             .empty_text(empty_text)
             .show(ui, palette);
-        self.selected = outcome.selected;
+        *selected = outcome.selected;
         outcome
     }
 
-    fn close_if_dismissed<R>(&self, result: &overlay::OverlayResult<R>) -> NewSessionPickerEvent {
+    fn close_if_dismissed<R>(
+        &self,
+        result: &overlay::OverlayResult<R>,
+    ) -> Option<NewSessionPickerEvent> {
         if result.escaped || result.clicked_outside {
-            NewSessionPickerEvent::Close
+            Some(NewSessionPickerEvent::Close)
         } else {
-            NewSessionPickerEvent::None
+            None
         }
     }
 
-    fn toggle_project_favorite(&mut self, project: ProjectPickerEntry) -> NewSessionPickerEvent {
-        if self.remote.is_some() {
-            let path = project.path;
-            let task_path = path.clone();
-            self.start_remote_task(move |remote, runner| {
-                crate::remote_catalog::toggle_remote_project_favorite_with_runner(
-                    &remote, &task_path, runner,
-                )
-                .map(|favorite| RemotePickerResult::Favorite { path, favorite })
-                .map_err(|error| error.to_string())
-            });
-            return NewSessionPickerEvent::None;
+    fn toggle_project_favorite(
+        &mut self,
+        project: ProjectPickerEntry,
+    ) -> Option<NewSessionPickerEvent> {
+        if let Some(remote) = &mut self.remote {
+            remote.start(RemoteEffect::ToggleFavorite(project.path));
+            return None;
         }
         match toggle_favorite_project_path(project_home_dir().as_deref(), &project.path) {
             Ok(favorite) => {
                 self.set_project_favorite(&project.path, favorite);
-                NewSessionPickerEvent::None
+                None
             }
-            Err(error) => NewSessionPickerEvent::Error(format!(
+            Err(error) => Some(NewSessionPickerEvent::Error(format!(
                 "favorite {}: {error}",
                 picker_display_path(&project.path, false)
-            )),
+            ))),
         }
     }
 
@@ -351,8 +303,8 @@ impl NewMuxSessionDialog {
         &mut self,
         project: ProjectPickerEntry,
         open_cwds: &[String],
-    ) -> NewSessionPickerEvent {
-        if self.remote.is_some() {
+    ) -> Option<NewSessionPickerEvent> {
+        if let Some(remote) = &mut self.remote {
             let path = project.path.clone();
             self.selected = 0;
             self.step = NewMuxSessionStep::Worktree;
@@ -360,19 +312,12 @@ impl NewMuxSessionDialog {
             self.focus_filter = true;
             self.worktrees.clear();
             self.selected_project = Some(project);
-            let open_cwds = open_cwds.to_vec();
-            self.start_remote_task(move |remote, runner| {
-                crate::remote_catalog::list_remote_worktrees_with_runner(
-                    &remote, &path, &open_cwds, runner,
-                )
-                .map(RemotePickerResult::Worktrees)
-                .map_err(|error| error.to_string())
-            });
-            return NewSessionPickerEvent::None;
+            remote.start(RemoteEffect::ListWorktrees(path, open_cwds.to_vec()));
+            return None;
         }
         let worktrees = discover_worktree_picker_entries(&project.path);
         if let Some(cwd) = single_unused_worktree_cwd(&worktrees, open_cwds, false) {
-            return NewSessionPickerEvent::CreateSession { cwd };
+            return Some(NewSessionPickerEvent::CreateSession { cwd });
         }
 
         self.selected = default_worktree_selection(&worktrees, open_cwds, false);
@@ -381,77 +326,37 @@ impl NewMuxSessionDialog {
         self.focus_filter = true;
         self.worktrees = worktrees;
         self.selected_project = Some(project);
-        NewSessionPickerEvent::None
+        None
     }
 
     /// Selecting the "New worktree" row advances to the branch-name prompt;
     /// an existing worktree creates a session directly.
-    fn activate_worktree(&mut self, entry: WorktreePickerEntry) -> NewSessionPickerEvent {
+    fn activate_worktree(&mut self, entry: WorktreePickerEntry) -> Option<NewSessionPickerEvent> {
         if entry.is_new {
             self.step = NewMuxSessionStep::BranchName;
             self.branch.clear();
             self.focus_filter = true;
-            NewSessionPickerEvent::None
+            None
         } else if let Some(cwd) = entry.path {
-            NewSessionPickerEvent::CreateSession { cwd }
+            Some(NewSessionPickerEvent::CreateSession { cwd })
         } else {
-            NewSessionPickerEvent::Close
+            Some(NewSessionPickerEvent::Close)
         }
     }
 
-    fn start_remote_task<T>(&mut self, task: T)
-    where
-        T: FnOnce(SshRemoteConfig, &CancellableCommandRunner) -> Result<RemotePickerResult, String>
-            + Send
-            + 'static,
-    {
-        let (Some(remote), Some(repaint)) = (self.remote.clone(), self.repaint.clone()) else {
-            return;
-        };
-        let (sender, receiver) = mpsc::channel();
-        let cancellation = CommandCancellation::default();
-        let runner = CancellableCommandRunner::new(cancellation.clone());
-        let Some(permit) = RemoteWorkerPermit::acquire() else {
-            let _ = sender.send(Err(
-                "the previous remote project operation is still stopping".to_owned(),
-            ));
-            repaint();
-            self.remote_task = Some(RemoteTask {
-                receiver,
-                cancellation,
-            });
-            return;
-        };
-        std::thread::spawn(move || {
-            let _permit = permit;
-            let _ = sender.send(task(remote, &runner));
-            repaint();
-        });
-        self.remote_task = Some(RemoteTask {
-            receiver,
-            cancellation,
-        });
+    fn remote_busy(&self) -> bool {
+        self.remote.as_ref().is_some_and(RemoteNewSession::is_busy)
     }
 
     fn poll_remote_task(&mut self) -> Option<NewSessionPickerEvent> {
-        let result = match self.remote_task.as_ref()?.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => {
-                self.remote_task = None;
-                return Some(NewSessionPickerEvent::Error(
-                    "remote project task stopped".to_owned(),
-                ));
-            }
-        };
-        self.remote_task = None;
+        let result = self.remote.as_mut()?.poll()?;
         match result {
-            Ok(RemotePickerResult::Projects(projects)) => {
+            Ok(RemoteOutcome::Projects(projects)) => {
                 self.projects = projects;
                 self.selected = 0;
                 None
             }
-            Ok(RemotePickerResult::Worktrees(worktrees)) => {
+            Ok(RemoteOutcome::Worktrees(worktrees)) => {
                 if let Some(cwd) = single_unused_worktree_cwd(&worktrees, &[], true) {
                     return Some(NewSessionPickerEvent::CreateSession { cwd });
                 }
@@ -459,11 +364,11 @@ impl NewMuxSessionDialog {
                 self.worktrees = worktrees;
                 None
             }
-            Ok(RemotePickerResult::Favorite { path, favorite }) => {
+            Ok(RemoteOutcome::Favorite { path, favorite }) => {
                 self.set_project_favorite(&path, favorite);
                 None
             }
-            Ok(RemotePickerResult::CreatedWorktree(cwd)) => {
+            Ok(RemoteOutcome::CreatedWorktree(cwd)) => {
                 Some(NewSessionPickerEvent::CreateSession { cwd })
             }
             Err(error) => Some(NewSessionPickerEvent::Error(error)),
@@ -507,23 +412,18 @@ fn worktree_is_open(entry: &WorktreePickerEntry, open_cwds: &[String], remote: b
         .is_some_and(|path| open_cwds.iter().any(|cwd| same_dir(cwd, path, false)))
 }
 
-const PROJECT_STEP_HINT_MACOS: &[(&str, &str)] =
-    &[("enter", "open"), ("cmd+f", "favorite"), ("esc", "close")];
-const PROJECT_STEP_HINT_OTHER: &[(&str, &str)] = &[
+const FAVORITE_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "cmd+f"
+} else {
+    "ctrl+shift+f"
+};
+const PROJECT_STEP_HINT: &[(&str, &str)] = &[
     ("enter", "open"),
-    ("ctrl+shift+f", "favorite"),
+    (FAVORITE_SHORTCUT, "favorite"),
     ("esc", "close"),
 ];
 const WORKTREE_STEP_HINT: &[(&str, &str)] = &[("enter", "create session"), ("esc", "close")];
 const BRANCH_STEP_HINT: &[(&str, &str)] = &[("enter", "create"), ("esc", "cancel")];
-
-fn project_step_hint() -> &'static [(&'static str, &'static str)] {
-    if cfg!(target_os = "macos") {
-        PROJECT_STEP_HINT_MACOS
-    } else {
-        PROJECT_STEP_HINT_OTHER
-    }
-}
 
 fn favorite_shortcut_pressed(ctx: &egui::Context) -> bool {
     ctx.input_mut(|input| {
@@ -558,6 +458,10 @@ fn favorite_shortcut_matches(modifiers: egui::Modifiers) -> bool {
 }
 
 /// Compare local directories through the filesystem. Compare remote paths as opaque target paths.
+///
+/// This is the one filesystem touch left in a view. It runs on a step transition, not per frame,
+/// and only compares two paths. Move the canonicalization to the owner if it ever runs per frame
+/// or over a list long enough to matter.
 fn same_dir(a: &str, b: &str, remote: bool) -> bool {
     if remote {
         return a.trim_end_matches(['/', '\\']) == b.trim_end_matches(['/', '\\']);
@@ -587,7 +491,7 @@ fn project_rows(entries: &[ProjectPickerEntry], remote: bool) -> Vec<ListRow> {
         .collect()
 }
 
-fn worktree_rows(entries: &[WorktreePickerEntry], theme: Theme) -> Vec<ListRow> {
+fn worktree_rows(entries: &[&WorktreePickerEntry], theme: Theme) -> Vec<ListRow> {
     entries
         .iter()
         .map(|entry| ListRow {

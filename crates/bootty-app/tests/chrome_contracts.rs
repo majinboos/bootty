@@ -1,23 +1,25 @@
 use bootty_app::{
+    SpaceSummary,
     theme::theme_palette_from_colors,
     ui::chrome::{
         ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState, SpaceSwitcherEvent,
-        SpaceSwitcherItem, StatusBarModel, show_space_switcher, show_status_bar,
-        status_bar_window_tab_row_count, status_bar_windows_intersect_x_range,
+        StatusBarModel, show_space_switcher, show_status_bar, status_bar_layout,
         take_sidebar_space_swipe,
     },
 };
 use bootty_config::config::{ColorConfig, SegmentAlign};
+use bootty_extension::ModuleItem;
 use bootty_mux::controller::SpaceId;
 use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
 
-fn space(id: i64, name: &str, active: bool) -> SpaceSwitcherItem {
-    SpaceSwitcherItem {
+fn space(id: i64, name: &str, active: bool) -> SpaceSummary {
+    SpaceSummary {
         id: SpaceId::from_persistence(id),
         name: name.to_owned(),
         icon: "folder".to_owned(),
         color: [0x7a, 0xa2, 0xf7],
+        tint_sidebar: false,
         active,
         error: None,
     }
@@ -32,18 +34,31 @@ fn wheel(delta: Vec2, phase: TouchPhase) -> Event {
     }
 }
 
+fn resolved(item: &ModuleItem) -> ResolvedItem<'_> {
+    ResolvedItem {
+        item,
+        icon: item.icon.as_deref(),
+        fg: None,
+        bg: None,
+        stroke: None,
+    }
+}
+
 #[test]
 fn window_tabs_move_to_another_row_when_the_notch_crosses_them() {
     let context = egui::Context::default();
     let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 300.0));
+    let items = [ModuleItem {
+        text: "1 alpha-with-long-name".to_owned(),
+        ..ModuleItem::default()
+    }];
     let segments = [ResolvedSegment {
         align: SegmentAlign::Left,
         source_slot: 0,
-        items: vec![ResolvedItem {
-            text: "1 alpha-with-long-name".to_owned(),
-            module: "windows".to_owned(),
-            ..ResolvedItem::default()
-        }],
+        module: "windows.luau",
+        surface: "windows",
+        items: vec![resolved(&items[0])],
+        ..ResolvedSegment::default()
     }];
 
     context
@@ -54,32 +69,60 @@ fn window_tabs_move_to_another_row_when_the_notch_crosses_them() {
             },
             |ui| {
                 let bar = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 30.0));
-                assert!(status_bar_windows_intersect_x_range(
-                    ui,
-                    bar,
-                    &segments,
-                    STATUS_EDGE_PAD,
-                    (20.0, 40.0),
-                ));
-                assert!(!status_bar_windows_intersect_x_range(
-                    ui,
-                    bar,
-                    &segments,
-                    STATUS_EDGE_PAD,
-                    (500.0, 540.0),
-                ));
                 assert_eq!(
-                    status_bar_window_tab_row_count(
-                        ui,
-                        bar,
-                        &segments,
-                        STATUS_EDGE_PAD,
-                        Some((20.0, 40.0)),
-                    ),
+                    status_bar_layout(ui, bar, &segments, STATUS_EDGE_PAD, Some((20.0, 40.0)))
+                        .row_count(),
                     2
+                );
+                assert_eq!(
+                    status_bar_layout(ui, bar, &segments, STATUS_EDGE_PAD, Some((500.0, 540.0)))
+                        .row_count(),
+                    1
                 );
             },
         )
+        .drop_without_applying_deltas();
+}
+
+#[test]
+fn notch_wrapping_uses_the_window_span_after_leading_segments() {
+    let context = egui::Context::default();
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(600.0, 300.0));
+    let items = [
+        ModuleItem {
+            text: "a deliberately wide leading segment".to_owned(),
+            ..ModuleItem::default()
+        },
+        ModuleItem {
+            text: "1 alpha".to_owned(),
+            ..ModuleItem::default()
+        },
+    ];
+    let segments = [
+        ResolvedSegment {
+            align: SegmentAlign::Left,
+            module: "prefix",
+            items: vec![resolved(&items[0])],
+            ..ResolvedSegment::default()
+        },
+        ResolvedSegment {
+            align: SegmentAlign::Left,
+            source_slot: 1,
+            module: "windows.luau",
+            surface: "windows",
+            items: vec![resolved(&items[1])],
+            ..ResolvedSegment::default()
+        },
+    ];
+
+    context
+        .run_ui(RawInput::default(), |ui| {
+            assert_eq!(
+                status_bar_layout(ui, screen, &segments, STATUS_EDGE_PAD, Some((20.0, 40.0)))
+                    .row_count(),
+                1
+            );
+        })
         .drop_without_applying_deltas();
 }
 
@@ -89,17 +132,16 @@ fn pressing_empty_status_chrome_starts_a_native_window_drag() {
     let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(500.0, 300.0));
     let palette = theme_palette_from_colors(&ColorConfig::default());
     let show = |ui: &mut egui::Ui| {
+        let segments = [];
+        let layout = status_bar_layout(ui, screen, &segments, STATUS_EDGE_PAD, None);
         show_status_bar(
             ui,
             palette,
             StatusBarModel {
-                segments: &[],
+                layout: &layout,
                 tab_context: None,
                 background: palette.base,
-                left_padding: STATUS_EDGE_PAD,
                 row_height: screen.height(),
-                notch_x: None,
-                tab_rows: 1,
                 interaction_id: "global-status-drag-contract",
             },
         );

@@ -148,15 +148,14 @@ fn resolve_face_for_char_and_style(
         .cloned()
         .unwrap_or_else(|| "monospace".to_owned());
     let override_family = ch.and_then(|ch| config.codepoint_overrides.family_for(ch));
-    let family = override_family
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_family.clone());
-    let fallback_families = if override_family.is_some() {
-        std::iter::once(default_family)
-            .chain(families.cloned())
-            .collect()
-    } else {
-        families.cloned().collect()
+    let (family, fallback_families) = match override_family {
+        Some(family) => (
+            family.to_owned(),
+            std::iter::once(default_family)
+                .chain(families.cloned())
+                .collect(),
+        ),
+        None => (default_family, families.cloned().collect()),
     };
     ResolvedFontFace {
         family,
@@ -173,6 +172,7 @@ pub struct ResolvedFontFace {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(usize)]
 pub enum FontStyle {
     #[default]
     Regular,
@@ -183,21 +183,11 @@ pub enum FontStyle {
 
 impl FontStyle {
     fn from_index(index: usize) -> Self {
-        match index {
-            0 => Self::Regular,
-            1 => Self::Bold,
-            2 => Self::Italic,
-            _ => Self::BoldItalic,
-        }
+        [Self::Regular, Self::Bold, Self::Italic, Self::BoldItalic][index.min(3)]
     }
 
     fn index(self) -> usize {
-        match self {
-            Self::Regular => 0,
-            Self::Bold => 1,
-            Self::Italic => 2,
-            Self::BoldItalic => 3,
-        }
+        self as usize
     }
 
     fn from_attrs(attrs: &TextAttrs) -> Self {
@@ -225,33 +215,27 @@ pub struct NativeSymbolPolicy {
 }
 
 impl NativeSymbolPolicy {
-    pub fn font_only() -> Self {
+    const fn all(enabled: bool) -> Self {
         Self {
-            blocks: false,
-            shades: false,
-            quadrants: false,
-            box_drawing: false,
-            powerline: false,
-            progress_indicators: false,
-            separators: false,
-            braille: false,
-            legacy: false,
-            special: false,
+            blocks: enabled,
+            shades: enabled,
+            quadrants: enabled,
+            box_drawing: enabled,
+            powerline: enabled,
+            progress_indicators: enabled,
+            separators: enabled,
+            braille: enabled,
+            legacy: enabled,
+            special: enabled,
         }
     }
+
+    pub fn font_only() -> Self {
+        Self::all(false)
+    }
+
     pub fn terminal_glyph_primitives() -> Self {
-        Self {
-            blocks: true,
-            shades: true,
-            quadrants: true,
-            box_drawing: true,
-            powerline: true,
-            progress_indicators: true,
-            separators: true,
-            braille: true,
-            legacy: true,
-            special: true,
-        }
+        Self::all(true)
     }
     pub fn classify(self, ch: char) -> Option<NativeSymbolClass> {
         let class = match ch {
@@ -278,18 +262,7 @@ impl NativeSymbolPolicy {
 
 impl Default for NativeSymbolPolicy {
     fn default() -> Self {
-        Self {
-            blocks: true,
-            shades: true,
-            quadrants: true,
-            box_drawing: true,
-            powerline: true,
-            progress_indicators: true,
-            separators: true,
-            braille: true,
-            legacy: true,
-            special: true,
-        }
+        Self::terminal_glyph_primitives()
     }
 }
 

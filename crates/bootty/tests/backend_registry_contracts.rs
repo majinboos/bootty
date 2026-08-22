@@ -14,7 +14,6 @@ fn configured_backends_resolve_without_cross_backend_fallback() {
         MuxBackendKind::Native,
         MuxBackendKind::Rmux,
         MuxBackendKind::Tmux,
-        MuxBackendKind::Zellij,
     ] {
         let config = MuxBindingConfig {
             backend,
@@ -120,15 +119,6 @@ fn built_backends_publish_the_exact_capability_matrix() {
                 BindingOperation::NavigatePane,
                 BindingOperation::ClosePane,
                 BindingOperation::TogglePaneZoom,
-                BindingOperation::CreateProjectSession,
-                BindingOperation::CreateWorktreeSession,
-                BindingOperation::RenameSession,
-                BindingOperation::DitchSession,
-            ],
-        ),
-        (
-            MuxBackendKind::Zellij,
-            vec![
                 BindingOperation::CreateProjectSession,
                 BindingOperation::CreateWorktreeSession,
                 BindingOperation::RenameSession,

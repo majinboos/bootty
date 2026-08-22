@@ -108,7 +108,6 @@ pub enum RemoteSpaceCommand {
 pub enum RemoteSpaceBackend {
     Rmux,
     Tmux,
-    Zellij,
 }
 
 impl From<RemoteSpaceBackend> for bootty_mux_model::MuxBackendKind {
@@ -116,7 +115,6 @@ impl From<RemoteSpaceBackend> for bootty_mux_model::MuxBackendKind {
         match value {
             RemoteSpaceBackend::Rmux => Self::Rmux,
             RemoteSpaceBackend::Tmux => Self::Tmux,
-            RemoteSpaceBackend::Zellij => Self::Zellij,
         }
     }
 }

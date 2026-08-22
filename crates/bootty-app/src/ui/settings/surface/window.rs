@@ -51,38 +51,17 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         "Choose who draws the outer window border.",
         |ui| {
             let mut decoration = win.config.window.window_decoration;
-            if super::described_combo(
+            if enum_combo(
                 ui,
                 palette,
                 "settings_decoration",
                 &mut decoration,
                 &[
-                    (
-                        WindowDecoration::Auto,
-                        "Automatic",
-                        "Let the platform pick based on the titlebar style.",
-                    ),
-                    (
-                        WindowDecoration::None,
-                        "Borderless",
-                        "No outer border or system window controls.",
-                    ),
-                    (
-                        WindowDecoration::Client,
-                        "Drawn by Bootty",
-                        "Bootty paints the window border and controls.",
-                    ),
-                    (
-                        WindowDecoration::Server,
-                        "Drawn by system",
-                        "The OS paints the native window border.",
-                    ),
+                    (WindowDecoration::Auto, "Automatic"),
+                    (WindowDecoration::None, "Borderless"),
+                    (WindowDecoration::Client, "Drawn by Bootty"),
+                    (WindowDecoration::Server, "Drawn by system"),
                 ],
-                super::ComboStyle {
-                    width: 260.0,
-                    searchable: false,
-                    placeholder: "",
-                },
             ) {
                 win.config.window.window_decoration = decoration;
                 win.writeback.set_str(
@@ -99,43 +78,24 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         "Controls native fullscreen and notch-aware non-native modes.",
         |ui| {
             let mut fullscreen = win.config.window.fullscreen;
-            if super::described_combo(
+            if enum_combo(
                 ui,
                 palette,
                 "settings_fullscreen",
                 &mut fullscreen,
                 &[
-                    (
-                        WindowFullscreen::Disabled,
-                        "Disabled",
-                        "Never enter fullscreen.",
-                    ),
-                    (
-                        WindowFullscreen::Native,
-                        "Native",
-                        "Use macOS native Spaces fullscreen.",
-                    ),
-                    (
-                        WindowFullscreen::NonNative,
-                        "Borderless",
-                        "Fill the display without native Spaces.",
-                    ),
+                    (WindowFullscreen::Disabled, "Disabled"),
+                    (WindowFullscreen::Native, "Native"),
+                    (WindowFullscreen::NonNative, "Borderless"),
                     (
                         WindowFullscreen::NonNativeVisibleMenu,
                         "Borderless + menu bar",
-                        "Keep the menu bar visible in borderless fullscreen.",
                     ),
                     (
                         WindowFullscreen::NonNativePaddedNotch,
                         "Borderless + notch padding",
-                        "Reserve space for a notched display.",
                     ),
                 ],
-                super::ComboStyle {
-                    width: 260.0,
-                    searchable: false,
-                    placeholder: "",
-                },
             ) {
                 win.config.window.fullscreen = fullscreen;
                 win.writeback
@@ -226,7 +186,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             range: 0.0..=24.0,
             suffix: " px",
             percent: false,
-            precision: 1,
             field: |chrome| &mut chrome.gap,
         },
     );
@@ -240,7 +199,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             range: 0.0..=1.0,
             suffix: "",
             percent: true,
-            precision: 1,
             field: |chrome| &mut chrome.unfocused_sidebar_dim,
         },
     );
@@ -254,7 +212,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             range: 0.0..=1.0,
             suffix: "",
             percent: true,
-            precision: 1,
             field: |chrome| &mut chrome.unfocused_terminal_dim,
         },
     );
@@ -270,7 +227,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             range: 0.0..=16.0,
             suffix: " px",
             percent: false,
-            precision: 1,
             field: |chrome| &mut chrome.pane_divider_width,
         },
     );
@@ -284,7 +240,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             range: 0.0..=8.0,
             suffix: " px",
             percent: false,
-            precision: 1,
             field: |chrome| &mut chrome.pane_focus_border_width,
         },
     );
@@ -298,7 +253,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             range: 0.0..=40.0,
             suffix: " px",
             percent: false,
-            precision: 1,
             field: |chrome| &mut chrome.pane_corner_radius,
         },
     );
@@ -345,24 +299,23 @@ struct WindowNumberRow {
 }
 
 fn numeric_window_row(win: &mut SettingsSurface, ui: &mut egui::Ui, spec: WindowNumberRow) {
-    super::settings_row(ui, win.palette, spec.label, spec.help, |ui| {
-        let mut value = *(spec.field)(&mut win.config.window);
-        if super::settings_number_edit(
-            ui,
-            win.palette,
-            &mut value,
-            super::NumberEditSpec {
-                id_salt: &spec.path,
-                range: spec.range,
-                suffix: " px",
-                precision: 1,
-                display_scale: 1.0,
-            },
-        ) {
-            *(spec.field)(&mut win.config.window) = value;
-            win.writeback.set_f32(&spec.path, value);
-        }
-    });
+    let value = (spec.field)(&mut win.config.window);
+    if super::number_row(
+        ui,
+        win.palette,
+        value,
+        super::NumberRow {
+            label: spec.label,
+            help: spec.help,
+            path: &spec.path,
+            range: spec.range,
+            suffix: " px",
+            scale: 1.0,
+            control: super::NumberControl::Edit,
+        },
+    ) {
+        win.writeback.set_f32(&spec.path, *value);
+    }
 }
 
 struct ChromeSliderRow {
@@ -373,32 +326,27 @@ struct ChromeSliderRow {
     suffix: &'static str,
     /// Render the chip as a 0–100% value (the stored value is a 0.0–1.0 fraction).
     percent: bool,
-    /// Decimal places in the chip (these sliders accept fractional px, so 0 reads as misleading).
-    precision: usize,
     field: fn(&mut bootty_config::config::ChromeConfig) -> &mut f32,
 }
 
 fn chrome_slider(win: &mut SettingsSurface, ui: &mut egui::Ui, spec: ChromeSliderRow) {
-    super::settings_row(ui, win.palette, spec.label, spec.help, |ui| {
-        let mut value = *(spec.field)(&mut win.config.chrome);
-        let suffix = if spec.percent { "%" } else { spec.suffix };
-        let display_scale = if spec.percent { 100.0 } else { 1.0 };
-        if super::settings_slider_with_edit(
-            ui,
-            win.palette,
-            &mut value,
-            super::NumberEditSpec {
-                id_salt: &spec.path,
-                range: spec.range,
-                suffix,
-                precision: spec.precision,
-                display_scale,
-            },
-        ) {
-            *(spec.field)(&mut win.config.chrome) = value;
-            win.writeback.set_f32(&spec.path, value);
-        }
-    });
+    let value = (spec.field)(&mut win.config.chrome);
+    if super::number_row(
+        ui,
+        win.palette,
+        value,
+        super::NumberRow {
+            label: spec.label,
+            help: spec.help,
+            path: &spec.path,
+            range: spec.range,
+            suffix: if spec.percent { "%" } else { spec.suffix },
+            scale: if spec.percent { 100.0 } else { 1.0 },
+            control: super::NumberControl::Slider,
+        },
+    ) {
+        win.writeback.set_f32(&spec.path, *value);
+    }
 }
 
 fn titlebar_token(style: MacosTitlebarStyle) -> &'static str {

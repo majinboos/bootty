@@ -114,8 +114,8 @@ status before making competitive claims.
 | `power_thermal` | modeled idle/typing/editor/flood/animation render workloads for power-sensitive profiling; pair with external telemetry for real power or thermal claims |
 | `input_protocols` | keyboard protocols, modifiers, function/repeat/dead-key/AltGr cases, mouse tracking, paste, OSC 52, and IME text handling |
 | `hostile_input` | invalid bytes, malformed controls, huge OSC/DCS payloads, reset storms, long lines, fuzz streams, image quota abuse, and recovery ladders |
-| `panes_multiwindow` | native/tmux/zellij-equivalent tabs and panes, active/inactive panes, all-panes-tailing updates, tab switching, create/close models, and aggregate multi-window rendering |
-| `multiplexer` | terminal-alone, native mux, tmux, zellij, screen, tmux-over-SSH, nested SSH/tmux, passthrough/fallback, feature classification, latency delta, and render overhead |
+| `panes_multiwindow` | native/tmux-equivalent tabs and panes, active/inactive panes, all-panes-tailing updates, tab switching, create/close models, and aggregate multi-window rendering |
+| `multiplexer` | terminal-alone, native mux, tmux, screen, tmux-over-SSH, nested SSH/tmux, passthrough/fallback, feature classification, latency delta, and render overhead |
 | `remote_session` | virtual-network replay for SSH, mosh, docker/podman exec, ConPTY-like sessions, resize propagation, and feature-degradation classification |
 | `real_app_replay` | deterministic replay streams for editors, fuzzy finders, diffs, build logs, log tails, dashboards, mux sessions, and AI/code-generation output |
 

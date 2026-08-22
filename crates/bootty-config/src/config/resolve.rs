@@ -1,9 +1,9 @@
 use super::load::{ConfigLoadError, ConfigResult};
 use super::model::{
-    AppearanceBranchConfig, AppearanceConfig, AppearanceMode, BackendKeybindConfig, BoottyConfig,
-    ChromeConfig, ColorConfig, CursorConfig, DiagnosticsConfig, FontConfig, InputConfig,
-    MultiplexerConfig, ResolvedTheme, SessionConfig, SidebarConfig, SshAuthenticationConfig,
-    SshProfileConfig, WindowConfig,
+    AppearanceBranchConfig, AppearanceConfig, BackendKeybindConfig, BoottyConfig, ChromeConfig,
+    ColorConfig, CursorConfig, DiagnosticsConfig, FontConfig, InputConfig, MultiplexerConfig,
+    ResolvedTheme, SessionConfig, SidebarConfig, SshAuthenticationConfig, SshProfileConfig,
+    WindowConfig,
 };
 use super::raw::{
     AppearanceBranchPatch, AppearancePatch, BackendKeybindPatch, ChromePatch, ColorPatch,
@@ -61,22 +61,12 @@ impl ConfigResolver<'_> {
             ..BoottyConfig::default()
         };
         apply_value(&mut config.version, raw.version);
-        // Legacy top-level `theme`/`[colors]` seed both appearance branches, but only when the
-        // config actually sets them — `config.theme` defaults to the dark theme, and treating
-        // that default as legacy would overwrite the light branch's own default.
-        let has_legacy_appearance = raw.theme.is_some() || raw.colors != ColorPatch::default();
-        if let Some(theme) = &raw.theme {
-            config.theme = Some(theme.clone());
-            config.colors = resolve_theme_colors(theme, self.config_dir)?;
-        }
-        apply_partial_colors(&mut config.colors, raw.colors);
-        let legacy_branch = has_legacy_appearance.then(|| AppearanceBranchConfig {
-            theme: config.theme.clone(),
-            colors: config.colors.clone(),
-        });
-        config.appearance = resolve_appearance(raw.appearance, legacy_branch, self.config_dir)?;
-        config.theme = config.appearance.dark.theme.clone();
-        config.colors = config.appearance.dark.colors.clone();
+        config.appearance = resolve_appearance(
+            raw.appearance,
+            raw.theme.as_deref(),
+            raw.colors,
+            self.config_dir,
+        )?;
         apply_partial_cursor(&mut config.cursor, raw.cursor);
         apply_partial_font(&mut config.font, raw.font)?;
         apply_font_features(&mut config.font, raw.font_feature)?;
@@ -247,9 +237,6 @@ fn apply_partial_backend_keybind(
     if let Some(value) = partial.tmux {
         keybinds.tmux = merge_keybind_entries(&keybinds.tmux, value);
     }
-    if let Some(value) = partial.zellij {
-        keybinds.zellij = merge_keybind_entries(&keybinds.zellij, value);
-    }
 }
 
 // User keybinds layer on top of the defaults so new default bindings reach existing configs;
@@ -331,15 +318,16 @@ fn apply_partial_cursor(cursor: &mut CursorConfig, partial: CursorPatch) {
 
 fn resolve_appearance(
     partial: AppearancePatch,
-    legacy_branch: Option<AppearanceBranchConfig>,
+    legacy_theme: Option<&str>,
+    legacy_colors: ColorPatch,
     config_dir: &Path,
 ) -> ConfigResult<AppearanceConfig> {
-    let default_appearance = AppearanceConfig::default();
-    let mut appearance = AppearanceConfig {
-        mode: AppearanceMode::System,
-        light: legacy_branch.clone().unwrap_or(default_appearance.light),
-        dark: legacy_branch.unwrap_or(default_appearance.dark),
-    };
+    let mut appearance = AppearanceConfig::default();
+    if legacy_theme.is_some() || legacy_colors != ColorPatch::default() {
+        appearance.apply_global_override(legacy_theme, config_dir, |colors| {
+            apply_partial_colors(colors, legacy_colors);
+        })?;
+    }
     apply_value(&mut appearance.mode, partial.mode);
     apply_appearance_branch(&mut appearance.light, partial.light, config_dir)?;
     apply_appearance_branch(&mut appearance.dark, partial.dark, config_dir)?;
@@ -357,6 +345,27 @@ fn apply_appearance_branch(
     }
     apply_partial_colors(&mut branch.colors, partial.colors);
     Ok(())
+}
+
+impl AppearanceConfig {
+    /// Apply one process-wide override to both appearance branches. The theme resolves first so
+    /// explicit color overrides take precedence, matching legacy top-level config semantics.
+    pub fn apply_global_override(
+        &mut self,
+        theme: Option<&str>,
+        config_dir: &Path,
+        override_colors: impl FnOnce(&mut ColorConfig),
+    ) -> ConfigResult<()> {
+        let mut branch = self.dark.clone();
+        if let Some(theme) = theme {
+            branch.theme = Some(theme.to_owned());
+            branch.colors = resolve_theme_colors(theme, config_dir)?;
+        }
+        override_colors(&mut branch.colors);
+        self.light = branch.clone();
+        self.dark = branch;
+        Ok(())
+    }
 }
 
 fn resolve_theme_colors(theme: &str, config_dir: &Path) -> ConfigResult<ColorConfig> {
@@ -389,6 +398,32 @@ fn load_user_theme(theme: &str, config_dir: &Path) -> ConfigResult<Option<Resolv
         return parse_theme_source(&source, &path.display().to_string()).map(Some);
     }
     Ok(None)
+}
+
+/// Every theme a user can select: the built-in catalog plus `themes/*.toml` beside the config
+/// file. Ordered case-insensitively with case-duplicates collapsed, so a user copy of a
+/// built-in theme replaces it in the list instead of appearing twice.
+pub fn available_theme_names(config_path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = super::theme_catalog::builtin_theme_names()
+        .map(str::to_owned)
+        .collect();
+    if let Some(config_dir) = config_path.parent()
+        && let Ok(entries) = fs::read_dir(config_dir.join("themes"))
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+            {
+                names.push(stem.to_owned());
+            }
+        }
+    }
+    names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+    names.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    names
 }
 
 fn user_theme_candidates(theme: &str, config_dir: &Path) -> [PathBuf; 2] {

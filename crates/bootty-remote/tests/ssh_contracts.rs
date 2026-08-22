@@ -181,7 +181,9 @@ fn ssh_runner_composes_daemon_readiness_and_backend_execution() {
     let calls = recorder.0.clone();
     let runner = SshCommandRunner::new(SshRemote::new(target("devbox")), recorder);
 
-    runner.run("zellij", &args(&["list-sessions"])).unwrap();
+    runner
+        .run("session-client", &args(&["list-sessions"]))
+        .unwrap();
 
     let calls = calls.borrow();
     assert_eq!(calls.len(), 2);
@@ -190,5 +192,5 @@ fn ssh_runner_composes_daemon_readiness_and_backend_execution() {
     assert_eq!(calls[1].0, "ssh");
     let command = calls[1].1.last().unwrap();
     assert!(command.contains(" remote-exec "));
-    assert!(!command.contains("zellij"));
+    assert!(!command.contains("session-client"));
 }

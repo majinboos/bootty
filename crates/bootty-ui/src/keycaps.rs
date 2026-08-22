@@ -1,4 +1,5 @@
 use eframe::egui;
+use std::borrow::Cow;
 
 /// Lay a trigger out as keycaps. On macOS the modifier symbols come from the icon font (the UI font
 /// has no command/option/control glyphs in some themes), elsewhere modifiers fall back to text
@@ -10,8 +11,7 @@ pub fn trigger_galley(
     color: egui::Color32,
     max_width: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    ui.painter()
-        .layout_job(trigger_layout_job(palette, trigger, color, max_width))
+    trigger_galley_from_painter(ui.painter(), palette, trigger, color, max_width)
 }
 
 pub fn trigger_galley_from_painter(
@@ -163,14 +163,12 @@ fn append_combo_separator(job: &mut egui::text::LayoutJob, palette: crate::Theme
                 ..Default::default()
             },
         );
-        job.append(
+        append_text(
+            job,
             " ",
             5.0,
-            egui::text::TextFormat {
-                font_id: egui::FontId::proportional(12.0),
-                color: palette.muted,
-                ..Default::default()
-            },
+            egui::FontId::proportional(12.0),
+            palette.muted,
         );
     }
 }
@@ -182,71 +180,63 @@ fn append_combo(
     color: egui::Color32,
 ) {
     use egui::text::TextFormat;
-    let tokens: Vec<&str> = combo
+    let macos = cfg!(target_os = "macos");
+    for (index, token) in combo
         .split('+')
         .map(str::trim)
         .filter(|token| !token.is_empty())
-        .collect();
-    for (index, &token) in tokens.iter().enumerate() {
+        .enumerate()
+    {
         let leading = if index == 0 { 0.0 } else { 3.0 };
-        if cfg!(target_os = "macos") {
-            if let Some((glyph, family)) = modifier_icon(token).and_then(crate::icons::icon_glyph) {
-                let glyph_leading = if let Some(side) = modifier_side_label(token) {
-                    job.append(
-                        side,
-                        leading,
-                        TextFormat {
-                            font_id: egui::FontId::monospace(9.0),
-                            color: palette.muted,
-                            ..Default::default()
-                        },
-                    );
-                    1.0
-                } else {
-                    leading
-                };
+        if macos
+            && let Some((glyph, family)) = modifier_icon(token).and_then(crate::icons::icon_glyph)
+        {
+            let glyph_leading = if let Some(side) = modifier_side_label(token) {
                 job.append(
-                    &glyph.to_string(),
-                    glyph_leading,
+                    side,
+                    leading,
                     TextFormat {
-                        font_id: egui::FontId::new(15.0, egui::FontFamily::Name(family.into())),
-                        color,
-                        ..Default::default()
-                    },
-                );
-                continue;
-            }
-            job.append(
-                &key_label(token),
-                leading,
-                TextFormat {
-                    font_id: egui::FontId::monospace(13.0),
-                    color,
-                    ..Default::default()
-                },
-            );
-        } else {
-            if index > 0 {
-                job.append(
-                    "+",
-                    2.0,
-                    TextFormat {
-                        font_id: egui::FontId::proportional(12.0),
+                        font_id: egui::FontId::monospace(9.0),
                         color: palette.muted,
                         ..Default::default()
                     },
                 );
-            }
+                1.0
+            } else {
+                leading
+            };
             job.append(
-                &key_label(token),
-                if index == 0 { 0.0 } else { 2.0 },
+                &glyph.to_string(),
+                glyph_leading,
                 TextFormat {
-                    font_id: egui::FontId::monospace(13.0),
+                    font_id: egui::FontId::new(15.0, egui::FontFamily::Name(family.into())),
                     color,
                     ..Default::default()
                 },
             );
+            continue;
         }
+        if !macos && index > 0 {
+            job.append(
+                "+",
+                2.0,
+                TextFormat {
+                    font_id: egui::FontId::proportional(12.0),
+                    color: palette.muted,
+                    ..Default::default()
+                },
+            );
+        }
+        let label = key_label(token);
+        job.append(
+            label.as_ref(),
+            if macos { leading } else { leading.min(2.0) },
+            TextFormat {
+                font_id: egui::FontId::monospace(13.0),
+                color,
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -278,26 +268,26 @@ fn modifier_side_label(token: &str) -> Option<&'static str> {
     }
 }
 
-fn key_label(token: &str) -> String {
+fn key_label(token: &str) -> Cow<'_, str> {
     match token {
-        "cmd" | "super" => "Cmd".to_owned(),
-        "left_cmd" | "left_super" => "LCmd".to_owned(),
-        "right_cmd" | "right_super" => "RCmd".to_owned(),
-        "ctrl" | "control" => "Ctrl".to_owned(),
-        "left_ctrl" | "left_control" => "LCtrl".to_owned(),
-        "right_ctrl" | "right_control" => "RCtrl".to_owned(),
-        "alt" | "option" => "Alt".to_owned(),
-        "left_alt" | "left_option" => "LAlt".to_owned(),
-        "right_alt" | "right_option" => "RAlt".to_owned(),
-        "shift" => "Shift".to_owned(),
-        "left_shift" => "LShift".to_owned(),
-        "right_shift" => "RShift".to_owned(),
-        "enter" | "return" => "Enter".to_owned(),
-        "esc" | "escape" => "Esc".to_owned(),
-        "space" => "Space".to_owned(),
-        "scroll_up" => "Scroll ↑".to_owned(),
-        "scroll_down" => "Scroll ↓".to_owned(),
-        other if other.chars().count() == 1 => other.to_uppercase(),
-        other => other.to_owned(),
+        "cmd" | "super" => "Cmd".into(),
+        "left_cmd" | "left_super" => "LCmd".into(),
+        "right_cmd" | "right_super" => "RCmd".into(),
+        "ctrl" | "control" => "Ctrl".into(),
+        "left_ctrl" | "left_control" => "LCtrl".into(),
+        "right_ctrl" | "right_control" => "RCtrl".into(),
+        "alt" | "option" => "Alt".into(),
+        "left_alt" | "left_option" => "LAlt".into(),
+        "right_alt" | "right_option" => "RAlt".into(),
+        "shift" => "Shift".into(),
+        "left_shift" => "LShift".into(),
+        "right_shift" => "RShift".into(),
+        "enter" | "return" => "Enter".into(),
+        "esc" | "escape" => "Esc".into(),
+        "space" => "Space".into(),
+        "scroll_up" => "Scroll ↑".into(),
+        "scroll_down" => "Scroll ↓".into(),
+        other if other.chars().count() == 1 => other.to_uppercase().into(),
+        other => other.into(),
     }
 }

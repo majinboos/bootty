@@ -8,9 +8,7 @@ use anyhow::Result;
 use bootty_command::CommandInvocation;
 use bootty_config::config::MultiplexerBackendConfig;
 use bootty_config::{
-    config::{
-        AppearanceMode, AppearanceVariant, BoottyConfig, ConfigWriteOutcome, update_config_document,
-    },
+    config::{AppearanceMode, AppearanceVariant, BoottyConfig, ConfigDocument, ConfigResult},
     config_reload::CONFIG_HOT_RELOAD_INTERVAL,
 };
 use bootty_mux::{
@@ -41,10 +39,11 @@ mod ditch;
 mod input;
 mod keybinds;
 mod mux_actions;
+pub(crate) use mux_actions::ExactMuxAction;
 mod recorded_chord;
 mod spaces;
 
-use crate::commands::CommandRuntime;
+use crate::commands::{CommandRuntime, ExactMuxTarget};
 use crate::config_runtime::AppConfigRuntime;
 use crate::terminal_config::terminal_live_config;
 use crate::terminal_interaction::{TerminalFocusIntent, TerminalInteractionRuntime};
@@ -54,6 +53,7 @@ use crate::workspace_runtime::WorkspaceRuntime;
 use keybinds::terminal_cursor_icon_for_mouse_shape;
 
 use crate::{
+    app_actions::AppKeyBindings,
     diagnostics::StabilityTraceSample,
     input::{WheelScrollState, focus::InputFocus},
     layout::Divider,
@@ -68,6 +68,7 @@ use crate::{
         terminal_find::{TerminalFindDialog, TerminalFindEvent},
     },
 };
+use bootty_mux::command::MuxCommand;
 use bootty_workspace::WorkspacePersistenceError;
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
@@ -97,6 +98,20 @@ pub struct ViewportSnapshot {
     pub fullscreen: bool,
     pub maximized: bool,
     pub content_height: f32,
+}
+
+/// Window and screen facts the chrome layout needs, sampled once per frame outside the paint
+/// pass. Each field is measured in points, in screen space; the view adds its own origin.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowChromeFacts {
+    /// Native or non-native fullscreen: chrome drops its borders and reserves the notch band.
+    pub fullscreen: bool,
+    /// The active screen has a notch and we are fullscreen, so the band has to be cleared.
+    pub notched: bool,
+    /// Measured height of the macOS notch band, or 0 when unreadable.
+    pub notch_band: f32,
+    /// Horizontal span the notch occupies, sampled only while tabs-in-notch is on.
+    pub notch_span: Option<(f32, f32)>,
 }
 
 /// Host actions requested by a frame update, applied by the eframe adapter.
@@ -155,6 +170,9 @@ pub struct AppState {
     /// previous frame's UI build. A primary press inside one of these must not begin a terminal
     /// text selection — the handle owns that drag. Populated each frame in `show_fixed_layout`.
     chrome_handle_rects: Vec<egui::Rect>,
+    /// Held while the status-bar caffeinate toggle is on. The OS assertion is owner state: the
+    /// chrome view only reports and toggles it.
+    keep_awake: Option<keepawake::KeepAwake>,
     wheel_scroll_state: WheelScrollState,
     terminal_cursor_icon: egui::CursorIcon,
     mouse_pointer_hidden_while_typing: bool,
@@ -164,6 +182,7 @@ pub struct AppState {
     theme_picker_restore_config: Option<BoottyConfig>,
     macos_non_native_fullscreen_active: bool,
     macos_non_native_fullscreen_pending_apply: bool,
+    window_chrome: WindowChromeFacts,
 }
 fn scoped_terminal_transition_key(
     scope: MuxScope,
@@ -264,6 +283,7 @@ impl AppState {
             terminal_surface: None,
             last_pane_area: None,
             chrome_handle_rects: Vec::new(),
+            keep_awake: None,
             terminal_view_transform: ViewTransform::IDENTITY,
             config_runtime,
             active_appearance_variant,
@@ -285,10 +305,59 @@ impl AppState {
             theme_picker_restore_config: None,
             macos_non_native_fullscreen_active,
             macos_non_native_fullscreen_pending_apply,
+            window_chrome: WindowChromeFacts::default(),
         })
     }
     pub fn config(&self) -> &BoottyConfig {
         self.config_runtime.current()
+    }
+
+    /// Identifies the accepted config/document pair, so a view can tell whether the copy it
+    /// already holds is current.
+    pub fn config_revision(&self) -> u64 {
+        self.config_runtime.revision()
+    }
+
+    pub(crate) fn config_document(&self) -> ConfigDocument {
+        self.config_runtime.document().clone()
+    }
+
+    pub(crate) fn commit_settings_document(
+        &mut self,
+        document: ConfigDocument,
+    ) -> Result<(ConfigDocument, Option<String>, Vec<AppEffect>)> {
+        let backend = self.workspace.active.binding.multiplexer.backend;
+        let (change, document, outcome) = self.config_runtime.commit_document(
+            document,
+            backend,
+            self.active_appearance_variant,
+        )?;
+        let warning = outcome.durability_warning().map(str::to_owned);
+        let mut effects = Vec::new();
+        self.apply_accepted_config(change, &mut effects);
+        if let Some(warning) = &warning {
+            self.last_error = Some(match self.last_error.take() {
+                Some(existing) => format!("{existing}; {warning}"),
+                None => warning.clone(),
+            });
+        }
+        Ok((document, warning, effects))
+    }
+
+    fn mutate_config_document(
+        &mut self,
+        mutate: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>,
+        effects: &mut Vec<AppEffect>,
+    ) {
+        let mut document = self.config_runtime.document().clone();
+        if let Err(error) = mutate(&mut document) {
+            self.last_error = Some(error.to_string());
+            return;
+        }
+        match self.commit_settings_document(document) {
+            Ok((_, _, accepted_effects)) => effects.extend(accepted_effects),
+            Err(error) => self.last_error = Some(error.to_string()),
+        }
     }
 
     /// Apply a dragged sidebar width to the live config without touching disk, so the layout
@@ -299,62 +368,32 @@ impl AppState {
 
     /// Persist the sidebar width to `config.toml` on drag release. The live value already matches,
     /// so the hot-reload baseline is refreshed to skip the redundant reload the write would trigger.
-    pub fn persist_sidebar_width(&mut self, width: f32) {
-        let path = self.config().config_path.clone();
-        let result = update_config_document(&path, |document| {
-            document.set_f32(&["chrome", "sidebar-width"], width)
-        });
-        match result {
-            Ok(outcome) => {
-                self.config_runtime.refresh_dependency_graph();
-                self.record_config_write_warning(&outcome);
-            }
-            Err(error) => self.last_error = Some(error.to_string()),
-        }
+    pub fn persist_sidebar_width(&mut self, width: f32, effects: &mut Vec<AppEffect>) {
+        self.mutate_config_document(
+            |document| document.set_f32(&["chrome", "sidebar-width"], width),
+            effects,
+        );
     }
     fn persist_appearance_mode(&mut self, mode: AppearanceMode, effects: &mut Vec<AppEffect>) {
-        let path = self.config().config_path.clone();
         let token = match mode {
             AppearanceMode::System => "system",
             AppearanceMode::Light => "light",
             AppearanceMode::Dark => "dark",
         };
-        let result = update_config_document(&path, |document| {
-            document.set_str(&["appearance", "mode"], token)
-        });
-        match result {
-            Ok(outcome) => {
-                self.reload_config(effects);
-                self.record_config_write_warning(&outcome);
-            }
-            Err(error) => self.last_error = Some(error.to_string()),
-        }
+        self.mutate_config_document(
+            |document| document.set_str(&["appearance", "mode"], token),
+            effects,
+        );
     }
     fn persist_active_theme(&mut self, theme: &str, effects: &mut Vec<AppEffect>) {
-        let path = self.config().config_path.clone();
         let branch = match self.active_appearance_variant {
             AppearanceVariant::Light => "light",
             AppearanceVariant::Dark => "dark",
         };
-        let result = update_config_document(&path, |document| {
-            document.set_str(&["appearance", branch, "theme"], theme)
-        });
-        match result {
-            Ok(outcome) => {
-                self.reload_config(effects);
-                self.record_config_write_warning(&outcome);
-            }
-            Err(error) => self.last_error = Some(error.to_string()),
-        }
-    }
-    fn record_config_write_warning(&mut self, outcome: &ConfigWriteOutcome) {
-        let Some(warning) = outcome.durability_warning() else {
-            return;
-        };
-        self.last_error = Some(match self.last_error.take() {
-            Some(existing) => format!("{existing}; {warning}"),
-            None => warning.to_owned(),
-        });
+        self.mutate_config_document(
+            |document| document.set_str(&["appearance", branch, "theme"], theme),
+            effects,
+        );
     }
     fn preview_active_theme(&mut self, theme: &str, effects: &mut Vec<AppEffect>) {
         let path = self.config().config_path.clone();
@@ -474,6 +513,38 @@ impl AppState {
     pub fn macos_non_native_fullscreen_active(&self) -> bool {
         self.macos_non_native_fullscreen_active
     }
+
+    pub fn window_chrome_facts(&self) -> WindowChromeFacts {
+        self.window_chrome
+    }
+
+    /// Read this frame's window/screen facts and re-assert the window chrome AppKit resets across
+    /// fullscreen transitions. Runs once per frame in the update phase, never from paint.
+    fn sample_window_chrome(&mut self, viewport: ViewportSnapshot) {
+        let fullscreen = self.macos_non_native_fullscreen_active || viewport.fullscreen;
+        if fullscreen {
+            bootty_winit::window::macos_disable_titlebar_separator();
+        }
+        // Drop the window shadow in fullscreen; its rim otherwise reads as a border around the
+        // screen-filling window. Re-asserted every frame because macOS resets it.
+        bootty_winit::window::macos_set_window_shadow(!fullscreen);
+        // Detect the notch by display name (stable across fullscreen/menu-bar state) rather than
+        // the safe-area inset, which zeroes out when the menu bar is hidden in non-native
+        // fullscreen.
+        let notched = fullscreen && bootty_winit::window::macos_active_screen_is_notched();
+        // Measured every frame, notched or not: the reader keeps a sticky cache that a transient
+        // zero must not clear, and it has to be warm on the first fullscreen frame.
+        let notch_band = bootty_winit::window::macos_active_screen_notch_height();
+        let notch_span = (notched && self.config().window.fullscreen_tabs_in_notch)
+            .then(bootty_winit::window::macos_active_screen_notch_span)
+            .flatten();
+        self.window_chrome = WindowChromeFacts {
+            fullscreen,
+            notched,
+            notch_band,
+            notch_span,
+        };
+    }
     fn sync_macos_non_native_fullscreen_presentation(&mut self) {
         if !self.macos_non_native_fullscreen_pending_apply {
             return;
@@ -492,11 +563,36 @@ impl AppState {
         self.last_error = Some(error.to_string());
     }
 
-    /// Reset the registered chrome-handle rects at the start of a UI build; handles re-register
-    /// themselves via `register_chrome_handle` as they are drawn.
-    pub fn reset_chrome_handles(&mut self) {
-        self.chrome_handle_rects.clear();
+    pub fn keep_awake_active(&self) -> bool {
+        self.keep_awake.is_some()
     }
+
+    /// Take or release the display/idle sleep assertion behind the caffeinate status item.
+    pub fn toggle_keep_awake(&mut self) {
+        if self.keep_awake.take().is_some() {
+            return;
+        }
+        match keepawake::Builder::default()
+            .display(true)
+            .idle(true)
+            .reason("Bootty status-bar toggle")
+            .app_name("Bootty")
+            .app_reverse_domain("dev.bootty")
+            .create()
+        {
+            Ok(guard) => self.keep_awake = Some(guard),
+            Err(error) => self.record_render_error(error),
+        }
+    }
+
+    /// Replace the frame's chrome-handle rects with the ones chrome just painted, so the next
+    /// input pass suppresses selection over live handles only. A frame that paints no chrome (the
+    /// settings surface) leaves the previous set in place.
+    pub fn set_chrome_handles(&mut self, rects: Vec<egui::Rect>) {
+        self.chrome_handle_rects = rects;
+    }
+
+    /// Add a handle painted after chrome, during the terminal pass (the pane dividers).
     pub fn register_chrome_handle(&mut self, rect: egui::Rect) {
         self.chrome_handle_rects.push(rect);
     }
@@ -508,6 +604,18 @@ impl AppState {
     }
     fn sync_terminal_panes(&mut self) -> Result<()> {
         self.workspace.sync_active_terminal_panes()
+    }
+
+    fn publish_backend_transition(&mut self, bindings: AppKeyBindings) {
+        self.config_runtime.publish_backend_keybindings(bindings);
+        self.terminal_surface = None;
+        self.last_pane_area = None;
+    }
+
+    fn sync_terminal_panes_or_record_error(&mut self) {
+        if let Err(error) = self.sync_terminal_panes() {
+            self.last_error = Some(error.to_string());
+        }
     }
     pub fn native_multi_pane(&self) -> bool {
         self.workspace.active.binding.native_multi_pane()
@@ -590,9 +698,7 @@ impl AppState {
         if !self.uses_native_terminal_layout() {
             return;
         }
-        if let Err(error) = self.sync_terminal_panes() {
-            self.last_error = Some(error.to_string());
-        }
+        self.sync_terminal_panes_or_record_error();
     }
     pub fn record_pane_area(&mut self, area: Rect) {
         self.last_pane_area = Some(area);
@@ -619,10 +725,7 @@ impl AppState {
             ) {
                 return false;
             }
-            self.config_runtime
-                .publish_backend_keybindings(app_key_bindings);
-            self.terminal_surface = None;
-            self.last_pane_area = None;
+            self.publish_backend_transition(app_key_bindings);
         }
         if let Err(error) =
             self.workspace
@@ -669,56 +772,54 @@ impl AppState {
         self.activate_session_from_ui(&session_id);
         true
     }
-    pub fn activate_window_from_ui(&mut self, session_id: &str, window_id: &str) {
-        if let Err(error) = self.workspace.activate_target(
-            self.workspace.active.binding.scope,
-            session_id,
-            Some(window_id),
-            &self.repaint,
-        ) {
-            self.last_error = Some(error.to_string());
-        } else {
-            self.sync_native_layout_terminal_now();
-        }
-    }
-    pub fn activate_relative_window_from_ui(
+    pub(crate) fn apply_exact_mux_action(
         &mut self,
-        session_id: &str,
-        window_id: &str,
-        delta: isize,
+        action: ExactMuxAction,
+        target: ExactMuxTarget,
     ) -> bool {
-        let Some((session_id, window_id)) = self
-            .workspace
-            .active
-            .binding
-            .relative_window_target(session_id, window_id, delta)
-        else {
+        let Some(command) = self.plan_exact_mux_action(action, &target) else {
             return false;
         };
-        self.activate_window_from_ui(&session_id, &window_id);
+        match command {
+            MuxCommand::ActivateWindow {
+                session_id,
+                window_id,
+            } => {
+                if let Err(error) = self.workspace.activate_target(
+                    target.scope(),
+                    &session_id,
+                    Some(&window_id),
+                    &self.repaint,
+                ) {
+                    self.last_error = Some(error.to_string());
+                    return false;
+                }
+                self.sync_native_layout_terminal_now();
+            }
+            MuxCommand::ClosePane {
+                session_id,
+                pane_id: Some(pane_id),
+            } => {
+                let (ExactMuxTarget::Window(_, _, window_id)
+                | ExactMuxTarget::Pane(_, _, window_id, _)) = target
+                else {
+                    return false;
+                };
+                let binding = &mut self.workspace.active.binding;
+                let window = binding.window_id(session_id.clone(), window_id);
+                let target_is_current = binding.current_window_id() == window;
+                let config = binding.multiplexer.clone();
+                binding
+                    .mux
+                    .close_pane(&session_id, Some(&pane_id), &self.repaint, &config);
+                binding.terminal.discard_pane(&pane_id);
+                if binding.uses_native_terminal_layout() {
+                    binding.remove_pane_from_layout(&window, &pane_id, target_is_current);
+                }
+            }
+            command => self.execute_mux_command(command),
+        }
         true
-    }
-    pub fn activate_last_window_from_ui(&mut self, session_id: &str) -> bool {
-        let changed = self
-            .workspace
-            .active
-            .binding
-            .activate_last_window(&self.repaint, session_id);
-        if changed {
-            self.sync_native_layout_terminal_now();
-        }
-        changed
-    }
-    pub fn new_tab_for_window_from_ui(&mut self, session_id: &str, window_id: &str) -> bool {
-        let changed =
-            self.workspace
-                .active
-                .binding
-                .new_tab_for_window(&self.repaint, session_id, window_id);
-        if changed {
-            self.sync_native_layout_terminal_now();
-        }
-        changed
     }
     pub fn reorder_window_before_from_ui(&mut self, source: &str, before: Option<&str>) -> bool {
         let changed =
@@ -730,23 +831,6 @@ impl AppState {
             self.sync_native_layout_terminal_now();
         }
         changed
-    }
-    pub fn move_window_from_ui(&mut self, session_id: &str, window_id: &str, delta: i32) -> bool {
-        let changed =
-            self.workspace
-                .active
-                .binding
-                .move_window(&self.repaint, session_id, window_id, delta);
-        if changed {
-            self.sync_native_layout_terminal_now();
-        }
-        changed
-    }
-    pub fn close_pane_for_window_from_ui(&mut self, session_id: &str, window_id: &str) -> bool {
-        self.workspace
-            .active
-            .binding
-            .close_pane_for_window(&self.repaint, session_id, window_id)
     }
     fn create_project_session_for_cwd(&mut self, cwd: String) {
         let command = self.workspace.project_session_command(&cwd);
@@ -767,16 +851,13 @@ impl AppState {
     }
     pub fn move_session_from_ui(&mut self, session_id: &str, delta: i32) -> bool {
         let result = self.workspace.move_active_session(session_id, delta);
-        self.apply_session_order_change(result)
+        self.apply_workspace_change(result)
     }
     pub fn reorder_session_before(&mut self, source: &str, target: Option<&str>) -> bool {
         let result = self.workspace.reorder_active_session_before(source, target);
-        self.apply_session_order_change(result)
+        self.apply_workspace_change(result)
     }
-    fn apply_session_order_change(
-        &mut self,
-        result: Result<bool, WorkspacePersistenceError>,
-    ) -> bool {
+    fn apply_workspace_change(&mut self, result: Result<bool, WorkspacePersistenceError>) -> bool {
         match result {
             Ok(changed) => changed,
             Err(error) => {
@@ -789,7 +870,7 @@ impl AppState {
         let result = self
             .workspace
             .detach_session_from_space(target.scope, &target.session_id);
-        let changed = self.apply_session_order_change(result);
+        let changed = self.apply_workspace_change(result);
         if changed {
             (self.repaint)();
         }
@@ -810,10 +891,17 @@ impl AppState {
             event,
             focused_pane_id.as_deref(),
         );
-        self.apply_terminal_focus_intent(outcome.focus_intent);
-        if let Some(error) = outcome.last_error {
+        self.apply_terminal_outcome(outcome.last_error, outcome.focus_intent);
+    }
+    fn apply_terminal_outcome(
+        &mut self,
+        last_error: Option<String>,
+        focus_intent: TerminalFocusIntent,
+    ) {
+        if let Some(error) = last_error {
             self.last_error = Some(error);
         }
+        self.apply_terminal_focus_intent(focus_intent);
     }
     fn apply_terminal_focus_intent(&mut self, intent: TerminalFocusIntent) {
         match intent {
@@ -1040,6 +1128,9 @@ impl AppState {
                 &mut effects,
             )
             + self.handle_dropped_file_paths(dropped_file_paths);
+        // Sampled last: this frame's keybinds may have toggled fullscreen and its config reload may
+        // have changed the tabs-in-notch gate, and the chrome paint that follows must see both.
+        self.sample_window_chrome(viewport);
         let pending_pty_bytes = self.workspace.active.binding.terminal.pending_pty_len();
         let (cols, rows) = self.workspace.active.binding.terminal.grid_size();
         self.config_runtime.record_stability(StabilityTraceSample {
@@ -1087,6 +1178,15 @@ impl AppState {
                 return false;
             }
         };
+        self.apply_accepted_config(change, effects);
+        true
+    }
+
+    fn apply_accepted_config(
+        &mut self,
+        change: crate::config_runtime::AcceptedConfigChange,
+        effects: &mut Vec<AppEffect>,
+    ) {
         if let Some(text_config) = change.text_config {
             effects.push(AppEffect::SetTerminalTextConfig(text_config));
         }
@@ -1138,7 +1238,6 @@ impl AppState {
         }
         self.last_error = (!warnings.is_empty()).then(|| warnings.join("; "));
         effects.push(AppEffect::RequestRepaint);
-        true
     }
     fn hot_reload_config_if_changed(&mut self, effects: &mut Vec<AppEffect>, now: Instant) {
         if !self.config_runtime.reload_due(now) {

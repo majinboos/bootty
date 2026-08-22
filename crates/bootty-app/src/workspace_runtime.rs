@@ -43,7 +43,7 @@ pub(crate) use binding_panes::mux_split_direction;
 pub(crate) use binding_session_names::RenameSessionOutcome;
 pub(crate) use binding_terminal_facts::{TerminalProgress, TerminalProgressState};
 pub(crate) use binding_windows::terminal_cwd_for_mux_command;
-pub(crate) use space_summary::SpaceSummary;
+pub use space_summary::SpaceSummary;
 
 use crate::{
     layout::{PaneLayout, SplitDirection},
@@ -55,6 +55,20 @@ use bootty_workspace::{
     SpaceRemoteOverride, WorkspaceBinding, WorkspacePersistenceError, WorkspaceRepository,
     WorkspaceSpace,
 };
+
+macro_rules! swap_terminal_owner {
+    ($left:expr, $right:expr) => {{
+        std::mem::swap(&mut $left.terminal, &mut $right.terminal);
+        std::mem::swap(
+            &mut $left.terminal_side_effect_tx,
+            &mut $right.terminal_side_effect_tx,
+        );
+        std::mem::swap(
+            &mut $left.terminal_side_effect_rx,
+            &mut $right.terminal_side_effect_rx,
+        );
+    }};
+}
 
 /// The only terminal data that the host needs to interpret after a workspace frame.
 ///
@@ -105,9 +119,12 @@ impl ScopedWindowId {
     }
 }
 
+/// Identity for per-pane terminal facts. Pane ids are unique within a binding, so the enclosing
+/// window is not part of the key: a pane that moves between windows keeps its recorded facts, and
+/// neither a read nor a write has to search the topology for its window.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub(super) struct ScopedPaneId {
-    pub(super) window: ScopedWindowId,
+    pub(super) scope: MuxScope,
     pub(super) pane_id: String,
 }
 
@@ -140,30 +157,13 @@ impl NativeTerminalOwner {
         }
     }
 
-    pub(super) fn replace_binding(binding: &mut BindingRuntime, replacement: Self) -> Self {
-        Self {
-            terminal: std::mem::replace(&mut binding.terminal, replacement.terminal),
-            terminal_side_effect_tx: std::mem::replace(
-                &mut binding.terminal_side_effect_tx,
-                replacement.terminal_side_effect_tx,
-            ),
-            terminal_side_effect_rx: std::mem::replace(
-                &mut binding.terminal_side_effect_rx,
-                replacement.terminal_side_effect_rx,
-            ),
-        }
+    pub(super) fn replace_binding(binding: &mut BindingRuntime, mut replacement: Self) -> Self {
+        replacement.swap_with_binding(binding);
+        replacement
     }
 
     pub(super) fn swap_with_binding(&mut self, binding: &mut BindingRuntime) {
-        std::mem::swap(&mut self.terminal, &mut binding.terminal);
-        std::mem::swap(
-            &mut self.terminal_side_effect_tx,
-            &mut binding.terminal_side_effect_tx,
-        );
-        std::mem::swap(
-            &mut self.terminal_side_effect_rx,
-            &mut binding.terminal_side_effect_rx,
-        );
+        swap_terminal_owner!(self, binding);
     }
 
     pub(super) fn discard_side_effects(&mut self) {
@@ -457,9 +457,8 @@ impl BindingRuntime {
     }
 
     fn reconcile_session_state(&self, candidate: &mut BindingStateCandidate) {
-        let renames = self
-            .mux
-            .all_sessions()
+        let sessions = self.mux.all_sessions();
+        let renames = sessions
             .iter()
             .filter_map(|session| {
                 let previous = candidate.session_names.last_observed_name(&session.id)?;
@@ -470,23 +469,15 @@ impl BindingRuntime {
             candidate.session_order.rename_session(&previous, &current);
         }
         if self.multiplexer.remote_space_id.is_some() {
-            for session in self.mux.all_sessions() {
+            for session in sessions {
                 candidate.session_order.add_session(&session.name);
             }
         }
-        candidate.session_order.sync_sessions(
-            self.mux
-                .all_sessions()
-                .iter()
-                .map(|session| session.name.as_str()),
-        );
+        candidate
+            .session_order
+            .sync_sessions(sessions.iter().map(|session| session.name.as_str()));
         for pending in self.pending_generated_names.values() {
-            if self
-                .mux
-                .all_sessions()
-                .iter()
-                .any(|session| session.name == pending.name)
-            {
+            if sessions.iter().any(|session| session.name == pending.name) {
                 candidate.session_order.add_session(&pending.name);
             }
         }
@@ -525,13 +516,9 @@ impl BindingRuntime {
         ScopedWindowId::new(self.scope, session_id, window_id)
     }
 
-    pub(super) fn pane_id(
-        &self,
-        window: ScopedWindowId,
-        pane_id: impl Into<String>,
-    ) -> ScopedPaneId {
+    pub(super) fn pane_id(&self, pane_id: impl Into<String>) -> ScopedPaneId {
         ScopedPaneId {
-            window,
+            scope: self.scope,
             pane_id: pane_id.into(),
         }
     }
@@ -568,10 +555,9 @@ impl SpaceRuntime {
                     repaint.clone(),
                 )
             })
-            .collect::<Vec<_>>();
-        if bindings.is_empty() {
-            return None;
-        }
+            .collect::<Vec<_>>()
+            .into_iter();
+        let binding = bindings.next()?;
         Some(Self {
             id: space.id(),
             name: space.name().to_owned(),
@@ -579,8 +565,8 @@ impl SpaceRuntime {
             color: space.color(),
             tint_sidebar: space.tint_sidebar(),
             position: space.position(),
-            binding: bindings.remove(0),
-            inactive_bindings: bindings,
+            binding,
+            inactive_bindings: bindings.collect(),
         })
     }
 
@@ -670,6 +656,14 @@ pub(super) struct WorkspaceRuntime {
 }
 
 impl WorkspaceRuntime {
+    fn spaces(&self) -> impl Iterator<Item = &SpaceRuntime> {
+        std::iter::once(&self.active).chain(self.inactive_spaces.iter())
+    }
+
+    fn spaces_mut(&mut self) -> impl Iterator<Item = &mut SpaceRuntime> {
+        std::iter::once(&mut self.active).chain(self.inactive_spaces.iter_mut())
+    }
+
     pub(super) fn open(
         config: &BoottyConfig,
         window_state_key: &str,
@@ -725,15 +719,9 @@ impl WorkspaceRuntime {
     /// terminal traversal. Lifecycle work starts later in `advance_frame`.
     pub(super) fn drain(&mut self) -> WorkspaceDrainResult {
         let active_drain = self.active.binding.terminal.drain_native_window();
-        for binding in &mut self.active.inactive_bindings {
+        for binding in self.bindings_mut().skip(1) {
             binding.terminal.drain_native_window();
             binding.discard_terminal_side_effects();
-        }
-        for space in &mut self.inactive_spaces {
-            for binding in space.bindings_mut() {
-                binding.terminal.drain_native_window();
-                binding.discard_terminal_side_effects();
-            }
         }
         if let Some(owner) = &mut self.parked_native_terminal {
             owner.drain_inactive();
@@ -856,15 +844,9 @@ impl WorkspaceRuntime {
             self.active.binding.backend_policy.panes.topology,
             window_focused,
         );
-        for binding in &mut self.active.inactive_bindings {
+        for binding in self.bindings_mut().skip(1) {
             binding.refresh_waiting_membership(repaint, window_focused);
             binding.restore_persisted_sessions(repaint, false);
-        }
-        for space in &mut self.inactive_spaces {
-            for binding in space.bindings_mut() {
-                binding.refresh_waiting_membership(repaint, window_focused);
-                binding.restore_persisted_sessions(repaint, false);
-            }
         }
 
         if let Err(error) = self.reconcile_binding_membership_mutations() {
@@ -930,10 +912,7 @@ impl WorkspaceRuntime {
     }
 
     pub(super) fn reconnect_space(&mut self, space_id: SpaceId, now: Instant) -> bool {
-        let Some(space) = std::iter::once(&mut self.active)
-            .chain(self.inactive_spaces.iter_mut())
-            .find(|space| space.id == space_id)
-        else {
+        let Some(space) = self.spaces_mut().find(|space| space.id == space_id) else {
             return false;
         };
         let mut restarted = false;
@@ -944,22 +923,11 @@ impl WorkspaceRuntime {
     }
 
     fn has_degraded_remote(&self) -> bool {
-        self.active
-            .bindings()
-            .chain(
-                self.inactive_spaces
-                    .iter()
-                    .flat_map(|space| space.bindings()),
-            )
-            .any(BindingRuntime::is_degraded_remote)
+        self.all_bindings().any(BindingRuntime::is_degraded_remote)
     }
 
     fn reset_remote_reconnects(&mut self, now: Instant) {
-        for binding in self.active.bindings_mut().chain(
-            self.inactive_spaces
-                .iter_mut()
-                .flat_map(|space| space.bindings_mut()),
-        ) {
+        for binding in self.bindings_mut() {
             if binding.is_degraded_remote() {
                 binding.restart_remote(now);
             }
@@ -979,57 +947,38 @@ impl WorkspaceRuntime {
     }
 
     fn space(&self, space_id: SpaceId) -> Option<&SpaceRuntime> {
-        std::iter::once(&self.active)
-            .chain(self.inactive_spaces.iter())
-            .find(|space| space.id == space_id)
+        self.spaces().find(|space| space.id == space_id)
     }
 
-    pub(super) fn selected_binding_scope(&self, space_id: SpaceId) -> Option<MuxScope> {
-        self.space(space_id).map(|space| space.binding.scope)
+    fn space_mut(&mut self, space_id: SpaceId) -> Option<&mut SpaceRuntime> {
+        self.spaces_mut().find(|space| space.id == space_id)
     }
 
     pub(super) fn space_summaries(&self) -> Vec<SpaceSummary> {
-        let mut spaces = vec![(
-            self.active.position,
-            SpaceSummary {
-                id: self.active.id,
-                name: self.active.name.clone(),
-                icon: self.active.icon.clone(),
-                color: self.active.color,
-                tint_sidebar: self.active.tint_sidebar,
-                active: true,
-                error: self.active.binding.degraded_error(),
-            },
-        )];
-        spaces.extend(self.inactive_spaces.iter().map(|space| {
-            (
-                space.position,
-                SpaceSummary {
-                    id: space.id,
-                    name: space.name.clone(),
-                    icon: space.icon.clone(),
-                    color: space.color,
-                    tint_sidebar: space.tint_sidebar,
-                    active: false,
-                    error: space.binding.degraded_error(),
-                },
-            )
-        }));
+        let mut spaces = self
+            .spaces()
+            .map(|space| {
+                (
+                    space.position,
+                    SpaceSummary {
+                        id: space.id,
+                        name: space.name.clone(),
+                        icon: space.icon.clone(),
+                        color: space.color,
+                        tint_sidebar: space.tint_sidebar,
+                        active: space.id == self.active.id,
+                        error: space.binding.degraded_error(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
         spaces.sort_by_key(|(position, _)| *position);
         spaces.into_iter().map(|(_, summary)| summary).collect()
     }
 
     pub(super) fn space_placement(&self, space_id: SpaceId) -> Option<SpaceMuxOverride> {
-        let scope = self.selected_binding_scope(space_id)?;
-        self.binding(scope).map(|binding| binding.placement.clone())
-    }
-
-    pub(super) fn binding_scopes(&self) -> impl Iterator<Item = MuxScope> + '_ {
-        self.all_bindings().map(|binding| binding.scope)
-    }
-
-    pub(super) fn binding_placement(&self, scope: MuxScope) -> Option<&SpaceMuxOverride> {
-        self.binding(scope).map(BindingRuntime::placement)
+        self.space(space_id)
+            .map(|space| space.binding.placement.clone())
     }
 
     pub(super) fn transition(&self, now: Instant) -> Option<(SpaceId, SpaceId, f32)> {
@@ -1044,12 +993,8 @@ impl WorkspaceRuntime {
     }
 
     pub(super) fn binding_backend(&self, scope: MuxScope) -> Option<MultiplexerBackendConfig> {
-        if scope == self.active.binding.scope {
-            return Some(self.active.binding.multiplexer.backend);
-        }
         self.active
-            .inactive_bindings
-            .iter()
+            .bindings()
             .find(|binding| binding.scope == scope)
             .map(|binding| binding.multiplexer.backend)
     }
@@ -1123,7 +1068,8 @@ impl WorkspaceRuntime {
         if self.active.binding.backend_policy.selection_publication
             == SelectionPublicationPolicy::PersistBeforePublish
         {
-            self.persist_binding_restore_selection(scope, session_id, window_id)?;
+            self.repository
+                .set_binding_restore_state(scope, false, Some(session_id), window_id)?;
         }
         let config = self.active.binding.multiplexer.clone();
         match window_id {
@@ -1157,7 +1103,19 @@ impl WorkspaceRuntime {
             return Ok(false);
         };
 
-        self.persist_active_binding_restore_state()?;
+        let selected_session = self
+            .active
+            .binding
+            .mux
+            .selected_session()
+            .map(str::to_owned);
+        let selected_window = self.active.binding.mux.selected_window().map(str::to_owned);
+        self.repository.set_binding_restore_state(
+            self.active.binding.scope,
+            self.active.binding.mux.last_error().is_some(),
+            selected_session.as_deref(),
+            selected_window.as_deref(),
+        )?;
         self.repository
             .set_selected_space(window_state_key, space_id)?;
 
@@ -1203,15 +1161,7 @@ impl WorkspaceRuntime {
 
         match (active_is_shared, target_is_shared) {
             (true, true) => {
-                std::mem::swap(&mut self.active.binding.terminal, &mut target.terminal);
-                std::mem::swap(
-                    &mut self.active.binding.terminal_side_effect_tx,
-                    &mut target.terminal_side_effect_tx,
-                );
-                std::mem::swap(
-                    &mut self.active.binding.terminal_side_effect_rx,
-                    &mut target.terminal_side_effect_rx,
-                );
+                swap_terminal_owner!(self.active.binding, target);
             }
             (true, false) => {
                 let mut binding_config = config.clone();
@@ -1305,7 +1255,7 @@ impl WorkspaceRuntime {
         config: &BoottyConfig,
         variant: AppearanceVariant,
     ) -> Result<SpaceUpdateOutcome, WorkspacePersistenceError> {
-        let Some(scope) = self.selected_binding_scope(summary.id) else {
+        let Some(scope) = self.space(summary.id).map(|space| space.binding.scope) else {
             return Ok(SpaceUpdateOutcome {
                 changed: false,
                 active_placement_changed: false,
@@ -1334,14 +1284,10 @@ impl WorkspaceRuntime {
         )?;
         if updated {
             let active_placement_changed = self.active.id == scope.space_id() && placement_changed;
-            let space = if self.active.id == scope.space_id() {
-                &mut self.active
-            } else {
-                self.inactive_spaces
-                    .iter_mut()
-                    .find(|space| space.id == scope.space_id())
-                    .expect("the updated Space remains live")
-            };
+            let repaint = self.repaint.clone();
+            let space = self
+                .space_mut(scope.space_id())
+                .expect("the updated Space remains live");
             space.name = summary.name.trim().to_owned();
             space.icon = summary.icon.trim().to_owned();
             space.color = summary.color;
@@ -1351,7 +1297,7 @@ impl WorkspaceRuntime {
                     .bindings_mut()
                     .find(|binding| binding.scope == scope)
                     .expect("the updated binding remains live");
-                binding.rebuild(config, mux, variant, self.repaint.clone());
+                binding.rebuild(config, mux, variant, repaint);
             }
             return Ok(SpaceUpdateOutcome {
                 changed: true,
@@ -1372,21 +1318,19 @@ impl WorkspaceRuntime {
         repaint: RepaintHandle,
     ) -> Result<(), WorkspacePersistenceError> {
         let profile_scopes = self
-            .binding_scopes()
-            .filter(|scope| requested_scopes.is_none_or(|scopes| scopes.contains(scope)))
-            .filter(|scope| {
-                self.binding_placement(*scope).is_some_and(|placement| {
-                    matches!(placement.remote, SpaceRemoteOverride::Profile(_))
-                })
-            })
+            .all_bindings()
+            .map(|binding| (binding.scope, binding.placement()))
+            .filter(|(scope, _)| requested_scopes.is_none_or(|scopes| scopes.contains(scope)))
+            .filter(|(_, placement)| matches!(placement.remote, SpaceRemoteOverride::Profile(_)))
+            .map(|(scope, _)| scope)
             .collect::<Vec<_>>();
         let mut pending_scopes = HashSet::new();
         for scope in &profile_scopes {
-            match self.binding_has_pending_membership_operation(*scope) {
-                Ok(true) => {
+            match self.repository.pending_binding_membership_mutation(*scope) {
+                Ok(Some(_)) => {
                     pending_scopes.insert(*scope);
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
                     self.deferred_profile_binding_rebuilds
                         .extend(profile_scopes.iter().copied());
@@ -1409,35 +1353,6 @@ impl WorkspaceRuntime {
             self.deferred_profile_binding_rebuilds.remove(&scope);
         }
         Ok(())
-    }
-
-    pub(super) fn persist_active_binding_restore_state(
-        &mut self,
-    ) -> Result<(), WorkspacePersistenceError> {
-        let selected_session = self
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .map(str::to_owned);
-        let selected_window = self.active.binding.mux.selected_window().map(str::to_owned);
-        self.repository.set_binding_restore_state(
-            self.active.binding.scope,
-            self.active.binding.mux.last_error().is_some(),
-            selected_session.as_deref(),
-            selected_window.as_deref(),
-        )?;
-        Ok(())
-    }
-
-    pub(super) fn persist_binding_restore_selection(
-        &mut self,
-        scope: MuxScope,
-        session_id: &str,
-        window_id: Option<&str>,
-    ) -> Result<(), WorkspacePersistenceError> {
-        self.repository
-            .set_binding_restore_state(scope, false, Some(session_id), window_id)
     }
 
     pub(super) fn binding_state_candidate(&self, scope: MuxScope) -> Option<BindingStateCandidate> {
@@ -1767,15 +1682,6 @@ impl WorkspaceRuntime {
         Ok(())
     }
 
-    pub(super) fn binding_has_pending_membership_operation(
-        &mut self,
-        scope: MuxScope,
-    ) -> Result<bool, WorkspacePersistenceError> {
-        self.repository
-            .pending_binding_membership_mutation(scope)
-            .map(|pending| pending.is_some())
-    }
-
     pub(super) fn active_reconciled_binding_state_candidate(&self) -> BindingStateCandidate {
         let mut candidate = self.active_binding_state_candidate();
         self.active.binding.reconcile_session_state(&mut candidate);
@@ -1834,37 +1740,15 @@ impl WorkspaceRuntime {
     }
 
     pub(super) fn all_bindings(&self) -> impl Iterator<Item = &BindingRuntime> {
-        self.active
-            .bindings()
-            .chain(self.inactive_spaces.iter().flat_map(SpaceRuntime::bindings))
+        self.spaces().flat_map(SpaceRuntime::bindings)
     }
 
     fn bindings_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
-        std::iter::once(&mut self.active.binding)
-            .chain(self.active.inactive_bindings.iter_mut())
-            .chain(
-                self.inactive_spaces
-                    .iter_mut()
-                    .flat_map(SpaceRuntime::bindings_mut),
-            )
+        self.spaces_mut().flat_map(SpaceRuntime::bindings_mut)
     }
 
     fn binding_mut(&mut self, scope: MuxScope) -> Option<&mut BindingRuntime> {
-        if self.active.binding.scope == scope {
-            return Some(&mut self.active.binding);
-        }
-        if let Some(binding) = self
-            .active
-            .inactive_bindings
-            .iter_mut()
-            .find(|binding| binding.scope == scope)
-        {
-            return Some(binding);
-        }
-        self.inactive_spaces
-            .iter_mut()
-            .flat_map(SpaceRuntime::bindings_mut)
-            .find(|binding| binding.scope == scope)
+        self.bindings_mut().find(|binding| binding.scope == scope)
     }
 
     pub(super) fn binding(&self, scope: MuxScope) -> Option<&BindingRuntime> {

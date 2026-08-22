@@ -1,18 +1,18 @@
 use std::{collections::VecDeque, time::Instant};
 
-pub(crate) const MAX_DRAIN_BYTES_PER_FRAME: usize = 4 * 1024 * 1024;
-pub(crate) const MAX_DRAIN_CHUNKS_PER_FRAME: usize = 32;
-pub(crate) const MAX_DRAIN_SLICE_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_DRAIN_TIME_US: u128 = 20_000;
+const MAX_DRAIN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_DRAIN_CHUNKS: usize = 32;
+const MAX_DRAIN_SLICE_BYTES: usize = 8 * 1024;
+const MAX_DRAIN_TIME_US: u128 = 20_000;
 
 #[derive(Clone, Debug, Default)]
-pub struct PtyBacklog {
+pub struct OutputBacklog {
     chunks: VecDeque<Vec<u8>>,
     bytes: usize,
     front_offset: usize,
 }
 
-impl PtyBacklog {
+impl OutputBacklog {
     pub fn new() -> Self {
         Self::default()
     }
@@ -26,6 +26,9 @@ impl PtyBacklog {
     }
 
     pub fn push_back(&mut self, bytes: Vec<u8>) {
+        if bytes.is_empty() {
+            return;
+        }
         self.bytes = self.bytes.saturating_add(bytes.len());
         self.chunks.push_back(bytes);
     }
@@ -38,7 +41,7 @@ impl PtyBacklog {
         self.bytes == 0
     }
 
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.chunks.clear();
         self.bytes = 0;
         self.front_offset = 0;
@@ -69,18 +72,18 @@ impl PtyBacklog {
     }
 }
 
-pub fn drain_pty_backlog(backlog: &mut PtyBacklog, write: impl FnMut(&[u8])) -> DrainStats {
-    drain_pty_backlog_with_limits(
+pub fn drain_output_backlog(backlog: &mut OutputBacklog, write: impl FnMut(&[u8])) -> DrainStats {
+    drain_output_backlog_with_limits(
         backlog,
-        MAX_DRAIN_BYTES_PER_FRAME,
-        MAX_DRAIN_CHUNKS_PER_FRAME,
+        MAX_DRAIN_BYTES,
+        MAX_DRAIN_CHUNKS,
         MAX_DRAIN_TIME_US,
         write,
     )
 }
 
-pub(crate) fn drain_pty_backlog_with_limits(
-    backlog: &mut PtyBacklog,
+pub fn drain_output_backlog_with_limits(
+    backlog: &mut OutputBacklog,
     max_bytes: usize,
     max_chunks: usize,
     max_time_us: u128,
@@ -139,3 +142,7 @@ fn drain_budget_exhausted_with_limits(
 ) -> bool {
     stats.bytes >= max_bytes || stats.chunks >= max_chunks
 }
+
+pub use OutputBacklog as PtyBacklog;
+pub use drain_output_backlog as drain_pty_backlog;
+pub(crate) use drain_output_backlog_with_limits as drain_pty_backlog_with_limits;

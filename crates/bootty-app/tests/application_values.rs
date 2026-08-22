@@ -144,19 +144,20 @@ fn terminal_focus_routes_input_to_the_terminal() {
 #[test]
 fn configured_terminal_colors_drive_the_ui_palette() {
     let mut config = BoottyConfig::default();
-    config.colors.background = Some(Color {
+    let colors = &mut config.appearance.dark.colors;
+    colors.background = Some(Color {
         r: 1,
         g: 2,
         b: 3,
         a: 0xff,
     });
-    config.colors.foreground = Some(Color {
+    colors.foreground = Some(Color {
         r: 240,
         g: 241,
         b: 242,
         a: 0xff,
     });
-    config.colors.palette = vec![
+    colors.palette = vec![
         Color {
             r: 0,
             g: 0,
@@ -195,7 +196,7 @@ fn configured_terminal_colors_drive_the_ui_palette() {
         },
     ];
 
-    let palette = theme_palette_from_colors(&config.colors);
+    let palette = theme_palette_from_colors(colors);
 
     assert_eq!(palette.base, Color32::from_rgb(1, 2, 3));
     assert_eq!(palette.text, Color32::from_rgb(240, 241, 242));

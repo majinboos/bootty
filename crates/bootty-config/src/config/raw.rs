@@ -138,7 +138,6 @@ pub(super) struct BackendKeybindPatch {
     pub(super) native: Option<Vec<String>>,
     pub(super) rmux: Option<Vec<String>>,
     pub(super) tmux: Option<Vec<String>>,
-    pub(super) zellij: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]

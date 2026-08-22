@@ -20,7 +20,7 @@ pub struct ProjectPickerEntry {
     pub favorite: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct WorktreePickerEntry {
     pub label: String,
     pub path: Option<String>,
@@ -88,13 +88,11 @@ pub fn detach_head(worktree_path: &str) -> Result<(), String> {
 /// tree plus every linked worktree. `0` when `cwd` is not in a git repo. Used to
 /// gate the detach action, which only earns its keep in a multi-worktree repo.
 pub fn worktree_count(cwd: &str) -> usize {
-    read(cwd, &["worktree", "list", "--porcelain"])
-        .map(|out| {
-            out.lines()
-                .filter(|line| line.starts_with("worktree "))
-                .count()
-        })
-        .unwrap_or(0)
+    read(cwd, &["worktree", "list", "--porcelain"]).map_or(0, |out| {
+        out.lines()
+            .filter(|line| line.starts_with("worktree "))
+            .count()
+    })
 }
 
 /// The repo's trunk branch — the one ditch must never offer to delete. Resolved
@@ -147,14 +145,13 @@ pub fn suggested_session_name(cwd: &str) -> String {
     let Some(worktree) = worktree_root(cwd) else {
         return session_name_for_path(cwd).to_owned();
     };
-    let status = status(&worktree);
+    let branch = read(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
 
     let group = main_worktree(&worktree)
         .as_deref()
         .map(|path| session_name_for_path(path).to_owned())
         .unwrap_or_else(|| session_name_for_path(&worktree).to_owned());
-    let leaf = status
-        .branch
+    let leaf = branch
         .as_deref()
         .and_then(|branch| branch.rsplit('/').next())
         .filter(|branch| !branch.is_empty())
@@ -209,23 +206,22 @@ pub fn toggle_favorite_project_path(home: Option<&Path>, project_path: &str) -> 
     let Some(path) = favorite_project_paths_file(home) else {
         return Ok(false);
     };
-    toggle_favorite_project_path_at(&path, home, project_path)
+    favorite_paths::toggle_favorite_project_path_at(&path, home, project_path)
 }
 
 pub fn discover_worktree_picker_entries(project_path: &str) -> Vec<WorktreePickerEntry> {
     let new_worktree = WorktreePickerEntry {
         label: "New worktree".to_owned(),
-        path: None,
         is_new: true,
-        occupied: false,
+        ..WorktreePickerEntry::default()
     };
-    let Ok(output) = git_command(project_path, &["worktree", "list", "--porcelain"]).output()
+    let Some(output) = git_command(project_path, &["worktree", "list", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
     else {
         return vec![main_worktree_entry(project_path)];
     };
-    if !output.status.success() {
-        return vec![main_worktree_entry(project_path)];
-    }
     let mut entries = vec![new_worktree];
     entries.extend(parse_git_worktree_list(&String::from_utf8_lossy(
         &output.stdout,
@@ -324,20 +320,11 @@ fn expand_home_path(home: Option<&Path>, path: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(path))
 }
 
-fn toggle_favorite_project_path_at(
-    favorites_file: &Path,
-    home: Option<&Path>,
-    project_path: &str,
-) -> io::Result<bool> {
-    favorite_paths::toggle_favorite_project_path_at(favorites_file, home, project_path)
-}
-
 fn main_worktree_entry(project_path: &str) -> WorktreePickerEntry {
     WorktreePickerEntry {
         label: format!("{} (main)", session_name_for_path(project_path)),
         path: Some(project_path.to_owned()),
-        is_new: false,
-        occupied: false,
+        ..WorktreePickerEntry::default()
     }
 }
 
@@ -355,8 +342,7 @@ fn parse_git_worktree_list(text: &str) -> Vec<WorktreePickerEntry> {
                 entries.push(WorktreePickerEntry {
                     label: format!("{} ({branch})", session_name_for_path(&path)),
                     path: Some(path),
-                    is_new: false,
-                    occupied: false,
+                    ..WorktreePickerEntry::default()
                 });
             }
         } else if let Some(rest) = line.strip_prefix("worktree ") {
@@ -405,10 +391,10 @@ fn session_name_for_path(path: &str) -> &str {
 fn read(cwd: &str, args: &[&str]) -> Option<String> {
     record_subprocess("git read");
     let output = git_command(cwd, args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 fn run(cwd: &str, args: &[&str]) -> Result<(), String> {
@@ -416,11 +402,11 @@ fn run(cwd: &str, args: &[&str]) -> Result<(), String> {
     let output = git_command(cwd, args)
         .output()
         .map_err(|error| error.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
-    }
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| String::from_utf8_lossy(&output.stderr).trim().to_owned())
 }
 
 fn git_command(cwd: &str, args: &[&str]) -> Command {

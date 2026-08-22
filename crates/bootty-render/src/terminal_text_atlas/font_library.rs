@@ -7,7 +7,7 @@ use ab_glyph::{Font, FontArc, GlyphId, PxScale, ScaleFont, point};
 use std::collections::HashMap;
 
 use crate::font_database::{
-    font_style, font_weight, load_font_id, load_matching_font, query_font_id, system_font_database,
+    font_style, font_weight, load_font_id, query_font_id, system_font_database,
 };
 use crate::terminal_font_face::FontFaceMetrics;
 use crate::terminal_text::{FontFeature, ResolvedFontFace};
@@ -15,7 +15,7 @@ use crate::terminal_text::{FontFeature, ResolvedFontFace};
 #[derive(Clone, Debug)]
 pub(super) struct FontLibrary {
     database: &'static fontdb::Database,
-    fonts: HashMap<ResolvedFontFace, Option<FontArc>>,
+    font_ids: HashMap<ResolvedFontFace, Option<fontdb::ID>>,
     fonts_by_id: HashMap<fontdb::ID, Option<FontArc>>,
     fallback_font_ids: HashMap<FallbackFontKey, Option<fontdb::ID>>,
     metrics: HashMap<FontMetricsKey, FontFaceMetrics>,
@@ -43,7 +43,7 @@ impl FontLibrary {
     pub(super) fn new() -> Self {
         Self {
             database: system_font_database(),
-            fonts: HashMap::new(),
+            font_ids: HashMap::new(),
             fonts_by_id: HashMap::new(),
             fallback_font_ids: HashMap::new(),
             metrics: HashMap::new(),
@@ -75,30 +75,34 @@ impl FontLibrary {
             clusters,
         )
     }
-    fn primary_font_id(&self, face: &ResolvedFontFace) -> Option<fontdb::ID> {
-        for family in std::iter::once(&face.family).chain(face.fallback_families.iter()) {
-            let query_family = if family == "monospace" {
-                fontdb::Family::Monospace
-            } else {
-                fontdb::Family::Name(family)
-            };
-            if let Some(id) = query_font_id(self.database, &[query_family], face.style) {
-                return Some(id);
+    fn primary_font_id(&mut self, face: &ResolvedFontFace) -> Option<fontdb::ID> {
+        if !self.font_ids.contains_key(face) {
+            let mut id = None;
+            for family in std::iter::once(&face.family).chain(face.fallback_families.iter()) {
+                let query_family = if family == "monospace" {
+                    fontdb::Family::Monospace
+                } else {
+                    fontdb::Family::Name(family)
+                };
+                if let Some(found) = query_font_id(self.database, &[query_family], face.style) {
+                    id = Some(found);
+                    break;
+                }
             }
+            let id = id
+                .or_else(|| query_font_id(self.database, &[fontdb::Family::Monospace], face.style));
+            self.font_ids.insert(face.clone(), id);
         }
-        query_font_id(self.database, &[fontdb::Family::Monospace], face.style)
+        self.font_ids.get(face).copied().flatten()
     }
 
     fn font_has_shaping_features(&mut self, id: fontdb::ID) -> bool {
-        if let Some(&capable) = self.shaping_capable.get(&id) {
-            return capable;
-        }
-        let capable = self
-            .database
-            .with_face_data(id, font_has_ligature_features)
-            .unwrap_or(false);
-        self.shaping_capable.insert(id, capable);
-        capable
+        let database = self.database;
+        *self.shaping_capable.entry(id).or_insert_with(|| {
+            database
+                .with_face_data(id, font_has_ligature_features)
+                .unwrap_or(false)
+        })
     }
 
     pub(super) fn font_for_cluster(
@@ -107,46 +111,8 @@ impl FontLibrary {
         cluster: &ShapedCluster,
         physical_font_size: f32,
     ) -> Option<FontArc> {
-        let ch = cluster
-            .text
-            .chars()
-            .find(|ch| !is_combining_mark(*ch) && !is_variation_selector(*ch))?;
-        let font = self.font_for_face(face)?;
-        if font_supports_char(&font, ch) {
-            return Some(font);
-        }
-
-        for family in &face.fallback_families {
-            let candidate = ResolvedFontFace {
-                family: family.clone(),
-                fallback_families: Vec::new(),
-                style: face.style,
-            };
-            let Some(font) = self.font_for_face(&candidate) else {
-                continue;
-            };
-            if font_supports_char(&font, ch) {
-                return Some(font);
-            }
-        }
-
-        let fallback_key = FallbackFontKey {
-            face: face.clone(),
-            ch,
-            physical_font_size_bits: physical_font_size.to_bits(),
-        };
-        if !self.fallback_font_ids.contains_key(&fallback_key) {
-            let fallback_id = font_id_supporting_char(self.database, face, ch, physical_font_size);
-            self.fallback_font_ids
-                .insert(fallback_key.clone(), fallback_id);
-        }
-        if let Some(id) = self.fallback_font_ids.get(&fallback_key).copied().flatten()
-            && let Some(font) = self.font_for_id(id)
-        {
-            return Some(font);
-        }
-
-        Some(font)
+        let id = self.font_id_for_cluster(face, cluster, physical_font_size, true)?;
+        self.font_for_id(id)
     }
 
     #[cfg(windows)]
@@ -156,29 +122,34 @@ impl FontLibrary {
         cluster: &ShapedCluster,
         physical_font_size: f32,
     ) -> Option<String> {
-        let id = self.font_id_for_cluster(face, cluster, physical_font_size)?;
+        let id = self.font_id_for_cluster(face, cluster, physical_font_size, false)?;
         self.database
             .face(id)
             .and_then(|info| info.families.first())
             .map(|(family, _)| family.clone())
     }
 
-    #[cfg(windows)]
     fn font_id_for_cluster(
         &mut self,
         face: &ResolvedFontFace,
         cluster: &ShapedCluster,
         physical_font_size: f32,
+        fallback_to_primary: bool,
     ) -> Option<fontdb::ID> {
         let ch = cluster
             .text
             .chars()
             .find(|ch| !is_combining_mark(*ch) && !is_variation_selector(*ch))?;
-        if let Some(id) = self.primary_font_id(face)
-            && let Some(font) = self.font_for_id(id)
-            && font_supports_char(&font, ch)
+        let primary_id = self.primary_font_id(face);
+        let primary_font = primary_id.and_then(|id| self.font_for_id(id));
+        if fallback_to_primary && primary_font.is_none() {
+            return None;
+        }
+        if primary_font
+            .as_ref()
+            .is_some_and(|font| font_supports_char(font, ch))
         {
-            return Some(id);
+            return primary_id;
         }
 
         for family in &face.fallback_families {
@@ -205,23 +176,27 @@ impl FontLibrary {
             self.fallback_font_ids
                 .insert(fallback_key.clone(), fallback_id);
         }
-        self.fallback_font_ids.get(&fallback_key).copied().flatten()
+        let fallback_id = self.fallback_font_ids.get(&fallback_key).copied().flatten();
+        if fallback_to_primary {
+            fallback_id
+                .filter(|id| self.font_for_id(*id).is_some())
+                .or(primary_id)
+        } else {
+            fallback_id
+        }
     }
 
     pub(super) fn font_for_face(&mut self, face: &ResolvedFontFace) -> Option<FontArc> {
-        if !self.fonts.contains_key(face) {
-            let font = load_font(self.database, face);
-            self.fonts.insert(face.clone(), font);
-        }
-        self.fonts.get(face).cloned().flatten()
+        let id = self.primary_font_id(face)?;
+        self.font_for_id(id)
     }
 
     fn font_for_id(&mut self, id: fontdb::ID) -> Option<FontArc> {
-        if !self.fonts_by_id.contains_key(&id) {
-            let font = load_font_id(self.database, id);
-            self.fonts_by_id.insert(id, font);
-        }
-        self.fonts_by_id.get(&id).cloned().flatten()
+        let database = self.database;
+        self.fonts_by_id
+            .entry(id)
+            .or_insert_with(|| load_font_id(database, id))
+            .clone()
     }
 
     pub(super) fn font_face_metrics_for(
@@ -241,12 +216,10 @@ impl FontLibrary {
             width,
             height,
         };
-        if let Some(metrics) = self.metrics.get(&key) {
-            return *metrics;
-        }
-        let metrics = font_face_metrics(font, scale, constraint_cells, width, height);
-        self.metrics.insert(key, metrics);
-        metrics
+        *self
+            .metrics
+            .entry(key)
+            .or_insert_with(|| font_face_metrics(font, scale, constraint_cells, width, height))
     }
 }
 
@@ -290,20 +263,6 @@ pub(super) fn font_face_metrics(
         face_height: f64::from(face_height),
         face_y: f64::from(((height as f32 - face_height) * 0.5).max(0.0)),
     }
-}
-
-fn load_font(database: &fontdb::Database, face: &ResolvedFontFace) -> Option<FontArc> {
-    for family in std::iter::once(&face.family).chain(face.fallback_families.iter()) {
-        let query_family = if family == "monospace" {
-            fontdb::Family::Monospace
-        } else {
-            fontdb::Family::Name(family)
-        };
-        if let Some(font) = load_matching_font(database, &[query_family], face.style) {
-            return Some(font);
-        }
-    }
-    load_matching_font(database, &[fontdb::Family::Monospace], face.style)
 }
 
 fn font_id_supporting_char(

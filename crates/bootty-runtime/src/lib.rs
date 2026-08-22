@@ -9,7 +9,10 @@ pub mod terminal_session;
 pub mod terminfo;
 
 pub use benchmark_trace::{BenchmarkTrace, TraceValue};
-pub use pty_backlog::{PtyBacklog, drain_pty_backlog};
+pub use pty_backlog::{
+    OutputBacklog, PtyBacklog, drain_output_backlog, drain_output_backlog_with_limits,
+    drain_pty_backlog,
+};
 pub use terminal_session::{
     DrainStats, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
 };

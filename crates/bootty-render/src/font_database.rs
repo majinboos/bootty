@@ -137,6 +137,19 @@ pub(super) fn font_style(style: FontStyle) -> fontdb::Style {
     }
 }
 
+/// Every family name the system database exposes, sorted and de-duplicated. Scanning the database
+/// is expensive, so callers read this once and keep the list.
+#[must_use]
+pub fn installed_family_names() -> Vec<String> {
+    let mut names: Vec<String> = system_font_database()
+        .faces()
+        .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 pub fn system_font_database() -> &'static fontdb::Database {
     static SYSTEM_FONT_DATABASE: OnceLock<fontdb::Database> = OnceLock::new();
     SYSTEM_FONT_DATABASE.get_or_init(load_system_font_database)

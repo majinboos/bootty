@@ -1,5 +1,5 @@
 use bootty_winit::direct_input::ModifierSideState;
-use bootty_winit::input_binding::BindingTrigger;
+use bootty_winit::input_binding::{BindingModSide, BindingTrigger};
 use eframe::egui;
 
 /// Trigger flag prefixes from the binding grammar (`performable:`, `global:`, …). Surfaced as
@@ -114,74 +114,56 @@ pub(super) fn unprefix_combo(combo: &str, prefix: &str) -> String {
         .to_owned()
 }
 
+/// Whether any step of `combo` constrains a modifier to one side. Read from the parsed trigger,
+/// not the text, so `control+a` and `ctrl+a` both report "no side" rather than differing.
 pub(super) fn combo_has_modifier_sides(combo: &str) -> bool {
-    combo
-        .split('>')
-        .flat_map(|step| step.split('+'))
-        .any(is_sided_modifier_token)
+    combo.split('>').any(|step| {
+        step.parse::<BindingTrigger>().is_ok_and(|trigger| {
+            let mods = trigger.mods;
+            mods.shift_side.is_some()
+                || mods.ctrl_side.is_some()
+                || mods.alt_side.is_some()
+                || mods.command_side.is_some()
+        })
+    })
 }
 
 pub(super) fn strip_modifier_sides(combo: &str) -> String {
-    rewrite_modifier_tokens(combo, strip_modifier_side_token)
+    rewrite_modifier_sides(combo, |trigger| {
+        trigger.mods = trigger.mods.without_side_constraints();
+    })
 }
 
+/// Constrain every held modifier to its left side, the side a recorder defaults to.
 pub(super) fn add_default_modifier_sides(combo: &str) -> String {
-    rewrite_modifier_tokens(combo, add_default_modifier_side_token)
+    rewrite_modifier_sides(combo, |trigger| {
+        for (held, side) in [
+            (trigger.mods.shift, &mut trigger.mods.shift_side),
+            (trigger.mods.ctrl, &mut trigger.mods.ctrl_side),
+            (trigger.mods.alt, &mut trigger.mods.alt_side),
+            (trigger.mods.command, &mut trigger.mods.command_side),
+        ] {
+            if held && side.is_none() {
+                *side = Some(BindingModSide::Left);
+            }
+        }
+    })
 }
 
-fn rewrite_modifier_tokens(combo: &str, rewrite: fn(&str) -> &str) -> String {
+/// Rewrite each step through the binding grammar's own parser and writer. A step that does not
+/// parse is kept verbatim, so toggling the side of a half-typed row never blanks it.
+fn rewrite_modifier_sides(combo: &str, rewrite: impl Fn(&mut BindingTrigger)) -> String {
     combo
         .split('>')
-        .map(|step| step.split('+').map(rewrite).collect::<Vec<_>>().join("+"))
+        .map(|step| match step.parse::<BindingTrigger>() {
+            Ok(mut trigger) => {
+                rewrite(&mut trigger);
+                trigger.format_entry()
+            }
+            Err(_) => step.to_owned(),
+        })
         .collect::<Vec<_>>()
         .join(">")
-}
-
-fn strip_modifier_side_token(token: &str) -> &str {
-    match token {
-        "left_shift" | "right_shift" => "shift",
-        "left_ctrl" | "left_control" | "right_ctrl" | "right_control" => "ctrl",
-        "left_alt" | "left_opt" | "left_option" | "right_alt" | "right_opt" | "right_option" => {
-            "alt"
-        }
-        "left_cmd" | "left_command" | "left_super" | "right_cmd" | "right_command"
-        | "right_super" => "cmd",
-        other => other,
-    }
-}
-
-fn add_default_modifier_side_token(token: &str) -> &str {
-    match token {
-        "shift" => "left_shift",
-        "ctrl" | "control" => "left_ctrl",
-        "alt" | "opt" | "option" => "left_alt",
-        "cmd" | "command" | "super" => "left_cmd",
-        other => other,
-    }
-}
-
-fn is_sided_modifier_token(token: &str) -> bool {
-    matches!(
-        token,
-        "left_shift"
-            | "right_shift"
-            | "left_ctrl"
-            | "left_control"
-            | "right_ctrl"
-            | "right_control"
-            | "left_alt"
-            | "left_opt"
-            | "left_option"
-            | "right_alt"
-            | "right_opt"
-            | "right_option"
-            | "left_cmd"
-            | "left_command"
-            | "left_super"
-            | "right_cmd"
-            | "right_command"
-            | "right_super"
-    )
 }
 
 pub(super) fn trigger_step(key: egui::Key, modifiers: egui::Modifiers) -> Option<String> {
@@ -207,67 +189,23 @@ pub(super) fn scroll_step(
 }
 
 fn modified_step(token: &str, modifiers: egui::Modifiers) -> String {
-    let mut parts: Vec<&str> = Vec::new();
     // egui aliases `command` to `ctrl` off macOS, so only treat the real Cmd key as cmd.
-    if cfg!(target_os = "macos") && (modifiers.mac_cmd || modifiers.command) {
-        parts.push("cmd");
-    }
-    if modifiers.ctrl {
-        parts.push("ctrl");
-    }
-    if modifiers.alt {
-        parts.push("alt");
-    }
-    if modifiers.shift {
-        parts.push("shift");
-    }
-    let mut step = parts.join("+");
-    if !step.is_empty() {
-        step.push('+');
-    }
-    step.push_str(token);
-    step
+    [
+        (cfg!(target_os = "macos") && (modifiers.mac_cmd || modifiers.command)).then_some("cmd"),
+        modifiers.ctrl.then_some("ctrl"),
+        modifiers.alt.then_some("alt"),
+        modifiers.shift.then_some("shift"),
+        Some(token),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("+")
 }
 
 fn key_token(key: egui::Key) -> Option<String> {
     use egui::Key;
     let token = match key {
-        Key::A => "a",
-        Key::B => "b",
-        Key::C => "c",
-        Key::D => "d",
-        Key::E => "e",
-        Key::F => "f",
-        Key::G => "g",
-        Key::H => "h",
-        Key::I => "i",
-        Key::J => "j",
-        Key::K => "k",
-        Key::L => "l",
-        Key::M => "m",
-        Key::N => "n",
-        Key::O => "o",
-        Key::P => "p",
-        Key::Q => "q",
-        Key::R => "r",
-        Key::S => "s",
-        Key::T => "t",
-        Key::U => "u",
-        Key::V => "v",
-        Key::W => "w",
-        Key::X => "x",
-        Key::Y => "y",
-        Key::Z => "z",
-        Key::Num0 => "0",
-        Key::Num1 => "1",
-        Key::Num2 => "2",
-        Key::Num3 => "3",
-        Key::Num4 => "4",
-        Key::Num5 => "5",
-        Key::Num6 => "6",
-        Key::Num7 => "7",
-        Key::Num8 => "8",
-        Key::Num9 => "9",
         Key::Comma => ",",
         Key::Period => ".",
         Key::Slash => "/",
@@ -280,32 +218,30 @@ fn key_token(key: egui::Key) -> Option<String> {
         Key::OpenBracket => "[",
         Key::CloseBracket => "]",
         Key::Space => "space",
-        Key::Enter => "Enter",
-        Key::Tab => "Tab",
-        Key::Backspace => "Backspace",
-        Key::Delete => "Delete",
         Key::ArrowUp => "ArrowUp",
         Key::ArrowDown => "ArrowDown",
         Key::ArrowLeft => "ArrowLeft",
         Key::ArrowRight => "ArrowRight",
-        Key::Home => "Home",
-        Key::End => "End",
-        Key::PageUp => "PageUp",
-        Key::PageDown => "PageDown",
-        Key::Insert => "Insert",
-        Key::F1 => "F1",
-        Key::F2 => "F2",
-        Key::F3 => "F3",
-        Key::F4 => "F4",
-        Key::F5 => "F5",
-        Key::F6 => "F6",
-        Key::F7 => "F7",
-        Key::F8 => "F8",
-        Key::F9 => "F9",
-        Key::F10 => "F10",
-        Key::F11 => "F11",
-        Key::F12 => "F12",
-        _ => return None,
+        _ => {
+            let name = key.name();
+            if name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric() {
+                return Some(name.to_ascii_lowercase());
+            }
+            return ((Key::F1..=Key::F12).contains(&key)
+                || matches!(
+                    key,
+                    Key::Enter
+                        | Key::Tab
+                        | Key::Backspace
+                        | Key::Delete
+                        | Key::Home
+                        | Key::End
+                        | Key::PageUp
+                        | Key::PageDown
+                        | Key::Insert
+                ))
+            .then(|| name.to_owned());
+        }
     };
     Some(token.to_owned())
 }

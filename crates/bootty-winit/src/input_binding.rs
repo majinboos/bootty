@@ -306,94 +306,194 @@ impl BindingKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum BindingAction {
-    Ignore,
-    Unbind,
-    Reset,
-    ReloadConfig,
-    NewWindow,
-    NewMuxSession,
-    SessionPicker,
-    CommandPalette,
-    CloseWindow,
-    CloseSurface,
-    Quit,
-    ToggleFullscreen,
-    ToggleSidebarFocus,
-    ToggleSidebarVisibility,
-    OpenSettings,
-    ChangeAppearance(AppearanceChoice),
-    SwitchTheme,
-    Csi(String),
-    Esc(String),
-    Text(String),
-    Search(String),
-    SearchSelection,
-    NavigateSearch(NavigateSearch),
-    StartSearch,
-    EndSearch,
-    CopyToClipboard(CopyToClipboard),
-    CopyUrlToClipboard,
-    CopyTitleToClipboard,
-    PasteFromClipboard,
-    CopyMode,
-    PasteFromSelection,
-    IncreaseFontSize(f32),
-    DecreaseFontSize(f32),
-    ResetFontSize,
-    SetFontSize(f32),
-    SetSurfaceTitle(String),
-    SetTabTitle(String),
-    ClearScreen,
-    SelectAll,
-    ScrollToTop,
-    ScrollToBottom,
-    ScrollToSelection,
-    ScrollToRow(usize),
-    ScrollPageUp,
-    ScrollPageDown,
-    ScrollPageFractional(f32),
-    ScrollPageLines(i16),
-    AdjustSelection(AdjustSelection),
-    JumpToPrompt(i16),
-    WriteScrollbackFile(WriteScreen),
-    NewTab,
-    NextTab,
-    PreviousTab,
-    LastTab,
-    SelectTab(u32),
-    MoveTab(i32),
-    SplitRight,
-    SplitDown,
-    SelectPane(PaneDirection),
-    NextPane,
-    PreviousPane,
-    KillPane,
-    TogglePaneZoom,
-    NextSession,
-    PreviousSession,
-    CreateSpace,
-    CloseSpace,
-    EditSpace,
-    NextSpace,
-    PreviousSpace,
-    SelectSpace(u32),
-    LastSession,
-    SelectSession(u32),
-    MoveSession(i32),
-    DitchSession,
-    RenameSession,
-    RenameTab,
-    ShowKeybinds,
-    WriteScreenFile(WriteScreen),
-    WriteSelectionFile(WriteScreen),
-    ToggleMouseReporting,
-    EndKeySequence,
-    ActivateKeyTable(String),
-    ActivateKeyTableOnce(String),
-    DeactivateKeyTable,
-    DeactivateAllKeyTables,
+macro_rules! format_binding_action {
+    (unit, $name:literal) => {
+        $name.to_owned()
+    };
+    (required_string, $name:literal, $value:ident) => {
+        format!("{}:{}", $name, $value)
+    };
+    (escaped_string, $name:literal, $value:ident) => {
+        format!("{}:{}", $name, format_text_bytes($value))
+    };
+    (nested_enum($parse:path), $name:literal, $value:ident) => {
+        format!("{}:{}", $name, $value.as_str())
+    };
+    (copy_to_clipboard, $name:literal, $value:ident) => {
+        format!("{}:{}", $name, $value.as_str())
+    };
+    (write_screen, $name:literal, $value:ident) => {
+        format!("{}:{}", $name, $value.format_entry())
+    };
+    ($kind:ident $(($parse:path))?, $name:literal, $value:ident) => {
+        format!("{}:{}", $name, $value)
+    };
+}
+
+macro_rules! parse_binding_action {
+    (unit, $value:ident, $variant:path) => {
+        parse_unit($value, $variant)
+    };
+    (required_string, $value:ident, $variant:path) => {
+        parse_required($value, |value| Ok($variant(value.to_owned())))
+    };
+    (escaped_string, $value:ident, $variant:path) => {
+        parse_binding_action!(required_string, $value, $variant)
+    };
+    (finite_number, $value:ident, $variant:path) => {
+        parse_required($value, |value| Ok($variant(parse_f32(value)?)))
+    };
+    (positive_index, $value:ident, $variant:path) => {
+        parse_required($value, |value| Ok($variant(parse_u32(value)?)))
+    };
+    (number($parse:path), $value:ident, $variant:path) => {
+        parse_required($value, |value| Ok($variant($parse(value)?)))
+    };
+    (nested_enum($parse:path), $value:ident, $variant:path) => {
+        parse_required($value, |value| Ok($variant($parse(value)?)))
+    };
+    (write_screen, $value:ident, $variant:path) => {
+        parse_required($value, |value| Ok($variant(WriteScreen::parse(value)?)))
+    };
+    (copy_to_clipboard, $value:ident, $variant:path) => {
+        match $value {
+            Some(value) => Ok($variant(CopyToClipboard::parse(value)?)),
+            None => Ok($variant(CopyToClipboard::default())),
+        }
+    };
+}
+
+macro_rules! binding_actions {
+    (
+        $(
+            $variant:ident $(($binding:ident: $ty:ty))?
+                => $name:literal [$kind:ident $(($parse:path))?],
+        )+
+    ) => {
+        #[derive(Clone, Debug, PartialEq)]
+        pub enum BindingAction {
+            $($variant $(($ty))?,)+
+        }
+
+        impl BindingAction {
+            pub fn format_entry(&self) -> String {
+                match self {
+                    $(
+                        Self::$variant $(($binding))? => format_binding_action!(
+                            $kind $(($parse))?, $name $(, $binding)?
+                        ),
+                    )+
+                }
+            }
+        }
+
+        pub fn parse_action(input: &str) -> Result<BindingAction, BindingParseError> {
+            let (name, value) = match input.split_once(':') {
+                Some((name, value)) => (name, Some(value)),
+                None => (input, None),
+            };
+            match name {
+                $(
+                    $name => parse_binding_action!(
+                        $kind $(($parse))?, value, BindingAction::$variant
+                    ),
+                )+
+                _ => Err(BindingParseError::InvalidAction),
+            }
+        }
+    };
+}
+
+binding_actions! {
+    Ignore => "ignore" [unit],
+    Unbind => "unbind" [unit],
+    Reset => "reset" [unit],
+    ReloadConfig => "reload_config" [unit],
+    NewWindow => "new_window" [unit],
+    NewMuxSession => "new_mux_session" [unit],
+    SessionPicker => "session_picker" [unit],
+    CommandPalette => "command_palette" [unit],
+    CloseWindow => "close_window" [unit],
+    CloseSurface => "close_surface" [unit],
+    Quit => "quit" [unit],
+    ToggleFullscreen => "toggle_fullscreen" [unit],
+    ToggleSidebarFocus => "toggle_sidebar_focus" [unit],
+    ToggleSidebarVisibility => "toggle_sidebar_visibility" [unit],
+    OpenSettings => "open_settings" [unit],
+    ChangeAppearance(value: AppearanceChoice)
+        => "change_appearance" [nested_enum(AppearanceChoice::parse)],
+    SwitchTheme => "switch_theme" [unit],
+    Csi(value: String) => "csi" [required_string],
+    Esc(value: String) => "esc" [required_string],
+    Text(value: String) => "text" [escaped_string],
+    Search(value: String) => "search" [escaped_string],
+    SearchSelection => "search_selection" [unit],
+    NavigateSearch(value: NavigateSearch)
+        => "navigate_search" [nested_enum(NavigateSearch::parse)],
+    StartSearch => "start_search" [unit],
+    EndSearch => "end_search" [unit],
+    CopyToClipboard(value: CopyToClipboard) => "copy_to_clipboard" [copy_to_clipboard],
+    CopyUrlToClipboard => "copy_url_to_clipboard" [unit],
+    CopyTitleToClipboard => "copy_title_to_clipboard" [unit],
+    PasteFromClipboard => "paste_from_clipboard" [unit],
+    CopyMode => "copy_mode" [unit],
+    PasteFromSelection => "paste_from_selection" [unit],
+    IncreaseFontSize(value: f32) => "increase_font_size" [finite_number],
+    DecreaseFontSize(value: f32) => "decrease_font_size" [finite_number],
+    ResetFontSize => "reset_font_size" [unit],
+    SetFontSize(value: f32) => "set_font_size" [finite_number],
+    SetSurfaceTitle(value: String) => "set_surface_title" [escaped_string],
+    SetTabTitle(value: String) => "set_tab_title" [escaped_string],
+    ClearScreen => "clear_screen" [unit],
+    SelectAll => "select_all" [unit],
+    ScrollToTop => "scroll_to_top" [unit],
+    ScrollToBottom => "scroll_to_bottom" [unit],
+    ScrollToSelection => "scroll_to_selection" [unit],
+    ScrollToRow(value: usize) => "scroll_to_row" [number(parse_usize)],
+    ScrollPageUp => "scroll_page_up" [unit],
+    ScrollPageDown => "scroll_page_down" [unit],
+    ScrollPageFractional(value: f32) => "scroll_page_fractional" [finite_number],
+    ScrollPageLines(value: i16) => "scroll_page_lines" [number(parse_i16)],
+    AdjustSelection(value: AdjustSelection)
+        => "adjust_selection" [nested_enum(AdjustSelection::parse)],
+    JumpToPrompt(value: i16) => "jump_to_prompt" [number(parse_i16)],
+    WriteScrollbackFile(value: WriteScreen) => "write_scrollback_file" [write_screen],
+    NewTab => "new_tab" [unit],
+    NextTab => "next_tab" [unit],
+    PreviousTab => "previous_tab" [unit],
+    LastTab => "last_tab" [unit],
+    SelectTab(value: u32) => "select_tab" [positive_index],
+    MoveTab(value: i32) => "move_tab" [number(parse_i32)],
+    SplitRight => "split_right" [unit],
+    SplitDown => "split_down" [unit],
+    SelectPane(value: PaneDirection) => "select_pane" [nested_enum(PaneDirection::parse)],
+    NextPane => "next_pane" [unit],
+    PreviousPane => "previous_pane" [unit],
+    KillPane => "kill_pane" [unit],
+    TogglePaneZoom => "toggle_pane_zoom" [unit],
+    NextSession => "next_session" [unit],
+    PreviousSession => "previous_session" [unit],
+    CreateSpace => "create_space" [unit],
+    CloseSpace => "close_space" [unit],
+    EditSpace => "edit_space" [unit],
+    NextSpace => "next_space" [unit],
+    PreviousSpace => "previous_space" [unit],
+    SelectSpace(value: u32) => "select_space" [positive_index],
+    LastSession => "last_session" [unit],
+    SelectSession(value: u32) => "select_session" [positive_index],
+    MoveSession(value: i32) => "move_session" [number(parse_i32)],
+    DitchSession => "ditch_session" [unit],
+    RenameSession => "rename_session" [unit],
+    RenameTab => "rename_tab" [unit],
+    ShowKeybinds => "show_keybinds" [unit],
+    WriteScreenFile(value: WriteScreen) => "write_screen_file" [write_screen],
+    WriteSelectionFile(value: WriteScreen) => "write_selection_file" [write_screen],
+    ToggleMouseReporting => "toggle_mouse_reporting" [unit],
+    EndKeySequence => "end_key_sequence" [unit],
+    ActivateKeyTable(value: String) => "activate_key_table" [escaped_string],
+    ActivateKeyTableOnce(value: String) => "activate_key_table_once" [escaped_string],
+    DeactivateKeyTable => "deactivate_key_table" [unit],
+    DeactivateAllKeyTables => "deactivate_all_key_tables" [unit],
 }
 
 macro_rules! string_enum {
@@ -584,109 +684,6 @@ pub struct WriteScreen {
     pub emit: WriteScreenFormat,
 }
 
-impl BindingAction {
-    pub fn format_entry(&self) -> String {
-        match self {
-            Self::Ignore => "ignore".to_owned(),
-            Self::Unbind => "unbind".to_owned(),
-            Self::Reset => "reset".to_owned(),
-            Self::ReloadConfig => "reload_config".to_owned(),
-            Self::NewWindow => "new_window".to_owned(),
-            Self::NewMuxSession => "new_mux_session".to_owned(),
-            Self::SessionPicker => "session_picker".to_owned(),
-            Self::CommandPalette => "command_palette".to_owned(),
-            Self::CloseWindow => "close_window".to_owned(),
-            Self::CloseSurface => "close_surface".to_owned(),
-            Self::Quit => "quit".to_owned(),
-            Self::ToggleFullscreen => "toggle_fullscreen".to_owned(),
-            Self::ToggleSidebarFocus => "toggle_sidebar_focus".to_owned(),
-            Self::ToggleSidebarVisibility => "toggle_sidebar_visibility".to_owned(),
-            Self::OpenSettings => "open_settings".to_owned(),
-            Self::ChangeAppearance(value) => format!("change_appearance:{}", value.as_str()),
-            Self::SwitchTheme => "switch_theme".to_owned(),
-            Self::Csi(value) => format!("csi:{value}"),
-            Self::Esc(value) => format!("esc:{value}"),
-            Self::Text(value) => format!("text:{}", format_text_bytes(value)),
-            Self::Search(value) => format!("search:{}", format_text_bytes(value)),
-            Self::SearchSelection => "search_selection".to_owned(),
-            Self::NavigateSearch(value) => format!("navigate_search:{}", value.as_str()),
-            Self::StartSearch => "start_search".to_owned(),
-            Self::EndSearch => "end_search".to_owned(),
-            Self::CopyToClipboard(value) => format!("copy_to_clipboard:{}", value.as_str()),
-            Self::CopyUrlToClipboard => "copy_url_to_clipboard".to_owned(),
-            Self::CopyTitleToClipboard => "copy_title_to_clipboard".to_owned(),
-            Self::PasteFromClipboard => "paste_from_clipboard".to_owned(),
-            Self::CopyMode => "copy_mode".to_owned(),
-            Self::PasteFromSelection => "paste_from_selection".to_owned(),
-            Self::IncreaseFontSize(value) => format!("increase_font_size:{value}"),
-            Self::DecreaseFontSize(value) => format!("decrease_font_size:{value}"),
-            Self::ResetFontSize => "reset_font_size".to_owned(),
-            Self::SetFontSize(value) => format!("set_font_size:{value}"),
-            Self::SetSurfaceTitle(value) => {
-                format!("set_surface_title:{}", format_text_bytes(value))
-            }
-            Self::SetTabTitle(value) => format!("set_tab_title:{}", format_text_bytes(value)),
-            Self::ClearScreen => "clear_screen".to_owned(),
-            Self::SelectAll => "select_all".to_owned(),
-            Self::ScrollToTop => "scroll_to_top".to_owned(),
-            Self::ScrollToBottom => "scroll_to_bottom".to_owned(),
-            Self::ScrollToSelection => "scroll_to_selection".to_owned(),
-            Self::ScrollToRow(value) => format!("scroll_to_row:{value}"),
-            Self::ScrollPageUp => "scroll_page_up".to_owned(),
-            Self::ScrollPageDown => "scroll_page_down".to_owned(),
-            Self::ScrollPageFractional(value) => format!("scroll_page_fractional:{value}"),
-            Self::ScrollPageLines(value) => format!("scroll_page_lines:{value}"),
-            Self::NewTab => "new_tab".to_owned(),
-            Self::NextTab => "next_tab".to_owned(),
-            Self::PreviousTab => "previous_tab".to_owned(),
-            Self::LastTab => "last_tab".to_owned(),
-            Self::SelectTab(value) => format!("select_tab:{value}"),
-            Self::MoveTab(value) => format!("move_tab:{value}"),
-            Self::SplitRight => "split_right".to_owned(),
-            Self::SplitDown => "split_down".to_owned(),
-            Self::SelectPane(value) => format!("select_pane:{}", value.as_str()),
-            Self::NextPane => "next_pane".to_owned(),
-            Self::PreviousPane => "previous_pane".to_owned(),
-            Self::KillPane => "kill_pane".to_owned(),
-            Self::TogglePaneZoom => "toggle_pane_zoom".to_owned(),
-            Self::NextSession => "next_session".to_owned(),
-            Self::PreviousSession => "previous_session".to_owned(),
-            Self::CreateSpace => "create_space".to_owned(),
-            Self::EditSpace => "edit_space".to_owned(),
-            Self::CloseSpace => "close_space".to_owned(),
-            Self::NextSpace => "next_space".to_owned(),
-            Self::PreviousSpace => "previous_space".to_owned(),
-            Self::SelectSpace(value) => format!("select_space:{value}"),
-            Self::LastSession => "last_session".to_owned(),
-            Self::SelectSession(value) => format!("select_session:{value}"),
-            Self::MoveSession(value) => format!("move_session:{value}"),
-            Self::DitchSession => "ditch_session".to_owned(),
-            Self::RenameSession => "rename_session".to_owned(),
-            Self::RenameTab => "rename_tab".to_owned(),
-            Self::ShowKeybinds => "show_keybinds".to_owned(),
-            Self::AdjustSelection(value) => format!("adjust_selection:{}", value.as_str()),
-            Self::JumpToPrompt(value) => format!("jump_to_prompt:{value}"),
-            Self::WriteScrollbackFile(value) => {
-                format!("write_scrollback_file:{}", value.format_entry())
-            }
-            Self::WriteScreenFile(value) => format!("write_screen_file:{}", value.format_entry()),
-            Self::WriteSelectionFile(value) => {
-                format!("write_selection_file:{}", value.format_entry())
-            }
-            Self::ToggleMouseReporting => "toggle_mouse_reporting".to_owned(),
-            Self::EndKeySequence => "end_key_sequence".to_owned(),
-            Self::ActivateKeyTable(value) => {
-                format!("activate_key_table:{}", format_text_bytes(value))
-            }
-            Self::ActivateKeyTableOnce(value) => {
-                format!("activate_key_table_once:{}", format_text_bytes(value))
-            }
-            Self::DeactivateKeyTable => "deactivate_key_table".to_owned(),
-            Self::DeactivateAllKeyTables => "deactivate_all_key_tables".to_owned(),
-        }
-    }
-}
-
 impl WriteScreen {
     fn parse(input: &str) -> Result<Self, BindingParseError> {
         let (action, emit) = match input.split_once(',') {
@@ -808,159 +805,6 @@ fn split_binding(input: &str) -> Result<(&str, &str), BindingParseError> {
         return Ok((&input[..index], &input[index + 1..]));
     }
     Err(BindingParseError::InvalidFormat)
-}
-
-pub fn parse_action(input: &str) -> Result<BindingAction, BindingParseError> {
-    let (name, value) = match input.split_once(':') {
-        Some((name, value)) => (name, Some(value)),
-        None => (input, None),
-    };
-    match name {
-        "ignore" => parse_unit(value, BindingAction::Ignore),
-        "unbind" => parse_unit(value, BindingAction::Unbind),
-        "reset" => parse_unit(value, BindingAction::Reset),
-        "reload_config" => parse_unit(value, BindingAction::ReloadConfig),
-        "new_window" => parse_unit(value, BindingAction::NewWindow),
-        "new_mux_session" => parse_unit(value, BindingAction::NewMuxSession),
-        "session_picker" => parse_unit(value, BindingAction::SessionPicker),
-        "command_palette" => parse_unit(value, BindingAction::CommandPalette),
-        "close_window" => parse_unit(value, BindingAction::CloseWindow),
-        "close_surface" => parse_unit(value, BindingAction::CloseSurface),
-        "quit" => parse_unit(value, BindingAction::Quit),
-        "toggle_fullscreen" => parse_unit(value, BindingAction::ToggleFullscreen),
-        "toggle_sidebar_focus" => parse_unit(value, BindingAction::ToggleSidebarFocus),
-        "toggle_sidebar_visibility" => parse_unit(value, BindingAction::ToggleSidebarVisibility),
-        "open_settings" => parse_unit(value, BindingAction::OpenSettings),
-        "change_appearance" => parse_required(value, |value| {
-            Ok(BindingAction::ChangeAppearance(AppearanceChoice::parse(
-                value,
-            )?))
-        }),
-        "switch_theme" => parse_unit(value, BindingAction::SwitchTheme),
-        "csi" => parse_required(value, |value| Ok(BindingAction::Csi(value.to_owned()))),
-        "esc" => parse_required(value, |value| Ok(BindingAction::Esc(value.to_owned()))),
-        "text" => parse_required(value, |value| Ok(BindingAction::Text(value.to_owned()))),
-        "search" => parse_required(value, |value| Ok(BindingAction::Search(value.to_owned()))),
-        "search_selection" => parse_unit(value, BindingAction::SearchSelection),
-        "navigate_search" => parse_required(value, |value| {
-            Ok(BindingAction::NavigateSearch(NavigateSearch::parse(value)?))
-        }),
-        "start_search" => parse_unit(value, BindingAction::StartSearch),
-        "end_search" => parse_unit(value, BindingAction::EndSearch),
-        "copy_to_clipboard" => match value {
-            Some(value) => Ok(BindingAction::CopyToClipboard(CopyToClipboard::parse(
-                value,
-            )?)),
-            None => Ok(BindingAction::CopyToClipboard(CopyToClipboard::default())),
-        },
-        "copy_url_to_clipboard" => parse_unit(value, BindingAction::CopyUrlToClipboard),
-        "copy_title_to_clipboard" => parse_unit(value, BindingAction::CopyTitleToClipboard),
-        "paste_from_clipboard" => parse_unit(value, BindingAction::PasteFromClipboard),
-        "paste_from_selection" => parse_unit(value, BindingAction::PasteFromSelection),
-        "copy_mode" => parse_unit(value, BindingAction::CopyMode),
-        "increase_font_size" => parse_required(value, |value| {
-            Ok(BindingAction::IncreaseFontSize(parse_f32(value)?))
-        }),
-        "decrease_font_size" => parse_required(value, |value| {
-            Ok(BindingAction::DecreaseFontSize(parse_f32(value)?))
-        }),
-        "reset_font_size" => parse_unit(value, BindingAction::ResetFontSize),
-        "set_font_size" => parse_required(value, |value| {
-            Ok(BindingAction::SetFontSize(parse_f32(value)?))
-        }),
-        "set_surface_title" => parse_required(value, |value| {
-            Ok(BindingAction::SetSurfaceTitle(value.to_owned()))
-        }),
-        "set_tab_title" => parse_required(value, |value| {
-            Ok(BindingAction::SetTabTitle(value.to_owned()))
-        }),
-        "clear_screen" => parse_unit(value, BindingAction::ClearScreen),
-        "select_all" => parse_unit(value, BindingAction::SelectAll),
-        "scroll_to_top" => parse_unit(value, BindingAction::ScrollToTop),
-        "scroll_to_bottom" => parse_unit(value, BindingAction::ScrollToBottom),
-        "scroll_to_selection" => parse_unit(value, BindingAction::ScrollToSelection),
-        "scroll_to_row" => parse_required(value, |value| {
-            Ok(BindingAction::ScrollToRow(parse_usize(value)?))
-        }),
-        "scroll_page_up" => parse_unit(value, BindingAction::ScrollPageUp),
-        "scroll_page_down" => parse_unit(value, BindingAction::ScrollPageDown),
-        "scroll_page_fractional" => parse_required(value, |value| {
-            Ok(BindingAction::ScrollPageFractional(parse_f32(value)?))
-        }),
-        "scroll_page_lines" => parse_required(value, |value| {
-            Ok(BindingAction::ScrollPageLines(parse_i16(value)?))
-        }),
-        "adjust_selection" => parse_required(value, |value| {
-            Ok(BindingAction::AdjustSelection(AdjustSelection::parse(
-                value,
-            )?))
-        }),
-        "new_tab" => parse_unit(value, BindingAction::NewTab),
-        "next_tab" => parse_unit(value, BindingAction::NextTab),
-        "previous_tab" => parse_unit(value, BindingAction::PreviousTab),
-        "last_tab" => parse_unit(value, BindingAction::LastTab),
-        "select_tab" => parse_required(value, |value| {
-            Ok(BindingAction::SelectTab(parse_u32(value)?))
-        }),
-        "move_tab" => parse_required(value, |value| Ok(BindingAction::MoveTab(parse_i32(value)?))),
-        "split_right" => parse_unit(value, BindingAction::SplitRight),
-        "split_down" => parse_unit(value, BindingAction::SplitDown),
-        "select_pane" => parse_required(value, |value| {
-            Ok(BindingAction::SelectPane(PaneDirection::parse(value)?))
-        }),
-        "next_pane" => parse_unit(value, BindingAction::NextPane),
-        "previous_pane" => parse_unit(value, BindingAction::PreviousPane),
-        "kill_pane" => parse_unit(value, BindingAction::KillPane),
-        "toggle_pane_zoom" => parse_unit(value, BindingAction::TogglePaneZoom),
-        "next_session" => parse_unit(value, BindingAction::NextSession),
-        "previous_session" => parse_unit(value, BindingAction::PreviousSession),
-        "create_space" => parse_unit(value, BindingAction::CreateSpace),
-        "edit_space" => parse_unit(value, BindingAction::EditSpace),
-        "close_space" => parse_unit(value, BindingAction::CloseSpace),
-        "next_space" => parse_unit(value, BindingAction::NextSpace),
-        "previous_space" => parse_unit(value, BindingAction::PreviousSpace),
-        "select_space" => parse_required(value, |value| {
-            Ok(BindingAction::SelectSpace(parse_u32(value)?))
-        }),
-        "last_session" => parse_unit(value, BindingAction::LastSession),
-        "select_session" => parse_required(value, |value| {
-            Ok(BindingAction::SelectSession(parse_u32(value)?))
-        }),
-        "move_session" => parse_required(value, |value| {
-            Ok(BindingAction::MoveSession(parse_i32(value)?))
-        }),
-        "ditch_session" => parse_unit(value, BindingAction::DitchSession),
-        "rename_session" => parse_unit(value, BindingAction::RenameSession),
-        "rename_tab" => parse_unit(value, BindingAction::RenameTab),
-        "show_keybinds" => parse_unit(value, BindingAction::ShowKeybinds),
-        "jump_to_prompt" => parse_required(value, |value| {
-            Ok(BindingAction::JumpToPrompt(parse_i16(value)?))
-        }),
-        "write_scrollback_file" => parse_required(value, |value| {
-            Ok(BindingAction::WriteScrollbackFile(WriteScreen::parse(
-                value,
-            )?))
-        }),
-        "write_screen_file" => parse_required(value, |value| {
-            Ok(BindingAction::WriteScreenFile(WriteScreen::parse(value)?))
-        }),
-        "write_selection_file" => parse_required(value, |value| {
-            Ok(BindingAction::WriteSelectionFile(WriteScreen::parse(
-                value,
-            )?))
-        }),
-        "toggle_mouse_reporting" => parse_unit(value, BindingAction::ToggleMouseReporting),
-        "end_key_sequence" => parse_unit(value, BindingAction::EndKeySequence),
-        "activate_key_table" => parse_required(value, |value| {
-            Ok(BindingAction::ActivateKeyTable(value.to_owned()))
-        }),
-        "activate_key_table_once" => parse_required(value, |value| {
-            Ok(BindingAction::ActivateKeyTableOnce(value.to_owned()))
-        }),
-        "deactivate_key_table" => parse_unit(value, BindingAction::DeactivateKeyTable),
-        "deactivate_all_key_tables" => parse_unit(value, BindingAction::DeactivateAllKeyTables),
-        _ => Err(BindingParseError::InvalidAction),
-    }
 }
 
 fn parse_unit(

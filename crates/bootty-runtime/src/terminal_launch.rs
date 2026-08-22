@@ -90,9 +90,9 @@ pub(crate) fn spawn(
         command.env_remove(name);
     }
     command.env(TERM_ENV, &launch_env.term);
-    command.env(COLORTERM_ENV, &launch_env.colorterm);
-    command.env(TERM_PROGRAM_ENV, &launch_env.term_program);
-    command.env(TERM_PROGRAM_VERSION_ENV, &launch_env.term_program_version);
+    command.env(COLORTERM_ENV, &config.colorterm);
+    command.env(TERM_PROGRAM_ENV, TERMINAL_PROGRAM);
+    command.env(TERM_PROGRAM_VERSION_ENV, TERMINAL_PROGRAM_VERSION);
     if let Some(terminfo) = &launch_env.terminfo {
         command.env(TERMINFO_ENV, terminfo.to_string_lossy().into_owned());
     }
@@ -123,10 +123,7 @@ pub(crate) fn spawn(
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ResolvedLaunchEnvironment {
     term: String,
-    colorterm: String,
     terminfo: Option<std::path::PathBuf>,
-    term_program: String,
-    term_program_version: String,
     env: Vec<(String, String)>,
 }
 
@@ -151,10 +148,7 @@ fn resolve_launch_environment(
 
     ResolvedLaunchEnvironment {
         term,
-        colorterm: config.colorterm.clone(),
         terminfo,
-        term_program: TERMINAL_PROGRAM.to_owned(),
-        term_program_version: TERMINAL_PROGRAM_VERSION.to_owned(),
         env,
     }
 }
@@ -173,7 +167,9 @@ pub fn configured_user_shell() -> Option<String> {
 fn locale_env_entries() -> Vec<(String, String)> {
     let mut entries = Vec::new();
     for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
-        push_env_if_present(&mut entries, key);
+        if let Ok(value) = env::var(key) {
+            entries.push((key.to_owned(), value));
+        }
     }
     for (key, value) in env::vars() {
         if key.starts_with("LC_") && !entries.iter().any(|(existing, _)| existing == &key) {
@@ -189,12 +185,6 @@ fn locale_env_entries() -> Vec<(String, String)> {
     entries
 }
 
-fn push_env_if_present(entries: &mut Vec<(String, String)>, key: &str) {
-    if let Ok(value) = env::var(key) {
-        entries.push((key.to_owned(), value));
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn normalize_locale_entries(entries: &mut Vec<(String, String)>) {
     for (_, value) in entries.iter_mut() {
@@ -202,11 +192,10 @@ fn normalize_locale_entries(entries: &mut Vec<(String, String)>) {
             *value = "en_US.UTF-8".to_owned();
         }
     }
-    if !entries.iter().any(|(key, _)| key == "LANG") {
-        entries.push(("LANG".to_owned(), "en_US.UTF-8".to_owned()));
-    }
-    if !entries.iter().any(|(key, _)| key == "LC_CTYPE") {
-        entries.push(("LC_CTYPE".to_owned(), "en_US.UTF-8".to_owned()));
+    for missing in ["LANG", "LC_CTYPE"] {
+        if !entries.iter().any(|(key, _)| key == missing) {
+            entries.push((missing.to_owned(), "en_US.UTF-8".to_owned()));
+        }
     }
 }
 
@@ -219,25 +208,16 @@ fn is_macos_c_locale(value: &str) -> bool {
 fn normalize_locale_entries(_entries: &mut Vec<(String, String)>) {}
 
 fn shell_command_path(configured: Option<String>) -> String {
-    select_shell_path(
+    [
         env::var(BOOTTY_SHELL_ENV).ok(),
         configured,
         configured_user_shell(),
         env::var("SHELL").ok(),
-    )
-}
-
-fn select_shell_path(
-    explicit: Option<String>,
-    configured: Option<String>,
-    login: Option<String>,
-    inherited: Option<String>,
-) -> String {
-    [explicit, configured, login, inherited]
-        .into_iter()
-        .flatten()
-        .find_map(normalize_shell_path)
-        .unwrap_or_else(|| DEFAULT_SHELL.to_string())
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(normalize_shell_path)
+    .unwrap_or_else(|| DEFAULT_SHELL.to_string())
 }
 
 fn normalize_shell_path(shell: String) -> Option<String> {
@@ -250,35 +230,15 @@ fn normalize_shell_path(shell: String) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn configured_login_shell() -> Option<String> {
-    configured_login_shell_with(
+    [
         env::var("USER").ok(),
         env::var("LOGNAME").ok(),
         current_username(),
-        read_login_shell_for_user,
-    )
-}
-
-#[cfg(target_os = "macos")]
-fn configured_login_shell_with(
-    user: Option<String>,
-    logname: Option<String>,
-    current: Option<String>,
-    mut read_shell: impl FnMut(&str) -> Option<String>,
-) -> Option<String> {
-    let user = select_configured_shell_username(user, logname, current)?;
-    read_shell(&user)
-}
-
-#[cfg(target_os = "macos")]
-fn select_configured_shell_username(
-    user: Option<String>,
-    logname: Option<String>,
-    current: Option<String>,
-) -> Option<String> {
-    [user, logname, current]
-        .into_iter()
-        .flatten()
-        .find_map(normalize_username)
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(normalize_username)
+    .and_then(|user| read_login_shell_for_user(&user))
 }
 
 #[cfg(target_os = "macos")]
@@ -295,10 +255,8 @@ fn current_username() -> Option<String> {
     let output = ProcessCommand::new("/usr/bin/id")
         .arg("-un")
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .ok()
+        .filter(|output| output.status.success())?;
     normalize_username(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
@@ -308,10 +266,8 @@ fn read_login_shell_for_user(user: &str) -> Option<String> {
     let output = ProcessCommand::new("/usr/bin/dscl")
         .args([".", "-read", user_record.as_str(), "UserShell"])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+        .ok()
+        .filter(|output| output.status.success())?;
     parse_user_shell_output(&String::from_utf8_lossy(&output.stdout))
 }
 

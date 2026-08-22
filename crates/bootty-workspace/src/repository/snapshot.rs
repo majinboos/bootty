@@ -81,27 +81,23 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
     if spaces.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let stored_space_count = tx.query_row("SELECT COUNT(*) FROM workspace_spaces", [], |row| {
-        row.get::<_, i64>(0)
-    })?;
-    if spaces.len() as i64 != stored_space_count {
-        return Err(rusqlite::Error::InvalidQuery);
-    }
-
     let binding_ids = spaces
         .iter()
         .flat_map(|space| space.bindings.iter())
         .map(|binding| binding.scope.binding_id().persistence_value())
         .collect::<HashSet<_>>();
-    let stored_binding_count =
-        tx.query_row("SELECT COUNT(*) FROM workspace_bindings", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-    if binding_ids.len() as i64 != stored_binding_count {
+    let (stored_spaces, stored_bindings) = tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM workspace_spaces),
+                (SELECT COUNT(*) FROM workspace_bindings)",
+        [],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    if spaces.len() as i64 != stored_spaces || binding_ids.len() as i64 != stored_bindings {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let mut groups = HashMap::<i64, Vec<(i64, SessionGroup, i64)>>::new();
-    let mut group_ids = HashMap::<i64, i64>::new();
+    let mut groups = HashMap::<i64, Vec<SessionGroup>>::new();
+    let mut group_ids = HashMap::<i64, (i64, usize)>::new();
+    let mut group_positions = HashSet::new();
     let mut statement = tx.prepare(
         "SELECT id, binding_id, name, position
          FROM workspace_session_groups ORDER BY binding_id, position, id",
@@ -119,26 +115,21 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
             || !binding_ids.contains(&binding_id)
             || name.contains('\0')
             || position < 0
+            || !group_positions.insert((binding_id, position))
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        if group_ids.insert(group_id, binding_id).is_some()
-            || groups
-                .entry(binding_id)
-                .or_default()
-                .iter()
-                .any(|(_, _, existing_position)| *existing_position == position)
+        let binding_groups = groups.entry(binding_id).or_default();
+        if group_ids
+            .insert(group_id, (binding_id, binding_groups.len()))
+            .is_some()
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        groups.entry(binding_id).or_default().push((
-            group_id,
-            SessionGroup {
-                name,
-                sessions: Vec::new(),
-            },
-            position,
-        ));
+        binding_groups.push(SessionGroup {
+            name,
+            sessions: Vec::new(),
+        });
     }
 
     let mut statement = tx.prepare(
@@ -158,14 +149,19 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
         if name.is_empty()
             || position < 0
             || !binding_ids.contains(&binding_id)
-            || group_ids.get(&group_id) != Some(&binding_id)
             || !session_keys.insert((binding_id, name.clone()))
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let Some((_, group, _)) = groups
+        let Some((_, group_index)) = group_ids
+            .get(&group_id)
+            .filter(|(owner, _)| *owner == binding_id)
+        else {
+            return Err(rusqlite::Error::InvalidQuery);
+        };
+        let Some(group) = groups
             .get_mut(&binding_id)
-            .and_then(|groups| groups.iter_mut().find(|(id, _, _)| *id == group_id))
+            .and_then(|groups| groups.get_mut(*group_index))
         else {
             return Err(rusqlite::Error::InvalidQuery);
         };
@@ -225,15 +221,9 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
         }
         for binding in &mut space.bindings {
             let binding_id = binding.scope.binding_id().persistence_value();
-            let entries = groups.remove(&binding_id).unwrap_or_default();
-            let mut entries = entries;
-            entries.sort_by_key(|(_, _, position)| *position);
-            let order = entries
-                .into_iter()
-                .map(|(_, group, _)| group)
-                .collect::<Vec<_>>();
-            binding.session_order =
-                SessionOrderStore::from_groups(order.clone(), !order.is_empty());
+            let order = groups.remove(&binding_id).unwrap_or_default();
+            let has_order = !order.is_empty();
+            binding.session_order = SessionOrderStore::from_groups(order, has_order);
             binding.session_names =
                 SessionNameStore::from_records(names.remove(&binding_id).unwrap_or_default());
         }
@@ -250,7 +240,6 @@ pub(super) fn backend_to_storage(backend: Option<MultiplexerBackendConfig>) -> &
         Some(MultiplexerBackendConfig::Rmux) => "rmux",
         Some(MultiplexerBackendConfig::Native) => "native",
         Some(MultiplexerBackendConfig::Tmux) => "tmux",
-        Some(MultiplexerBackendConfig::Zellij) => "zellij",
     }
 }
 
@@ -285,11 +274,8 @@ pub(super) fn color_to_hex([red, green, blue]: [u8; 3]) -> String {
 
 pub(super) fn color_from_hex(value: &str) -> Option<[u8; 3]> {
     let value = value.strip_prefix('#')?;
-    (value.len() == 6).then_some([
-        u8::from_str_radix(&value[0..2], 16).ok()?,
-        u8::from_str_radix(&value[2..4], 16).ok()?,
-        u8::from_str_radix(&value[4..6], 16).ok()?,
-    ])
+    let rgb = u32::from_str_radix(value, 16).ok()?;
+    (value.len() == 6).then_some([(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8])
 }
 
 pub(super) fn backend_from_storage(
@@ -300,7 +286,6 @@ pub(super) fn backend_from_storage(
         "rmux" => Ok(Some(MultiplexerBackendConfig::Rmux)),
         "native" => Ok(Some(MultiplexerBackendConfig::Native)),
         "tmux" => Ok(Some(MultiplexerBackendConfig::Tmux)),
-        "zellij" => Ok(Some(MultiplexerBackendConfig::Zellij)),
         _ => Err(rusqlite::Error::InvalidQuery),
     }
 }

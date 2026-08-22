@@ -108,20 +108,21 @@ fn release_daemon(target: RemoteTarget) -> Result<PathBuf> {
 fn bundled_daemon(executable: &std::path::Path, target: RemoteTarget) -> Option<PathBuf> {
     let directory = executable.parent()?;
     let asset = target.asset_name();
-    let mut candidates = Vec::new();
-    if RemoteTarget::current() == Some(target) {
-        candidates.push(executable.with_file_name(if cfg!(windows) {
+    let sidecar = (RemoteTarget::current() == Some(target)).then(|| {
+        executable.with_file_name(if cfg!(windows) {
             "bootty-daemon.exe"
         } else {
             "bootty-daemon"
-        }));
-    }
-    candidates.extend([
-        directory.join("../Resources/daemons").join(&asset),
-        directory.join("../share/bootty/daemons").join(&asset),
-        directory.join("daemons").join(&asset),
-    ]);
-    candidates.into_iter().find(|candidate| candidate.is_file())
+        })
+    });
+    sidecar
+        .into_iter()
+        .chain([
+            directory.join("../Resources/daemons").join(&asset),
+            directory.join("../share/bootty/daemons").join(&asset),
+            directory.join("daemons").join(&asset),
+        ])
+        .find(|candidate| candidate.is_file())
 }
 
 fn daemon_cache_dir() -> Result<PathBuf> {
@@ -238,6 +239,17 @@ pub(crate) fn ensure<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result
         "{installed}.{}-{generation:032x}.upload",
         std::process::id()
     );
+    macro_rules! cleanup_on_error {
+        ($result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    remove_remote_candidate(target, remote, runner, &temporary);
+                    return Err(error);
+                }
+            }
+        };
+    }
     let create = if target.is_unix() {
         format!("mkdir -p {REMOTE_DAEMON_DIRECTORY}")
     } else {
@@ -246,27 +258,18 @@ pub(crate) fn ensure<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result
     require_remote_success(remote, runner, &create, "create remote daemon directory")?;
 
     let (program, args) = remote.scp_command(&daemon, &temporary);
-    match runner.run(&program, &args) {
-        Ok(output) if output.success => {}
-        Ok(output) => {
-            remove_remote_candidate(target, remote, runner, &temporary);
-            bail!("upload Bootty daemon: {}", first_error(&output.stderr))
-        }
-        Err(error) => {
-            remove_remote_candidate(target, remote, runner, &temporary);
-            return Err(error).context("upload Bootty daemon");
-        }
+    let output = cleanup_on_error!(runner.run(&program, &args).context("upload Bootty daemon"));
+    if !output.success {
+        remove_remote_candidate(target, remote, runner, &temporary);
+        bail!("upload Bootty daemon: {}", first_error(&output.stderr))
     }
-    if target.is_unix()
-        && let Err(error) = require_remote_success(
+    if target.is_unix() {
+        cleanup_on_error!(require_remote_success(
             remote,
             runner,
             &format!("chmod 700 {temporary}"),
             "make remote daemon executable",
-        )
-    {
-        remove_remote_candidate(target, remote, runner, &temporary);
-        return Err(error);
+        ));
     }
 
     let candidate = if target.is_unix() {
@@ -274,10 +277,7 @@ pub(crate) fn ensure<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result
     } else {
         Ok(())
     };
-    if let Err(error) = candidate {
-        remove_remote_candidate(target, remote, runner, &temporary);
-        return Err(error);
-    }
+    cleanup_on_error!(candidate);
     let promote = if target.is_unix() {
         unix_publish_command(&temporary, installed)
     } else {
@@ -288,13 +288,7 @@ pub(crate) fn ensure<R: CommandRunner>(remote: &SshRemote, runner: &R) -> Result
         )
     };
     let (program, args) = remote.raw_command(&promote);
-    let output = match runner.run(&program, &args) {
-        Ok(output) => output,
-        Err(error) => {
-            remove_remote_candidate(target, remote, runner, &temporary);
-            return Err(error).context("publish Bootty daemon");
-        }
-    };
+    let output = cleanup_on_error!(runner.run(&program, &args).context("publish Bootty daemon"));
     if !output.success {
         remove_remote_candidate(target, remote, runner, &temporary);
         let (program, args) = remote.ping_command();

@@ -1,6 +1,3 @@
-#![allow(clippy::assigning_clones)]
-#![allow(clippy::single_match_else)]
-
 use std::collections::HashSet;
 
 fn session_group(name: &str) -> &str {
@@ -20,17 +17,13 @@ struct SessionStore {
 
 impl SessionStore {
     fn ordered_names(&self) -> Vec<String> {
-        self.entries
-            .iter()
-            .flat_map(|group| group.sessions.iter().cloned())
-            .collect()
+        self.names().map(str::to_owned).collect()
     }
 
-    fn existing_names(&self) -> HashSet<String> {
+    fn names(&self) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
-            .flat_map(|group| group.sessions.iter().cloned())
-            .collect()
+            .flat_map(|group| group.sessions.iter().map(String::as_str))
     }
 
     fn insert_unique(&mut self, name: &str) {
@@ -50,7 +43,7 @@ impl SessionStore {
             .iter_mut()
             .find(|entry| entry.sessions.len() == 1 && entry.sessions[0] == group)
         {
-            entry.name = group.to_owned();
+            group.clone_into(&mut entry.name);
             entry.sessions.push(name.to_owned());
         } else {
             self.entries.push(SessionGroup {
@@ -72,29 +65,29 @@ impl SessionStore {
     }
 
     fn rename_session(&mut self, old: &str, new: &str) -> bool {
-        if new.is_empty() || new.contains('\0') || old == new || self.existing_names().contains(new)
+        if new.is_empty()
+            || new.contains('\0')
+            || old == new
+            || self.names().any(|name| name == new)
         {
             return false;
         }
         let Some((entry_index, session_index)) = self.find_session(old) else {
             return false;
         };
-        self.entries[entry_index].sessions[session_index] = new.to_owned();
+        new.clone_into(&mut self.entries[entry_index].sessions[session_index]);
         true
     }
 
     fn prune(&mut self, alive: &HashSet<&str>) -> bool {
-        let mut changed = false;
+        let before = (self.entries.len(), self.names().count());
         for entry in &mut self.entries {
-            let before = entry.sessions.len();
             entry
                 .sessions
                 .retain(|session| alive.contains(session.as_str()));
-            changed |= entry.sessions.len() != before;
         }
-        let before = self.entries.len();
         self.entries.retain(|entry| !entry.sessions.is_empty());
-        changed || self.entries.len() != before
+        before != (self.entries.len(), self.names().count())
     }
 
     fn move_session(&mut self, name: &str, delta: i32) -> bool {
@@ -121,46 +114,26 @@ impl SessionStore {
             }
         }
 
-        let source = self.entries[entry_idx].sessions[0].clone();
         let target = if delta < 0 {
-            self.entries
-                .get(entry_idx.saturating_sub(1))
-                .and_then(|entry| entry.sessions.first().cloned())
+            Some(entry_idx.checked_sub(1).unwrap_or(entry_idx))
         } else {
-            self.entries
-                .get(entry_idx + 2)
-                .and_then(|entry| entry.sessions.first().cloned())
+            (entry_idx + 2 < self.entries.len()).then_some(entry_idx + 2)
         };
-        self.move_block_before(&source, target.as_deref())
+        self.move_block_before(entry_idx, target)
     }
 
-    fn move_block_before(&mut self, source: &str, target: Option<&str>) -> bool {
-        let previous = self.entries.clone();
-        let Some(source_index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.sessions.first().is_some_and(|name| name == source))
-        else {
+    fn move_block_before(&mut self, source: usize, target: Option<usize>) -> bool {
+        if source >= self.entries.len() || target.is_some_and(|target| target >= self.entries.len())
+        {
             return false;
-        };
-
-        let entry = self.entries.remove(source_index);
-        let insert_index =
-            match target {
-                Some(target) => {
-                    let Some(target_index) = self.entries.iter().position(|entry| {
-                        entry.sessions.first().is_some_and(|name| name == target)
-                    }) else {
-                        self.entries.insert(source_index, entry);
-                        return false;
-                    };
-                    target_index
-                }
-                None => self.entries.len(),
-            };
-
-        self.entries.insert(insert_index, entry);
-        self.entries != previous
+        }
+        let entry = self.entries.remove(source);
+        let insert = target.map_or(self.entries.len(), |target| {
+            target - usize::from(target > source)
+        });
+        let changed = insert != source;
+        self.entries.insert(insert, entry);
+        changed
     }
 
     /// Moves `source` to sit before `before` (or to the end when `None`). Within one group this
@@ -189,15 +162,10 @@ impl SessionStore {
                     sessions.insert(insert_idx, moved);
                     true
                 } else {
-                    let src_leader = self.entries[src_group].sessions[0].clone();
-                    let tgt_leader = self.entries[tgt_group].sessions[0].clone();
-                    self.move_block_before(&src_leader, Some(&tgt_leader))
+                    self.move_block_before(src_group, Some(tgt_group))
                 }
             }
-            None => {
-                let src_leader = self.entries[src_group].sessions[0].clone();
-                self.move_block_before(&src_leader, None)
-            }
+            None => self.move_block_before(src_group, None),
         }
     }
 
@@ -238,7 +206,7 @@ impl SessionOrderStore {
     }
 
     pub fn add_session(&mut self, name: &str) -> bool {
-        if name.is_empty() || self.store.existing_names().contains(name) {
+        if name.is_empty() || self.store.names().any(|session| session == name) {
             return false;
         }
         self.store.insert_unique(name);
@@ -248,18 +216,12 @@ impl SessionOrderStore {
 
     pub fn remove_session(&mut self, name: &str) -> bool {
         let removed = self.store.remove(name);
-        if removed {
-            self.membership_initialized = true;
-        }
-        removed
+        self.record_change(removed)
     }
 
     pub fn rename_session(&mut self, old: &str, new: &str) -> bool {
         let renamed = self.store.rename_session(old, new);
-        if renamed {
-            self.membership_initialized = true;
-        }
-        renamed
+        self.record_change(renamed)
     }
 
     pub fn session_names(&self) -> Vec<String> {
@@ -278,23 +240,16 @@ impl SessionOrderStore {
             .iter()
             .map(String::as_str)
             .collect::<HashSet<_>>();
-        let existing = self.store.existing_names();
         let mut changed = false;
-        if !self.membership_initialized && existing.is_empty() {
+        if !self.membership_initialized && self.store.names().next().is_none() {
             for session in &ordered_alive {
                 self.store.insert_unique(session);
                 changed = true;
             }
         }
         changed |= self.store.prune(&alive);
-        if changed {
-            self.membership_initialized = true;
-        }
-        self.store
-            .ordered_names()
-            .into_iter()
-            .filter(|session| alive.contains(session.as_str()))
-            .collect()
+        self.record_change(changed);
+        self.store.ordered_names()
     }
 
     pub fn move_session<'a>(
@@ -305,10 +260,7 @@ impl SessionOrderStore {
     ) -> bool {
         self.sync_sessions(sessions);
         let moved = self.store.move_session(name, delta);
-        if moved {
-            self.membership_initialized = true;
-        }
-        moved
+        self.record_change(moved)
     }
 
     pub fn move_session_before<'a>(
@@ -319,9 +271,11 @@ impl SessionOrderStore {
     ) -> bool {
         self.sync_sessions(sessions);
         let moved = self.store.move_session_before(source, before);
-        if moved {
-            self.membership_initialized = true;
-        }
-        moved
+        self.record_change(moved)
+    }
+
+    fn record_change(&mut self, changed: bool) -> bool {
+        self.membership_initialized |= changed;
+        changed
     }
 }
