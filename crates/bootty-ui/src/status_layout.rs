@@ -77,6 +77,8 @@ pub const STATUS_EDGE_PAD: f32 = 12.0;
 pub const STATUS_ITEM_GAP: f32 = 4.0;
 pub const STATUS_ITEM_PAD: f32 = 10.0;
 pub const STATUS_ICON_GAP: f32 = 6.0;
+/// Extra clearance required before already-wrapped tabs collapse back to one row.
+pub const STATUS_NOTCH_WRAP_HYSTERESIS: f32 = 4.0;
 /// Square edge of a status-bar icon glyph, matched to the 12pt text.
 pub const STATUS_ICON_SIZE: f32 = 14.0;
 /// Battery meter dimensions for a `gauge` item (body width excludes the nub).
@@ -91,6 +93,19 @@ pub fn status_bar_layout<'a>(
     segments: &'a [ResolvedSegment<'a>],
     left_padding: f32,
     notch_x: Option<(f32, f32)>,
+) -> StatusBarLayout<'a> {
+    status_bar_layout_with_tab_wrap(ui, bar_rect, segments, left_padding, notch_x, false)
+}
+
+/// Lay out the status bar while retaining a small hysteresis window around the notch boundary.
+/// `tabs_were_wrapped` is the previous frame's result for the top window-tab segment.
+pub fn status_bar_layout_with_tab_wrap<'a>(
+    ui: &egui::Ui,
+    bar_rect: Rect,
+    segments: &'a [ResolvedSegment<'a>],
+    left_padding: f32,
+    notch_x: Option<(f32, f32)>,
+    tabs_were_wrapped: bool,
 ) -> StatusBarLayout<'a> {
     let font = egui::FontId::monospace(12.0);
     let widths = segments
@@ -129,8 +144,16 @@ pub fn status_bar_layout<'a>(
         .find(|index| segments[*index].wrappable);
     let (window_start, window_span) =
         window_geometry(segments, &widths, &left, left_start, bottom_bound);
-    let notch_collision = notch_x
-        .is_some_and(|notch| window_span.is_some_and(|span| span.0 < notch.1 && notch.0 < span.1));
+    let notch_collision = notch_x.is_some_and(|notch| {
+        window_span.is_some_and(|span| {
+            let wrap_boundary = if tabs_were_wrapped {
+                notch.0 - STATUS_NOTCH_WRAP_HYSTERESIS
+            } else {
+                notch.0
+            };
+            span.0 < notch.1 && wrap_boundary < span.1
+        })
+    });
     let group_count = window.map_or(1, |window| window_group_count(&segments[window]));
     let row_bounds = WindowRowBounds {
         left_start,

@@ -12,6 +12,7 @@ pub(crate) use runtime::{
 
 pub use bootty_ui::status_layout::{
     ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, StatusBarLayout, status_bar_layout,
+    status_bar_layout_with_tab_wrap,
 };
 pub(crate) use sidebar_panel::MACOS_TITLEBAR_BUTTON_SAFE_WIDTH;
 pub use sidebar_panel::{
