@@ -18,19 +18,19 @@ and show the error in the status bar.
 For a one-off run that ignores live config and sidecar state, use:
 
 ```sh
-bootty --defaults
+bootty app --defaults
 ```
 
 To load a specific config file instead of the XDG path, use:
 
 ```sh
-bootty --config /path/to/config.toml
+bootty app --config /path/to/config.toml
 ```
 
 Startup flags can override common config values after the file is loaded:
 
 ```sh
-bootty --defaults --backend native --fullscreen non-native --titlebar hidden --window-decoration none --no-sidebar
+bootty app --defaults --backend native --fullscreen non-native --titlebar hidden --window-decoration none --no-sidebar
 ```
 
 Run `bootty --help` for the full flag list.
@@ -92,7 +92,7 @@ host = "devbox" # ~/.ssh/config alias, hostname, or address
 # program = "ssh"      # the SSH client to run
 # args = ["-i", "~/.ssh/devbox"] # extra flags, passed before the destination
 
-# `bootty --backend tmux --ssh-remote devbox` does the same for one run.
+# `bootty app --backend tmux --ssh-remote devbox` does the same for one run.
 #
 # This is the default every space inherits. A single space can name its own host
 # in the space editor, next to its backend, so remote and local spaces sit side

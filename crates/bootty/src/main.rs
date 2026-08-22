@@ -176,7 +176,7 @@ fn run() -> Result<()> {
         Some(Command::RemoteRmux { payload }) => {
             std::process::exit(bootty_rmux::run_remote_rmux_command(payload)?);
         }
-        None => {}
+        Some(Command::App(_)) | None => {}
     }
     if control::running_instance()?.is_some() {
         return Ok(());

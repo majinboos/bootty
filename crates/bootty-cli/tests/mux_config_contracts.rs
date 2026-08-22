@@ -24,6 +24,7 @@ args = ["-i", "key"]
 
     let cli = Cli::parse_from([
         "bootty",
+        "app",
         "--config",
         path.to_str().expect("UTF-8 config path"),
         "--ssh-remote",

@@ -13,7 +13,7 @@ use bootty_font::FontFeature;
 use bootty_terminal::terminal_engine::NATIVE_SCROLLBACK_BYTES_PER_ROW_ESTIMATE;
 use clap::{Args, ValueEnum};
 
-#[derive(Debug, Default, Args)]
+#[derive(Clone, Debug, Default, Args)]
 pub(super) struct ConfigOverrides {
     /// Force the multiplexer backend.
     #[arg(long, value_enum, value_name = "BACKEND")]
