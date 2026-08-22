@@ -4,7 +4,8 @@ use std::{
 };
 
 use crate::{
-    ExtensionInvocationSender, ModuleIdentity, SurfaceSnapshot, surfaces::PublishedSurfaceSnapshot,
+    ExtensionInvocationSender, ModuleIdentity, SurfacePlacement, SurfaceSnapshot,
+    surfaces::PublishedSurfaceSnapshot,
 };
 use bootty_command::CommandDescriptor;
 
@@ -156,18 +157,7 @@ impl ExtensionCatalog {
                 return Err(format!("event topic {topic} is registered more than once"));
             }
         }
-        let mut surface_ids = BTreeSet::new();
-        for surface in &surfaces {
-            if surface.declaration.id.is_empty() {
-                return Err("extension surface identity is invalid".to_owned());
-            }
-            if !surface_ids.insert(surface.declaration.id.clone()) {
-                return Err(format!(
-                    "surface {} is registered more than once",
-                    surface.declaration.id
-                ));
-            }
-        }
+        validate_surfaces(&surfaces)?;
 
         // All collision checks and replacement happen under this one lock.
         let mut state = self
@@ -195,25 +185,13 @@ impl ExtensionCatalog {
                 return Err(format!("event topic {topic} is already registered"));
             }
         }
-        for surface in &surfaces {
-            if state.surfaces.values().any(|registered| {
-                registered.module != module
-                    && registered.snapshot.declaration.placement == surface.declaration.placement
-                    && registered.snapshot.declaration.id == surface.declaration.id
-            }) {
-                return Err(format!(
-                    "surface {} is already registered for {:?}",
-                    surface.declaration.id, surface.declaration.placement
-                ));
-            }
-        }
+        ensure_surfaces_available(&state, module, &surfaces)?;
 
         if let Some((_, previous)) = state.generations.get(module) {
             previous.retire();
         }
         state.commands.retain(|_, command| command.module != module);
         state.topics.retain(|_, topic| topic.module != module);
-        state.surfaces.retain(|_, surface| surface.module != module);
         for (descriptor, sender) in commands {
             state.commands.insert(
                 descriptor.id.clone(),
@@ -234,16 +212,7 @@ impl ExtensionCatalog {
                 },
             );
         }
-        for snapshot in surfaces {
-            state.surfaces.insert(
-                (module.to_owned(), snapshot.declaration.id.clone()),
-                ExtensionSurface {
-                    module: module.to_owned(),
-                    generation,
-                    snapshot,
-                },
-            );
-        }
+        replace_surfaces(&mut state, module, generation, surfaces);
         state
             .generations
             .insert(module.to_owned(), (generation, token));
@@ -292,6 +261,38 @@ impl ExtensionCatalog {
             .unwrap_or_default()
     }
 
+    /// Snapshots for one placement, cloned inside the lock so a caller that wants the status bar
+    /// does not copy every sidebar and session surface as well.
+    #[must_use]
+    pub fn surfaces_for(&self, placement: SurfacePlacement) -> Vec<PublishedSurfaceSnapshot> {
+        self.state
+            .read()
+            .map(|state| {
+                state
+                    .surfaces
+                    .values()
+                    .filter(|surface| surface.snapshot.declaration.placement == placement)
+                    .map(|surface| PublishedSurfaceSnapshot {
+                        module: surface.module.clone(),
+                        generation: surface.generation,
+                        snapshot: surface.snapshot.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether any surface is published for `placement`, without cloning a snapshot.
+    #[must_use]
+    pub fn has_surfaces(&self, placement: SurfacePlacement) -> bool {
+        self.state.read().is_ok_and(|state| {
+            state
+                .surfaces
+                .values()
+                .any(|surface| surface.snapshot.declaration.placement == placement)
+        })
+    }
+
     #[must_use]
     pub fn surfaces(&self) -> Vec<PublishedSurfaceSnapshot> {
         self.state
@@ -316,18 +317,7 @@ impl ExtensionCatalog {
         generation: u64,
         surfaces: Vec<SurfaceSnapshot>,
     ) -> Result<(), String> {
-        let mut surface_ids = BTreeSet::new();
-        for surface in &surfaces {
-            if surface.declaration.id.is_empty() {
-                return Err("extension surface identity is invalid".to_owned());
-            }
-            if !surface_ids.insert(surface.declaration.id.clone()) {
-                return Err(format!(
-                    "surface {} is registered more than once",
-                    surface.declaration.id
-                ));
-            }
-        }
+        validate_surfaces(&surfaces)?;
         let mut state = self
             .state
             .write()
@@ -335,29 +325,8 @@ impl ExtensionCatalog {
         if !generation_is_active(&state, module, generation) {
             return Err("extension generation is not active".to_owned());
         }
-        for surface in &surfaces {
-            if state.surfaces.values().any(|registered| {
-                registered.module != module
-                    && registered.snapshot.declaration.placement == surface.declaration.placement
-                    && registered.snapshot.declaration.id == surface.declaration.id
-            }) {
-                return Err(format!(
-                    "surface {} is already registered for {:?}",
-                    surface.declaration.id, surface.declaration.placement
-                ));
-            }
-        }
-        state.surfaces.retain(|_, surface| surface.module != module);
-        for snapshot in surfaces {
-            state.surfaces.insert(
-                (module.to_owned(), snapshot.declaration.id.clone()),
-                ExtensionSurface {
-                    module: module.to_owned(),
-                    generation,
-                    snapshot,
-                },
-            );
-        }
+        ensure_surfaces_available(&state, module, &surfaces)?;
+        replace_surfaces(&mut state, module, generation, surfaces);
         Ok(())
     }
 
@@ -395,6 +364,61 @@ impl ExtensionCatalog {
             return Err("extension generation is not active".to_owned());
         }
         Ok(action())
+    }
+}
+
+fn validate_surfaces(surfaces: &[SurfaceSnapshot]) -> Result<(), String> {
+    let mut ids = BTreeSet::new();
+    for surface in surfaces {
+        if surface.declaration.id.is_empty() {
+            return Err("extension surface identity is invalid".to_owned());
+        }
+        if !ids.insert(&surface.declaration.id) {
+            return Err(format!(
+                "surface {} is registered more than once",
+                surface.declaration.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_surfaces_available(
+    state: &CatalogState,
+    module: &str,
+    surfaces: &[SurfaceSnapshot],
+) -> Result<(), String> {
+    for surface in surfaces {
+        if state.surfaces.values().any(|registered| {
+            registered.module != module
+                && registered.snapshot.declaration.placement == surface.declaration.placement
+                && registered.snapshot.declaration.id == surface.declaration.id
+        }) {
+            return Err(format!(
+                "surface {} is already registered for {:?}",
+                surface.declaration.id, surface.declaration.placement
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn replace_surfaces(
+    state: &mut CatalogState,
+    module: &str,
+    generation: u64,
+    surfaces: Vec<SurfaceSnapshot>,
+) {
+    state.surfaces.retain(|_, surface| surface.module != module);
+    for snapshot in surfaces {
+        state.surfaces.insert(
+            (module.to_owned(), snapshot.declaration.id.clone()),
+            ExtensionSurface {
+                module: module.to_owned(),
+                generation,
+                snapshot,
+            },
+        );
     }
 }
 

@@ -3,13 +3,13 @@ use std::sync::Arc;
 use crate::{
     geometry::SurfaceRect,
     paint_plan::{
-        BackgroundRect, CursorPlan, CursorShape, DecorationLine, DecorationStyle, PlanColor,
-        TerminalPaintPlan, TextAttrs, TextRun, cursor_fill_rect,
+        BackgroundRect, CursorPlan, CursorShape, DecorationStyle, PlanColor, TerminalPaintPlan,
+        TextAttrs, TextRun, cursor_fill_rect,
     },
     terminal_image::{
         KittyImageFrame, KittyImageLayer, KittyImagePlacement, KittyVirtualPlacement,
     },
-    terminal_sprite::{SpriteCommand, SpriteGlyph},
+    terminal_sprite::SpriteGlyph,
     terminal_text::{ResolvedFontFace, TerminalTextContract},
 };
 
@@ -81,11 +81,25 @@ impl TerminalRenderFrame {
         for run in &plan.text_runs {
             self.push_text_run(run, text_contract, text_pool);
         }
-        for decoration in &plan.decorations {
-            self.push_decoration(decoration);
-        }
+        self.commands
+            .extend(plan.decorations.iter().map(|decoration| {
+                TerminalRenderCommand::Decoration(LineCommand {
+                    start_x: decoration.start_x,
+                    start_y: decoration.start_y,
+                    end_x: decoration.end_x,
+                    end_y: decoration.end_y,
+                    color: decoration.color,
+                    style: decoration.style,
+                })
+            }));
         self.push_image_layer(images, KittyImageLayer::AboveText);
-        self.push_virtual_placements(images);
+        self.commands.extend(
+            images
+                .virtual_placements
+                .iter()
+                .copied()
+                .map(TerminalRenderCommand::KittyVirtualPlacement),
+        );
         if let Some(cursor) = &plan.cursor {
             self.push_cursor(cursor, text_contract, text_pool);
         }
@@ -115,16 +129,6 @@ impl TerminalRenderFrame {
         );
     }
 
-    fn push_virtual_placements(&mut self, images: &KittyImageFrame) {
-        self.commands.extend(
-            images
-                .virtual_placements
-                .iter()
-                .copied()
-                .map(TerminalRenderCommand::KittyVirtualPlacement),
-        );
-    }
-
     fn push_text_run(
         &mut self,
         run: &TextRun,
@@ -142,11 +146,7 @@ impl TerminalRenderFrame {
                     width: run.cells,
                 },
                 &run.text,
-                RunFont {
-                    face,
-                    font_size: text_contract.config.font_size,
-                    font_features: Arc::clone(&text_contract.font_features),
-                },
+                RunFont::new(face, text_contract),
                 text_pool,
             );
             return;
@@ -172,16 +172,12 @@ impl TerminalRenderFrame {
                             width: cell.saturating_sub(text_start_cell),
                         },
                         &run.text[text_start_byte..byte_index],
-                        RunFont {
-                            face,
-                            font_size: text_contract.config.font_size,
-                            font_features: Arc::clone(&text_contract.font_features),
-                        },
+                        RunFont::new(face, text_contract),
                         text_pool,
                     );
                     text_active = false;
                 }
-                self.push_sprite_fragment(run, cell, ch, glyph);
+                self.push_sprite_fragment(run, cell, glyph);
                 cell = cell.saturating_add(crate::terminal_text::terminal_char_cell_delta(ch));
                 continue;
             }
@@ -206,11 +202,7 @@ impl TerminalRenderFrame {
                     width: cell.saturating_sub(text_start_cell),
                 },
                 &run.text[text_start_byte..],
-                RunFont {
-                    face,
-                    font_size: text_contract.config.font_size,
-                    font_features: Arc::clone(&text_contract.font_features),
-                },
+                RunFont::new(face, text_contract),
                 text_pool,
             );
         }
@@ -289,28 +281,14 @@ impl TerminalRenderFrame {
         }));
     }
 
-    fn push_sprite_fragment(&mut self, run: &TextRun, cell: u16, ch: char, glyph: SpriteGlyph) {
+    fn push_sprite_fragment(&mut self, run: &TextRun, cell: u16, glyph: SpriteGlyph) {
         let cell_width = run.cell_rect.width() / f32::from(run.cells.max(1));
         let rect = cell_rect(run.cell_rect, cell_width, cell, 1);
         self.commands
             .push(TerminalRenderCommand::Sprite(SpriteCommandBatch {
-                ch,
                 glyph,
                 rect,
                 color: run.attrs.fg,
-                commands: glyph.commands_for(rect),
-            }));
-    }
-
-    fn push_decoration(&mut self, decoration: &DecorationLine) {
-        self.commands
-            .push(TerminalRenderCommand::Decoration(LineCommand {
-                start_x: decoration.start_x,
-                start_y: decoration.start_y,
-                end_x: decoration.end_x,
-                end_y: decoration.end_y,
-                color: decoration.color,
-                style: decoration.style,
             }));
     }
 
@@ -407,6 +385,16 @@ struct RunFont {
     font_features: Arc<[crate::terminal_text::FontFeature]>,
 }
 
+impl RunFont {
+    fn new(face: Arc<ResolvedFontFace>, contract: &TerminalTextContract) -> Self {
+        Self {
+            face,
+            font_size: contract.config.font_size,
+            font_features: Arc::clone(&contract.font_features),
+        }
+    }
+}
+
 fn command_capacity_for_plan(plan: &TerminalPaintPlan, images: &KittyImageFrame) -> usize {
     let cursor_commands = plan.cursor.as_ref().map_or(0, |cursor| {
         1 + usize::from(cursor.text_under_cursor.is_some())
@@ -425,17 +413,14 @@ fn translate_image_placement(
     surface: SurfaceRect,
 ) -> KittyImagePlacement {
     let mut placement = placement.clone();
-    placement.destination = translate_rect(placement.destination, surface.min_x, surface.min_y);
+    let rect = placement.destination;
+    placement.destination = SurfaceRect {
+        min_x: rect.min_x + surface.min_x,
+        min_y: rect.min_y + surface.min_y,
+        max_x: rect.max_x + surface.min_x,
+        max_y: rect.max_y + surface.min_y,
+    };
     placement
-}
-
-fn translate_rect(rect: SurfaceRect, dx: f32, dy: f32) -> SurfaceRect {
-    SurfaceRect {
-        min_x: rect.min_x + dx,
-        min_y: rect.min_y + dy,
-        max_x: rect.max_x + dx,
-        max_y: rect.max_y + dy,
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -488,11 +473,9 @@ impl PartialEq for TextCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpriteCommandBatch {
-    pub ch: char,
     pub glyph: SpriteGlyph,
     pub rect: SurfaceRect,
     pub color: PlanColor,
-    pub commands: Vec<SpriteCommand>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -58,19 +58,6 @@ fn each_backend_owns_its_application_behavior_policy() {
             TerminalResidency::BindingScoped,
             SelectionPublicationPolicy::Direct,
         ),
-        (
-            MuxBackendKind::Zellij,
-            PaneBehavior {
-                topology: PaneTopology::Attach,
-                cache_terminals: false,
-                resize_cached_terminals: false,
-            },
-            TerminalProgressPolicy::TerminalOsc,
-            PersistedSessionPolicy::Never,
-            GeneratedSessionNamePolicy::Reconcile,
-            TerminalResidency::BindingScoped,
-            SelectionPublicationPolicy::Direct,
-        ),
     ];
 
     for (

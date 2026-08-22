@@ -1,7 +1,7 @@
 use bootty_render::paint_plan::{PaintPlanner, PlanColor, TerminalPaintPlan};
 use bootty_surface::geometry::{CellMetrics, TerminalPadding, TerminalSurface};
 use bootty_terminal::terminal_frame::{
-    CellStyle, FrameColors, FrameStats, RenderCell, RenderFrame,
+    CellStyle, FrameColors, FrameSelection, FrameStats, RenderCell, RenderFrame,
 };
 use libghostty_vt::style::RgbColor;
 
@@ -143,4 +143,81 @@ fn selection_and_search_foregrounds_remain_exact() {
 
     assert_eq!(foreground(&plan, "a"), color(1, 2, 3));
     assert_eq!(foreground(&plan, "s"), color(20, 20, 20));
+}
+
+#[test]
+fn overlay_background_order_and_foreground_precedence_remain_exact() {
+    let mut frame = frame(&['s', 'a', 'x']);
+    frame.colors.selection_background = Some(rgb(4, 5, 6));
+    frame.search_matches = (0..3)
+        .map(|row| FrameSelection {
+            row,
+            start_col: 0,
+            end_col: 0,
+        })
+        .collect();
+    frame.active_search_match = Some(FrameSelection {
+        row: 1,
+        start_col: 0,
+        end_col: 0,
+    });
+    frame.selections.push(FrameSelection {
+        row: 2,
+        start_col: 0,
+        end_col: 0,
+    });
+
+    let plan = plan(&frame);
+
+    assert_eq!(
+        plan.backgrounds
+            .iter()
+            .map(|background| background.color)
+            .collect::<Vec<_>>(),
+        vec![
+            PlanColor {
+                r: 245,
+                g: 194,
+                b: 66,
+                a: 210,
+            };
+            3
+        ]
+        .into_iter()
+        .chain([color(255, 235, 120), color(4, 5, 6)])
+        .collect::<Vec<_>>()
+    );
+    assert_eq!(foreground(&plan, "s"), color(20, 20, 20));
+    assert_eq!(foreground(&plan, "a"), color(0, 0, 0));
+    assert_eq!(foreground(&plan, "x"), color(1, 2, 3));
+}
+
+#[test]
+fn overlay_backgrounds_keep_unclipped_ranges_while_the_text_mask_is_clipped() {
+    let mut frame = frame(&['a']);
+    frame.search_matches = vec![
+        FrameSelection {
+            row: 0,
+            start_col: 0,
+            end_col: 3,
+        },
+        FrameSelection {
+            row: 0,
+            start_col: 1,
+            end_col: 0,
+        },
+        FrameSelection {
+            row: 2,
+            start_col: 0,
+            end_col: 1,
+        },
+    ];
+
+    let plan = plan(&frame);
+
+    assert_eq!(plan.backgrounds.len(), 2);
+    assert_eq!(plan.backgrounds[0].rect.width(), 40.0);
+    assert_eq!(plan.backgrounds[1].rect.width(), 20.0);
+    assert_eq!(plan.backgrounds[1].rect.min_y, 40.0);
+    assert_eq!(foreground(&plan, "a"), color(20, 20, 20));
 }

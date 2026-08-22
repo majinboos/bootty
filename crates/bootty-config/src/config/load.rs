@@ -149,6 +149,15 @@ pub fn load_config_from_path(path: impl AsRef<Path>) -> ConfigResult<BoottyConfi
     load_config_attempt(path).config
 }
 
+pub(super) fn validate_config_document(
+    path: &Path,
+    document: &ConfigDocument,
+) -> ConfigResult<BoottyConfig> {
+    let mut traversal = ConfigGraphTraversal::default();
+    let mut document = traversal.merge_root_document(path, document.document.clone())?;
+    resolve_loaded_document(&mut document, path)
+}
+
 pub(crate) struct ConfigLoadAttempt {
     pub(crate) config: ConfigResult<BoottyConfig>,
     pub(crate) snapshot: ConfigFileSnapshot,
@@ -167,19 +176,7 @@ pub(crate) fn load_config_attempt(path: &Path) -> ConfigLoadAttempt {
     }
 
     let ConfigGraphLoad { document, snapshot } = load_config_graph(path);
-    let config = document.and_then(|mut document| {
-        let compatibility_warnings = take_ghostty_compatibility_warnings(&mut document);
-        document.as_table_mut().remove("include");
-        let raw = parse_raw_config_document(document, path)?;
-        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut config = ConfigResolver {
-            path: path.to_path_buf(),
-            config_dir,
-        }
-        .resolve(raw)?;
-        config.compatibility_warnings = compatibility_warnings;
-        Ok(config)
-    });
+    let config = document.and_then(|mut document| resolve_loaded_document(&mut document, path));
     ConfigLoadAttempt { config, snapshot }
 }
 
@@ -248,6 +245,16 @@ fn load_config_graph(path: &Path) -> ConfigGraphLoad {
 }
 
 impl ConfigGraphTraversal {
+    fn merge_root_document(
+        &mut self,
+        path: &Path,
+        document: DocumentMut,
+    ) -> ConfigResult<DocumentMut> {
+        let id = config_file_id(path);
+        self.paths.push(id.clone());
+        self.merge_includes(path, id, document)
+    }
+
     fn load_merged_document(&mut self, path: &Path) -> ConfigResult<DocumentMut> {
         let id = config_file_id(path);
         self.paths.push(id.clone());
@@ -276,14 +283,22 @@ impl ConfigGraphTraversal {
                 )));
             }
         };
-        let mut document = source.parse::<DocumentMut>().map_err(|error| {
+        let document = source.parse::<DocumentMut>().map_err(|error| {
             ConfigLoadError::new(format!(
                 "failed to parse config file {}: {error}",
                 path.display()
             ))
         })?;
-        let includes = config_document_includes(&document, path)?;
+        self.merge_includes(path, id, document)
+    }
 
+    fn merge_includes(
+        &mut self,
+        path: &Path,
+        id: PathBuf,
+        mut document: DocumentMut,
+    ) -> ConfigResult<DocumentMut> {
+        let includes = config_document_includes(&document, path)?;
         self.stack.push(id.clone());
         let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
         for include in includes {
@@ -293,14 +308,29 @@ impl ConfigGraphTraversal {
                 self.paths.push(config_file_id(&include_path));
                 continue;
             }
-            let child = self.load_merged_document(&include_path)?;
-            let child = child.into_table();
-            merge_toml_tables(document.as_table_mut(), &child);
+            merge_toml_tables(
+                document.as_table_mut(),
+                &self.load_merged_document(&include_path)?.into_table(),
+            );
         }
         self.stack.pop();
         self.loaded.insert(id);
         Ok(document)
     }
+}
+
+fn resolve_loaded_document(document: &mut DocumentMut, path: &Path) -> ConfigResult<BoottyConfig> {
+    let compatibility_warnings = take_ghostty_compatibility_warnings(document);
+    document.as_table_mut().remove("include");
+    let raw = parse_raw_config_document(document.clone(), path)?;
+    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut config = ConfigResolver {
+        path: path.to_path_buf(),
+        config_dir,
+    }
+    .resolve(raw)?;
+    config.compatibility_warnings = compatibility_warnings;
+    Ok(config)
 }
 
 fn merge_toml_tables(target: &mut Table, overlay: &Table) {

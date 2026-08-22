@@ -1,39 +1,27 @@
-use super::{
-    SettingsSurface,
-    trigger_edit::{combo_has_modifier_sides, combo_is_prefixed, parse_trigger_flags},
-};
-use bootty_config::config::split_keybind_entry;
+use super::trigger_edit::{combo_has_modifier_sides, combo_is_prefixed, parse_trigger_flags};
+use crate::ui::settings::surface::writeback::SettingsWriteback;
+use bootty_config::config::{BoottyConfig, InputConfig, split_keybind_entry};
 
 /// Which keybind list is being edited: the global list, one of the per-backend lists, or the
 /// sidebar navigation list (which has its own action vocabulary).
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub(in crate::ui::settings) enum KeybindScope {
+    #[default]
     Global,
     Native,
     Rmux,
     #[cfg(not(windows))]
     Tmux,
-    Zellij,
     Sidebar,
 }
 
 impl KeybindScope {
-    #[cfg(not(windows))]
     pub(super) const ALL: &'static [(KeybindScope, &'static str)] = &[
         (Self::Global, "Global"),
         (Self::Native, "Native"),
         (Self::Rmux, "Rmux"),
+        #[cfg(not(windows))]
         (Self::Tmux, "Tmux"),
-        (Self::Zellij, "Zellij"),
-        (Self::Sidebar, "Sidebar"),
-    ];
-
-    #[cfg(windows)]
-    pub(super) const ALL: &'static [(KeybindScope, &'static str)] = &[
-        (Self::Global, "Global"),
-        (Self::Native, "Native"),
-        (Self::Rmux, "Rmux"),
-        (Self::Zellij, "Zellij"),
         (Self::Sidebar, "Sidebar"),
     ];
 
@@ -44,9 +32,14 @@ impl KeybindScope {
             Self::Rmux => &["input", "backend-keybind", "rmux"],
             #[cfg(not(windows))]
             Self::Tmux => &["input", "backend-keybind", "tmux"],
-            Self::Zellij => &["input", "backend-keybind", "zellij"],
             Self::Sidebar => &["input", "sidebar-keybind"],
         }
+    }
+
+    pub(super) fn effective_prefix(self, input: &InputConfig) -> Option<String> {
+        matches!(self, Self::Global | Self::Native | Self::Rmux)
+            .then(|| input.effective_prefix())
+            .flatten()
     }
 
     /// Whether `entry` (`trigger=action`) is a valid binding for this list. The sidebar list uses
@@ -91,6 +84,20 @@ pub(in crate::ui::settings) struct BindingRow {
     pub prefixed: bool,
 }
 
+impl BindingRow {
+    /// `None` is an incomplete draft; complete rows are either valid or invalid.
+    pub(super) fn validity(&self, scope: KeybindScope) -> Option<bool> {
+        let trigger = self.trigger.trim();
+        let action = self.action.trim();
+        (!trigger.is_empty() && !action.is_empty()).then(|| scope.entry_is_valid(trigger, action))
+    }
+
+    fn entry(&self, scope: KeybindScope) -> Option<String> {
+        self.validity(scope)?
+            .then(|| format!("{}={}", self.trigger.trim(), self.action.trim()))
+    }
+}
+
 /// In-progress chord capture: steps accumulate until `deadline` passes with no new key.
 pub(in crate::ui::settings) struct ChordCapture {
     pub row: usize,
@@ -125,17 +132,15 @@ const SIDEBAR_ACTION_INFO: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Load the editable rows for `scope` from the draft document, not from the accepted config, so a
+/// user override list never shows the built-in defaults as editable rows.
 pub(super) fn read_scope_entries(
-    win: &SettingsSurface,
+    writeback: &SettingsWriteback,
+    input: &InputConfig,
     scope: KeybindScope,
 ) -> (bool, Vec<BindingRow>) {
-    let prefix = match scope {
-        KeybindScope::Global | KeybindScope::Native | KeybindScope::Rmux => {
-            win.config.input.effective_prefix()
-        }
-        _ => None,
-    };
-    let Some(entries) = win.writeback.string_array(scope.path()) else {
+    let prefix = scope.effective_prefix(input);
+    let Some(entries) = writeback.string_array(scope.path()) else {
         return (false, Vec::new());
     };
 
@@ -164,7 +169,7 @@ pub(super) fn read_scope_entries(
 }
 
 pub(super) fn write_scope(
-    win: &mut SettingsSurface,
+    writeback: &mut SettingsWriteback,
     scope: KeybindScope,
     clear: bool,
     rows: &[BindingRow],
@@ -173,34 +178,20 @@ pub(super) fn write_scope(
     if clear {
         entries.push("clear".to_owned());
     }
-    for row in rows {
-        let trigger = row.trigger.trim();
-        let action = row.action.trim();
-        if trigger.is_empty() || action.is_empty() {
-            continue;
-        }
-        // Skip invalid rows so a half-typed binding never makes the whole config fail to reload.
-        if scope.entry_is_valid(trigger, action) {
-            entries.push(format!("{trigger}={action}"));
-        }
-    }
-    win.writeback.set_strings(scope.path(), &entries);
+    // Skip incomplete and invalid drafts so they never make the config fail to reload.
+    entries.extend(rows.iter().filter_map(|row| row.entry(scope)));
+    writeback.set_strings(scope.path(), &entries);
 }
 
-/// The shortcuts that actually apply for `scope`: backend scopes show the fully merged view
-/// (global rows + the backend's own rows, including prefixed chords), matching what the runtime
-/// resolves for that backend. Global shows the merge for the currently configured backend, since
-/// that's what actually fires while using the app.
-pub(super) fn effective_bindings(win: &SettingsSurface, scope: KeybindScope) -> Vec<String> {
+pub(super) fn effective_bindings(config: &BoottyConfig, scope: KeybindScope) -> Vec<String> {
     use bootty_config::config::MultiplexerBackendConfig;
-    let input = &win.config.input;
+    let input = &config.input;
     match scope {
-        KeybindScope::Global => input.keybinds_for_backend(win.config.multiplexer.backend),
+        KeybindScope::Global => input.keybinds_for_backend(config.multiplexer.backend),
         KeybindScope::Native => input.keybinds_for_backend(MultiplexerBackendConfig::Native),
         KeybindScope::Rmux => input.keybinds_for_backend(MultiplexerBackendConfig::Rmux),
         #[cfg(not(windows))]
         KeybindScope::Tmux => input.keybinds_for_backend(MultiplexerBackendConfig::Tmux),
-        KeybindScope::Zellij => input.keybinds_for_backend(MultiplexerBackendConfig::Zellij),
         KeybindScope::Sidebar => input.sidebar_keybind.clone(),
     }
 }

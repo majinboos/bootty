@@ -2,9 +2,10 @@ use std::{path::Path, sync::Arc};
 
 use bootty_command::{Caller, app_command_channel};
 use bootty_extension::{
-    ExtensionCatalog, ExtensionHost, ModuleIdentity, SurfacePlacement, display_path,
-    editable_module_source, event_queue, import_legacy_extension_module, legacy_extension_modules,
-    module_identities, preview_module_surfaces, reset_module_source, save_module_source,
+    ExtensionCatalog, ExtensionHost, ModuleIdentity, ModuleSourceOutcome, ModuleSourceRequest,
+    SurfacePlacement, display_path, editable_module_source, event_queue,
+    import_legacy_extension_module, legacy_extension_modules, module_identities, module_template,
+    preview_module_surfaces, reset_module_source, save_module_source,
 };
 
 fn theme() -> Vec<(String, String)> {
@@ -24,24 +25,25 @@ fn legacy_module_stays_in_place_until_explicit_validated_import() {
     let legacy_source = "return function() return { text = 'legacy windows' } end\n";
     std::fs::write(&legacy_path, legacy_source).expect("legacy source");
 
-    let legacy = legacy_extension_modules(config.path()).expect("legacy catalog");
-    assert_eq!(legacy.len(), 1);
-    assert_eq!(legacy[0].target_identity.as_str(), "windows.luau");
-    let identity = import_legacy_extension_module(config.path(), &legacy[0], theme())
-        .expect("validated import");
-    assert_eq!(identity.as_str(), "windows.luau");
-    assert_eq!(
-        std::fs::read_to_string(&legacy_path).expect("legacy source remains"),
-        legacy_source
-    );
-
     let catalog = Arc::new(ExtensionCatalog::default());
     let (sender, _receiver) = app_command_channel(4, Arc::new(|| {}));
-    let host = ExtensionHost::load(
+    let mut host = ExtensionHost::load(
         &config.path().join("extensions"),
         catalog,
         sender.for_caller(Caller::Luau),
         event_queue().0,
+    );
+    let legacy = host.module_sources().legacy.to_vec();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(legacy[0].target_identity.as_str(), "windows.luau");
+
+    assert_eq!(
+        host.apply_module_source_request(ModuleSourceRequest::ImportLegacy(legacy[0].clone())),
+        ModuleSourceOutcome::Imported(Ok(ModuleIdentity::parse("windows.luau").expect("identity")))
+    );
+    assert_eq!(
+        std::fs::read_to_string(&legacy_path).expect("legacy source remains"),
+        legacy_source
     );
     let surface = host
         .surface(SurfacePlacement::Status, "windows")
@@ -237,4 +239,66 @@ fn an_in_root_source_alias_keeps_one_canonical_module_identity() {
         .collect::<Vec<_>>();
     assert_eq!(surfaces.len(), 1);
     assert_eq!(surfaces[0].module, "real.luau");
+}
+
+#[test]
+fn editor_requests_run_against_the_host_extension_root() {
+    let config = tempfile::tempdir().expect("config root");
+    let root = config.path().join("extensions");
+    let broken = ModuleIdentity::parse("broken.luau").expect("identity");
+    save_module_source(&root, &broken, "this is not luau").expect("write broken module");
+
+    let catalog = Arc::new(ExtensionCatalog::default());
+    let (sender, _receiver) = app_command_channel(4, Arc::new(|| {}));
+    let mut host = ExtensionHost::load(
+        &root,
+        catalog,
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+    // A module that fails to load stays listed, or it could never be edited back into shape.
+    assert!(host.module_sources().identities.contains(&broken));
+
+    let created = ModuleIdentity::parse("nested/extra.luau").expect("identity");
+    assert_eq!(
+        host.apply_module_source_request(ModuleSourceRequest::Create(
+            "nested/extra.luau".to_owned()
+        )),
+        ModuleSourceOutcome::Created(Ok(created.clone()))
+    );
+    assert!(host.module_sources().identities.contains(&created));
+    assert!(matches!(
+        host.apply_module_source_request(ModuleSourceRequest::Create(
+            "nested/extra.luau".to_owned()
+        )),
+        ModuleSourceOutcome::Created(Err(error)) if error.contains("already exists")
+    ));
+
+    let missing = ModuleIdentity::parse("missing.luau").expect("identity");
+    let ModuleSourceOutcome::Loaded { source, exists } =
+        host.apply_module_source_request(ModuleSourceRequest::Load(missing.clone()))
+    else {
+        panic!("load answers with a source");
+    };
+    assert!(!exists);
+    assert_eq!(source.source, module_template(&missing));
+    assert!(!root.join("missing.luau").exists());
+
+    host.apply_module_source_request(ModuleSourceRequest::Save {
+        identity: broken.clone(),
+        source: "-- fixed".to_owned(),
+    });
+    let ModuleSourceOutcome::Loaded { source, exists } =
+        host.apply_module_source_request(ModuleSourceRequest::Load(broken.clone()))
+    else {
+        panic!("load answers with a source");
+    };
+    assert!(exists);
+    assert_eq!(source.source, "-- fixed");
+
+    assert_eq!(
+        host.apply_module_source_request(ModuleSourceRequest::Reset(broken.clone())),
+        ModuleSourceOutcome::Reset(Ok(broken.clone()))
+    );
+    assert!(!host.module_sources().identities.contains(&broken));
 }

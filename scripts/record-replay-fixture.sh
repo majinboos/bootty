@@ -59,7 +59,7 @@ start_ns=$(date +%s%N 2>/dev/null || date +%s000000000)
   printf '\n'
   printf 'uname=%q\n' "$(uname -a)"
   printf 'shell=%q\n' "${SHELL:-unknown}"
-  for app in nvim vim helix hx emacs less fzf git tmux zellij btop htop kubectl docker podman cargo npm pytest go; do
+  for app in nvim vim helix hx emacs less fzf git tmux btop htop kubectl docker podman cargo npm pytest go; do
     if command -v "$app" >/dev/null 2>&1; then
       version=$($app --version 2>&1 | head -n 1 | tr -d '\r') || version=unknown
       printf 'version_%s=%q\n' "$app" "$version"

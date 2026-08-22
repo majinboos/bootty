@@ -39,7 +39,7 @@ impl SiteBackend {
             return;
         }
         self.hovered_menu = None;
-        match page_tab_hit(
+        let tab_hit = page_tab_hit(
             self.selected,
             self.current_tab(),
             self.current_subtab(),
@@ -47,48 +47,25 @@ impl SiteBackend {
             y,
             self.cols,
             self.rows,
-        ) {
-            Some(TabHit::Primary(tab)) => {
-                self.hovered_tab = Some(tab);
-                self.hovered_subtab = None;
-                self.hovered_leaf_tab = None;
-                if kind == "down" {
-                    self.set_active_tab(tab);
-                    self.selection.clear();
-                    self.detail_scroll = 0;
-                    self.update(Msg::Focus(Focus::Detail));
-                    return;
-                }
+        );
+        (self.hovered_tab, self.hovered_subtab, self.hovered_leaf_tab) = match tab_hit {
+            Some(TabHit::Primary(tab)) => (Some(tab), None, None),
+            Some(TabHit::Secondary(tab)) => (None, Some(tab), None),
+            Some(TabHit::Tertiary(tab)) => (None, None, Some(tab)),
+            None => (None, None, None),
+        };
+        if kind == "down"
+            && let Some(tab_hit) = tab_hit
+        {
+            match tab_hit {
+                TabHit::Primary(tab) => self.set_active_tab(tab),
+                TabHit::Secondary(tab) => self.set_active_subtab(tab),
+                TabHit::Tertiary(tab) => self.set_active_leaf_tab(tab),
             }
-            Some(TabHit::Secondary(tab)) => {
-                self.hovered_tab = None;
-                self.hovered_subtab = Some(tab);
-                self.hovered_leaf_tab = None;
-                if kind == "down" {
-                    self.set_active_subtab(tab);
-                    self.selection.clear();
-                    self.detail_scroll = 0;
-                    self.update(Msg::Focus(Focus::Detail));
-                    return;
-                }
-            }
-            Some(TabHit::Tertiary(tab)) => {
-                self.hovered_tab = None;
-                self.hovered_subtab = None;
-                self.hovered_leaf_tab = Some(tab);
-                if kind == "down" {
-                    self.set_active_leaf_tab(tab);
-                    self.selection.clear();
-                    self.detail_scroll = 0;
-                    self.update(Msg::Focus(Focus::Detail));
-                    return;
-                }
-            }
-            None => {
-                self.hovered_tab = None;
-                self.hovered_subtab = None;
-                self.hovered_leaf_tab = None;
-            }
+            self.selection.clear();
+            self.detail_scroll = 0;
+            self.update(Msg::Focus(Focus::Detail));
+            return;
         }
 
         let point = SelectionPoint::new(x, y);
@@ -319,74 +296,74 @@ impl SiteBackend {
     }
 
     fn current_tab(&self) -> usize {
-        self.active_tabs
-            .get(self.selected)
-            .copied()
-            .unwrap_or_default()
-            .min(sections()[self.selected].tabs.len().saturating_sub(1))
+        active(
+            &self.active_tabs,
+            self.selected,
+            sections()[self.selected].tabs.len(),
+        )
     }
 
     fn current_subtab(&self) -> usize {
-        self.active_subtabs
-            .get(self.selected)
-            .copied()
-            .unwrap_or_default()
-            .min(
-                sections()[self.selected].tabs[self.current_tab()]
-                    .subtabs
-                    .len()
-                    .saturating_sub(1),
-            )
+        active(
+            &self.active_subtabs,
+            self.selected,
+            sections()[self.selected].tabs[self.current_tab()]
+                .subtabs
+                .len(),
+        )
     }
 
     fn current_leaf_tab(&self) -> usize {
-        self.active_leaf_tabs
-            .get(self.selected)
-            .copied()
-            .unwrap_or_default()
-            .min(
-                section_leaf_tab_count(
-                    sections()[self.selected],
-                    self.current_tab(),
-                    self.current_subtab(),
-                )
-                .saturating_sub(1),
-            )
+        active(
+            &self.active_leaf_tabs,
+            self.selected,
+            section_leaf_tab_count(
+                sections()[self.selected],
+                self.current_tab(),
+                self.current_subtab(),
+            ),
+        )
     }
 
     fn set_active_tab(&mut self, tab: usize) {
-        if self.active_tabs.len() != sections().len() {
-            self.active_tabs.resize(sections().len(), 0);
-        }
-        self.active_tabs[self.selected] =
-            tab.min(sections()[self.selected].tabs.len().saturating_sub(1));
+        set_active(
+            &mut self.active_tabs,
+            self.selected,
+            tab,
+            sections()[self.selected].tabs.len(),
+        );
         self.set_active_subtab(0);
     }
 
     fn set_active_subtab(&mut self, tab: usize) {
-        if self.active_subtabs.len() != sections().len() {
-            self.active_subtabs.resize(sections().len(), 0);
-        }
-        let max = sections()[self.selected].tabs[self.current_tab()]
+        let count = sections()[self.selected].tabs[self.current_tab()]
             .subtabs
-            .len()
-            .saturating_sub(1);
-        self.active_subtabs[self.selected] = tab.min(max);
+            .len();
+        set_active(&mut self.active_subtabs, self.selected, tab, count);
         self.set_active_leaf_tab(0);
     }
 
     fn set_active_leaf_tab(&mut self, tab: usize) {
-        if self.active_leaf_tabs.len() != sections().len() {
-            self.active_leaf_tabs.resize(sections().len(), 0);
-        }
-        let max = section_leaf_tab_count(
+        let count = section_leaf_tab_count(
             sections()[self.selected],
             self.current_tab(),
             self.current_subtab(),
-        )
-        .saturating_sub(1);
-        self.active_leaf_tabs[self.selected] = tab.min(max);
+        );
+        set_active(&mut self.active_leaf_tabs, self.selected, tab, count);
     }
+}
+
+fn set_active(values: &mut Vec<usize>, selected: usize, value: usize, count: usize) {
+    values.resize(sections().len(), 0);
+    values[selected] = value.min(count.saturating_sub(1));
+}
+
+fn active(values: &[usize], selected: usize, count: usize) -> usize {
+    values
+        .get(selected)
+        .copied()
+        .unwrap_or_default()
+        .min(count.saturating_sub(1))
 }
 fn section_index_for_page(page: &str) -> Option<usize> {
     let normalized = page.trim_matches('/').to_ascii_lowercase();

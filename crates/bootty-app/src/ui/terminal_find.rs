@@ -1,4 +1,4 @@
-use bootty_ui::{Theme, icons};
+use bootty_ui::{Theme, settings::settings_icon_button};
 use eframe::egui;
 
 use bootty_terminal::terminal_engine::TerminalSearchDirection;
@@ -75,7 +75,7 @@ impl TerminalFindDialog {
                         ui.horizontal(|ui| {
                             let count_text = self.count_text();
                             let count_width = 48.0;
-                            let button_width = 72.0;
+                            let button_width = 96.0;
                             let field_width =
                                 (width - count_width - button_width - 18.0).max(120.0);
                             let response = bootty_ui::flat_text_edit_singleline(
@@ -134,7 +134,8 @@ impl TerminalFindDialog {
                                 ),
                             );
 
-                            if icon_button(ui, theme, "chevron-up", "Find previous").clicked()
+                            if settings_icon_button(ui, palette, "chevron-up", "Find previous")
+                                .clicked()
                                 && !query.is_empty()
                             {
                                 event = TerminalFindEvent::Search {
@@ -142,15 +143,16 @@ impl TerminalFindDialog {
                                     direction: TerminalSearchDirection::Previous,
                                 };
                             }
-                            if icon_button(ui, theme, "chevron-down", "Find next").clicked()
+                            if settings_icon_button(ui, palette, "chevron-down", "Find next")
+                                .clicked()
                                 && !query.is_empty()
                             {
                                 event = TerminalFindEvent::Search {
-                                    query: query.clone(),
+                                    query,
                                     direction: TerminalSearchDirection::Next,
                                 };
                             }
-                            if icon_button(ui, theme, "x", "Close find").clicked() {
+                            if settings_icon_button(ui, palette, "x", "Close find").clicked() {
                                 event = TerminalFindEvent::Close;
                             }
                         });
@@ -185,31 +187,4 @@ impl TerminalFindDialog {
             None => String::new(),
         }
     }
-}
-
-fn icon_button(
-    ui: &mut egui::Ui,
-    theme: Theme,
-    slug: &str,
-    tooltip: &'static str,
-) -> egui::Response {
-    let palette = theme.palette;
-    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::click());
-    let fill = if response.hovered() {
-        palette.hover
-    } else {
-        palette.pane
-    };
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(palette.radius), fill);
-    if !icons::paint_icon_slug(ui.painter(), slug, rect.center(), 14.0, palette.text) {
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            slug,
-            egui::FontId::monospace(11.0),
-            palette.text,
-        );
-    }
-    response.on_hover_text(tooltip)
 }

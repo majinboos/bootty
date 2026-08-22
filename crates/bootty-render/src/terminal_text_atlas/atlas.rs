@@ -394,12 +394,20 @@ impl GlyphAtlas {
     }
 
     pub fn set(&mut self, entry: GlyphAtlasEntry, alpha: &[u8]) {
-        blit_pixels(
+        blit_pixels_from_source(
             &mut self.pixels,
-            self.width,
-            self.format.depth(),
-            entry,
-            alpha,
+            BlitTarget {
+                atlas_width: self.width,
+                depth: self.format.depth(),
+                entry,
+            },
+            BlitSource {
+                pixels: alpha,
+                width: entry.width,
+                x: 0,
+                y: 0,
+                clear_missing: false,
+            },
         );
         self.modified = self.modified.saturating_add(1);
         self.dirty_regions.push((self.modified, entry));
@@ -425,6 +433,7 @@ impl GlyphAtlas {
                 width: source_width,
                 x: source_x,
                 y: source_y,
+                clear_missing: true,
             },
         );
         self.modified = self.modified.saturating_add(1);
@@ -586,27 +595,6 @@ fn atlas_byte_len(width: u32, height: u32, depth: u32) -> Result<usize, GlyphAtl
         .ok_or(GlyphAtlasError::CapacityExceeded)
 }
 
-fn blit_pixels(
-    pixels: &mut [u8],
-    atlas_width: u32,
-    depth: u32,
-    entry: GlyphAtlasEntry,
-    alpha: &[u8],
-) {
-    let row_bytes = (entry.width * depth) as usize;
-    for y in 0..entry.height {
-        let dst_start = (((entry.y + y) * atlas_width + entry.x) * depth) as usize;
-        let src_start = (y * entry.width * depth) as usize;
-        let Some(dst_row) = pixels.get_mut(dst_start..dst_start.saturating_add(row_bytes)) else {
-            continue;
-        };
-        let Some(src_row) = alpha.get(src_start..src_start.saturating_add(row_bytes)) else {
-            continue;
-        };
-        dst_row.copy_from_slice(src_row);
-    }
-}
-
 #[derive(Clone, Copy)]
 struct BlitTarget {
     atlas_width: u32,
@@ -620,6 +608,7 @@ struct BlitSource<'a> {
     width: u32,
     x: u32,
     y: u32,
+    clear_missing: bool,
 }
 
 fn blit_pixels_from_source(pixels: &mut [u8], target: BlitTarget, source: BlitSource<'_>) {
@@ -630,7 +619,9 @@ fn blit_pixels_from_source(pixels: &mut [u8], target: BlitTarget, source: BlitSo
         let Some(dst_row) = pixels.get_mut(dst_start..dst_start.saturating_add(row_bytes)) else {
             continue;
         };
-        dst_row.fill(0);
+        if source.clear_missing {
+            dst_row.fill(0);
+        }
 
         let src_start = (((source.y + y) * source.width + source.x) * target.depth) as usize;
         let Some(src_row) = source

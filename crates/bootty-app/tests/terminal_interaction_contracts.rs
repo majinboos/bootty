@@ -89,15 +89,13 @@ fn start_two_panes(state: &mut AppState) -> (String, String) {
         outcomes.try_recv().ok()
     });
     assert!(matches!(outcome, Some(CommandOutcome::Success { .. })));
-    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("session dialog") else {
-        panic!("expected session dialog")
-    };
-    state.apply_picker_event(
-        dialog,
-        NewSessionPickerEvent::CreateSession {
-            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
-        },
-    );
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::NewSession(_))
+    ));
+    state.apply_picker_event(NewSessionPickerEvent::CreateSession {
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+    });
     for tick in 0..20 {
         state.update_frame(frame(
             started + Duration::from_millis(250 + tick),

@@ -26,14 +26,9 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         "Empty uses the macOS account login shell. Applies to new sessions.",
         |ui| {
             let mut shell = win.config.session.shell.clone().unwrap_or_default();
-            if text_field(ui, palette, &mut shell, "default login shell").changed() {
-                if shell.trim().is_empty() {
-                    win.config.session.shell = None;
-                    win.writeback.remove(&["session", "shell"]);
-                } else {
-                    win.config.session.shell = Some(shell.clone());
-                    win.writeback.set_str(&["session", "shell"], &shell);
-                }
+            if super::settings_text_edit(ui, palette, &mut shell, "default login shell").changed() {
+                win.config.session.shell = super::nonempty(&shell);
+                super::write_optional_text(&mut win.writeback, &["session", "shell"], &shell);
             }
         },
     );
@@ -50,15 +45,13 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default();
-            if text_field(ui, palette, &mut cwd, "inherit from launcher").changed() {
-                if cwd.trim().is_empty() {
-                    win.config.session.working_directory = None;
-                    win.writeback.remove(&["session", "working-directory"]);
-                } else {
-                    win.config.session.working_directory = Some(PathBuf::from(cwd.clone()));
-                    win.writeback
-                        .set_str(&["session", "working-directory"], &cwd);
-                }
+            if super::settings_text_edit(ui, palette, &mut cwd, "inherit from launcher").changed() {
+                win.config.session.working_directory = super::nonempty(&cwd).map(PathBuf::from);
+                super::write_optional_text(
+                    &mut win.writeback,
+                    &["session", "working-directory"],
+                    &cwd,
+                );
             }
         },
     );
@@ -71,13 +64,9 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         "Advertised terminal type for new shells.",
         |ui| {
             let mut term = win.config.session.term.clone();
-            if text_field(ui, palette, &mut term, "xterm-256color").changed() {
+            if super::settings_text_edit(ui, palette, &mut term, "xterm-256color").changed() {
                 win.config.session.term = term.clone();
-                if term.trim().is_empty() {
-                    win.writeback.remove(&["session", "term"]);
-                } else {
-                    win.writeback.set_str(&["session", "term"], &term);
-                }
+                super::write_optional_text(&mut win.writeback, &["session", "term"], &term);
             }
         },
     );
@@ -88,13 +77,13 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         "Advertised color capability for new shells.",
         |ui| {
             let mut colorterm = win.config.session.colorterm.clone();
-            if text_field(ui, palette, &mut colorterm, "truecolor").changed() {
+            if super::settings_text_edit(ui, palette, &mut colorterm, "truecolor").changed() {
                 win.config.session.colorterm = colorterm.clone();
-                if colorterm.trim().is_empty() {
-                    win.writeback.remove(&["session", "colorterm"]);
-                } else {
-                    win.writeback.set_str(&["session", "colorterm"], &colorterm);
-                }
+                super::write_optional_text(
+                    &mut win.writeback,
+                    &["session", "colorterm"],
+                    &colorterm,
+                );
             }
         },
     );
@@ -141,7 +130,10 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     );
     ui.add_space(6.0);
 
-    let mut env = win.config.session.env.clone();
+    let mut env = win
+        .session_env
+        .take()
+        .unwrap_or_else(|| win.config.session.env.clone());
     let mut changed = false;
     let mut remove: Option<usize> = None;
     for (index, (name, value)) in env.iter_mut().enumerate() {
@@ -167,10 +159,11 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         changed = true;
     }
     if changed {
-        win.config.session.env = env.clone();
+        // Incomplete pairs stay in the editor draft; only complete ones reach the document.
         let valid: Vec<(String, String)> = env
-            .into_iter()
+            .iter()
             .filter(|(name, _)| !name.trim().is_empty())
+            .cloned()
             .collect();
         if valid.is_empty() {
             win.writeback.remove(&["session", "env"]);
@@ -178,13 +171,5 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             win.writeback.set_env(&["session", "env"], &valid);
         }
     }
-}
-
-fn text_field(
-    ui: &mut egui::Ui,
-    palette: bootty_ui::ThemePalette,
-    value: &mut String,
-    hint: &str,
-) -> egui::Response {
-    super::settings_text_edit(ui, palette, value, hint)
+    win.session_env = Some(env);
 }

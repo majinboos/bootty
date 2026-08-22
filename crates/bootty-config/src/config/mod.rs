@@ -22,8 +22,11 @@ pub use model::{
     SshProfileConfig, SshRemoteConfig, StatusSegment, ThemeInfo, WindowConfig, WindowDecoration,
     WindowFullscreen,
 };
-pub use resolve::resolve_theme;
+pub use resolve::{available_theme_names, resolve_theme};
 pub use theme_catalog::{DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, builtin_theme_names};
-pub use writeback::{ConfigWriteOutcome, update_config_document, write_font_size_preference};
+pub use writeback::{
+    AcceptedConfigDocument, ConfigWriteOutcome, commit_config_document, update_config_document,
+    write_font_size_preference,
+};
 
 pub(crate) use load::{config_dependency_snapshot, load_config_attempt};

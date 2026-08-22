@@ -14,6 +14,23 @@ use objc2_app_kit::{NSApplication, NSCursor, NSScreen, NSTitlebarSeparatorStyle,
 static MACOS_CURSOR_ICON: AtomicU8 = AtomicU8::new(0);
 
 #[cfg(target_os = "macos")]
+fn active_window(app: &NSApplication) -> Option<objc2::rc::Retained<NSWindow>> {
+    app.keyWindow()
+        .or_else(|| app.mainWindow())
+        .or_else(|| app.windows().firstObject())
+}
+
+#[cfg(target_os = "macos")]
+fn with_active_window(action: impl FnOnce(&NSWindow)) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    if let Some(window) = active_window(&NSApplication::sharedApplication(mtm)) {
+        action(&window);
+    }
+}
+
+#[cfg(target_os = "macos")]
 pub fn set_macos_cursor_icon(icon: CursorIcon) {
     MACOS_CURSOR_ICON.store(
         match icon {
@@ -66,11 +83,7 @@ fn platform_active_screen_is_notched() -> bool {
     // Prefer the active window's screen, but fall back to scanning every screen: when the window's
     // `screen()` is unresolved mid-transition, a built-in panel still present in the list is enough.
     let app = NSApplication::sharedApplication(mtm);
-    if let Some(screen) = app
-        .keyWindow()
-        .or_else(|| app.mainWindow())
-        .or_else(|| app.windows().firstObject())
-        .and_then(|window| window.screen())
+    if let Some(screen) = active_window(&app).and_then(|window| window.screen())
         && name_reads_as_notched(&screen.localizedName().to_string())
     {
         return true;
@@ -114,12 +127,7 @@ fn measure_active_screen_notch_height() -> f32 {
         return 0.0;
     };
     let app = NSApplication::sharedApplication(mtm);
-    let Some(screen) = app
-        .keyWindow()
-        .or_else(|| app.mainWindow())
-        .or_else(|| app.windows().firstObject())
-        .and_then(|window| window.screen())
-    else {
+    let Some(screen) = active_window(&app).and_then(|window| window.screen()) else {
         return 0.0;
     };
     // auxiliaryTopLeftArea is Apple's API for laying out around the camera housing, so it stays
@@ -152,11 +160,7 @@ pub fn macos_active_screen_notch_span() -> Option<(f32, f32)> {
 fn platform_active_screen_notch_span() -> Option<(f32, f32)> {
     let mtm = MainThreadMarker::new()?;
     let app = NSApplication::sharedApplication(mtm);
-    let screen = app
-        .keyWindow()
-        .or_else(|| app.mainWindow())
-        .or_else(|| app.windows().firstObject())
-        .and_then(|window| window.screen())?;
+    let screen = active_window(&app).and_then(|window| window.screen())?;
     let frame = screen.frame();
     let width = frame.size.width as f32;
     if width <= 0.0 {
@@ -203,17 +207,7 @@ pub fn macos_set_window_shadow(enabled: bool) {
 
 #[cfg(target_os = "macos")]
 fn platform_set_window_shadow(enabled: bool) {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    if let Some(window) = app
-        .keyWindow()
-        .or_else(|| app.mainWindow())
-        .or_else(|| app.windows().firstObject())
-    {
-        window.setHasShadow(enabled);
-    }
+    with_active_window(|window| window.setHasShadow(enabled));
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -221,17 +215,9 @@ fn platform_set_window_shadow(_enabled: bool) {}
 
 #[cfg(target_os = "macos")]
 fn platform_disable_titlebar_separator() {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    if let Some(window) = app
-        .keyWindow()
-        .or_else(|| app.mainWindow())
-        .or_else(|| app.windows().firstObject())
-    {
+    with_active_window(|window| {
         window.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::None);
-    }
+    });
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -262,17 +248,7 @@ pub fn restore_macos_presentation() -> bool {
 
 /// Whether this platform adapter owns the non-native fullscreen frame.
 pub fn handles_macos_non_native_fullscreen_frame() -> bool {
-    platform_handles_macos_non_native_fullscreen_frame()
-}
-
-#[cfg(target_os = "macos")]
-fn platform_handles_macos_non_native_fullscreen_frame() -> bool {
-    true
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_handles_macos_non_native_fullscreen_frame() -> bool {
-    false
+    cfg!(target_os = "macos")
 }
 
 #[cfg(target_os = "macos")]
@@ -333,7 +309,7 @@ mod macos_presentation {
                 NSApplicationPresentationOptions::AutoHideDock
                     | NSApplicationPresentationOptions::AutoHideMenuBar,
             );
-            if let Some(window) = active_window(&app) {
+            if let Some(window) = super::active_window(&app) {
                 let mut saved_state = SAVED_WINDOW_STATE.lock().expect("lock window state");
                 if saved_state.is_none() {
                     *saved_state = Some(WindowState::from_window(&window));
@@ -365,17 +341,11 @@ mod macos_presentation {
             app.setPresentationOptions(NSApplicationPresentationOptions::from_bits_retain(options));
         }
         if let Some(state) = SAVED_WINDOW_STATE.lock().expect("lock window state").take()
-            && let Some(window) = active_window(&app)
+            && let Some(window) = super::active_window(&app)
         {
             state.restore(&window);
         }
         true
-    }
-
-    fn active_window(app: &NSApplication) -> Option<objc2::rc::Retained<NSWindow>> {
-        app.keyWindow()
-            .or_else(|| app.mainWindow())
-            .or_else(|| app.windows().firstObject())
     }
 
     impl WindowState {

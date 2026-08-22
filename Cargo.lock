@@ -689,7 +689,6 @@ dependencies = [
  "bootty-rmux",
  "bootty-tmux",
  "bootty-workspace-hack",
- "bootty-zellij",
  "clap",
  "egui",
  "embed-resource",
@@ -722,7 +721,6 @@ dependencies = [
  "bootty-winit",
  "bootty-workspace",
  "bootty-workspace-hack",
- "bootty-zellij",
  "criterion",
  "eframe",
  "egui",
@@ -734,7 +732,6 @@ dependencies = [
  "pollster 0.4.0",
  "rusqlite",
  "serde_json",
- "strum",
  "tempfile",
  "thiserror 2.0.20",
  "wgpu",
@@ -858,7 +855,6 @@ dependencies = [
  "bootty-remote",
  "bootty-rmux",
  "bootty-tmux",
- "bootty-zellij",
  "rmux-server",
  "rusqlite",
  "serde",
@@ -1022,7 +1018,6 @@ version = "0.4.0"
 dependencies = [
  "bootty-surface",
  "egui",
- "png",
  "serde",
  "serde-wasm-bindgen",
  "syntect",
@@ -1236,20 +1231,6 @@ dependencies = [
  "bootty-workspace-hack",
  "tempfile",
  "winsafe",
-]
-
-[[package]]
-name = "bootty-zellij"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bootty-identity",
- "bootty-mux",
- "bootty-mux-model",
- "bootty-remote",
- "bootty-workspace-hack",
- "inventory",
- "rmux-ipc",
 ]
 
 [[package]]

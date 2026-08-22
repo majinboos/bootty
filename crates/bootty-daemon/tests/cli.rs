@@ -392,7 +392,7 @@ fn legacy_config_and_session_order_are_isolated_by_application_identity() {
     .expect("production config file");
     std::fs::write(
         config.join("bootty-dev/config.toml"),
-        "[multiplexer]\nbackend = \"zellij\"\n",
+        "[multiplexer]\nbackend = \"rmux\"\n",
     )
     .expect("development config file");
     seed_legacy_catalog(
@@ -440,7 +440,7 @@ fn legacy_config_and_session_order_are_isolated_by_application_identity() {
     let development_spaces: serde_json::Value =
         serde_json::from_slice(&development.stdout).expect("development legacy JSON");
     assert_eq!(development_spaces[0]["name"], "Development legacy");
-    assert_eq!(development_spaces[0]["backend"], "zellij");
+    assert_eq!(development_spaces[0]["backend"], "rmux");
 
     assert_eq!(migration_marker(&production_state), 1);
     assert_eq!(
@@ -521,7 +521,7 @@ fn importer_selects_a_later_explicit_local_binding() {
     connection
         .execute(
             "INSERT INTO workspace_bindings (id, space_id, backend, remote)
-             VALUES (2, 1, 'zellij', '{\"source\":\"local\"}')",
+             VALUES (2, 1, 'rmux', '{\"source\":\"local\"}')",
             [],
         )
         .expect("later local binding");
@@ -540,7 +540,7 @@ fn importer_selects_a_later_explicit_local_binding() {
         String::from_utf8_lossy(&imported.stderr)
     );
     let spaces: serde_json::Value = serde_json::from_slice(&imported.stdout).expect("catalog JSON");
-    assert_eq!(spaces[0]["backend"], "zellij");
+    assert_eq!(spaces[0]["backend"], "rmux");
     let id = spaces[0]["id"].as_str().expect("Space id");
     assert_eq!(
         destination_sessions(&destination, id),
@@ -574,7 +574,7 @@ fn importer_rejects_ambiguous_supported_local_bindings_without_a_marker() {
     connection
         .execute(
             "INSERT INTO workspace_bindings (id, space_id, backend, remote)
-             VALUES (2, 1, 'zellij', '{\"source\":\"local\"}')",
+             VALUES (2, 1, 'rmux', '{\"source\":\"local\"}')",
             [],
         )
         .expect("second local binding");

@@ -98,10 +98,6 @@ struct TmuxControlClient {
 }
 
 impl TmuxControlClient {
-    fn start(program: &str, prefix_args: &[String], remote: Option<&SshRemote>) -> Result<Self> {
-        Self::start_with(program, prefix_args, remote)
-    }
-
     /// `prefix_args` go before `-C`, which is where tmux wants `-L`/`-S`. Only tests pass any.
     fn start_with(
         program: &str,
@@ -162,7 +158,7 @@ impl TmuxControlClient {
     fn query(&mut self, line: &str, blocks: usize) -> Result<String> {
         writeln!(self.stdin, "{line}")?;
         self.stdin.flush()?;
-        let mut body = String::new();
+        let mut bodies = Vec::with_capacity(blocks);
         for _ in 0..blocks {
             let reply = self.take_reply()?;
             if reply.error {
@@ -171,15 +167,11 @@ impl TmuxControlClient {
                     reply.body
                 ));
             }
-            if reply.body.is_empty() {
-                continue;
+            if !reply.body.is_empty() {
+                bodies.push(reply.body);
             }
-            if !body.is_empty() {
-                body.push('\n');
-            }
-            body.push_str(&reply.body);
         }
-        Ok(body)
+        Ok(bodies.join("\n"))
     }
 }
 
@@ -250,7 +242,7 @@ impl TmuxControlRunner {
                 return None;
             }
             if let Ok(client) =
-                TmuxControlClient::start(program, &self.prefix_args, self.remote.as_ref())
+                TmuxControlClient::start_with(program, &self.prefix_args, self.remote.as_ref())
             {
                 slot.client = Some(client);
                 slot.retry_after = None;
@@ -274,9 +266,6 @@ impl TmuxControlRunner {
             None
         }
     }
-}
-
-impl TmuxControlRunner {
     /// A client answers for one tmux server, so the host it runs on is part of its identity.
     fn client_key(&self, program: &str) -> String {
         self.remote.as_ref().map_or_else(
@@ -305,9 +294,6 @@ fn expected_blocks(args: &[String]) -> usize {
 /// carries — and tmux offers no way to escape a quote inside them, so an argument holding one goes
 /// back to being its own process rather than being mangled here.
 fn control_command_line(args: &[String]) -> Option<String> {
-    if args.is_empty() {
-        return None;
-    }
     let mut line = String::new();
     for command in args.split(|arg| arg == ";") {
         let (name, arguments) = command.split_first()?;

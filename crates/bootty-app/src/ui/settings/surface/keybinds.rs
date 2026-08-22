@@ -1,11 +1,11 @@
-use bootty_ui::{icons, keycaps};
+use bootty_ui::settings::{ComboStyle, described_combo};
 use eframe::egui;
 
 mod model;
 mod trigger_edit;
 
 use super::SettingsSurface;
-use bootty_config::config::{KeybindPreset, split_keybind_entry};
+use bootty_config::config::KeybindPreset;
 use bootty_winit::direct_input::ModifierSideState;
 pub(super) use model::{BindingRow, ChordCapture, KeybindScope};
 use model::{action_options, effective_bindings, read_scope_entries, write_scope};
@@ -18,6 +18,67 @@ use trigger_edit::{
 /// Seconds to wait for the next chord step before committing the captured trigger.
 const CHORD_TIMEOUT: f64 = 0.8;
 
+/// Editor state for the Keys pane. Accepted bindings live in the config; these are the drafts,
+/// which may be incomplete and must survive an accepted rebind.
+#[derive(Default)]
+pub(super) struct EditorState {
+    /// Which keybind list is being edited (global, or one of the per-backend lists).
+    scope: KeybindScope,
+    /// The user layer on top of the built-in defaults, for `loaded_scope`.
+    rows: Option<Vec<BindingRow>>,
+    /// Whether the loaded scope drops the built-in defaults (the `clear` sentinel).
+    clear: bool,
+    /// Rows may be incomplete while edited; persistence happens only at explicit boundaries.
+    dirty: bool,
+    /// The scope `rows`/`clear` were loaded for; reloaded when the scope changes.
+    loaded_scope: Option<KeybindScope>,
+    capture: Option<ChordCapture>,
+    /// Whether the preset-prefix recorder is capturing (one combo, commits on the first step).
+    prefix_capture: bool,
+    /// Modifier-remap rows (`from`, `to`); loaded lazily so incomplete rows persist.
+    modifier_rows: Option<Vec<(String, String)>>,
+    /// An action to focus (adding a row if absent) on the next frame, set by the palette's
+    /// "configure this command's keybinding".
+    pending_focus: Option<String>,
+}
+
+impl EditorState {
+    /// Whether either recorder is armed. Read before the frame so the host routes direct input to
+    /// the recorder instead of egui.
+    pub(super) fn is_recording(&self) -> bool {
+        self.capture.is_some() || self.prefix_capture
+    }
+
+    /// Whether a row's chord recorder is armed; Escape cancels that but not the prefix recorder.
+    pub(super) fn capturing_chord(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    pub(super) fn cancel_capture(&mut self) {
+        self.capture = None;
+    }
+
+    /// `commit_draft` clears `dirty` when it writes the rows into the draft document, before the
+    /// owner has accepted anything. A refused write has to put it back, or Apply disappears while
+    /// the failure notice is still on screen and the rows can never be retried.
+    pub(super) fn rearm_after_rejected_submission(&mut self) {
+        self.dirty = self.rows.is_some();
+    }
+
+    /// Drop the loaded rows so the next frame reloads them from the draft document.
+    fn reload_scope(&mut self) {
+        self.loaded_scope = None;
+    }
+
+    /// Jump to `scope` and focus `action`, adding a row for it if the scope has none.
+    pub(super) fn focus_action(&mut self, scope: KeybindScope, action: Option<&str>) {
+        self.scope = scope;
+        self.reload_scope();
+        self.cancel_capture();
+        self.pending_focus = action.map(str::to_owned);
+    }
+}
+
 pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     let direct_chords = std::mem::take(&mut win.recorder_chords);
@@ -28,7 +89,7 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     super::section(ui, palette, "KEYBINDINGS");
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Scope").color(palette.subtext));
-        let mut scope = win.keybind_scope;
+        let mut scope = win.keybinds.scope;
         if !KeybindScope::ALL
             .iter()
             .any(|(candidate, _)| *candidate == scope)
@@ -43,43 +104,41 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         if let Some(index) = super::settings_segmented_ltr(ui, palette, &labels, current) {
             scope = KeybindScope::ALL[index].0;
         }
-        win.keybind_scope = scope;
+        if scope != win.keybinds.scope {
+            commit_draft(win);
+            win.keybinds.rows = None;
+            win.keybinds.reload_scope();
+        }
+        win.keybinds.scope = scope;
     });
     ui.add_space(8.0);
-    let scope = win.keybind_scope;
+    let scope = win.keybinds.scope;
 
-    if win.keybind_loaded_scope != Some(scope) {
-        let (clear, rows) = read_scope_entries(win, scope);
-        win.keybind_clear = clear;
-        win.keybind_rows = Some(rows);
-        win.keybind_loaded_scope = Some(scope);
-        win.keybind_capture = None;
+    if win.keybinds.loaded_scope != Some(scope) {
+        let (clear, rows) = read_scope_entries(&win.writeback, &win.config.input, scope);
+        win.keybinds.clear = clear;
+        win.keybinds.rows = Some(rows);
+        win.keybinds.loaded_scope = Some(scope);
+        win.keybinds.cancel_capture();
     }
 
-    let mut rows = win.keybind_rows.take().unwrap_or_default();
-    let mut clear = win.keybind_clear;
-    let mut capture = win.keybind_capture.take();
+    let mut rows = win.keybinds.rows.take().unwrap_or_default();
+    let mut clear = win.keybinds.clear;
+    let mut capture = win.keybinds.capture.take();
     let mut changed = false;
     // Prefixed chords are idiomatic in the global and native/rmux scopes; the tmux backend
     // relays raw bytes and the sidebar has no chord support, so those record literally.
-    let effective_prefix = match scope {
-        KeybindScope::Global | KeybindScope::Native | KeybindScope::Rmux => {
-            win.config.input.effective_prefix()
-        }
-        _ => None,
-    };
+    let effective_prefix = scope.effective_prefix(&win.config.input);
 
     // "Configure this command's keybinding" (from the palette): surface the row for
     // the requested action — adding an empty one if absent — and filter the list to
     // it. Recording is left for the user to start; auto-starting it would capture
     // the very chord that opened this view (e.g. `cmd+shift+,`).
-    if let Some(target) = win.pending_keybind_focus.take() {
+    if let Some(target) = win.keybinds.pending_focus.take() {
         if !rows.iter().any(|row| row.action.trim() == target.as_str()) {
             rows.push(BindingRow {
-                trigger: String::new(),
                 action: target.clone(),
-                side_sensitive: false,
-                prefixed: false,
+                ..BindingRow::default()
             });
         }
         let search_id = ui.make_persistent_id(("settings_keybind_search", scope));
@@ -90,15 +149,14 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         changed = true;
     }
 
-    let id = ui.make_persistent_id(("settings_keybind_search", scope));
-    let mut search: String = ui.memory(|memory| memory.data.get_temp(id).unwrap_or_default());
+    let search_id = ui.make_persistent_id(("settings_keybind_search", scope));
+    let mut search: String =
+        ui.memory(|memory| memory.data.get_temp(search_id).unwrap_or_default());
     if super::settings_text_edit_width(ui, palette, &mut search, "Search keybindings", 280.0)
         .changed()
     {
-        ui.memory_mut(|memory| memory.data.insert_temp(id, search));
+        ui.memory_mut(|memory| memory.data.insert_temp(search_id, search.clone()));
     }
-    let search_id = ui.make_persistent_id(("settings_keybind_search", scope));
-    let search: String = ui.memory(|memory| memory.data.get_temp(search_id).unwrap_or_default());
     let needle = search.trim().to_ascii_lowercase();
 
     handle_capture(
@@ -111,27 +169,28 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         effective_prefix.as_deref(),
     );
 
-    let invalid_count = rows
+    let (complete_count, invalid_count) = rows
         .iter()
-        .filter(|row| {
-            let trigger = row.trigger.trim();
-            let action = row.action.trim();
-            !(trigger.is_empty() || action.is_empty() || scope.entry_is_valid(trigger, action))
+        .filter_map(|row| row.validity(scope))
+        .fold((0, 0), |(complete, invalid), valid| {
+            (complete + 1, invalid + usize::from(!valid))
+        });
+    ui.label(
+        egui::RichText::new(format!(
+            "{complete_count} complete, {invalid_count} invalid"
+        ))
+        .color(if invalid_count == 0 {
+            palette.muted
+        } else {
+            palette.destructive
         })
-        .count();
-    let complete_count = rows
-        .iter()
-        .filter(|row| !row.trigger.trim().is_empty() && !row.action.trim().is_empty())
-        .count();
-    let summary = if invalid_count == 0 {
-        format!("{complete_count} complete binding rows; no conflicts or invalid actions detected.")
-    } else {
-        format!("{invalid_count} invalid binding rows need attention.")
-    };
-    conflict_banner(ui, palette, invalid_count, &summary);
+        .size(12.0),
+    );
+    ui.add_space(8.0);
 
     let mut remove: Option<usize> = None;
     let mut toggle_capture: Option<usize> = None;
+    let action_options = action_options(scope);
     // Zero the inter-row spacing so the striped rows read as one continuous table.
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -148,6 +207,7 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
                 BindingEditorContext {
                     scope,
                     index,
+                    action_options: &action_options,
                     prefix: effective_prefix.as_deref(),
                     capture: capture.as_ref(),
                     changed: &mut changed,
@@ -165,7 +225,7 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     }
 
     if let Some(index) = toggle_capture {
-        win.prefix_capture = false;
+        win.keybinds.prefix_capture = false;
         capture = match capture {
             Some(cap) if cap.row == index => None,
             _ => Some(ChordCapture {
@@ -190,16 +250,41 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         };
     }
 
-    win.keybind_clear = clear;
-    if changed {
-        write_scope(win, scope, clear, &rows);
-        // Keep the resolved-shortcuts panel in sync with what was just written.
-        super::reload_settings_config(win);
-    }
-    win.keybind_rows = Some(rows);
-    win.keybind_capture = capture;
+    let apply = (win.keybinds.dirty || changed)
+        && super::settings_button(ui, palette, "Apply keybindings").clicked();
 
-    effective_bindings_panel(win, ui, scope);
+    win.keybinds.clear = clear;
+    win.keybinds.dirty |= changed;
+    win.keybinds.rows = Some(rows);
+    win.keybinds.capture = capture;
+    if apply {
+        commit_draft(win);
+    }
+
+    egui::CollapsingHeader::new("Resolved shortcuts")
+        .default_open(false)
+        .show(ui, |ui| {
+            for entry in effective_bindings(&win.config, scope) {
+                ui.monospace(entry);
+            }
+        });
+}
+
+pub(super) fn commit_draft(win: &mut SettingsSurface) {
+    if !win.keybinds.dirty {
+        return;
+    }
+    let Some(rows) = win.keybinds.rows.take() else {
+        return;
+    };
+    write_scope(
+        &mut win.writeback,
+        win.keybinds.scope,
+        win.keybinds.clear,
+        &rows,
+    );
+    win.keybinds.rows = Some(rows);
+    win.keybinds.dirty = false;
 }
 
 /// Global input settings, laid out at the top of the page with the same row grammar as the rest of
@@ -283,19 +368,18 @@ fn preset_options(win: &mut SettingsSurface, ui: &mut egui::Ui, direct_chords: &
                 let preset = KeybindPreset::ALL[index];
                 win.writeback.set_str(&["input", "preset"], preset.as_str());
                 // Re-resolve so the built-in default tables (and effective prefix) swap over.
-                super::reload_settings_config(win);
-                win.keybind_loaded_scope = None;
+                win.keybinds.reload_scope();
             }
         },
     );
 
     let preset = win.config.input.preset;
     if preset.default_prefix().is_none() {
-        win.prefix_capture = false;
+        win.keybinds.prefix_capture = false;
         return;
     }
     let prefix = win.config.input.effective_prefix().unwrap_or_default();
-    let recording = win.prefix_capture;
+    let recording = win.keybinds.prefix_capture;
     let mut toggle_recording = false;
     let mut reset_prefix = false;
     super::settings_row(
@@ -305,10 +389,7 @@ fn preset_options(win: &mut SettingsSurface, ui: &mut egui::Ui, direct_chords: &
         "Leader combo for prefixed shortcuts: press it, then the bound key.",
         |ui| {
             let capture_text = "Press a combo… Esc to cancel";
-            if record_cell(ui, palette, &prefix, recording, capture_text).clicked() {
-                toggle_recording = true;
-            }
-            if record_dot_button(ui, palette, recording).clicked() {
+            if record_button(ui, &prefix, recording, capture_text).clicked() {
                 toggle_recording = true;
             }
             if win.config.input.prefix.is_some()
@@ -320,16 +401,15 @@ fn preset_options(win: &mut SettingsSurface, ui: &mut egui::Ui, direct_chords: &
         },
     );
     if toggle_recording {
-        win.prefix_capture = !recording;
-        win.keybind_capture = None;
+        win.keybinds.prefix_capture = !recording;
+        win.keybinds.cancel_capture();
     }
     if reset_prefix {
-        win.prefix_capture = false;
+        win.keybinds.prefix_capture = false;
         win.writeback.remove(&["input", "prefix"]);
-        super::reload_settings_config(win);
-        win.keybind_loaded_scope = None;
+        win.keybinds.reload_scope();
     }
-    if win.prefix_capture {
+    if win.keybinds.prefix_capture {
         handle_prefix_capture(win, ui, direct_chords);
     }
 }
@@ -340,7 +420,7 @@ fn handle_prefix_capture(win: &mut SettingsSurface, ui: &egui::Ui, direct_chords
     ui.ctx().request_repaint();
     let step = if let Some((key, modifiers)) = drain_first_key_press(ui) {
         if key == egui::Key::Escape {
-            win.prefix_capture = false;
+            win.keybinds.prefix_capture = false;
             return;
         }
         trigger_step(key, modifiers)
@@ -350,11 +430,10 @@ fn handle_prefix_capture(win: &mut SettingsSurface, ui: &egui::Ui, direct_chords
     let Some(step) = step else {
         return;
     };
-    win.prefix_capture = false;
+    win.keybinds.prefix_capture = false;
     win.writeback.set_str(&["input", "prefix"], &step);
     // Re-resolve so the prefixed default chords rebuild against the new prefix.
-    super::reload_settings_config(win);
-    win.keybind_loaded_scope = None;
+    win.keybinds.reload_scope();
 }
 
 /// Per-scope toggle for whether Bootty's built-in shortcuts stay active. Stored as a `clear`
@@ -379,7 +458,7 @@ fn defaults_toggle(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, clear: &
 
 fn modifier_remaps(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
-    if win.modifier_rows.is_none() {
+    if win.keybinds.modifier_rows.is_none() {
         let rows = win
             .config
             .input
@@ -390,49 +469,15 @@ fn modifier_remaps(win: &mut SettingsSurface, ui: &mut egui::Ui) {
                 None => (entry.clone(), String::new()),
             })
             .collect();
-        win.modifier_rows = Some(rows);
+        win.keybinds.modifier_rows = Some(rows);
     }
-    let mut rows = win.modifier_rows.take().unwrap_or_default();
+    let mut rows = win.keybinds.modifier_rows.take().unwrap_or_default();
     let mut changed = false;
     let mut remove: Option<usize> = None;
     for (index, (from, to)) in rows.iter_mut().enumerate() {
         ui.horizontal(|ui| {
-            let from_index = MODIFIER_TOKENS
-                .iter()
-                .position(|&token| token == from.as_str());
-            let from_label = if from.is_empty() {
-                "from"
-            } else {
-                from.as_str()
-            };
-            if let Some(choice) = super::searchable_combo(
-                ui,
-                palette,
-                &format!("mod_remap_from_{index}"),
-                from_label,
-                118.0,
-                MODIFIER_TOKENS,
-                from_index,
-            ) {
-                *from = MODIFIER_TOKENS[choice].to_owned();
-                changed = true;
-            }
-            let to_index = MODIFIER_TOKENS
-                .iter()
-                .position(|&token| token == to.as_str());
-            let to_label = if to.is_empty() { "to" } else { to.as_str() };
-            if let Some(choice) = super::searchable_combo(
-                ui,
-                palette,
-                &format!("mod_remap_to_{index}"),
-                to_label,
-                118.0,
-                MODIFIER_TOKENS,
-                to_index,
-            ) {
-                *to = MODIFIER_TOKENS[choice].to_owned();
-                changed = true;
-            }
+            changed |= modifier_combo(ui, palette, index, "from", from);
+            changed |= modifier_combo(ui, palette, index, "to", to);
             if super::settings_icon_button(ui, palette, "x", "Remove remap").clicked() {
                 remove = Some(index);
             }
@@ -452,8 +497,7 @@ fn modifier_remaps(win: &mut SettingsSurface, ui: &mut egui::Ui) {
             .iter()
             .filter(|(from, to)| remap_is_valid(from, to))
             .map(|(from, to)| format!("{from}={to}"))
-            .collect();
-        win.config.input.modifier_remap = entries.clone();
+            .collect::<Vec<String>>();
         if entries.is_empty() {
             win.writeback.remove(&["input", "modifier-remap"]);
         } else {
@@ -461,142 +505,37 @@ fn modifier_remaps(win: &mut SettingsSurface, ui: &mut egui::Ui) {
                 .set_strings(&["input", "modifier-remap"], &entries);
         }
     }
-    win.modifier_rows = Some(rows);
+    win.keybinds.modifier_rows = Some(rows);
 }
 
-fn conflict_banner(
+fn modifier_combo(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
-    invalid_count: usize,
-    summary: &str,
-) {
-    let ok = invalid_count == 0;
-    egui::Frame::NONE
-        .fill(palette.pane)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(12, 10))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let color = if ok {
-                    palette.success
-                } else {
-                    palette.destructive
-                };
-                if let Some(icon) =
-                    icons::icon_text(if ok { "check" } else { "circle-alert" }, 16.0, color)
-                {
-                    ui.label(icon);
-                }
-                ui.label(
-                    egui::RichText::new(if ok {
-                        "No conflicts"
-                    } else {
-                        "Needs attention"
-                    })
-                    .color(color)
-                    .strong(),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new(summary).color(palette.muted).size(12.0));
-                });
-            });
-        });
-    ui.add_space(12.0);
-}
-
-fn effective_bindings_panel(win: &SettingsSurface, ui: &mut egui::Ui, scope: KeybindScope) {
-    let palette = win.palette;
-    ui.add_space(10.0);
-    egui::CollapsingHeader::new(
-        egui::RichText::new("Resolved shortcuts")
-            .color(palette.subtext)
-            .size(12.0),
-    )
-    .default_open(false)
-    .show(ui, |ui| {
-        let search_id = ui.make_persistent_id(("settings_resolved_keybind_search", scope));
-        let mut search: String =
-            ui.memory(|memory| memory.data.get_temp(search_id).unwrap_or_default());
-        if super::settings_text_edit_width(
-            ui,
-            palette,
-            &mut search,
-            "Search resolved shortcuts",
-            320.0,
-        )
-        .changed()
-        {
-            ui.memory_mut(|memory| memory.data.insert_temp(search_id, search.clone()));
-        }
-        let needle = search.trim().to_ascii_lowercase();
-        ui.add_space(8.0);
-        // Render the rows inline (no nested scroll area) so the panel grows to its full height and
-        // the page's own scroll handles overflow — a nested scroll collapsed it to a couple rows.
-        egui::Frame::NONE
-            .fill(palette.pane)
-            .stroke(egui::Stroke::new(1.0, palette.border))
-            .corner_radius(egui::CornerRadius::same(palette.radius))
-            .inner_margin(egui::Margin::symmetric(12, 10))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                // Collect the filtered entries, then lay them out in an aligned multi-column grid.
-                let entries: Vec<(String, String, [bool; 4])> = effective_bindings(win, scope)
-                    .iter()
-                    .filter_map(|entry| {
-                        let (trigger, action) = split_keybind_entry(entry).map_or_else(
-                            || (entry.to_owned(), String::new()),
-                            |(trigger, action)| (trigger.to_owned(), action.to_owned()),
-                        );
-                        let haystack = format!("{trigger} {action}").to_ascii_lowercase();
-                        if !needle.is_empty() && !haystack.contains(&needle) {
-                            return None;
-                        }
-                        let (flags, combo) = parse_trigger_flags(&trigger);
-                        Some((combo, action_title(&action), flags))
-                    })
-                    .collect();
-                if entries.is_empty() {
-                    ui.label(
-                        egui::RichText::new("No matching shortcuts.")
-                            .color(palette.muted)
-                            .size(12.0),
-                    );
-                    return;
-                }
-                let cols = ((ui.available_width() / 280.0).floor() as usize).clamp(1, 6);
-                // egui::Grid keeps columns aligned (each column sizes to its widest cell) rather than
-                // packing each cell to its own content width, which staggered the old layout.
-                egui::Grid::new(("resolved_shortcuts_grid", scope))
-                    .num_columns(cols)
-                    .spacing([28.0, 12.0])
-                    .show(ui, |ui| {
-                        for (index, (combo, title, flags)) in entries.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                keycap_chip(ui, palette, combo);
-                                ui.add_space(8.0);
-                                ui.label(egui::RichText::new(title).color(palette.subtext));
-                                let tags: Vec<&str> = TRIGGER_FLAGS
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(flag_index, _)| flags[*flag_index])
-                                    .map(|(_, (name, _, _))| *name)
-                                    .collect();
-                                if !tags.is_empty() {
-                                    ui.label(
-                                        egui::RichText::new(format!("· {}", tags.join(" · ")))
-                                            .color(palette.muted)
-                                            .size(11.0),
-                                    );
-                                }
-                            });
-                            if (index + 1) % cols == 0 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-            });
-    });
+    row: usize,
+    side: &'static str,
+    value: &mut String,
+) -> bool {
+    let selected = MODIFIER_TOKENS
+        .iter()
+        .position(|token| *token == value.as_str());
+    let label = if value.is_empty() {
+        side
+    } else {
+        value.as_str()
+    };
+    let Some(choice) = super::searchable_combo(
+        ui,
+        palette,
+        &format!("mod_remap_{side}_{row}"),
+        label,
+        118.0,
+        MODIFIER_TOKENS,
+        selected,
+    ) else {
+        return false;
+    };
+    *value = MODIFIER_TOKENS[choice].to_owned();
+    true
 }
 
 /// Shared control height for the trigger cell and the value field so they line up exactly.
@@ -673,21 +612,14 @@ fn binding_editor_row(
                     }
                 }
 
-                if record_cell(ui, palette, &combo, recording, &capture_text).clicked() {
+                if record_button(ui, &combo, recording, &capture_text).clicked() {
                     *ctx.toggle_capture = Some(ctx.index);
                 }
 
-                if record_dot_button(ui, palette, recording).clicked() {
-                    *ctx.toggle_capture = Some(ctx.index);
-                }
-
-                if let Some(icon) = icons::icon_text("arrow-right", 14.0, palette.muted) {
-                    ui.label(icon);
-                }
+                ui.label(egui::RichText::new("→").color(palette.muted));
 
                 // Title + description picker, drawn from the shared action catalog.
-                let options = action_options(ctx.scope);
-                let (base, params) = split_action_for_editor(&row.action, &options);
+                let (base, params) = split_action_for_editor(&row.action, ctx.action_options);
 
                 // Spread the action + value across the leftover width, reserving a right cluster for
                 // the status, flags, and remove controls so the row uses its full width.
@@ -698,17 +630,18 @@ fn binding_editor_row(
                 let action_width = (fields * 0.58 - 8.0).clamp(150.0, 320.0);
                 let value_width = (fields - action_width - 8.0).clamp(90.0, 240.0);
 
-                let mut chosen_action: &'static str = options
+                let mut chosen_action: &'static str = ctx
+                    .action_options
                     .iter()
                     .find(|(name, _, _)| *name == base)
                     .map_or("", |(name, _, _)| *name);
-                if super::described_combo(
+                if described_combo(
                     ui,
                     palette,
                     &format!("kb_action_{}", ctx.index),
                     &mut chosen_action,
-                    &options,
-                    super::ComboStyle {
+                    ctx.action_options,
+                    ComboStyle {
                         width: action_width,
                         searchable: true,
                         placeholder: "action",
@@ -744,12 +677,19 @@ fn binding_editor_row(
                     if super::settings_icon_button(ui, palette, "x", "Remove binding").clicked() {
                         *ctx.remove = Some(ctx.index);
                     }
-                    if flags_button(ui, palette, any_flag, flags_open).clicked() {
+                    let options_tip = if any_flag {
+                        "Binding options (active)"
+                    } else {
+                        "Binding options"
+                    };
+                    if super::settings_icon_button(ui, palette, "sliders-horizontal", options_tip)
+                        .clicked()
+                    {
                         flags_open = !flags_open;
                         ui.memory_mut(|memory| memory.data.insert_temp(flags_open_id, flags_open));
                     }
                     ui.add_space(4.0);
-                    binding_status(ui, palette, ctx.scope, &row.trigger, &row.action);
+                    binding_status(ui, palette, row, ctx.scope);
                 });
             });
 
@@ -769,271 +709,87 @@ fn binding_flags_editor(
     row: &mut BindingRow,
     changed: &mut bool,
 ) {
-    egui::Frame::NONE
-        .inner_margin(egui::Margin {
-            left: 10,
-            right: 10,
-            top: 4,
-            bottom: 8,
-        })
-        .show(ui, |ui| {
-            for (index, (_, label, help)) in TRIGGER_FLAGS.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let mut on = flags[index];
-                    if super::settings_toggle(ui, palette, &mut on) {
-                        flags[index] = on;
-                        row.trigger = join_trigger_flags(flags, combo);
-                        *changed = true;
-                    }
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(*label)
-                                .color(palette.text)
-                                .strong()
-                                .size(12.0),
-                        );
-                        ui.label(egui::RichText::new(*help).color(palette.muted).size(11.0));
-                    });
-                });
-                ui.add_space(2.0);
-            }
-
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let mut on = row.side_sensitive;
-                if super::settings_toggle(ui, palette, &mut on) {
-                    row.side_sensitive = on;
-                    let combo = if on {
-                        add_default_modifier_sides(combo)
-                    } else {
-                        strip_modifier_sides(combo)
-                    };
-                    row.trigger = join_trigger_flags(flags, &combo);
-                    *changed = true;
-                }
-                ui.vertical(|ui| {
-                    ui.label(
-                        egui::RichText::new("Modifier side")
-                            .color(palette.text)
-                            .strong()
-                            .size(12.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(
-                            "Require the same physical left/right modifier side that was recorded.",
-                        )
-                        .color(palette.muted)
-                        .size(11.0),
-                    );
-                });
-            });
-        });
-}
-
-/// The record indicator: a red ball at rest, a red square while capturing.
-fn record_dot_button(
-    ui: &mut egui::Ui,
-    palette: bootty_ui::ThemePalette,
-    recording: bool,
-) -> egui::Response {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::Vec2::splat(ROW_CONTROL_HEIGHT), egui::Sense::click());
-    let center = rect.center();
-    let red = palette.destructive;
-    if recording {
-        ui.painter().rect_filled(
-            egui::Rect::from_center_size(center, egui::Vec2::splat(12.0)),
-            egui::CornerRadius::same(3),
-            red,
-        );
-    } else {
-        ui.painter().circle_filled(center, 7.0, red);
-        if response.hovered() {
-            ui.painter()
-                .circle_stroke(center, 10.0, egui::Stroke::new(1.5, red));
+    for (index, (_, label, help)) in TRIGGER_FLAGS.iter().enumerate() {
+        if binding_option(ui, palette, &mut flags[index], label, help) {
+            row.trigger = join_trigger_flags(flags, combo);
+            *changed = true;
         }
     }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    if binding_option(
+        ui,
+        palette,
+        &mut row.side_sensitive,
+        "Modifier side",
+        "Require the same physical left/right modifier side that was recorded.",
+    ) {
+        let combo = if row.side_sensitive {
+            add_default_modifier_sides(combo)
+        } else {
+            strip_modifier_sides(combo)
+        };
+        row.trigger = join_trigger_flags(flags, &combo);
+        *changed = true;
     }
-    response.on_hover_text(if recording {
-        "Stop recording"
-    } else {
-        "Record shortcut"
-    })
 }
 
-/// Small toggle button that opens the per-binding flags editor; tinted when any flag is active.
-fn flags_button(
+fn binding_option(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
-    active: bool,
-    open: bool,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(30.0), egui::Sense::click());
-    let radius = egui::CornerRadius::same(palette.radius);
-    let fill = if open || response.hovered() {
-        palette.hover
-    } else {
-        palette.surface
-    };
-    ui.painter().rect_filled(rect, radius, fill);
-    ui.painter().rect_stroke(
-        rect,
-        radius,
-        egui::Stroke::new(1.0, palette.border),
-        egui::StrokeKind::Inside,
-    );
-    let tint = if active {
-        palette.primary
-    } else {
-        palette.muted
-    };
-    icons::paint_icon_slug(
-        ui.painter(),
-        "sliders-horizontal",
-        rect.center(),
-        15.0,
-        tint,
-    );
-    response.on_hover_text("Binding options")
+    value: &mut bool,
+    label: &str,
+    help: &str,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        changed = super::settings_toggle(ui, palette, value);
+        ui.vertical(|ui| {
+            ui.label(egui::RichText::new(label).color(palette.text).strong());
+            ui.label(egui::RichText::new(help).color(palette.muted).small());
+        });
+    });
+    changed
 }
 
-/// The clickable shortcut cell: shows the bound combo as keycaps, or a pulsing recording prompt
-/// while capturing. Clicking toggles capture, mirroring the record button beside it.
-fn record_cell(
+/// The shortcut recorder is one ordinary button; capture behavior lives in `handle_capture`.
+fn record_button(
     ui: &mut egui::Ui,
-    palette: bootty_ui::ThemePalette,
     trigger: &str,
     recording: bool,
     capture_text: &str,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::Vec2::new(220.0, ROW_CONTROL_HEIGHT),
-        egui::Sense::click(),
-    );
-    let radius = egui::CornerRadius::same(palette.radius);
-    let text_pos = rect.left_center() + egui::vec2(10.0, 0.0);
-    if recording {
-        ui.ctx().request_repaint();
-        let pulse = (ui.input(|input| input.time) * 3.0).sin() * 0.5 + 0.5;
-        let alpha = (pulse * 90.0) as u8 + 45;
-        let glow = egui::Color32::from_rgba_unmultiplied(
-            palette.primary.r(),
-            palette.primary.g(),
-            palette.primary.b(),
-            alpha,
-        );
-        ui.painter().rect_filled(rect, radius, palette.mantle);
-        ui.painter().rect_filled(rect, radius, glow);
-        ui.painter().rect_stroke(
-            rect,
-            radius,
-            egui::Stroke::new(1.0, palette.primary),
-            egui::StrokeKind::Inside,
-        );
-        if capture_text.starts_with("Press keys") {
-            ui.painter().text(
-                text_pos,
-                egui::Align2::LEFT_CENTER,
-                capture_text,
-                egui::FontId::proportional(12.0),
-                palette.text,
-            );
-        } else {
-            let galley = keycaps::trigger_galley_from_painter(
-                ui.painter(),
-                palette,
-                capture_text,
-                palette.text,
-                rect.width() - 20.0,
-            );
-            let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5);
-            ui.painter().galley(pos, galley, palette.text);
-        }
+    let text = if recording {
+        capture_text
+    } else if trigger.trim().is_empty() {
+        "Click to record"
     } else {
-        let fill = if response.hovered() {
-            palette.hover
+        trigger
+    };
+    ui.add_sized([220.0, ROW_CONTROL_HEIGHT], egui::Button::new(text))
+        .on_hover_text(if recording {
+            "Recording — press keys or scroll, Esc cancels"
         } else {
-            palette.mantle
-        };
-        ui.painter().rect_filled(rect, radius, fill);
-        ui.painter().rect_stroke(
-            rect,
-            radius,
-            egui::Stroke::new(1.0, palette.border),
-            egui::StrokeKind::Inside,
-        );
-        if trigger.trim().is_empty() {
-            ui.painter().text(
-                text_pos,
-                egui::Align2::LEFT_CENTER,
-                "Click to record",
-                egui::FontId::proportional(12.0),
-                palette.muted,
-            );
-        } else {
-            let galley =
-                keycaps::trigger_galley(ui, palette, trigger, palette.text, rect.width() - 20.0);
-            let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5);
-            ui.painter().galley(pos, galley, palette.text);
-        }
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-    }
-    response.on_hover_text(if recording {
-        "Recording — press keys or scroll, Esc cancels"
-    } else {
-        "Click to record a shortcut"
-    })
+            "Click to record a shortcut"
+        })
 }
 
 fn binding_status(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
+    row: &BindingRow,
     scope: KeybindScope,
-    trigger: &str,
-    action: &str,
 ) {
-    let trigger = trigger.trim();
-    let action = action.trim();
-    if trigger.is_empty() || action.is_empty() {
-        ui.label(
-            egui::RichText::new("incomplete")
-                .color(palette.muted)
-                .size(11.0),
-        );
-    } else if scope.entry_is_valid(trigger, action) {
-        if let Some(icon) = icons::icon_text("check", 16.0, palette.success) {
-            ui.label(icon);
-        }
-    } else {
-        ui.label(
-            egui::RichText::new("invalid")
-                .color(palette.destructive)
-                .size(11.0),
-        );
-    }
-}
-
-/// A framed keycap rendering of a resolved trigger for the read-only list.
-fn keycap_chip(ui: &mut egui::Ui, palette: bootty_ui::ThemePalette, trigger: &str) {
-    egui::Frame::NONE
-        .fill(palette.surface)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(10, 5))
-        .show(ui, |ui| {
-            let galley = keycaps::trigger_galley(ui, palette, trigger, palette.text, 320.0);
-            ui.add(egui::Label::new(galley).selectable(false));
-        });
+    let (status, color) = match row.validity(scope) {
+        None => ("incomplete", palette.muted),
+        Some(true) => ("valid", palette.success),
+        Some(false) => ("invalid", palette.destructive),
+    };
+    ui.label(egui::RichText::new(status).color(color).small());
 }
 
 struct BindingEditorContext<'a> {
     scope: KeybindScope,
     index: usize,
+    action_options: &'a [(&'static str, &'static str, &'static str)],
     /// The active preset's prefix, when this scope supports prefixed chords.
     prefix: Option<&'a str>,
     capture: Option<&'a ChordCapture>,
@@ -1065,49 +821,33 @@ fn handle_capture(
     let now = ui.input(|input| input.time);
     // Keep repainting so the chord-timeout commit fires even without further input.
     ui.ctx().request_repaint();
+    let row = capture.as_ref().expect("capture checked above").row;
+    let side_sensitive = rows.get(row).is_some_and(|row| row.side_sensitive);
 
-    // egui events first, for Escape (cancel) and any non-cmd chord egui still delivers as a key.
-    if let Some((key, modifiers)) = drain_first_key_press(ui) {
+    // Input sources are ordered: egui keys, wheel, then chords intercepted by direct input.
+    let step = if let Some((key, modifiers)) = drain_first_key_press(ui) {
         if key == egui::Key::Escape {
             *capture = None;
             return;
         }
-        if let Some(cap) = capture.as_mut()
-            && let Some(step) = captured_step(
-                rows.get(cap.row).is_some_and(|row| row.side_sensitive),
-                direct_chords,
-                key,
-                modifiers,
-            )
-        {
-            cap.steps.push(step);
-            cap.deadline = Some(now + CHORD_TIMEOUT);
+        let step = captured_step(side_sensitive, direct_chords, key, modifiers);
+        if step.is_none() {
+            return;
         }
-        return;
-    }
-
-    // Wheel steps: `scroll_up` / `scroll_down` are bindable triggers (the default font-size zoom
-    // rides on `alt+shift+scroll`), so the recorder captures the wheel the same way it captures keys.
-    if let Some((up, modifiers)) = drain_first_scroll(ui)
-        && let Some(cap) = capture.as_mut()
-    {
-        let side_sensitive = rows.get(cap.row).is_some_and(|row| row.side_sensitive);
-        cap.steps
-            .push(scroll_step(up, modifiers, modifier_sides, side_sensitive));
-        cap.deadline = Some(now + CHORD_TIMEOUT);
-        return;
-    }
-
-    // Direct-input chords: cmd-modified combos (incl. Cmd+C/Cmd+X/Cmd+V and their +alt/+shift
-    // variants) that egui turns into copy/cut/paste events with no recordable key event.
-    if let Some(step) = direct_chords.first()
-        && let Some(cap) = capture.as_mut()
-    {
-        let step = if rows.get(cap.row).is_some_and(|row| row.side_sensitive) {
-            step.clone()
-        } else {
-            strip_modifier_sides(step)
-        };
+        step
+    } else if let Some((up, modifiers)) = drain_first_scroll(ui) {
+        Some(scroll_step(up, modifiers, modifier_sides, side_sensitive))
+    } else {
+        direct_chords.first().map(|step| {
+            if side_sensitive {
+                step.clone()
+            } else {
+                strip_modifier_sides(step)
+            }
+        })
+    };
+    if let Some(step) = step {
+        let cap = capture.as_mut().expect("capture checked above");
         cap.steps.push(step);
         cap.deadline = Some(now + CHORD_TIMEOUT);
         return;
@@ -1202,48 +942,5 @@ fn split_action_for_editor(
     match action.split_once(':') {
         Some((base, params)) => (base.to_owned(), params.to_owned()),
         None => (action.to_owned(), String::new()),
-    }
-}
-
-/// A human-readable label for an action string, preferring the shared action catalog's title (the
-/// same titles the command palette shows) and falling back to sentence-casing the name for actions
-/// the catalog doesn't know (sidebar actions, `text`/`csi`/…). Keeps any trailing `:param` suffix.
-fn action_title(action: &str) -> String {
-    if let Some(command) = crate::action_catalog::Command::from_action(action) {
-        return command.title().to_owned();
-    }
-    let (base, param) = match action.split_once(':') {
-        Some((base, param)) => (base, Some(param)),
-        None => (action, None),
-    };
-    let mut title = crate::action_catalog::Command::from_action(base)
-        .map(|command| command.title().to_owned())
-        .unwrap_or_else(|| humanize_action(base));
-    if let Some(param) = param {
-        title.push_str(": ");
-        title.push_str(param);
-    }
-    title
-}
-
-/// Turn a snake_case action name into a sentence-cased label.
-fn humanize_action(name: &str) -> String {
-    let mut title = String::with_capacity(name.len());
-    for (index, word) in name.split('_').filter(|word| !word.is_empty()).enumerate() {
-        if index > 0 {
-            title.push(' ');
-            title.push_str(word);
-        } else {
-            let mut chars = word.chars();
-            if let Some(first) = chars.next() {
-                title.extend(first.to_uppercase());
-                title.push_str(chars.as_str());
-            }
-        }
-    }
-    if title.is_empty() {
-        name.to_owned()
-    } else {
-        title
     }
 }

@@ -189,11 +189,9 @@ fn session(id: &str, name: &str) -> MuxSession {
 fn open_catalog(path: &Path) -> Result<Catalog> {
     bootty_rmux::link();
     bootty_tmux::link();
-    bootty_zellij::link();
     let backends = bootty_mux::provider::MuxBackendRegistry::collect([
         bootty_mux::MuxBackendKind::Rmux,
         bootty_mux::MuxBackendKind::Tmux,
-        bootty_mux::MuxBackendKind::Zellij,
     ])?;
     Catalog::open(
         path,

@@ -58,16 +58,11 @@ impl Divider {
     /// The ratio (fraction for the first/left/top child) implied by dragging this divider to
     /// `pointer`, before any min-size clamping.
     pub fn ratio_at(&self, pointer: Pos2, gap: f32) -> f32 {
-        match self.direction {
-            SplitDirection::Right => {
-                let extent = (self.area.width() - gap).max(1.0);
-                (pointer.x - self.area.min.x) / extent
-            }
-            SplitDirection::Down => {
-                let extent = (self.area.height() - gap).max(1.0);
-                (pointer.y - self.area.min.y) / extent
-            }
-        }
+        let (extent, offset) = match self.direction {
+            SplitDirection::Right => (self.area.width(), pointer.x - self.area.min.x),
+            SplitDirection::Down => (self.area.height(), pointer.y - self.area.min.y),
+        };
+        offset / (extent - gap).max(1.0)
     }
 }
 
@@ -75,12 +70,6 @@ impl Divider {
 pub struct PaneLayout {
     root: Node,
     focused: PaneId,
-}
-
-enum Removal {
-    NotFound,
-    RemovedLeaf,
-    Replaced(Node),
 }
 
 impl PaneLayout {
@@ -138,12 +127,11 @@ impl PaneLayout {
 
     /// Move focus to `pane` if it is a leaf of this layout.
     pub fn set_focus(&mut self, pane: &str) -> bool {
-        if self.contains(pane) {
+        let found = self.contains(pane);
+        if found {
             self.focused = pane.to_owned();
-            true
-        } else {
-            false
         }
+        found
     }
 
     /// Replace the focused leaf with a split whose first child is the old pane and second child is
@@ -158,17 +146,13 @@ impl PaneLayout {
     /// remove the last pane. Returns whether a pane was removed; if the focused pane went away,
     /// focus moves to the surviving neighbor.
     pub fn remove(&mut self, pane: &str) -> bool {
-        match Self::remove_node(&self.root, pane) {
-            Removal::Replaced(node) => {
-                self.root = node;
-                if !self.contains(&self.focused) {
-                    self.focused = Self::first_leaf(&self.root).to_owned();
-                }
-                true
-            }
-            // RemovedLeaf at the root means `pane` is the only pane; keep it.
-            Removal::RemovedLeaf | Removal::NotFound => false,
+        if !Self::remove_node(&mut self.root, pane) {
+            return false;
         }
+        if !Self::node_contains(&self.root, &self.focused) {
+            self.focused = Self::first_leaf(&self.root).to_owned();
+        }
+        true
     }
 
     /// Bring the tree in line with the backend's pane set: drop leaves whose pane has gone away
@@ -322,35 +306,21 @@ impl PaneLayout {
         }
     }
 
-    fn remove_node(node: &Node, pane: &str) -> Removal {
-        match node {
-            Node::Leaf(id) if id == pane => Removal::RemovedLeaf,
-            Node::Leaf(_) => Removal::NotFound,
-            Node::Split {
-                direction,
-                ratio,
-                first,
-                second,
-            } => match Self::remove_node(first, pane) {
-                Removal::RemovedLeaf => Removal::Replaced((**second).clone()),
-                Removal::Replaced(node) => Removal::Replaced(Node::Split {
-                    direction: *direction,
-                    ratio: *ratio,
-                    first: Box::new(node),
-                    second: second.clone(),
-                }),
-                Removal::NotFound => match Self::remove_node(second, pane) {
-                    Removal::RemovedLeaf => Removal::Replaced((**first).clone()),
-                    Removal::Replaced(node) => Removal::Replaced(Node::Split {
-                        direction: *direction,
-                        ratio: *ratio,
-                        first: first.clone(),
-                        second: Box::new(node),
-                    }),
-                    Removal::NotFound => Removal::NotFound,
-                },
-            },
+    fn remove_node(node: &mut Node, pane: &str) -> bool {
+        let Node::Split { first, second, .. } = node else {
+            return false;
+        };
+        if matches!(&**first, Node::Leaf(id) if id == pane) {
+            let replacement = (**second).clone();
+            *node = replacement;
+            return true;
         }
+        if matches!(&**second, Node::Leaf(id) if id == pane) {
+            let replacement = (**first).clone();
+            *node = replacement;
+            return true;
+        }
+        Self::remove_node(first, pane) || Self::remove_node(second, pane)
     }
 
     fn layout_node(node: &Node, area: Rect, gap: f32, out: &mut Vec<(PaneId, Rect)>) {
@@ -451,48 +421,45 @@ fn split_area(area: Rect, direction: SplitDirection, ratio: f32, gap: f32) -> (R
 }
 
 fn divider_rect(area: Rect, direction: SplitDirection, ratio: f32, gap: f32) -> Rect {
+    let (first, second) = split_area(area, direction, ratio, gap);
     match direction {
-        SplitDirection::Right => {
-            let first_w = (area.width() - gap).max(0.0) * ratio;
-            Rect::from_min_size(
-                Pos2::new(area.min.x + first_w, area.min.y),
-                Vec2::new(gap, area.height()),
-            )
-        }
-        SplitDirection::Down => {
-            let first_h = (area.height() - gap).max(0.0) * ratio;
-            Rect::from_min_size(
-                Pos2::new(area.min.x, area.min.y + first_h),
-                Vec2::new(area.width(), gap),
-            )
-        }
+        SplitDirection::Right => Rect::from_min_max(
+            Pos2::new(first.max.x, area.min.y),
+            Pos2::new(second.min.x, area.max.y),
+        ),
+        SplitDirection::Down => Rect::from_min_max(
+            Pos2::new(area.min.x, first.max.y),
+            Pos2::new(area.max.x, second.min.y),
+        ),
     }
 }
 
 /// For a candidate rect relative to `origin` in `direction`, return `(distance_along_axis,
 /// perpendicular_overlap)` when the candidate lies on the correct side with overlap, else `None`.
 fn directional_gap(origin: Rect, candidate: Rect, direction: Direction) -> Option<(f32, f32)> {
-    let overlaps_x = origin.min.x < candidate.max.x && candidate.min.x < origin.max.x;
-    let overlaps_y = origin.min.y < candidate.max.y && candidate.min.y < origin.max.y;
-    match direction {
-        Direction::Right if candidate.center().x > origin.center().x && overlaps_y => Some((
+    let (forward, primary, overlap) = match direction {
+        Direction::Right => (
+            candidate.center().x > origin.center().x,
             candidate.min.x - origin.max.x,
             vertical_overlap(origin, candidate),
-        )),
-        Direction::Left if candidate.center().x < origin.center().x && overlaps_y => Some((
+        ),
+        Direction::Left => (
+            candidate.center().x < origin.center().x,
             origin.min.x - candidate.max.x,
             vertical_overlap(origin, candidate),
-        )),
-        Direction::Down if candidate.center().y > origin.center().y && overlaps_x => Some((
+        ),
+        Direction::Down => (
+            candidate.center().y > origin.center().y,
             candidate.min.y - origin.max.y,
             horizontal_overlap(origin, candidate),
-        )),
-        Direction::Up if candidate.center().y < origin.center().y && overlaps_x => Some((
+        ),
+        Direction::Up => (
+            candidate.center().y < origin.center().y,
             origin.min.y - candidate.max.y,
             horizontal_overlap(origin, candidate),
-        )),
-        _ => None,
-    }
+        ),
+    };
+    (forward && overlap > 0.0).then_some((primary, overlap))
 }
 
 fn vertical_overlap(a: Rect, b: Rect) -> f32 {

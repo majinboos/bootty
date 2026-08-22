@@ -14,7 +14,7 @@ use bootty_app::{
     renderer::RendererMetrics,
     ui::{
         ditch::{DitchAction, DitchSessionEvent},
-        new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
+        new_session_picker::NewSessionPickerEvent,
     },
 };
 use bootty_command::{
@@ -430,7 +430,7 @@ fn pending_ditch_completes_in_its_original_space() {
                     selection_publication: SelectionPublicationPolicy::Direct,
                 }),
                 Arc::new(RestoreProvider {
-                    kind: MuxBackendKind::Zellij,
+                    kind: MuxBackendKind::Rmux,
                     dispatch: MuxCommandDispatch::CallerThread,
                     sessions: Arc::clone(&second_sessions),
                     create_calls: Arc::clone(&create_calls),
@@ -439,7 +439,7 @@ fn pending_ditch_completes_in_its_original_space() {
                     selection_publication: SelectionPublicationPolicy::Direct,
                 }),
             ],
-            [MuxBackendKind::Tmux, MuxBackendKind::Zellij],
+            [MuxBackendKind::Tmux, MuxBackendKind::Rmux],
         )
         .expect("delayed test backend registry"),
     );
@@ -461,7 +461,7 @@ fn pending_ditch_completes_in_its_original_space() {
             [0x22, 0x44, 0x66],
             false,
             SpaceMuxOverride {
-                backend: Some(MultiplexerBackendConfig::Zellij),
+                backend: Some(MultiplexerBackendConfig::Rmux),
                 remote: SpaceRemoteOverride::Local,
             },
             config.multiplexer.hide_tmux_status,
@@ -484,18 +484,16 @@ fn pending_ditch_completes_in_its_original_space() {
             .any(|session| session.id == "delayed")
     }));
     assert!(state.open_ditch_session_dialog_for("delayed"));
-    let ModalDialog::DitchSession(dialog) = state.take_modal_dialog().expect("ditch dialog") else {
-        panic!("expected ditch dialog");
-    };
+    assert!(matches!(
+        state.modal_dialog(),
+        Some(ModalDialog::DitchSession(_))
+    ));
     state.clear_last_error();
-    state.apply_ditch_session_event(
-        dialog,
-        DitchSessionEvent::Ditch {
-            session_id: "delayed".to_owned(),
-            cwd: None,
-            action: DitchAction::KillOnly,
-        },
-    );
+    state.apply_ditch_session_event(DitchSessionEvent::Ditch {
+        session_id: "delayed".to_owned(),
+        cwd: None,
+        action: DitchAction::KillOnly,
+    });
     assert!(state.activate_space_from_ui(second_id));
     assert!(state.binding_session_groups()[0].sessions.is_empty());
     release_tx.send(()).expect("release delayed ditch");
@@ -989,12 +987,9 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
     let repaint = Arc::new(|| {});
     let mut state =
         AppState::new(config, support::backends(), repaint, None, None).expect("app state");
-    state.apply_picker_event(
-        NewMuxSessionDialog::open(),
-        NewSessionPickerEvent::CreateSession {
-            cwd: first_cwd.to_string_lossy().into_owned(),
-        },
-    );
+    state.apply_picker_event(NewSessionPickerEvent::CreateSession {
+        cwd: first_cwd.to_string_lossy().into_owned(),
+    });
     let started = Instant::now();
     assert!((0..250).any(|tick| {
         state.update_frame(frame(started + Duration::from_millis(tick)));
@@ -1006,12 +1001,9 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
             .any(|session| session.name == "project")
     }));
 
-    state.apply_picker_event(
-        NewMuxSessionDialog::open(),
-        NewSessionPickerEvent::CreateSession {
-            cwd: second_cwd.to_string_lossy().into_owned(),
-        },
-    );
+    state.apply_picker_event(NewSessionPickerEvent::CreateSession {
+        cwd: second_cwd.to_string_lossy().into_owned(),
+    });
     std::fs::write(
         &config_path,
         "[ssh-profiles.test]\nname = \"Changed\"\nhost = \"localhost\"\nprogram = \"ssh\"\n",

@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use bootty_config::{
     color::Color,
     config::{AppearanceBranchConfig, AppearanceMode, AppearanceVariant, ColorConfig},
@@ -23,96 +21,22 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     theme_row(win, ui, variant);
 
     super::section(ui, palette, "TERMINAL COLORS");
-    terminal_color_row(
-        win,
-        ui,
-        "Background",
-        "Terminal background override.",
-        &["colors", "background"],
-        palette.base,
-        |colors| &mut colors.background,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Foreground",
-        "Primary terminal text override.",
-        &["colors", "foreground"],
-        palette.text,
-        |colors| &mut colors.foreground,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Cursor",
-        "Cursor fill color.",
-        &["colors", "cursor"],
-        palette.primary,
-        |colors| &mut colors.cursor,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Cursor text",
-        "Text drawn under the cursor.",
-        &["colors", "cursor-text"],
-        palette.base,
-        |colors| &mut colors.cursor_text,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Selection",
-        "Selection background and foreground.",
-        &["colors", "selection-background"],
-        palette.hover,
-        |colors| &mut colors.selection_background,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Selection text",
-        "Selected text foreground.",
-        &["colors", "selection-foreground"],
-        palette.subtext,
-        |colors| &mut colors.selection_foreground,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Highlight",
-        "Search or match highlight background.",
-        &["colors", "highlight-background"],
-        palette.hover,
-        |colors| &mut colors.highlight_background,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Highlight text",
-        "Search or match highlight foreground.",
-        &["colors", "highlight-foreground"],
-        palette.text,
-        |colors| &mut colors.highlight_foreground,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Pointer foreground",
-        "Pointer text/foreground override.",
-        &["colors", "pointer-foreground"],
-        palette.base,
-        |colors| &mut colors.pointer_foreground,
-    );
-    terminal_color_row(
-        win,
-        ui,
-        "Pointer background",
-        "Pointer background override.",
-        &["colors", "pointer-background"],
-        palette.text,
-        |colors| &mut colors.pointer_background,
-    );
+    #[rustfmt::skip]
+    let colors: &[TerminalColorRow] = &[
+        ("Background", "Terminal background override.", "background", palette.base, |c| &mut c.background),
+        ("Foreground", "Primary terminal text override.", "foreground", palette.text, |c| &mut c.foreground),
+        ("Cursor", "Cursor fill color.", "cursor", palette.primary, |c| &mut c.cursor),
+        ("Cursor text", "Text drawn under the cursor.", "cursor-text", palette.base, |c| &mut c.cursor_text),
+        ("Selection", "Selection background and foreground.", "selection-background", palette.hover, |c| &mut c.selection_background),
+        ("Selection text", "Selected text foreground.", "selection-foreground", palette.subtext, |c| &mut c.selection_foreground),
+        ("Highlight", "Search or match highlight background.", "highlight-background", palette.hover, |c| &mut c.highlight_background),
+        ("Highlight text", "Search or match highlight foreground.", "highlight-foreground", palette.text, |c| &mut c.highlight_foreground),
+        ("Pointer foreground", "Pointer text/foreground override.", "pointer-foreground", palette.base, |c| &mut c.pointer_foreground),
+        ("Pointer background", "Pointer background override.", "pointer-background", palette.text, |c| &mut c.pointer_background),
+    ];
+    for &(label, help, key, seed, field) in colors {
+        terminal_color_row(win, ui, label, help, key, seed, field);
+    }
 
     super::section(ui, palette, "SIDEBAR COLORS");
     super::settings_notice(
@@ -120,15 +44,17 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         palette.muted,
         "Unset colors inherit from the active theme.",
     );
-    super::sidebar_color_row(
-        win,
-        ui,
-        "Background",
-        "Sidebar panel background.",
-        &["sidebar", "background"],
-        palette.mantle,
-        |sidebar| &mut sidebar.background,
-    );
+    #[rustfmt::skip]
+    let sidebar_colors: &[SidebarColorRow] = &[
+        ("Background", "Sidebar panel background.", "background", palette.mantle, |s| &mut s.background),
+        ("Foreground", "Sidebar text and icons.", "foreground", palette.text, |s| &mut s.foreground),
+        ("Selected row", "Selected session fill.", "selected", palette.surface, |s| &mut s.selected),
+        ("Hover row", "Hovered session fill.", "hover", palette.hover, |s| &mut s.hover),
+        ("Border", "Separator between sidebar and terminal content.", "border", palette.border, |s| &mut s.border),
+    ];
+    for &(label, help, key, seed, field) in sidebar_colors {
+        super::sidebar_color_row(win, ui, label, help, &["sidebar", key], seed, field);
+    }
     super::chrome_color_row(
         win,
         ui,
@@ -137,42 +63,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         &["chrome", "status-background"],
         palette.mantle,
         |chrome| &mut chrome.status_background,
-    );
-    super::sidebar_color_row(
-        win,
-        ui,
-        "Foreground",
-        "Sidebar text and icons.",
-        &["sidebar", "foreground"],
-        palette.text,
-        |sidebar| &mut sidebar.foreground,
-    );
-    super::sidebar_color_row(
-        win,
-        ui,
-        "Selected row",
-        "Selected session fill.",
-        &["sidebar", "selected"],
-        palette.surface,
-        |sidebar| &mut sidebar.selected,
-    );
-    super::sidebar_color_row(
-        win,
-        ui,
-        "Hover row",
-        "Hovered session fill.",
-        &["sidebar", "hover"],
-        palette.hover,
-        |sidebar| &mut sidebar.hover,
-    );
-    super::sidebar_color_row(
-        win,
-        ui,
-        "Border",
-        "Separator between sidebar and terminal content.",
-        &["sidebar", "border"],
-        palette.border,
-        |sidebar| &mut sidebar.border,
     );
 
     super::section(ui, palette, "FULLSCREEN NOTCH");
@@ -314,15 +204,10 @@ fn remove_branch_config_value(
     if variant == AppearanceVariant::Dark {
         win.writeback.remove(path);
     }
-    super::reload_settings_config(win);
 }
 
 fn theme_row(win: &mut SettingsSurface, ui: &mut egui::Ui, variant: AppearanceVariant) {
-    let config_path = win.writeback.path().to_path_buf();
-    let themes = win
-        .theme_names
-        .get_or_insert_with(|| available_themes(&config_path))
-        .clone();
+    let themes = win.theme_names.clone();
     super::settings_row(
         ui,
         win.palette,
@@ -354,7 +239,6 @@ fn theme_row(win: &mut SettingsSurface, ui: &mut egui::Ui, variant: AppearanceVa
                 branch_mut(&mut win.config, variant).theme = Some(chosen.clone());
                 win.writeback
                     .set_str(&["appearance", branch_key(variant), "theme"], &chosen);
-                super::reload_settings_config(win);
             }
         },
     );
@@ -365,7 +249,7 @@ fn terminal_color_row(
     ui: &mut egui::Ui,
     label: &str,
     help: &str,
-    path: &[&str],
+    key: &str,
     seed: egui::Color32,
     field: fn(&mut ColorConfig) -> &mut Option<Color>,
 ) {
@@ -383,17 +267,33 @@ fn terminal_color_row(
                 a: 0xff,
             });
             win.writeback
-                .set_color(&["appearance", branch_key(variant), path[0], path[1]], rgb);
+                .set_color(&["appearance", branch_key(variant), "colors", key], rgb);
         }
-        let override_path = ["appearance", branch_key(variant), path[0], path[1]];
-        let legacy_path = [path[0], path[1]];
+        let override_path = ["appearance", branch_key(variant), "colors", key];
+        let legacy_path = ["colors", key];
         let has_override = win.writeback.contains(&override_path)
             || (variant == AppearanceVariant::Dark && win.writeback.contains(&legacy_path));
         if has_override && super::settings_button(ui, win.palette, "Reset").clicked() {
-            remove_branch_config_value(win, variant, path);
+            remove_branch_config_value(win, variant, &["colors", key]);
         }
     });
 }
+
+type TerminalColorRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    egui::Color32,
+    fn(&mut ColorConfig) -> &mut Option<Color>,
+);
+
+type SidebarColorRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    egui::Color32,
+    fn(&mut bootty_config::config::SidebarConfig) -> &mut Option<Color>,
+);
 
 fn palette_section(win: &mut SettingsSurface, ui: &mut egui::Ui, variant: AppearanceVariant) {
     let palette = win.palette;
@@ -626,25 +526,4 @@ fn rgb_to_color(color: RgbColor) -> Color {
         b: color.b,
         a: 0xff,
     }
-}
-
-fn available_themes(config_path: &Path) -> Vec<String> {
-    let mut names: Vec<String> = bootty_config::config::builtin_theme_names()
-        .map(str::to_owned)
-        .collect();
-    if let Some(dir) = config_path.parent().map(|parent| parent.join("themes"))
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "toml")
-                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-            {
-                names.push(stem.to_owned());
-            }
-        }
-    }
-    names.sort_unstable();
-    names.dedup();
-    names
 }

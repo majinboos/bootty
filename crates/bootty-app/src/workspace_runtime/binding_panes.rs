@@ -36,13 +36,10 @@ fn focus_after_reconcile(
     new_panes: &[String],
     selected_pane: Option<&str>,
 ) -> Option<String> {
-    if restored_from_server {
-        return selected_pane.map(str::to_owned);
-    }
-    if let Some(selected_pane) = selected_pane
-        && new_panes.iter().any(|pane| pane == selected_pane)
+    if restored_from_server
+        || selected_pane.is_some_and(|selected| new_panes.iter().any(|pane| pane == selected))
     {
-        return Some(selected_pane.to_owned());
+        return selected_pane.map(str::to_owned);
     }
     new_panes.first().cloned()
 }
@@ -128,20 +125,17 @@ impl BindingRuntime {
             .mux
             .selected_session_anchor()
             .and_then(|anchor| anchor.pane_id.clone());
-        let server_layout = self
+        let mut server_layout = self
             .mux
             .selected_window_layout()
             .and_then(PaneLayout::from_mux_layout)
             .filter(|layout| pane_sets_match(&layout.panes(), &pane_ids));
-        let layout_missing = !self.pane_layouts.contains_key(&key);
-        let stale_layout = self
+        let layout_missing_or_stale = self
             .pane_layouts
             .get(&key)
-            .is_some_and(|layout| layout.panes().iter().all(|pane| !pane_ids.contains(pane)));
+            .is_none_or(|layout| layout.panes().iter().all(|pane| !pane_ids.contains(pane)));
         let mut restored_from_server = false;
-        if (layout_missing || stale_layout)
-            && let Some(layout) = server_layout.clone()
-        {
+        if layout_missing_or_stale && let Some(layout) = server_layout.take() {
             self.pane_layouts.insert(key.clone(), layout);
             restored_from_server = true;
         }
@@ -156,7 +150,6 @@ impl BindingRuntime {
             .filter(|pane| !previous_panes.contains(pane))
             .cloned()
             .collect::<Vec<_>>();
-        let has_new_pane = !new_panes.is_empty();
         {
             let layout = self
                 .pane_layouts
@@ -166,12 +159,7 @@ impl BindingRuntime {
                 *layout = PaneLayout::single(pane_ids[0].clone());
             }
         }
-        let removed_panes = previous_panes
-            .iter()
-            .filter(|pane| !pane_ids.contains(pane))
-            .cloned()
-            .collect::<Vec<_>>();
-        let pane_set_changed = has_new_pane || !removed_panes.is_empty();
+        let pane_set_changed = !pane_sets_match(&previous_panes, &pane_ids);
         if pane_set_changed && let Some(layout) = server_layout {
             self.pane_layouts.insert(key.clone(), layout);
             restored_from_server = true;
@@ -274,39 +262,36 @@ impl BindingRuntime {
     ) {
         let session = self.mux.selected_session().unwrap_or("local").to_owned();
         let config = self.multiplexer.clone();
-        if !self.uses_native_terminal_layout() {
-            self.mux.execute_command(
-                repaint,
-                &config,
-                MuxCommand::SplitPane {
-                    session_id: session,
-                    pane_id: target_pane_id.map(str::to_owned),
-                    direction: mux_split_direction(direction),
-                },
-            );
-            return;
-        }
-        let key = self.current_window_id();
-        let focused = target_pane_id.map(str::to_owned).or_else(|| {
-            self.pane_layouts
-                .get(&key)
-                .map(|layout| layout.focused().to_owned())
-                .or_else(|| {
-                    self.mux
-                        .selected_session_anchor()
-                        .and_then(|anchor| anchor.pane_id.clone())
-                })
+        let layout_update = self.uses_native_terminal_layout().then(|| {
+            let key = self.current_window_id();
+            let focused = target_pane_id.map(str::to_owned).or_else(|| {
+                self.pane_layouts
+                    .get(&key)
+                    .map(|layout| layout.focused().to_owned())
+                    .or_else(|| {
+                        self.mux
+                            .selected_session_anchor()
+                            .and_then(|anchor| anchor.pane_id.clone())
+                    })
+            });
+            (key, focused)
         });
+        let pane_id = layout_update
+            .as_ref()
+            .map(|(_, focused)| focused.clone())
+            .unwrap_or_else(|| target_pane_id.map(str::to_owned));
         self.mux.execute_command(
             repaint,
             &config,
             MuxCommand::SplitPane {
                 session_id: session,
-                pane_id: focused.clone(),
+                pane_id,
                 direction: mux_split_direction(direction),
             },
         );
-        self.apply_split_layout_after_command(key, focused, direction);
+        if let Some((key, focused)) = layout_update {
+            self.apply_split_layout_after_command(key, focused, direction);
+        }
     }
 
     fn apply_split_layout_after_command(
@@ -325,24 +310,25 @@ impl BindingRuntime {
                 unreachable!("attach topology cannot publish a process-local split")
             }
         }
-        let new_pane = self
+        let Some(new_pane) = self
             .mux
             .selected_session_anchor()
-            .and_then(|anchor| anchor.pane_id.clone());
-        if let Some(new_pane) = new_pane {
-            let layout = self
-                .pane_layouts
-                .entry(key.clone())
-                .or_insert_with(|| PaneLayout::single(new_pane.clone()));
-            if let Some(focused) = &focused {
-                layout.set_focus(focused);
-            }
-            if !layout.contains(&new_pane) {
-                layout.split_focused(new_pane, direction);
-            }
-            self.pending_pane_split_directions.remove(&key);
-            let _ = self.sync_terminal_panes();
+            .and_then(|anchor| anchor.pane_id.clone())
+        else {
+            return;
+        };
+        let layout = self
+            .pane_layouts
+            .entry(key.clone())
+            .or_insert_with(|| PaneLayout::single(new_pane.clone()));
+        if let Some(focused) = &focused {
+            layout.set_focus(focused);
         }
+        if !layout.contains(&new_pane) {
+            layout.split_focused(new_pane, direction);
+        }
+        self.pending_pane_split_directions.remove(&key);
+        let _ = self.sync_terminal_panes();
     }
 
     pub(crate) fn focus_pane_neighbor(&mut self, direction: MuxDirection, area: Rect, gap: f32) {

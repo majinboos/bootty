@@ -8,8 +8,12 @@ use std::{
 
 use crate::fact_values::{MuxView, SessionReorder};
 use crate::facts::ExtensionFacts;
-use crate::module_runtime::{ActiveModule, prepare_module};
-use crate::module_sources::{discover_modules, legacy_extension_modules};
+use crate::module_runtime::{ActiveModule, ModuleWorker, prepare_module};
+use crate::module_sources::{
+    LegacyExtensionModule, ModuleSourceOutcome, ModuleSourceRequest, ModuleSources,
+    create_module_source, discover_modules, editable_module_source, import_legacy_extension_module,
+    legacy_extension_modules, module_template, reset_module_source, save_module_source,
+};
 use crate::storage::ExtensionStorage;
 use crate::{
     ExtensionCatalog, ExtensionEventSender, ExtensionGenerationCandidate, ExtensionUiAction,
@@ -25,6 +29,11 @@ pub struct ExtensionHost {
     commands: BoundAppCommandSender,
     events: ExtensionEventSender,
     active: BTreeMap<ModuleIdentity, ActiveModule>,
+    /// Every module the last scan discovered, including ones that failed to load: the editor
+    /// must be able to open a broken module to fix it.
+    discovered: Vec<ModuleIdentity>,
+    /// Inactive pre-module extension files awaiting import, refreshed by each scan.
+    legacy: Vec<LegacyExtensionModule>,
     retired: Vec<thread::JoinHandle<()>>,
     next_check: Instant,
     next_generation: u64,
@@ -65,6 +74,8 @@ impl ExtensionHost {
             commands,
             events,
             active: BTreeMap::new(),
+            discovered: Vec::new(),
+            legacy: Vec::new(),
             retired: Vec::new(),
             next_check: Instant::now(),
             next_generation: 1,
@@ -73,15 +84,12 @@ impl ExtensionHost {
             battery: starship_battery::Manager::new().ok(),
             next_metrics: Instant::now(),
         };
-        if let Some(config_dir) = root.parent()
-            && let Ok(legacy) = legacy_extension_modules(config_dir)
-            && !legacy.is_empty()
-        {
+        host.reconcile(false);
+        if !host.legacy.is_empty() {
             eprintln!(
                 "legacy extension modules are inactive; import them from Settings > Extensions"
             );
         }
-        host.reconcile(false);
         host
     }
 
@@ -90,9 +98,7 @@ impl ExtensionHost {
             self.next_metrics = now + Duration::from_secs(2);
             let metrics = facts::sample_metrics(&mut self.metrics_system, self.battery.as_ref());
             if self.facts.update_metrics(metrics) {
-                for active in self.active.values() {
-                    active.worker.sender.try_render();
-                }
+                self.render_all();
             }
         }
         if now < self.next_check {
@@ -103,9 +109,12 @@ impl ExtensionHost {
     }
 
     pub fn update_mux(&self, view: MuxView) {
-        if !self.facts.update_mux(view) {
-            return;
+        if self.facts.update_mux(view) {
+            self.render_all();
         }
+    }
+
+    fn render_all(&self) {
         for active in self.active.values() {
             active.worker.sender.try_render();
         }
@@ -119,12 +128,7 @@ impl ExtensionHost {
 
     #[must_use]
     pub fn surfaces(&self, placement: SurfacePlacement) -> Vec<PublishedSurfaceSnapshot> {
-        let mut surfaces = self
-            .catalog
-            .surfaces()
-            .into_iter()
-            .filter(|surface| surface.snapshot.declaration.placement == placement)
-            .collect::<Vec<_>>();
+        let mut surfaces = self.catalog.surfaces_for(placement);
         surfaces.sort_by(|left, right| {
             left.snapshot
                 .declaration
@@ -147,13 +151,15 @@ impl ExtensionHost {
         placement: SurfacePlacement,
         name: &str,
     ) -> Option<PublishedSurfaceSnapshot> {
-        self.surfaces(placement).into_iter().find(|surface| {
-            surface.snapshot.declaration.id == name
-                || Path::new(&surface.module)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    == Some(name)
-        })
+        self.surfaces(placement)
+            .into_iter()
+            .find(|surface| surface.matches_name(name))
+    }
+
+    /// Whether `placement` has any published surface, without cloning one.
+    #[must_use]
+    pub fn has_surfaces(&self, placement: SurfacePlacement) -> bool {
+        self.catalog.has_surfaces(placement)
     }
 
     pub fn take_session_reorders(&self) -> Vec<SessionReorder> {
@@ -176,8 +182,84 @@ impl ExtensionHost {
             .map_err(str::to_owned)
     }
 
+    /// Modules the settings editor may open, and the legacy files it may import. Both come
+    /// from the periodic scan, so painting never walks the extension directory.
+    #[must_use]
+    pub fn module_sources(&self) -> ModuleSources<'_> {
+        ModuleSources {
+            identities: &self.discovered,
+            legacy: &self.legacy,
+        }
+    }
+
+    /// Run one editor request against the extension root. The periodic scan publishes the
+    /// resulting source, so a save stays debounced instead of reloading per keystroke.
+    pub fn apply_module_source_request(
+        &mut self,
+        request: ModuleSourceRequest,
+    ) -> ModuleSourceOutcome {
+        match request {
+            ModuleSourceRequest::Load(identity) => {
+                match editable_module_source(&self.root, &identity) {
+                    Some(source) => ModuleSourceOutcome::Loaded {
+                        source,
+                        exists: true,
+                    },
+                    None => ModuleSourceOutcome::Loaded {
+                        source: crate::module_sources::EditableModuleSource {
+                            source: module_template(&identity),
+                            path: self.root.join(identity.as_ref()),
+                            identity,
+                            customized: false,
+                            has_builtin: false,
+                        },
+                        exists: false,
+                    },
+                }
+            }
+            ModuleSourceRequest::Create(value) => {
+                let created = create_module_source(&self.root, &value);
+                if created.is_ok() {
+                    self.reconcile(false);
+                }
+                ModuleSourceOutcome::Created(created)
+            }
+            ModuleSourceRequest::Save { identity, source } => ModuleSourceOutcome::Saved(
+                save_module_source(&self.root, &identity, &source)
+                    .map_err(|error| error.to_string()),
+            ),
+            ModuleSourceRequest::Reset(identity) => {
+                let reset = reset_module_source(&self.root, &identity)
+                    .map(|()| identity)
+                    .map_err(|error| error.to_string());
+                if reset.is_ok() {
+                    self.reconcile(false);
+                }
+                ModuleSourceOutcome::Reset(reset)
+            }
+            ModuleSourceRequest::ImportLegacy(legacy) => {
+                let Some(config_dir) = self.root.parent() else {
+                    return ModuleSourceOutcome::Imported(Err(
+                        "extension root has no config directory".to_owned(),
+                    ));
+                };
+                let imported =
+                    import_legacy_extension_module(config_dir, &legacy, self.facts.theme());
+                if imported.is_ok() {
+                    self.reconcile(false);
+                }
+                ModuleSourceOutcome::Imported(imported)
+            }
+        }
+    }
+
     fn reconcile(&mut self, force: bool) {
         self.reap_retired();
+        self.legacy = self
+            .root
+            .parent()
+            .and_then(|config_dir| legacy_extension_modules(config_dir).ok())
+            .unwrap_or_default();
         let discovered = match discover_modules(&self.root) {
             Ok(discovered) => discovered,
             Err(error) => {
@@ -186,6 +268,7 @@ impl ExtensionHost {
             }
         };
         let present = discovered.keys().cloned().collect::<BTreeSet<_>>();
+        self.discovered = present.iter().cloned().collect();
         for (identity, source) in discovered {
             let source = match source {
                 Ok(source) => source,
@@ -202,12 +285,11 @@ impl ExtensionHost {
             {
                 continue;
             }
-            let generation = self.next_generation;
             let Some(next_generation) = self.next_generation.checked_add(1) else {
                 eprintln!("failed to load extension {identity}: extension generation exhausted");
                 continue;
             };
-            self.next_generation = next_generation;
+            let generation = std::mem::replace(&mut self.next_generation, next_generation);
             let storage = match self.active.get(&identity) {
                 Some(active) => active.storage.clone(),
                 None => match ExtensionStorage::open(&self.root, identity.as_str()) {
@@ -244,9 +326,7 @@ impl ExtensionHost {
                     surfaces: prepared.surfaces,
                 })
             {
-                if let Some(thread) = prepared.worker.retire() {
-                    self.retired.push(thread);
-                }
+                self.retire_worker(prepared.worker);
                 eprintln!("failed to publish extension {identity}: {error}");
                 continue;
             }
@@ -256,10 +336,8 @@ impl ExtensionHost {
                 worker: prepared.worker,
                 storage,
             };
-            if let Some(previous) = self.active.insert(identity, next)
-                && let Some(thread) = previous.worker.retire()
-            {
-                self.retired.push(thread);
+            if let Some(previous) = self.active.insert(identity, next) {
+                self.retire_worker(previous.worker);
             }
         }
         let removed = self
@@ -274,23 +352,21 @@ impl ExtensionHost {
             };
             self.catalog
                 .remove_generation(identity.as_str(), previous.generation);
-            if let Some(thread) = previous.worker.retire() {
-                self.retired.push(thread);
-            }
+            self.retire_worker(previous.worker);
         }
         self.reap_retired();
     }
 
-    fn reap_retired(&mut self) {
-        let mut pending = Vec::new();
-        for thread in self.retired.drain(..) {
-            if thread.is_finished() {
-                let _ = thread.join();
-            } else {
-                pending.push(thread);
-            }
+    fn retire_worker(&mut self, worker: ModuleWorker) {
+        if let Some(thread) = worker.retire() {
+            self.retired.push(thread);
         }
-        self.retired = pending;
+    }
+
+    fn reap_retired(&mut self) {
+        for thread in self.retired.extract_if(.., |thread| thread.is_finished()) {
+            let _ = thread.join();
+        }
     }
 }
 

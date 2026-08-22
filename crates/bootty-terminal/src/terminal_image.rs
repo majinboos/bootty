@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
@@ -21,17 +20,8 @@ pub struct KittyImageDataCache {
 }
 
 struct CachedKittyImageData {
-    fingerprint: KittyImageFingerprint,
+    generation: u64,
     data: Arc<Vec<u8>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KittyImageFingerprint {
-    number: u32,
-    width: u32,
-    height: u32,
-    format: ImageFormat,
-    payload_hash: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -132,24 +122,18 @@ pub fn collect_kitty_image_frame(
             let Some(image) = graphics.image(image_id) else {
                 continue;
             };
+            let render_info = placement.placement_render_info(&image, terminal)?;
+            if !render_info.viewport_visible {
+                continue;
+            }
             let width = image.width()?;
             let height = image.height()?;
             let format = image.format()?;
             let Some(image_bytes) = image.data()? else {
                 continue;
             };
-            let fingerprint = KittyImageFingerprint {
-                number: image.number()?,
-                width,
-                height,
-                format,
-                payload_hash: kitty_image_payload_hash(image_bytes),
-            };
-            let render_info = placement.placement_render_info(&image, terminal)?;
-            if !render_info.viewport_visible {
-                continue;
-            }
-            let data = image_cache.data_for(image_id, fingerprint, image_bytes);
+            let generation = image.generation()?;
+            let data = image_cache.data_for(image_id, generation, image_bytes);
             frame.placements.push(KittyImagePlacement {
                 image_id,
                 placement_id: placement.placement_id()?,
@@ -180,21 +164,10 @@ pub fn collect_kitty_image_frame(
     Ok(frame)
 }
 
-fn kitty_image_payload_hash(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
 impl KittyImageDataCache {
-    fn data_for(
-        &mut self,
-        image_id: u32,
-        fingerprint: KittyImageFingerprint,
-        bytes: &[u8],
-    ) -> Arc<Vec<u8>> {
+    fn data_for(&mut self, image_id: u32, generation: u64, bytes: &[u8]) -> Arc<Vec<u8>> {
         if let Some(cached) = self.images.get(&image_id)
-            && cached.fingerprint == fingerprint
+            && cached.generation == generation
         {
             return cached.data.clone();
         }
@@ -203,7 +176,7 @@ impl KittyImageDataCache {
         self.images.insert(
             image_id,
             CachedKittyImageData {
-                fingerprint,
+                generation,
                 data: data.clone(),
             },
         );
@@ -213,23 +186,10 @@ impl KittyImageDataCache {
     pub(super) fn data_for_image(
         &mut self,
         image_id: u32,
-        number: u32,
-        width: u32,
-        height: u32,
-        format: ImageFormat,
+        generation: u64,
         bytes: &[u8],
     ) -> Arc<Vec<u8>> {
-        self.data_for(
-            image_id,
-            KittyImageFingerprint {
-                number,
-                width,
-                height,
-                format,
-                payload_hash: kitty_image_payload_hash(bytes),
-            },
-            bytes,
-        )
+        self.data_for(image_id, generation, bytes)
     }
 
     pub(crate) fn retain_frame(&mut self, frame: &KittyImageFrame) {

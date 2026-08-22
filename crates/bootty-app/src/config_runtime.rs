@@ -3,7 +3,10 @@ use std::time::Instant;
 use anyhow::Result;
 use bootty_command::CommandInvocation;
 use bootty_config::{
-    config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig},
+    config::{
+        AppearanceVariant, BoottyConfig, ConfigDocument, ConfigWriteOutcome,
+        MultiplexerBackendConfig, commit_config_document, load_or_create_config_document,
+    },
     config_reload::ConfigHotReload,
 };
 use bootty_render::terminal_text::TerminalTextConfig;
@@ -48,6 +51,7 @@ fn new_session_only_config_changed(previous: &BoottyConfig, next: &BoottyConfig)
 
 pub(super) struct AppConfigRuntime {
     current: BoottyConfig,
+    document: ConfigDocument,
     hot_reload: ConfigHotReload,
     modifier_remaps: ModifierRemapSet,
     backend_key_bindings: BackendKeyBindings,
@@ -56,13 +60,15 @@ pub(super) struct AppConfigRuntime {
     macos_option_as_alt: MacosOptionAsAlt,
     has_new_session_config_changes: bool,
     stability_trace: Option<StabilityTrace>,
+    /// Bumped by every accepted or live change to `current`/`document`. Views hold the
+    /// revision they last read so they can skip re-cloning an unchanged config.
+    revision: u64,
 }
 
 struct BackendKeyBindings {
     native: AppKeyBindings,
     rmux: AppKeyBindings,
     tmux: AppKeyBindings,
-    zellij: AppKeyBindings,
 }
 
 impl BackendKeyBindings {
@@ -78,9 +84,6 @@ impl BackendKeyBindings {
             tmux: AppKeyBindings::from_keybinds(
                 &input.keybinds_for_backend(MultiplexerBackendConfig::Tmux),
             )?,
-            zellij: AppKeyBindings::from_keybinds(
-                &input.keybinds_for_backend(MultiplexerBackendConfig::Zellij),
-            )?,
         })
     }
 
@@ -89,13 +92,13 @@ impl BackendKeyBindings {
             MultiplexerBackendConfig::Native => self.native.clone(),
             MultiplexerBackendConfig::Rmux => self.rmux.clone(),
             MultiplexerBackendConfig::Tmux => self.tmux.clone(),
-            MultiplexerBackendConfig::Zellij => self.zellij.clone(),
         }
     }
 }
 
 impl AppConfigRuntime {
     pub(super) fn new(config: BoottyConfig) -> Result<Self> {
+        let document = load_or_create_config_document(&config.config_path)?;
         let modifier_remaps = resolve_modifier_remaps(&config.input.modifier_remap)?;
         let sidebar_key_bindings =
             SidebarKeyBindings::from_keybinds(&config.input.sidebar_keybind)?;
@@ -105,6 +108,7 @@ impl AppConfigRuntime {
         let hot_reload = ConfigHotReload::new(&config.config_path);
         Ok(Self {
             current: config,
+            document,
             hot_reload,
             modifier_remaps,
             app_key_bindings: backend_key_bindings.native.clone(),
@@ -113,11 +117,26 @@ impl AppConfigRuntime {
             macos_option_as_alt,
             has_new_session_config_changes: false,
             stability_trace,
+            revision: 0,
         })
     }
 
     pub(super) fn current(&self) -> &BoottyConfig {
         &self.current
+    }
+
+    pub(super) fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The only mutable path to the accepted config: taking it records the change.
+    fn current_mut(&mut self) -> &mut BoottyConfig {
+        self.revision = self.revision.wrapping_add(1);
+        &mut self.current
+    }
+
+    pub(super) fn document(&self) -> &ConfigDocument {
+        &self.document
     }
 
     pub(super) fn prepare_backend_keybindings(
@@ -137,6 +156,40 @@ impl AppConfigRuntime {
         appearance: AppearanceVariant,
     ) -> Result<AcceptedConfigChange> {
         let next = self.hot_reload.reload_config()?;
+        let document = load_or_create_config_document(&next.config_path)?;
+        let change = self.accept(next, backend, appearance)?;
+        self.document = document;
+        Ok(change)
+    }
+
+    pub(super) fn commit_document(
+        &mut self,
+        document: ConfigDocument,
+        backend: MultiplexerBackendConfig,
+        appearance: AppearanceVariant,
+    ) -> Result<(AcceptedConfigChange, ConfigDocument, ConfigWriteOutcome)> {
+        let path = self.current.config_path.clone();
+        let (accepted, ()) = commit_config_document(&path, document, |candidate| {
+            // App-owned input parsing is part of acceptance, so reject before replacement.
+            resolve_modifier_remaps(&candidate.input.modifier_remap)
+                .map_err(|error| error.to_string())?;
+            BackendKeyBindings::from_config(candidate).map_err(|error| error.to_string())?;
+            SidebarKeyBindings::from_keybinds(&candidate.input.sidebar_keybind)
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        })?;
+        let change = self.accept(accepted.config, backend, appearance)?;
+        self.hot_reload.refresh_dependency_graph();
+        self.document = accepted.document.clone();
+        Ok((change, accepted.document, accepted.write_outcome))
+    }
+
+    fn accept(
+        &mut self,
+        next: BoottyConfig,
+        backend: MultiplexerBackendConfig,
+        appearance: AppearanceVariant,
+    ) -> Result<AcceptedConfigChange> {
         let modifier_remaps = resolve_modifier_remaps(&next.input.modifier_remap)?;
         let backend_key_bindings = BackendKeyBindings::from_config(&next)?;
         let app_key_bindings = backend_key_bindings.for_backend(backend);
@@ -161,7 +214,7 @@ impl AppConfigRuntime {
         }
         let live_config = live_config_changed.then(|| terminal_live_config(&next, appearance));
         self.macos_option_as_alt = terminal_macos_option_as_alt(next.input.macos_option_as_alt);
-        self.current = next.clone();
+        *self.current_mut() = next.clone();
         self.modifier_remaps = modifier_remaps;
         self.backend_key_bindings = backend_key_bindings;
         self.app_key_bindings = app_key_bindings;
@@ -180,10 +233,6 @@ impl AppConfigRuntime {
 
     pub(super) fn reload_due(&mut self, now: Instant) -> bool {
         self.hot_reload.changed(now)
-    }
-
-    pub(super) fn refresh_dependency_graph(&mut self) {
-        self.hot_reload.refresh_dependency_graph();
     }
 
     pub(super) fn has_new_session_config_changes(&self) -> bool {
@@ -238,23 +287,24 @@ impl AppConfigRuntime {
     }
 
     pub(super) fn set_sidebar_width(&mut self, width: f32) {
-        self.current.chrome.sidebar_width = width;
+        self.current_mut().chrome.sidebar_width = width;
     }
 
     pub(super) fn show_sidebar(&mut self) {
-        self.current.chrome.sidebar = true;
+        self.current_mut().chrome.sidebar = true;
     }
 
     pub(super) fn toggle_sidebar(&mut self) -> bool {
-        self.current.chrome.sidebar = !self.current.chrome.sidebar;
-        self.current.chrome.sidebar
+        let config = self.current_mut();
+        config.chrome.sidebar = !config.chrome.sidebar;
+        config.chrome.sidebar
     }
 
     pub(super) fn replace_preview_config(&mut self, config: BoottyConfig) {
-        self.current = config;
+        *self.current_mut() = config;
     }
 
     pub(super) fn set_font_size(&mut self, size: f32) {
-        self.current.font.size = size;
+        self.current_mut().font.size = size;
     }
 }

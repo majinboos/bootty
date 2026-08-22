@@ -13,11 +13,9 @@ fn sprite_fixture() -> SurfaceRect {
 fn sprite_command_batch(ch: char, rect: SurfaceRect) -> SpriteCommandBatch {
     let glyph = SpriteGlyph::from_char(ch).unwrap_or_else(|| panic!("missing glyph {ch}"));
     SpriteCommandBatch {
-        ch: glyph.ch,
         glyph,
         rect,
         color: color(),
-        commands: glyph.commands_for(rect),
     }
 }
 

@@ -13,8 +13,6 @@ use std::{collections::BTreeMap, path::PathBuf};
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoottyConfig {
     pub version: u32,
-    pub theme: Option<String>,
-    pub colors: ColorConfig,
     pub appearance: AppearanceConfig,
     pub cursor: CursorConfig,
     pub font: FontConfig,
@@ -350,7 +348,6 @@ pub struct BackendKeybindConfig {
     pub native: Vec<String>,
     pub rmux: Vec<String>,
     pub tmux: Vec<String>,
-    pub zellij: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -480,7 +477,6 @@ impl InputConfig {
             MultiplexerBackendConfig::Native => &self.backend_keybinds.native,
             MultiplexerBackendConfig::Rmux => &self.backend_keybinds.rmux,
             MultiplexerBackendConfig::Tmux => &self.backend_keybinds.tmux,
-            MultiplexerBackendConfig::Zellij => &self.backend_keybinds.zellij,
         };
         keybinds.extend(backend_keybinds.iter().cloned());
         resolve_macos_option_alt_keybinds(keybinds, self.macos_option_as_alt)
@@ -507,7 +503,6 @@ impl InputConfig {
             native: preset_layout_keybinds(self.preset, prefix.as_deref()),
             rmux: preset_layout_keybinds(self.preset, prefix.as_deref()),
             tmux: preset_tmux_backend_keybinds(self.preset, prefix.as_deref()),
-            zellij: Vec::new(),
         };
     }
 }

@@ -12,7 +12,6 @@ pub enum MuxBackendKind {
     #[default]
     Native,
     Tmux,
-    Zellij,
 }
 
 /// The versioned wire value returned by the remote Space catalog.
@@ -27,7 +26,7 @@ pub struct RemoteSpaceSummary {
 impl MuxBackendKind {
     /// Returns whether the backend has a client that can run on another host.
     pub const fn supports_remote(self) -> bool {
-        matches!(self, Self::Rmux | Self::Tmux | Self::Zellij)
+        matches!(self, Self::Rmux | Self::Tmux)
     }
 }
 

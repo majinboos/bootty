@@ -154,11 +154,11 @@ fn command_boundary_routes_prompt_sprites_away_from_ordinary_text() {
     )));
     assert!(frame.commands.iter().any(|command| matches!(
         command,
-        TerminalRenderCommand::Sprite(sprite) if sprite.ch == '┃' && !sprite.commands.is_empty()
+        TerminalRenderCommand::Sprite(sprite) if sprite.glyph.ch == '┃'
     )));
     assert!(frame.commands.iter().any(|command| matches!(
         command,
-        TerminalRenderCommand::Sprite(sprite) if sprite.ch == '\u{E0B8}' && !sprite.commands.is_empty()
+        TerminalRenderCommand::Sprite(sprite) if sprite.glyph.ch == '\u{E0B8}'
     )));
     assert!(!frame.commands.iter().any(|command| matches!(
         command,
@@ -207,9 +207,7 @@ fn command_boundary_preserves_prompt_separator_foreground_color() {
     assert!(frame.commands.iter().any(|command| matches!(
         command,
         TerminalRenderCommand::Sprite(sprite)
-            if sprite.ch == '❯'
-                && sprite.color == prompt_color
-                && !sprite.commands.is_empty()
+            if sprite.glyph.ch == '❯' && sprite.color == prompt_color
     )));
     assert!(!frame.commands.iter().any(|command| matches!(
         command,
@@ -235,7 +233,7 @@ fn command_boundary_routes_block_shade_progress_row_through_sprites() {
         assert!(
             frame.commands.iter().any(|command| matches!(
                 command,
-                TerminalRenderCommand::Sprite(sprite) if sprite.ch == ch && !sprite.commands.is_empty()
+                TerminalRenderCommand::Sprite(sprite) if sprite.glyph.ch == ch
             )),
             "{ch} should route through sprite commands"
         );
@@ -254,17 +252,17 @@ fn command_boundary_routes_block_shade_progress_row_through_sprites() {
             TerminalRenderCommand::Text(text_1),
         ] if text_0.text == "0"
             && text_0.rect == SurfaceRect::from_min_size(0.0, 0.0, 10.0, 20.0)
-            && thin_block.ch == '▏'
+            && thin_block.glyph.ch == '▏'
             && thin_block.rect == SurfaceRect::from_min_size(10.0, 0.0, 10.0, 20.0)
-            && half_block.ch == '▌'
+            && half_block.glyph.ch == '▌'
             && half_block.rect == SurfaceRect::from_min_size(20.0, 0.0, 10.0, 20.0)
-            && full_block.ch == '█'
+            && full_block.glyph.ch == '█'
             && full_block.rect == SurfaceRect::from_min_size(30.0, 0.0, 10.0, 20.0)
-            && dark_shade.ch == '▓'
+            && dark_shade.glyph.ch == '▓'
             && dark_shade.rect == SurfaceRect::from_min_size(40.0, 0.0, 10.0, 20.0)
-            && medium_shade.ch == '▒'
+            && medium_shade.glyph.ch == '▒'
             && medium_shade.rect == SurfaceRect::from_min_size(50.0, 0.0, 10.0, 20.0)
-            && light_shade.ch == '░'
+            && light_shade.glyph.ch == '░'
             && light_shade.rect == SurfaceRect::from_min_size(60.0, 0.0, 10.0, 20.0)
             && text_1.text == "1"
             && text_1.rect == SurfaceRect::from_min_size(70.0, 0.0, 10.0, 20.0)

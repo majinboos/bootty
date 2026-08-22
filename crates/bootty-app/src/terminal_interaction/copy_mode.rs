@@ -4,18 +4,23 @@ use bootty_terminal::{
     terminal_engine::{TerminalCopyModeAction, TerminalCopyModeMotion, TerminalSearchDirection},
     terminal_input_model::{KeyInput, TerminalKey},
 };
+use bootty_winit::direct_input::ModifierSideState;
+
+use crate::{app_actions::key_mods_for_egui_binding, input::terminal_key};
 
 pub(super) fn copy_shortcut_pressed(event: &egui::Event) -> bool {
-    matches!(
-        event,
-        egui::Event::Key {
-            key: egui::Key::C,
-            pressed: true,
-            repeat: false,
-            modifiers,
-            ..
-        } if modifiers.command && !modifiers.ctrl && !modifiers.alt
-    )
+    let egui::Event::Key {
+        key,
+        pressed: true,
+        repeat,
+        modifiers,
+        ..
+    } = event
+    else {
+        return false;
+    };
+    copy_mode_input_for_egui_key(*key, *modifiers, *repeat)
+        .is_some_and(direct_copy_shortcut_pressed)
 }
 
 pub(super) fn direct_copy_shortcut_pressed(input: KeyInput) -> bool {
@@ -36,11 +41,12 @@ pub(super) fn copy_mode_egui_key_should_pass_to_app(
     key: egui::Key,
     modifiers: egui::Modifiers,
 ) -> bool {
-    modifiers.alt || (modifiers.command && !copy_mode_egui_key_is_copy_shortcut(key, modifiers))
-}
-
-fn copy_mode_egui_key_is_copy_shortcut(key: egui::Key, modifiers: egui::Modifiers) -> bool {
-    key == egui::Key::C && modifiers.command && !modifiers.ctrl && !modifiers.alt
+    copy_mode_input_for_egui_key(key, modifiers, false)
+        .map(copy_mode_input_should_pass_to_app)
+        .unwrap_or_else(|| {
+            let mods = key_mods_for_egui_binding(modifiers, ModifierSideState::default());
+            mods.alt || mods.command
+        })
 }
 
 pub(super) fn copy_mode_input_should_pass_to_app(input: KeyInput) -> bool {
@@ -96,10 +102,12 @@ pub(super) fn copy_mode_action_for_egui_event(
         egui::Event::Key {
             key,
             pressed: true,
+            repeat,
             modifiers,
             ..
         } => {
-            let action = copy_mode_action_for_egui_key(*key, *modifiers);
+            let action = copy_mode_input_for_egui_key(*key, *modifiers, *repeat)
+                .and_then(copy_mode_action_for_input);
             *suppress_next_text = action.is_some() && copy_mode_egui_key_may_emit_text(*key);
             action
         }
@@ -107,7 +115,8 @@ pub(super) fn copy_mode_action_for_egui_event(
             if std::mem::take(suppress_next_text) {
                 None
             } else {
-                text.chars().find_map(copy_mode_action_for_char)
+                text.chars()
+                    .find_map(copy_mode_action_for_shifted_punctuation)
             }
         }
         _ => None,
@@ -115,135 +124,29 @@ pub(super) fn copy_mode_action_for_egui_event(
 }
 
 pub(super) fn copy_mode_egui_key_may_emit_text(key: egui::Key) -> bool {
-    matches!(
-        key,
-        egui::Key::Questionmark
-            | egui::Key::Slash
-            | egui::Key::A
-            | egui::Key::B
-            | egui::Key::C
-            | egui::Key::D
-            | egui::Key::E
-            | egui::Key::F
-            | egui::Key::G
-            | egui::Key::H
-            | egui::Key::I
-            | egui::Key::J
-            | egui::Key::K
-            | egui::Key::L
-            | egui::Key::M
-            | egui::Key::N
-            | egui::Key::O
-            | egui::Key::P
-            | egui::Key::Q
-            | egui::Key::R
-            | egui::Key::S
-            | egui::Key::T
-            | egui::Key::U
-            | egui::Key::V
-            | egui::Key::W
-            | egui::Key::X
-            | egui::Key::Y
-            | egui::Key::Z
-            | egui::Key::Num0
-            | egui::Key::Num1
-            | egui::Key::Num2
-            | egui::Key::Num3
-            | egui::Key::Num4
-            | egui::Key::Num5
-            | egui::Key::Num6
-            | egui::Key::Num7
-            | egui::Key::Num8
-            | egui::Key::Num9
-            | egui::Key::Space
-    )
+    let name = key.name().as_bytes();
+    (name.len() == 1 && name[0].is_ascii_alphanumeric())
+        || matches!(
+            key,
+            egui::Key::Questionmark | egui::Key::Slash | egui::Key::Space
+        )
 }
 
-pub(super) fn copy_mode_action_for_egui_key(
+fn copy_mode_input_for_egui_key(
     key: egui::Key,
     modifiers: egui::Modifiers,
-) -> Option<CopyModeKeyAction> {
-    if key == egui::Key::C && modifiers.command && !modifiers.ctrl && !modifiers.alt {
-        return copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel);
-    }
-    if modifiers.command || modifiers.alt {
-        return None;
-    }
-    if modifiers.ctrl {
-        return copy_mode_ctrl_key_action(key);
-    }
-    match key {
-        egui::Key::Questionmark => {
-            return Some(CopyModeKeyAction::SearchPrompt(
-                TerminalSearchDirection::Previous,
-            ));
-        }
-        egui::Key::Slash if modifiers.shift => {
-            return Some(CopyModeKeyAction::SearchPrompt(
-                TerminalSearchDirection::Previous,
-            ));
-        }
-        egui::Key::Slash => {
-            return Some(CopyModeKeyAction::SearchPrompt(
-                TerminalSearchDirection::Next,
-            ));
-        }
-        egui::Key::Num3 if modifiers.shift => {
-            return Some(CopyModeKeyAction::SearchWord(
-                TerminalSearchDirection::Previous,
-            ));
-        }
-        egui::Key::Num8 if modifiers.shift => {
-            return Some(CopyModeKeyAction::SearchWord(TerminalSearchDirection::Next));
-        }
-        _ => {}
-    }
-    if modifiers.shift {
-        return match key {
-            egui::Key::G => copy_mode_motion(TerminalCopyModeMotion::HistoryBottom),
-            egui::Key::H => copy_mode_motion(TerminalCopyModeMotion::TopLine),
-            egui::Key::L => copy_mode_motion(TerminalCopyModeMotion::BottomLine),
-            egui::Key::M => copy_mode_motion(TerminalCopyModeMotion::MiddleLine),
-            egui::Key::V => copy_mode_terminal_action(TerminalCopyModeAction::SelectLine),
-            egui::Key::Num4 => copy_mode_motion(TerminalCopyModeMotion::EndOfLine),
-            egui::Key::Num6 => copy_mode_motion(TerminalCopyModeMotion::BackToIndentation),
-            _ => None,
-        };
-    }
-    match key {
-        egui::Key::Escape => {
-            copy_mode_terminal_action(TerminalCopyModeAction::CancelOrClearSelection)
-        }
-        egui::Key::Enter => {
-            copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel)
-        }
-        egui::Key::Space => copy_mode_terminal_action(TerminalCopyModeAction::BeginSelection),
-        egui::Key::ArrowLeft => copy_mode_motion(TerminalCopyModeMotion::Left),
-        egui::Key::ArrowRight => copy_mode_motion(TerminalCopyModeMotion::Right),
-        egui::Key::ArrowUp => copy_mode_motion(TerminalCopyModeMotion::Up),
-        egui::Key::ArrowDown => copy_mode_motion(TerminalCopyModeMotion::Down),
-        egui::Key::PageUp => copy_mode_motion(TerminalCopyModeMotion::PageUp),
-        egui::Key::PageDown => copy_mode_motion(TerminalCopyModeMotion::PageDown),
-        egui::Key::Home => copy_mode_motion(TerminalCopyModeMotion::StartOfLine),
-        egui::Key::End => copy_mode_motion(TerminalCopyModeMotion::EndOfLine),
-        egui::Key::H => copy_mode_motion(TerminalCopyModeMotion::Left),
-        egui::Key::J => copy_mode_motion(TerminalCopyModeMotion::Down),
-        egui::Key::K => copy_mode_motion(TerminalCopyModeMotion::Up),
-        egui::Key::L => copy_mode_motion(TerminalCopyModeMotion::Right),
-        egui::Key::N => Some(CopyModeKeyAction::SearchRepeat(
-            CopyModeSearchRepeat::SameDirection,
-        )),
-        egui::Key::G => copy_mode_motion(TerminalCopyModeMotion::HistoryTop),
-        egui::Key::W => copy_mode_motion(TerminalCopyModeMotion::NextWord),
-        egui::Key::B => copy_mode_motion(TerminalCopyModeMotion::PreviousWord),
-        egui::Key::E => copy_mode_motion(TerminalCopyModeMotion::NextWordEnd),
-        egui::Key::V => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelection),
-        egui::Key::O => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelectionEnd),
-        egui::Key::Y => copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel),
-        egui::Key::Q => copy_mode_terminal_action(TerminalCopyModeAction::Cancel),
-        egui::Key::Num0 => copy_mode_motion(TerminalCopyModeMotion::StartOfLine),
-        _ => None,
-    }
+    repeat: bool,
+) -> Option<KeyInput> {
+    let mut mods = key_mods_for_egui_binding(modifiers, ModifierSideState::default());
+    // Some egui backends report `?` as a logical key without the Shift bit.
+    mods.shift |= key == egui::Key::Questionmark;
+    Some(KeyInput {
+        key: terminal_key(key)?,
+        mods,
+        repeat,
+        utf8: None,
+        unshifted: None,
+    })
 }
 
 pub(super) fn copy_mode_action_for_input(input: KeyInput) -> Option<CopyModeKeyAction> {
@@ -257,42 +160,9 @@ pub(super) fn copy_mode_action_for_input(input: KeyInput) -> Option<CopyModeKeyA
         return copy_mode_ctrl_terminal_key_action(input.key);
     }
     if input.mods.shift {
-        return copy_mode_shift_terminal_key_action(input.key).or_else(|| {
-            input
-                .utf8
-                .and_then(single_char)
-                .and_then(copy_mode_action_for_char)
-        });
+        return copy_mode_shift_terminal_key_action(input.key);
     }
-    copy_mode_terminal_key_action(input.key).or_else(|| {
-        input
-            .utf8
-            .and_then(single_char)
-            .and_then(copy_mode_action_for_char)
-    })
-}
-
-fn single_char(value: &str) -> Option<char> {
-    let mut chars = value.chars();
-    let ch = chars.next()?;
-    chars.next().is_none().then_some(ch)
-}
-
-fn copy_mode_ctrl_key_action(key: egui::Key) -> Option<CopyModeKeyAction> {
-    match key {
-        egui::Key::B => copy_mode_motion(TerminalCopyModeMotion::PageUp),
-        egui::Key::C | egui::Key::G => copy_mode_terminal_action(TerminalCopyModeAction::Cancel),
-        egui::Key::D => copy_mode_motion(TerminalCopyModeMotion::HalfPageDown),
-        egui::Key::E => copy_mode_motion(TerminalCopyModeMotion::ScrollDown),
-        egui::Key::F => copy_mode_motion(TerminalCopyModeMotion::PageDown),
-        egui::Key::J => copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel),
-        egui::Key::N => copy_mode_motion(TerminalCopyModeMotion::Down),
-        egui::Key::P => copy_mode_motion(TerminalCopyModeMotion::Up),
-        egui::Key::U => copy_mode_motion(TerminalCopyModeMotion::HalfPageUp),
-        egui::Key::V => copy_mode_terminal_action(TerminalCopyModeAction::ToggleRectangle),
-        egui::Key::Y => copy_mode_motion(TerminalCopyModeMotion::ScrollUp),
-        _ => None,
-    }
+    copy_mode_terminal_key_action(input.key)
 }
 
 fn copy_mode_ctrl_terminal_key_action(key: TerminalKey) -> Option<CopyModeKeyAction> {
@@ -318,10 +188,26 @@ fn copy_mode_ctrl_terminal_key_action(key: TerminalKey) -> Option<CopyModeKeyAct
 
 fn copy_mode_shift_terminal_key_action(key: TerminalKey) -> Option<CopyModeKeyAction> {
     match key {
+        TerminalKey::Slash => Some(CopyModeKeyAction::SearchPrompt(
+            TerminalSearchDirection::Previous,
+        )),
+        TerminalKey::Digit3 => Some(CopyModeKeyAction::SearchWord(
+            TerminalSearchDirection::Previous,
+        )),
+        TerminalKey::Digit8 | TerminalKey::NumpadMultiply => {
+            Some(CopyModeKeyAction::SearchWord(TerminalSearchDirection::Next))
+        }
+        TerminalKey::NumpadDivide => Some(CopyModeKeyAction::SearchPrompt(
+            TerminalSearchDirection::Next,
+        )),
+        TerminalKey::Numpad0 => copy_mode_motion(TerminalCopyModeMotion::StartOfLine),
         TerminalKey::G => copy_mode_motion(TerminalCopyModeMotion::HistoryBottom),
         TerminalKey::H => copy_mode_motion(TerminalCopyModeMotion::TopLine),
         TerminalKey::L => copy_mode_motion(TerminalCopyModeMotion::BottomLine),
         TerminalKey::M => copy_mode_motion(TerminalCopyModeMotion::MiddleLine),
+        TerminalKey::N => Some(CopyModeKeyAction::SearchRepeat(
+            CopyModeSearchRepeat::OppositeDirection,
+        )),
         TerminalKey::V => copy_mode_terminal_action(TerminalCopyModeAction::SelectLine),
         TerminalKey::Digit4 => copy_mode_motion(TerminalCopyModeMotion::EndOfLine),
         TerminalKey::Digit6 => copy_mode_motion(TerminalCopyModeMotion::BackToIndentation),
@@ -346,6 +232,12 @@ fn copy_mode_terminal_key_action(key: TerminalKey) -> Option<CopyModeKeyAction> 
         TerminalKey::PageDown => copy_mode_motion(TerminalCopyModeMotion::PageDown),
         TerminalKey::Home => copy_mode_motion(TerminalCopyModeMotion::StartOfLine),
         TerminalKey::End => copy_mode_motion(TerminalCopyModeMotion::EndOfLine),
+        TerminalKey::Slash | TerminalKey::NumpadDivide => Some(CopyModeKeyAction::SearchPrompt(
+            TerminalSearchDirection::Next,
+        )),
+        TerminalKey::NumpadMultiply => {
+            Some(CopyModeKeyAction::SearchWord(TerminalSearchDirection::Next))
+        }
         TerminalKey::H => copy_mode_motion(TerminalCopyModeMotion::Left),
         TerminalKey::J => copy_mode_motion(TerminalCopyModeMotion::Down),
         TerminalKey::K => copy_mode_motion(TerminalCopyModeMotion::Up),
@@ -368,11 +260,8 @@ fn copy_mode_terminal_key_action(key: TerminalKey) -> Option<CopyModeKeyAction> 
     }
 }
 
-pub(super) fn copy_mode_action_for_char(ch: char) -> Option<CopyModeKeyAction> {
+fn copy_mode_action_for_shifted_punctuation(ch: char) -> Option<CopyModeKeyAction> {
     match ch {
-        '/' => Some(CopyModeKeyAction::SearchPrompt(
-            TerminalSearchDirection::Next,
-        )),
         '?' => Some(CopyModeKeyAction::SearchPrompt(
             TerminalSearchDirection::Previous,
         )),
@@ -382,30 +271,6 @@ pub(super) fn copy_mode_action_for_char(ch: char) -> Option<CopyModeKeyAction> {
         )),
         '$' => copy_mode_motion(TerminalCopyModeMotion::EndOfLine),
         '^' => copy_mode_motion(TerminalCopyModeMotion::BackToIndentation),
-        '0' => copy_mode_motion(TerminalCopyModeMotion::StartOfLine),
-        'b' => copy_mode_motion(TerminalCopyModeMotion::PreviousWord),
-        'e' => copy_mode_motion(TerminalCopyModeMotion::NextWordEnd),
-        'g' => copy_mode_motion(TerminalCopyModeMotion::HistoryTop),
-        'G' => copy_mode_motion(TerminalCopyModeMotion::HistoryBottom),
-        'h' => copy_mode_motion(TerminalCopyModeMotion::Left),
-        'H' => copy_mode_motion(TerminalCopyModeMotion::TopLine),
-        'j' => copy_mode_motion(TerminalCopyModeMotion::Down),
-        'k' => copy_mode_motion(TerminalCopyModeMotion::Up),
-        'l' => copy_mode_motion(TerminalCopyModeMotion::Right),
-        'L' => copy_mode_motion(TerminalCopyModeMotion::BottomLine),
-        'M' => copy_mode_motion(TerminalCopyModeMotion::MiddleLine),
-        'n' => Some(CopyModeKeyAction::SearchRepeat(
-            CopyModeSearchRepeat::SameDirection,
-        )),
-        'N' => Some(CopyModeKeyAction::SearchRepeat(
-            CopyModeSearchRepeat::OppositeDirection,
-        )),
-        'o' => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelectionEnd),
-        'q' => copy_mode_terminal_action(TerminalCopyModeAction::Cancel),
-        'v' => copy_mode_terminal_action(TerminalCopyModeAction::ToggleSelection),
-        'V' => copy_mode_terminal_action(TerminalCopyModeAction::SelectLine),
-        'w' => copy_mode_motion(TerminalCopyModeMotion::NextWord),
-        'y' => copy_mode_terminal_action(TerminalCopyModeAction::CopySelectionAndCancel),
         _ => None,
     }
 }

@@ -15,7 +15,6 @@ pub struct SessionPickerDialog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionPickerEvent {
-    None,
     Close,
     ActivateSession(ScopedSessionTarget),
 }
@@ -40,7 +39,7 @@ impl SessionPickerDialog {
         ctx: &egui::Context,
         theme: Theme,
         groups: &[BindingSessionGroup],
-    ) -> SessionPickerEvent {
+    ) -> Option<SessionPickerEvent> {
         let picker_rows = picker_rows(groups, &self.filter);
         self.selected = overlay::clamp_selection(self.selected, picker_rows.len());
         let rows = picker_rows
@@ -86,12 +85,12 @@ impl SessionPickerDialog {
         if let Some(index) = result.inner
             && let Some(target) = picker_rows.get(index).and_then(|row| row.target.as_ref())
         {
-            return SessionPickerEvent::ActivateSession(target.clone());
+            return Some(SessionPickerEvent::ActivateSession(target.clone()));
         }
         if result.escaped || result.clicked_outside {
-            return SessionPickerEvent::Close;
+            return Some(SessionPickerEvent::Close);
         }
-        SessionPickerEvent::None
+        None
     }
 }
 

@@ -3,9 +3,8 @@ use std::collections::HashMap;
 use bootty_app::ui::{
     session_navigation::BindingSessionGroup,
     sidebar::{
-        SidebarDisplay, SidebarItemKind, SidebarTree, build_binding_sidebar_items,
-        build_sidebar_items_from_published_items, session_group, session_suffix,
-        sidebar_session_colors,
+        build_binding_sidebar_items, build_sidebar_items_from_published_items, session_group,
+        session_suffix, sidebar_session_colors,
     },
 };
 use bootty_extension::{
@@ -88,19 +87,12 @@ fn extension_session_rows_keep_identity_style_and_selection() {
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].session_id, Some("$1"));
-    assert_eq!(
-        rows[0].display,
-        SidebarDisplay::Numbered {
-            number: 1,
-            label: "api"
-        }
-    );
+    assert_eq!((rows[0].number, rows[0].text), (Some(1), "api"));
     assert!(rows[0].current);
     assert!(rows[0].can_return_to_last_session);
-    assert!(matches!(
-        rows[0].kind,
-        SidebarItemKind::Session { active: true }
-    ));
+    assert_eq!(rows[0].context_position, Some((0, 1)));
+    assert_eq!(rows[0].kind, "session");
+    assert!(rows[0].active);
     assert_eq!(
         rows[0].color,
         Color32::from_rgba_unmultiplied(0x89, 0xb4, 0xfa, 0xff)
@@ -140,13 +132,15 @@ fn binding_groups_keep_colliding_backend_ids_scoped() {
     let items = build_binding_sidebar_items(&groups);
 
     assert_eq!(items.len(), 4);
-    assert_eq!(items[0].display, SidebarDisplay::Text("Local"));
-    assert_eq!(items[2].display, SidebarDisplay::Text("Remote"));
-    assert_eq!(items[1].session_scope, Some(local_scope));
-    assert_eq!(items[3].session_scope, Some(remote_scope));
+    assert_eq!(items[0].text, "Local");
+    assert_eq!(items[2].text, "Remote");
+    assert_eq!(items[1].scope, local_scope);
+    assert_eq!(items[3].scope, remote_scope);
     assert!(items[1].current);
     assert!(!items[3].current);
-    assert_ne!(items[1].id, items[3].id);
+    assert_eq!(items[1].context_position, Some((0, 1)));
+    assert_eq!(items[3].context_position, Some((0, 1)));
+    assert_ne!((items[1].scope, items[1].id), (items[3].scope, items[3].id));
 }
 
 #[test]
@@ -167,15 +161,11 @@ fn native_sessions_project_to_grouped_sidebar_rows() {
     let items = build_binding_sidebar_items(&groups);
 
     assert_eq!(items.len(), 4);
-    assert_eq!(
-        items[2].display,
-        SidebarDisplay::Numbered {
-            number: 1,
-            label: "api"
-        }
-    );
-    assert_eq!(items[2].tree, SidebarTree::Middle);
-    assert_eq!(items[3].tree, SidebarTree::Last);
+    assert_eq!((items[2].number, items[2].text), (Some(1), "api"));
+    assert_eq!(items[2].tree, Some("middle"));
+    assert_eq!(items[3].tree, Some("last"));
+    assert_eq!(items[2].context_position, Some((0, 2)));
+    assert_eq!(items[3].context_position, Some((1, 2)));
 }
 
 #[test]
@@ -194,7 +184,7 @@ fn selected_session_is_the_only_current_sidebar_row() {
     let items = build_binding_sidebar_items(&groups);
     let current = items
         .iter()
-        .filter(|item| matches!(item.kind, SidebarItemKind::Session { .. }) && item.current)
+        .filter(|item| item.kind == "session" && item.current)
         .map(|item| item.session_id)
         .collect::<Vec<_>>();
 
@@ -208,11 +198,11 @@ fn ungrouped_sessions_receive_distinct_accent_colors() {
         session("project", "project", "fish"),
     ];
 
-    let colors = sidebar_session_colors(&sessions, &[]);
+    let colors = sidebar_session_colors(&sessions, &[] as &[String]);
 
     assert_eq!(colors.len(), 2);
-    assert_ne!(colors[0].color, colors[1].color);
-    assert_ne!(colors[0].dim_color, colors[1].dim_color);
+    assert_ne!(colors[0].0, colors[1].0);
+    assert_ne!(colors[0].1, colors[1].1);
 }
 
 #[test]

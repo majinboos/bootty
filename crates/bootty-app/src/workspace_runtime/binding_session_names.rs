@@ -1,9 +1,10 @@
-use std::{collections::HashSet, hash::Hasher, path::PathBuf};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
 
-use super::{BindingRuntime, PendingGeneratedName, SpaceRuntime, WorkspaceRuntime};
+use super::{BindingRuntime, PendingGeneratedName, WorkspaceRuntime};
 use crate::ui::new_session_picker::NewMuxSessionRequest;
 use bootty_mux::{RepaintHandle, command::MuxCommand, provider::GeneratedSessionNamePolicy};
-use bootty_workspace::WorkspacePersistenceError;
+use bootty_workspace::{SessionNameStore, WorkspacePersistenceError};
 
 pub(crate) enum RenameSessionOutcome {
     Missing,
@@ -24,6 +25,21 @@ fn suggested_session_name(cwd: &str, remote: bool) -> String {
         crate::strings::session_name_for_remote_path(cwd)
     } else {
         bootty_mux::project::suggested_session_name(cwd)
+    }
+}
+
+fn record_session_name(
+    names: &mut SessionNameStore,
+    session_id: &str,
+    cwd: &str,
+    name: &str,
+    display_name: &str,
+    explicit: bool,
+) {
+    if explicit {
+        names.mark_explicit(session_id, name, display_name, cwd);
+    } else {
+        names.remember_generated(session_id, cwd, name, display_name);
     }
 }
 
@@ -49,7 +65,7 @@ impl BindingRuntime {
 fn session_root(cwd: &str) -> String {
     let cwd = bootty_mux::project::worktree_root(cwd).unwrap_or_else(|| cwd.to_owned());
     std::fs::canonicalize(&cwd)
-        .unwrap_or_else(|_| PathBuf::from(cwd))
+        .unwrap_or_else(|_| cwd.into())
         .to_string_lossy()
         .into_owned()
 }
@@ -58,14 +74,7 @@ impl WorkspaceRuntime {
     fn generated_names_signature(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for session in self.active.binding.mux.all_sessions() {
-            hasher.write(session.id.as_bytes());
-            hasher.write_u8(0);
-            hasher.write(session.name.as_bytes());
-            hasher.write_u8(0);
-            if let Some(cwd) = session.anchor.cwd.as_deref() {
-                hasher.write(cwd.as_bytes());
-            }
-            hasher.write_u8(1);
+            (&session.id, &session.name, &session.anchor.cwd).hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -126,21 +135,14 @@ impl WorkspaceRuntime {
                 } else {
                     crate::strings::session_name_for_path(&cwd)
                 };
-                if session.name == legacy_name {
-                    candidate.session_names.remember_generated(
-                        &session.id,
-                        &cwd,
-                        &session.name,
-                        &session.name,
-                    );
-                } else {
-                    candidate.session_names.mark_explicit(
-                        &session.id,
-                        &session.name,
-                        &session.name,
-                        &cwd,
-                    );
-                }
+                record_session_name(
+                    &mut candidate.session_names,
+                    &session.id,
+                    &cwd,
+                    &session.name,
+                    &session.name,
+                    session.name != legacy_name,
+                );
                 candidate
                     .session_names
                     .observe_session(&session.id, &session.name, &cwd)
@@ -148,12 +150,13 @@ impl WorkspaceRuntime {
             };
 
             if record.display_name.is_empty() {
-                let generated_suffix = session.name != record.generated_name
+                if record.explicit
+                    && session.name != record.generated_name
                     && crate::strings::is_uniquified_session_name(
                         &session.name,
                         &record.generated_name,
-                    );
-                if record.explicit && generated_suffix {
+                    )
+                {
                     candidate
                         .session_names
                         .reclaim_generated(&session.id, &session.name);
@@ -176,39 +179,31 @@ impl WorkspaceRuntime {
                 record.display_name = display_name;
             }
 
-            if let Some(pending) = pending_generated_names.get(&session.id).cloned() {
-                if pending.cwd == cwd {
-                    if session.name == pending.name {
-                        planned_names.remove(&pending.name);
-                        if pending.explicit {
-                            candidate.session_names.mark_explicit(
-                                &session.id,
-                                &pending.name,
-                                &pending.display_name,
-                                &cwd,
-                            );
-                        } else {
-                            candidate.session_names.remember_generated(
-                                &session.id,
-                                &cwd,
-                                &pending.name,
-                                &pending.display_name,
-                            );
-                        }
-                        pending_generated_names.remove(&session.id);
-                    } else if session.name != record.generated_name {
-                        planned_names.remove(&pending.name);
-                        pending_generated_names.remove(&session.id);
-                        candidate.session_names.mark_explicit(
-                            &session.id,
-                            &session.name,
-                            &session.name,
-                            &cwd,
-                        );
-                    }
-                    continue;
+            if let Some(pending) = pending_generated_names.remove(&session.id)
+                && pending.cwd == cwd
+            {
+                if session.name == pending.name {
+                    planned_names.remove(&pending.name);
+                    record_session_name(
+                        &mut candidate.session_names,
+                        &session.id,
+                        &cwd,
+                        &pending.name,
+                        &pending.display_name,
+                        pending.explicit,
+                    );
+                } else if session.name != record.generated_name {
+                    planned_names.remove(&pending.name);
+                    candidate.session_names.mark_explicit(
+                        &session.id,
+                        &session.name,
+                        &session.name,
+                        &cwd,
+                    );
+                } else {
+                    pending_generated_names.insert(session.id.clone(), pending);
                 }
-                pending_generated_names.remove(&session.id);
+                continue;
             }
             if record.explicit {
                 continue;
@@ -263,9 +258,7 @@ impl WorkspaceRuntime {
     }
 
     fn taken_session_names(&self, keep: Option<&str>) -> Vec<String> {
-        std::iter::once(&self.active.binding)
-            .chain(self.active.inactive_bindings.iter())
-            .chain(self.inactive_spaces.iter().flat_map(SpaceRuntime::bindings))
+        self.all_bindings()
             .flat_map(|binding| {
                 binding.mux.backend_session_names().iter().cloned().chain(
                     binding

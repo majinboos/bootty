@@ -44,6 +44,7 @@ struct FakeProvider {
 
 struct DynamicBackend {
     snapshot_calls: Arc<AtomicUsize>,
+    execute_calls: Arc<AtomicUsize>,
 }
 
 impl MuxBackend for DynamicBackend {
@@ -56,6 +57,7 @@ impl MuxBackend for DynamicBackend {
     }
 
     fn execute(&mut self, _command: MuxCommand) -> Result<()> {
+        self.execute_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -63,6 +65,7 @@ impl MuxBackend for DynamicBackend {
 struct DynamicProvider {
     caller_thread: Arc<std::sync::atomic::AtomicBool>,
     snapshot_calls: Arc<AtomicUsize>,
+    execute_calls: Arc<AtomicUsize>,
 }
 
 impl MuxBackendProvider for DynamicProvider {
@@ -85,6 +88,7 @@ impl MuxBackendProvider for DynamicProvider {
     ) -> Box<dyn MuxBackend> {
         Box::new(DynamicBackend {
             snapshot_calls: Arc::clone(&self.snapshot_calls),
+            execute_calls: Arc::clone(&self.execute_calls),
         })
     }
 }
@@ -366,6 +370,7 @@ fn refresh_outcome_keeps_applied_and_error_as_independent_fields() {
             [Arc::new(DynamicProvider {
                 caller_thread: Arc::clone(&caller_thread),
                 snapshot_calls: Arc::clone(&snapshot_calls),
+                execute_calls: Arc::new(AtomicUsize::new(0)),
             })],
             [MuxBackendKind::Tmux],
         )
@@ -397,4 +402,47 @@ fn refresh_outcome_keeps_applied_and_error_as_independent_fields() {
         controller.unavailable_reason(),
         Some("dynamic refresh failure")
     );
+}
+
+#[test]
+fn caller_thread_snapshot_failure_executes_once_and_surfaces_error() {
+    let execute_calls = Arc::new(AtomicUsize::new(0));
+    let registry = Arc::new(
+        MuxBackendRegistry::from_app_providers(
+            [Arc::new(DynamicProvider {
+                caller_thread: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                snapshot_calls: Arc::new(AtomicUsize::new(1)),
+                execute_calls: Arc::clone(&execute_calls),
+            })],
+            [MuxBackendKind::Tmux],
+        )
+        .unwrap(),
+    );
+    let config = MuxBindingConfig {
+        backend: MuxBackendKind::Tmux,
+        ..Default::default()
+    };
+    let scope = MuxScope::new(SpaceId::from_persistence(3), BindingId::from_persistence(3));
+    let repaint: RepaintHandle = Arc::new(|| {});
+    let mut controller = MuxController::new(scope, registry, None);
+
+    controller.execute_command(
+        &repaint,
+        &config,
+        MuxCommand::SplitPane {
+            session_id: "session".into(),
+            pane_id: None,
+            direction: MuxSplitDirection::Right,
+        },
+    );
+
+    assert_eq!(controller.last_error(), Some("dynamic refresh failure"));
+    for _ in 0..256 {
+        if execute_calls.load(Ordering::SeqCst) > 1 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(controller.poll_command(), None);
 }

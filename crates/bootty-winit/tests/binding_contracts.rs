@@ -2,8 +2,8 @@ use bootty_winit::{
     input_binding::{
         AdjustSelection, BindingAction, BindingElement, BindingFlags, BindingKey, BindingModSide,
         BindingMods, BindingParseError, BindingTrigger, CopyToClipboard, InputBinding,
-        NavigateSearch, WriteScreen, WriteScreenAction, WriteScreenFormat, parse_binding,
-        parse_binding_elements,
+        NavigateSearch, WriteScreen, WriteScreenAction, WriteScreenFormat, parse_action,
+        parse_binding, parse_binding_elements,
     },
     input_binding_set::BindingSet,
     terminal::{KeyInput, KeyMods, TerminalKey},
@@ -462,4 +462,59 @@ fn binding_formatting_is_canonical() {
         .format_entry(),
         "KeyA"
     );
+}
+
+#[test]
+fn binding_action_grammar_preserves_defaults_and_validation() {
+    for (input, action, canonical) in [
+        (
+            "copy_to_clipboard",
+            BindingAction::CopyToClipboard(CopyToClipboard::Mixed),
+            "copy_to_clipboard:mixed",
+        ),
+        (
+            "write_screen_file:open",
+            BindingAction::WriteScreenFile(WriteScreen {
+                action: WriteScreenAction::Open,
+                emit: WriteScreenFormat::Plain,
+            }),
+            "write_screen_file:open,plain",
+        ),
+        ("select_tab:1", BindingAction::SelectTab(1), "select_tab:1"),
+        (
+            "select_space:2",
+            BindingAction::SelectSpace(2),
+            "select_space:2",
+        ),
+        (
+            "select_session:3",
+            BindingAction::SelectSession(3),
+            "select_session:3",
+        ),
+        (
+            "set_surface_title:\u{1f47b}",
+            BindingAction::SetSurfaceTitle("\u{1f47b}".to_owned()),
+            "set_surface_title:\\xf0\\x9f\\x91\\xbb",
+        ),
+    ] {
+        assert_eq!(parse_action(input), Ok(action.clone()), "{input}");
+        assert_eq!(action.format_entry(), canonical, "{input}");
+    }
+
+    for input in [
+        "ignore:value",
+        "set_surface_title",
+        "set_font_size:nan",
+        "select_tab:0",
+        "select_space:0",
+        "select_session:0",
+        "select_pane:sideways",
+        "write_screen_file:copy,html,extra",
+    ] {
+        assert_eq!(
+            parse_action(input),
+            Err(BindingParseError::InvalidFormat),
+            "{input}"
+        );
+    }
 }

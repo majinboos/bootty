@@ -31,11 +31,9 @@ pub(crate) fn run_remote_space(args: &[String], identity: ApplicationIdentity) -
     };
     bootty_rmux::link();
     bootty_tmux::link();
-    bootty_zellij::link();
     let backends = std::sync::Arc::new(bootty_mux::provider::MuxBackendRegistry::collect([
         bootty_mux::MuxBackendKind::Rmux,
         bootty_mux::MuxBackendKind::Tmux,
-        bootty_mux::MuxBackendKind::Zellij,
     ])?);
     let mut catalog = Catalog::open(&state_path(identity)?, identity, backends)?;
     match command.as_str() {

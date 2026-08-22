@@ -43,16 +43,12 @@ pub(super) fn classify_schema(
         return Err(rusqlite::Error::InvalidQuery);
     }
 
-    let space_columns = table_columns(conn, "workspace_spaces")?;
-    let binding_columns = table_columns(conn, "workspace_bindings")?;
-    let required_space_columns = ["id", "name", "position"];
-    let required_binding_columns = ["id", "space_id", "name", "backend", "hide_tmux_status"];
-    if !required_space_columns
-        .iter()
-        .all(|column| space_columns.contains(*column))
-        || !required_binding_columns
-            .iter()
-            .all(|column| binding_columns.contains(*column))
+    if !table_has_columns(conn, "workspace_spaces", &["id", "name", "position"])?
+        || !table_has_columns(
+            conn,
+            "workspace_bindings",
+            &["id", "space_id", "name", "backend", "hide_tmux_status"],
+        )?
     {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -131,11 +127,7 @@ pub(super) fn classify_schema(
             if !tables.contains(table) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
-            let actual_columns = table_columns(conn, table)?;
-            if !columns
-                .iter()
-                .all(|column| actual_columns.contains(*column))
-            {
+            if !table_has_columns(conn, table, columns)? {
                 return Err(rusqlite::Error::InvalidQuery);
             }
         }
@@ -162,6 +154,23 @@ fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<HashSet<Str
         .collect()
 }
 
+fn table_has_columns(conn: &Connection, table: &str, required: &[&str]) -> rusqlite::Result<bool> {
+    let columns = table_columns(conn, table)?;
+    Ok(required.iter().all(|column| columns.contains(*column)))
+}
+
+fn add_column_if_missing(
+    tx: &Transaction<'_>,
+    columns: &HashSet<String>,
+    column: &str,
+    sql: &str,
+) -> rusqlite::Result<()> {
+    if !columns.contains(column) {
+        tx.execute(sql, [])?;
+    }
+    Ok(())
+}
+
 pub(super) fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqlite::Result<()> {
     let table_sql = conn
         .query_row(
@@ -182,26 +191,17 @@ pub(super) fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqli
     }
 
     let columns = table_columns(conn, "workspace_bindings")?;
-    let remote = if columns.contains("remote") {
-        "remote"
-    } else {
-        "NULL"
+    let column_or = |column, fallback| {
+        if columns.contains(column) {
+            column
+        } else {
+            fallback
+        }
     };
-    let unavailable = if columns.contains("unavailable") {
-        "unavailable"
-    } else {
-        "0"
-    };
-    let selected_session_id = if columns.contains("selected_session_id") {
-        "selected_session_id"
-    } else {
-        "NULL"
-    };
-    let selected_window_id = if columns.contains("selected_window_id") {
-        "selected_window_id"
-    } else {
-        "NULL"
-    };
+    let remote = column_or("remote", "NULL");
+    let unavailable = column_or("unavailable", "0");
+    let selected_session_id = column_or("selected_session_id", "NULL");
+    let selected_window_id = column_or("selected_window_id", "NULL");
 
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     let migration = conn.execute_batch(&format!(
@@ -231,8 +231,7 @@ pub(super) fn migrate_workspace_binding_cardinality(conn: &Connection) -> rusqli
         let _ = conn.execute_batch("ROLLBACK;");
     }
     let foreign_keys = conn.pragma_update(None, "foreign_keys", "ON");
-    migration?;
-    foreign_keys
+    migration.and(foreign_keys)
 }
 
 pub(super) fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
@@ -314,16 +313,13 @@ pub(super) fn new_remote_space_id(tx: &Transaction<'_>) -> rusqlite::Result<Stri
 }
 
 pub(super) fn migrate_workspace_remote_ids(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare("PRAGMA table_info(workspace_spaces)")?;
-    let has_remote_id = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == "remote_id");
-    drop(statement);
-    if !has_remote_id {
-        tx.execute("ALTER TABLE workspace_spaces ADD COLUMN remote_id TEXT", [])?;
-    }
+    let columns = table_columns(tx, "workspace_spaces")?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "remote_id",
+        "ALTER TABLE workspace_spaces ADD COLUMN remote_id TEXT",
+    )?;
     tx.execute(
         "UPDATE workspace_spaces
          SET remote_id = lower(hex(randomblob(4))) || '-' ||
@@ -343,95 +339,76 @@ pub(super) fn migrate_workspace_remote_ids(tx: &Transaction<'_>) -> rusqlite::Re
 }
 
 pub(super) fn migrate_workspace_space_icons(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare("PRAGMA table_info(workspace_spaces)")?;
-    let has_icon = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == "icon");
-    drop(statement);
-    if !has_icon {
-        tx.execute(
-            "ALTER TABLE workspace_spaces ADD COLUMN icon TEXT NOT NULL DEFAULT 'folder'",
-            [],
-        )?;
-    }
-    Ok(())
+    let columns = table_columns(tx, "workspace_spaces")?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "icon",
+        "ALTER TABLE workspace_spaces ADD COLUMN icon TEXT NOT NULL DEFAULT 'folder'",
+    )
 }
 
 pub(super) fn migrate_workspace_space_appearance(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare("PRAGMA table_info(workspace_spaces)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    drop(statement);
-    if !columns.contains("color") {
-        tx.execute(
-            "ALTER TABLE workspace_spaces ADD COLUMN color TEXT NOT NULL DEFAULT '#7AA2F7'",
-            [],
-        )?;
-    }
-    if !columns.contains("tint_sidebar") {
-        tx.execute(
-            "ALTER TABLE workspace_spaces ADD COLUMN tint_sidebar INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    Ok(())
+    let columns = table_columns(tx, "workspace_spaces")?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "color",
+        "ALTER TABLE workspace_spaces ADD COLUMN color TEXT NOT NULL DEFAULT '#7AA2F7'",
+    )?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "tint_sidebar",
+        "ALTER TABLE workspace_spaces ADD COLUMN tint_sidebar INTEGER NOT NULL DEFAULT 0",
+    )
 }
 
 pub(super) fn migrate_workspace_session_name_metadata(
     tx: &Transaction<'_>,
 ) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare("PRAGMA table_info(workspace_session_name_metadata)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    drop(statement);
-    if !columns.contains("session_name") {
-        tx.execute(
-            "ALTER TABLE workspace_session_name_metadata
-             ADD COLUMN session_name TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    if !columns.contains("display_name") {
-        tx.execute(
-            "ALTER TABLE workspace_session_name_metadata
-             ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    Ok(())
+    let columns = table_columns(tx, "workspace_session_name_metadata")?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "session_name",
+        "ALTER TABLE workspace_session_name_metadata
+         ADD COLUMN session_name TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "display_name",
+        "ALTER TABLE workspace_session_name_metadata
+         ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+    )
 }
 
 pub(super) fn migrate_workspace_snapshot_state(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let mut statement = tx.prepare("PRAGMA table_info(workspace_bindings)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    drop(statement);
-    if !columns.contains("unavailable") {
-        tx.execute(
-            "ALTER TABLE workspace_bindings
-             ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    if !columns.contains("selected_session_id") {
-        tx.execute(
-            "ALTER TABLE workspace_bindings ADD COLUMN selected_session_id TEXT",
-            [],
-        )?;
-    }
-    if !columns.contains("selected_window_id") {
-        tx.execute(
-            "ALTER TABLE workspace_bindings ADD COLUMN selected_window_id TEXT",
-            [],
-        )?;
-    }
-    if !columns.contains("remote") {
-        tx.execute("ALTER TABLE workspace_bindings ADD COLUMN remote TEXT", [])?;
-    }
-    Ok(())
+    let columns = table_columns(tx, "workspace_bindings")?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "unavailable",
+        "ALTER TABLE workspace_bindings
+         ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "selected_session_id",
+        "ALTER TABLE workspace_bindings ADD COLUMN selected_session_id TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "selected_window_id",
+        "ALTER TABLE workspace_bindings ADD COLUMN selected_window_id TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        &columns,
+        "remote",
+        "ALTER TABLE workspace_bindings ADD COLUMN remote TEXT",
+    )
 }

@@ -77,7 +77,7 @@ unfocused-terminal-dim = 0.08
 backend = "rmux"
 
 # native keeps mux state and terminals inside Bootty. rmux renders through
-# rmux-sdk. tmux and zellij attach through their backend UI.
+# rmux-sdk. tmux attaches through its backend UI.
 
 # Attach a multiplexer running on another host. Bootty reaches the remote host
 # over SSH and renders its sessions here. On first use, Bootty uploads the

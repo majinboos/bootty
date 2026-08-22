@@ -618,7 +618,7 @@ impl TextAtlasBuilder {
         let height = (command.rect.height() * pixels_per_point).ceil().max(1.0) as u32;
         let key = GlyphAtlasKey {
             face: self.sprite_face_key.clone(),
-            text: self.intern_char(command.ch),
+            text: self.intern_char(command.glyph.ch),
             font_size_bits: command.rect.height().to_bits(),
             pixels_per_point_bits: pixels_per_point.to_bits(),
             width,
@@ -626,7 +626,8 @@ impl TextAtlasBuilder {
         };
         let format = self.atlas.format();
         let entry = self.atlas.insert_or_get_with(key, width, height, || {
-            let alpha = rasterize_sprite_commands(&command.commands, command.rect, width, height);
+            let commands = command.glyph.commands_for(command.rect);
+            let alpha = rasterize_sprite_commands(&commands, command.rect, width, height);
             alpha_to_atlas_pixels(format, alpha)
         });
         TexturedGlyphQuad {

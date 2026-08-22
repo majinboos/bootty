@@ -29,6 +29,41 @@ pub struct EditableModuleSource {
     pub has_builtin: bool,
 }
 
+/// The editable module set, borrowed for one settings frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModuleSources<'a> {
+    pub identities: &'a [ModuleIdentity],
+    pub legacy: &'a [LegacyExtensionModule],
+}
+
+/// One module-source edit requested by the settings editor. The extension host owns the
+/// extension root and the live module set, so every path decision stays behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModuleSourceRequest {
+    Load(ModuleIdentity),
+    Create(String),
+    Save {
+        identity: ModuleIdentity,
+        source: String,
+    },
+    Reset(ModuleIdentity),
+    ImportLegacy(LegacyExtensionModule),
+}
+
+/// The result of one [`ModuleSourceRequest`], applied to the editor after painting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModuleSourceOutcome {
+    Loaded {
+        source: EditableModuleSource,
+        /// False when no file and no built-in exists yet; editing creates it.
+        exists: bool,
+    },
+    Created(Result<ModuleIdentity, String>),
+    Saved(Result<PathBuf, String>),
+    Reset(Result<ModuleIdentity, String>),
+    Imported(Result<ModuleIdentity, String>),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LegacyExtensionModule {
     pub source_path: PathBuf,
@@ -99,10 +134,9 @@ pub fn import_legacy_extension_module(
     legacy: &LegacyExtensionModule,
     theme: Vec<(String, String)>,
 ) -> Result<ModuleIdentity, String> {
-    let current = legacy_extension_modules(config_dir)?;
-    let legacy = current
-        .iter()
-        .find(|candidate| candidate == &legacy)
+    let legacy = legacy_extension_modules(config_dir)?
+        .into_iter()
+        .find(|candidate| candidate == legacy)
         .ok_or_else(|| "legacy extension module is no longer available".to_owned())?;
     let source = fs::read_to_string(&legacy.source_path).map_err(|error| error.to_string())?;
     let source = wrap_legacy_surface_source(&legacy.surface_id, legacy.placement, source.as_str());
@@ -119,7 +153,7 @@ pub fn import_legacy_extension_module(
         &source,
     )
     .map_err(|error| error.to_string())?;
-    Ok(legacy.target_identity.clone())
+    Ok(legacy.target_identity)
 }
 
 fn legacy_target_identity(
@@ -149,9 +183,17 @@ fn wrap_legacy_surface_source(
     placement: SurfacePlacement,
     source: &str,
 ) -> String {
+    surface_module_source(
+        "-- Imported from a legacy Bootty extension directory.\n",
+        surface_id,
+        placement.as_str(),
+        source,
+    )
+}
+
+fn surface_module_source(header: &str, identity: &str, placement: &str, source: &str) -> String {
     format!(
-        r#"-- Imported from a legacy Bootty extension directory.
-local candidate = (function()
+        r#"{header}local candidate = (function()
 {source}
 end)()
 local render = candidate
@@ -160,9 +202,8 @@ if type(candidate) == "table" then
     render = candidate.render
     interval = candidate.interval
 end
-bootty.ui.register({{ id = "{surface_id}", placement = "{}", interval = interval }}, render)
-"#,
-        placement.as_str()
+bootty.ui.register({{ id = "{identity}", placement = "{placement}", interval = interval }}, render)
+"#
     )
 }
 
@@ -172,25 +213,19 @@ pub fn editable_module_source(
 ) -> Option<EditableModuleSource> {
     let path = root.join(identity.as_ref());
     let builtin = builtin_source(identity);
-    match fs::read_to_string(&path) {
-        Ok(source) => Some(EditableModuleSource {
-            identity: identity.clone(),
-            source,
-            path,
-            customized: true,
-            has_builtin: builtin.is_some(),
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            builtin.map(|source| EditableModuleSource {
-                identity: identity.clone(),
-                source,
-                path,
-                customized: false,
-                has_builtin: true,
-            })
-        }
-        Err(_) => None,
-    }
+    let has_builtin = builtin.is_some();
+    let (source, customized) = match fs::read_to_string(&path) {
+        Ok(source) => (source, true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (builtin?, false),
+        Err(_) => return None,
+    };
+    Some(EditableModuleSource {
+        identity: identity.clone(),
+        source,
+        path,
+        customized,
+        has_builtin,
+    })
 }
 
 pub fn save_module_source(
@@ -208,6 +243,30 @@ pub fn save_module_source(
     fs::create_dir_all(parent)?;
     crate::source_writer::save_within(root, &path, source)?;
     Ok(path)
+}
+
+/// Write the starter source for a module that does not exist yet. Rejects an identity that
+/// is already backed by a file so a create never overwrites an edited module.
+pub fn create_module_source(root: &Path, value: &str) -> Result<ModuleIdentity, String> {
+    let identity = ModuleIdentity::parse(value.trim().to_owned())?;
+    if root.join(identity.as_ref()).exists() {
+        return Err(format!("Module `{identity}` already exists."));
+    }
+    save_module_source(root, &identity, &module_template(&identity))
+        .map_err(|error| format!("Create failed: {error}"))?;
+    Ok(identity)
+}
+
+/// Starter source for a new module: one registered sidebar surface that renders its own name.
+pub fn module_template(identity: &ModuleIdentity) -> String {
+    let id = identity
+        .as_ref()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("extension");
+    format!(
+        "--!strict\nbootty.ui.register({{ id = \"{id}\", placement = \"sidebar\" }}, function()\n\treturn {{ {{ text = \"{id}\" }} }}\nend)\n"
+    )
 }
 
 pub fn reset_module_source(root: &Path, identity: &ModuleIdentity) -> std::io::Result<()> {
@@ -266,14 +325,13 @@ pub(crate) fn discover_modules(
         }
         canonical_paths.insert(canonical_path);
     }
-    let paths = canonical_paths.into_iter().collect::<Vec<_>>();
-    if paths.len() + modules.len() > MODULE_LIMIT {
+    if canonical_paths.len() + modules.len() > MODULE_LIMIT {
         return Err(format!(
             "extension module count exceeds the limit of {MODULE_LIMIT}"
         ));
     }
-    for path in paths {
-        let identity = module_identity(root, &path)?;
+    for path in canonical_paths {
+        let identity = module_identity(&canonical_root, &path)?;
         let loaded = load_module_source(identity.clone(), &path);
         modules.insert(identity, loaded);
     }
@@ -281,20 +339,7 @@ pub(crate) fn discover_modules(
 }
 
 fn builtin_module_source(identity: &str, placement: &str, source: &str) -> String {
-    format!(
-        r#"
-local candidate = (function()
-{source}
-end)()
-local render = candidate
-local interval = nil
-if type(candidate) == "table" then
-    render = candidate.render
-    interval = candidate.interval
-end
-bootty.ui.register({{ id = "{identity}", placement = "{placement}", interval = interval }}, render)
-"#
-    )
+    surface_module_source("\n", identity, placement, source)
 }
 
 fn collect_module_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -318,14 +363,9 @@ fn is_module_path(path: &Path) -> bool {
         .is_some_and(|extension| matches!(extension, "lua" | "luau"))
 }
 
-fn module_identity(root: &Path, path: &Path) -> Result<ModuleIdentity, String> {
-    let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
-    let canonical_path = path.canonicalize().map_err(|error| error.to_string())?;
-    if !canonical_path.starts_with(&canonical_root) {
-        return Err("extension module must stay inside the extension root".to_owned());
-    }
+fn module_identity(canonical_root: &Path, canonical_path: &Path) -> Result<ModuleIdentity, String> {
     let relative = canonical_path
-        .strip_prefix(&canonical_root)
+        .strip_prefix(canonical_root)
         .map_err(|_| "extension module must stay inside the extension root".to_owned())?;
     let parts = relative
         .components()

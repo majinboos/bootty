@@ -350,29 +350,9 @@ impl BackendPaneTerminal {
         let kind = registry.selected_kind(config);
         let policy = registry.build_pane_policy(config);
         let behavior = registry.app_policy(config).panes;
-        Self::new_with_policy(
-            geometry,
-            registry,
-            kind,
-            policy,
-            behavior,
-            terminal_config,
-            repaint_wakeup,
-        )
-    }
-
-    fn new_with_policy(
-        geometry: TerminalGeometry,
-        registry: Arc<MuxBackendRegistry>,
-        policy_kind: MuxBackendKind,
-        policy: Box<dyn BackendPanePolicy>,
-        behavior: PaneBehavior,
-        terminal_config: TerminalSessionConfig,
-        repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
-    ) -> Self {
         Self {
             registry,
-            policy_kind,
+            policy_kind: kind,
             policy,
             behavior,
             active_target: None,
@@ -424,7 +404,7 @@ impl BackendPaneTerminal {
             self.behavior = next_behavior;
             self.active_target = None;
             self.native_terminals.clear();
-            self.clear_terminal();
+            self.terminal = idle_terminal();
         }
         let target = anchor
             .cloned()
@@ -446,7 +426,7 @@ impl BackendPaneTerminal {
         let terminal = self.start_terminal(target.as_ref()).inspect_err(|_| {
             self.active_target = None;
             self.policy.sync_target(None, config.hide_tmux_status);
-            self.clear_terminal();
+            self.terminal = idle_terminal();
         })?;
         bootty_runtime::latency::trace_slow("attach.start_terminal", phase, 2.0);
 
@@ -602,7 +582,7 @@ impl BackendPaneTerminal {
                 .start_terminal(focused_target.as_ref())
                 .inspect_err(|_| {
                     self.active_target = None;
-                    self.clear_terminal();
+                    self.terminal = idle_terminal();
                 })?;
             self.active_target = focused_target;
             self.set_active_terminal(terminal);
@@ -651,12 +631,11 @@ impl BackendPaneTerminal {
 
     fn force_native_layout_pane_resizes(&mut self) -> Result<()> {
         self.terminal.force_resize()?;
-        let targets = self.native_window_targets.clone();
-        for target in targets {
-            if self.active_target.as_ref() == Some(&target) {
+        for target in &self.native_window_targets {
+            if self.active_target.as_ref() == Some(target) {
                 continue;
             }
-            if let Some(runtime) = self.native_terminals.get_mut(&target) {
+            if let Some(runtime) = self.native_terminals.get_mut(target) {
                 runtime.force_resize()?;
             }
         }
@@ -680,9 +659,8 @@ impl BackendPaneTerminal {
         let target = self
             .native_window_targets
             .iter()
-            .find(|target| target.input_selector() == pane_id)?
-            .clone();
-        let terminal = self.native_terminals.get_mut(&target)?;
+            .find(|target| target.input_selector() == pane_id)?;
+        let terminal = self.native_terminals.get_mut(target)?;
         Some(&mut **terminal)
     }
 
@@ -718,8 +696,7 @@ impl BackendPaneTerminal {
         {
             exited.push(id.to_owned());
         }
-        let targets = self.native_window_targets.clone();
-        for target in &targets {
+        for target in &self.native_window_targets {
             if self.active_target.as_ref() == Some(target) {
                 continue;
             }
@@ -742,9 +719,8 @@ impl BackendPaneTerminal {
             .native_window_targets
             .iter()
             .find(|target| target.input_selector() == pane_id)
-            .cloned()
         {
-            self.native_terminals.remove(&target);
+            self.native_terminals.remove(target);
         }
     }
 
@@ -790,10 +766,6 @@ impl BackendPaneTerminal {
     pub fn discard_active_pane(&mut self) {
         self.terminal = idle_terminal();
         self.active_target = None;
-    }
-
-    fn clear_terminal(&mut self) {
-        self.terminal = idle_terminal();
     }
 
     fn park_cached_terminal(&mut self) {
@@ -1102,11 +1074,10 @@ fn scoped_target_matches_anchor(
     target: Option<&ScopedMuxPaneTarget>,
     anchor: Option<&MuxPaneAnchor>,
 ) -> bool {
-    match target {
-        Some(target) if target.scope != scope => false,
-        Some(target) => target_matches_anchor(topology, Some(&target.target), anchor),
-        None => target_matches_anchor(topology, None, anchor),
+    if target.is_some_and(|target| target.scope != scope) {
+        return false;
     }
+    target_matches_anchor(topology, target.map(|target| &target.target), anchor)
 }
 
 fn target_matches_anchor(
@@ -1116,18 +1087,12 @@ fn target_matches_anchor(
 ) -> bool {
     match (target, anchor) {
         (None, None) => true,
-        (Some(target), Some(anchor)) => {
-            if target.session_id() != anchor.session_id {
-                return false;
-            }
-            // Attached clients (tmux/zellij attach PTYs) follow pane and
-            // window changes server-side; restarting them on an active-pane
+        (Some(target), Some(anchor)) if target.session_id() == anchor.session_id => {
+            // Attached multiplexer clients follow pane and window changes
+            // server-side; restarting them on an active-pane
             // change blanks the whole surface for nothing.
-            if topology == PaneTopology::Attach {
-                return true;
-            }
             let anchor_selector = anchor.pane_id.as_deref().unwrap_or(&anchor.session_id);
-            target.input_selector() == anchor_selector
+            topology == PaneTopology::Attach || target.input_selector() == anchor_selector
         }
         _ => false,
     }

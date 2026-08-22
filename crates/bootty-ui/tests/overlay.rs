@@ -4,19 +4,26 @@ use bootty_ui::{
 };
 use eframe::egui::{self, Event, Key, Modifiers, RawInput};
 
-fn key_event(key: Key) -> Event {
+fn key_event(key: Key, modifiers: Modifiers) -> Event {
     Event::Key {
         key,
         physical_key: None,
         pressed: true,
         repeat: false,
-        modifiers: Modifiers::NONE,
+        modifiers,
     }
 }
 
 fn key_input(key: Key) -> RawInput {
+    modified_key_input(key, Modifiers::NONE)
+}
+
+fn modified_key_input(key: Key, modifiers: Modifiers) -> RawInput {
     RawInput {
-        events: vec![key_event(key)],
+        events: vec![
+            Event::ModifiersChanged(modifiers),
+            key_event(key, modifiers),
+        ],
         ..RawInput::default()
     }
 }
@@ -69,6 +76,30 @@ fn list_navigation_stays_within_the_available_rows() {
 }
 
 #[test]
+fn list_supports_control_navigation_and_enter_activation() {
+    let context = egui::Context::default();
+    let rows = rows(&["one", "two"]);
+    let control = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+
+    let next = show_list(&context, &rows, 0, modified_key_input(Key::N, control));
+    assert_eq!(next.selected, 1);
+
+    let activated = show_list(&context, &rows, next.selected, key_input(Key::Enter));
+    assert_eq!(activated.activated, Some(1));
+
+    let previous = show_list(
+        &context,
+        &rows,
+        activated.selected,
+        modified_key_input(Key::P, control),
+    );
+    assert_eq!(previous.selected, 0);
+}
+
+#[test]
 fn stored_list_selection_is_clamped_after_rows_disappear() {
     assert_eq!(clamp_selection(0, 0), 0);
     assert_eq!(clamp_selection(9, 3), 2);
@@ -101,6 +132,9 @@ fn list_navigation_skips_section_rows() {
 
     let first = show_list(&context, &rows, 0, RawInput::default());
     assert_eq!(first.selected, 1);
+
+    let normalized = show_list(&context, &rows, 0, key_input(Key::ArrowDown));
+    assert_eq!(normalized.selected, 1);
 
     let next = show_list(&context, &rows, first.selected, key_input(Key::ArrowDown));
     assert_eq!(next.selected, 3);

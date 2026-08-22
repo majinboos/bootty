@@ -59,19 +59,28 @@ pub struct PublishedSurfaceSnapshot {
 }
 
 impl PublishedSurfaceSnapshot {
+    /// Whether `name` selects this surface. Config names a surface by either identity: the id the
+    /// module declared, or the file stem of the module that produced it.
     #[must_use]
-    pub fn into_items(self) -> Vec<PublishedSurfaceItem> {
-        let surface = self.snapshot.declaration.id;
+    pub fn matches_name(&self, name: &str) -> bool {
+        self.snapshot.declaration.id == name
+            || std::path::Path::new(&self.module)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                == Some(name)
+    }
+
+    pub fn items(&self) -> impl Iterator<Item = PublishedSurfaceItem> + '_ {
         self.snapshot
             .items
-            .into_iter()
-            .map(|item| PublishedSurfaceItem {
+            .iter()
+            .cloned()
+            .map(move |item| PublishedSurfaceItem {
                 module: self.module.clone(),
                 generation: self.generation,
-                surface: surface.clone(),
+                surface: self.snapshot.declaration.id.clone(),
                 item,
             })
-            .collect()
     }
 }
 

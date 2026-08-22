@@ -1,50 +1,32 @@
 use crate::geometry::SurfaceRect;
 use crate::terminal_sprite::families::primitives::{
-    clear_stroke_segment, filled_polygon, filled_triangle, heavy_line_width, left_bottom, left_top,
-    line_width, placeholder_commands, points_from_array, points_from_vec, right_bottom, right_top,
-    sixel_grid_commands, stroke_polyline, stroke_segment,
+    clear_stroke_segment, fill_rect, filled_polygon, filled_triangle, heavy_line_width,
+    left_bottom, left_top, line_width, placeholder_commands, points_from_array, points_from_vec,
+    right_bottom, right_top, sixel_grid_commands, stroke_polyline, stroke_segment,
 };
 use crate::terminal_sprite::{SpriteCommand, SpritePoint, SpriteShape};
 
-pub(super) fn commands_for(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
-    if ('\u{1FB00}'..='\u{1FB3B}').contains(&ch) {
-        return sextant_commands(ch, rect);
-    }
-    if ('\u{1FB3C}'..='\u{1FB67}').contains(&ch) {
-        return smooth_mosaic_commands(ch, rect);
-    }
-    if ('\u{1FB68}'..='\u{1FB6F}').contains(&ch) || ('\u{1FB9A}'..='\u{1FB9B}').contains(&ch) {
-        return legacy_edge_triangle_commands(ch, rect);
-    }
-    if ('\u{1FB9C}'..='\u{1FB9F}').contains(&ch) {
-        return legacy_corner_triangle_shade_commands(ch, rect);
-    }
-    if ('\u{1FB70}'..='\u{1FB97}').contains(&ch) {
-        return legacy_block_extension_commands(ch, rect);
-    }
-    if ('\u{1FB98}'..='\u{1FB99}').contains(&ch) {
-        return legacy_hatch_commands(ch, rect);
-    }
-    if ('\u{1FBA0}'..='\u{1FBAE}').contains(&ch) {
-        return legacy_corner_diagonal_commands(ch, rect);
-    }
-    if ch == '\u{1FBAF}' {
-        return legacy_mixed_box_connector_commands(rect);
-    }
-    if ('\u{1FBBD}'..='\u{1FBBF}').contains(&ch) {
-        return legacy_inverse_diagonal_commands(ch, rect);
-    }
-    if ('\u{1FBCE}'..='\u{1FBCF}').contains(&ch) || ('\u{1FBE4}'..='\u{1FBE7}').contains(&ch) {
-        return legacy_fractional_block_commands(ch, rect);
-    }
-    if ('\u{1FBD0}'..='\u{1FBDF}').contains(&ch) {
-        return legacy_cell_diagonal_commands(ch, rect);
-    }
-    if ('\u{1FBE0}'..='\u{1FBEF}').contains(&ch) {
-        return legacy_circle_commands(ch, rect);
-    }
+enum EighthAxis {
+    Columns,
+    Rows,
+}
 
-    placeholder_commands(rect)
+pub(super) fn commands_for(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
+    match ch as u32 {
+        0x1FB00..=0x1FB3B => sextant_commands(ch, rect),
+        0x1FB3C..=0x1FB67 => smooth_mosaic_commands(ch, rect),
+        0x1FB68..=0x1FB6F | 0x1FB9A..=0x1FB9B => legacy_edge_triangle_commands(ch, rect),
+        0x1FB70..=0x1FB97 => legacy_block_extension_commands(ch, rect),
+        0x1FB98..=0x1FB99 => legacy_hatch_commands(ch, rect),
+        0x1FB9C..=0x1FB9F => legacy_corner_triangle_shade_commands(ch, rect),
+        0x1FBA0..=0x1FBAE => legacy_corner_diagonal_commands(ch, rect),
+        0x1FBAF => legacy_mixed_box_connector_commands(rect),
+        0x1FBBD..=0x1FBBF => legacy_inverse_diagonal_commands(ch, rect),
+        0x1FBCE..=0x1FBCF | 0x1FBE4..=0x1FBE7 => legacy_fractional_block_commands(ch, rect),
+        0x1FBD0..=0x1FBDF => legacy_cell_diagonal_commands(ch, rect),
+        0x1FBE0..=0x1FBEF => legacy_circle_commands(ch, rect),
+        _ => placeholder_commands(rect),
+    }
 }
 
 fn smooth_mosaic_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
@@ -59,62 +41,52 @@ fn smooth_mosaic_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
 }
 
 fn legacy_block_extension_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
+    use EighthAxis::{Columns as C, Rows as R};
+
     let cp = ch as u32;
     if (0x1FB70..=0x1FB75).contains(&cp) {
         let slot = (cp - 0x1FB6F) as u8;
-        return vec![fill_eighth_columns(rect, slot, slot + 1)];
+        return vec![eighths(rect, C, slot, slot + 1, 1.0)];
     }
     if (0x1FB76..=0x1FB7B).contains(&cp) {
         let slot = (cp - 0x1FB75) as u8;
-        return vec![fill_eighth_rows(rect, slot, slot + 1)];
+        return vec![eighths(rect, R, slot, slot + 1, 1.0)];
     }
 
     match cp {
-        0x1FB7C => vec![
-            fill_eighth_columns(rect, 0, 1),
-            fill_eighth_rows(rect, 7, 8),
-        ],
-        0x1FB7D => vec![
-            fill_eighth_columns(rect, 0, 1),
-            fill_eighth_rows(rect, 0, 1),
-        ],
-        0x1FB7E => vec![
-            fill_eighth_columns(rect, 7, 8),
-            fill_eighth_rows(rect, 0, 1),
-        ],
-        0x1FB7F => vec![
-            fill_eighth_columns(rect, 7, 8),
-            fill_eighth_rows(rect, 7, 8),
-        ],
-        0x1FB80 => vec![fill_eighth_rows(rect, 0, 1), fill_eighth_rows(rect, 7, 8)],
+        0x1FB7C => vec![eighths(rect, C, 0, 1, 1.0), eighths(rect, R, 7, 8, 1.0)],
+        0x1FB7D => vec![eighths(rect, C, 0, 1, 1.0), eighths(rect, R, 0, 1, 1.0)],
+        0x1FB7E => vec![eighths(rect, C, 7, 8, 1.0), eighths(rect, R, 0, 1, 1.0)],
+        0x1FB7F => vec![eighths(rect, C, 7, 8, 1.0), eighths(rect, R, 7, 8, 1.0)],
+        0x1FB80 => vec![eighths(rect, R, 0, 1, 1.0), eighths(rect, R, 7, 8, 1.0)],
         0x1FB81 => vec![
-            fill_eighth_rows(rect, 0, 1),
-            fill_eighth_rows(rect, 2, 3),
-            fill_eighth_rows(rect, 4, 5),
-            fill_eighth_rows(rect, 7, 8),
+            eighths(rect, R, 0, 1, 1.0),
+            eighths(rect, R, 2, 3, 1.0),
+            eighths(rect, R, 4, 5, 1.0),
+            eighths(rect, R, 7, 8, 1.0),
         ],
-        0x1FB82 => vec![fill_eighth_rows(rect, 0, 2)],
-        0x1FB83 => vec![fill_eighth_rows(rect, 0, 3)],
-        0x1FB84 => vec![fill_eighth_rows(rect, 0, 5)],
-        0x1FB85 => vec![fill_eighth_rows(rect, 0, 6)],
-        0x1FB86 => vec![fill_eighth_rows(rect, 0, 7)],
-        0x1FB87 => vec![fill_eighth_columns(rect, 6, 8)],
-        0x1FB88 => vec![fill_eighth_columns(rect, 5, 8)],
-        0x1FB89 => vec![fill_eighth_columns(rect, 3, 8)],
-        0x1FB8A => vec![fill_eighth_columns(rect, 2, 8)],
-        0x1FB8B => vec![fill_eighth_columns(rect, 1, 8)],
-        0x1FB8C => vec![shade_eighth_columns(rect, 0, 4, 0.5)],
-        0x1FB8D => vec![shade_eighth_columns(rect, 4, 8, 0.5)],
-        0x1FB8E => vec![shade_eighth_rows(rect, 0, 4, 0.5)],
-        0x1FB8F => vec![shade_eighth_rows(rect, 4, 8, 0.5)],
+        0x1FB82 => vec![eighths(rect, R, 0, 2, 1.0)],
+        0x1FB83 => vec![eighths(rect, R, 0, 3, 1.0)],
+        0x1FB84 => vec![eighths(rect, R, 0, 5, 1.0)],
+        0x1FB85 => vec![eighths(rect, R, 0, 6, 1.0)],
+        0x1FB86 => vec![eighths(rect, R, 0, 7, 1.0)],
+        0x1FB87 => vec![eighths(rect, C, 6, 8, 1.0)],
+        0x1FB88 => vec![eighths(rect, C, 5, 8, 1.0)],
+        0x1FB89 => vec![eighths(rect, C, 3, 8, 1.0)],
+        0x1FB8A => vec![eighths(rect, C, 2, 8, 1.0)],
+        0x1FB8B => vec![eighths(rect, C, 1, 8, 1.0)],
+        0x1FB8C => vec![eighths(rect, C, 0, 4, 0.5)],
+        0x1FB8D => vec![eighths(rect, C, 4, 8, 0.5)],
+        0x1FB8E => vec![eighths(rect, R, 0, 4, 0.5)],
+        0x1FB8F => vec![eighths(rect, R, 4, 8, 0.5)],
         0x1FB90 => vec![shade_rect(rect, 0.5)],
-        0x1FB91 => vec![shade_rect(rect, 0.5), fill_eighth_rows(rect, 0, 4)],
-        0x1FB92 => vec![shade_rect(rect, 0.5), fill_eighth_rows(rect, 4, 8)],
+        0x1FB91 => vec![shade_rect(rect, 0.5), eighths(rect, R, 0, 4, 1.0)],
+        0x1FB92 => vec![shade_rect(rect, 0.5), eighths(rect, R, 4, 8, 1.0)],
         0x1FB93 => Vec::new(),
-        0x1FB94 => vec![shade_rect(rect, 0.5), fill_eighth_columns(rect, 4, 8)],
+        0x1FB94 => vec![shade_rect(rect, 0.5), eighths(rect, C, 4, 8, 1.0)],
         0x1FB95 => checkerboard_commands(rect, 0),
         0x1FB96 => checkerboard_commands(rect, 1),
-        0x1FB97 => vec![fill_eighth_rows(rect, 2, 4), fill_eighth_rows(rect, 6, 8)],
+        0x1FB97 => vec![eighths(rect, R, 2, 4, 1.0), eighths(rect, R, 6, 8, 1.0)],
         _ => placeholder_commands(rect),
     }
 }
@@ -140,40 +112,22 @@ fn clipped_hatch_line(rect: SurfaceRect, offset: f32, descending: bool) -> Sprit
         }
     };
 
-    if descending {
-        let top_x = w + offset;
-        let bottom_x = offset;
-        if (0.0..=w).contains(&top_x) {
-            add_unique(&mut points, rect.min_x + top_x, rect.min_y);
-        }
-        if (0.0..=w).contains(&bottom_x) {
-            add_unique(&mut points, rect.min_x + bottom_x, rect.max_y);
-        }
-        let left_y = h * (w + offset) / w;
-        if (0.0..=h).contains(&left_y) {
-            add_unique(&mut points, rect.min_x, rect.min_y + left_y);
-        }
-        let right_y = h * offset / w;
-        if (0.0..=h).contains(&right_y) {
-            add_unique(&mut points, rect.max_x, rect.min_y + right_y);
-        }
+    let (top_x, bottom_x, left_y, right_y) = if descending {
+        (w + offset, offset, h * (w + offset) / w, h * offset / w)
     } else {
-        let top_x = offset;
-        let bottom_x = w + offset;
-        if (0.0..=w).contains(&top_x) {
-            add_unique(&mut points, rect.min_x + top_x, rect.min_y);
-        }
-        if (0.0..=w).contains(&bottom_x) {
-            add_unique(&mut points, rect.min_x + bottom_x, rect.max_y);
-        }
-        let left_y = -offset * h / w;
-        if (0.0..=h).contains(&left_y) {
-            add_unique(&mut points, rect.min_x, rect.min_y + left_y);
-        }
-        let right_y = (w - offset) * h / w;
-        if (0.0..=h).contains(&right_y) {
-            add_unique(&mut points, rect.max_x, rect.min_y + right_y);
-        }
+        (offset, w + offset, -offset * h / w, (w - offset) * h / w)
+    };
+    if (0.0..=w).contains(&top_x) {
+        add_unique(&mut points, rect.min_x + top_x, rect.min_y);
+    }
+    if (0.0..=w).contains(&bottom_x) {
+        add_unique(&mut points, rect.min_x + bottom_x, rect.max_y);
+    }
+    if (0.0..=h).contains(&left_y) {
+        add_unique(&mut points, rect.min_x, rect.min_y + left_y);
+    }
+    if (0.0..=h).contains(&right_y) {
+        add_unique(&mut points, rect.max_x, rect.min_y + right_y);
     }
 
     stroke_polyline(points, rect)
@@ -187,28 +141,9 @@ fn legacy_mixed_box_connector_commands(rect: SurfaceRect) -> Vec<SpriteCommand> 
     let v_heavy_left = rect.min_x + ((rect.width() - heavy) / 2.0).floor();
 
     vec![
-        SpriteCommand::FillRect {
-            rect: SurfaceRect::from_min_size(
-                v_heavy_left,
-                rect.min_y,
-                heavy,
-                h_light_bottom - rect.min_y,
-            ),
-            alpha: 1.0,
-        },
-        SpriteCommand::FillRect {
-            rect: SurfaceRect::from_min_size(
-                v_heavy_left,
-                h_light_top,
-                heavy,
-                rect.max_y - h_light_top,
-            ),
-            alpha: 1.0,
-        },
-        SpriteCommand::FillRect {
-            rect: SurfaceRect::from_min_size(rect.min_x, h_light_top, rect.width(), light),
-            alpha: 1.0,
-        },
+        fill_rect(v_heavy_left, rect.min_y, heavy, h_light_bottom - rect.min_y),
+        fill_rect(v_heavy_left, h_light_top, heavy, rect.max_y - h_light_top),
+        fill_rect(rect.min_x, h_light_top, rect.width(), light),
     ]
 }
 
@@ -526,15 +461,12 @@ fn fill_fractional_rect(
     width: f32,
     height: f32,
 ) -> SpriteCommand {
-    SpriteCommand::FillRect {
-        rect: SurfaceRect::from_min_size(
-            rect.min_x + rect.width() * x,
-            rect.min_y + rect.height() * y,
-            rect.width() * width,
-            rect.height() * height,
-        ),
-        alpha: 1.0,
-    }
+    fill_rect(
+        rect.min_x + rect.width() * x,
+        rect.min_y + rect.height() * y,
+        rect.width() * width,
+        rect.height() * height,
+    )
 }
 
 fn legacy_cell_diagonal_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
@@ -611,24 +543,17 @@ fn legacy_corner_diagonal_segment(
 ) -> (SpritePoint, SpritePoint) {
     let center_x = rect.min_x + rect.width() * 0.5;
     let center_y = rect.min_y + rect.height() * 0.5;
-    match corner {
-        LegacyCorner::UpperLeft => (
-            SpritePoint::new(center_x, rect.min_y),
-            SpritePoint::new(rect.min_x, center_y),
-        ),
-        LegacyCorner::UpperRight => (
-            SpritePoint::new(center_x, rect.min_y),
-            SpritePoint::new(rect.max_x, center_y),
-        ),
-        LegacyCorner::LowerLeft => (
-            SpritePoint::new(center_x, rect.max_y),
-            SpritePoint::new(rect.min_x, center_y),
-        ),
-        LegacyCorner::LowerRight => (
-            SpritePoint::new(center_x, rect.max_y),
-            SpritePoint::new(rect.max_x, center_y),
-        ),
-    }
+    let index = corner as usize;
+    let edge_y = if index < 2 { rect.min_y } else { rect.max_y };
+    let edge_x = if index.is_multiple_of(2) {
+        rect.min_x
+    } else {
+        rect.max_x
+    };
+    (
+        SpritePoint::new(center_x, edge_y),
+        SpritePoint::new(edge_x, center_y),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -645,29 +570,9 @@ enum LegacyAlignment {
 }
 
 fn legacy_alignment_point(alignment: LegacyAlignment, rect: SurfaceRect) -> SpritePoint {
-    let x = match alignment {
-        LegacyAlignment::UpperLeft | LegacyAlignment::MiddleLeft | LegacyAlignment::LowerLeft => {
-            rect.min_x
-        }
-        LegacyAlignment::UpperRight
-        | LegacyAlignment::MiddleRight
-        | LegacyAlignment::LowerRight => rect.max_x,
-        LegacyAlignment::UpperCenter
-        | LegacyAlignment::MiddleCenter
-        | LegacyAlignment::LowerCenter => rect.min_x + rect.width() * 0.5,
-    };
-    let y = match alignment {
-        LegacyAlignment::UpperLeft | LegacyAlignment::UpperCenter | LegacyAlignment::UpperRight => {
-            rect.min_y
-        }
-        LegacyAlignment::LowerLeft | LegacyAlignment::LowerCenter | LegacyAlignment::LowerRight => {
-            rect.max_y
-        }
-        LegacyAlignment::MiddleLeft
-        | LegacyAlignment::MiddleCenter
-        | LegacyAlignment::MiddleRight => rect.min_y + rect.height() * 0.5,
-    };
-
+    let index = alignment as usize;
+    let x = [rect.min_x, rect.min_x + rect.width() * 0.5, rect.max_x][index % 3];
+    let y = [rect.min_y, rect.min_y + rect.height() * 0.5, rect.max_y][index / 3];
     SpritePoint::new(x, y)
 }
 
@@ -749,54 +654,29 @@ fn sextant_commands(ch: char, rect: SurfaceRect) -> Vec<SpriteCommand> {
 
     sixel_grid_commands(pattern as u8, rect, 3, 2)
 }
-fn fill_eighth_columns(rect: SurfaceRect, start: u8, end: u8) -> SpriteCommand {
-    let column_width = rect.width() / 8.0;
+fn eighths(rect: SurfaceRect, axis: EighthAxis, start: u8, end: u8, alpha: f32) -> SpriteCommand {
+    let (x, y, width, height) = match axis {
+        EighthAxis::Columns => {
+            let eighth = rect.width() / 8.0;
+            (
+                rect.min_x + f32::from(start) * eighth,
+                rect.min_y,
+                f32::from(end - start) * eighth,
+                rect.height(),
+            )
+        }
+        EighthAxis::Rows => {
+            let eighth = rect.height() / 8.0;
+            (
+                rect.min_x,
+                rect.min_y + f32::from(start) * eighth,
+                rect.width(),
+                f32::from(end - start) * eighth,
+            )
+        }
+    };
     SpriteCommand::FillRect {
-        rect: SurfaceRect::from_min_size(
-            rect.min_x + f32::from(start) * column_width,
-            rect.min_y,
-            f32::from(end - start) * column_width,
-            rect.height(),
-        ),
-        alpha: 1.0,
-    }
-}
-
-fn fill_eighth_rows(rect: SurfaceRect, start: u8, end: u8) -> SpriteCommand {
-    let row_height = rect.height() / 8.0;
-    SpriteCommand::FillRect {
-        rect: SurfaceRect::from_min_size(
-            rect.min_x,
-            rect.min_y + f32::from(start) * row_height,
-            rect.width(),
-            f32::from(end - start) * row_height,
-        ),
-        alpha: 1.0,
-    }
-}
-
-fn shade_eighth_columns(rect: SurfaceRect, start: u8, end: u8, alpha: f32) -> SpriteCommand {
-    let column_width = rect.width() / 8.0;
-    SpriteCommand::FillRect {
-        rect: SurfaceRect::from_min_size(
-            rect.min_x + f32::from(start) * column_width,
-            rect.min_y,
-            f32::from(end - start) * column_width,
-            rect.height(),
-        ),
-        alpha,
-    }
-}
-
-fn shade_eighth_rows(rect: SurfaceRect, start: u8, end: u8, alpha: f32) -> SpriteCommand {
-    let row_height = rect.height() / 8.0;
-    SpriteCommand::FillRect {
-        rect: SurfaceRect::from_min_size(
-            rect.min_x,
-            rect.min_y + f32::from(start) * row_height,
-            rect.width(),
-            f32::from(end - start) * row_height,
-        ),
+        rect: SurfaceRect::from_min_size(x, y, width, height),
         alpha,
     }
 }
@@ -817,15 +697,12 @@ fn checkerboard_commands(rect: SurfaceRect, parity: usize) -> Vec<SpriteCommand>
             if (x + y) % 2 != parity {
                 continue;
             }
-            commands.push(SpriteCommand::FillRect {
-                rect: SurfaceRect::from_min_size(
-                    rect.min_x + x as f32 * cell_width,
-                    rect.min_y + y as f32 * cell_height,
-                    cell_width,
-                    cell_height,
-                ),
-                alpha: 1.0,
-            });
+            commands.push(fill_rect(
+                rect.min_x + x as f32 * cell_width,
+                rect.min_y + y as f32 * cell_height,
+                cell_width,
+                cell_height,
+            ));
         }
     }
 

@@ -323,7 +323,7 @@ fn a_space_update_changes_the_selected_binding_instead_of_the_first_binding() {
             [9, 8, 7],
             true,
             SpaceMuxOverride {
-                backend: Some(MultiplexerBackendConfig::Zellij),
+                backend: Some(MultiplexerBackendConfig::Rmux),
                 remote: SpaceRemoteOverride::Local,
             },
         )
@@ -346,7 +346,7 @@ fn a_space_update_changes_the_selected_binding_instead_of_the_first_binding() {
     assert_eq!(first.remote_override(), &SpaceRemoteOverride::Inherit);
     assert_eq!(
         second.backend_override(),
-        Some(MultiplexerBackendConfig::Zellij)
+        Some(MultiplexerBackendConfig::Rmux)
     );
     assert_eq!(second.remote_override(), &SpaceRemoteOverride::Local);
 }

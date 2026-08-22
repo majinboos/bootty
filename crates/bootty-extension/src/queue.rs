@@ -66,11 +66,21 @@ impl ExtensionWorkerSender {
 }
 
 impl ExtensionWorkerReceiver {
-    pub(crate) fn recv_timeout(
+    pub(crate) fn recv_until(
         &self,
-        timeout: Duration,
-    ) -> Result<ExtensionWorkerMessage, mpsc::RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
+        deadline: Option<Instant>,
+    ) -> Result<Option<ExtensionWorkerMessage>, mpsc::RecvError> {
+        let Some(deadline) = deadline else {
+            return self.receiver.recv().map(Some);
+        };
+        match self
+            .receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            Ok(message) => Ok(Some(message)),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+        }
     }
 
     pub(crate) fn drain_shutdown(&self) {

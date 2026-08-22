@@ -1,17 +1,26 @@
 use std::{fs, io, path::Path};
 
 use bootty_write::{CommitOutcome, NewFileMode, ResolveTargetError, WriteTarget};
-use toml_edit::{Array, DocumentMut, InlineTable, Value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
-use super::load::{ConfigDocument, ConfigLoadError, ConfigResult, load_or_create_config_document};
-use super::model::{
-    SegmentAlign, SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment,
+use super::load::{
+    ConfigDocument, ConfigLoadError, ConfigResult, load_or_create_config_document,
+    validate_config_document,
 };
+use super::model::BoottyConfig;
+use super::model::{SegmentAlign, SshProfileConfig, StatusSegment};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigWriteOutcome {
     Confirmed,
     CommittedWithDurabilityWarning(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct AcceptedConfigDocument {
+    pub config: BoottyConfig,
+    pub document: ConfigDocument,
+    pub write_outcome: ConfigWriteOutcome,
 }
 
 impl ConfigWriteOutcome {
@@ -81,59 +90,16 @@ impl ConfigDocument {
 
     pub fn set_ssh_profile(&mut self, id: &str, profile: &SshProfileConfig) -> ConfigResult<()> {
         self.remove_ssh_profile(id)?;
-        let root = ["ssh-profiles", id];
-        self.set_item(&[root[0], root[1], "name"], toml_edit::value(&profile.name))?;
-        self.set_item(&[root[0], root[1], "host"], toml_edit::value(&profile.host))?;
-        if let Some(user) = &profile.user {
-            self.set_item(&[root[0], root[1], "user"], toml_edit::value(user))?;
-        }
-        if let Some(port) = profile.port {
-            self.set_item(
-                &[root[0], root[1], "port"],
-                toml_edit::value(i64::from(port)),
-            )?;
-        }
-        let authentication = match profile.authentication {
-            SshAuthenticationConfig::Auto => "auto",
-            SshAuthenticationConfig::Agent => "agent",
-            SshAuthenticationConfig::KeyFile => "key-file",
-        };
-        self.set_item(
-            &[root[0], root[1], "authentication"],
-            toml_edit::value(authentication),
-        )?;
-        let host_key_policy = match profile.host_key_policy {
-            SshHostKeyPolicyConfig::Strict => "strict",
-            SshHostKeyPolicyConfig::AcceptNew => "accept-new",
-        };
-        self.set_item(
-            &[root[0], root[1], "host-key-policy"],
-            toml_edit::value(host_key_policy),
-        )?;
-        if let Some(identity_file) = &profile.identity_file {
-            self.set_item(
-                &[root[0], root[1], "identity-file"],
-                toml_edit::value(identity_file.display().to_string()),
-            )?;
-        }
-        if let Some(proxy_jump) = &profile.proxy_jump {
-            self.set_item(
-                &[root[0], root[1], "proxy-jump"],
-                toml_edit::value(proxy_jump),
-            )?;
+        let mut serialized = toml_edit::ser::to_document(profile).map_err(|error| {
+            ConfigLoadError::new(format!("failed to serialize SSH profile {id:?}: {error}"))
+        })?;
+        if profile.args.is_empty() {
+            serialized.remove("args");
         }
         self.set_item(
-            &[root[0], root[1], "program"],
-            toml_edit::value(&profile.program),
-        )?;
-        if !profile.args.is_empty() {
-            let mut args = Array::new();
-            for arg in &profile.args {
-                args.push(arg.as_str());
-            }
-            self.set_item(&[root[0], root[1], "args"], toml_edit::value(args))?;
-        }
-        Ok(())
+            &["ssh-profiles", id],
+            Item::Table(serialized.as_table().clone()),
+        )
     }
 
     pub fn remove_ssh_profile(&mut self, id: &str) -> ConfigResult<()> {
@@ -187,12 +153,58 @@ pub fn update_config_document(
         fs::create_dir_all(parent)
             .map_err(|error| write_error(requested_path, "prepare", error))?;
     }
-    let target = resolve_config_target(requested_path)?;
-    let target = target
-        .lock()
-        .map_err(|error| write_error(requested_path, "claim writer lease", error))?;
+    let target = lock_config_target(requested_path)?;
     let mut document = load_or_create_config_document(requested_path)?;
     mutate(&mut document)?;
+    replace_locked_document(requested_path, &target, document).map(|(_, outcome)| outcome)
+}
+
+/// Validate and atomically replace a complete editable config document.
+///
+/// Resolution, including includes and referenced themes, and the caller's application-specific
+/// validation finish before the first byte is replaced. On failure both the caller's accepted
+/// config and the file remain unchanged. The validator may return prepared publication state.
+pub fn commit_config_document<T>(
+    path: impl AsRef<Path>,
+    document: ConfigDocument,
+    validate: impl FnOnce(&BoottyConfig) -> Result<T, String>,
+) -> ConfigResult<(AcceptedConfigDocument, T)> {
+    let requested_path = path.as_ref();
+    if let Some(parent) = requested_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .map_err(|error| write_error(requested_path, "prepare", error))?;
+    }
+    let target = lock_config_target(requested_path)?;
+    commit_locked_document(requested_path, &target, document, validate)
+}
+
+fn commit_locked_document<T>(
+    requested_path: &Path,
+    target: &bootty_write::LockedWriteTarget,
+    document: ConfigDocument,
+    validate: impl FnOnce(&BoottyConfig) -> Result<T, String>,
+) -> ConfigResult<(AcceptedConfigDocument, T)> {
+    let config = validate_config_document(requested_path, &document)?;
+    let validated = validate(&config).map_err(ConfigLoadError::new)?;
+    let (document, write_outcome) = replace_locked_document(requested_path, target, document)?;
+    Ok((
+        AcceptedConfigDocument {
+            config,
+            document,
+            write_outcome,
+        },
+        validated,
+    ))
+}
+
+fn replace_locked_document(
+    requested_path: &Path,
+    target: &bootty_write::LockedWriteTarget,
+    document: ConfigDocument,
+) -> ConfigResult<(ConfigDocument, ConfigWriteOutcome)> {
     let source = document.document.to_string();
     source.parse::<DocumentMut>().map_err(|error| {
         ConfigLoadError::new(format!(
@@ -200,14 +212,13 @@ pub fn update_config_document(
             requested_path.display()
         ))
     })?;
-
     let outcome = target
         .replace(source.as_bytes(), NewFileMode::Private)
         .map_err(|error| {
             let phase = error.phase();
             write_error(requested_path, phase, error.into_io())
         })?;
-    Ok(match outcome {
+    let write_outcome = match outcome {
         CommitOutcome::Confirmed => ConfigWriteOutcome::Confirmed,
         CommitOutcome::CommittedWithDurabilityWarning(error) => {
             ConfigWriteOutcome::CommittedWithDurabilityWarning(format!(
@@ -215,7 +226,8 @@ pub fn update_config_document(
                 requested_path.display()
             ))
         }
-    })
+    };
+    Ok((document, write_outcome))
 }
 
 pub fn write_font_size_preference(
@@ -235,6 +247,12 @@ fn resolve_config_target(path: &Path) -> ConfigResult<WriteTarget> {
         };
         write_error(path, "resolve target", error)
     })
+}
+
+fn lock_config_target(path: &Path) -> ConfigResult<bootty_write::LockedWriteTarget> {
+    resolve_config_target(path)?
+        .lock()
+        .map_err(|error| write_error(path, "claim writer lease", error))
 }
 
 fn write_error(path: &Path, phase: &str, error: impl std::fmt::Display) -> ConfigLoadError {

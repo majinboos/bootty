@@ -149,7 +149,6 @@ impl AppState {
         let surface = self.terminal_surface;
         let view = self.terminal_view_transform;
         let input_focus = self.input_focus;
-        let chrome_handle_rects = self.chrome_handle_rects.clone();
         let outcome = self.terminal_interaction.handle_egui_input(
             &mut self.workspace.active.binding.terminal,
             TerminalInteractionInput {
@@ -160,16 +159,13 @@ impl AppState {
                 terminal_input_enabled,
                 surface,
                 view,
-                chrome_handle_rects: &chrome_handle_rects,
+                chrome_handle_rects: &self.chrome_handle_rects,
                 copy_on_select,
             },
         );
         let count = outcome.handled_count;
-        if let Some(error) = outcome.last_error {
-            self.last_error = Some(error);
-        }
         effects.extend(outcome.effects);
-        self.apply_terminal_focus_intent(outcome.focus_intent);
+        self.apply_terminal_outcome(outcome.last_error, outcome.focus_intent);
 
         let mut events = outcome.events;
         // `cmd+shift+,` over a palette row jumps to that command's keybinding editor.
@@ -290,28 +286,22 @@ impl AppState {
             );
             copy_mode_active = interaction.copy_mode_active;
             effects.extend(interaction.effects);
-            if let Some(error) = interaction.last_error {
-                self.last_error = Some(error);
-            }
-            self.apply_terminal_focus_intent(interaction.focus_intent);
+            self.apply_terminal_outcome(interaction.last_error, interaction.focus_intent);
             if interaction.consumed {
                 continue;
             }
-            if let Some(invocation) = self.config_runtime.invocation_for_input(input) {
+            if let Some(invocation) = self
+                .config_runtime
+                .invocation_for_input(input)
+                .or_else(|| builtin_app_invocation_for_direct_key(input))
+            {
                 if invocation.command == "paste_from_clipboard" {
                     self.terminal_interaction.mark_paste_suppression();
                 }
                 let _ = self.dispatch_command(invocation, viewport, effects);
                 continue;
             }
-            if let Some(invocation) = builtin_app_invocation_for_direct_key(input) {
-                self.dispatch_command(invocation, viewport, effects);
-                continue;
-            }
-            if copy_mode_active {
-                continue;
-            }
-            if input.mods.command {
+            if copy_mode_active || input.mods.command {
                 continue;
             }
             self.apply_terminal_input(TerminalInputCommand::Key(input), effects);
@@ -328,9 +318,8 @@ impl AppState {
             return 0;
         }
         self.ensure_sidebar_hovered_session();
-        let mut count = 0;
+        let count = events.len();
         for event in events {
-            count += 1;
             let egui::Event::Key {
                 key,
                 pressed: true,
@@ -359,7 +348,12 @@ impl AppState {
         true
     }
     fn ensure_sidebar_hovered_session(&mut self) {
-        if self.sidebar_hovered_index().is_some() {
+        let targets = self.session_navigation_targets();
+        if self
+            .sidebar_hovered_session
+            .as_ref()
+            .is_some_and(|hovered| targets.contains(hovered))
+        {
             return;
         }
         self.sidebar_hovered_session = self
@@ -369,12 +363,16 @@ impl AppState {
             .mux
             .selected_session()
             .and_then(|selected| self.session_target_matching(selected))
-            .or_else(|| self.session_navigation_targets().into_iter().next());
+            .or_else(|| targets.into_iter().next());
     }
     fn move_sidebar_hover(&mut self, delta: isize) {
         self.ensure_sidebar_hovered_session();
         let targets = self.session_navigation_targets();
-        let Some(current) = self.sidebar_hovered_index() else {
+        let Some(current) = self
+            .sidebar_hovered_session
+            .as_ref()
+            .and_then(|hovered| targets.iter().position(|target| target == hovered))
+        else {
             return;
         };
         let next = (current as isize + delta).rem_euclid(targets.len() as isize) as usize;
@@ -388,12 +386,6 @@ impl AppState {
             .is_some_and(|target| self.activate_scoped_session_from_ui(&target));
         self.input_focus = InputFocus::Terminal;
         activated
-    }
-    fn sidebar_hovered_index(&self) -> Option<usize> {
-        let hovered = self.sidebar_hovered_session.as_ref()?;
-        self.session_navigation_targets()
-            .iter()
-            .position(|target| target == hovered)
     }
     pub(super) fn session_navigation_targets(&self) -> Vec<ScopedSessionTarget> {
         self.binding_session_groups()
@@ -421,56 +413,22 @@ impl AppState {
         command: TerminalInputCommand,
         effects: &mut Vec<AppEffect>,
     ) {
-        match command {
-            TerminalInputCommand::Text(text) => {
-                if let Err(error) = self
-                    .workspace
-                    .active
-                    .binding
-                    .terminal
-                    .write_input(text.as_bytes())
-                {
-                    self.last_error = Some(error.to_string());
-                } else {
-                    self.hide_mouse_pointer_for_terminal_typing(effects);
-                }
-            }
-            TerminalInputCommand::Paste(text) => {
-                if let Err(error) = self.workspace.active.binding.terminal.write_paste(&text) {
-                    self.last_error = Some(error.to_string());
-                }
-            }
-            TerminalInputCommand::Focus(focused) => {
-                if let Err(error) = self.workspace.active.binding.terminal.encode_focus(focused) {
-                    self.last_error = Some(error.to_string());
-                }
-            }
-            TerminalInputCommand::Key(input) => {
-                if let Err(error) = self.workspace.active.binding.terminal.encode_key(input) {
-                    self.last_error = Some(error.to_string());
-                } else {
-                    self.hide_mouse_pointer_for_terminal_typing(effects);
-                }
-            }
-            TerminalInputCommand::Mouse(input) => {
-                if let Err(error) = self.workspace.active.binding.terminal.encode_mouse(input) {
-                    self.last_error = Some(error.to_string());
-                }
-            }
+        let terminal = &mut self.workspace.active.binding.terminal;
+        let (result, hides_pointer) = match command {
+            TerminalInputCommand::Text(text) => (terminal.write_input(text.as_bytes()), true),
+            TerminalInputCommand::Paste(text) => (terminal.write_paste(&text), false),
+            TerminalInputCommand::Focus(focused) => (terminal.encode_focus(focused), false),
+            TerminalInputCommand::Key(input) => (terminal.encode_key(input), true),
+            TerminalInputCommand::Mouse(input) => (terminal.encode_mouse(input), false),
             TerminalInputCommand::MouseWheel {
                 input,
                 scroll_delta,
-            } => {
-                if let Err(error) = self
-                    .workspace
-                    .active
-                    .binding
-                    .terminal
-                    .handle_mouse_wheel(input, scroll_delta)
-                {
-                    self.last_error = Some(error.to_string());
-                }
-            }
+            } => (terminal.handle_mouse_wheel(input, scroll_delta), false),
+        };
+        if let Err(error) = result {
+            self.last_error = Some(error.to_string());
+        } else if hides_pointer {
+            self.hide_mouse_pointer_for_terminal_typing(effects);
         }
     }
 }
@@ -519,9 +477,6 @@ fn event_is_terminal_pointer(event: &egui::Event) -> bool {
 }
 
 fn local_file_handoff(paths: &[PathBuf]) -> LocalFileHandoff {
-    if paths.is_empty() {
-        return LocalFileHandoff::Rejected("file handoff ignored: no local files");
-    }
     if paths.iter().any(|path| !path.exists()) {
         return LocalFileHandoff::Rejected("file handoff rejected: local path is unavailable");
     }

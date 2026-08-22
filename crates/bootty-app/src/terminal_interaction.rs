@@ -119,12 +119,13 @@ impl TerminalInteractionRuntime {
         &self,
         action: &crate::app_actions::TerminalFindAction,
     ) -> bool {
-        match action {
-            crate::app_actions::TerminalFindAction::Prompt => true,
-            crate::app_actions::TerminalFindAction::Previous
-            | crate::app_actions::TerminalFindAction::Next => self.last_search.is_empty(),
-            _ => false,
-        }
+        matches!(action, crate::app_actions::TerminalFindAction::Prompt)
+            || self.last_search.is_empty()
+                && matches!(
+                    action,
+                    crate::app_actions::TerminalFindAction::Previous
+                        | crate::app_actions::TerminalFindAction::Next
+                )
     }
 
     pub(super) fn apply_find_event(
@@ -197,12 +198,10 @@ impl TerminalInteractionRuntime {
             crate::app_actions::TerminalFindAction::Prompt => {
                 outcome.focus_intent =
                     self.open_find(terminal, TerminalSearchDirection::Next, focused_pane_id);
-                outcome.effects.push(AppEffect::RequestRepaint);
             }
             crate::app_actions::TerminalFindAction::Close => {
                 self.clear_find_search(terminal);
                 outcome.focus_intent = TerminalFocusIntent::Terminal;
-                outcome.effects.push(AppEffect::RequestRepaint);
             }
             crate::app_actions::TerminalFindAction::Search(query) => {
                 self.search_terminal(
@@ -211,50 +210,36 @@ impl TerminalInteractionRuntime {
                     &query,
                     TerminalSearchDirection::Current,
                 );
-                outcome.effects.push(AppEffect::RequestRepaint);
             }
             crate::app_actions::TerminalFindAction::SearchSelection => {
-                if let Some(query) = self.selected_terminal_text(terminal) {
-                    self.search_terminal(
-                        terminal,
-                        focused_pane_id,
-                        &query,
-                        TerminalSearchDirection::Current,
-                    );
-                    outcome.effects.push(AppEffect::RequestRepaint);
-                }
+                let Some(query) = self.selected_terminal_text(terminal) else {
+                    return self.finish(outcome);
+                };
+                self.search_terminal(
+                    terminal,
+                    focused_pane_id,
+                    &query,
+                    TerminalSearchDirection::Current,
+                );
             }
-            crate::app_actions::TerminalFindAction::Previous => {
+            action @ (crate::app_actions::TerminalFindAction::Previous
+            | crate::app_actions::TerminalFindAction::Next) => {
+                let direction =
+                    if matches!(action, crate::app_actions::TerminalFindAction::Previous) {
+                        TerminalSearchDirection::Previous
+                    } else {
+                        TerminalSearchDirection::Next
+                    };
                 let query = self.last_search.clone();
                 if query.is_empty() {
                     outcome.focus_intent =
                         self.open_find(terminal, TerminalSearchDirection::Next, focused_pane_id);
                 } else {
-                    self.search_terminal(
-                        terminal,
-                        focused_pane_id,
-                        &query,
-                        TerminalSearchDirection::Previous,
-                    );
+                    self.search_terminal(terminal, focused_pane_id, &query, direction);
                 }
-                outcome.effects.push(AppEffect::RequestRepaint);
-            }
-            crate::app_actions::TerminalFindAction::Next => {
-                let query = self.last_search.clone();
-                if query.is_empty() {
-                    outcome.focus_intent =
-                        self.open_find(terminal, TerminalSearchDirection::Next, focused_pane_id);
-                } else {
-                    self.search_terminal(
-                        terminal,
-                        focused_pane_id,
-                        &query,
-                        TerminalSearchDirection::Next,
-                    );
-                }
-                outcome.effects.push(AppEffect::RequestRepaint);
             }
         }
+        outcome.effects.push(AppEffect::RequestRepaint);
         self.finish(outcome)
     }
 
@@ -641,14 +626,13 @@ impl TerminalInteractionRuntime {
         let result = (|| -> Result<bool> {
             let mut selection = |format| terminal.format_selection(format);
             match format {
-                CopyToClipboard::Plain => {
-                    let Some(bytes) = selection(TerminalSelectionFormat::PlainText)? else {
-                        return Ok(false);
+                format @ (CopyToClipboard::Plain | CopyToClipboard::Vt) => {
+                    let selection_format = match format {
+                        CopyToClipboard::Plain => TerminalSelectionFormat::PlainText,
+                        CopyToClipboard::Vt => TerminalSelectionFormat::Vt,
+                        _ => unreachable!(),
                     };
-                    write_clipboard_text(&String::from_utf8_lossy(&bytes))?;
-                }
-                CopyToClipboard::Vt => {
-                    let Some(bytes) = selection(TerminalSelectionFormat::Vt)? else {
+                    let Some(bytes) = selection(selection_format)? else {
                         return Ok(false);
                     };
                     write_clipboard_text(&String::from_utf8_lossy(&bytes))?;
@@ -752,29 +736,13 @@ impl TerminalInteractionRuntime {
         if let Some(pane_id) = focused_pane_id
             && let Some(source) = terminal.focused_terminal_runtime(pane_id)
         {
-            return match source.search_viewport(query, direction).and_then(|found| {
-                source.extract_frame().map(|frame| TerminalFindResult {
-                    found,
-                    active_index: frame.active_search_match_index,
-                    match_count: frame.search_match_count,
-                })
-            }) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.record_error(error);
-                    TerminalFindResult::default()
-                }
-            };
+            return self.resolve_find_result(search_runtime(source, query, direction));
         }
-        match terminal
-            .search_viewport(query, direction)
-            .and_then(|found| {
-                terminal.extract_frame().map(|frame| TerminalFindResult {
-                    found,
-                    active_index: frame.active_search_match_index,
-                    match_count: frame.search_match_count,
-                })
-            }) {
+        self.resolve_find_result(search_runtime(terminal, query, direction))
+    }
+
+    fn resolve_find_result(&mut self, result: Result<TerminalFindResult>) -> TerminalFindResult {
+        match result {
             Ok(result) => result,
             Err(error) => {
                 self.record_error(error);
@@ -842,13 +810,9 @@ impl TerminalInteractionRuntime {
         self.last_error = Some(error.to_string());
     }
 
-    fn take_last_error(&mut self) -> Option<String> {
-        self.last_error.take()
-    }
-
     fn finish(&mut self, mut outcome: TerminalInteractionOutcome) -> TerminalInteractionOutcome {
-        outcome.last_error = self.take_last_error();
-        let focus_intent = self.take_focus_intent();
+        let (last_error, focus_intent) = self.take_operation_state();
+        outcome.last_error = last_error;
         if focus_intent != TerminalFocusIntent::None {
             outcome.focus_intent = focus_intent;
         }
@@ -859,24 +823,37 @@ impl TerminalInteractionRuntime {
         &mut self,
         mut outcome: TerminalDirectInputOutcome,
     ) -> TerminalDirectInputOutcome {
-        outcome.last_error = self.take_last_error();
-        outcome.focus_intent = self.take_focus_intent();
+        (outcome.last_error, outcome.focus_intent) = self.take_operation_state();
         outcome
     }
 
-    fn take_focus_intent(&mut self) -> TerminalFocusIntent {
-        std::mem::take(&mut self.pending_focus_intent)
+    fn take_operation_state(&mut self) -> (Option<String>, TerminalFocusIntent) {
+        (
+            self.last_error.take(),
+            std::mem::take(&mut self.pending_focus_intent),
+        )
     }
 }
 
-fn remove_first_paste_event(events: &mut Vec<egui::Event>) -> bool {
+fn search_runtime(
+    terminal: &mut dyn TerminalRuntime,
+    query: &str,
+    direction: TerminalSearchDirection,
+) -> Result<TerminalFindResult> {
+    let found = terminal.search_viewport(query, direction)?;
+    let frame = terminal.extract_frame()?;
+    Ok(TerminalFindResult {
+        found,
+        active_index: frame.active_search_match_index,
+        match_count: frame.search_match_count,
+    })
+}
+
+fn remove_first_paste_event(events: &mut Vec<egui::Event>) {
     if let Some(index) = events
         .iter()
         .position(|event| matches!(event, egui::Event::Paste(_)))
     {
         events.remove(index);
-        true
-    } else {
-        false
     }
 }

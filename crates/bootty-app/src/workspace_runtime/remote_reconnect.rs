@@ -45,11 +45,24 @@ pub(super) struct BindingReconnect {
 }
 
 impl BindingRuntime {
+    fn schedule_reattach(
+        &mut self,
+        now: Instant,
+        attached_for: Option<Duration>,
+        error: impl FnOnce(&str, u32) -> String,
+    ) -> bool {
+        let Some(remote) = self.multiplexer.remote.as_ref() else {
+            return false;
+        };
+        let reattach = RemoteReattach::after_failure(self.reconnect.pending, attached_for, now);
+        self.mux
+            .set_availability_error(Some(error(&remote.host, reattach.attempts)));
+        self.reconnect.pending = Some(reattach);
+        true
+    }
+
     /// Returns `true` when the caller must close the local attach pane.
     pub(super) fn handle_attach_client_exit(&mut self, now: Instant) -> bool {
-        let Some(remote) = self.multiplexer.remote.as_ref() else {
-            return true;
-        };
         if self
             .reconnect
             .pending
@@ -61,27 +74,15 @@ impl BindingRuntime {
             .reconnect
             .attach_started
             .map(|started| now.saturating_duration_since(started));
-        let reattach = RemoteReattach::after_failure(self.reconnect.pending, attached_for, now);
-        let error = format!(
-            "lost the connection to {}; reconnecting (attempt {})",
-            remote.host, reattach.attempts
-        );
-        self.mux.set_availability_error(Some(error));
-        self.reconnect.pending = Some(reattach);
-        false
+        !self.schedule_reattach(now, attached_for, |host, attempts| {
+            format!("lost the connection to {host}; reconnecting (attempt {attempts})")
+        })
     }
 
     pub(super) fn handle_attach_start_failure(&mut self, now: Instant, detail: &str) {
-        let Some(remote) = self.multiplexer.remote.as_ref() else {
-            return;
-        };
-        let reattach = RemoteReattach::after_failure(self.reconnect.pending, None, now);
-        let error = format!(
-            "could not connect to {}: {detail}; reconnecting (attempt {})",
-            remote.host, reattach.attempts
-        );
-        self.mux.set_availability_error(Some(error));
-        self.reconnect.pending = Some(reattach);
+        self.schedule_reattach(now, None, |host, attempts| {
+            format!("could not connect to {host}: {detail}; reconnecting (attempt {attempts})")
+        });
     }
 
     pub(super) fn resolve_attach_exit_after_refresh(&mut self, refresh_applied: bool) {

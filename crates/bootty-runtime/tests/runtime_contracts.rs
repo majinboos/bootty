@@ -5,8 +5,8 @@ use std::{sync::Arc, thread, time::Instant};
 #[cfg(unix)]
 use bootty_runtime::frame_source::TerminalFrameSource;
 use bootty_runtime::{
-    BenchmarkTrace, PtyBacklog, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
-    TraceValue, drain_pty_backlog,
+    BenchmarkTrace, OutputBacklog, SessionLaunchConfig, TerminalSession, TerminalSessionConfig,
+    TraceValue, drain_output_backlog, drain_output_backlog_with_limits,
     geometry::TerminalGeometry,
     perf::{guard_frame_path, record_subprocess},
     scheduler::{RepaintScheduler, RepaintSignal},
@@ -70,18 +70,44 @@ fn benchmark_trace_writes_sampled_json_lines() {
 }
 
 #[test]
-fn pty_backlog_drains_complete_chunks_in_order() {
-    let mut backlog = PtyBacklog::new();
+fn output_backlog_drains_complete_chunks_in_order() {
+    let mut backlog = OutputBacklog::new();
+    backlog.push_back(Vec::new());
     backlog.push_back(b"first".to_vec());
     backlog.push_back(b"second".to_vec());
     let mut output = Vec::new();
 
-    let stats = drain_pty_backlog(&mut backlog, |bytes| output.extend_from_slice(bytes));
+    let stats = drain_output_backlog(&mut backlog, |bytes| output.extend_from_slice(bytes));
 
     assert_eq!(output, b"firstsecond");
     assert_eq!(stats.bytes, output.len());
     assert_eq!(stats.chunks, 2);
     assert!(backlog.is_empty());
+}
+
+#[test]
+fn output_backlog_preserves_partial_chunks_at_custom_limits() {
+    let mut backlog = OutputBacklog::new();
+    backlog.push_back(vec![b'a'; 9_000]);
+    backlog.push_back(b"tail".to_vec());
+    let mut output = Vec::new();
+
+    let stats = drain_output_backlog_with_limits(&mut backlog, 9_000, 2, u128::MAX, |bytes| {
+        output.extend_from_slice(bytes)
+    });
+
+    assert_eq!(stats.bytes, 9_000);
+    assert_eq!(stats.chunks, 2);
+    assert_eq!(backlog.len(), 4);
+    assert!(output.iter().all(|byte| *byte == b'a'));
+
+    let stats = drain_output_backlog_with_limits(&mut backlog, usize::MAX, 1, u128::MAX, |bytes| {
+        output.extend_from_slice(bytes)
+    });
+    assert_eq!(stats.bytes, 4);
+    assert_eq!(stats.chunks, 1);
+    assert!(backlog.is_empty());
+    assert_eq!(&output[9_000..], b"tail");
 }
 
 #[test]
@@ -93,13 +119,13 @@ fn bounded_pty_drain_preserves_split_synchronized_output_control() {
         cell_height: 16,
     };
     let mut engine = TerminalEngine::new(geometry).expect("terminal engine");
-    let mut backlog = PtyBacklog::new();
+    let mut backlog = OutputBacklog::new();
     let mut bytes = vec![b'x'; 8191];
     bytes.extend_from_slice(b"\x1b[?2026h");
     backlog.push_back(bytes);
     let mut slices = Vec::new();
 
-    let stats = drain_pty_backlog(&mut backlog, |slice| {
+    let stats = drain_output_backlog(&mut backlog, |slice| {
         slices.push(slice.to_vec());
         engine.write_vt(slice);
     });
@@ -125,11 +151,11 @@ fn completed_synchronized_output_batch_suppresses_intermediate_publish() {
         cell_height: 16,
     };
     let mut engine = TerminalEngine::new(geometry).expect("terminal engine");
-    let mut backlog = PtyBacklog::new();
+    let mut backlog = OutputBacklog::new();
     backlog.push_back(b"\x1b[?2026hredraw\x1b[?2026l".to_vec());
     let mut observed = false;
 
-    let stats = drain_pty_backlog(&mut backlog, |slice| {
+    let stats = drain_output_backlog(&mut backlog, |slice| {
         engine.write_vt(slice);
         observed |= engine.take_synchronized_output_observed();
     });

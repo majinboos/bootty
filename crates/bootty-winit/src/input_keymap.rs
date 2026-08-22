@@ -25,13 +25,9 @@ pub fn key_mods_from_egui_modifiers(modifiers: egui::Modifiers) -> KeyMods {
 }
 
 pub fn mouse_mods_from_egui_modifiers(modifiers: egui::Modifiers) -> KeyMods {
-    KeyMods {
-        shift: modifiers.shift,
-        alt: modifiers.alt,
-        ctrl: modifiers.ctrl,
-        command: false,
-        ..Default::default()
-    }
+    let mut mods = key_mods_from_egui_modifiers(modifiers);
+    mods.command = false;
+    mods
 }
 
 pub fn key_mods_from_winit_modifiers(modifiers: ModifiersState) -> KeyMods {
@@ -156,15 +152,12 @@ pub fn bare_terminal_key_input_with_sides_and_remaps(
 
 #[cfg(feature = "bare-host")]
 pub fn bare_terminal_paste_shortcut(code: KeyCode, modifiers: ModifiersState) -> bool {
-    if code != KeyCode::KeyV {
-        return false;
-    }
     let platform_paste = if cfg!(target_os = "macos") {
         modifiers.super_key()
     } else {
         modifiers.control_key()
     };
-    platform_paste && !modifiers.alt_key()
+    code == KeyCode::KeyV && platform_paste && !modifiers.alt_key()
 }
 
 pub fn bare_terminal_key_input_with_sides(
@@ -351,17 +344,8 @@ fn mouse_input_from_surface_clamped_point(
         x: pos.x.clamp(surface.rect.min_x, surface.rect.max_x),
         y: pos.y.clamp(surface.rect.min_y, surface.rect.max_y),
     };
-    let position = surface
-        .mouse_position(clamped)
-        .expect("clamped mouse position is inside the terminal surface");
-    MouseInput {
-        action,
-        button,
-        mods,
-        x: position.x,
-        y: position.y,
-        size: surface.mouse_metrics().into(),
-    }
+    mouse_input_from_surface_point(clamped, action, button, mods, surface)
+        .expect("clamped mouse position is inside the terminal surface")
 }
 
 pub fn mouse_input_from_surface_clamped_with_view(
@@ -438,12 +422,10 @@ pub fn key_unshifted(key: TerminalKey) -> Option<char> {
 }
 
 pub fn mouse_wheel_button_from_delta_y(delta_y: f32) -> Option<MouseButton> {
-    if delta_y > 0.0 {
-        Some(MouseButton::Four)
-    } else if delta_y < 0.0 {
-        Some(MouseButton::Five)
-    } else {
-        None
+    match delta_y.partial_cmp(&0.0) {
+        Some(std::cmp::Ordering::Greater) => Some(MouseButton::Four),
+        Some(std::cmp::Ordering::Less) => Some(MouseButton::Five),
+        Some(std::cmp::Ordering::Equal) | None => None,
     }
 }
 

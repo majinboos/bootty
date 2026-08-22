@@ -23,6 +23,8 @@ pub struct ListRow {
     /// Optional dim description rendered under the primary label (needs a taller
     /// [`ListView::row_height`]).
     pub secondary: Option<String>,
+    /// Override the secondary label color.
+    pub secondary_tint: Option<Color32>,
     /// Character indices in the secondary label that matched the active fuzzy query.
     pub secondary_matches: Vec<usize>,
     /// Optional right-aligned secondary label.
@@ -33,6 +35,8 @@ pub struct ListRow {
     pub trailing_keybind: Option<String>,
     /// Marks the active/current entry: accent bar + primary tint.
     pub current: bool,
+    /// Override the selected row's accent bar color.
+    pub selection_tint: Option<Color32>,
     /// Non-selectable section heading row.
     pub section: bool,
 }
@@ -219,15 +223,18 @@ fn paint_row(
     if let Some(background) = background {
         painter.rect_filled(rect, 0.0, background);
     }
-    if row.current {
+    let indicator_tint = if selected { row.selection_tint } else { None }
+        .or_else(|| row.current.then_some(palette.primary));
+    if let Some(tint) = indicator_tint {
         painter.rect_filled(
             Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height())),
             0.0,
-            palette.primary,
+            tint,
         );
     }
 
     let row_background = background.unwrap_or(palette.pane);
+    let match_color = readable_color(row_background, palette.warning);
     let text_color = readable_color(
         row_background,
         if row.current {
@@ -267,7 +274,7 @@ fn paint_row(
             matches: &row.primary_matches,
             font: FontId::monospace(13.0),
             color: row.primary_tint.unwrap_or(text_color),
-            match_color: readable_color(row_background, palette.warning),
+            match_color,
         },
     );
     if let Some(secondary) = &row.secondary {
@@ -279,8 +286,10 @@ fn paint_row(
                 text: secondary,
                 matches: &row.secondary_matches,
                 font: FontId::monospace(11.0),
-                color: readable_color(row_background, palette.muted),
-                match_color: readable_color(row_background, palette.warning),
+                color: row
+                    .secondary_tint
+                    .unwrap_or_else(|| readable_color(row_background, palette.muted)),
+                match_color,
             },
         );
     }
@@ -302,7 +311,7 @@ fn paint_row(
                 matches: &row.trailing_matches,
                 font: FontId::monospace(12.0),
                 color: readable_color(row_background, palette.muted),
-                match_color: readable_color(row_background, palette.warning),
+                match_color,
             },
         );
     }
@@ -323,14 +332,9 @@ fn paint_highlighted_text(painter: &egui::Painter, text: HighlightedText<'_>) {
         painter.text(text.pos, text.align, text.text, text.font, text.color);
         return;
     }
-    let matched = text
-        .matches
-        .iter()
-        .copied()
-        .collect::<std::collections::HashSet<_>>();
     let mut job = egui::text::LayoutJob::default();
     for (index, ch) in text.text.chars().enumerate() {
-        let color = if matched.contains(&index) {
+        let color = if text.matches.contains(&index) {
             text.match_color
         } else {
             text.color
@@ -379,40 +383,27 @@ fn pointer_moved_since_last_frame(
 }
 
 fn selectable_selection_after_nav(
-    selected: usize,
+    mut selected: usize,
     rows: &[ListRow],
     next: bool,
     previous: bool,
 ) -> usize {
-    let selectable = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, row)| (!row.section).then_some(index))
-        .collect::<Vec<_>>();
-    let Some(position) = selectable.iter().position(|&index| index == selected) else {
-        return selectable.first().copied().unwrap_or(0);
+    let Some(_) = rows.get(selected).filter(|row| !row.section) else {
+        return rows.iter().position(|row| !row.section).unwrap_or(0);
     };
-    let position = selection_after_nav(position, selectable.len(), next, previous);
-    selectable[position]
-}
-
-/// Move the selection one row for a down/up press, clamped to the list (no wrap).
-#[must_use]
-pub(super) fn selection_after_nav(
-    selected: usize,
-    len: usize,
-    next: bool,
-    previous: bool,
-) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let mut selected = selected.min(len - 1);
     if next {
-        selected = (selected + 1).min(len - 1);
+        selected = rows
+            .iter()
+            .enumerate()
+            .skip(selected + 1)
+            .find(|(_, row)| !row.section)
+            .map_or(selected, |(index, _)| index);
     }
     if previous {
-        selected = selected.saturating_sub(1);
+        selected = rows[..selected]
+            .iter()
+            .rposition(|row| !row.section)
+            .unwrap_or(selected);
     }
     selected
 }

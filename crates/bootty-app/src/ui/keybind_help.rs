@@ -14,12 +14,6 @@ pub struct KeybindHelpDialog {
     focus_filter: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum KeybindHelpEvent {
-    None,
-    Close,
-}
-
 impl KeybindHelpDialog {
     /// Build from the raw `chord=action` binding strings the config resolves for
     /// the active backend.
@@ -37,7 +31,7 @@ impl KeybindHelpDialog {
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> KeybindHelpEvent {
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> bool {
         let matches = filtered(&self.bindings, &self.filter);
         self.selected = overlay::clamp_selection(self.selected, matches.len());
         let rows: Vec<ListRow> = matches
@@ -80,11 +74,7 @@ impl KeybindHelpDialog {
                 self.selected = outcome.selected;
             });
 
-        if result.escaped || result.clicked_outside {
-            KeybindHelpEvent::Close
-        } else {
-            KeybindHelpEvent::None
-        }
+        result.escaped || result.clicked_outside
     }
 }
 

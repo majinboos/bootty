@@ -22,6 +22,35 @@ pub enum ModalDialog {
     ThemePicker(ThemePickerDialog),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ModalKind {
+    NewSession,
+    SpaceEditor,
+    SessionPicker,
+    RenameSession,
+    RenameTab,
+    DitchSession,
+    KeybindHelp,
+    CommandPalette,
+    ThemePicker,
+}
+
+impl ModalDialog {
+    pub(crate) fn kind(&self) -> ModalKind {
+        match self {
+            Self::NewSession(_) => ModalKind::NewSession,
+            Self::SpaceEditor(_) => ModalKind::SpaceEditor,
+            Self::SessionPicker(_) => ModalKind::SessionPicker,
+            Self::RenameSession(_) => ModalKind::RenameSession,
+            Self::RenameTab(_) => ModalKind::RenameTab,
+            Self::DitchSession(_) => ModalKind::DitchSession,
+            Self::KeybindHelp(_) => ModalKind::KeybindHelp,
+            Self::CommandPalette(_) => ModalKind::CommandPalette,
+            Self::ThemePicker(_) => ModalKind::ThemePicker,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DialogRuntime {
     modal: Option<Box<ModalDialog>>,
@@ -38,6 +67,14 @@ impl DialogRuntime {
 
     pub(crate) fn has_modal(&self) -> bool {
         self.modal.is_some()
+    }
+
+    pub(crate) fn current(&self) -> Option<&ModalDialog> {
+        self.modal.as_deref()
+    }
+
+    pub(crate) fn current_mut(&mut self) -> Option<&mut ModalDialog> {
+        self.modal.as_deref_mut()
     }
 
     pub(crate) fn is_session_picker(&self) -> bool {
@@ -73,9 +110,5 @@ impl DialogRuntime {
         ) {
             self.modal = None;
         }
-    }
-
-    pub(crate) fn take(&mut self) -> Option<ModalDialog> {
-        self.modal.take().map(|dialog| *dialog)
     }
 }

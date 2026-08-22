@@ -11,7 +11,7 @@ use winit::{
         ElementState, KeyEvent, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent,
     },
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{ModifiersState, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -25,8 +25,7 @@ use crate::{
     direct_input::ModifierSideState,
     file_paths::format_file_paths_for_paste,
     geometry::{
-        CellMetrics, SurfaceRect, TerminalGeometry, TerminalPadding, TerminalSurface,
-        ViewTransform, geometry_for_pixels,
+        CellMetrics, SurfaceRect, TerminalGeometry, TerminalPadding, TerminalSurface, ViewTransform,
     },
     input_keymap::{
         key_mods_from_winit_modifiers, mouse_input_from_surface, mouse_input_from_surface_clamped,
@@ -86,7 +85,7 @@ impl BareTerminalViewport {
     }
 
     pub fn geometry(self) -> TerminalGeometry {
-        geometry_for_pixels(self.width, self.height, self.cell, self.padding)
+        self.terminal_surface().geometry()
     }
 
     pub fn surface_rect(self) -> SurfaceRect {
@@ -186,12 +185,7 @@ impl BareTerminalInput {
     }
 
     fn key_input_after_side_state(&self, event: &KeyEvent) -> Option<KeyInput> {
-        if event.state != ElementState::Pressed {
-            return None;
-        }
-        let PhysicalKey::Code(code) = event.physical_key else {
-            return None;
-        };
+        let code = pressed_key_code(event)?;
         bare_terminal_key_input_with_sides_and_remaps(
             code,
             self.modifiers,
@@ -202,13 +196,9 @@ impl BareTerminalInput {
     }
 
     fn paste_shortcut_after_side_state(&self, event: &KeyEvent) -> bool {
-        if event.state != ElementState::Pressed || event.repeat {
-            return false;
-        }
-        let PhysicalKey::Code(code) = event.physical_key else {
-            return false;
-        };
-        bare_terminal_paste_shortcut(code, self.modifiers)
+        !event.repeat
+            && pressed_key_code(event)
+                .is_some_and(|code| bare_terminal_paste_shortcut(code, self.modifiers))
     }
 
     pub fn mouse_input(
@@ -220,13 +210,13 @@ impl BareTerminalInput {
         let pos = self.cursor_pos?;
         if action == MouseAction::Release && button.is_some() && self.pressed_mouse_button == button
         {
-            return bare_terminal_mouse_input_clamped(
+            return Some(mouse_input_from_surface_clamped(
                 pos,
                 action,
                 button,
-                self.modifiers,
-                viewport,
-            );
+                key_mods_from_winit_modifiers(self.modifiers),
+                viewport.terminal_surface(),
+            ));
         }
         bare_terminal_mouse_input(pos, action, button, self.modifiers, viewport)
     }
@@ -236,13 +226,27 @@ impl BareTerminalInput {
         delta: MouseScrollDelta,
         viewport: BareTerminalViewport,
     ) -> Option<MouseInput> {
-        let button = bare_terminal_mouse_wheel_button(delta)?;
+        let y = match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+        };
+        let button = mouse_wheel_button_from_delta_y(y)?;
         self.mouse_input(MouseAction::Press, Some(button), viewport)
     }
 
     pub fn mouse_motion(&self, viewport: BareTerminalViewport) -> Option<MouseInput> {
         self.mouse_input(MouseAction::Motion, self.pressed_mouse_button, viewport)
     }
+}
+
+fn pressed_key_code(event: &KeyEvent) -> Option<KeyCode> {
+    if event.state != ElementState::Pressed {
+        return None;
+    }
+    let PhysicalKey::Code(code) = event.physical_key else {
+        return None;
+    };
+    Some(code)
 }
 
 pub fn bare_terminal_mouse_input(
@@ -262,22 +266,6 @@ pub fn bare_terminal_mouse_input(
     )
 }
 
-fn bare_terminal_mouse_input_clamped(
-    pos: Pos2,
-    action: MouseAction,
-    button: Option<MouseButton>,
-    modifiers: ModifiersState,
-    viewport: BareTerminalViewport,
-) -> Option<MouseInput> {
-    Some(mouse_input_from_surface_clamped(
-        pos,
-        action,
-        button,
-        key_mods_from_winit_modifiers(modifiers),
-        viewport.terminal_surface(),
-    ))
-}
-
 fn bare_terminal_mouse_button(button: WinitMouseButton) -> Option<MouseButton> {
     match button {
         WinitMouseButton::Left => Some(MouseButton::Left),
@@ -285,14 +273,6 @@ fn bare_terminal_mouse_button(button: WinitMouseButton) -> Option<MouseButton> {
         WinitMouseButton::Middle => Some(MouseButton::Middle),
         _ => None,
     }
-}
-
-fn bare_terminal_mouse_wheel_button(delta: MouseScrollDelta) -> Option<MouseButton> {
-    let y = match delta {
-        MouseScrollDelta::LineDelta(_, y) => y,
-        MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
-    };
-    mouse_wheel_button_from_delta_y(y)
 }
 
 pub fn terminal_render_frame_for_bare_host(
@@ -316,10 +296,7 @@ pub fn run() -> Result<()> {
     let result = event_loop
         .run_app(&mut app)
         .context("run bare terminal host");
-    if let Some(error) = app.error {
-        return Err(error);
-    }
-    result
+    app.error.map_or(result, Err)
 }
 
 #[derive(Default)]
@@ -347,21 +324,17 @@ impl ApplicationHandler for BareTerminalApp {
                 f64::from(INITIAL_WIDTH),
                 f64::from(INITIAL_HEIGHT),
             ));
-        let window = match event_loop.create_window(attributes) {
-            Ok(window) => Arc::new(window),
-            Err(error) => {
-                self.fail(event_loop, error.into());
-                return;
-            }
-        };
-
-        match pollster::block_on(BareTerminalState::new(window)) {
+        let state = (|| -> Result<BareTerminalState> {
+            let window = Arc::new(event_loop.create_window(attributes)?);
+            pollster::block_on(BareTerminalState::new(window))
+        })();
+        match state {
             Ok(state) => {
                 state.window.request_redraw();
                 self.state = Some(state);
             }
             Err(error) => self.fail(event_loop, error),
-        }
+        };
     }
 
     fn window_event(
@@ -370,12 +343,13 @@ impl ApplicationHandler for BareTerminalApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(state) = self.state.as_mut() else {
+        let Some(state) = self
+            .state
+            .as_mut()
+            .filter(|state| state.window.id() == window_id)
+        else {
             return;
         };
-        if state.window.id() != window_id {
-            return;
-        }
 
         let result = match event {
             WindowEvent::CloseRequested => {
@@ -384,7 +358,7 @@ impl ApplicationHandler for BareTerminalApp {
             }
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::ModifiersChanged(modifiers) => {
-                state.set_modifiers(modifiers.state());
+                state.input.set_modifiers(modifiers.state());
                 Ok(())
             }
             WindowEvent::Focused(_) => {
@@ -464,10 +438,6 @@ impl BareTerminalState {
         Ok(())
     }
 
-    fn set_modifiers(&mut self, modifiers: ModifiersState) {
-        self.input.set_modifiers(modifiers);
-    }
-
     fn handle_key_input(&mut self, event: &KeyEvent) -> Result<()> {
         self.input.update_key_side_state(event);
         if self.input.paste_shortcut_after_side_state(event) {
@@ -493,22 +463,13 @@ impl BareTerminalState {
         } else {
             MouseAction::Release
         };
-        if let Some(input) = self.input.mouse_input(action, Some(button), self.viewport) {
-            self.input.set_mouse_button_state(button, state);
-            self.terminal.encode_mouse(input)?;
-            self.window.request_redraw();
-        } else {
-            self.input.set_mouse_button_state(button, state);
-        }
-        Ok(())
+        let input = self.input.mouse_input(action, Some(button), self.viewport);
+        self.input.set_mouse_button_state(button, state);
+        self.send_mouse(input)
     }
 
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) -> Result<()> {
-        if let Some(input) = self.input.mouse_wheel(delta, self.viewport) {
-            self.terminal.encode_mouse(input)?;
-            self.window.request_redraw();
-        }
-        Ok(())
+        self.send_mouse(self.input.mouse_wheel(delta, self.viewport))
     }
 
     fn handle_dropped_file(&mut self, path: std::path::PathBuf) -> Result<()> {
@@ -520,7 +481,11 @@ impl BareTerminalState {
     }
 
     fn handle_mouse_motion(&mut self) -> Result<()> {
-        if let Some(input) = self.input.mouse_motion(self.viewport) {
+        self.send_mouse(self.input.mouse_motion(self.viewport))
+    }
+
+    fn send_mouse(&mut self, input: Option<MouseInput>) -> Result<()> {
+        if let Some(input) = input {
             self.terminal.encode_mouse(input)?;
             self.window.request_redraw();
         }
@@ -628,10 +593,8 @@ impl BareTerminalGpu {
             return;
         }
 
-        let surface_config =
-            BareRendererSurfaceConfig::new(size.width, size.height, self.config.format);
-        self.config.width = surface_config.width;
-        self.config.height = surface_config.height;
+        self.config.width = size.width;
+        self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
     }
 

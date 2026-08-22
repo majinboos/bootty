@@ -46,12 +46,6 @@ const TMUX_CLIENT_FEATURES: &str =
     "256,RGB,clipboard,focus,hyperlinks,overline,strikethrough,sync,title";
 
 #[cfg(feature = "app")]
-struct TmuxPanePassthroughOverride {
-    pane_id: String,
-    previous: TmuxOptionValue,
-}
-
-#[cfg(feature = "app")]
 struct TmuxOptionValue {
     value: String,
     local: bool,
@@ -61,7 +55,7 @@ struct TmuxOptionValue {
 pub struct TmuxPanePolicy {
     remote: Option<SshRemote>,
     status_hidden_sessions: Vec<String>,
-    passthrough_all_panes: HashMap<String, TmuxPanePassthroughOverride>,
+    passthrough_all_panes: HashMap<String, TmuxOptionValue>,
 }
 
 #[cfg(feature = "app")]
@@ -83,19 +77,14 @@ impl TmuxPanePolicy {
             return;
         }
         if let Ok(previous) = take_pane_allow_passthrough(self.remote.as_ref(), pane_id) {
-            self.passthrough_all_panes.insert(
-                pane_id.to_owned(),
-                TmuxPanePassthroughOverride {
-                    pane_id: pane_id.to_owned(),
-                    previous,
-                },
-            );
+            self.passthrough_all_panes
+                .insert(pane_id.to_owned(), previous);
         }
     }
 
     fn restore_passthrough_overrides(&mut self) {
-        for (_, previous) in self.passthrough_all_panes.drain() {
-            let _ = restore_pane_allow_passthrough(self.remote.as_ref(), &previous);
+        for (pane_id, previous) in self.passthrough_all_panes.drain() {
+            let _ = restore_pane_allow_passthrough(self.remote.as_ref(), &pane_id, &previous);
         }
     }
 
@@ -224,7 +213,6 @@ fn run_tmux(remote: Option<&SshRemote>, args: &[&str], what: &str) -> Result<Str
     let output = Command::new(resolve_launch_program(&program)?)
         .args(&args)
         .env_remove("TMUX")
-        .env_remove("ZELLIJ")
         .output()?;
     if !output.status.success() {
         anyhow::bail!(
@@ -250,21 +238,15 @@ fn parse_allow_passthrough(stdout: &str) -> Option<TmuxOptionValue> {
 #[cfg(feature = "app")]
 fn restore_pane_allow_passthrough(
     remote: Option<&SshRemote>,
-    previous: &TmuxPanePassthroughOverride,
+    pane_id: &str,
+    previous: &TmuxOptionValue,
 ) -> Result<()> {
-    if previous.previous.local {
-        return set_pane_allow_passthrough(remote, &previous.pane_id, &previous.previous.value);
+    if previous.local {
+        return set_pane_allow_passthrough(remote, pane_id, &previous.value);
     }
     run_tmux(
         remote,
-        &[
-            "set-option",
-            "-u",
-            "-p",
-            "-t",
-            &previous.pane_id,
-            "allow-passthrough",
-        ],
+        &["set-option", "-u", "-p", "-t", pane_id, "allow-passthrough"],
         "unset-option allow-passthrough",
     )
     .map(|_| ())
@@ -350,10 +332,10 @@ impl<R> TmuxBackend<R> {
 }
 
 impl<R: CommandRunner> TmuxBackend<R> {
-    fn run(&self, args: &[&str]) -> Result<String> {
+    fn run(&self, args: &[&str]) -> Result<()> {
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
         let output = self.runner.run(&self.program, &args)?;
-        require_success(&self.program, &args, output)
+        require_success(&self.program, &args, output).map(|_| ())
     }
 
     fn run_snapshot(&self, args: &[&str]) -> Result<Option<String>> {
@@ -368,22 +350,48 @@ impl<R: CommandRunner> TmuxBackend<R> {
         require_success(&self.program, &args, output).map(Some)
     }
 
-    fn run_owned(&self, args: &[String]) -> Result<String> {
+    fn run_owned(&self, args: &[String]) -> Result<()> {
         let output = self.runner.run(&self.program, args)?;
-        require_success(&self.program, args, output)
+        require_success(&self.program, args, output).map(|_| ())
     }
 
-    fn run_owned_allow_server_exit(&self, args: &[String]) -> Result<String> {
+    fn run_owned_allow_server_exit(&self, args: &[String]) -> Result<()> {
         let output = self.runner.run(&self.program, args)?;
         if !output.success && tmux_server_exited(&output.stderr) {
-            return Ok(String::new());
+            return Ok(());
         }
-        require_success(&self.program, args, output)
+        require_success(&self.program, args, output).map(|_| ())
     }
 
-    fn run_disowned_owned(&self, args: &[String]) -> Result<String> {
+    fn run_disowned_owned(&self, args: &[String]) -> Result<()> {
         let output = self.runner.run_disowned(&self.program, args)?;
-        require_success(&self.program, args, output)
+        require_success(&self.program, args, output).map(|_| ())
+    }
+
+    fn move_window(&self, window_id: String, delta: i32) -> Result<()> {
+        if delta != 0 {
+            self.run_owned(&["select-window".into(), "-t".into(), window_id])?;
+        }
+        let target = if delta < 0 { "-1" } else { "+1" };
+        for _ in 0..delta.unsigned_abs() {
+            self.run(&["swap-window", "-t", target])?;
+            self.run(&["select-window", "-t", target])?;
+        }
+        Ok(())
+    }
+
+    fn select_relative_pane(
+        &self,
+        session_id: &str,
+        window_id: Option<String>,
+        suffix: &str,
+    ) -> Result<()> {
+        let target = window_id.map_or_else(
+            || format!("{session_id}:{suffix}"),
+            |window_id| format!("{window_id}{suffix}"),
+        );
+        self.run_owned(&["select-pane".into(), "-t".into(), target])?;
+        Ok(())
     }
 }
 
@@ -409,10 +417,7 @@ impl<R: CommandRunner> TmuxBackend<R> {
 
     pub fn execute(&mut self, command: MuxCommand) -> Result<()> {
         match command {
-            MuxCommand::ActivateWindow {
-                session_id: _,
-                window_id,
-            } => {
+            MuxCommand::ActivateWindow { window_id, .. } => {
                 self.run_owned(&["select-window".into(), "-t".into(), window_id])?;
             }
             MuxCommand::CreateProjectSession { session_id, cwd }
@@ -444,9 +449,7 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 self.run_owned(&args)?;
             }
             MuxCommand::RenameWindow {
-                session_id: _,
-                window_id,
-                name,
+                window_id, name, ..
             } => {
                 self.run_owned(&["rename-window".into(), "-t".into(), window_id, name])?;
             }
@@ -471,35 +474,15 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 window_id,
                 delta,
             } => {
-                if delta != 0 {
-                    self.run_owned(&[
-                        "select-window".into(),
-                        "-t".into(),
-                        window_id.unwrap_or(session_id),
-                    ])?;
-                }
-                // Relative swap, following the moved window, matching tmux/rmux copy of the
-                // active-window move behavior after selecting the requested source window.
-                let target = if delta < 0 { "-1" } else { "+1" };
-                for _ in 0..delta.unsigned_abs() {
-                    self.run(&["swap-window", "-t", target])?;
-                    self.run(&["select-window", "-t", target])?;
-                }
+                self.move_window(window_id.unwrap_or(session_id), delta)?;
             }
             MuxCommand::MoveWindowPreservingSelection {
-                session_id: _,
                 window_id,
                 delta,
                 selected_window_id,
+                ..
             } => {
-                if delta != 0 {
-                    self.run_owned(&["select-window".into(), "-t".into(), window_id])?;
-                }
-                let target = if delta < 0 { "-1" } else { "+1" };
-                for _ in 0..delta.unsigned_abs() {
-                    self.run(&["swap-window", "-t", target])?;
-                    self.run(&["select-window", "-t", target])?;
-                }
+                self.move_window(window_id, delta)?;
                 self.run_owned(&["select-window".into(), "-t".into(), selected_window_id])?;
             }
             MuxCommand::SplitPane {
@@ -540,21 +523,13 @@ impl<R: CommandRunner> TmuxBackend<R> {
                 session_id,
                 window_id,
             } => {
-                let target = window_id.map_or_else(
-                    || format!("{session_id}:.+"),
-                    |window_id| format!("{window_id}.+"),
-                );
-                self.run_owned(&["select-pane".into(), "-t".into(), target])?;
+                self.select_relative_pane(&session_id, window_id, ".+")?;
             }
             MuxCommand::SelectPreviousPane {
                 session_id,
                 window_id,
             } => {
-                let target = window_id.map_or_else(
-                    || format!("{session_id}:.-"),
-                    |window_id| format!("{window_id}.-"),
-                );
-                self.run_owned(&["select-pane".into(), "-t".into(), target])?;
+                self.select_relative_pane(&session_id, window_id, ".-")?;
             }
             MuxCommand::KillPane {
                 session_id,
@@ -623,17 +598,11 @@ fn tmux_server_exited(stderr: &str) -> bool {
 }
 
 fn tmux_fields(line: &str, fixed_fields_before_tail: usize) -> Vec<String> {
-    if line.contains(TMUX_FIELD_SEPARATOR) {
-        return line
-            .split(TMUX_FIELD_SEPARATOR)
-            .map(str::to_owned)
-            .collect();
-    }
-    if line.contains('\t') {
-        return line.split('\t').map(str::to_owned).collect();
-    }
-    if line.contains("\\t") {
-        return line.split("\\t").map(str::to_owned).collect();
+    if let Some(separator) = ["\x1f", "\t", "\\t"]
+        .into_iter()
+        .find(|separator| line.contains(separator))
+    {
+        return line.split(separator).map(str::to_owned).collect();
     }
     underscore_joined_tmux_fields(line, fixed_fields_before_tail)
 }
@@ -645,10 +614,7 @@ fn underscore_joined_tmux_fields(line: &str, fixed_fields_before_tail: usize) ->
     if parts.len() <= fixed_fields_before_tail {
         return vec![line.to_owned()];
     }
-    let Some(tail) = parts.pop() else {
-        return vec![line.to_owned()];
-    };
-    let Some((cwd, process)) = tail.rsplit_once('_') else {
+    let Some((cwd, process)) = parts.pop().and_then(|tail| tail.rsplit_once('_')) else {
         return vec![line.to_owned()];
     };
     let mut fields = parts.into_iter().map(str::to_owned).collect::<Vec<_>>();
@@ -687,6 +653,10 @@ fn strip_snapshot_tag(line: &str, tag: char) -> Option<&str> {
         .or_else(|| tagged.strip_prefix("\\t"))
 }
 
+fn nonempty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
 fn parse_tmux_snapshot(session_listing: &str, pane_listing: &str) -> Result<MuxSnapshot> {
     let mut sessions = Vec::new();
     for line in session_listing
@@ -697,17 +667,17 @@ fn parse_tmux_snapshot(session_listing: &str, pane_listing: &str) -> Result<MuxS
         let id = fields.next().context("tmux snapshot missing session id")?;
         let name = fields
             .next()
-            .filter(|value| !value.is_empty())
+            .and_then(nonempty)
             .unwrap_or_else(|| id.clone());
         let attached = fields.next().is_some_and(|value| value != "0");
         let _windows = fields.next();
-        let pane_id = fields.next().filter(|value| !value.is_empty());
+        let pane_id = fields.next().and_then(nonempty);
         let pane_process_id = fields.next().and_then(|value| value.parse().ok());
-        let cwd = fields.next().filter(|value| !value.is_empty());
-        let process = fields.next().filter(|value| !value.is_empty());
+        let cwd = fields.next().and_then(nonempty);
+        let process = fields.next().and_then(nonempty);
         sessions.push(MuxSession {
             id: id.clone(),
-            name: name.clone(),
+            name,
             active: attached,
             anchor: MuxPaneAnchor {
                 session_id: id,
@@ -759,10 +729,10 @@ fn furthest_along(
 fn add_tmux_windows(sessions: &mut [MuxSession], pane_listing: &str) {
     for line in pane_listing.lines().filter(|line| !line.trim().is_empty()) {
         let mut fields = tmux_fields(line, 9).into_iter();
-        let Some(session_id) = fields.next().filter(|value| !value.is_empty()) else {
+        let Some(session_id) = fields.next().and_then(nonempty) else {
             continue;
         };
-        let Some(window_id) = fields.next().filter(|value| !value.is_empty()) else {
+        let Some(window_id) = fields.next().and_then(nonempty) else {
             continue;
         };
         let Some(window_index) = fields.next().and_then(|value| value.parse().ok()) else {
@@ -773,10 +743,10 @@ fn add_tmux_windows(sessions: &mut [MuxSession], pane_listing: &str) {
         };
         let window_active = fields.next().is_some_and(|value| value != "0");
         let pane_active = fields.next().is_some_and(|value| value != "0");
-        let pane_id = fields.next().filter(|value| !value.is_empty());
+        let pane_id = fields.next().and_then(nonempty);
         let progress = tmux_pane_progress(fields.next(), fields.next());
-        let cwd = fields.next().filter(|value| !value.is_empty());
-        let process = fields.next().filter(|value| !value.is_empty());
+        let cwd = fields.next().and_then(nonempty);
+        let process = fields.next().and_then(nonempty);
 
         let Some(session) = sessions.iter_mut().find(|session| session.id == session_id) else {
             continue;
@@ -791,11 +761,11 @@ fn add_tmux_windows(sessions: &mut [MuxSession], pane_listing: &str) {
         {
             if pane_active || window.anchor.pane_id.is_none() {
                 window.anchor = MuxPaneAnchor {
-                    session_id: session_id.clone(),
-                    pane_id: pane_id.clone(),
+                    session_id,
+                    pane_id,
                     pane_pid: None,
-                    cwd: cwd.clone(),
-                    process: process.clone(),
+                    cwd,
+                    process,
                 };
             }
             // A window's bar stands for every pane in it, so the busiest pane wins.

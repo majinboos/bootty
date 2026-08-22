@@ -362,6 +362,7 @@ pub(crate) fn page_tab_hit(
         .saturating_add(secondary_rows)
         .saturating_add(card_rows);
 
+    let mut tertiary_y = markdown_y;
     if inline_secondary_tabs {
         let markdown_height = shell
             .height
@@ -377,35 +378,13 @@ pub(crate) fn page_tab_hit(
             markdown_height,
         ) {
             secondary_y = markdown_y.saturating_add(parent_height);
-            let tertiary_y = secondary_y
+            tertiary_y = secondary_y
                 .saturating_add(TAB_ROWS)
                 .saturating_add(group_height)
                 .saturating_add(USAGE_HEADING_ROWS);
-            if primary_tabs && y == primary_y {
-                return tab_hit(section.tabs.iter().map(|tab| tab.label), x).map(TabHit::Primary);
-            }
-            if y == secondary_y {
-                return tab_hit(
-                    (0..section_subtab_count(*section, active_tab))
-                        .map(|index| section_subtab_label(*section, active_tab, index)),
-                    x,
-                )
-                .map(TabHit::Secondary);
-            }
-            if y == tertiary_y {
-                return tab_hit(
-                    (0..section_leaf_tab_count(*section, active_tab, active_subtab)).map(|index| {
-                        section_leaf_tab_label(*section, active_tab, active_subtab, index)
-                    }),
-                    x,
-                )
-                .map(TabHit::Tertiary);
-            }
-            return None;
         }
     }
 
-    let tertiary_y = markdown_y;
     if primary_tabs && y == primary_y {
         return tab_hit(section.tabs.iter().map(|tab| tab.label), x).map(TabHit::Primary);
     }

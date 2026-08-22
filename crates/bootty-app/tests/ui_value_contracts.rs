@@ -21,7 +21,7 @@ fn session_rename_trims_the_submitted_name_and_rejects_blank_names() {
     let context = egui::Context::default();
     install_icon_fonts(&context);
     let mut dialog = RenameSessionDialog::open("session-1".to_owned(), "  review  ".to_owned());
-    let mut event = RenameSessionEvent::None;
+    let mut event = None;
     context
         .run_ui(RawInput::default(), |ui| {
             event = dialog.show(
@@ -46,10 +46,10 @@ fn session_rename_trims_the_submitted_name_and_rejects_blank_names() {
         .drop_without_applying_deltas();
     assert_eq!(
         event,
-        RenameSessionEvent::Rename {
+        Some(RenameSessionEvent::Rename {
             session_id: "session-1".to_owned(),
             name: "review".to_owned(),
-        }
+        })
     );
 
     let mut blank = RenameSessionDialog::open("session-2".to_owned(), "   ".to_owned());
@@ -75,7 +75,7 @@ fn session_rename_trims_the_submitted_name_and_rejects_blank_names() {
             },
         )
         .drop_without_applying_deltas();
-    assert_eq!(event, RenameSessionEvent::None);
+    assert_eq!(event, None);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn blank_tab_rename_restores_terminal_managed_titles() {
         "window-1".to_owned(),
         "   ".to_owned(),
     );
-    let mut event = RenameTabEvent::None;
+    let mut event = None;
     context
         .run_ui(RawInput::default(), |ui| {
             event = dialog.show(
@@ -113,10 +113,10 @@ fn blank_tab_rename_restores_terminal_managed_titles() {
 
     assert_eq!(
         event,
-        RenameTabEvent::Rename {
+        Some(RenameTabEvent::Rename {
             session_id: "session-1".to_owned(),
             window_id: "window-1".to_owned(),
             name: String::new(),
-        }
+        })
     );
 }

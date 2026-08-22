@@ -259,10 +259,13 @@ impl PaintPlanner {
         );
 
         plan_backgrounds(&mut self.plan, surface, frame, default_fg, default_bg);
-        plan_search_matches(&mut self.plan, surface, frame);
-        plan_active_search_match(&mut self.plan, surface, frame);
-        plan_selections(&mut self.plan, surface, frame, default_fg);
-        prepare_overlay_mask(&mut self.overlay_mask, frame);
+        plan_overlays(
+            &mut self.plan,
+            &mut self.overlay_mask,
+            surface,
+            frame,
+            default_fg,
+        );
         plan_text_runs(
             &mut self.plan,
             &mut self.run_text_pool,
@@ -350,7 +353,13 @@ struct TextPlanContext {
     minimum_contrast: bool,
 }
 
-fn prepare_overlay_mask(mask: &mut Vec<u8>, frame: &RenderFrame) {
+fn plan_overlays(
+    plan: &mut TerminalPaintPlan,
+    mask: &mut Vec<u8>,
+    surface: TerminalSurface,
+    frame: &RenderFrame,
+    default_fg: PlanColor,
+) {
     if frame.selections.is_empty()
         && frame.search_matches.is_empty()
         && frame.active_search_match.is_none()
@@ -360,44 +369,56 @@ fn prepare_overlay_mask(mask: &mut Vec<u8>, frame: &RenderFrame) {
     }
     mask.resize(usize::from(frame.cols) * usize::from(frame.rows), 0);
     mask.fill(0);
-    mark_overlay_ranges(
-        mask,
-        frame.cols,
-        frame.rows,
+
+    let mut append = |ranges: &[FrameSelection], background: PlanColor, overlay| {
+        for range in ranges {
+            if range.end_col >= range.start_col {
+                let cells = range
+                    .end_col
+                    .saturating_sub(range.start_col)
+                    .saturating_add(1);
+                push_background(
+                    &mut plan.backgrounds,
+                    surface.run_rect(range.start_col, range.row, cells),
+                    background,
+                );
+            }
+
+            if range.row >= frame.rows || range.start_col >= frame.cols {
+                continue;
+            }
+            let end_col = range.end_col.min(frame.cols - 1);
+            if end_col < range.start_col {
+                continue;
+            }
+            let row_start = usize::from(range.row) * usize::from(frame.cols);
+            let start = row_start + usize::from(range.start_col);
+            let end = row_start + usize::from(end_col);
+            mask[start..=end].fill(overlay);
+        }
+    };
+
+    append(
         &frame.search_matches,
+        search_match_background(),
         OVERLAY_SEARCH,
     );
     if let Some(active) = frame.active_search_match {
-        mark_overlay_ranges(
-            mask,
-            frame.cols,
-            frame.rows,
+        append(
             std::slice::from_ref(&active),
+            active_search_match_background(),
             OVERLAY_ACTIVE_SEARCH,
         );
     }
-    mark_overlay_ranges(
-        mask,
-        frame.cols,
-        frame.rows,
+    append(
         &frame.selections,
+        frame
+            .colors
+            .selection_background
+            .map(PlanColor::opaque)
+            .unwrap_or(default_fg),
         OVERLAY_SELECTION,
     );
-}
-
-fn mark_overlay_ranges(mask: &mut [u8], cols: u16, rows: u16, ranges: &[FrameSelection], flag: u8) {
-    for range in ranges {
-        if range.row >= rows || range.start_col >= cols {
-            continue;
-        }
-        let end_col = range.end_col.min(cols - 1);
-        if end_col < range.start_col {
-            continue;
-        }
-        let start = usize::from(range.row) * usize::from(cols) + usize::from(range.start_col);
-        let end = usize::from(range.row) * usize::from(cols) + usize::from(end_col);
-        mask[start..=end].fill(flag);
-    }
 }
 
 fn cell_overlay(mask: &[u8], cols: u16, cell: &RenderCell) -> u8 {
@@ -420,6 +441,17 @@ fn plan_text_runs(
         search: search_match_text_foreground(),
         active_search: active_search_match_text_foreground(),
     };
+    let attrs_for = |cell: &RenderCell, text: &[char]| {
+        paint_attrs(
+            cell,
+            text,
+            cell_overlay(overlay_mask, frame.cols, cell),
+            context.default_fg,
+            context.default_bg,
+            colors,
+            context.minimum_contrast,
+        )
+    };
     let mut cell_index = 0;
     while cell_index < frame.cells.len() {
         let first = &frame.cells[cell_index];
@@ -430,15 +462,7 @@ fn plan_text_runs(
             continue;
         }
 
-        let attrs = paint_attrs(
-            first,
-            first_text,
-            cell_overlay(overlay_mask, frame.cols, first),
-            context.default_fg,
-            context.default_bg,
-            colors,
-            context.minimum_contrast,
-        );
+        let attrs = attrs_for(first, first_text);
         let mut run_text = pool.pop().unwrap_or_default();
         run_text.clear();
         run_text.extend(first_text);
@@ -455,15 +479,7 @@ fn plan_text_runs(
                     || next.x != end_x
                     || next.style.invisible
                     || next_text.is_empty()
-                    || paint_attrs(
-                        next,
-                        next_text,
-                        cell_overlay(overlay_mask, frame.cols, next),
-                        context.default_fg,
-                        context.default_bg,
-                        colors,
-                        context.minimum_contrast,
-                    ) != attrs
+                    || attrs_for(next, next_text) != attrs
                 {
                     break;
                 }
@@ -495,45 +511,38 @@ fn plan_decorations(
     attrs: TextAttrs,
     font_size: f32,
 ) {
-    if attrs.underline != Underline::None {
-        let style = match attrs.underline {
-            Underline::None => unreachable!("none handled above"),
-            Underline::Single => DecorationStyle::Single,
-            Underline::Double => DecorationStyle::Double,
-            Underline::Curly => DecorationStyle::Curly,
-            Underline::Dotted => DecorationStyle::Dotted,
-            Underline::Dashed => DecorationStyle::Dashed,
-            _ => DecorationStyle::Single,
-        };
-        decorations.push(DecorationLine {
-            start_x: rect.min_x,
-            start_y: rect.min_y + font_size + 3.0,
-            end_x: rect.max_x,
-            end_y: rect.min_y + font_size + 3.0,
-            color: attrs.fg,
-            style,
-        });
-    }
-    if attrs.strikethrough {
-        decorations.push(DecorationLine {
-            start_x: rect.min_x,
-            start_y: rect.min_y + rect.height() * 0.55,
-            end_x: rect.max_x,
-            end_y: rect.min_y + rect.height() * 0.55,
-            color: attrs.fg,
-            style: DecorationStyle::Strikethrough,
-        });
-    }
-    if attrs.overline {
-        decorations.push(DecorationLine {
-            start_x: rect.min_x,
-            start_y: rect.min_y + TEXT_Y_OFFSET,
-            end_x: rect.max_x,
-            end_y: rect.min_y + TEXT_Y_OFFSET,
-            color: attrs.fg,
-            style: DecorationStyle::Overline,
-        });
-    }
+    let underline = match attrs.underline {
+        Underline::None => None,
+        Underline::Single => Some(DecorationStyle::Single),
+        Underline::Double => Some(DecorationStyle::Double),
+        Underline::Curly => Some(DecorationStyle::Curly),
+        Underline::Dotted => Some(DecorationStyle::Dotted),
+        Underline::Dashed => Some(DecorationStyle::Dashed),
+        _ => Some(DecorationStyle::Single),
+    };
+    let lines = [
+        underline.map(|style| (rect.min_y + font_size + 3.0, style)),
+        attrs.strikethrough.then_some((
+            rect.min_y + rect.height() * 0.55,
+            DecorationStyle::Strikethrough,
+        )),
+        attrs
+            .overline
+            .then_some((rect.min_y + TEXT_Y_OFFSET, DecorationStyle::Overline)),
+    ];
+    decorations.extend(
+        lines
+            .into_iter()
+            .flatten()
+            .map(|(y, style)| DecorationLine {
+                start_x: rect.min_x,
+                start_y: y,
+                end_x: rect.max_x,
+                end_y: y,
+                color: attrs.fg,
+                style,
+            }),
+    );
 }
 
 fn plan_cursor(
@@ -576,11 +585,8 @@ fn plan_cursor(
     } else {
         cursor.x
     };
-    let rect = if cursor.at_wide_tail {
-        surface.run_rect(cursor_x, cursor.y, 2)
-    } else {
-        surface.cell_rect(cursor.x, cursor.y)
-    };
+    let cells = if cursor.at_wide_tail { 2 } else { 1 };
+    let rect = surface.run_rect(cursor_x, cursor.y, cells);
     let text_under_cursor = if shape == CursorShape::Block {
         cursor_cell(frame, cursor_x, cursor.y).and_then(|cell| {
             if cell.style.invisible {
@@ -672,64 +678,6 @@ fn cell_colors(
         fg = fg.gamma_multiply(0.62);
     }
     (fg, bg)
-}
-
-fn plan_selections(
-    plan: &mut TerminalPaintPlan,
-    surface: TerminalSurface,
-    frame: &RenderFrame,
-    default_fg: PlanColor,
-) {
-    let background = frame
-        .colors
-        .selection_background
-        .map(PlanColor::opaque)
-        .unwrap_or(default_fg);
-    for selection in &frame.selections {
-        plan_frame_selection_background(plan, surface, *selection, background);
-    }
-}
-
-fn plan_search_matches(
-    plan: &mut TerminalPaintPlan,
-    surface: TerminalSurface,
-    frame: &RenderFrame,
-) {
-    let background = search_match_background();
-    for selection in &frame.search_matches {
-        plan_frame_selection_background(plan, surface, *selection, background);
-    }
-}
-
-fn plan_active_search_match(
-    plan: &mut TerminalPaintPlan,
-    surface: TerminalSurface,
-    frame: &RenderFrame,
-) {
-    let Some(selection) = frame.active_search_match else {
-        return;
-    };
-    plan_frame_selection_background(plan, surface, selection, active_search_match_background());
-}
-
-fn plan_frame_selection_background(
-    plan: &mut TerminalPaintPlan,
-    surface: TerminalSurface,
-    selection: FrameSelection,
-    background: PlanColor,
-) {
-    if selection.end_col < selection.start_col {
-        return;
-    }
-    let cells = selection
-        .end_col
-        .saturating_sub(selection.start_col)
-        .saturating_add(1);
-    push_background(
-        &mut plan.backgrounds,
-        surface.run_rect(selection.start_col, selection.row, cells),
-        background,
-    );
 }
 
 pub(crate) fn search_match_background() -> PlanColor {

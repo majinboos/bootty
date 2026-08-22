@@ -263,30 +263,32 @@ impl GlyphConstraint {
 }
 
 pub fn terminal_glyph_constraint(codepoint: u32) -> GlyphConstraint {
-    nerd_font_constraint(codepoint).unwrap_or_else(|| {
-        if is_symbol_codepoint(codepoint) {
-            GlyphConstraint {
-                size: GlyphConstraintSize::Fit,
-                ..GlyphConstraint::NONE
-            }
+    nerd_font_constraint(codepoint).unwrap_or_else(|| GlyphConstraint {
+        size: if is_symbol_codepoint(codepoint) {
+            GlyphConstraintSize::Fit
         } else {
-            GlyphConstraint::NONE
-        }
+            GlyphConstraintSize::None
+        },
+        ..GlyphConstraint::NONE
     })
 }
+
+const NERD_ICON_CONSTRAINT: GlyphConstraint = GlyphConstraint {
+    size: GlyphConstraintSize::FitCover1,
+    height: GlyphConstraintHeight::Icon,
+    align_horizontal: GlyphConstraintAlign::Center1,
+    align_vertical: GlyphConstraintAlign::Center1,
+    ..GlyphConstraint::NONE
+};
 
 pub fn nerd_font_constraint(codepoint: u32) -> Option<GlyphConstraint> {
     Some(match codepoint {
         0xEA61 => GlyphConstraint {
-            size: GlyphConstraintSize::FitCover1,
-            height: GlyphConstraintHeight::Icon,
-            align_horizontal: GlyphConstraintAlign::Center1,
-            align_vertical: GlyphConstraintAlign::Center1,
             relative_width: 0.7513020833333334,
             relative_height: 0.9291573452647278,
             relative_x: 0.0846354166666667,
             relative_y: 0.0708426547352722,
-            ..GlyphConstraint::NONE
+            ..NERD_ICON_CONSTRAINT
         },
         0xE0C0 => GlyphConstraint {
             size: GlyphConstraintSize::Stretch,
@@ -298,13 +300,7 @@ pub fn nerd_font_constraint(codepoint: u32) -> Option<GlyphConstraint> {
             pad_bottom: -0.005,
             ..GlyphConstraint::NONE
         },
-        0xF000..=0xF533 | 0xF0001..=0xF1AF0 => GlyphConstraint {
-            size: GlyphConstraintSize::FitCover1,
-            height: GlyphConstraintHeight::Icon,
-            align_horizontal: GlyphConstraintAlign::Center1,
-            align_vertical: GlyphConstraintAlign::Center1,
-            ..GlyphConstraint::NONE
-        },
+        0xF000..=0xF533 | 0xF0001..=0xF1AF0 => NERD_ICON_CONSTRAINT,
         _ => return None,
     })
 }

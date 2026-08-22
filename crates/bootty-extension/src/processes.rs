@@ -65,12 +65,8 @@ impl EventQueue {
         if self.dropped > 0 && events.len() < limit {
             events.push(ProcessEvent::Dropped(std::mem::take(&mut self.dropped)));
         }
-        while events.len() < limit {
-            let Some(event) = self.events.pop_front() else {
-                break;
-            };
-            events.push(event);
-        }
+        let take = (limit - events.len()).min(self.events.len());
+        events.extend(self.events.drain(..take));
         events
     }
 }
@@ -129,16 +125,12 @@ impl ManagedProcesses {
         cwd: Option<&Path>,
     ) -> Result<ProcessStatus, String> {
         validate_process_id(&id)?;
-        validate_argv(argv)?;
+        let (program, arguments) = validate_argv(argv)?;
         if self.inner.retired.load(Ordering::Acquire) {
             return Err("extension generation is no longer active".to_owned());
         }
 
-        let mut processes = self
-            .inner
-            .processes
-            .lock()
-            .map_err(|_| "extension process registry lock poisoned".to_owned())?;
+        let mut processes = self.processes()?;
         processes.retain(|_, process| process.running.load(Ordering::Acquire));
         if processes.contains_key(&id) {
             return Err(format!("extension process {id:?} is already running"));
@@ -149,9 +141,6 @@ impl ManagedProcesses {
             ));
         }
 
-        let (program, arguments) = argv
-            .split_first()
-            .ok_or_else(|| "extension process needs a program".to_owned())?;
         let mut command = Command::new(program);
         command.args(arguments);
         if let Some(cwd) = cwd {
@@ -211,11 +200,7 @@ impl ManagedProcesses {
         if line.contains(['\n', '\r']) {
             return Err("extension process input must be one line".to_owned());
         }
-        let processes = self
-            .inner
-            .processes
-            .lock()
-            .map_err(|_| "extension process registry lock poisoned".to_owned())?;
+        let processes = self.processes()?;
         let process = processes
             .get(id)
             .ok_or_else(|| format!("extension process {id:?} is not running"))?;
@@ -249,11 +234,7 @@ impl ManagedProcesses {
                 "extension process poll limit must be between 1 and {OUTPUT_QUEUE_LIMIT}"
             ));
         }
-        let processes = self
-            .inner
-            .processes
-            .lock()
-            .map_err(|_| "extension process registry lock poisoned".to_owned())?;
+        let processes = self.processes()?;
         let process = processes
             .get(id)
             .ok_or_else(|| format!("extension process {id:?} does not exist"))?;
@@ -265,11 +246,7 @@ impl ManagedProcesses {
     }
 
     pub(super) fn stop(&self, id: &str) -> Result<(), String> {
-        let processes = self
-            .inner
-            .processes
-            .lock()
-            .map_err(|_| "extension process registry lock poisoned".to_owned())?;
+        let processes = self.processes()?;
         let process = processes
             .get(id)
             .ok_or_else(|| format!("extension process {id:?} does not exist"))?;
@@ -278,6 +255,15 @@ impl ManagedProcesses {
 
     pub(super) fn retire(&self) {
         self.inner.retire();
+    }
+
+    fn processes(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, ManagedProcess>>, String> {
+        self.inner
+            .processes
+            .lock()
+            .map_err(|_| "extension process registry lock poisoned".to_owned())
     }
 }
 
@@ -296,22 +282,18 @@ fn stop_and_wait(process: &ManagedProcess) -> Result<(), String> {
                     Ok(())
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if process.running.load(Ordering::Acquire) {
-                    Err("extension process supervisor is unavailable".to_owned())
-                } else {
-                    Ok(())
-                }
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => stopped_or_unavailable(process),
         },
         Err(mpsc::TrySendError::Full(_)) => wait_until_stopped(process),
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            if process.running.load(Ordering::Acquire) {
-                Err("extension process supervisor is unavailable".to_owned())
-            } else {
-                Ok(())
-            }
-        }
+        Err(mpsc::TrySendError::Disconnected(_)) => stopped_or_unavailable(process),
+    }
+}
+
+fn stopped_or_unavailable(process: &ManagedProcess) -> Result<(), String> {
+    if process.running.load(Ordering::Acquire) {
+        Err("extension process supervisor is unavailable".to_owned())
+    } else {
+        Ok(())
     }
 }
 
@@ -353,10 +335,10 @@ fn validate_process_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_argv(argv: &[String]) -> Result<(), String> {
-    if argv.is_empty() {
-        return Err("extension process needs a program".to_owned());
-    }
+fn validate_argv(argv: &[String]) -> Result<(&str, &[String]), String> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| "extension process needs a program".to_owned())?;
     if argv.len() > ARGUMENT_LIMIT {
         return Err(format!(
             "extension process argument count exceeds the limit of {ARGUMENT_LIMIT}"
@@ -371,7 +353,7 @@ fn validate_argv(argv: &[String]) -> Result<(), String> {
     if argv.iter().any(|argument| argument.contains('\0')) {
         return Err("extension process arguments contain a null byte".to_owned());
     }
-    Ok(())
+    Ok((program.as_str(), arguments))
 }
 
 #[derive(Clone, Copy)]

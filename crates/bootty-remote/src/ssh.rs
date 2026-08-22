@@ -1,8 +1,8 @@
 //! Runs a backend's multiplexer client on another host over SSH.
 //!
 //! The client-server backends already treat the multiplexer as something they talk to rather than
-//! something they contain: snapshots and mutations are `tmux`/`zellij` invocations, and a pane is a
-//! PTY running an attach client. Both only need their argv prefixed with an SSH invocation to land
+//! something they contain: snapshots and mutations are multiplexer-client invocations, and a pane
+//! is a PTY running an attach client. They only need their argv prefixed with an SSH invocation to land
 //! on the other host, so a remote binding reuses every parser, layout and capability the local one
 //! does.
 

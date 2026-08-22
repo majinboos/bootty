@@ -16,10 +16,10 @@ fn key_event(key: Key) -> Event {
     }
 }
 
-fn show(dialog: &mut NewMuxSessionDialog, input: RawInput) -> NewSessionPickerEvent {
+fn show(dialog: &mut NewMuxSessionDialog, input: RawInput) -> Option<NewSessionPickerEvent> {
     let context = egui::Context::default();
     install_icon_fonts(&context);
-    let mut event = NewSessionPickerEvent::None;
+    let mut event = None;
     context
         .run_ui(input, |ui| {
             event = dialog.show(
@@ -36,10 +36,7 @@ fn show(dialog: &mut NewMuxSessionDialog, input: RawInput) -> NewSessionPickerEv
 fn new_session_picker_stays_open_without_a_dismiss_action() {
     let mut dialog = NewMuxSessionDialog::open();
 
-    assert_eq!(
-        show(&mut dialog, RawInput::default()),
-        NewSessionPickerEvent::None
-    );
+    assert_eq!(show(&mut dialog, RawInput::default()), None);
 }
 
 #[test]
@@ -54,6 +51,6 @@ fn escape_closes_the_new_session_picker() {
                 ..RawInput::default()
             },
         ),
-        NewSessionPickerEvent::Close
+        Some(NewSessionPickerEvent::Close)
     );
 }

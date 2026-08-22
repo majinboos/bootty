@@ -224,21 +224,6 @@ fn active_window_of(
     })
 }
 
-fn selected_window_for_session<'a>(
-    session: &'a MuxSession,
-    selected_window: Option<&str>,
-) -> Option<&'a crate::snapshot::MuxWindow> {
-    selected_window
-        .and_then(|id| session.windows.iter().find(|window| window.id == id))
-        .or_else(|| {
-            session
-                .active_window_id
-                .as_deref()
-                .and_then(|id| session.windows.iter().find(|window| window.id == id))
-        })
-        .or_else(|| session.windows.first())
-}
-
 fn optimistic_window_after_command(
     sessions: &[MuxSession],
     selected_window: Option<&str>,
@@ -522,19 +507,16 @@ impl MuxController {
     }
 
     pub fn set_availability_error(&mut self, error: Option<String>) {
-        self.availability_error = error.map(BindingAvailabilityError::Runtime);
-        self.last_error = self
-            .availability_error
-            .as_ref()
-            .map(|error| error.message().to_owned());
+        self.set_availability(error.map(BindingAvailabilityError::Runtime));
     }
 
     pub fn set_configured_availability_error(&mut self, error: Option<String>) {
-        self.availability_error = error.map(BindingAvailabilityError::Configured);
-        self.last_error = self
-            .availability_error
-            .as_ref()
-            .map(|error| error.message().to_owned());
+        self.set_availability(error.map(BindingAvailabilityError::Configured));
+    }
+
+    fn set_availability(&mut self, error: Option<BindingAvailabilityError>) {
+        self.last_error = error.as_ref().map(|error| error.message().to_owned());
+        self.availability_error = error;
     }
 
     pub fn unavailable_reason(&self) -> Option<&str> {
@@ -707,26 +689,38 @@ impl MuxController {
             .map(|session| session.id.as_str())
     }
 
-    pub fn selected_session_anchor(&self) -> Option<&crate::snapshot::MuxPaneAnchor> {
+    fn selected_session_snapshot(&self) -> Option<&MuxSession> {
         let selected = self.selected_session.as_deref()?;
-        let session = self
-            .sessions
+        self.sessions
             .iter()
-            .find(|session| session.id == selected || session.name == selected)?;
-        if let Some(window) = selected_window_for_session(session, self.selected_window.as_deref())
-        {
-            return Some(&window.anchor);
-        }
-        Some(&session.anchor)
+            .find(|session| session_matches(session, selected))
+    }
+
+    fn selected_window_snapshot(&self) -> Option<&crate::snapshot::MuxWindow> {
+        let session = self.selected_session_snapshot()?;
+        self.selected_window
+            .as_deref()
+            .and_then(|id| session.windows.iter().find(|window| window.id == id))
+            .or_else(|| {
+                session
+                    .active_window_id
+                    .as_deref()
+                    .and_then(|id| session.windows.iter().find(|window| window.id == id))
+            })
+            .or_else(|| session.windows.first())
+    }
+
+    pub fn selected_session_anchor(&self) -> Option<&crate::snapshot::MuxPaneAnchor> {
+        self.selected_window_snapshot()
+            .map(|window| &window.anchor)
+            .or_else(|| {
+                self.selected_session_snapshot()
+                    .map(|session| &session.anchor)
+            })
     }
 
     pub fn selected_session_windows(&self) -> &[crate::snapshot::MuxWindow] {
-        let Some(selected) = self.selected_session.as_deref() else {
-            return &[];
-        };
-        self.sessions
-            .iter()
-            .find(|session| session.id == selected || session.name == selected)
+        self.selected_session_snapshot()
             .map(|session| session.windows.as_slice())
             .unwrap_or_default()
     }
@@ -735,28 +729,13 @@ impl MuxController {
     /// window is selected). Native renders these as a split layout; other backends report a single
     /// attach anchor.
     pub fn selected_window_panes(&self) -> &[crate::snapshot::MuxPaneAnchor] {
-        let Some(selected) = self.selected_session.as_deref() else {
-            return &[];
-        };
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == selected || session.name == selected)
-        else {
-            return &[];
-        };
-        selected_window_for_session(session, self.selected_window.as_deref())
+        self.selected_window_snapshot()
             .map(|window| window.panes.as_slice())
             .unwrap_or_default()
     }
 
     pub fn selected_window_layout(&self) -> Option<&crate::snapshot::MuxPaneLayout> {
-        let selected = self.selected_session.as_deref()?;
-        let session = self
-            .sessions
-            .iter()
-            .find(|session| session.id == selected || session.name == selected)?;
-        selected_window_for_session(session, self.selected_window.as_deref())
+        self.selected_window_snapshot()
             .and_then(|window| window.layout.as_ref())
     }
 
@@ -801,9 +780,8 @@ impl MuxController {
         let recovering = self.refresh_failed;
         let outcome = self.refresh_sessions_inner(repaint, config, interval);
         if let Some(error) = &outcome.error {
-            self.last_error = Some(error.clone());
+            self.set_availability_error(Some(error.clone()));
             self.refresh_failed = true;
-            self.availability_error = Some(BindingAvailabilityError::Runtime(error.clone()));
         }
         if outcome.applied {
             let backend_changed = self
@@ -815,8 +793,7 @@ impl MuxController {
             }
             self.observed_backend = self.current_backend;
             if outcome.error.is_none() {
-                self.last_error = None;
-                self.availability_error = None;
+                self.set_availability_error(None);
                 self.refresh_failed = false;
             }
             self.record_resource_snapshot();
@@ -1061,15 +1038,13 @@ impl MuxController {
             session_id: session_id.to_owned(),
             window_id: window_id.to_owned(),
         };
-        if self
-            .execute_inline_command(
+        if self.registry.command_dispatch(config) == MuxCommandDispatch::CallerThread {
+            self.execute_and_apply_inline_command(
                 config,
-                command.clone(),
+                command,
                 Some(session_id.to_owned()),
                 Some(window_id.to_owned()),
-            )
-            .is_ok()
-        {
+            );
             repaint();
             return;
         }
@@ -1141,15 +1116,13 @@ impl MuxController {
         config: &MuxBindingConfig,
         command: MuxCommand,
     ) {
-        if self
-            .execute_inline_command(
+        if self.registry.command_dispatch(config) == MuxCommandDispatch::CallerThread {
+            self.execute_and_apply_inline_command(
                 config,
-                command.clone(),
+                command,
                 self.selected_session.clone(),
                 self.selected_window.clone(),
-            )
-            .is_ok()
-        {
+            );
             repaint();
             return;
         }
@@ -1177,17 +1150,17 @@ impl MuxController {
             cwd: request.cwd,
         };
         self.expected_session = Some(request.session_id.clone());
-        if self
-            .execute_inline_command(
+        if self.registry.command_dispatch(config) == MuxCommandDispatch::CallerThread {
+            let succeeded = self.execute_and_apply_inline_command(
                 config,
-                command.clone(),
-                Some(request.session_id.clone()),
+                command,
+                Some(request.session_id),
                 None,
-            )
-            .is_ok()
-        {
+            );
             repaint();
-            self.record_resource_snapshot();
+            if succeeded {
+                self.record_resource_snapshot();
+            }
             return;
         }
         self.activate_session(&request.session_id);
@@ -1256,17 +1229,17 @@ impl MuxController {
             return;
         }
         let (selected_session, preferred_window) = self.command_completion(&command);
-        if self
-            .execute_inline_command(
+        if self.registry.command_dispatch(config) == MuxCommandDispatch::CallerThread {
+            let succeeded = self.execute_and_apply_inline_command(
                 config,
-                command.clone(),
-                selected_session.clone(),
-                preferred_window.clone(),
-            )
-            .is_ok()
-        {
+                command,
+                selected_session,
+                preferred_window,
+            );
             repaint();
-            self.record_resource_snapshot();
+            if succeeded {
+                self.record_resource_snapshot();
+            }
             return;
         }
         let selected_window = self.apply_optimistic_command_selection(&command);
@@ -1312,12 +1285,7 @@ impl MuxController {
         }
         if command_dispatch == MuxCommandDispatch::CallerThread {
             let result = self
-                .execute_inline_command(
-                    config,
-                    command,
-                    completion.selected_session.clone(),
-                    completion.selected_window.clone(),
-                )
+                .execute_inline_command(config, command)
                 .map(|snapshot| MuxCommandCompletion::from_snapshot(config.clone(), snapshot));
             let _ = response_tx.send(result);
             repaint();
@@ -1346,16 +1314,10 @@ impl MuxController {
     }
 
     fn execute_inline_command(
-        &mut self,
+        &self,
         config: &MuxBindingConfig,
         command: MuxCommand,
-        preferred_session: Option<String>,
-        preferred_window: Option<String>,
     ) -> Result<MuxSnapshot, MuxCommandError> {
-        if self.registry.command_dispatch(config) != MuxCommandDispatch::CallerThread {
-            return Err(MuxCommandError::Unavailable);
-        }
-        let backend_kind = self.registry.selected_kind(config);
         let mut backend = self.build_backend(config);
         execute_backend_command(
             &self.registry,
@@ -1369,15 +1331,27 @@ impl MuxController {
                 .snapshot()
                 .map_err(|error| MuxCommandError::Failed(error.to_string()))
         })
-        .inspect(|snapshot| {
-            self.apply_snapshot(
-                backend_kind,
-                snapshot.clone(),
-                preferred_session,
-                preferred_window,
-            );
-            self.last_session_refresh = None;
-        })
+    }
+
+    fn execute_and_apply_inline_command(
+        &mut self,
+        config: &MuxBindingConfig,
+        command: MuxCommand,
+        preferred_session: Option<String>,
+        preferred_window: Option<String>,
+    ) -> bool {
+        let backend_kind = self.registry.selected_kind(config);
+        let result = self
+            .execute_inline_command(config, command)
+            .map(|snapshot| {
+                self.apply_snapshot(backend_kind, snapshot, preferred_session, preferred_window)
+            });
+        if result.is_err() {
+            self.expected_session = None;
+        }
+        self.last_session_refresh = None;
+        self.last_error = result.as_ref().err().map(ToString::to_string);
+        result.is_ok()
     }
 
     fn apply_refreshed_snapshot(&mut self, backend: MuxBackendKind, snapshot: MuxSnapshot) -> bool {

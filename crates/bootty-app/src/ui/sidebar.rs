@@ -6,56 +6,24 @@ use eframe::egui::Color32;
 
 use crate::{theme::module_color32, ui::session_navigation::BindingSessionGroup};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SidebarState {
-    pub focused: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum SidebarItemKind {
-    Group,
-    Session { active: bool },
-    Row,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SidebarItemId<'a> {
-    Binding(MuxScope),
-    Group { scope: MuxScope, name: &'a str },
-    Session { scope: MuxScope, id: &'a str },
-    Row(&'a str),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidebarDisplay<'a> {
-    Text(&'a str),
-    Numbered { number: usize, label: &'a str },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidebarTree {
-    None,
-    Middle,
-    Last,
-    Pipe,
-    Blank,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct SidebarItem<'a> {
-    pub id: SidebarItemId<'a>,
-    pub display: SidebarDisplay<'a>,
+    pub id: &'a str,
+    pub text: &'a str,
+    pub number: Option<usize>,
     pub indent: u16,
-    pub tree: SidebarTree,
+    pub tree: Option<&'a str>,
     pub selectable: bool,
     pub session_id: Option<&'a str>,
-    pub session_scope: Option<MuxScope>,
+    pub scope: MuxScope,
     pub reorder_anchor: Option<&'a str>,
     pub color: Color32,
     pub dim_color: Color32,
-    pub kind: SidebarItemKind,
+    pub kind: &'a str,
+    pub active: bool,
     pub current: bool,
     pub can_return_to_last_session: bool,
+    pub context_position: Option<(usize, usize)>,
     pub icon: Option<&'a str>,
     pub primitives: &'a [ModulePrimitive],
     pub extension_action: Option<ExtensionUiAction>,
@@ -65,36 +33,27 @@ pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec
     let mut items = Vec::new();
     for group in groups {
         items.push(SidebarItem {
-            id: SidebarItemId::Binding(group.scope),
-            display: SidebarDisplay::Text(&group.label),
+            id: &group.label,
+            text: &group.label,
+            number: None,
             indent: 0,
-            tree: SidebarTree::None,
+            tree: None,
             selectable: false,
             session_id: None,
-            session_scope: None,
+            scope: group.scope,
             reorder_anchor: None,
             color: Color32::WHITE,
             dim_color: Color32::GRAY,
-            kind: SidebarItemKind::Group,
+            kind: "group",
+            active: false,
             current: false,
             can_return_to_last_session: false,
+            context_position: None,
             icon: Some("terminal"),
             primitives: &[],
             extension_action: None,
         });
-        let display_names = group
-            .sessions
-            .iter()
-            .map(|session| group.display_name(session))
-            .collect::<Vec<_>>();
-        let mut binding_items = build_sidebar_items_inner(
-            group.scope,
-            &group.sessions,
-            &display_names,
-            group.selected_session.as_deref(),
-            group.active,
-            group.can_return_to_last_session,
-        );
+        let mut binding_items = build_sidebar_items_inner(group);
         for item in &mut binding_items {
             item.indent = item.indent.saturating_add(2);
             item.reorder_anchor = None;
@@ -104,41 +63,26 @@ pub fn build_binding_sidebar_items<'a>(groups: &'a [BindingSessionGroup]) -> Vec
     items
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SidebarSessionColor<'a> {
-    pub session_id: &'a str,
-    pub color: Color32,
-    pub dim_color: Color32,
-}
-
 /// Session accents, grouped the same way the sidebar groups its rows: by the names bootty shows.
-pub fn sidebar_session_colors<'a>(
+pub fn sidebar_session_colors<'a, T: AsRef<str>>(
     sessions: &'a [MuxSession],
-    display_names: &[&'a str],
-) -> Vec<SidebarSessionColor<'a>> {
-    let mut group_meta = GroupMeta::new(sessions, display_names);
-    let dynamic_total = group_meta.dynamic_total;
+    display_names: &'a [T],
+) -> Vec<(Color32, Color32)> {
+    let mut group_meta = GroupMeta::new(sessions, display_names.iter().map(|name| name.as_ref()));
+    let dynamic_total = group_meta.groups.len();
     sessions
         .iter()
         .enumerate()
-        .filter_map(|(index, session)| {
-            let group_info = group_meta.session(index)?;
-            let group_total = if group_info.name.is_empty() {
+        .map(|(index, _)| {
+            let (group_index, group) = group_meta.session(index);
+            let group_total = if group.name.is_empty() {
                 0
             } else {
-                group_info.count
+                group.count
             };
-            let (color, dim_color) = computed_color(
-                group_info.index,
-                dynamic_total,
-                group_info.position,
-                group_total,
-            );
-            Some(SidebarSessionColor {
-                session_id: session.id.as_str(),
-                color,
-                dim_color,
-            })
+            let (color, dim_color) =
+                computed_color(group_index, dynamic_total, group.position, group_total);
+            (color, dim_color)
         })
         .collect()
 }
@@ -149,7 +93,7 @@ pub fn build_sidebar_items_from_published_items<'a>(
     selected_session: Option<&str>,
     can_return_to_last_session: bool,
 ) -> Vec<SidebarItem<'a>> {
-    items
+    let mut rows = items
         .iter()
         .filter_map(|published| {
             sidebar_item_from_module_item(
@@ -160,7 +104,24 @@ pub fn build_sidebar_items_from_published_items<'a>(
                 can_return_to_last_session,
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut positions = HashMap::new();
+    for id in rows
+        .iter()
+        .filter(|row| row.kind == "session")
+        .filter_map(|row| row.session_id)
+    {
+        let position = positions.len();
+        positions.entry(id).or_insert(position);
+    }
+    let count = positions.len();
+    for row in &mut rows {
+        row.context_position = row
+            .session_id
+            .and_then(|id| positions.get(id).copied())
+            .map(|position| (position, count));
+    }
+    rows
 }
 
 fn sidebar_item_from_module_item<'a>(
@@ -181,14 +142,6 @@ fn sidebar_item_from_module_item<'a>(
             item.text.as_str()
         }
     });
-    let display = if let Some(number) = item.number {
-        SidebarDisplay::Numbered {
-            number,
-            label: item.text.as_str(),
-        }
-    } else {
-        SidebarDisplay::Text(item.text.as_str())
-    };
     let selected = selected_session.is_some_and(|selected| {
         item.session_id.as_deref() == Some(selected) || item.text == selected
     });
@@ -198,131 +151,91 @@ fn sidebar_item_from_module_item<'a>(
     } else {
         item.current.unwrap_or(false)
     };
-    let sidebar_kind = match kind {
-        "group" => SidebarItemKind::Group,
-        "session" => SidebarItemKind::Session {
-            active: selected_session.map_or(item.active.unwrap_or(current), |_| current),
-        },
-        _ => SidebarItemKind::Row,
-    };
     let color = item.fg.map(module_color32).unwrap_or(Color32::WHITE);
     Some(SidebarItem {
-        id: sidebar_item_id(kind, scope, row_key, item.text.as_str()),
-        display,
+        id: row_key,
+        text: item.text.as_str(),
+        number: item.number,
         indent: item.indent.unwrap_or(0),
-        tree: sidebar_tree(item.tree.as_deref()),
+        tree: item.tree.as_deref(),
         selectable,
         session_id: item.session_id.as_deref(),
-        session_scope: item.session_id.as_ref().map(|_| scope),
+        scope,
         reorder_anchor: item.reorder_anchor.as_deref(),
         color,
         dim_color: item.dim_fg.map(module_color32).unwrap_or(color),
-        kind: sidebar_kind,
+        kind,
+        active: kind == "session"
+            && selected_session.map_or(item.active.unwrap_or(current), |_| current),
         current,
-        // Every row a session owns offers the same context menu, so the flag follows the session
-        // rather than the title row alone.
         can_return_to_last_session: item.session_id.is_some() && can_return_to_last_session,
+        context_position: None,
         icon: item.icon.as_deref(),
         primitives: &item.primitives,
         extension_action,
     })
 }
 
-fn sidebar_item_id<'a>(
-    kind: &str,
-    scope: MuxScope,
-    row_key: &'a str,
-    text: &'a str,
-) -> SidebarItemId<'a> {
-    match kind {
-        "group" => SidebarItemId::Group { scope, name: text },
-        "session" => SidebarItemId::Session { scope, id: row_key },
-        _ => SidebarItemId::Row(row_key),
-    }
-}
-
-fn sidebar_tree(value: Option<&str>) -> SidebarTree {
-    match value {
-        Some("middle") => SidebarTree::Middle,
-        Some("last") => SidebarTree::Last,
-        Some("pipe") => SidebarTree::Pipe,
-        Some("blank") => SidebarTree::Blank,
-        _ => SidebarTree::None,
-    }
-}
-
-fn build_sidebar_items_inner<'a>(
-    scope: MuxScope,
-    sessions: &'a [MuxSession],
-    display_names: &[&'a str],
-    selected_session: Option<&str>,
-    binding_active: bool,
-    can_return_to_last_session: bool,
-) -> Vec<SidebarItem<'a>> {
-    let mut group_meta = GroupMeta::new(sessions, display_names);
-    let full_capacity = sessions.len().saturating_mul(6);
+fn build_sidebar_items_inner<'a>(binding: &'a BindingSessionGroup) -> Vec<SidebarItem<'a>> {
+    let sessions = &binding.sessions;
+    let scope = binding.scope;
+    let mut group_meta = GroupMeta::new(
+        sessions,
+        sessions.iter().map(|session| binding.display_name(session)),
+    );
+    let group_count = group_meta.groups.len();
+    let full_capacity = sessions.len().saturating_mul(2);
     let mut items = Vec::with_capacity(full_capacity);
-    let mut ordinal = 0usize;
     let mut last_group = "";
 
     for (index, session) in sessions.iter().enumerate() {
-        let Some(group_info) = group_meta.session(index) else {
-            continue;
-        };
+        let (group_index, group_info) = group_meta.session(index);
         // Labels come from the name bootty shows; anchors and ids stay on the backend's.
-        let display_name = display_names
-            .get(index)
-            .copied()
-            .unwrap_or(session.name.as_str());
+        let display_name = binding.display_name(session);
         let group = group_info.name;
-        let group_index = group_info.index;
-        let group_count = group_info.count;
-        let group_total = if group.is_empty() { 0 } else { group_count };
-        let is_grouped = !group.is_empty() && group_total > 1;
-        let is_last_in_group =
-            is_grouped && group_meta.session_group_index(index + 1) != Some(group_index);
-        let session_tree = if !is_grouped {
-            SidebarTree::None
-        } else if is_last_in_group {
-            SidebarTree::Last
+        let group_total = if group.is_empty() {
+            0
         } else {
-            SidebarTree::Middle
+            group_info.count
+        };
+        let is_grouped = group_total > 1;
+        let is_last_in_group =
+            is_grouped && group_meta.session_groups.get(index + 1).copied() != Some(group_index);
+        let session_tree = if !is_grouped {
+            None
+        } else if is_last_in_group {
+            Some("last")
+        } else {
+            Some("middle")
         };
 
-        let (color, dim_color) = computed_color(
-            group_index,
-            group_meta.dynamic_total,
-            group_info.position,
-            group_total,
-        );
-        let selected = binding_active
-            && if selected_session.is_some() {
-                selected_session == Some(session.id.as_str())
-                    || selected_session == Some(session.name.as_str())
-            } else {
-                session.active
-            };
+        let (color, dim_color) =
+            computed_color(group_index, group_count, group_info.position, group_total);
+        let selected = binding.session_is_current(session);
         let reorder_anchor = if is_grouped {
             group_info.leader_session
         } else {
             session.name.as_str()
         };
-        let (display, session_indent) = if is_grouped {
+        let (text, number, indent) = if is_grouped {
             if group != last_group {
                 items.push(SidebarItem {
-                    id: SidebarItemId::Group { scope, name: group },
-                    display: SidebarDisplay::Text(group),
+                    id: group,
+                    text: group,
+                    number: None,
                     indent: 0,
-                    tree: SidebarTree::None,
+                    tree: None,
                     selectable: false,
                     session_id: None,
-                    session_scope: None,
+                    scope,
                     reorder_anchor: Some(reorder_anchor),
                     color,
                     dim_color,
-                    kind: SidebarItemKind::Group,
+                    kind: "group",
+                    active: false,
                     current: false,
                     can_return_to_last_session: false,
+                    context_position: None,
                     icon: None,
                     primitives: &[],
                     extension_action: None,
@@ -330,43 +243,33 @@ fn build_sidebar_items_inner<'a>(
             }
             let suffix = session_suffix(display_name);
             let label = if suffix.is_empty() { group } else { suffix };
-            let display = SidebarDisplay::Numbered {
-                number: ordinal + 1,
-                label,
-            };
-            ordinal += 1;
-            (display, 2)
+            (label, Some(index + 1), 2)
         } else {
             let label = if group.is_empty() {
                 display_name
             } else {
                 group
             };
-            let display = SidebarDisplay::Numbered {
-                number: ordinal + 1,
-                label,
-            };
-            ordinal += 1;
-            (display, 0)
+            (label, Some(index + 1), 0)
         };
 
         items.push(SidebarItem {
-            id: SidebarItemId::Session {
-                scope,
-                id: session.id.as_str(),
-            },
-            display,
-            indent: session_indent,
+            id: session.id.as_str(),
+            text,
+            number,
+            indent,
             tree: session_tree,
             selectable: true,
             session_id: Some(session.id.as_str()),
-            session_scope: Some(scope),
+            scope,
             reorder_anchor: Some(reorder_anchor),
             color,
             dim_color,
-            kind: SidebarItemKind::Session { active: selected },
+            kind: "session",
+            active: selected,
             current: selected,
-            can_return_to_last_session,
+            can_return_to_last_session: binding.can_return_to_last_session,
+            context_position: Some((index, sessions.len())),
             icon: None,
             primitives: &[],
             extension_action: None,
@@ -385,27 +288,17 @@ pub fn session_suffix(name: &str) -> &str {
     name.split_once('/').map_or("", |(_, suffix)| suffix)
 }
 
-#[derive(Debug)]
-struct GroupSummary<'a> {
+#[derive(Clone, Copy, Debug)]
+struct Group<'a> {
     name: &'a str,
     leader_session: &'a str,
-    count: usize,
-    position: usize,
-}
-
-#[derive(Debug)]
-struct GroupSession<'a> {
-    name: &'a str,
-    leader_session: &'a str,
-    index: usize,
     count: usize,
     position: usize,
 }
 
 struct GroupMeta<'a> {
-    groups: Vec<GroupSummary<'a>>,
+    groups: Vec<Group<'a>>,
     session_groups: Vec<usize>,
-    dynamic_total: usize,
 }
 
 impl<'a> GroupMeta<'a> {
@@ -413,17 +306,15 @@ impl<'a> GroupMeta<'a> {
     /// project into two groups. `display_names` pairs with `sessions` by position and may be short,
     /// in which case the backend name stands in. `leader_session` stays a backend name: it is the
     /// reorder anchor, an identity rather than a label.
-    fn new(sessions: &'a [MuxSession], display_names: &[&'a str]) -> Self {
-        let mut groups = Vec::<GroupSummary<'a>>::new();
-        let mut session_groups = Vec::with_capacity(sessions.len());
+    fn new(
+        display_sessions: &'a [MuxSession],
+        mut display_names: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let mut groups = Vec::<Group<'a>>::new();
+        let mut session_groups = Vec::with_capacity(display_sessions.len());
         let mut lookup = HashMap::<&'a str, usize>::new();
-        for (index, session) in sessions.iter().enumerate() {
-            let group = session_group(
-                display_names
-                    .get(index)
-                    .copied()
-                    .unwrap_or(session.name.as_str()),
-            );
+        for session in display_sessions {
+            let group = session_group(display_names.next().unwrap_or(session.name.as_str()));
             if let Some(index) = lookup.get(group).copied() {
                 groups[index].count += 1;
                 session_groups.push(index);
@@ -431,7 +322,7 @@ impl<'a> GroupMeta<'a> {
             }
 
             let index = groups.len();
-            groups.push(GroupSummary {
+            groups.push(Group {
                 name: group,
                 leader_session: session.name.as_str(),
                 count: 1,
@@ -440,32 +331,26 @@ impl<'a> GroupMeta<'a> {
             session_groups.push(index);
             lookup.insert(group, index);
         }
-        let dynamic_total = groups.len();
         Self {
             groups,
             session_groups,
-            dynamic_total,
         }
     }
 
-    fn session_group_index(&self, index: usize) -> Option<usize> {
-        self.session_groups.get(index).copied()
-    }
-
-    fn session(&mut self, index: usize) -> Option<GroupSession<'a>> {
-        let group_index = self.session_group_index(index)?;
-        let summary = self.groups.get_mut(group_index)?;
+    fn session(&mut self, index: usize) -> (usize, Group<'a>) {
+        let group_index = self.session_groups[index];
+        let summary = &mut self.groups[group_index];
         let position = summary.position;
         if !summary.name.is_empty() {
             summary.position += 1;
         }
-        Some(GroupSession {
-            name: summary.name,
-            leader_session: summary.leader_session,
-            index: group_index,
-            count: summary.count,
-            position,
-        })
+        (
+            group_index,
+            Group {
+                position,
+                ..*summary
+            },
+        )
     }
 }
 
@@ -508,9 +393,6 @@ fn hsl_to_color(hue: f64, saturation: f64, lightness: f64) -> Color32 {
         4 => (x, 0.0, c),
         _ => (c, 0.0, x),
     };
-    Color32::from_rgb(
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    )
+    let channel = |value| ((value + m) * 255.0) as u8;
+    Color32::from_rgb(channel(r), channel(g), channel(b))
 }

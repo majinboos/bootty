@@ -194,14 +194,9 @@ impl Default for InputConfig {
 
 impl Default for BoottyConfig {
     fn default() -> Self {
-        let appearance = AppearanceConfig::default();
-        let theme = appearance.dark.theme.clone();
-        let colors = appearance.dark.colors.clone();
         Self {
             version: 1,
-            appearance,
-            theme,
-            colors,
+            appearance: AppearanceConfig::default(),
             cursor: CursorConfig::default(),
             font: FontConfig::default(),
             chrome: ChromeConfig::default(),

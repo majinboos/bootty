@@ -9,6 +9,7 @@ use bootty_command::{
 };
 use bootty_control::ControlCatalog;
 use bootty_extension::{ExtensionCatalog, ExtensionInvocationSender};
+use bootty_mux::controller::MuxScope;
 
 use crate::{
     action_catalog::Command,
@@ -18,6 +19,38 @@ use crate::{
 mod runtime;
 
 pub(crate) use runtime::CommandRuntime;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExactMuxTarget {
+    Binding(MuxScope),
+    Session(MuxScope, String),
+    Window(MuxScope, String, String),
+    Pane(MuxScope, String, String, String),
+}
+
+impl ExactMuxTarget {
+    pub(crate) fn window(scope: MuxScope, session_id: &str, window_id: &str) -> Self {
+        Self::Window(scope, session_id.to_owned(), window_id.to_owned())
+    }
+
+    pub(crate) fn scope(&self) -> MuxScope {
+        match self {
+            Self::Binding(scope)
+            | Self::Session(scope, ..)
+            | Self::Window(scope, ..)
+            | Self::Pane(scope, ..) => *scope,
+        }
+    }
+
+    pub(crate) fn ids(&self) -> (Option<&str>, Option<&str>, Option<&str>) {
+        match self {
+            Self::Binding(_) => (None, None, None),
+            Self::Session(_, session) => (Some(session), None, None),
+            Self::Window(_, session, window) => (Some(session), Some(window), None),
+            Self::Pane(_, session, window, pane) => (Some(session), Some(window), Some(pane)),
+        }
+    }
+}
 
 pub fn command_invocation_from_catalog(
     command: Command,
@@ -72,13 +105,9 @@ impl CommandRegistry {
 
     pub fn palette_commands(&self) -> impl Iterator<Item = Command> + '_ {
         Command::all().filter(|command| {
-            let id = command
-                .action()
-                .split_once(':')
-                .map_or(command.action(), |(id, _)| id);
             command.palette_action().is_some()
                 && self
-                    .describe(id)
+                    .describe(command.id())
                     .is_some_and(|descriptor| descriptor.palette)
         })
     }
@@ -124,20 +153,9 @@ impl CommandRegistry {
     fn from_core_commands() -> Self {
         let mut commands = BTreeMap::new();
         for command in Command::all() {
-            let action = command.action();
-            let id = action.split_once(':').map_or(action, |(id, _)| id);
-            let (title, description) = descriptor_metadata(id, command);
-            let descriptor = CommandDescriptor {
-                id: id.to_owned(),
-                title: title.to_owned(),
-                description: description.to_owned(),
-                mutation: mutation_for(id),
-                arguments: schema_for(id),
-                target: target_for(id),
-                palette: command.palette_action().is_some(),
-            };
+            let descriptor = command.descriptor();
             commands
-                .entry(id.to_owned())
+                .entry(descriptor.id.clone())
                 .and_modify(|existing: &mut RegisteredCommand| {
                     existing.descriptor.palette |= descriptor.palette;
                 })
@@ -314,24 +332,6 @@ impl CommandCatalog {
     }
 }
 
-fn descriptor_metadata(id: &str, command: Command) -> (&str, &str) {
-    match id {
-        "change_appearance" => (
-            "Change Appearance",
-            "Use the system, light, or dark appearance.",
-        ),
-        "move_tab" => (
-            "Move Tab",
-            "Move the selected tab by the signed position delta.",
-        ),
-        "navigate_search" => (
-            "Navigate Search",
-            "Move to the next or previous terminal search match.",
-        ),
-        _ => (command.title(), command.description()),
-    }
-}
-
 fn sidebar_descriptor(action: SidebarAction) -> CommandDescriptor {
     let (title, description) = match action {
         SidebarAction::Ignore => (
@@ -414,55 +414,6 @@ fn validate_arguments(
     Ok(())
 }
 
-fn schema_for(id: &str) -> CompactSchema {
-    let argument = match id {
-        "select_tab" | "select_session" | "select_space" => {
-            Some(bounded_integer("index", 1, i64::from(u32::MAX)))
-        }
-        "move_tab" | "move_session" => Some(bounded_integer(
-            "delta",
-            i64::from(i32::MIN),
-            i64::from(i32::MAX),
-        )),
-        "scroll_page_lines" => Some(bounded_integer(
-            "delta",
-            i64::from(i16::MIN),
-            i64::from(i16::MAX),
-        )),
-        "increase_font_size" | "decrease_font_size" | "set_font_size" => {
-            Some(argument("size", ValueType::Number))
-        }
-        "select_pane" => Some(choice("direction", true, &["left", "right", "up", "down"])),
-        "change_appearance" => Some(choice("appearance", true, &["system", "light", "dark"])),
-        "navigate_search" => Some(choice("direction", true, &["next", "previous"])),
-        "copy_to_clipboard" => Some(choice("format", false, &["plain", "vt", "html", "mixed"])),
-        "csi" | "esc" | "text" | "search" => Some(argument("value", ValueType::String)),
-        _ => None,
-    };
-    CompactSchema {
-        arguments: argument.into_iter().collect(),
-    }
-}
-
-fn bounded_integer(name: &str, minimum: i64, maximum: i64) -> ArgumentSchema {
-    ArgumentSchema {
-        minimum: Some(minimum),
-        maximum: Some(maximum),
-        ..argument(name, ValueType::Integer)
-    }
-}
-
-fn choice(name: &str, required: bool, choices: &[&str]) -> ArgumentSchema {
-    ArgumentSchema {
-        name: name.to_owned(),
-        value_type: ValueType::String,
-        required,
-        choices: choices.iter().map(|choice| (*choice).to_owned()).collect(),
-        minimum: None,
-        maximum: None,
-    }
-}
-
 fn argument(name: &str, value_type: ValueType) -> ArgumentSchema {
     ArgumentSchema {
         name: name.to_owned(),
@@ -482,80 +433,6 @@ fn resource_kind(value: &str) -> Option<ResourceKind> {
         "mux_window" => Some(ResourceKind::MuxWindow),
         "pane" => Some(ResourceKind::Pane),
         "terminal" => Some(ResourceKind::Terminal),
-        _ => None,
-    }
-}
-
-fn mutation_for(id: &str) -> MutationClass {
-    const DESTRUCTIVE: &[&str] = &[
-        "close_space",
-        "close_surface",
-        "close_window",
-        "ditch_session",
-        "kill_pane",
-        "quit",
-    ];
-    const READ_ONLY: &[&str] = &["show_keybinds", "terminal.read"];
-    if DESTRUCTIVE.contains(&id) {
-        MutationClass::Destructive
-    } else if READ_ONLY.contains(&id) {
-        MutationClass::Read
-    } else {
-        MutationClass::Write
-    }
-}
-
-fn target_for(id: &str) -> Option<ResourceKind> {
-    match id {
-        "quit" => Some(ResourceKind::Instance),
-        "close_window"
-        | "toggle_fullscreen"
-        | "toggle_sidebar_focus"
-        | "toggle_sidebar_visibility"
-        | "open_settings"
-        | "change_appearance"
-        | "switch_theme"
-        | "reload_config"
-        | "create_space"
-        | "next_space"
-        | "previous_space"
-        | "select_space"
-        | "show_keybinds"
-        | "command_palette"
-        | "increase_font_size"
-        | "decrease_font_size"
-        | "reset_font_size"
-        | "set_font_size" => Some(ResourceKind::ApplicationWindow),
-        "new_window" | "new_mux_session" | "session_picker" | "next_session"
-        | "previous_session" | "last_session" | "select_session" | "close_space" | "edit_space" => {
-            Some(ResourceKind::Binding)
-        }
-        "new_tab" | "rename_session" | "ditch_session" | "move_session" | "next_tab"
-        | "previous_tab" | "last_tab" | "select_tab" => Some(ResourceKind::Session),
-        "move_tab" | "rename_tab" | "select_pane" | "next_pane" | "previous_pane" => {
-            Some(ResourceKind::MuxWindow)
-        }
-        "split_right" | "split_down" | "kill_pane" | "close_surface" | "toggle_pane_zoom" => {
-            Some(ResourceKind::Pane)
-        }
-        "scroll_to_top"
-        | "scroll_to_bottom"
-        | "scroll_page_up"
-        | "scroll_page_down"
-        | "scroll_page_lines"
-        | "start_search"
-        | "search"
-        | "search_selection"
-        | "navigate_search"
-        | "end_search"
-        | "copy_to_clipboard"
-        | "copy_mode"
-        | "paste_from_clipboard"
-        | "csi"
-        | "esc"
-        | "text"
-        | "terminal.read"
-        | "terminal.write" => Some(ResourceKind::Terminal),
         _ => None,
     }
 }

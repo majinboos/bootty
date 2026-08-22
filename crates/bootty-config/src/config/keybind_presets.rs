@@ -377,13 +377,13 @@ pub(super) fn navigation_keybinds() -> &'static [&'static str] {
         "right_alt+shift+,=move_tab:-1",
         "left_alt+shift+.=move_tab:1",
         "right_alt+shift+.=move_tab:1",
-        "alt+h=select_pane:left",
-        "alt+j=select_pane:down",
-        "alt+k=select_pane:up",
-        "alt+l=select_pane:right",
-        "alt+o=next_pane",
-        "alt+x=kill_pane",
-        "alt+z=toggle_pane_zoom",
+        "alt+shift+h=select_pane:left",
+        "alt+shift+j=select_pane:down",
+        "alt+shift+k=select_pane:up",
+        "alt+shift+l=select_pane:right",
+        "alt+shift+o=next_pane",
+        "alt+shift+x=kill_pane",
+        "alt+shift+z=toggle_pane_zoom",
     ]
 }
 

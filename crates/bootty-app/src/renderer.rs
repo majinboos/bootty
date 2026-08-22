@@ -263,7 +263,7 @@ impl TerminalWidget {
                 rect.max.y - 1.0,
                 egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
             );
-            if hyperlink_activation_requested(response.clicked(), modifiers) {
+            if response.clicked() && modifiers.command {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(link.url));
             }
         } else if response.hovered() {
@@ -590,12 +590,9 @@ impl TerminalRenderCache {
     }
 }
 
-fn is_uninitialized_frame(frame: &RenderFrame) -> bool {
-    frame.cols == 0 || frame.rows == 0
-}
-
 fn is_transition_placeholder_frame(frame: &RenderFrame) -> bool {
-    is_uninitialized_frame(frame)
+    frame.cols == 0
+        || frame.rows == 0
         || (frame.cells.is_empty()
             && frame.text.is_empty()
             && frame.images.placements.is_empty()
@@ -770,10 +767,6 @@ impl ScrollbarVisibility {
         self.last_offset = Some(scrollbar.offset);
         self.active_until.is_some_and(|until| now <= until)
     }
-}
-
-fn hyperlink_activation_requested(clicked: bool, modifiers: egui::Modifiers) -> bool {
-    clicked && modifiers.command
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -992,25 +985,15 @@ fn paint_terminal_content(
     target_format: Option<wgpu::TextureFormat>,
     view: ViewTransform,
 ) {
-    let Some(callback) = terminal_render_shape(renderer_id, frame, target_format, view) else {
+    let Some(callback) = target_format.and_then(|target_format| {
+        terminal_render_callback_for_renderer(renderer_id, frame, target_format, view)
+    }) else {
         return;
     };
-    ui.painter_at(egui_rect(frame.surface)).add(callback);
-}
-
-fn terminal_render_shape(
-    renderer_id: TerminalRendererId,
-    frame: &TerminalRenderFrame,
-    target_format: Option<wgpu::TextureFormat>,
-    view: ViewTransform,
-) -> Option<egui::Shape> {
-    let target_format = target_format?;
-    terminal_render_callback_for_renderer(renderer_id, frame, target_format, view)
-}
-
-fn egui_rect(rect: SurfaceRect) -> Rect {
-    Rect::from_min_max(
+    let rect = frame.surface;
+    ui.painter_at(Rect::from_min_max(
         Pos2::new(rect.min_x, rect.min_y),
         Pos2::new(rect.max_x, rect.max_y),
-    )
+    ))
+    .add(callback);
 }

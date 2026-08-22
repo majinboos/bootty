@@ -31,7 +31,6 @@ fn parse_stored_backend(value: &str, binding_id: i64) -> Result<Option<Multiplex
         "native" => Some(MultiplexerBackendConfig::Native),
         "rmux" => Some(MultiplexerBackendConfig::Rmux),
         "tmux" => Some(MultiplexerBackendConfig::Tmux),
-        "zellij" => Some(MultiplexerBackendConfig::Zellij),
         _ => bail!("legacy binding {binding_id} has unknown backend {value:?}"),
     };
     Ok(backend)
@@ -141,7 +140,8 @@ fn required_table_columns(
     let columns = table_columns(transaction, table)?;
     if let Some(column) = required
         .iter()
-        .find(|column| !columns.iter().any(|existing| existing == *column))
+        .copied()
+        .find(|column| !columns.contains(*column))
     {
         bail!("legacy catalog table {table} is missing required column {column}")
     }
@@ -411,7 +411,7 @@ fn load_ungrouped_sessions(
     transaction: &Transaction<'_>,
     binding_ids: &HashSet<i64>,
 ) -> Result<HashMap<i64, Vec<String>>> {
-    let mut sessions = Vec::new();
+    let mut ordered = HashMap::new();
     let mut names = HashSet::new();
     let mut positions = HashSet::new();
     let mut statement = transaction.prepare(
@@ -443,10 +443,6 @@ fn load_ungrouped_sessions(
         {
             bail!("legacy workspace session has an invalid row")
         }
-        sessions.push(session);
-    }
-    let mut ordered = HashMap::new();
-    for session in sessions {
         ordered
             .entry(session.binding_id)
             .or_insert_with(Vec::new)
@@ -475,26 +471,21 @@ fn build_plan(
         let Some(remote_id) = space.remote_id.filter(|remote_id| !remote_id.is_empty()) else {
             continue;
         };
-        let mut candidates = Vec::new();
-        for binding in bindings_by_space
+        let mut candidates = bindings_by_space
             .get(&space.database_id)
             .into_iter()
             .flatten()
-        {
-            let effective = binding.backend.unwrap_or(config.multiplexer.backend);
-            let Some(backend) = destination_backend(effective) else {
-                continue;
-            };
-            if binding.local {
-                candidates.push((binding.id, backend));
-            }
-        }
-        if candidates.len() > 1 {
-            bail!("legacy workspace Space {remote_id:?} has ambiguous local bindings")
-        }
-        let Some((binding_id, backend)) = candidates.pop() else {
+            .filter(|binding| binding.local)
+            .filter_map(|binding| {
+                destination_backend(binding.backend.unwrap_or(config.multiplexer.backend))
+                    .map(|backend| (binding.id, backend))
+            });
+        let Some((binding_id, backend)) = candidates.next() else {
             continue;
         };
+        if candidates.next().is_some() {
+            bail!("legacy workspace Space {remote_id:?} has ambiguous local bindings")
+        }
         if !imported_names.insert(space.name.clone()) {
             bail!("legacy workspace Spaces contain duplicate imported names")
         }
@@ -514,7 +505,6 @@ fn destination_backend(backend: MultiplexerBackendConfig) -> Option<Backend> {
         MultiplexerBackendConfig::Native => None,
         MultiplexerBackendConfig::Rmux => Some(Backend::Rmux),
         MultiplexerBackendConfig::Tmux => Some(Backend::Tmux),
-        MultiplexerBackendConfig::Zellij => Some(Backend::Zellij),
     }
 }
 

@@ -112,7 +112,7 @@ position = "left" # or "right"
 
 [multiplexer]
 # native keeps mux state and terminals inside Bootty. rmux renders through
-# rmux-sdk. tmux and zellij attach through their backend UI.
+# rmux-sdk. tmux attaches through its backend UI.
 backend = "native"
 # tmux backend only: hide tmux's own status bar inside Bootty's client by
 # toggling the attached session's status option off (restored on detach), so
@@ -267,13 +267,13 @@ native = [
   "alt+9=select_tab:9",
   "left_alt+shift+,=move_tab:-1",
   "left_alt+shift+.=move_tab:1",
-  "alt+h=select_pane:left",
-  "alt+j=select_pane:down",
-  "alt+k=select_pane:up",
-  "alt+l=select_pane:right",
-  "alt+o=next_pane",
-  "alt+x=kill_pane",
-  "alt+z=toggle_pane_zoom",
+  "alt+shift+h=select_pane:left",
+  "alt+shift+j=select_pane:down",
+  "alt+shift+k=select_pane:up",
+  "alt+shift+l=select_pane:right",
+  "alt+shift+o=next_pane",
+  "alt+shift+x=kill_pane",
+  "alt+shift+z=toggle_pane_zoom",
   "cmd+y=scroll_page_up",
   "cmd+shift+y=scroll_page_down",
   "cmd+ArrowUp=scroll_page_lines:-1",

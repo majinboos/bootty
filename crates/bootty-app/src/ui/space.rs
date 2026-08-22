@@ -1,11 +1,6 @@
-use std::{
-    collections::hash_map::DefaultHasher,
-    hash::{Hash, Hasher},
-    sync::mpsc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::LazyLock;
 
-use bootty_config::config::{MultiplexerBackendConfig, SshProfileConfig, SshRemoteConfig};
+use bootty_config::config::{MultiplexerBackendConfig, SshProfileConfig};
 use bootty_mux::controller::SpaceId;
 use bootty_ui::overlay::{FloatingWindow, TextPrompt};
 use bootty_ui::{
@@ -16,21 +11,14 @@ use bootty_ui::{
 use eframe::egui;
 use iconflow::{Pack, list};
 
-use crate::remote_catalog::{self, RemoteSpaceSummary};
+use crate::remote_catalog::{RemoteCatalogResult, RemoteCatalogTask, RemoteSpaceSummary};
 use bootty_workspace::{
     DEFAULT_SPACE_COLOR, RemoteSpaceRef, SpaceMuxOverride, SpaceRemoteOverride,
 };
 
 #[derive(Debug)]
 pub struct SpaceEditorDialog {
-    space_id: Option<SpaceId>,
-    name: String,
-    icon: String,
-    color: [u8; 3],
-    tint_sidebar: bool,
-    backend: Option<MultiplexerBackendConfig>,
-    remote: RemoteFields,
-    remote_source: SpaceRemoteOverride,
+    draft: SpaceDraft,
     profiles: Vec<(String, SshProfileConfig)>,
     catalog: RemoteCatalogState,
     new_remote_space_name: String,
@@ -39,135 +27,40 @@ pub struct SpaceEditorDialog {
     icon_search: String,
 }
 
-#[derive(Debug)]
-struct RemoteCatalogResult {
-    spaces: Vec<RemoteSpaceSummary>,
-    selected: Option<RemoteSpaceSummary>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpaceDraft {
+    pub space_id: Option<SpaceId>,
+    pub name: String,
+    pub icon: String,
+    pub color: [u8; 3],
+    pub tint_sidebar: bool,
+    pub backend: Option<MultiplexerBackendConfig>,
+    pub remote_source: SpaceRemoteOverride,
 }
 
 #[derive(Debug, Default)]
 enum RemoteCatalogState {
     #[default]
     Idle,
-    Running {
-        profile_id: String,
-        receiver: mpsc::Receiver<Result<RemoteCatalogResult, String>>,
-    },
-    Ready {
-        profile_id: String,
-        spaces: Vec<RemoteSpaceSummary>,
-    },
-    Failed {
-        profile_id: String,
-        error: String,
-    },
+    Running(RemoteCatalogTask),
+    Ready(Vec<RemoteSpaceSummary>, Option<String>),
+    Failed(String),
 }
-/// The remote connection as typed. Held as text so a half-written port or host does not have to
-/// parse on every keystroke; it becomes an [`SshRemoteConfig`] when the space is saved.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RemoteFields {
-    host: String,
-    user: String,
-    port: String,
-    program: String,
-    flags: String,
-}
-
-impl RemoteFields {
-    fn from_config(remote: Option<&SshRemoteConfig>) -> Self {
-        let Some(remote) = remote else {
-            return Self::default();
-        };
-        Self {
-            host: remote.host.clone(),
-            user: remote.user.clone().unwrap_or_default(),
-            port: remote.port.map(|port| port.to_string()).unwrap_or_default(),
-            program: remote.program.clone(),
-            flags: remote.args.join(" "),
-        }
-    }
-
-    /// The remote to save, or `None` when no host is named: a remote without a host reaches
-    /// nothing, and the rest of the fields describe how to reach a host that is not there.
-    fn to_config(&self) -> Option<SshRemoteConfig> {
-        let host = self.host.trim();
-        if host.is_empty() {
-            return None;
-        }
-        let mut remote = SshRemoteConfig::for_host(host);
-        remote.user = nonempty(&self.user);
-        remote.port = self.port.trim().parse().ok();
-        if let Some(program) = nonempty(&self.program) {
-            remote.program = program;
-        }
-        remote.args = self
-            .flags
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        Some(remote)
-    }
-}
-
-fn nonempty(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty()).then(|| value.to_owned())
-}
-
-fn remote_text_edit(
-    ui: &mut egui::Ui,
-    value: &mut String,
-    theme: Theme,
-    hint: &str,
-    width: f32,
-) -> egui::Response {
-    let response = ui.allocate_ui_with_layout(
-        egui::vec2(width, 34.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            bootty_ui::themed_text_edit_singleline(ui, value, theme, |edit| {
-                edit.hint_text(hint).desired_width(width)
-            })
-        },
-    );
-    response.inner.union(response.response)
+struct SpacePresentation {
+    title: &'static str,
+    normalized_name: Option<String>,
+    can_save: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SpaceEditorEvent {
-    None,
+pub enum SpaceEditorIntent {
     Close,
-    Save {
-        space_id: Option<SpaceId>,
-        name: String,
-        icon: String,
-        color: [u8; 3],
-        tint_sidebar: bool,
-        mux: SpaceMuxOverride,
-    },
+    Save(SpaceDraft),
 }
 
 impl SpaceEditorDialog {
     pub fn new_space(icon: String, mux: SpaceMuxOverride) -> Self {
-        Self {
-            space_id: None,
-            name: String::new(),
-            icon,
-            color: DEFAULT_SPACE_COLOR,
-            tint_sidebar: false,
-            backend: mux.backend,
-            remote: RemoteFields::from_config(match &mux.remote {
-                SpaceRemoteOverride::Inline(remote) => Some(remote),
-                _ => None,
-            }),
-            remote_source: mux.remote,
-            profiles: Vec::new(),
-            catalog: RemoteCatalogState::Idle,
-            new_remote_space_name: String::new(),
-            new_remote_space_backend: MultiplexerBackendConfig::Tmux,
-            icon_search: String::new(),
-            focus: true,
-        }
+        Self::open(None, String::new(), icon, DEFAULT_SPACE_COLOR, false, mux)
     }
 
     pub fn edit_space(
@@ -178,18 +71,27 @@ impl SpaceEditorDialog {
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
     ) -> Self {
+        Self::open(Some(space_id), name, icon, color, tint_sidebar, mux)
+    }
+
+    fn open(
+        space_id: Option<SpaceId>,
+        name: String,
+        icon: String,
+        color: [u8; 3],
+        tint_sidebar: bool,
+        mux: SpaceMuxOverride,
+    ) -> Self {
         Self {
-            space_id: Some(space_id),
-            name,
-            icon,
-            color,
-            tint_sidebar,
-            backend: mux.backend,
-            remote: RemoteFields::from_config(match &mux.remote {
-                SpaceRemoteOverride::Inline(remote) => Some(remote),
-                _ => None,
-            }),
-            remote_source: mux.remote,
+            draft: SpaceDraft {
+                space_id,
+                name,
+                icon,
+                color,
+                tint_sidebar,
+                backend: mux.backend,
+                remote_source: mux.remote,
+            },
             profiles: Vec::new(),
             catalog: RemoteCatalogState::Idle,
             new_remote_space_name: String::new(),
@@ -207,15 +109,10 @@ impl SpaceEditorDialog {
         self
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> SpaceEditorEvent {
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> Option<SpaceEditorIntent> {
         self.poll_catalog();
-        let name = normalized_name(&self.name);
-        let title = if self.space_id.is_some() {
-            "Edit Space"
-        } else {
-            "New Space"
-        };
-        let result = FloatingWindow::new("space-editor-dialog", title)
+        let presentation = self.presentation();
+        let result = FloatingWindow::new("space-editor-dialog", presentation.title)
             .icon("shapes")
             .hint("Enter save   Esc close")
             .width(overlay::panel_width(ctx, 620.0, 420.0))
@@ -223,9 +120,14 @@ impl SpaceEditorDialog {
                 let submitted = TextPrompt::new("space-editor-name")
                     .caption("space name")
                     .hint("space name...")
-                    .validation(name.is_none().then_some("name cannot be empty"))
-                    .submit_disabled(name.is_none())
-                    .show(ui, theme, &mut self.name, &mut self.focus)
+                    .validation(
+                        presentation
+                            .normalized_name
+                            .is_none()
+                            .then_some("name cannot be empty"),
+                    )
+                    .submit_disabled(presentation.normalized_name.is_none())
+                    .show(ui, theme, &mut self.draft.name, &mut self.focus)
                     .submitted;
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
@@ -236,15 +138,18 @@ impl SpaceEditorDialog {
                             .color(palette.muted),
                     );
                     ui.add_space(6.0);
-                    egui::color_picker::color_edit_button_srgb(ui, &mut self.color);
+                    egui::color_picker::color_edit_button_srgb(ui, &mut self.draft.color);
                     ui.label(
-                        egui::RichText::new(color_hex(self.color))
+                        egui::RichText::new(color_hex(self.draft.color))
                             .monospace()
                             .size(12.0)
                             .color(palette.muted),
                     );
                 });
-                ui.checkbox(&mut self.tint_sidebar, "Tint sidebar with Space color");
+                ui.checkbox(
+                    &mut self.draft.tint_sidebar,
+                    "Tint sidebar with Space color",
+                );
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -254,20 +159,19 @@ impl SpaceEditorDialog {
                             .color(palette.muted),
                     );
                     ui.add_enabled_ui(
-                        !matches!(&self.remote_source, SpaceRemoteOverride::Profile(_)),
+                        !matches!(&self.draft.remote_source, SpaceRemoteOverride::Profile(_)),
                         |ui| {
                             egui::ComboBox::from_id_salt("space-editor-backend")
-                                .selected_text(backend_label(self.backend))
+                                .selected_text(backend_label(self.draft.backend))
                                 .show_ui(ui, |ui| {
                                     for backend in [
                                         None,
                                         Some(MultiplexerBackendConfig::Native),
                                         Some(MultiplexerBackendConfig::Rmux),
                                         Some(MultiplexerBackendConfig::Tmux),
-                                        Some(MultiplexerBackendConfig::Zellij),
                                     ] {
                                         ui.selectable_value(
-                                            &mut self.backend,
+                                            &mut self.draft.backend,
                                             backend,
                                             backend_label(backend),
                                         );
@@ -284,63 +188,56 @@ impl SpaceEditorDialog {
                         .color(palette.muted),
                 );
                 ui.add_space(4.0);
-                show_icon_search_field(ui, palette, &mut self.icon_search)
-                    .on_hover_text("Filter Phosphor and Lucide icons");
+                overlay::filter_field(
+                    ui,
+                    egui::Id::new("space-icon-search"),
+                    &mut self.icon_search,
+                    theme,
+                    "search icons...",
+                )
+                .on_hover_text("Filter Phosphor and Lucide icons");
                 ui.add_space(6.0);
-                show_icon_picker(ui, palette, &mut self.icon, &self.icon_search);
+                show_icon_picker(ui, palette, &mut self.draft.icon, &self.icon_search);
                 ui.add_space(16.0);
                 submitted
                     || ui
-                        .add_enabled(
-                            name.is_some() && self.remote_ready(),
-                            egui::Button::new("Save"),
-                        )
+                        .add_enabled(presentation.can_save, egui::Button::new("Save"))
                         .clicked()
             });
 
         if result.inner
-            && self.remote_ready()
-            && let Some(name) = name
+            && presentation.can_save
+            && let Some(name) = presentation.normalized_name
         {
-            return SpaceEditorEvent::Save {
-                space_id: self.space_id,
-                name,
-                icon: self.icon.clone(),
-                color: self.color,
-                tint_sidebar: self.tint_sidebar,
-                mux: SpaceMuxOverride {
-                    backend: self.backend,
-                    remote: match &self.remote_source {
-                        SpaceRemoteOverride::Inherit => self
-                            .remote
-                            .to_config()
-                            .map(SpaceRemoteOverride::Inline)
-                            .unwrap_or_default(),
-                        SpaceRemoteOverride::Inline(_) => self
-                            .remote
-                            .to_config()
-                            .map(SpaceRemoteOverride::Inline)
-                            .unwrap_or(SpaceRemoteOverride::Local),
-                        remote => remote.clone(),
-                    },
-                },
-            };
+            self.draft.name = name;
+            return Some(SpaceEditorIntent::Save(self.draft.clone()));
         }
         if result.escaped || result.clicked_outside {
-            return SpaceEditorEvent::Close;
+            return Some(SpaceEditorIntent::Close);
         }
-        SpaceEditorEvent::None
+        None
     }
-}
 
-impl SpaceEditorDialog {
+    fn presentation(&self) -> SpacePresentation {
+        let normalized_name = normalized_name(&self.draft.name);
+        SpacePresentation {
+            title: if self.draft.space_id.is_some() {
+                "Edit Space"
+            } else {
+                "New Space"
+            },
+            can_save: normalized_name.is_some() && self.remote_ready(),
+            normalized_name,
+        }
+    }
+
     /// The host this space's multiplexer runs on. Only for the backends bootty reaches through a
     /// client — the others keep their terminals in this process, with no host to name.
     fn remote_ui(&mut self, ui: &mut egui::Ui, theme: Theme) {
         self.location_ui(ui);
         if let Some(profile_id) = self.selected_profile_id() {
             self.catalog_ui(ui, theme, profile_id);
-        } else if matches!(&self.remote_source, SpaceRemoteOverride::Inline(_)) {
+        } else if matches!(&self.draft.remote_source, SpaceRemoteOverride::Inline(_)) {
             ui.label(
                 egui::RichText::new(
                     "Legacy inline SSH settings are preserved. Select an SSH profile to migrate.",
@@ -352,18 +249,13 @@ impl SpaceEditorDialog {
     }
 
     fn selected_profile_id(&self) -> Option<String> {
-        match &self.remote_source {
+        match &self.draft.remote_source {
             SpaceRemoteOverride::Profile(remote) => Some(remote.profile_id.clone()),
             _ => None,
         }
     }
 
     fn location_ui(&mut self, ui: &mut egui::Ui) {
-        let profiles = self
-            .profiles
-            .iter()
-            .map(|(id, profile)| (id.clone(), profile.name.clone()))
-            .collect::<Vec<_>>();
         let mut requested = None;
         ui.horizontal(|ui| {
             ui.label("location");
@@ -372,7 +264,7 @@ impl SpaceEditorDialog {
                 .show_ui(ui, |ui| {
                     if ui
                         .selectable_label(
-                            matches!(&self.remote_source, SpaceRemoteOverride::Inherit),
+                            matches!(&self.draft.remote_source, SpaceRemoteOverride::Inherit),
                             "Inherit",
                         )
                         .clicked()
@@ -381,22 +273,22 @@ impl SpaceEditorDialog {
                     }
                     if ui
                         .selectable_label(
-                            matches!(&self.remote_source, SpaceRemoteOverride::Local),
+                            matches!(&self.draft.remote_source, SpaceRemoteOverride::Local),
                             "This computer",
                         )
                         .clicked()
                     {
                         requested = Some(SpaceRemoteOverride::Local);
                     }
-                    for (profile_id, name) in profiles {
+                    for (profile_id, profile) in &self.profiles {
                         let selected = matches!(
-                            &self.remote_source,
+                            &self.draft.remote_source,
                             SpaceRemoteOverride::Profile(remote)
-                                if remote.profile_id == profile_id
+                                if remote.profile_id.as_str() == profile_id.as_str()
                         );
-                        if ui.selectable_label(selected, name).clicked() {
+                        if ui.selectable_label(selected, &profile.name).clicked() {
                             requested = Some(SpaceRemoteOverride::Profile(RemoteSpaceRef {
-                                profile_id,
+                                profile_id: profile_id.clone(),
                                 remote_space_id: String::new(),
                                 remote_space_name: String::new(),
                                 backend: MultiplexerBackendConfig::Tmux,
@@ -406,49 +298,32 @@ impl SpaceEditorDialog {
                 });
         });
         if let Some(remote) = requested {
-            self.remote_source = remote;
+            self.draft.remote_source = remote;
             self.catalog = RemoteCatalogState::Idle;
         }
     }
 
     fn catalog_ui(&mut self, ui: &mut egui::Ui, theme: Theme, profile_id: String) {
-        enum View {
-            Idle,
-            Running,
-            Ready(Vec<RemoteSpaceSummary>),
-            Failed(String),
-        }
-        let view = match &self.catalog {
-            RemoteCatalogState::Idle => View::Idle,
-            RemoteCatalogState::Running {
-                profile_id: current,
-                ..
-            } if current == &profile_id => View::Running,
-            RemoteCatalogState::Ready {
-                profile_id: current,
-                spaces,
-            } if current == &profile_id => View::Ready(spaces.clone()),
-            RemoteCatalogState::Failed {
-                profile_id: current,
-                error,
-            } if current == &profile_id => View::Failed(error.clone()),
-            _ => View::Idle,
-        };
-        match view {
-            View::Idle => self.start_catalog(ui.ctx(), &profile_id, None),
-            View::Running => {
+        match std::mem::take(&mut self.catalog) {
+            RemoteCatalogState::Idle => self.start_catalog(&profile_id, None),
+            RemoteCatalogState::Running(task) => {
                 ui.label("Loading remote Spaces...");
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_millis(50));
+                self.catalog = RemoteCatalogState::Running(task);
             }
-            View::Failed(error) => {
-                ui.label(egui::RichText::new(error).color(theme.palette.destructive));
+            RemoteCatalogState::Failed(error) => {
+                ui.label(egui::RichText::new(&error).color(theme.palette.destructive));
+                self.catalog = RemoteCatalogState::Failed(error);
                 if ui.button("Retry").clicked() {
-                    self.start_catalog(ui.ctx(), &profile_id, None);
+                    self.start_catalog(&profile_id, None);
                 }
             }
-            View::Ready(spaces) => {
-                let selected = match &self.remote_source {
+            RemoteCatalogState::Ready(spaces, warning) => {
+                if let Some(warning) = &warning {
+                    ui.label(egui::RichText::new(warning).color(theme.palette.destructive));
+                }
+                let selected = match &self.draft.remote_source {
                     SpaceRemoteOverride::Profile(remote)
                         if !remote.remote_space_name.is_empty() =>
                     {
@@ -459,36 +334,44 @@ impl SpaceEditorDialog {
                 egui::ComboBox::from_id_salt("space-editor-remote-space")
                     .selected_text(selected)
                     .show_ui(ui, |ui| {
-                        for space in spaces {
+                        for space in &spaces {
                             let current = matches!(
-                                &self.remote_source,
+                                &self.draft.remote_source,
                                 SpaceRemoteOverride::Profile(remote)
                                     if remote.remote_space_id == space.id
                             );
                             if ui.selectable_label(current, &space.name).clicked() {
-                                self.backend = Some(space.backend);
-                                self.remote_source = SpaceRemoteOverride::Profile(RemoteSpaceRef {
-                                    profile_id: profile_id.clone(),
-                                    remote_space_id: space.id,
-                                    remote_space_name: space.name,
-                                    backend: space.backend,
-                                });
+                                self.draft.backend = Some(space.backend);
+                                self.draft.remote_source =
+                                    SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                                        profile_id: profile_id.clone(),
+                                        remote_space_id: space.id.clone(),
+                                        remote_space_name: space.name.clone(),
+                                        backend: space.backend,
+                                    });
                             }
                         }
                     });
-                self.create_remote_space_ui(ui, theme, &profile_id);
+                let create = self.create_remote_space_ui(ui, theme);
+                self.catalog = RemoteCatalogState::Ready(spaces, warning);
+                if let Some(create) = create {
+                    self.start_catalog(&profile_id, Some(create));
+                }
             }
         }
     }
 
-    fn create_remote_space_ui(&mut self, ui: &mut egui::Ui, theme: Theme, profile_id: &str) {
+    fn create_remote_space_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        theme: Theme,
+    ) -> Option<(String, MultiplexerBackendConfig)> {
         ui.horizontal(|ui| {
-            remote_text_edit(
+            bootty_ui::themed_text_edit_singleline(
                 ui,
                 &mut self.new_remote_space_name,
                 theme,
-                "new remote Space",
-                220.0,
+                |edit| edit.hint_text("new remote Space").desired_width(220.0),
             );
             egui::ComboBox::from_id_salt("space-editor-new-remote-backend")
                 .selected_text(backend_label(Some(self.new_remote_space_backend)))
@@ -496,7 +379,6 @@ impl SpaceEditorDialog {
                     for backend in [
                         MultiplexerBackendConfig::Rmux,
                         MultiplexerBackendConfig::Tmux,
-                        MultiplexerBackendConfig::Zellij,
                     ] {
                         ui.selectable_value(
                             &mut self.new_remote_space_backend,
@@ -512,18 +394,18 @@ impl SpaceEditorDialog {
                 )
                 .clicked()
             {
-                let name = self.new_remote_space_name.trim().to_owned();
-                self.start_catalog(
-                    ui.ctx(),
-                    profile_id,
-                    Some((name, self.new_remote_space_backend)),
-                );
+                return Some((
+                    self.new_remote_space_name.trim().to_owned(),
+                    self.new_remote_space_backend,
+                ));
             }
-        });
+            None
+        })
+        .inner
     }
 
     fn remote_source_label(&self) -> String {
-        match &self.remote_source {
+        match &self.draft.remote_source {
             SpaceRemoteOverride::Inherit => "Inherit".to_owned(),
             SpaceRemoteOverride::Local => "This computer".to_owned(),
             SpaceRemoteOverride::Profile(remote) => self
@@ -538,14 +420,13 @@ impl SpaceEditorDialog {
 
     fn remote_ready(&self) -> bool {
         !matches!(
-            &self.remote_source,
+            &self.draft.remote_source,
             SpaceRemoteOverride::Profile(remote) if remote.remote_space_id.is_empty()
         )
     }
 
     fn start_catalog(
         &mut self,
-        ctx: &egui::Context,
         profile_id: &str,
         create: Option<(String, MultiplexerBackendConfig)>,
     ) {
@@ -555,134 +436,84 @@ impl SpaceEditorDialog {
             .find(|(id, _)| id == profile_id)
             .map(|(_, profile)| profile.clone())
         else {
-            self.catalog = RemoteCatalogState::Failed {
-                profile_id: profile_id.to_owned(),
-                error: format!("SSH profile '{profile_id}' is unavailable"),
-            };
+            self.catalog =
+                RemoteCatalogState::Failed(format!("SSH profile '{profile_id}' is unavailable"));
             return;
         };
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let result = if let Some((name, backend)) = create {
-                remote_catalog::create_remote(&profile, &name, backend).and_then(|selected| {
-                    remote_catalog::list_remote(&profile).map(|spaces| RemoteCatalogResult {
-                        spaces,
-                        selected: Some(selected),
-                    })
-                })
-            } else {
-                remote_catalog::list_remote(&profile).map(|spaces| RemoteCatalogResult {
-                    spaces,
-                    selected: None,
-                })
-            }
-            .map_err(|error| error.to_string());
-            let _ = sender.send(result);
-            ctx.request_repaint();
-        });
-        self.catalog = RemoteCatalogState::Running {
-            profile_id: profile_id.to_owned(),
-            receiver,
+        self.catalog = match RemoteCatalogTask::start(profile_id.to_owned(), profile, create) {
+            Ok(task) => RemoteCatalogState::Running(task),
+            Err(error) => RemoteCatalogState::Failed(error.to_owned()),
         };
     }
 
     fn poll_catalog(&mut self) {
-        let RemoteCatalogState::Running {
-            profile_id,
-            receiver,
-        } = &self.catalog
-        else {
+        let RemoteCatalogState::Running(task) = &self.catalog else {
             return;
         };
-        let Ok(result) = receiver.try_recv() else {
+        let Some(result) = task.try_recv() else {
             return;
         };
-        let profile_id = profile_id.clone();
+        let profile_id = task.profile_id.clone();
         match result {
-            Ok(result) => self.accept_catalog_result(profile_id, result),
-            Err(error) => {
-                self.catalog = RemoteCatalogState::Failed { profile_id, error };
-            }
+            Ok(result) => self.accept_catalog_result(&profile_id, result),
+            Err(error) => self.catalog = RemoteCatalogState::Failed(error),
         }
     }
 
-    fn accept_catalog_result(&mut self, profile_id: String, result: RemoteCatalogResult) {
-        if let Some(selected) = result.selected {
-            self.backend = Some(selected.backend);
-            self.remote_source = SpaceRemoteOverride::Profile(RemoteSpaceRef {
-                profile_id: profile_id.clone(),
-                remote_space_id: selected.id,
-                remote_space_name: selected.name,
-                backend: selected.backend,
-            });
-            self.new_remote_space_name.clear();
+    fn accept_catalog_result(&mut self, profile_id: &str, result: RemoteCatalogResult) {
+        if self.selected_profile_id().as_deref() != Some(profile_id) {
+            self.catalog = RemoteCatalogState::Idle;
+            return;
         }
-        self.catalog = RemoteCatalogState::Ready {
-            profile_id,
-            spaces: result.spaces,
+        let (spaces, warning) = match result {
+            RemoteCatalogResult::Listed(spaces) => (spaces, None),
+            RemoteCatalogResult::Created {
+                selected,
+                refreshed,
+            } => {
+                self.draft.backend = Some(selected.backend);
+                self.draft.remote_source = SpaceRemoteOverride::Profile(RemoteSpaceRef {
+                    profile_id: profile_id.to_owned(),
+                    remote_space_id: selected.id.clone(),
+                    remote_space_name: selected.name.clone(),
+                    backend: selected.backend,
+                });
+                self.new_remote_space_name.clear();
+                match refreshed {
+                    Ok(spaces) => (spaces, None),
+                    Err(error) => (
+                        vec![selected],
+                        Some(format!(
+                            "Remote Space was created, but refresh failed: {error}"
+                        )),
+                    ),
+                }
+            }
         };
+        self.catalog = RemoteCatalogState::Ready(spaces, warning);
     }
 }
 
 pub(crate) fn default_space_icon(existing: &[String]) -> String {
-    let available = space_icon_inventory()
-        .into_iter()
-        .filter(|icon| !existing.iter().any(|used| used == icon))
-        .collect::<Vec<_>>();
-    if available.is_empty() {
-        return space_icon_inventory()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "folder".to_owned());
-    }
-
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut hasher);
-    existing.hash(&mut hasher);
-    let rotation = hasher.finish().rotate_left(17) as usize;
-    available[rotation % available.len()].clone()
-}
-
-pub(crate) fn space_icon_inventory() -> Vec<String> {
-    list(Pack::Phosphor)
+    space_icon_inventory()
         .iter()
-        .filter_map(|icon| icon.strip_suffix("-duotone"))
-        .map(|icon| format!("phosphor:{icon}"))
-        .chain(list(Pack::Lucide).iter().map(|icon| (*icon).to_owned()))
-        .filter(|icon| has_slug(icon))
-        .collect()
+        .find(|icon| !existing.iter().any(|used| used == *icon))
+        .or_else(|| space_icon_inventory().first())
+        .cloned()
+        .unwrap_or_else(|| "folder".to_owned())
 }
 
-fn show_icon_search_field(
-    ui: &mut egui::Ui,
-    palette: ThemePalette,
-    search: &mut String,
-) -> egui::Response {
-    let fill = palette.surface;
-    let width = (ui.available_width() - 18.0).max(0.0);
-    egui::Frame::NONE
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, palette.border))
-        .corner_radius(egui::CornerRadius::same(palette.radius))
-        .inner_margin(egui::Margin::symmetric(8, 5))
-        .show(ui, |ui| {
-            ui.add_sized(
-                [width, 22.0],
-                egui::TextEdit::singleline(search)
-                    .id(egui::Id::new("space-icon-search"))
-                    .hint_text("search icons...")
-                    .text_color(palette.text)
-                    .vertical_align(egui::Align::Center)
-                    .background_color(fill)
-                    .frame(egui::Frame::NONE),
-            )
-        })
-        .inner
+pub(crate) fn space_icon_inventory() -> &'static [String] {
+    static ICONS: LazyLock<Vec<String>> = LazyLock::new(|| {
+        list(Pack::Phosphor)
+            .iter()
+            .filter_map(|icon| icon.strip_suffix("-duotone"))
+            .map(|icon| format!("phosphor:{icon}"))
+            .chain(list(Pack::Lucide).iter().map(|icon| (*icon).to_owned()))
+            .filter(|icon| has_slug(icon))
+            .collect()
+    });
+    &ICONS
 }
 
 fn show_icon_picker(ui: &mut egui::Ui, palette: ThemePalette, selected: &mut String, search: &str) {
@@ -710,7 +541,7 @@ fn show_icon_picker(ui: &mut egui::Ui, palette: ThemePalette, selected: &mut Str
                     .spacing(egui::vec2(8.0, 8.0))
                     .show(ui, |ui| {
                         for (index, icon) in icons.iter().enumerate() {
-                            let current = *selected == *icon;
+                            let current = selected.as_str() == icon.as_str();
                             let button = egui::Button::new(
                                 icon_text(
                                     icon,
@@ -726,10 +557,10 @@ fn show_icon_picker(ui: &mut egui::Ui, palette: ThemePalette, selected: &mut Str
                             });
                             if ui
                                 .add_sized(button_size, button)
-                                .on_hover_text(icon)
+                                .on_hover_text(icon.as_str())
                                 .clicked()
                             {
-                                *selected = icon.clone();
+                                *selected = (**icon).clone();
                             }
                             if (index + 1) % columns == 0 {
                                 ui.end_row();
@@ -740,10 +571,10 @@ fn show_icon_picker(ui: &mut egui::Ui, palette: ThemePalette, selected: &mut Str
     });
 }
 
-fn matching_icons(query: &str) -> Vec<String> {
+fn matching_icons(query: &str) -> Vec<&'static String> {
     let query = query.to_ascii_lowercase();
     space_icon_inventory()
-        .into_iter()
+        .iter()
         .filter(|icon| icon.to_ascii_lowercase().contains(&query))
         .collect()
 }
@@ -754,7 +585,6 @@ fn backend_label(backend: Option<MultiplexerBackendConfig>) -> &'static str {
         Some(MultiplexerBackendConfig::Native) => "Native",
         Some(MultiplexerBackendConfig::Rmux) => "Rmux",
         Some(MultiplexerBackendConfig::Tmux) => "Tmux",
-        Some(MultiplexerBackendConfig::Zellij) => "Zellij",
     }
 }
 

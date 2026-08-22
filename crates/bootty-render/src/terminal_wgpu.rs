@@ -22,10 +22,13 @@ use pipelines::{
     background_pipeline, image_pipeline, text_pipeline, text_texture_format,
     texture_bind_group_layout,
 };
-use std::collections::HashMap;
 use std::sync::{
     Arc, Weak,
     atomic::{AtomicU64, Ordering},
+};
+use std::{
+    collections::{HashMap, HashSet},
+    hash::{Hash, Hasher},
 };
 use vertices::{
     BackgroundVertex, TerminalQuadDraw, TextVertex, background_quad_vertices, image_vertices,
@@ -222,22 +225,24 @@ struct TerminalCallbackKey {
     target_format: wgpu::TextureFormat,
 }
 
-struct TerminalBackgroundFrameResources {
+struct TerminalVertexBuffer<V> {
     vertex_buffer: wgpu::Buffer,
-    vertices: Vec<BackgroundVertex>,
+    vertices: Vec<V>,
     vertex_count: u32,
     byte_capacity: usize,
+    label: &'static str,
 }
 
-impl TerminalBackgroundFrameResources {
+impl<V: PartialEq> TerminalVertexBuffer<V> {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        vertices: &mut Vec<BackgroundVertex>,
+        label: &'static str,
+        vertices: &mut Vec<V>,
     ) -> Self {
         let mut resources = Self {
             vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("bootty_terminal_renderer_vertices"),
+                label: Some(label),
                 size: 1,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
@@ -245,17 +250,13 @@ impl TerminalBackgroundFrameResources {
             vertices: Vec::new(),
             vertex_count: 0,
             byte_capacity: 0,
+            label,
         };
         resources.update(device, queue, vertices);
         resources
     }
 
-    fn update(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        vertices: &mut Vec<BackgroundVertex>,
-    ) {
+    fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &mut Vec<V>) {
         if vertices.is_empty() {
             self.vertices.clear();
             self.vertex_count = 0;
@@ -266,7 +267,7 @@ impl TerminalBackgroundFrameResources {
         let bytes = vertex_bytes(vertices);
         if bytes.len() > self.byte_capacity {
             self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bootty_terminal_renderer_vertices"),
+                label: Some(self.label),
                 contents: bytes,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             });
@@ -279,6 +280,8 @@ impl TerminalBackgroundFrameResources {
         self.vertex_count = vertex_count;
     }
 }
+
+type TerminalBackgroundFrameResources = TerminalVertexBuffer<BackgroundVertex>;
 
 enum TerminalPreparedLayer {
     Background(usize),
@@ -295,6 +298,7 @@ enum ActiveTerminalPipeline {
 
 struct PreparedTerminalFrameCache {
     frame: TerminalRenderFrame,
+    image_texture_keys: Vec<TerminalImageTextureKey>,
     pixels_per_point_bits: u32,
     view_bits: [u32; 3],
     // Atlas growth shifts every glyph's UVs, so a stale count must invalidate the cached vertices.
@@ -313,6 +317,11 @@ impl PreparedTerminalFrameCache {
         self.pixels_per_point_bits == pixels_per_point_bits
             && self.view_bits == view_bits
             && self.atlas_resized_count == atlas_resized_count
+            && self
+                .image_texture_keys
+                .iter()
+                .copied()
+                .eq(frame.commands.iter().filter_map(terminal_image_texture_key))
             && self.frame == *frame
     }
 }
@@ -336,7 +345,8 @@ pub struct TerminalWgpuRenderer {
     background_batch_scratch: Vec<Vec<BackgroundVertex>>,
     text_batch_scratch: Vec<Vec<TexturedGlyphQuad>>,
     text_batch_dirty_scratch: Vec<bool>,
-    image_resources: Vec<Option<TerminalImageFrameResources>>,
+    image_textures: HashMap<TerminalImageTextureKey, TerminalImageTextureResources>,
+    image_resources: Vec<Option<TerminalImagePlacementResources>>,
     prepared_frame_cache: Option<PreparedTerminalFrameCache>,
     prepared_frame_cache_cooldown: u8,
     text_linear_filter: bool,
@@ -384,6 +394,7 @@ impl TerminalWgpuRenderer {
             background_batch_scratch: Vec::new(),
             text_batch_scratch: Vec::new(),
             text_batch_dirty_scratch: Vec::new(),
+            image_textures: HashMap::new(),
             image_resources: Vec::new(),
             prepared_frame_cache: None,
             prepared_frame_cache_cooldown: 0,
@@ -457,8 +468,18 @@ impl TerminalWgpuRenderer {
         loop {
             build_attempt += 1;
             self.layers.clear();
-            let mut previous_image_resources =
-                std::mem::take(&mut self.image_resources).into_iter();
+            let mut previous_image_resources = HashMap::<_, Vec<_>>::new();
+            for resources in std::mem::take(&mut self.image_resources)
+                .into_iter()
+                .rev()
+                .flatten()
+            {
+                previous_image_resources
+                    .entry(resources.placement_key)
+                    .or_default()
+                    .push(resources);
+            }
+            let mut frame_image_texture_keys = HashSet::new();
 
             let mut background_batches = std::mem::take(&mut self.background_batch_scratch);
             let mut text_batches = std::mem::take(&mut self.text_batch_scratch);
@@ -523,7 +544,10 @@ impl TerminalWgpuRenderer {
                         cursor,
                     ),
                     TerminalRenderCommand::Image(image) => {
-                        let previous = previous_image_resources.next().flatten();
+                        let placement_key = TerminalImagePlacementKey::from_image(image);
+                        let previous = previous_image_resources
+                            .get_mut(&placement_key)
+                            .and_then(Vec::pop);
                         let resources = prepare_image_resource(
                             device,
                             queue,
@@ -532,10 +556,16 @@ impl TerminalWgpuRenderer {
                                 pixels_per_point,
                             },
                             image,
-                            &self.texture_bind_group_layout,
-                            &self.image_sampler,
+                            ImageTextureBindings {
+                                layout: &self.texture_bind_group_layout,
+                                sampler: &self.image_sampler,
+                            },
+                            &mut self.image_textures,
                             previous,
                         );
+                        if let Some(resources) = &resources {
+                            frame_image_texture_keys.insert(resources.texture_key);
+                        }
                         image_vertex_count += resources
                             .as_ref()
                             .map_or(0, |resources| resources.vertex_count);
@@ -547,6 +577,8 @@ impl TerminalWgpuRenderer {
                     TerminalRenderCommand::KittyVirtualPlacement(_) => {}
                 }
             }
+            self.image_textures
+                .retain(|key, _| frame_image_texture_keys.contains(key));
             text_builder.finish_text_frame();
 
             let background_vertex_count = self.prepare_background_resources(
@@ -579,6 +611,11 @@ impl TerminalWgpuRenderer {
             if update_frame_cache && !grew_during_build {
                 self.prepared_frame_cache = Some(PreparedTerminalFrameCache {
                     frame: frame.clone(),
+                    image_texture_keys: frame
+                        .commands
+                        .iter()
+                        .filter_map(terminal_image_texture_key)
+                        .collect(),
                     pixels_per_point_bits,
                     view_bits,
                     atlas_resized_count,
@@ -614,7 +651,7 @@ impl TerminalWgpuRenderer {
                     let Some(layer) = resources.layers.get(*index) else {
                         continue;
                     };
-                    if layer.vertex_count == 0 {
+                    if layer.buffer.vertex_count == 0 {
                         continue;
                     }
                     let Some(texture) = &self.text_texture else {
@@ -630,8 +667,8 @@ impl TerminalWgpuRenderer {
                         &texture.bind_group
                     };
                     render_pass.set_bind_group(0, bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, layer.vertex_buffer.slice(..));
-                    render_pass.draw(0..layer.vertex_count, 0..1);
+                    render_pass.set_vertex_buffer(0, layer.buffer.vertex_buffer.slice(..));
+                    render_pass.draw(0..layer.buffer.vertex_count, 0..1);
                 }
                 TerminalPreparedLayer::Image(index) => {
                     let Some(Some(resources)) = self.image_resources.get(*index) else {
@@ -640,11 +677,14 @@ impl TerminalWgpuRenderer {
                     if resources.vertex_count == 0 {
                         continue;
                     }
+                    let Some(texture) = self.image_textures.get(&resources.texture_key) else {
+                        continue;
+                    };
                     if active_pipeline != Some(ActiveTerminalPipeline::Image) {
                         render_pass.set_pipeline(&self.image_pipeline);
                         active_pipeline = Some(ActiveTerminalPipeline::Image);
                     }
-                    render_pass.set_bind_group(0, &resources.bind_group, &[]);
+                    render_pass.set_bind_group(0, &texture.bind_group, &[]);
                     render_pass.set_vertex_buffer(0, resources.vertex_buffer.slice(..));
                     render_pass.draw(0..resources.vertex_count, 0..1);
                 }
@@ -665,7 +705,10 @@ impl TerminalWgpuRenderer {
             } else {
                 self.background_resources
                     .push(TerminalBackgroundFrameResources::new(
-                        device, queue, vertices,
+                        device,
+                        queue,
+                        "bootty_terminal_renderer_vertices",
+                        vertices,
                     ));
             }
             vertex_count += self.background_resources[layer_index].vertex_count;
@@ -716,7 +759,7 @@ impl TerminalWgpuRenderer {
                     &mut vertices,
                 ));
             }
-            vertex_count += resources.layers[layer_index].vertex_count;
+            vertex_count += resources.layers[layer_index].buffer.vertex_count;
         }
         self.text_vertex_scratch = vertices;
         resources.layers.truncate(dirty_batches.len());
@@ -930,12 +973,10 @@ struct TextRenderTarget {
 }
 
 struct TerminalTextLayerResources {
-    vertex_buffer: wgpu::Buffer,
+    buffer: TerminalVertexBuffer<TextVertex>,
     surface: Option<SurfaceRect>,
     pixels_per_point: f32,
     quads: Vec<TexturedGlyphQuad>,
-    vertex_count: u32,
-    byte_capacity: usize,
 }
 
 impl TerminalTextLayerResources {
@@ -946,18 +987,17 @@ impl TerminalTextLayerResources {
         quads: &[TexturedGlyphQuad],
         vertices: &mut Vec<TextVertex>,
     ) -> Self {
+        vertices.clear();
         let mut resources = Self {
-            vertex_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("bootty_terminal_text_vertices"),
-                size: 1,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
+            buffer: TerminalVertexBuffer::new(
+                device,
+                queue,
+                "bootty_terminal_text_vertices",
+                vertices,
+            ),
             surface: None,
             pixels_per_point: target.ppp,
             quads: Vec::new(),
-            vertex_count: 0,
-            byte_capacity: 0,
         };
         resources.update(device, queue, target, quads, true, vertices);
         resources
@@ -977,7 +1017,8 @@ impl TerminalTextLayerResources {
         if quads.is_empty() {
             self.surface = None;
             self.quads.clear();
-            self.vertex_count = 0;
+            vertices.clear();
+            self.buffer.update(device, queue, vertices);
             return;
         }
         if !changed && self.surface == Some(surface) {
@@ -989,33 +1030,27 @@ impl TerminalTextLayerResources {
 
         vertices.clear();
         text_vertices_into(surface, ppp, quads, vertices);
-        let vertex_count = vertices.len() as u32;
-        let bytes = vertex_bytes(vertices);
-        if bytes.len() > self.byte_capacity {
-            self.vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bootty_terminal_text_vertices"),
-                contents: bytes,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            });
-            self.byte_capacity = bytes.len();
-        } else {
-            queue.write_buffer(&self.vertex_buffer, 0, bytes);
-        }
+        self.buffer.update(device, queue, vertices);
         self.surface = Some(surface);
         self.quads.clear();
         self.quads.extend_from_slice(quads);
-        self.vertex_count = vertex_count;
     }
 }
 
-struct TerminalImageFrameResources {
+struct TerminalImagePlacementResources {
+    placement_key: TerminalImagePlacementKey,
     texture_key: TerminalImageTextureKey,
-    _texture: wgpu::Texture,
-    _view: wgpu::TextureView,
-    bind_group: wgpu::BindGroup,
     vertex_buffer: wgpu::Buffer,
     vertices: [TextVertex; 6],
     vertex_count: u32,
+}
+
+struct TerminalImageTextureResources {
+    // Keep the allocation alive so its address remains a valid cache identity.
+    _data: Arc<Vec<u8>>,
+    _texture: wgpu::Texture,
+    _view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
 }
 
 #[derive(Clone, Copy)]
@@ -1024,11 +1059,25 @@ struct ImageRenderTarget {
     pixels_per_point: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct TerminalImagePlacementKey {
+    image_id: u32,
+    placement_id: u32,
+}
+
+impl TerminalImagePlacementKey {
+    fn from_image(image: &KittyImagePlacement) -> Self {
+        Self {
+            image_id: image.image_id,
+            placement_id: image.placement_id,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TerminalImageTextureKey {
     data_ptr: usize,
     data_len: usize,
-    image_id: u32,
     image_width: u32,
     image_height: u32,
     image_format: libghostty_vt::kitty::graphics::ImageFormat,
@@ -1039,7 +1088,6 @@ impl TerminalImageTextureKey {
         Self {
             data_ptr: Arc::as_ptr(&image.data) as usize,
             data_len: image.data.len(),
-            image_id: image.image_id,
             image_width: image.image_width,
             image_height: image.image_height,
             image_format: image.image_format,
@@ -1047,8 +1095,31 @@ impl TerminalImageTextureKey {
     }
 }
 
-impl TerminalImageFrameResources {
-    fn update_vertices(&mut self, queue: &wgpu::Queue, vertices: [TextVertex; 6]) {
+fn terminal_image_texture_key(command: &TerminalRenderCommand) -> Option<TerminalImageTextureKey> {
+    match command {
+        TerminalRenderCommand::Image(image) => Some(TerminalImageTextureKey::from_image(image)),
+        _ => None,
+    }
+}
+
+impl Hash for TerminalImageTextureKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.data_ptr.hash(state);
+        self.data_len.hash(state);
+        self.image_width.hash(state);
+        self.image_height.hash(state);
+        std::mem::discriminant(&self.image_format).hash(state);
+    }
+}
+
+impl TerminalImagePlacementResources {
+    fn update(
+        &mut self,
+        queue: &wgpu::Queue,
+        texture_key: TerminalImageTextureKey,
+        vertices: [TextVertex; 6],
+    ) {
+        self.texture_key = texture_key;
         if self.vertices != vertices {
             queue.write_buffer(&self.vertex_buffer, 0, vertex_bytes(&vertices));
             self.vertices = vertices;
@@ -1056,80 +1127,109 @@ impl TerminalImageFrameResources {
     }
 }
 
+impl TerminalImageTextureResources {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &KittyImagePlacement,
+        bind_group_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+    ) -> Option<Self> {
+        let pixels = rgba_image_texture_pixels(image)?;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bootty_terminal_kitty_image"),
+            size: wgpu::Extent3d {
+                width: image.image_width,
+                height: image.image_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: terminal_image_texture_format(),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            pixels.as_ref(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(image.image_width * 4),
+                rows_per_image: Some(image.image_height),
+            },
+            wgpu::Extent3d {
+                width: image.image_width,
+                height: image.image_height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bootty_terminal_image_bind_group"),
+            layout: bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        });
+        Some(Self {
+            _data: Arc::clone(&image.data),
+            _texture: texture,
+            _view: view,
+            bind_group,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ImageTextureBindings<'a> {
+    layout: &'a wgpu::BindGroupLayout,
+    sampler: &'a wgpu::Sampler,
+}
+
 fn prepare_image_resource(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     target: ImageRenderTarget,
     image: &KittyImagePlacement,
-    bind_group_layout: &wgpu::BindGroupLayout,
-    sampler: &wgpu::Sampler,
-    previous: Option<TerminalImageFrameResources>,
-) -> Option<TerminalImageFrameResources> {
+    bindings: ImageTextureBindings<'_>,
+    textures: &mut HashMap<TerminalImageTextureKey, TerminalImageTextureResources>,
+    previous: Option<TerminalImagePlacementResources>,
+) -> Option<TerminalImagePlacementResources> {
     if !image_fits_device_limits(device, image) {
         return None;
     }
     let vertices = image_vertices(target.surface, target.pixels_per_point, image)?;
     let texture_key = TerminalImageTextureKey::from_image(image);
-    if let Some(mut previous) = previous
-        && previous.texture_key == texture_key
-    {
-        previous.update_vertices(queue, vertices);
+    if let std::collections::hash_map::Entry::Vacant(entry) = textures.entry(texture_key) {
+        let resources = TerminalImageTextureResources::new(
+            device,
+            queue,
+            image,
+            bindings.layout,
+            bindings.sampler,
+        )?;
+        entry.insert(resources);
+    }
+    if let Some(mut previous) = previous {
+        previous.update(queue, texture_key, vertices);
         return Some(previous);
     }
-    let pixels = rgba_image_texture_pixels(image)?;
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("bootty_terminal_kitty_image"),
-        size: wgpu::Extent3d {
-            width: image.image_width,
-            height: image.image_height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: terminal_image_texture_format(),
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        pixels.as_ref(),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(image.image_width * 4),
-            rows_per_image: Some(image.image_height),
-        },
-        wgpu::Extent3d {
-            width: image.image_width,
-            height: image.image_height,
-            depth_or_array_layers: 1,
-        },
-    );
-    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("bootty_terminal_image_bind_group"),
-        layout: bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(sampler),
-            },
-        ],
-    });
-    Some(TerminalImageFrameResources {
+    Some(TerminalImagePlacementResources {
+        placement_key: TerminalImagePlacementKey::from_image(image),
         texture_key,
-        _texture: texture,
-        _view: view,
-        bind_group,
         vertex_buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bootty_terminal_image_vertices"),
             contents: vertex_bytes(&vertices),

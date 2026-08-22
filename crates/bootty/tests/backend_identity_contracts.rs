@@ -7,10 +7,9 @@ mod unix {
     };
 
     use bootty_identity::ApplicationIdentity;
-    use bootty_mux::{SshTarget, command::MuxCommand, process::CommandRunner};
+    use bootty_mux::{SshTarget, process::CommandRunner};
     use bootty_remote::ssh::SshRemote;
     use bootty_tmux::TmuxControlRunner;
-    use bootty_zellij::ZellijBackend;
 
     const HELPER_ENV: &str = "BOOTTY_BACKEND_IDENTITY_CONTRACT_HELPER";
     const FIXTURE_ENV: &str = "BOOTTY_BACKEND_IDENTITY_CONTRACT_FIXTURE";
@@ -24,24 +23,18 @@ mod unix {
     }
 
     #[test]
-    fn development_local_backends_use_distinct_server_namespaces() {
+    fn development_tmux_uses_a_distinct_server_namespace() {
         let directory = tempfile::tempdir().expect("temporary directory");
         executable(
             directory.path(),
             "argv-probe",
             "#!/bin/sh\nprintf '%s\\n' \"$@\"\n",
         );
-        executable(
-            directory.path(),
-            "zellij",
-            "#!/bin/sh\nprintf '%s\\n' \"$ZELLIJ_SOCKET_DIR\"\n",
-        );
-
         let status =
             std::process::Command::new(std::env::current_exe().expect("current test executable"))
                 .args([
                     "--exact",
-                    "unix::development_local_backends_use_distinct_server_namespaces_helper",
+                    "unix::development_tmux_uses_a_distinct_server_namespace_helper",
                 ])
                 .env(HELPER_ENV, "1")
                 .env(FIXTURE_ENV, directory.path())
@@ -53,7 +46,7 @@ mod unix {
     }
 
     #[test]
-    fn development_local_backends_use_distinct_server_namespaces_helper() {
+    fn development_tmux_uses_a_distinct_server_namespace_helper() {
         if env::var_os(HELPER_ENV).is_none() {
             return;
         }
@@ -91,31 +84,5 @@ mod unix {
             .expect("remote tmux command");
         assert!(!remote.stdout.contains("bootty-dev"));
         assert!(remote.stdout.contains("'tmux' 'kill-session' '-t' 'build'"));
-
-        let production = ZellijBackend::for_identity(ApplicationIdentity::Production)
-            .expect("production zellij backend")
-            .snapshot()
-            .expect("production zellij snapshot");
-        let mut development = ZellijBackend::for_identity(ApplicationIdentity::Development)
-            .expect("development zellij backend");
-        let development_snapshot = development.snapshot().expect("development zellij snapshot");
-        development
-            .execute(MuxCommand::DitchSession {
-                session_id: "unused".to_owned(),
-            })
-            .expect("development zellij mutation");
-
-        assert_eq!(production.sessions, Vec::new());
-        let socket_dir = &development_snapshot.sessions[0].name;
-        assert!(socket_dir.ends_with("/zellij"));
-        assert!(Path::new(socket_dir).is_dir());
-        assert_eq!(
-            std::fs::metadata(socket_dir)
-                .expect("socket directory metadata")
-                .permissions()
-                .mode()
-                & 0o777,
-            0o700
-        );
     }
 }

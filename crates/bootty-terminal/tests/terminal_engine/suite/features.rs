@@ -302,6 +302,26 @@ fn terminal_engine_handles_iterm2_copy_open_and_reports() -> Result<()> {
 }
 
 #[test]
+fn terminal_engine_collects_split_iterm2_copy_capture() -> Result<()> {
+    let mut engine = TerminalEngine::new(test_geometry(12, 1))?;
+
+    engine.write_vt(b"\x1b]1337;CopyToClipboard=clipboard\x1b\\");
+    engine.write_vt(b"copied ");
+    engine.write_vt(b"\x1b[31");
+    engine.write_vt(b"mred\x1b[0m text");
+    engine.write_vt(b"\x1b]1337;EndCopy\x1b\\");
+
+    assert_eq!(
+        engine.drain_side_effects(),
+        vec![
+            TerminalSideEffect::Iterm2Control("CopyToClipboard=clipboard".to_owned()),
+            TerminalSideEffect::ClipboardWrite("copied red text".to_owned()),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn terminal_engine_preserves_malformed_iterm_report_variable_as_control() -> Result<()> {
     let mut engine = TerminalEngine::new(test_geometry(12, 1))?;
 

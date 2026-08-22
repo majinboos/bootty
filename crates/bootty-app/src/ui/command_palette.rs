@@ -26,7 +26,6 @@ pub struct CommandPaletteDialog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommandPaletteEvent {
-    None,
     Close,
     Run(Command),
 }
@@ -60,7 +59,7 @@ impl CommandPaletteDialog {
             .map(|command| command.action())
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> CommandPaletteEvent {
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> Option<CommandPaletteEvent> {
         let matches = filtered(&self.commands, &self.filter);
         self.selected = overlay::clamp_selection(self.selected, matches.len());
         let rows: Vec<ListRow> = matches
@@ -124,12 +123,12 @@ impl CommandPaletteDialog {
                 .get(index)
                 .and_then(|matched| self.commands.get(matched.index))
         {
-            return CommandPaletteEvent::Run(*command);
+            return Some(CommandPaletteEvent::Run(*command));
         }
         if result.escaped || result.clicked_outside {
-            return CommandPaletteEvent::Close;
+            return Some(CommandPaletteEvent::Close);
         }
-        CommandPaletteEvent::None
+        None
     }
 }
 

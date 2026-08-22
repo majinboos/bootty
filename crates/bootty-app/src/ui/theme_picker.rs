@@ -11,7 +11,7 @@ pub struct ThemePickerDialog {
     selected: usize,
     focus_filter: bool,
     entries: Vec<ThemeEntry>,
-    scope: ThemeScope,
+    scope: Option<ThemeKind>,
     current: Option<String>,
     branch_label: String,
     last_preview: Option<String>,
@@ -19,7 +19,6 @@ pub struct ThemePickerDialog {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThemePickerEvent {
-    None,
     Close,
     RestorePreview,
     Preview(String),
@@ -38,39 +37,6 @@ enum ThemeKind {
     Dark,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThemeScope {
-    All,
-    Light,
-    Dark,
-}
-
-impl ThemeScope {
-    fn next(self) -> Self {
-        match self {
-            Self::All => Self::Light,
-            Self::Light => Self::Dark,
-            Self::Dark => Self::All,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Light => "Light",
-            Self::Dark => "Dark",
-        }
-    }
-
-    fn accepts(self, kind: ThemeKind) -> bool {
-        match self {
-            Self::All => true,
-            Self::Light => kind == ThemeKind::Light,
-            Self::Dark => kind == ThemeKind::Dark,
-        }
-    }
-}
-
 impl ThemePickerDialog {
     pub fn open(config_path: &Path, current: Option<&str>, branch_label: &str) -> Self {
         Self {
@@ -78,17 +44,20 @@ impl ThemePickerDialog {
             selected: 0,
             focus_filter: true,
             entries: available_theme_entries(config_path),
-            scope: ThemeScope::All,
+            scope: None,
             current: current.map(str::to_owned),
             branch_label: branch_label.to_owned(),
             last_preview: None,
         }
     }
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> ThemePickerEvent {
-        let tab = ctx.input(|input| input.key_pressed(egui::Key::Tab));
-        if tab {
-            self.scope = self.scope.next();
+    pub fn show(&mut self, ctx: &egui::Context, theme: Theme) -> Option<ThemePickerEvent> {
+        if ctx.input(|input| input.key_pressed(egui::Key::Tab)) {
+            self.scope = match self.scope {
+                None => Some(ThemeKind::Light),
+                Some(ThemeKind::Light) => Some(ThemeKind::Dark),
+                Some(ThemeKind::Dark) => None,
+            };
             self.selected = 0;
             self.last_preview = None;
         }
@@ -120,7 +89,7 @@ impl ThemePickerDialog {
             .footer(format!(
                 "{} themes · {}",
                 self.entries.len(),
-                self.scope.label()
+                self.scope.map_or("All", ThemeKind::label)
             ))
             .width(overlay::panel_width(ctx, 760.0, 480.0))
             .show(ctx, theme, |ui, palette| {
@@ -138,12 +107,13 @@ impl ThemePickerDialog {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.colored_label(palette.muted, "Showing");
-                    for scope in [ThemeScope::All, ThemeScope::Light, ThemeScope::Dark] {
+                    for scope in [None, Some(ThemeKind::Light), Some(ThemeKind::Dark)] {
                         let selected = self.scope == scope;
+                        let label = scope.map_or("All", ThemeKind::label);
                         let text = if selected {
-                            egui::RichText::new(scope.label()).color(palette.base)
+                            egui::RichText::new(label).color(palette.base)
                         } else {
-                            egui::RichText::new(scope.label()).color(palette.text)
+                            egui::RichText::new(label).color(palette.text)
                         };
                         let fill = if selected {
                             palette.primary
@@ -187,51 +157,27 @@ impl ThemePickerDialog {
                 .and_then(|entry| entry.and_then(|entry| self.entries.get(entry)))
                 .map(|entry| entry.name.clone())
         {
-            return ThemePickerEvent::Select(theme);
+            return Some(ThemePickerEvent::Select(theme));
         }
         if result.escaped || result.clicked_outside {
-            return ThemePickerEvent::Close;
+            return Some(ThemePickerEvent::Close);
         }
         if let Some(preview) = preview {
             if self.current.as_deref() == Some(preview.as_str()) {
                 if self.last_preview.take().is_some() {
-                    return ThemePickerEvent::RestorePreview;
+                    return Some(ThemePickerEvent::RestorePreview);
                 }
             } else if self.last_preview.as_deref() != Some(preview.as_str()) {
                 self.last_preview = Some(preview.clone());
-                return ThemePickerEvent::Preview(preview);
+                return Some(ThemePickerEvent::Preview(preview));
             }
         }
-        ThemePickerEvent::None
+        None
     }
-}
-
-pub fn available_themes(config_path: &Path) -> Vec<String> {
-    available_theme_entries(config_path)
-        .into_iter()
-        .map(|entry| entry.name)
-        .collect()
 }
 
 fn available_theme_entries(config_path: &Path) -> Vec<ThemeEntry> {
-    let mut names: Vec<String> = bootty_config::config::builtin_theme_names()
-        .map(str::to_owned)
-        .collect();
-    if let Some(dir) = config_path.parent().map(|parent| parent.join("themes"))
-        && let Ok(entries) = std::fs::read_dir(dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "toml")
-                && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-            {
-                names.push(stem.to_owned());
-            }
-        }
-    }
-    names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
-    names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    names
+    bootty_config::config::available_theme_names(config_path)
         .into_iter()
         .map(|name| ThemeEntry {
             kind: classify_theme(&name),
@@ -243,24 +189,22 @@ fn available_theme_entries(config_path: &Path) -> Vec<ThemeEntry> {
 fn rows_for(
     entries: &[ThemeEntry],
     filter: &str,
-    scope: ThemeScope,
+    scope: Option<ThemeKind>,
     current: Option<&str>,
     branch_label: &str,
 ) -> (Vec<ListRow>, Vec<Option<usize>>) {
     let mut rows = Vec::new();
     let mut row_entries = Vec::new();
-    let groups = match scope {
-        ThemeScope::All => [Some(ThemeKind::Light), Some(ThemeKind::Dark)],
-        ThemeScope::Light => [Some(ThemeKind::Light), None],
-        ThemeScope::Dark => [Some(ThemeKind::Dark), None],
-    };
+    let groups = scope.map_or([Some(ThemeKind::Light), Some(ThemeKind::Dark)], |kind| {
+        [Some(kind), None]
+    });
     let matches = filtered(entries, filter, scope);
     for kind in groups.into_iter().flatten() {
-        let section_matches = matches
+        let mut section_matches = matches
             .iter()
             .filter(|matched| entries[matched.index].kind == kind)
-            .collect::<Vec<_>>();
-        if section_matches.is_empty() {
+            .peekable();
+        if section_matches.peek().is_none() {
             continue;
         }
         rows.push(ListRow {
@@ -301,12 +245,12 @@ impl ThemeKind {
     }
 }
 
-fn filtered(entries: &[ThemeEntry], filter: &str, scope: ThemeScope) -> Vec<MatchedTheme> {
+fn filtered(entries: &[ThemeEntry], filter: &str, scope: Option<ThemeKind>) -> Vec<MatchedTheme> {
     let filter = filter.trim();
     let mut matches = entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| scope.accepts(entry.kind))
+        .filter(|(_, entry)| scope.is_none_or(|kind| kind == entry.kind))
         .filter_map(|(index, entry)| {
             if filter.is_empty() {
                 return Some(MatchedTheme {
