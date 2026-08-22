@@ -2,8 +2,15 @@ use std::{collections::HashMap, hint::black_box, path::PathBuf, sync::Arc, time:
 
 use anyhow::Result;
 use bootty_app::{
-    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
+    app::{AppState, FrameInputs, ViewportSnapshot},
+    config::{BoottyConfig, MultiplexerBackendConfig},
+    geometry::{TerminalGeometry, ViewTransform},
+    mux::{
+        RepaintHandle,
+        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+    },
     renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
+    terminal::{RenderFrame, TerminalEngine},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
         session_navigation::BindingSessionGroup,
@@ -58,10 +65,7 @@ impl TerminalFrameSource for BenchTerminal {
         Ok(())
     }
 
-    fn set_render_cell_metrics(
-        &mut self,
-        cell: bootty_render::geometry::CellMetrics,
-    ) -> Result<()> {
+    fn set_render_cell_metrics(&mut self, cell: bootty_app::geometry::CellMetrics) -> Result<()> {
         self.engine.set_render_cell_metrics(cell);
         Ok(())
     }

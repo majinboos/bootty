@@ -9,7 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bootty_command::CommandCancellation;
 use bootty_mux_model::{MuxBackendKind, MuxBindingConfig};
 use serde::{Deserialize, Serialize};
 
@@ -136,11 +135,11 @@ pub type MuxCommandResult = std::result::Result<MuxCommandCompletion, MuxCommand
 pub struct MuxCommandCompletion {
     pub selected_session: Option<String>,
     pub selected_window: Option<String>,
-    snapshot: Option<(MultiplexerConfig, MuxSnapshot)>,
+    snapshot: Option<(MuxBindingConfig, MuxSnapshot)>,
 }
 
 impl MuxCommandCompletion {
-    pub fn matches_config(&self, config: &MultiplexerConfig) -> bool {
+    pub fn matches_config(&self, config: &MuxBindingConfig) -> bool {
         self.snapshot
             .as_ref()
             .is_none_or(|(completed_config, _)| completed_config == config)
@@ -154,7 +153,7 @@ impl MuxCommandCompletion {
         }
     }
 
-    fn from_snapshot(config: MultiplexerConfig, snapshot: MuxSnapshot) -> Self {
+    fn from_snapshot(config: MuxBindingConfig, snapshot: MuxSnapshot) -> Self {
         let selected_session = snapshot.active_session_id.clone().or_else(|| {
             snapshot
                 .sessions
@@ -178,7 +177,7 @@ impl MuxCommandCompletion {
 }
 #[derive(Default)]
 struct CommandConfigState {
-    config: Option<MultiplexerConfig>,
+    config: Option<MuxBindingConfig>,
     generation: u64,
 }
 
@@ -473,7 +472,7 @@ pub struct BindingMuxController {
     binding_generation: u64,
     resource_generations: BTreeMap<MuxResourceKey, u64>,
     observed_resources: BTreeMap<MuxResourceKey, String>,
-    observed_backend: Option<MultiplexerBackendConfig>,
+    observed_backend: Option<MuxBackendKind>,
 }
 
 #[derive(Clone, Debug)]
@@ -538,7 +537,7 @@ impl BindingMuxController {
 
     pub fn operation_outcome(
         &self,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         operation: BindingOperation,
     ) -> BindingOperationOutcome<()> {
         let Some(scope) = self.controller.scope else {
@@ -638,7 +637,7 @@ impl BindingMuxController {
         &mut self,
         request: NewMuxSessionRequest,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) {
         self.controller
             .create_project_session(request, repaint, config);
@@ -648,7 +647,7 @@ impl BindingMuxController {
     pub fn execute_command(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
     ) {
         self.controller.execute_command(repaint, config, command);
@@ -658,7 +657,7 @@ impl BindingMuxController {
     pub fn refresh_sessions(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) -> Option<String> {
         let recovering = self.refresh_failed;
         let error = self.controller.refresh_sessions(repaint, config);
@@ -699,7 +698,7 @@ impl BindingMuxController {
     pub fn complete_authoritative_command(
         &mut self,
         result: MuxCommandResult,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) -> MuxCommandResult {
         let result = self
             .controller
@@ -787,147 +786,11 @@ impl MuxController {
         self.last_error.as_deref()
     }
 
-    pub fn set_error(&mut self, error: Option<String>) {
-        self.last_error = error;
-    }
-
-    pub fn set_availability_error(&mut self, error: Option<String>) {
-        self.availability_error = error.map(BindingAvailabilityError::Runtime);
-        self.last_error = self
-            .availability_error
-            .as_ref()
-            .map(|error| error.message().to_owned());
-    }
-
-    pub fn set_configured_availability_error(&mut self, error: Option<String>) {
-        self.availability_error = error.map(BindingAvailabilityError::Configured);
-        self.last_error = self
-            .availability_error
-            .as_ref()
-            .map(|error| error.message().to_owned());
-    }
-
-    pub fn unavailable_reason(&self) -> Option<&str> {
-        self.availability_error
-            .as_ref()
-            .map(BindingAvailabilityError::message)
-    }
-
-    pub fn binding_generation(&self) -> u64 {
-        self.binding_generation
-    }
-
-    pub fn operation_outcome(
-        &self,
-        config: &MuxBindingConfig,
-        operation: BindingOperation,
-    ) -> BindingOperationOutcome<()> {
-        let Some(scope) = self.scope else {
-            return BindingOperationOutcome::Supported(());
-        };
-        if self.availability_error.is_some() {
-            return BindingOperationOutcome::Unavailable;
-        }
-        if self
-            .registry
-            .capabilities(config, scope)
-            .supports(operation)
-        {
-            BindingOperationOutcome::Supported(())
-        } else {
-            BindingOperationOutcome::Unsupported
-        }
-    }
-
-    pub fn session_generation(&self, session_id: &str) -> Option<u64> {
-        MuxResourceKey::Session(session_id.to_owned())
-            .generation_in(&self.resource_generations, &self.observed_resources)
-    }
-
-    pub fn window_generation(&self, session_id: &str, window_id: &str) -> Option<u64> {
-        MuxResourceKey::Window(session_id.to_owned(), window_id.to_owned())
-            .generation_in(&self.resource_generations, &self.observed_resources)
-    }
-
-    pub fn pane_generation(&self, session_id: &str, window_id: &str, pane_id: &str) -> Option<u64> {
-        MuxResourceKey::Pane(
-            session_id.to_owned(),
-            window_id.to_owned(),
-            pane_id.to_owned(),
-        )
-        .generation_in(&self.resource_generations, &self.observed_resources)
-    }
-
-    pub fn terminal_generation(
-        &self,
-        session_id: &str,
-        window_id: &str,
-        pane_id: &str,
-    ) -> Option<u64> {
-        self.pane_generation(session_id, window_id, pane_id)
-    }
-
-    fn record_resource_snapshot(&mut self) {
-        let mut current = BTreeMap::new();
-        for session in self.sessions() {
-            current.insert(MuxResourceKey::Session(session.id.clone()), String::new());
-            for window in &session.windows {
-                current.insert(
-                    MuxResourceKey::Window(session.id.clone(), window.id.clone()),
-                    String::new(),
-                );
-                for pane in std::iter::once(&window.anchor).chain(&window.panes) {
-                    let Some(pane_id) = &pane.pane_id else {
-                        continue;
-                    };
-                    current.insert(
-                        MuxResourceKey::Pane(
-                            session.id.clone(),
-                            window.id.clone(),
-                            pane_id.clone(),
-                        ),
-                        format!("{:?}:{:?}", pane.pane_pid, pane.process),
-                    );
-                }
-            }
-        }
-        for (key, fingerprint) in &current {
-            let reappeared = !self.observed_resources.contains_key(key);
-            let occupant_changed = self
-                .observed_resources
-                .get(key)
-                .is_some_and(|previous| previous != fingerprint);
-            match self.resource_generations.get_mut(key) {
-                Some(generation) if reappeared || occupant_changed => {
-                    *generation = generation.saturating_add(1);
-                }
-                Some(_) => {}
-                None => {
-                    self.resource_generations.insert(key.clone(), 1);
-                }
-            }
-        }
-        self.observed_resources = current;
-    }
-
     fn build_backend(&self, config: &MuxBindingConfig) -> Box<dyn MuxBackend> {
-        self.registry
-            .build_backend(config, self.workspace.as_deref())
+        build_backend_with(self.backend_factory.as_ref(), config)
     }
 
     fn observe_command_config(&mut self, config: &MuxBindingConfig) -> u64 {
-        let mut state = self
-            .command_config
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.config.as_ref() != Some(config) {
-            state.config = Some(config.clone());
-            state.generation = state.generation.wrapping_add(1);
-        }
-        state.generation
-    }
-
-    fn observe_command_config(&mut self, config: &MultiplexerConfig) -> u64 {
         let mut state = self
             .command_config
             .lock()
@@ -1070,7 +933,7 @@ impl MuxController {
     pub fn refresh_sessions(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
     ) -> Option<String> {
         self.observe_command_config(config);
         while let Some((generation, result)) = self.poll_session_refresh() {
@@ -1095,11 +958,8 @@ impl MuxController {
             return outcome;
         }
 
-        if self.registry.command_dispatch(config) == MuxCommandDispatch::CallerThread {
-            let inline = self.refresh_inline_sessions(config);
-            outcome.applied |= inline.applied;
-            outcome.error = inline.error;
-            return outcome;
+        if backend == MuxBackendKind::Native {
+            return self.refresh_native_sessions(config);
         }
 
         if self.session_refresh_pending {
@@ -1132,11 +992,11 @@ impl MuxController {
         }
     }
 
-    fn refresh_inline_sessions(&mut self, config: &MuxBindingConfig) -> MuxSessionRefreshOutcome {
+    fn refresh_native_sessions(&mut self, config: &MuxBindingConfig) -> Option<String> {
         match self.build_backend(config).snapshot() {
             Ok(snapshot) => {
-                let backend = self.registry.selected_kind(config);
-                let applied = self.apply_refreshed_snapshot(backend, snapshot);
+                self.refresh_completed |=
+                    self.apply_refreshed_snapshot(MuxBackendKind::Native, snapshot);
                 self.last_session_refresh = Some(Instant::now());
                 MuxSessionRefreshOutcome {
                     applied,
@@ -1242,7 +1102,7 @@ impl MuxController {
     fn complete_authoritative_command(
         &mut self,
         result: MuxCommandResult,
-        active_config: Option<&MultiplexerConfig>,
+        active_config: Option<&MuxBindingConfig>,
     ) -> MuxCommandResult {
         match result {
             Ok(completion) => {
@@ -1397,6 +1257,21 @@ impl MuxController {
             name,
         };
         self.execute_preserving_selection(repaint, config, command);
+    }
+
+    pub fn ditch_session(
+        &mut self,
+        session_id: &str,
+        repaint: &RepaintHandle,
+        config: &MuxBindingConfig,
+    ) {
+        self.execute_preserving_selection(
+            repaint,
+            config,
+            MuxCommand::DitchSession {
+                session_id: session_id.to_owned(),
+            },
+        );
     }
 
     pub fn close_pane(
@@ -1562,7 +1437,7 @@ impl MuxController {
     pub fn execute_command_authoritatively(
         &mut self,
         repaint: &RepaintHandle,
-        config: &MultiplexerConfig,
+        config: &MuxBindingConfig,
         command: MuxCommand,
         deadline: Instant,
         cancellation: CommandCancellation,
@@ -1579,12 +1454,11 @@ impl MuxController {
             let _ = response_tx.send(Err(MuxCommandError::DeadlineExceeded));
             return response_rx;
         }
-        if selected_backend(config) == MultiplexerBackendConfig::Native && !cancellation.try_start()
-        {
+        if selected_backend(config) == MuxBackendKind::Native && !cancellation.try_start() {
             let _ = response_tx.send(Err(MuxCommandError::Cancelled));
             return response_rx;
         }
-        if selected_backend(config) == MultiplexerBackendConfig::Native {
+        if selected_backend(config) == MuxBackendKind::Native {
             let result = self
                 .execute_native_command(
                     config,
@@ -1621,77 +1495,13 @@ impl MuxController {
 
     fn execute_native_command(
         &mut self,
-        repaint: &RepaintHandle,
-        config: &MuxBindingConfig,
-        command: MuxCommand,
-        deadline: Instant,
-        cancellation: CommandCancellation,
-    ) -> mpsc::Receiver<MuxCommandResult> {
-        let (response_tx, response_rx) = mpsc::channel();
-        if self.availability_error.is_some() {
-            let _ = response_tx.send(Err(MuxCommandError::Unavailable));
-            return response_rx;
-        }
-        let (selected_session, selected_window) = self.command_completion(&command);
-        let completion = MuxCommandCompletion::requested(selected_session, selected_window);
-        if cancellation.is_cancelled() {
-            let _ = response_tx.send(Err(MuxCommandError::Cancelled));
-            return response_rx;
-        }
-        if Instant::now() >= deadline {
-            cancellation.cancel();
-            let _ = response_tx.send(Err(MuxCommandError::DeadlineExceeded));
-            return response_rx;
-        }
-        let command_dispatch = self.registry.command_dispatch(config);
-        if command_dispatch == MuxCommandDispatch::CallerThread && !cancellation.try_start() {
-            let _ = response_tx.send(Err(MuxCommandError::Cancelled));
-            return response_rx;
-        }
-        if command_dispatch == MuxCommandDispatch::CallerThread {
-            let result = self
-                .execute_inline_command(
-                    config,
-                    command,
-                    completion.selected_session.clone(),
-                    completion.selected_window.clone(),
-                )
-                .map(|snapshot| MuxCommandCompletion::from_snapshot(config.clone(), snapshot));
-            let _ = response_tx.send(result);
-            repaint();
-            return response_rx;
-        }
-        self.enqueue_command(
-            repaint,
-            config,
-            command,
-            completion,
-            Some(response_tx),
-            Some((deadline, cancellation)),
-        );
-        response_rx
-    }
-
-    fn command_completion(&self, command: &MuxCommand) -> (Option<String>, Option<String>) {
-        (
-            Some(command_session_id(command).to_owned()),
-            optimistic_window_after_command(
-                &self.sessions,
-                self.selected_window.as_deref(),
-                command,
-            ),
-        )
-    }
-
-    fn execute_inline_command(
-        &mut self,
         config: &MuxBindingConfig,
         command: MuxCommand,
         preferred_session: Option<String>,
         preferred_window: Option<String>,
     ) -> Result<MuxSnapshot, MuxCommandError> {
         let backend_kind = selected_backend(config);
-        if backend_kind != MultiplexerBackendConfig::Native {
+        if backend_kind != MuxBackendKind::Native {
             return Err(MuxCommandError::Unavailable);
         }
         let backend_kind = self.registry.selected_kind(config);
@@ -1714,10 +1524,20 @@ impl MuxController {
     }
 
     fn apply_refreshed_snapshot(&mut self, backend: MuxBackendKind, snapshot: MuxSnapshot) -> bool {
-        if !snapshot.disposition.is_authoritative() {
+        let same_backend = self.current_backend == Some(backend);
+        if backend == MuxBackendKind::Rmux
+            && !snapshot.sessions.is_empty()
+            && !sessions_have_renderable_pane(&snapshot.sessions)
+        {
             return false;
         }
-        let same_backend = self.current_backend == Some(backend);
+        if backend == MuxBackendKind::Rmux
+            && same_backend
+            && sessions_have_renderable_pane(&self.sessions)
+            && !sessions_have_renderable_pane(&snapshot.sessions)
+        {
+            return false;
+        }
         let keep_selection = same_backend || self.current_backend.is_none();
         let current_session = keep_selection
             .then(|| self.selected_session.take())

@@ -1,12 +1,15 @@
-use std::{fs, io, path::Path};
-
-use bootty_write::{CommitOutcome, NewFileMode, ResolveTargetError, WriteTarget};
-use toml_edit::{Array, DocumentMut, InlineTable, Value};
-
-use super::load::{ConfigDocument, ConfigLoadError, ConfigResult, load_or_create_config_document};
-use super::model::{
-    SegmentAlign, SshAuthenticationConfig, SshHostKeyPolicyConfig, SshProfileConfig, StatusSegment,
+use std::{
+    collections::HashSet,
+    fs::{self, File},
+    io::{self, Write},
+    path::{Component, Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
+
+use tempfile::Builder;
+use toml_edit::DocumentMut;
+
+use super::{ConfigDocument, ConfigLoadError, ConfigResult, load_or_create_config_document};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigWriteOutcome {
@@ -23,158 +26,6 @@ impl ConfigWriteOutcome {
     }
 }
 
-impl ConfigDocument {
-    pub fn set_f32(&mut self, path: &[&str], value: f32) -> ConfigResult<()> {
-        self.set_item(path, toml_edit::value(f64::from(value)))
-    }
-
-    pub fn set_bool(&mut self, path: &[&str], value: bool) -> ConfigResult<()> {
-        self.set_item(path, toml_edit::value(value))
-    }
-
-    pub fn set_str(&mut self, path: &[&str], value: &str) -> ConfigResult<()> {
-        self.set_item(path, toml_edit::value(value))
-    }
-
-    pub fn set_i64(&mut self, path: &[&str], value: i64) -> ConfigResult<()> {
-        self.set_item(path, toml_edit::value(value))
-    }
-
-    pub fn set_strings(&mut self, path: &[&str], values: &[String]) -> ConfigResult<()> {
-        let mut array = Array::new();
-        for value in values {
-            array.push(value.as_str());
-        }
-        self.set_item(path, toml_edit::value(array))
-    }
-
-    pub fn set_env(&mut self, path: &[&str], entries: &[(String, String)]) -> ConfigResult<()> {
-        let mut array = Array::new();
-        for (name, value) in entries {
-            let mut table = InlineTable::new();
-            table.insert("name", Value::from(name.as_str()));
-            table.insert("value", Value::from(value.as_str()));
-            array.push(table);
-        }
-        self.set_item(path, toml_edit::value(array))
-    }
-
-    pub fn set_top_bar_enabled(&mut self, enabled: bool) -> ConfigResult<()> {
-        self.remove(&["chrome", "status-bar"])?;
-        self.set_bool(&["chrome", "top-bar"], enabled)
-    }
-
-    pub fn set_top_status_segments(&mut self, segments: &[StatusSegment]) -> ConfigResult<()> {
-        self.remove(&["chrome", "status-segment"])?;
-        self.set_item(
-            &["chrome", "top-segment"],
-            toml_edit::value(serialize_status_segments(segments)),
-        )
-    }
-
-    pub fn set_bottom_status_segments(&mut self, segments: &[StatusSegment]) -> ConfigResult<()> {
-        self.set_item(
-            &["chrome", "bottom-segment"],
-            toml_edit::value(serialize_status_segments(segments)),
-        )
-    }
-
-    pub fn set_ssh_profile(&mut self, id: &str, profile: &SshProfileConfig) -> ConfigResult<()> {
-        self.remove_ssh_profile(id)?;
-        let root = ["ssh-profiles", id];
-        self.set_item(&[root[0], root[1], "name"], toml_edit::value(&profile.name))?;
-        self.set_item(&[root[0], root[1], "host"], toml_edit::value(&profile.host))?;
-        if let Some(user) = &profile.user {
-            self.set_item(&[root[0], root[1], "user"], toml_edit::value(user))?;
-        }
-        if let Some(port) = profile.port {
-            self.set_item(
-                &[root[0], root[1], "port"],
-                toml_edit::value(i64::from(port)),
-            )?;
-        }
-        let authentication = match profile.authentication {
-            SshAuthenticationConfig::Auto => "auto",
-            SshAuthenticationConfig::Agent => "agent",
-            SshAuthenticationConfig::KeyFile => "key-file",
-        };
-        self.set_item(
-            &[root[0], root[1], "authentication"],
-            toml_edit::value(authentication),
-        )?;
-        let host_key_policy = match profile.host_key_policy {
-            SshHostKeyPolicyConfig::Strict => "strict",
-            SshHostKeyPolicyConfig::AcceptNew => "accept-new",
-        };
-        self.set_item(
-            &[root[0], root[1], "host-key-policy"],
-            toml_edit::value(host_key_policy),
-        )?;
-        if let Some(identity_file) = &profile.identity_file {
-            self.set_item(
-                &[root[0], root[1], "identity-file"],
-                toml_edit::value(identity_file.display().to_string()),
-            )?;
-        }
-        if let Some(proxy_jump) = &profile.proxy_jump {
-            self.set_item(
-                &[root[0], root[1], "proxy-jump"],
-                toml_edit::value(proxy_jump),
-            )?;
-        }
-        self.set_item(
-            &[root[0], root[1], "program"],
-            toml_edit::value(&profile.program),
-        )?;
-        if !profile.args.is_empty() {
-            let mut args = Array::new();
-            for arg in &profile.args {
-                args.push(arg.as_str());
-            }
-            self.set_item(&[root[0], root[1], "args"], toml_edit::value(args))?;
-        }
-        Ok(())
-    }
-
-    pub fn remove_ssh_profile(&mut self, id: &str) -> ConfigResult<()> {
-        self.remove(&["ssh-profiles", id])
-    }
-}
-
-fn serialize_status_segments(segments: &[StatusSegment]) -> Array {
-    let mut array = Array::new();
-    for segment in segments {
-        let mut table = InlineTable::new();
-        let align = match segment.align {
-            SegmentAlign::Left => "left",
-            SegmentAlign::Center => "center",
-            SegmentAlign::Right => "right",
-        };
-        table.insert("align", Value::from(align));
-        table.insert("module", Value::from(segment.module.as_str()));
-        for (key, color) in [("fg", segment.fg), ("bg", segment.bg)] {
-            if let Some(color) = color {
-                let hex = if color.a == 0xff {
-                    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
-                } else {
-                    format!(
-                        "#{:02x}{:02x}{:02x}{:02x}",
-                        color.r, color.g, color.b, color.a
-                    )
-                };
-                table.insert(key, Value::from(hex));
-            }
-        }
-        if let Some(icon) = &segment.icon
-            && !icon.is_empty()
-        {
-            table.insert("icon", Value::from(icon.as_str()));
-        }
-        array.push(table);
-    }
-    array
-}
-
 pub fn update_config_document(
     path: impl AsRef<Path>,
     mutate: impl FnOnce(&mut ConfigDocument) -> ConfigResult<()>,
@@ -187,9 +38,27 @@ pub fn update_config_document(
         fs::create_dir_all(parent)
             .map_err(|error| write_error(requested_path, "prepare", error))?;
     }
-    let target = resolve_config_target(requested_path)?;
-    let target = target
-        .lock()
+    let target = resolve_write_target(requested_path)
+        .map_err(|error| write_error(requested_path, "resolve target", error))?;
+    let parent = target.parent().ok_or_else(|| {
+        write_error(
+            requested_path,
+            "prepare",
+            io::Error::new(io::ErrorKind::InvalidInput, "config target has no parent"),
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(write_error(
+            requested_path,
+            "prepare",
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("target directory {} does not exist", parent.display()),
+            ),
+        ));
+    }
+
+    let _lease = ConfigWriteLease::acquire(&target)
         .map_err(|error| write_error(requested_path, "claim writer lease", error))?;
     let mut document = load_or_create_config_document(requested_path)?;
     mutate(&mut document)?;
@@ -201,40 +70,201 @@ pub fn update_config_document(
         ))
     })?;
 
-    let outcome = target
-        .replace(source.as_bytes(), NewFileMode::Private)
-        .map_err(|error| {
-            let phase = error.phase();
-            write_error(requested_path, phase, error.into_io())
+    atomic_replace(requested_path, &target, source.as_bytes())
+}
+
+struct ConfigWriteLease {
+    _process: MutexGuard<'static, ()>,
+    _file: File,
+}
+
+impl ConfigWriteLease {
+    fn acquire(target: &Path) -> io::Result<Self> {
+        static PROCESS_CONFIG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+        let process = PROCESS_CONFIG_WRITE_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("config writer lock is poisoned"))?;
+        let file_name = target.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "config target has no file name",
+            )
         })?;
-    Ok(match outcome {
-        CommitOutcome::Confirmed => ConfigWriteOutcome::Confirmed,
-        CommitOutcome::CommittedWithDurabilityWarning(error) => {
-            ConfigWriteOutcome::CommittedWithDurabilityWarning(format!(
+        let mut lock_name = std::ffi::OsString::from(".");
+        lock_name.push(file_name);
+        lock_name.push(".bootty-write.lock");
+        let path = target.with_file_name(lock_name);
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        file.lock()?;
+        Ok(Self {
+            _process: process,
+            _file: file,
+        })
+    }
+}
+
+fn resolve_write_target(requested_path: &Path) -> io::Result<PathBuf> {
+    let mut current = normalize_absolute_path(requested_path)?;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "config symlink cycle detected",
+            ));
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&current)?;
+                current = if link.is_absolute() {
+                    link
+                } else {
+                    current
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(link)
+                };
+                current = normalize_absolute_path(&current)?;
+            }
+            Ok(_) => return fs::canonicalize(current),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let parent = current.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "config target has no parent")
+                })?;
+                let parent = fs::canonicalize(parent)?;
+                let file_name = current.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "config target has no file name",
+                    )
+                })?;
+                return Ok(parent.join(file_name));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn normalize_absolute_path(path: &Path) -> io::Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn atomic_replace(
+    requested_path: &Path,
+    target: &Path,
+    bytes: &[u8],
+) -> ConfigResult<ConfigWriteOutcome> {
+    let parent = target
+        .parent()
+        .expect("resolved config target has a parent");
+    let existing = match fs::metadata(target) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(write_error(requested_path, "read permissions", error)),
+    };
+    let mut temporary = Builder::new()
+        .prefix(".bootty-config-")
+        .tempfile_in(parent)
+        .map_err(|error| write_error(requested_path, "prepare", error))?;
+
+    set_replacement_permissions(temporary.as_file(), existing.as_ref())
+        .map_err(|error| write_error(requested_path, "prepare permissions", error))?;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.flush())
+        .map_err(|error| write_error(requested_path, "write", error))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| write_error(requested_path, "sync", error))?;
+
+    let temporary = temporary.into_temp_path();
+    replace_file(temporary.as_ref(), target, existing.is_some())
+        .map_err(|error| write_error(requested_path, "replace", error))?;
+
+    #[cfg(unix)]
+    {
+        if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+            return Ok(ConfigWriteOutcome::CommittedWithDurabilityWarning(format!(
                 "config file {} was replaced, but sync directory failed: {error}",
                 requested_path.display()
-            ))
+            )));
         }
-    })
+    }
+
+    Ok(ConfigWriteOutcome::Confirmed)
 }
 
-pub fn write_font_size_preference(
-    path: impl AsRef<Path>,
-    size: f32,
-) -> ConfigResult<ConfigWriteOutcome> {
-    update_config_document(path, |document| document.set_f32(&["font", "size"], size))
+#[cfg(unix)]
+fn set_replacement_permissions(file: &File, existing: Option<&fs::Metadata>) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = existing.map_or(0o600, |metadata| metadata.permissions().mode() & 0o7777);
+    file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
-fn resolve_config_target(path: &Path) -> ConfigResult<WriteTarget> {
-    WriteTarget::resolve(path).map_err(|error| {
-        let error = match error {
-            ResolveTargetError::SymlinkCycle => {
-                io::Error::new(io::ErrorKind::InvalidInput, "config symlink cycle detected")
-            }
-            ResolveTargetError::Io(error) => error,
-        };
-        write_error(path, "resolve target", error)
-    })
+#[cfg(not(unix))]
+fn set_replacement_permissions(_file: &File, _existing: Option<&fs::Metadata>) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn replace_file(temporary: &Path, target: &Path, _target_exists: bool) -> io::Result<()> {
+    fs::rename(temporary, target)
+}
+
+#[cfg(windows)]
+fn replace_file(temporary: &Path, target: &Path, target_exists: bool) -> io::Result<()> {
+    let temporary = temporary.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows paths must be valid UTF-8",
+        )
+    })?;
+    let target = target.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows paths must be valid UTF-8",
+        )
+    })?;
+    let result = if target_exists {
+        winsafe::ReplaceFile(target, temporary, None, winsafe::co::REPLACEFILE::default())
+    } else {
+        winsafe::MoveFileEx(
+            temporary,
+            Some(target),
+            winsafe::co::MOVEFILE::WRITE_THROUGH,
+        )
+    };
+    result.map_err(|error| io::Error::from_raw_os_error(error.raw() as i32))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn replace_file(temporary: &Path, target: &Path, _target_exists: bool) -> io::Result<()> {
+    fs::rename(temporary, target)
 }
 
 fn write_error(path: &Path, phase: &str, error: impl std::fmt::Display) -> ConfigLoadError {

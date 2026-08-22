@@ -29,38 +29,37 @@ use recorded_chord::normalize_recorded_chord;
 use selection::{TerminalSelectionAction, TerminalSelectionRouteContext, TerminalSelectionRouter};
 
 use super::command_runtime::CommandRuntime;
+use super::config_runtime::AppConfigRuntime;
+use super::dialog_runtime::{DialogRuntime, ModalDialog};
+use super::terminal_config::{
+    terminal_live_config, terminal_session_config_with_side_effects, terminal_text_config,
+};
 use super::workspace_runtime::{
     BindingRuntime, BindingStateCandidate, PendingGeneratedName, RemoteReattach, ScopedPaneId,
-    ScopedWindowId, SpaceRuntime, WorkspaceRuntime, binding_runtime_for_multiplexer,
-    terminal_session_config_with_side_effects,
+    ScopedWindowId, SpaceRuntime, WorkspaceRuntime,
 };
 
 use crate::{
     app_actions::{
-        AppAction, AppKeyBindings, FontSizeAction, KeybindAction, MuxKeyAction, SidebarAction,
-        SidebarKeyBindings, TerminalFindAction, TerminalScrollAction,
-        builtin_app_invocation_for_direct_key, split_app_actions_for_bindings_with_modifier_sides,
+        AppAction, FontSizeAction, KeybindAction, MuxKeyAction, SidebarAction, TerminalFindAction,
+        TerminalScrollAction, builtin_app_invocation_for_direct_key,
     },
     commands::{Caller, CommandInvocation, CommandTarget, ResourceKind},
     config::{
-        AppearanceMode, AppearanceVariant, BoottyConfig, ConfigState, WindowConfig,
-        load_config_from_path, load_or_create_config_document,
+        AppearanceMode, AppearanceVariant, BoottyConfig, ConfigWriteOutcome, WindowConfig,
+        update_config_document,
     },
-    config_reload::{CONFIG_HOT_RELOAD_INTERVAL, ConfigHotReload, new_session_only_config_changed},
-    diagnostics::{
-        STATUS_METRICS_SAMPLE_INTERVAL, StabilityTrace, StabilityTraceSample, StatusMetrics,
-    },
+    config_reload::CONFIG_HOT_RELOAD_INTERVAL,
+    diagnostics::{STATUS_METRICS_SAMPLE_INTERVAL, StabilityTraceSample, StatusMetrics},
     direct_input::{DirectKeyInput, ModifierSideState},
     geometry::{TerminalSurface, ViewTransform},
     input::{
         InputSnapshot, TerminalInputCommand, WheelScrollState,
         focus::InputFocus,
         router::{RoutedInput, route_events},
-        terminal_input_commands_with_wheel_state,
     },
     input_binding::CopyToClipboard,
     layout::{Direction, Divider, PaneLayout, SplitDirection},
-    modifier_remap::ModifierRemapSet,
     mux::{
         RepaintHandle,
         capability::BindingOperation,
@@ -75,7 +74,7 @@ use crate::{
         read_clipboard_text, restore_macos_presentation, show_desktop_notification,
         write_clipboard_html, write_clipboard_text,
     },
-    renderer::{RendererMetrics, TerminalRenderSource},
+    renderer::{RendererMetrics, TerminalFrameSource},
     scheduler::{RepaintScheduler, RepaintSignal},
     terminal::{DrainStats, MouseButton, TerminalSearchDirection},
     terminal_text::TerminalTextConfig,
@@ -95,9 +94,9 @@ use crate::{
     workspace::{SpaceMuxOverride, SpaceRemoteOverride},
 };
 use bootty_terminal::terminal_engine::{
-    TerminalColorConfig, TerminalCopyModeAction, TerminalCursorConfig, TerminalFeatureConfig,
-    TerminalSelectionFormat, TerminalSideEffect, TerminalSideEffectEvent,
-    encode_iterm2_report_cell_size, encode_iterm2_report_variable, encode_osc52_response,
+    TerminalCopyModeAction, TerminalLiveConfig, TerminalSelectionFormat, TerminalSideEffect,
+    TerminalSideEffectEvent, encode_iterm2_report_cell_size, encode_iterm2_report_variable,
+    encode_osc52_response,
 };
 
 const PRIMARY_WINDOW_STATE_KEY: &str = "main";
@@ -293,12 +292,9 @@ pub struct AppState {
     /// The full terminal area the panes were last laid out within, for geometric neighbor lookup.
     last_pane_area: Option<Rect>,
     terminal_view_transform: ViewTransform,
-    config_state: ConfigState,
+    config_runtime: AppConfigRuntime,
     active_appearance_variant: AppearanceVariant,
     input_focus: InputFocus,
-    app_key_bindings: AppKeyBindings,
-    sidebar_key_bindings: SidebarKeyBindings,
-    has_new_session_config_changes: bool,
     pub(super) repaint: RepaintHandle,
     direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
     modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
@@ -310,31 +306,19 @@ pub struct AppState {
     settings_open: bool,
     /// Mirrors whether a Luau-opened floating window is showing. That window lives on `BoottyApp`
     /// rather than here, so input gating reads this mirror to stop feeding the terminal behind it.
-    lua_window_open: bool,
+    extension_overlay_open: bool,
     terminal_selection: TerminalSelectionRouter,
     /// Screen rects of chrome resize handles (sidebar edge, pane dividers) registered during the
     /// previous frame's UI build. A primary press inside one of these must not begin a terminal
     /// text selection — the handle owns that drag. Populated each frame in `show_fixed_layout`.
     chrome_handle_rects: Vec<egui::Rect>,
     wheel_scroll_state: WheelScrollState,
-    modifier_remaps: ModifierRemapSet,
     terminal_cursor_icon: egui::CursorIcon,
     mouse_pointer_hidden_while_typing: bool,
     last_mouse_hover_pos: Option<Pos2>,
-    macos_option_as_alt: crate::terminal::MacosOptionAsAlt,
-    stability_trace: Option<StabilityTrace>,
-    pub(super) config_hot_reload: ConfigHotReload,
     deferred_profile_binding_rebuilds: HashSet<MuxScope>,
-    new_mux_session_dialog: Option<NewMuxSessionDialog>,
+    dialogs: DialogRuntime,
     sidebar_hovered_session: Option<ScopedSessionTarget>,
-    session_picker_dialog: Option<SessionPickerDialog>,
-    rename_session_dialog: Option<RenameSessionDialog>,
-    rename_tab_dialog: Option<RenameTabDialog>,
-    ditch_session_dialog: Option<DitchSessionDialog>,
-    keybind_help_dialog: Option<KeybindHelpDialog>,
-    command_palette_dialog: Option<CommandPaletteDialog>,
-    theme_picker_dialog: Option<ThemePickerDialog>,
-    space_editor_dialog: Option<SpaceEditorDialog>,
     terminal_find_dialog: Option<TerminalFindDialog>,
     terminal_find_return_focus_after_search: bool,
     last_terminal_search: String,
@@ -599,28 +583,23 @@ impl AppState {
         direct_input_rx: Option<mpsc::Receiver<DirectKeyInput>>,
         modifier_side_rx: Option<mpsc::Receiver<ModifierSideState>>,
     ) -> Result<Self> {
-        let modifier_remaps = config.input.modifier_remaps()?;
-        let macos_option_as_alt = config.input.macos_option_as_alt.into();
-        let sidebar_key_bindings =
-            SidebarKeyBindings::from_keybinds(&config.input.sidebar_keybind)?;
-        let stability_trace = StabilityTrace::from_config(&config);
+        let mut config_runtime = AppConfigRuntime::new(config)?;
+        let config = config_runtime.current();
         let active_appearance_variant = config.appearance.mode.variant(AppearanceVariant::Dark);
         let workspace = WorkspaceRuntime::open(
-            &config,
+            config,
             &window_state_key,
             active_appearance_variant,
             repaint.clone(),
         )?;
-        let keybinds = config
-            .input
-            .keybinds_for_backend(workspace.multiplexer_backend());
-        let app_key_bindings = AppKeyBindings::from_keybinds(&keybinds)?;
-        let config_hot_reload = ConfigHotReload::new(&config.config_path);
+        let app_key_bindings =
+            config_runtime.prepare_backend_keybindings(workspace.multiplexer_backend());
         let macos_non_native_fullscreen_active = config.window.non_native_fullscreen_enabled();
         let macos_non_native_fullscreen_applied =
             apply_macos_non_native_fullscreen_presentation(&config.window);
         let macos_non_native_fullscreen_pending_apply =
             macos_non_native_fullscreen_active && !macos_non_native_fullscreen_applied;
+        config_runtime.publish_backend_keybindings(app_key_bindings);
         #[cfg(debug_assertions)]
         let diagnostic_action_driver = DiagnosticActionDriver::from_env();
         let commands = CommandRuntime::new(repaint.clone());
@@ -640,12 +619,9 @@ impl AppState {
             last_pane_area: None,
             chrome_handle_rects: Vec::new(),
             terminal_view_transform: ViewTransform::IDENTITY,
-            config_state: ConfigState::new(config),
+            config_runtime,
             active_appearance_variant,
             input_focus: InputFocus::Terminal,
-            app_key_bindings,
-            sidebar_key_bindings,
-            has_new_session_config_changes: false,
             repaint,
             direct_input_rx,
             modifier_side_rx,
@@ -653,32 +629,20 @@ impl AppState {
             pending_direct_input: Vec::new(),
             suppress_next_egui_paste: false,
             settings_open: false,
-            lua_window_open: false,
+            extension_overlay_open: false,
             terminal_selection: TerminalSelectionRouter::default(),
             wheel_scroll_state: WheelScrollState::default(),
-            modifier_remaps,
             terminal_cursor_icon: egui::CursorIcon::Text,
             mouse_pointer_hidden_while_typing: false,
             last_mouse_hover_pos: None,
-            macos_option_as_alt,
-            stability_trace,
-            config_hot_reload,
             deferred_profile_binding_rebuilds: HashSet::new(),
-            new_mux_session_dialog: None,
+            dialogs: DialogRuntime::default(),
             sidebar_hovered_session: None,
-            session_picker_dialog: None,
-            rename_session_dialog: None,
-            rename_tab_dialog: None,
-            command_palette_dialog: None,
-            theme_picker_dialog: None,
-            space_editor_dialog: None,
             terminal_find_dialog: None,
             terminal_find_return_focus_after_search: false,
             last_terminal_search: String::new(),
             last_terminal_search_direction: TerminalSearchDirection::Next,
             theme_picker_restore_config: None,
-            ditch_session_dialog: None,
-            keybind_help_dialog: None,
             #[cfg(debug_assertions)]
             diagnostic_action_driver,
             macos_non_native_fullscreen_active,
@@ -687,29 +651,30 @@ impl AppState {
     }
 
     pub fn config(&self) -> &BoottyConfig {
-        self.config_state.current()
+        self.config_runtime.current()
     }
 
     /// Apply a dragged sidebar width to the live config without touching disk, so the layout
     /// tracks the pointer each frame. [`Self::persist_sidebar_width`] writes the final value.
     pub fn set_sidebar_width_live(&mut self, width: f32) {
-        self.config_state.current_mut().chrome.sidebar_width = width;
+        self.config_runtime.set_sidebar_width(width);
     }
 
     /// Persist the sidebar width to `config.toml` on drag release. The live value already matches,
     /// so the hot-reload baseline is refreshed to skip the redundant reload the write would trigger.
     pub fn persist_sidebar_width(&mut self, width: f32) {
         let path = self.config().config_path.clone();
-        let result = (|| {
-            let mut document = load_or_create_config_document(&path)?;
+        let result = update_config_document(&path, |document| {
             document.set_item(
                 &["chrome", "sidebar-width"],
                 bootty_config::toml_edit::value(f64::from(width)),
-            )?;
-            document.write_to_disk()
-        })();
+            )
+        });
         match result {
-            Ok(()) => self.config_hot_reload.refresh_after_reload(&path),
+            Ok(outcome) => {
+                self.config_runtime.refresh_dependency_graph();
+                self.record_config_write_warning(&outcome);
+            }
             Err(error) => self.last_error = Some(error.to_string()),
         }
     }
@@ -721,18 +686,16 @@ impl AppState {
             AppearanceMode::Light => "light",
             AppearanceMode::Dark => "dark",
         };
-        let result = (|| {
-            let mut document = load_or_create_config_document(&path)?;
+        let result = update_config_document(&path, |document| {
             document.set_item(
                 &["appearance", "mode"],
                 bootty_config::toml_edit::value(token),
-            )?;
-            document.write_to_disk()
-        })();
+            )
+        });
         match result {
-            Ok(()) => {
-                self.config_hot_reload.refresh_after_reload(&path);
+            Ok(outcome) => {
                 self.reload_config(effects);
+                self.record_config_write_warning(&outcome);
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -744,21 +707,29 @@ impl AppState {
             AppearanceVariant::Light => "light",
             AppearanceVariant::Dark => "dark",
         };
-        let result = (|| {
-            let mut document = load_or_create_config_document(&path)?;
+        let result = update_config_document(&path, |document| {
             document.set_item(
                 &["appearance", branch, "theme"],
                 bootty_config::toml_edit::value(theme),
-            )?;
-            document.write_to_disk()
-        })();
+            )
+        });
         match result {
-            Ok(()) => {
-                self.config_hot_reload.refresh_after_reload(&path);
+            Ok(outcome) => {
                 self.reload_config(effects);
+                self.record_config_write_warning(&outcome);
             }
             Err(error) => self.last_error = Some(error.to_string()),
         }
+    }
+
+    fn record_config_write_warning(&mut self, outcome: &ConfigWriteOutcome) {
+        let Some(warning) = outcome.durability_warning() else {
+            return;
+        };
+        self.last_error = Some(match self.last_error.take() {
+            Some(existing) => format!("{existing}; {warning}"),
+            None => warning.to_owned(),
+        });
     }
 
     fn preview_active_theme(&mut self, theme: &str, effects: &mut Vec<AppEffect>) {
@@ -774,61 +745,46 @@ impl AppState {
             }
         };
         let variant = self.active_appearance_variant;
-        let config = self.config_state.current_mut();
+        let mut config = self.config().clone();
         let branch = match variant {
             AppearanceVariant::Light => &mut config.appearance.light,
             AppearanceVariant::Dark => &mut config.appearance.dark,
         };
         branch.theme = Some(theme.to_owned());
         branch.colors = resolved.colors;
-        let colors = self
-            .config()
-            .colors_for_appearance(variant)
-            .terminal_color_config();
-        match self.set_binding_terminal_colors(colors) {
-            Ok(()) => effects.push(AppEffect::RequestRepaint),
-            Err(error) => self.last_error = Some(error.to_string()),
-        }
+        self.config_runtime.replace_preview_config(config);
+        self.publish_live_terminal_config(variant);
+        effects.push(AppEffect::RequestRepaint);
     }
 
     fn restore_theme_picker_preview(&mut self) -> bool {
         let Some(config) = self.theme_picker_restore_config.clone() else {
             return false;
         };
-        self.config_state.accept(config);
-        let colors = self
-            .config()
-            .colors_for_appearance(self.active_appearance_variant)
-            .terminal_color_config();
-        match self.set_binding_terminal_colors(colors) {
-            Ok(()) => true,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                false
-            }
+        self.config_runtime.replace_preview_config(config);
+        self.publish_live_terminal_config(self.active_appearance_variant);
+        true
+    }
+
+    fn publish_live_terminal_config(&mut self, variant: AppearanceVariant) {
+        let config = self.config().clone();
+        let live_config = terminal_live_config(&config, variant);
+        let warnings = self.publish_terminal_config(&config, variant, Some(&live_config));
+        if !warnings.is_empty() {
+            self.last_error = Some(warnings.join("; "));
         }
     }
 
     pub fn theme_picker_preview_active(&self) -> bool {
-        self.theme_picker_restore_config.is_some() && self.theme_picker_dialog.is_some()
+        self.theme_picker_restore_config.is_some() && self.dialogs.is_theme_picker()
     }
 
     pub fn set_appearance_variant(&mut self, variant: AppearanceVariant) {
         if self.active_appearance_variant == variant {
             return;
         }
-        let colors = self
-            .config()
-            .colors_for_appearance(variant)
-            .terminal_color_config();
-        match self.set_binding_terminal_colors(colors) {
-            Ok(()) => {
-                self.active_appearance_variant = variant;
-            }
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-            }
-        }
+        self.active_appearance_variant = variant;
+        self.publish_live_terminal_config(variant);
     }
 
     pub fn active_appearance_variant(&self) -> AppearanceVariant {
@@ -857,17 +813,6 @@ impl AppState {
 
     pub fn space_summaries(&self) -> Vec<SpaceSummary> {
         self.workspace.space_summaries()
-    }
-
-    fn space_backend_override(
-        &self,
-        space_id: SpaceId,
-    ) -> Option<Option<MultiplexerBackendConfig>> {
-        self.workspace.backend_override(space_id)
-    }
-
-    fn space_remote_override(&self, space_id: SpaceId) -> Option<SpaceRemoteOverride> {
-        self.workspace.remote_override(space_id)
     }
 
     pub fn space_transition(&self, now: Instant) -> Option<(SpaceId, SpaceId, f32)> {
@@ -970,34 +915,24 @@ impl AppState {
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
     ) -> bool {
-        let SpaceMuxOverride {
-            backend: backend_override,
-            remote: remote_override,
-        } = mux.clone();
         let Some(binding_scope) = self.workspace.selected_binding_scope(space_id) else {
             return false;
         };
-        let Some(previous_override) = self.space_backend_override(space_id) else {
+        let Some(previous_placement) = self.workspace.space_placement(space_id) else {
             return false;
         };
-        let previous_remote = self.space_remote_override(space_id);
-        let resolved_backend = backend_override.unwrap_or(self.config().multiplexer.backend);
+        let resolved_backend = mux.backend.unwrap_or(self.config().multiplexer.backend);
         let app_key_bindings = if space_id == self.workspace.active.id {
-            let keybinds = self.config().input.keybinds_for_backend(resolved_backend);
-            match AppKeyBindings::from_keybinds(&keybinds) {
-                Ok(bindings) => Some(bindings),
-                Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    return false;
-                }
-            }
+            Some(
+                self.config_runtime
+                    .prepare_backend_keybindings(resolved_backend),
+            )
         } else {
             None
         };
         // The remote decides which machine the binding's sessions live on, so a change to it needs
         // the same rebuild a backend change does.
-        let backend_changed = previous_override != backend_override
-            || previous_remote.as_ref() != Some(&remote_override);
+        let backend_changed = previous_placement != mux;
         let runtime_config = self.config().clone();
         let active_appearance_variant = self.active_appearance_variant;
         let repaint = self.repaint.clone();
@@ -1006,67 +941,22 @@ impl AppState {
             .update_space(binding_scope, name, icon, color, tint_sidebar, mux)
         {
             Ok(true) => {
-                if space_id == self.workspace.active.id {
-                    self.workspace.active.name = name.trim().to_owned();
-                    self.workspace.active.icon = icon.trim().to_owned();
-                    self.workspace.active.color = color;
-                    self.workspace.active.tint_sidebar = tint_sidebar;
-                    if backend_changed {
-                        let scope = self.workspace.active.binding.scope;
-                        let label = self.workspace.active.binding.label.clone();
-                        let session_order =
-                            std::mem::take(&mut self.workspace.active.binding.session_order);
-                        let session_names =
-                            std::mem::take(&mut self.workspace.active.binding.session_names);
-                        self.workspace.active.binding = binding_runtime_for_multiplexer(
-                            &runtime_config,
-                            BindingStateCandidate {
-                                scope,
-                                session_order,
-                                session_names,
-                            },
-                            label,
-                            backend_override,
-                            remote_override.clone(),
-                            active_appearance_variant,
-                            repaint.clone(),
+                if backend_changed {
+                    self.workspace.rebuild_binding(
+                        binding_scope,
+                        &runtime_config,
+                        active_appearance_variant,
+                        repaint,
+                    );
+                    if space_id == self.workspace.active.id {
+                        self.config_runtime.publish_backend_keybindings(
+                            app_key_bindings.expect("active backend bindings were validated"),
                         );
-                        self.app_key_bindings =
-                            app_key_bindings.expect("active backend bindings were validated");
                         self.terminal_surface = None;
                         self.last_pane_area = None;
                         if let Err(error) = self.sync_terminal_panes() {
                             self.last_error = Some(error.to_string());
                         }
-                    }
-                } else if let Some(space) = self
-                    .workspace
-                    .inactive_spaces
-                    .iter_mut()
-                    .find(|space| space.id == space_id)
-                {
-                    space.name = name.trim().to_owned();
-                    space.icon = icon.trim().to_owned();
-                    space.color = color;
-                    space.tint_sidebar = tint_sidebar;
-                    if backend_changed {
-                        let scope = space.binding.scope;
-                        let label = space.binding.label.clone();
-                        let session_order = std::mem::take(&mut space.binding.session_order);
-                        let session_names = std::mem::take(&mut space.binding.session_names);
-                        space.binding = binding_runtime_for_multiplexer(
-                            &runtime_config,
-                            BindingStateCandidate {
-                                scope,
-                                session_order,
-                                session_names,
-                            },
-                            label,
-                            backend_override,
-                            remote_override.clone(),
-                            active_appearance_variant,
-                            repaint.clone(),
-                        );
                     }
                 }
                 true
@@ -1123,14 +1013,7 @@ impl AppState {
         let Some(backend) = self.workspace.space_backend(space_id) else {
             return false;
         };
-        let keybinds = self.config().input.keybinds_for_backend(backend);
-        let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
-            Ok(bindings) => bindings,
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                return false;
-            }
-        };
+        let app_key_bindings = self.config_runtime.prepare_backend_keybindings(backend);
         let switch_started = crate::diagnostics::latency_start();
         let config = self.config().clone();
         if let Err(error) = self.workspace.activate_space(
@@ -1144,7 +1027,8 @@ impl AppState {
             self.last_error = Some(error.to_string());
             return false;
         }
-        self.app_key_bindings = app_key_bindings;
+        self.config_runtime
+            .publish_backend_keybindings(app_key_bindings);
         self.terminal_surface = None;
         self.last_pane_area = None;
         self.clear_space_context_dialogs();
@@ -1160,13 +1044,8 @@ impl AppState {
     }
 
     fn clear_space_context_dialogs(&mut self) {
-        self.new_mux_session_dialog = None;
+        self.dialogs.clear_space_context();
         self.sidebar_hovered_session = None;
-        self.session_picker_dialog = None;
-        self.rename_session_dialog = None;
-        self.rename_tab_dialog = None;
-        self.ditch_session_dialog = None;
-        self.space_editor_dialog = None;
     }
 
     pub fn binding_session_groups(&self) -> Vec<BindingSessionGroup> {
@@ -1301,45 +1180,52 @@ impl AppState {
         groups
     }
 
-    fn binding_runtimes_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
-        std::iter::once(&mut self.workspace.active.binding)
-            .chain(self.workspace.active.inactive_bindings.iter_mut())
-            .chain(
-                self.workspace
-                    .inactive_spaces
-                    .iter_mut()
-                    .flat_map(SpaceRuntime::bindings_mut),
-            )
-    }
+    fn publish_terminal_config(
+        &mut self,
+        config: &BoottyConfig,
+        variant: AppearanceVariant,
+        live_config: Option<&TerminalLiveConfig>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
 
-    fn set_binding_terminal_colors(&mut self, colors: TerminalColorConfig) -> Result<()> {
         if let Some(owner) = &mut self.workspace.parked_native_terminal {
-            owner.terminal.set_colors(colors.clone())?;
+            let mut owner_config = config.clone();
+            owner_config.multiplexer.backend = MultiplexerBackendConfig::Native;
+            let session_config = terminal_session_config_with_side_effects(
+                &owner_config,
+                variant,
+                &owner.terminal_side_effect_tx,
+            );
+            owner.terminal.set_terminal_config(session_config);
+            if let Some(live_config) = live_config
+                && let Err(error) = owner.terminal.apply_live_config(live_config.clone())
+            {
+                warnings.push(format!(
+                    "terminal config publication failed for parked native terminal: {error}"
+                ));
+            }
         }
-        for binding in self.binding_runtimes_mut() {
-            binding.terminal.set_colors(colors.clone())?;
-        }
-        Ok(())
-    }
 
-    fn set_binding_cursor_config(&mut self, cursor: TerminalCursorConfig) -> Result<()> {
-        if let Some(owner) = &mut self.workspace.parked_native_terminal {
-            owner.terminal.set_cursor_config(cursor)?;
+        for binding in self.workspace.bindings_mut() {
+            let mut binding_config = config.clone();
+            binding_config.multiplexer = binding.multiplexer.clone();
+            let session_config = terminal_session_config_with_side_effects(
+                &binding_config,
+                variant,
+                &binding.terminal_side_effect_tx,
+            );
+            binding.terminal.set_terminal_config(session_config);
+            if let Some(live_config) = live_config
+                && let Err(error) = binding.terminal.apply_live_config(live_config.clone())
+            {
+                warnings.push(format!(
+                    "terminal config publication failed for {:?}: {error}",
+                    binding.scope
+                ));
+            }
         }
-        for binding in self.binding_runtimes_mut() {
-            binding.terminal.set_cursor_config(cursor)?;
-        }
-        Ok(())
-    }
 
-    fn set_binding_feature_config(&mut self, features: TerminalFeatureConfig) -> Result<()> {
-        if let Some(owner) = &mut self.workspace.parked_native_terminal {
-            owner.terminal.set_feature_config(features)?;
-        }
-        for binding in self.binding_runtimes_mut() {
-            binding.terminal.set_feature_config(features)?;
-        }
-        Ok(())
+        warnings
     }
 
     pub(super) fn active_multiplexer(&self) -> &crate::config::MultiplexerConfig {
@@ -1407,8 +1293,8 @@ impl AppState {
 
     /// Mirror whether a Luau floating window is showing so the direct input path stops feeding the
     /// terminal behind it, matching how the native overlays gate input.
-    pub fn set_lua_window_open(&mut self, open: bool) {
-        self.lua_window_open = open;
+    pub fn set_extension_overlay_open(&mut self, open: bool) {
+        self.extension_overlay_open = open;
     }
 
     pub fn macos_non_native_fullscreen_active(&self) -> bool {
@@ -1954,7 +1840,7 @@ impl AppState {
         }
     }
 
-    pub fn render_source_for_pane(
+    pub fn terminal_runtime_for_pane(
         &mut self,
         pane_id: &str,
     ) -> Option<&mut (dyn TerminalRuntime + '_)> {
@@ -1962,7 +1848,7 @@ impl AppState {
             .active
             .binding
             .terminal
-            .render_source_for_pane(pane_id)
+            .terminal_runtime_for_pane(pane_id)
     }
 
     pub fn pane_terminal_window_size<F>(&self, leaf_size: F) -> Option<(u16, u16)>
@@ -2139,14 +2025,7 @@ impl AppState {
             let Some(backend) = self.workspace.binding_backend(target.scope) else {
                 return false;
             };
-            let keybinds = self.config().input.keybinds_for_backend(backend);
-            let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
-                Ok(bindings) => bindings,
-                Err(error) => {
-                    self.last_error = Some(error.to_string());
-                    return false;
-                }
-            };
+            let app_key_bindings = self.config_runtime.prepare_backend_keybindings(backend);
             let config = self.config().clone();
             if !self.workspace.activate_binding(
                 target.scope,
@@ -2156,7 +2035,8 @@ impl AppState {
             ) {
                 return false;
             }
-            self.app_key_bindings = app_key_bindings;
+            self.config_runtime
+                .publish_backend_keybindings(app_key_bindings);
             self.terminal_surface = None;
             self.last_pane_area = None;
         }
@@ -3008,15 +2888,15 @@ impl AppState {
     }
 
     pub fn take_dialog(&mut self) -> Option<NewMuxSessionDialog> {
-        self.new_mux_session_dialog.take()
+        self.dialogs.take_new_session()
     }
     pub fn take_space_editor_dialog(&mut self) -> Option<SpaceEditorDialog> {
-        self.space_editor_dialog.take()
+        self.dialogs.take_space_editor()
     }
 
     pub fn apply_space_editor_event(&mut self, dialog: SpaceEditorDialog, event: SpaceEditorEvent) {
         match event {
-            SpaceEditorEvent::None => self.space_editor_dialog = Some(dialog),
+            SpaceEditorEvent::None => self.dialogs.open(ModalDialog::SpaceEditor(dialog)),
             SpaceEditorEvent::Close => self.input_focus = InputFocus::Terminal,
             SpaceEditorEvent::Save {
                 space_id,
@@ -3044,7 +2924,7 @@ impl AppState {
                     ),
                 };
                 if !saved {
-                    self.space_editor_dialog = Some(dialog);
+                    self.dialogs.open(ModalDialog::SpaceEditor(dialog));
                 }
             }
         }
@@ -3078,7 +2958,7 @@ impl AppState {
     }
 
     pub fn take_session_picker_dialog(&mut self) -> Option<SessionPickerDialog> {
-        self.session_picker_dialog.take()
+        self.dialogs.take_session_picker()
     }
 
     pub fn apply_session_picker_event(
@@ -3088,7 +2968,7 @@ impl AppState {
     ) {
         match event {
             SessionPickerEvent::None => {
-                self.session_picker_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::SessionPicker(dialog));
             }
             SessionPickerEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3120,7 +3000,7 @@ impl AppState {
     }
 
     pub fn take_rename_session_dialog(&mut self) -> Option<RenameSessionDialog> {
-        self.rename_session_dialog.take()
+        self.dialogs.take_rename_session()
     }
 
     pub fn apply_rename_session_event(
@@ -3130,7 +3010,7 @@ impl AppState {
     ) {
         match event {
             RenameSessionEvent::None => {
-                self.rename_session_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::RenameSession(dialog));
             }
             RenameSessionEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3139,7 +3019,7 @@ impl AppState {
                 let name = name.trim().to_owned();
                 if name.is_empty() {
                     self.last_error = Some("session name cannot be empty".to_owned());
-                    self.rename_session_dialog = Some(dialog);
+                    self.dialogs.open(ModalDialog::RenameSession(dialog));
                     return;
                 }
                 let session = self
@@ -3177,7 +3057,7 @@ impl AppState {
                     };
                     if !self.begin_active_binding_membership_mutation(&command, Some(&pending_name))
                     {
-                        self.rename_session_dialog = Some(dialog);
+                        self.dialogs.open(ModalDialog::RenameSession(dialog));
                         return;
                     }
                     self.workspace
@@ -3205,13 +3085,13 @@ impl AppState {
     }
 
     pub fn take_rename_tab_dialog(&mut self) -> Option<RenameTabDialog> {
-        self.rename_tab_dialog.take()
+        self.dialogs.take_rename_tab()
     }
 
     pub fn apply_rename_tab_event(&mut self, dialog: RenameTabDialog, event: RenameTabEvent) {
         match event {
             RenameTabEvent::None => {
-                self.rename_tab_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::RenameTab(dialog));
             }
             RenameTabEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3288,7 +3168,7 @@ impl AppState {
     }
 
     pub fn take_ditch_session_dialog(&mut self) -> Option<DitchSessionDialog> {
-        self.ditch_session_dialog.take()
+        self.dialogs.take_ditch_session()
     }
 
     pub fn apply_ditch_session_event(
@@ -3298,7 +3178,7 @@ impl AppState {
     ) {
         match event {
             DitchSessionEvent::None => {
-                self.ditch_session_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::DitchSession(dialog));
             }
             DitchSessionEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3313,7 +3193,7 @@ impl AppState {
                     // dialog so the user sees the error instead of losing the session
                     // on top of an orphaned worktree.
                     self.last_error = Some(format!("ditch: {error}"));
-                    self.ditch_session_dialog = Some(dialog);
+                    self.dialogs.open(ModalDialog::DitchSession(dialog));
                     return;
                 }
                 let mux_config = self.active_multiplexer().clone();
@@ -3321,7 +3201,7 @@ impl AppState {
                     session_id: session_id.clone(),
                 };
                 if !self.begin_active_binding_membership_mutation(&command, None) {
-                    self.ditch_session_dialog = Some(dialog);
+                    self.dialogs.open(ModalDialog::DitchSession(dialog));
                     return;
                 }
                 self.workspace.active.binding.mux.ditch_session(
@@ -3341,13 +3221,13 @@ impl AppState {
     }
 
     pub fn take_keybind_help_dialog(&mut self) -> Option<KeybindHelpDialog> {
-        self.keybind_help_dialog.take()
+        self.dialogs.take_keybind_help()
     }
 
     pub fn apply_keybind_help_event(&mut self, dialog: KeybindHelpDialog, event: KeybindHelpEvent) {
         match event {
             KeybindHelpEvent::None => {
-                self.keybind_help_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::KeybindHelp(dialog));
             }
             KeybindHelpEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3356,7 +3236,7 @@ impl AppState {
     }
 
     pub fn take_command_palette_dialog(&mut self) -> Option<CommandPaletteDialog> {
-        self.command_palette_dialog.take()
+        self.dialogs.take_command_palette()
     }
 
     pub fn apply_command_palette_event(
@@ -3366,7 +3246,7 @@ impl AppState {
     ) {
         match event {
             CommandPaletteEvent::None => {
-                self.command_palette_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::CommandPalette(dialog));
             }
             CommandPaletteEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3399,7 +3279,7 @@ impl AppState {
     }
 
     pub fn take_theme_picker_dialog(&mut self) -> Option<ThemePickerDialog> {
-        self.theme_picker_dialog.take()
+        self.dialogs.take_theme_picker()
     }
 
     pub fn apply_theme_picker_event(
@@ -3410,7 +3290,7 @@ impl AppState {
     ) {
         match event {
             ThemePickerEvent::None => {
-                self.theme_picker_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::ThemePicker(dialog));
             }
             ThemePickerEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
@@ -3423,11 +3303,11 @@ impl AppState {
                 if self.restore_theme_picker_preview() {
                     effects.push(AppEffect::RequestRepaint);
                 }
-                self.theme_picker_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::ThemePicker(dialog));
             }
             ThemePickerEvent::Preview(theme) => {
                 self.preview_active_theme(&theme, effects);
-                self.theme_picker_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::ThemePicker(dialog));
             }
             ThemePickerEvent::Select(theme) => {
                 self.input_focus = InputFocus::Terminal;
@@ -3444,14 +3324,14 @@ impl AppState {
     ) {
         match event {
             NewSessionPickerEvent::None => {
-                self.new_mux_session_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::NewSession(dialog));
             }
             NewSessionPickerEvent::Close => {
                 self.input_focus = InputFocus::Terminal;
             }
             NewSessionPickerEvent::Error(error) => {
                 self.last_error = Some(error);
-                self.new_mux_session_dialog = Some(dialog);
+                self.dialogs.open(ModalDialog::NewSession(dialog));
             }
             NewSessionPickerEvent::CreateWorktree { repo, branch } => {
                 match crate::git::add_worktree(&repo, &branch) {
@@ -3461,7 +3341,7 @@ impl AppState {
                     }
                     Err(error) => {
                         self.last_error = Some(format!("worktree: {error}"));
-                        self.new_mux_session_dialog = Some(dialog);
+                        self.dialogs.open(ModalDialog::NewSession(dialog));
                     }
                 }
             }
@@ -3970,7 +3850,7 @@ impl AppState {
             self.start_due_reattach(now, &mut effects);
         }
 
-        for binding in self.binding_runtimes_mut() {
+        for binding in self.workspace.bindings_mut() {
             if let Some(result) = binding.mux.poll_command() {
                 if result.is_err() {
                     binding.pending_generated_names.clear();
@@ -4068,19 +3948,16 @@ impl AppState {
 
         let pending_pty_bytes = self.workspace.active.binding.terminal.pending_pty_len();
         let (cols, rows) = self.workspace.active.binding.terminal.grid_size();
-        if let Some(trace) = &mut self.stability_trace {
-            trace.record(StabilityTraceSample {
-                elapsed_ms: trace.started_at.elapsed().as_millis(),
-                selected_session: self.workspace.active.binding.mux.selected_session(),
-                cols,
-                rows,
-                pending_pty_bytes,
-                drain_bytes: self.last_drain.bytes,
-                drain_elapsed_us: self.last_drain.elapsed_us,
-                text_runs: renderer_metrics.text_runs,
-                last_error: self.last_error.as_deref(),
-            });
-        }
+        self.config_runtime.record_stability(StabilityTraceSample {
+            selected_session: self.workspace.active.binding.mux.selected_session(),
+            cols,
+            rows,
+            pending_pty_bytes,
+            drain_bytes: self.last_drain.bytes,
+            drain_elapsed_us: self.last_drain.elapsed_us,
+            text_runs: renderer_metrics.text_runs,
+            last_error: self.last_error.as_deref(),
+        });
         if now.duration_since(self.last_status_metrics_sample) >= STATUS_METRICS_SAMPLE_INTERVAL {
             self.status_metrics = StatusMetrics {
                 drain: self.last_drain,
@@ -4098,7 +3975,7 @@ impl AppState {
             cursor_blinking: renderer_metrics.cursor_blinking,
             input_commands,
         });
-        let repaint_after = repaint.after.min(CONFIG_HOT_RELOAD_INTERVAL);
+        let repaint_after = repaint.min(CONFIG_HOT_RELOAD_INTERVAL);
         if repaint_after.is_zero() {
             if !effects
                 .iter()
@@ -4117,15 +3994,7 @@ impl AppState {
     fn close_overlay_dialogs(&mut self) -> bool {
         let restored_preview = self.restore_theme_picker_preview();
         self.theme_picker_restore_config = None;
-        self.new_mux_session_dialog = None;
-        self.session_picker_dialog = None;
-        self.rename_session_dialog = None;
-        self.rename_tab_dialog = None;
-        self.ditch_session_dialog = None;
-        self.keybind_help_dialog = None;
-        self.command_palette_dialog = None;
-        self.theme_picker_dialog = None;
-        self.space_editor_dialog = None;
+        self.dialogs.clear();
         self.terminal_find_dialog = None;
         self.terminal_find_return_focus_after_search = false;
         restored_preview
@@ -4133,13 +4002,13 @@ impl AppState {
 
     fn open_new_mux_session_dialog(&mut self) {
         self.close_overlay_dialogs();
-        self.new_mux_session_dialog = Some(
+        self.dialogs.open(ModalDialog::NewSession(
             self.active_multiplexer()
                 .remote
                 .clone()
                 .map(|remote| NewMuxSessionDialog::open_remote(remote, self.repaint.clone()))
                 .unwrap_or_else(NewMuxSessionDialog::open),
-        );
+        ));
         self.input_focus = InputFocus::Picker;
     }
     pub fn open_create_space_dialog_from_ui(&mut self) -> bool {
@@ -4155,49 +4024,45 @@ impl AppState {
             .iter()
             .map(|(id, profile)| (id.clone(), profile.clone()))
             .collect::<Vec<_>>();
-        self.space_editor_dialog = Some(
+        self.dialogs.open(ModalDialog::SpaceEditor(
             SpaceEditorDialog::new_space(
                 default_space_icon(&existing_icons),
                 SpaceMuxOverride::default(),
             )
             .with_profiles(profiles.into_iter()),
-        );
+        ));
         self.input_focus = InputFocus::Picker;
         true
     }
 
     pub fn open_edit_space_dialog_from_ui(&mut self, space_id: SpaceId) -> bool {
-        let backend = self.space_backend_override(space_id);
-        let Some((space, backend)) = self
+        let placement = self.workspace.space_placement(space_id);
+        let Some((space, placement)) = self
             .space_summaries()
             .into_iter()
             .find(|space| space.id == space_id)
-            .zip(backend)
+            .zip(placement)
         else {
             return false;
         };
         self.close_overlay_dialogs();
-        // Save only this Space's remote override.
-        let remote = self
-            .space_remote_override(space.id)
-            .expect("a listed Space has a remote source");
         let profiles = self
             .config()
             .ssh_profiles
             .iter()
             .map(|(id, profile)| (id.clone(), profile.clone()))
             .collect::<Vec<_>>();
-        self.space_editor_dialog = Some(
+        self.dialogs.open(ModalDialog::SpaceEditor(
             SpaceEditorDialog::edit_space(
                 space.id,
                 space.name,
                 space.icon,
                 space.color,
                 space.tint_sidebar,
-                SpaceMuxOverride { backend, remote },
+                placement,
             )
             .with_profiles(profiles.into_iter()),
-        );
+        ));
         self.input_focus = InputFocus::Picker;
         true
     }
@@ -4209,7 +4074,8 @@ impl AppState {
 
     fn open_session_picker_dialog(&mut self) {
         self.close_overlay_dialogs();
-        self.session_picker_dialog = Some(SessionPickerDialog::open());
+        self.dialogs
+            .open(ModalDialog::SessionPicker(SessionPickerDialog::open()));
         self.input_focus = InputFocus::Picker;
     }
 
@@ -4219,8 +4085,8 @@ impl AppState {
     }
 
     fn toggle_session_picker_dialog(&mut self) {
-        if self.session_picker_dialog.is_some() {
-            self.session_picker_dialog = None;
+        if self.dialogs.is_session_picker() {
+            self.dialogs.clear();
             self.input_focus = InputFocus::Terminal;
         } else {
             self.open_session_picker_dialog();
@@ -4267,7 +4133,10 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
-        self.rename_session_dialog = Some(RenameSessionDialog::open(session_id, name));
+        self.dialogs
+            .open(ModalDialog::RenameSession(RenameSessionDialog::open(
+                session_id, name,
+            )));
         self.input_focus = InputFocus::Picker;
         true
     }
@@ -4299,7 +4168,10 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
-        self.rename_tab_dialog = Some(RenameTabDialog::open(session_id, window_id, name));
+        self.dialogs
+            .open(ModalDialog::RenameTab(RenameTabDialog::open(
+                session_id, window_id, name,
+            )));
         self.input_focus = InputFocus::Picker;
         true
     }
@@ -4355,7 +4227,10 @@ impl AppState {
             return false;
         };
         self.close_overlay_dialogs();
-        self.ditch_session_dialog = Some(DitchSessionDialog::open(session_id, cwd));
+        self.dialogs
+            .open(ModalDialog::DitchSession(DitchSessionDialog::open(
+                session_id, cwd,
+            )));
         self.input_focus = InputFocus::Picker;
         true
     }
@@ -4366,7 +4241,8 @@ impl AppState {
             .input
             .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
         self.close_overlay_dialogs();
-        self.keybind_help_dialog = Some(KeybindHelpDialog::open(&bindings));
+        self.dialogs
+            .open(ModalDialog::KeybindHelp(KeybindHelpDialog::open(&bindings)));
         self.input_focus = InputFocus::Picker;
     }
 
@@ -4376,7 +4252,10 @@ impl AppState {
             .input
             .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
         self.close_overlay_dialogs();
-        self.command_palette_dialog = Some(CommandPaletteDialog::open(&bindings));
+        self.dialogs
+            .open(ModalDialog::CommandPalette(CommandPaletteDialog::open(
+                &bindings,
+            )));
         self.input_focus = InputFocus::Picker;
     }
 
@@ -4410,26 +4289,19 @@ impl AppState {
         let restore_config = config.clone();
         self.close_overlay_dialogs();
         self.theme_picker_restore_config = Some(restore_config);
-        self.theme_picker_dialog = Some(ThemePickerDialog::open(
-            &config_path,
-            current.as_deref(),
-            branch,
-        ));
+        self.dialogs
+            .open(ModalDialog::ThemePicker(ThemePickerDialog::open(
+                &config_path,
+                current.as_deref(),
+                branch,
+            )));
         self.input_focus = InputFocus::Picker;
     }
 
     fn direct_terminal_input_enabled(&self) -> bool {
         self.input_focus.terminal_owns_input()
-            && self.new_mux_session_dialog.is_none()
-            && self.session_picker_dialog.is_none()
-            && self.rename_session_dialog.is_none()
-            && self.rename_tab_dialog.is_none()
-            && self.ditch_session_dialog.is_none()
-            && self.keybind_help_dialog.is_none()
-            && self.command_palette_dialog.is_none()
-            && self.theme_picker_dialog.is_none()
-            && self.space_editor_dialog.is_none()
-            && !self.lua_window_open
+            && !self.dialogs.has_modal()
+            && !self.extension_overlay_open
             && !self.settings_open
     }
 
@@ -4442,10 +4314,15 @@ impl AppState {
         let variant = self.active_appearance_variant;
         let profile_scopes = self
             .workspace
-            .all_bindings()
-            .filter(|binding| matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)))
-            .filter(|binding| requested_scopes.is_none_or(|scopes| scopes.contains(&binding.scope)))
-            .map(|binding| binding.scope)
+            .binding_scopes()
+            .filter(|scope| requested_scopes.is_none_or(|scopes| scopes.contains(scope)))
+            .filter(|scope| {
+                self.workspace
+                    .binding_placement(*scope)
+                    .is_some_and(|placement| {
+                        matches!(placement.remote, SpaceRemoteOverride::Profile(_))
+                    })
+            })
             .collect::<Vec<_>>();
         let mut pending_scopes = HashSet::new();
         for scope in &profile_scopes {
@@ -4467,34 +4344,15 @@ impl AppState {
         self.deferred_profile_binding_rebuilds
             .extend(pending_scopes.iter().copied());
         let mut rebuilt_scopes = Vec::new();
-        for binding in self.binding_runtimes_mut() {
-            if !matches!(binding.remote_override, SpaceRemoteOverride::Profile(_)) {
-                continue;
-            }
-            if requested_scopes.is_some_and(|scopes| !scopes.contains(&binding.scope)) {
+        for binding in self.workspace.bindings_mut() {
+            if !profile_scopes.contains(&binding.scope) {
                 continue;
             }
             if pending_scopes.contains(&binding.scope) {
                 continue;
             }
-            let session_order = std::mem::take(&mut binding.session_order);
-            let session_names = std::mem::take(&mut binding.session_names);
-            let pending_generated_names = std::mem::take(&mut binding.pending_generated_names);
-            let mut replacement = binding_runtime_for_multiplexer(
-                config,
-                BindingStateCandidate {
-                    scope: binding.scope,
-                    session_order,
-                    session_names,
-                },
-                binding.label.clone(),
-                binding.backend_override,
-                binding.remote_override.clone(),
-                variant,
-                repaint.clone(),
-            );
-            replacement.pending_generated_names = pending_generated_names;
-            *binding = replacement;
+            let placement = binding.placement().clone();
+            binding.rebuild(config, placement, variant, repaint.clone());
             rebuilt_scopes.push(binding.scope);
         }
         for scope in rebuilt_scopes {
@@ -4504,122 +4362,42 @@ impl AppState {
     }
 
     pub fn reload_config(&mut self, effects: &mut Vec<AppEffect>) -> bool {
-        let previous = self.config().clone();
-        let path = previous.config_path.clone();
-        let next = match load_config_from_path(&path) {
-            Ok(config) => config,
+        let change = match self.config_runtime.reload(
+            self.workspace.active.binding.multiplexer.backend,
+            self.active_appearance_variant,
+        ) {
+            Ok(change) => change,
             Err(error) => {
-                self.config_state.reject(error.to_string());
-                self.last_error = self.config_state.last_error().map(str::to_owned);
+                self.last_error = Some(error.to_string());
                 return false;
             }
         };
-        let compatibility_warning = (!next.compatibility_warnings.is_empty())
-            .then(|| next.compatibility_warnings.join("; "));
-        let modifier_remaps = match next.input.modifier_remaps() {
-            Ok(remaps) => remaps,
-            Err(error) => {
-                self.config_state.reject(error.to_string());
-                self.last_error = self.config_state.last_error().map(str::to_owned);
-                return false;
-            }
-        };
-        let keybinds = next
-            .input
-            .keybinds_for_backend(self.workspace.active.binding.multiplexer.backend);
-        let app_key_bindings = match AppKeyBindings::from_keybinds(&keybinds) {
-            Ok(bindings) => bindings,
-            Err(error) => {
-                self.config_state.reject(error.to_string());
-                self.last_error = self.config_state.last_error().map(str::to_owned);
-                return false;
-            }
-        };
-        let sidebar_key_bindings =
-            match SidebarKeyBindings::from_keybinds(&next.input.sidebar_keybind) {
-                Ok(bindings) => bindings,
-                Err(error) => {
-                    self.config_state.reject(error.to_string());
-                    self.last_error = self.config_state.last_error().map(str::to_owned);
-                    return false;
-                }
-            };
-
-        let previous_colors = previous.colors_for_appearance(self.active_appearance_variant);
-        let next_colors = next.colors_for_appearance(self.active_appearance_variant);
-        if previous_colors != next_colors
-            && let Err(error) =
-                self.set_binding_terminal_colors(next_colors.terminal_color_config())
-        {
-            self.config_state.reject(error.to_string());
-            self.last_error = self.config_state.last_error().map(str::to_owned);
-            return false;
+        if let Some(text_config) = change.text_config {
+            effects.push(AppEffect::SetTerminalTextConfig(text_config));
         }
-        if previous.cursor != next.cursor
-            && let Err(error) = self.set_binding_cursor_config(next.cursor.terminal_cursor_config())
-        {
-            self.config_state.reject(error.to_string());
-            self.last_error = self.config_state.last_error().map(str::to_owned);
-            return false;
+        if let Some(ui_fonts) = change.ui_fonts {
+            effects.push(AppEffect::SetUiFonts(ui_fonts));
         }
-        if previous.session.glyph_protocol != next.session.glyph_protocol
-            && let Err(error) =
-                self.set_binding_feature_config(next.session.terminal_feature_config())
-        {
-            self.config_state.reject(error.to_string());
-            self.last_error = self.config_state.last_error().map(str::to_owned);
-            return false;
-        }
-        if previous.font != next.font {
-            effects.push(AppEffect::SetTerminalTextConfig(
-                next.font.terminal_text_config(),
-            ));
-            if previous.font.ui_families() != next.font.ui_families() {
-                effects.push(AppEffect::SetUiFonts(next.font.ui_families().to_vec()));
-            }
-        }
-        if previous.window.title != next.window.title {
-            effects.push(AppEffect::SetWindowTitle(next.window.title.clone()));
-        }
-        if previous.diagnostics != next.diagnostics {
-            self.stability_trace = StabilityTrace::from_config(&next);
+        if let Some(window_title) = change.window_title {
+            effects.push(AppEffect::SetWindowTitle(window_title));
         }
 
-        self.modifier_remaps = modifier_remaps;
-        self.macos_option_as_alt = next.input.macos_option_as_alt.into();
-        self.app_key_bindings = app_key_bindings;
-        self.sidebar_key_bindings = sidebar_key_bindings;
-        let active_appearance_variant = self.active_appearance_variant;
-        let profile_reload_error = if previous.ssh_profiles != next.ssh_profiles {
-            self.rebuild_profile_bindings(&next, None)
+        let mut warnings = Vec::new();
+        let profile_reload_error = if change.ssh_profiles_changed {
+            self.rebuild_profile_bindings(&change.config, None)
                 .err()
                 .map(|error| error.to_string())
         } else {
             None
         };
-        for binding in self.binding_runtimes_mut() {
-            let mut binding_config = next.clone();
-            binding_config.multiplexer = binding.multiplexer.clone();
-            let session_config = terminal_session_config_with_side_effects(
-                &binding_config,
-                active_appearance_variant,
-                &binding.terminal_side_effect_tx,
-            );
-            binding.terminal.set_terminal_config(session_config);
+        if let Some(error) = profile_reload_error {
+            warnings.push(error);
         }
-        if let Some(owner) = &mut self.workspace.parked_native_terminal {
-            let mut owner_config = next.clone();
-            owner_config.multiplexer.backend = crate::config::MultiplexerBackendConfig::Native;
-            let session_config = terminal_session_config_with_side_effects(
-                &owner_config,
-                active_appearance_variant,
-                &owner.terminal_side_effect_tx,
-            );
-            owner.terminal.set_terminal_config(session_config);
-        }
-        self.has_new_session_config_changes = new_session_only_config_changed(&previous, &next)
-            || self.has_new_session_config_changes;
-        self.config_state.accept(next);
+        warnings.extend(self.publish_terminal_config(
+            &change.config,
+            self.active_appearance_variant,
+            change.live_config.as_ref(),
+        ));
         self.set_mouse_pointer_hidden_while_typing(self.mouse_pointer_hidden_while_typing, effects);
         self.workspace
             .active
@@ -4627,42 +4405,33 @@ impl AppState {
             .pending_generated_names
             .clear();
         self.sync_session_order();
-        self.last_error = profile_reload_error.or_else(|| match (
-            self.has_new_session_config_changes,
-            compatibility_warning,
-        ) {
-            (true, Some(warning)) => Some(format!(
-                "config reloaded; session/window settings require a new window or restart; {warning}"
-            )),
-            (true, None) => Some(
+        if self.config_runtime.has_new_session_config_changes() {
+            warnings.push(
                 "config reloaded; session/window settings require a new window or restart"
                     .to_owned(),
-            ),
-            (false, warning) => warning,
-        });
+            );
+        }
+        if let Some(warning) = change.compatibility_warning {
+            warnings.push(warning);
+        }
+        self.last_error = (!warnings.is_empty()).then(|| warnings.join("; "));
         effects.push(AppEffect::RequestRepaint);
         true
     }
 
     fn hot_reload_config_if_changed(&mut self, effects: &mut Vec<AppEffect>, now: Instant) {
-        if !self.config_hot_reload.changed(now) {
+        if !self.config_runtime.reload_due(now) {
             return;
         }
-        let path = self.config().config_path.clone();
-        if self.reload_config(effects) {
-            self.config_hot_reload.refresh_after_reload(&path);
-        }
+        self.reload_config(effects);
     }
 
     fn split_app_actions(
         &mut self,
         events: Vec<egui::Event>,
     ) -> (Vec<egui::Event>, Vec<CommandInvocation>) {
-        split_app_actions_for_bindings_with_modifier_sides(
-            &mut self.app_key_bindings,
-            events,
-            self.modifier_sides,
-        )
+        self.config_runtime
+            .split_app_actions(events, self.modifier_sides)
     }
 
     /// While the command palette is open, find and remove the configure-keybinding
@@ -4670,7 +4439,7 @@ impl AppState {
     /// doesn't also trigger whatever global binding shares that chord. Returns
     /// whether one was consumed.
     fn take_configure_keybind_chord(&self, events: &mut Vec<egui::Event>) -> bool {
-        if self.command_palette_dialog.is_none() {
+        if !self.dialogs.is_command_palette() {
             return false;
         }
         let macos = cfg!(target_os = "macos");
@@ -4716,9 +4485,7 @@ impl AppState {
             return false;
         }
 
-        match TerminalRenderSource::is_mouse_tracking(
-            self.workspace.active.binding.terminal.as_mut(),
-        ) {
+        match TerminalRuntime::is_mouse_tracking(self.workspace.active.binding.terminal.as_mut()) {
             Ok(mouse_tracking) => mouse_tracking,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -4737,21 +4504,19 @@ impl AppState {
             let copy_on_select = self.config().input.copy_on_select
                 && matches!(&action, TerminalSelectionAction::End(_));
             let result = match action {
-                TerminalSelectionAction::Begin(event) => TerminalRenderSource::begin_selection(
+                TerminalSelectionAction::Begin(event) => TerminalRuntime::begin_selection(
                     self.workspace.active.binding.terminal.as_mut(),
                     event,
                 ),
-                TerminalSelectionAction::Scroll(delta) => {
-                    TerminalRenderSource::scroll_viewport_delta(
-                        self.workspace.active.binding.terminal.as_mut(),
-                        delta,
-                    )
-                }
-                TerminalSelectionAction::Update(event) => TerminalRenderSource::update_selection(
+                TerminalSelectionAction::Scroll(delta) => TerminalRuntime::scroll_viewport_delta(
+                    self.workspace.active.binding.terminal.as_mut(),
+                    delta,
+                ),
+                TerminalSelectionAction::Update(event) => TerminalRuntime::update_selection(
                     self.workspace.active.binding.terminal.as_mut(),
                     event,
                 ),
-                TerminalSelectionAction::End(event) => TerminalRenderSource::end_selection(
+                TerminalSelectionAction::End(event) => TerminalRuntime::end_selection(
                     self.workspace.active.binding.terminal.as_mut(),
                     event,
                 ),
@@ -4770,9 +4535,7 @@ impl AppState {
     }
 
     fn terminal_copy_mode_active(&mut self) -> bool {
-        match TerminalRenderSource::copy_mode_active(
-            self.workspace.active.binding.terminal.as_mut(),
-        ) {
+        match TerminalRuntime::copy_mode_active(self.workspace.active.binding.terminal.as_mut()) {
             Ok(active) => active,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -4782,8 +4545,7 @@ impl AppState {
     }
 
     fn enter_terminal_copy_mode(&mut self, effects: &mut Vec<AppEffect>) {
-        match TerminalRenderSource::enter_copy_mode(self.workspace.active.binding.terminal.as_mut())
-        {
+        match TerminalRuntime::enter_copy_mode(self.workspace.active.binding.terminal.as_mut()) {
             Ok(()) => effects.push(AppEffect::RequestRepaint),
             Err(error) => self.last_error = Some(error.to_string()),
         }
@@ -4841,7 +4603,7 @@ impl AppState {
             | TerminalCopyModeAction::SearchWord(direction) => Some(*direction),
             _ => None,
         };
-        match TerminalRenderSource::handle_copy_mode_action(
+        match TerminalRuntime::handle_copy_mode_action(
             self.workspace.active.binding.terminal.as_mut(),
             action,
         ) {
@@ -4979,8 +4741,8 @@ impl AppState {
         // Consume it here so it doesn't also fire its own global binding.
         if self.take_configure_keybind_chord(&mut events) {
             let action = self
-                .command_palette_dialog
-                .as_ref()
+                .dialogs
+                .command_palette()
                 .and_then(CommandPaletteDialog::current_action)
                 .map(str::to_owned);
             self.close_overlay_dialogs();
@@ -5020,12 +4782,9 @@ impl AppState {
                 .map(crate::renderer::scrollbar_hit_rect),
             view: self.terminal_view_transform,
         };
-        let commands = terminal_input_commands_with_wheel_state(
-            snapshot,
-            &self.modifier_remaps,
-            self.macos_option_as_alt,
-            &mut self.wheel_scroll_state,
-        );
+        let commands = self
+            .config_runtime
+            .terminal_input_commands(snapshot, &mut self.wheel_scroll_state);
         let count = commands.len()
             + actions.len()
             + sidebar_count
@@ -5091,7 +4850,7 @@ impl AppState {
         let mut copy_mode_active = self.terminal_copy_mode_active();
         for input in inputs {
             let mut input = input.input();
-            input.mods = self.modifier_remaps.apply(input.mods);
+            input.mods = self.config_runtime.remap_mods(input.mods);
             if copy_mode_active {
                 if let Some(action) = copy_mode_action_for_input(input) {
                     copy_mode_active = self.apply_copy_mode_key_action(action, effects);
@@ -5106,7 +4865,7 @@ impl AppState {
             {
                 continue;
             }
-            if let Some(invocation) = self.app_key_bindings.invocation_for_input(input) {
+            if let Some(invocation) = self.config_runtime.invocation_for_input(input) {
                 if invocation.command == "paste_from_clipboard" {
                     self.suppress_next_egui_paste = true;
                 }
@@ -5151,8 +4910,7 @@ impl AppState {
             else {
                 continue;
             };
-            let Some(invocation) = self.sidebar_key_bindings.invocation_for_key(key, modifiers)
-            else {
+            let Some(invocation) = self.config_runtime.sidebar_invocation(key, modifiers) else {
                 continue;
             };
             self.dispatch_command(invocation, viewport, effects);
@@ -5206,10 +4964,7 @@ impl AppState {
     ) {
         match action {
             KeybindAction::App(AppAction::ReloadConfig) => {
-                if self.reload_config(effects) {
-                    let path = self.config().config_path.clone();
-                    self.config_hot_reload.refresh_after_reload(&path);
-                }
+                self.reload_config(effects);
             }
             KeybindAction::App(AppAction::Ignore) => {}
             KeybindAction::App(AppAction::NewWindow | AppAction::NewMuxSession) => {
@@ -5319,7 +5074,7 @@ impl AppState {
                 if self.input_focus == InputFocus::Sidebar {
                     self.input_focus = InputFocus::Terminal;
                 } else {
-                    self.config_state.current_mut().chrome.sidebar = true;
+                    self.config_runtime.show_sidebar();
                     self.input_focus = InputFocus::Sidebar;
                     self.sidebar_hovered_session = self
                         .workspace
@@ -5333,9 +5088,7 @@ impl AppState {
                 effects.push(AppEffect::RequestRepaint);
             }
             KeybindAction::App(AppAction::ToggleSidebarVisibility) => {
-                let chrome = &mut self.config_state.current_mut().chrome;
-                chrome.sidebar = !chrome.sidebar;
-                if !chrome.sidebar {
+                if !self.config_runtime.toggle_sidebar() {
                     self.input_focus = InputFocus::Terminal;
                 }
                 effects.push(AppEffect::RequestRepaint);
@@ -6154,7 +5907,7 @@ impl AppState {
                 .active
                 .binding
                 .terminal
-                .focused_render_source(&pane_id)
+                .focused_terminal_runtime(&pane_id)
         {
             let found = source.search_viewport(query, direction)?;
             let frame = source.extract_frame()?;
@@ -6184,7 +5937,7 @@ impl AppState {
         query: &str,
         direction: TerminalSearchDirection,
     ) -> TerminalFindResult {
-        match TerminalRenderSource::handle_copy_mode_action(
+        match TerminalRuntime::handle_copy_mode_action(
             self.workspace.active.binding.terminal.as_mut(),
             TerminalCopyModeAction::Search {
                 query: query.to_owned(),
@@ -6313,8 +6066,8 @@ impl AppState {
             FontSizeAction::Set(size) => size,
         }
         .max(1.0);
-        self.config_state.current_mut().font.size = next_size;
-        let text_config = self.config().font.terminal_text_config();
+        self.config_runtime.set_font_size(next_size);
+        let text_config = terminal_text_config(&self.config().font);
         if let Some(existing) = effects.iter_mut().rev().find_map(|effect| match effect {
             AppEffect::SetTerminalTextConfig(existing) => Some(existing),
             _ => None,

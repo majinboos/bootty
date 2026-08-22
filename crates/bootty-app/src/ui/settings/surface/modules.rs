@@ -1,16 +1,13 @@
 use std::path::{Path, PathBuf};
 
-use bootty_extension::{
-    ModuleIdentity, SurfaceDeclaration, SurfacePlacement, SurfaceSnapshot, editable_module_source,
-    error_item, import_legacy_extension_module, legacy_extension_modules, module_identities,
-    preview_module_surfaces, reset_module_source, save_module_source,
-};
-use bootty_ui::icons;
 use eframe::egui::{self, RichText};
 
-use crate::theme::module_color32;
-
-use super::SettingsSurface;
+use super::SettingsWindow;
+use crate::command_extensions::{
+    ModuleIdentity, SurfacePlacement, editable_module_source, import_legacy_extension_module,
+    legacy_extension_modules, module_identities, preview_module_surfaces, reset_module_source,
+    save_module_source,
+};
 
 #[derive(Default)]
 pub(super) struct EditorState {
@@ -26,10 +23,10 @@ pub(super) struct EditorState {
     error: Option<String>,
     preview_source: String,
     preview_theme: Vec<(String, String)>,
-    preview: Vec<SurfaceSnapshot>,
+    preview: Vec<crate::command_extensions::SurfaceSnapshot>,
 }
 
-pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
+pub(super) fn sidebar_ui(win: &mut SettingsWindow, ui: &mut egui::Ui) {
     let palette = win.palette;
     let Some(root) = extension_root(win) else {
         return;
@@ -108,10 +105,10 @@ pub(super) fn sidebar_ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
 }
 
 pub(super) fn settings_pane<T>(
-    win: &mut SettingsSurface,
+    win: &mut SettingsWindow,
     ui: &mut egui::Ui,
-    selector: impl FnOnce(&mut SettingsSurface, &mut egui::Ui) -> T,
-    content: impl FnOnce(&mut SettingsSurface, &mut egui::Ui, T),
+    selector: impl FnOnce(&mut SettingsWindow, &mut egui::Ui) -> T,
+    content: impl FnOnce(&mut SettingsWindow, &mut egui::Ui, T),
 ) {
     let selector_width = (ui.available_width() * 0.25).clamp(210.0, 280.0);
     ui.horizontal_top(|ui| {
@@ -132,7 +129,7 @@ pub(super) fn settings_pane<T>(
 }
 
 pub(super) fn source_editor_for_surface(
-    win: &mut SettingsSurface,
+    win: &mut SettingsWindow,
     ui: &mut egui::Ui,
     surface: &str,
 ) {
@@ -147,7 +144,7 @@ pub(super) fn source_editor_for_surface(
     source_editor(win, ui, &identity);
 }
 
-fn source_editor(win: &mut SettingsSurface, ui: &mut egui::Ui, identity: &ModuleIdentity) {
+fn source_editor(win: &mut SettingsWindow, ui: &mut egui::Ui, identity: &ModuleIdentity) {
     let palette = win.palette;
     let Some(root) = extension_root(win) else {
         return;
@@ -181,10 +178,7 @@ fn source_editor(win: &mut SettingsSurface, ui: &mut egui::Ui, identity: &Module
         });
 }
 
-pub(super) fn new_module_ui(
-    win: &mut SettingsSurface,
-    ui: &mut egui::Ui,
-) -> Option<ModuleIdentity> {
+pub(super) fn new_module_ui(win: &mut SettingsWindow, ui: &mut egui::Ui) -> Option<ModuleIdentity> {
     let palette = win.palette;
     if !win.module_editor.creating {
         if super::settings_button(ui, palette, "+ New module").clicked() {
@@ -292,7 +286,7 @@ pub(super) fn module_selector_row(
     if let Some(handle) = handle {
         handle.paint_in(ui, palette, gutter);
     } else {
-        icons::paint_icon_slug(
+        crate::ui::icons::paint_icon_slug(
             ui.painter(),
             "file-code",
             gutter.center(),
@@ -310,7 +304,7 @@ pub(super) fn module_selector_row(
 fn module_preview(
     ui: &mut egui::Ui,
     palette: bootty_ui::ThemePalette,
-    surfaces: &[SurfaceSnapshot],
+    surfaces: &[crate::command_extensions::SurfaceSnapshot],
 ) {
     ui.label(
         RichText::new("PREVIEW · EXAMPLE DATA")
@@ -330,15 +324,9 @@ fn module_preview(
         for item in &surface.items {
             ui.horizontal_wrapped(|ui| {
                 if let Some(icon) = &item.icon {
-                    ui.label(
-                        RichText::new(icon)
-                            .color(item.fg.map(module_color32).unwrap_or(palette.text)),
-                    );
+                    ui.label(RichText::new(icon).color(item.fg.unwrap_or(palette.text)));
                 }
-                ui.label(
-                    RichText::new(&item.text)
-                        .color(item.fg.map(module_color32).unwrap_or(palette.text)),
-                );
+                ui.label(RichText::new(&item.text).color(item.fg.unwrap_or(palette.text)));
             });
         }
     }
@@ -432,7 +420,7 @@ fn load_editor(state: &mut EditorState, root: &Path, identity: &ModuleIdentity) 
     state.preview_source.clear();
 }
 
-fn extension_root(win: &SettingsSurface) -> Option<PathBuf> {
+fn extension_root(win: &SettingsWindow) -> Option<PathBuf> {
     win.writeback
         .path()
         .parent()
@@ -450,14 +438,14 @@ fn module_template(identity: &ModuleIdentity) -> String {
     )
 }
 
-fn error_surface(error: String) -> SurfaceSnapshot {
-    SurfaceSnapshot {
-        declaration: SurfaceDeclaration {
+fn error_surface(error: String) -> crate::command_extensions::SurfaceSnapshot {
+    crate::command_extensions::SurfaceSnapshot {
+        declaration: crate::command_extensions::SurfaceDeclaration {
             id: "preview-error".to_owned(),
             placement: SurfacePlacement::Floating,
             order: 0,
             interval: std::time::Duration::from_secs(1),
         },
-        items: vec![error_item(&error)],
+        items: vec![crate::extension_ui::error_item(&error)],
     }
 }

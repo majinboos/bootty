@@ -2,13 +2,6 @@ pub use crate::space_protocol::decode_command;
 use anyhow::{Context, Result, bail};
 use bootty_mux_model::MuxBackendKind;
 
-use bootty_mux::{
-    backend::MuxBackend,
-    command::MuxCommand,
-    process::{CommandRunner, SystemCommandRunner},
-    snapshot::MuxSnapshot,
-};
-
 use crate::{
     space_protocol::encode_command,
     ssh::{REMOTE_DAEMON_PROGRAM, SshRemote, remote_daemon_failure},
@@ -70,6 +63,15 @@ impl MuxBackend for RemoteSpaceBackend {
             encode_command(&command)?,
         ])?;
         Ok(())
+    }
+
+    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+        match self.backend {
+            MuxBackendKind::Rmux => rmux_capabilities(scope),
+            MuxBackendKind::Tmux => tmux_capabilities(scope),
+            MuxBackendKind::Zellij => zellij_capabilities(scope),
+            MuxBackendKind::Native => BindingCapabilityDescriptor::new(scope, []),
+        }
     }
 }
 

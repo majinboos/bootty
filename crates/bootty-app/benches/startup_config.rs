@@ -5,6 +5,7 @@ use bootty_app::{
         BoottyConfig, MultiplexerBackendConfig, builtin_theme_names, load_config_from_path,
         resolve_theme, write_font_size_preference,
     },
+    input::resolve_modifier_remaps,
     input_binding_set::BindingSet,
     workspace::{SessionOrderStore, WorkspaceRepository},
 };

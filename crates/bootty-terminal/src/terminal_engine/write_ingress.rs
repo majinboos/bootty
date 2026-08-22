@@ -2,6 +2,23 @@ use std::borrow::Cow;
 
 use memchr::{memchr3_iter, memmem::find};
 
+pub(crate) fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    let first = *needle.first()?;
+    if needle.len() == 1 {
+        return haystack.iter().position(|byte| *byte == first);
+    }
+
+    let mut offset = 0;
+    while let Some(relative_start) = haystack[offset..].iter().position(|byte| *byte == first) {
+        let start = offset + relative_start;
+        if haystack[start..].starts_with(needle) {
+            return Some(start);
+        }
+        offset = start + 1;
+    }
+    None
+}
+
 pub(crate) fn find_osc_terminator(bytes: &[u8]) -> Option<(usize, usize)> {
     let mut index = 0;
     while index < bytes.len() {

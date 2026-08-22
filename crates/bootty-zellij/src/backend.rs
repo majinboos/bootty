@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use anyhow::{Context, Result};
+
 use bootty_mux::{
     backend::MuxBackend,
     command::MuxCommand,
@@ -55,7 +57,7 @@ impl<R> ZellijBackend<R> {
 }
 
 impl<R: CommandRunner> ZellijBackend<R> {
-    fn command(&self, args: &[String]) -> Result<bootty_mux::process::CommandOutput> {
+    fn command(&self, args: &[String]) -> Result<crate::process::CommandOutput> {
         let Some(socket_dir) = &self.socket_dir else {
             return self.runner.run("zellij", args);
         };
@@ -64,7 +66,7 @@ impl<R: CommandRunner> ZellijBackend<R> {
             .env("ZELLIJ_SOCKET_DIR", socket_dir)
             .output()
             .context("run zellij")?;
-        Ok(bootty_mux::process::CommandOutput {
+        Ok(crate::process::CommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
@@ -77,9 +79,9 @@ impl<R: CommandRunner> ZellijBackend<R> {
         require_success("zellij", &args, output)
     }
 
-    fn run_owned(&self, args: &[String]) -> Result<String> {
-        let output = self.command(args)?;
-        require_success("zellij", args, output)
+    fn run_owned(&self, args: Vec<String>) -> Result<String> {
+        let output = self.command(&args)?;
+        require_success("zellij", &args, output)
     }
 }
 
@@ -106,74 +108,6 @@ pub(crate) fn prepare_socket_dir(
 
     #[cfg(not(unix))]
     anyhow::bail!("BoottyDev local zellij is unavailable on this platform")
-}
-
-#[cfg(feature = "app")]
-pub struct ZellijPanePolicy {
-    remote: Option<SshRemote>,
-}
-
-#[cfg(feature = "app")]
-impl ZellijPanePolicy {
-    pub fn new(remote: Option<SshRemote>) -> Self {
-        Self { remote }
-    }
-}
-
-#[cfg(feature = "app")]
-impl BackendPanePolicy for ZellijPanePolicy {
-    fn remote_target(&self) -> Option<&bootty_mux_model::SshTarget> {
-        self.remote.as_ref().map(SshRemote::target)
-    }
-
-    fn start_terminal(
-        &mut self,
-        request: PaneStartRequest<'_>,
-    ) -> Result<Option<Box<dyn TerminalRuntime>>> {
-        let identity = if self.remote.is_some() {
-            bootty_identity::ApplicationIdentity::Production
-        } else {
-            bootty_identity::ApplicationIdentity::for_process()
-        };
-        let env = prepare_socket_dir(identity)?
-            .map(|socket_dir| {
-                vec![(
-                    "ZELLIJ_SOCKET_DIR".to_owned(),
-                    socket_dir.to_string_lossy().into_owned(),
-                )]
-            })
-            .unwrap_or_default();
-        let session_id = request.target.session_id().to_owned();
-        let args = vec!["attach".to_owned(), "--create".to_owned(), session_id];
-        let (program, args, remote) = match &self.remote {
-            Some(remote) => {
-                let (program, args) = remote.proxy_tty_command("zellij", &args)?;
-                (program, args, true)
-            }
-            None => ("zellij".to_owned(), args, false),
-        };
-        start_attach_terminal(
-            request,
-            AttachLaunch {
-                program,
-                args,
-                env_remove: vec!["ZELLIJ".to_owned()],
-                env,
-                remote,
-            },
-        )
-        .map(Some)
-    }
-
-    fn sync_target(&mut self, _target: Option<&ScopedMuxPaneTarget>, _hide_tmux_status: bool) {}
-
-    fn set_layout_window(&mut self, _window_id: Option<&str>) {}
-
-    fn resize_layout_window(&mut self, _request: PaneLayoutResizeRequest<'_>) -> Result<bool> {
-        Ok(false)
-    }
-
-    fn deactivate(&mut self) {}
 }
 
 impl<R: CommandRunner> ZellijBackend<R> {

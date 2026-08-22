@@ -461,21 +461,6 @@ fn terminal_engine_loads_kitty_png_from_regular_file() -> Result<()> {
 }
 
 #[test]
-fn terminal_engine_loads_kitty_png_from_temporary_file() -> Result<()> {
-    let mut engine = test_terminal_engine()?;
-    let path = write_kitty_temporary_fixture(&base64_decode_ascii(ONE_PIXEL_PNG_BASE64)?)?;
-    let command = format!("\x1b_Ga=T,f=100,t=t,q=1;{}\x1b\\", file_payload(&path)?);
-
-    engine.write_vt(command.as_bytes());
-    let frame = engine.extract_frame()?;
-    assert_eq!(frame.images.placements.len(), 1);
-    assert_eq!(frame.images.placements[0].image_width, 1);
-    assert_eq!(frame.images.placements[0].image_height, 1);
-    assert!(!path.as_ref().exists());
-    Ok(())
-}
-
-#[test]
 fn terminal_engine_ports_kitty_image_png_file_and_media_limits() -> Result<()> {
     let png_path = write_temp_fixture(
         "tty-graphics-protocol-image.png",

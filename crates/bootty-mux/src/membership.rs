@@ -1,4 +1,4 @@
-use thiserror::Error;
+use std::{error::Error, fmt};
 
 /// A backend session membership observed in a multiplexer snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,9 +25,16 @@ pub enum MembershipOperation {
     },
 }
 
-#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[error("membership operation is invalid")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MembershipValidationError;
+
+impl fmt::Display for MembershipValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("membership operation is invalid")
+    }
+}
+
+impl Error for MembershipValidationError {}
 
 impl MembershipOperation {
     /// Reject empty or NUL-containing backend identity values.

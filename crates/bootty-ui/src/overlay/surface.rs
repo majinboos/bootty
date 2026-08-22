@@ -6,8 +6,10 @@
 //! later windows, a text prompt or action menu). The body decides what closes
 //! the window via the returned [`OverlayResult`].
 
-use crate::{Theme, ThemePalette, icons, keycaps};
+use bootty_ui::{Theme, ThemePalette};
 use eframe::egui::{self, Color32, CornerRadius, Stroke};
+
+use crate::ui::{icons, keycaps};
 
 /// What a [`FloatingWindow`] produced for one frame.
 pub struct OverlayResult<R> {
@@ -54,7 +56,7 @@ impl FloatingWindow {
         }
     }
 
-    /// Leading header icon slug (resolved through `bootty_ui::icons`).
+    /// Leading header icon slug (resolved through `ui::icons`).
     #[must_use]
     pub fn icon(mut self, slug: impl Into<String>) -> Self {
         self.icon = Some(slug.into());
@@ -129,7 +131,7 @@ impl FloatingWindow {
             .order(panel_order)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                crate::configure_style(ui.style_mut(), theme);
+                bootty_ui::configure_style(ui.style_mut(), theme);
                 egui::Frame::popup(ui.style())
                     .fill(palette.pane)
                     .stroke(Stroke::new(1.0, palette.border))
@@ -223,7 +225,7 @@ pub fn filter_field(
     theme: Theme,
     hint: &str,
 ) -> egui::Response {
-    crate::flat_text_edit_singleline(ui, buf, theme, |edit| {
+    bootty_ui::flat_text_edit_singleline(ui, buf, theme, |edit| {
         edit.id(id).desired_width(f32::INFINITY).hint_text(hint)
     })
 }
@@ -248,6 +250,22 @@ pub fn panel_width(ctx: &egui::Context, preferred: f32, min: f32) -> f32 {
 pub fn list_max_height(ctx: &egui::Context, min: f32, max: f32) -> f32 {
     let available = ctx.input(|input| input.content_rect().height());
     (available - 200.0).clamp(min, max)
+}
+
+/// Parse a `chord=action` keybind string into `(chord, action)`, dropping any
+/// scope/flag prefixes (`all:`, `global:`, `unconsumed:`, `performable:`) from the
+/// chord. The action name never contains `=`, so the *last* `=` is the divider —
+/// this keeps a literal `=` key (e.g. `cmd+=`) intact.
+#[must_use]
+pub fn parse_keybind(raw: &str) -> Option<(String, String)> {
+    let (mut chord, action) = raw.rsplit_once('=')?;
+    chord = chord.trim();
+    while let Some(("all" | "global" | "unconsumed" | "performable", rest)) = chord.split_once(':')
+    {
+        chord = rest;
+    }
+    let action = action.trim();
+    (!chord.is_empty() && !action.is_empty()).then(|| (chord.to_owned(), action.to_owned()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

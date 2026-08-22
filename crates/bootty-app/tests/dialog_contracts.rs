@@ -1,27 +1,24 @@
 use std::{collections::HashMap, fs};
 
 use bootty_app::{
-    AppState, ModalDialog,
+    app::AppState,
+    config::{AppearanceVariant, BoottyConfig},
+    mux::{
+        controller::{BindingId, MuxScope, SpaceId},
+        snapshot::{MuxPaneAnchor, MuxSession},
+    },
     theme::theme_from_config,
     ui::{
         ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
-        keybind_help::KeybindHelpDialog,
+        icons::install_icon_fonts,
         session_navigation::BindingSessionGroup,
         session_picker::{SessionPickerDialog, SessionPickerEvent},
         space::{SpaceEditorDialog, SpaceEditorEvent},
         theme_picker::{ThemePickerDialog, ThemePickerEvent, available_themes},
     },
+    workspace::SpaceMuxOverride,
 };
-use bootty_config::config::{AppearanceVariant, BoottyConfig};
-use bootty_mux::{
-    controller::{BindingId, MuxScope, SpaceId},
-    snapshot::{MuxPaneAnchor, MuxSession},
-};
-use bootty_ui::icons::install_icon_fonts;
-use bootty_workspace::SpaceMuxOverride;
 use egui::{Context, Event, Key, RawInput, Rect, Vec2};
-
-mod support;
 
 fn input(event: Event) -> RawInput {
     RawInput {
@@ -66,34 +63,23 @@ fn theme_picker_closes_on_escape() {
     let context = context();
     let mut event = ThemePickerEvent::None;
 
-    context
-        .run_ui(
-            input(Event::Key {
-                key: Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }),
-            |ui| {
-                event = dialog.show(
-                    ui.ctx(),
-                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-                );
-            },
-        )
-        .drop_without_applying_deltas();
+    let _ = context.run_ui(
+        input(Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }),
+        |ui| {
+            event = dialog.show(
+                ui.ctx(),
+                theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+            );
+        },
+    );
 
     assert_eq!(event, ThemePickerEvent::Close);
-}
-
-#[test]
-fn keybind_help_accepts_prefixed_bindings_for_display() {
-    let dialog = KeybindHelpDialog::open(&["performable:cmd+==increase_font_size:1".to_owned()]);
-    let debug = format!("{dialog:?}");
-
-    assert!(debug.contains("cmd+="));
-    assert!(debug.contains("increase_font_size:1"));
 }
 
 #[test]
@@ -127,24 +113,22 @@ fn session_picker_activates_the_selected_session() {
     let context = context();
     let mut event = SessionPickerEvent::None;
 
-    context
-        .run_ui(
-            input(Event::Key {
-                key: Key::Enter,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }),
-            |ui| {
-                event = dialog.show(
-                    ui.ctx(),
-                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-                    &groups,
-                );
-            },
-        )
-        .drop_without_applying_deltas();
+    let _ = context.run_ui(
+        input(Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }),
+        |ui| {
+            event = dialog.show(
+                ui.ctx(),
+                theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+                &groups,
+            );
+        },
+    );
 
     assert_eq!(
         event,
@@ -160,23 +144,21 @@ fn ditch_dialog_defaults_to_safe_session_close_outside_git() {
     let context = context();
     let mut event = DitchSessionEvent::None;
 
-    context
-        .run_ui(
-            input(Event::Key {
-                key: Key::Enter,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }),
-            |ui| {
-                event = dialog.show(
-                    ui.ctx(),
-                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-                );
-            },
-        )
-        .drop_without_applying_deltas();
+    let _ = context.run_ui(
+        input(Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }),
+        |ui| {
+            event = dialog.show(
+                ui.ctx(),
+                theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+            );
+        },
+    );
 
     assert_eq!(
         event,
@@ -194,23 +176,21 @@ fn space_editor_closes_on_escape() {
     let context = context();
     let mut event = SpaceEditorEvent::None;
 
-    context
-        .run_ui(
-            input(Event::Key {
-                key: Key::Escape,
-                physical_key: None,
-                pressed: true,
-                repeat: false,
-                modifiers: egui::Modifiers::NONE,
-            }),
-            |ui| {
-                event = dialog.show(
-                    ui.ctx(),
-                    theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-                );
-            },
-        )
-        .drop_without_applying_deltas();
+    let _ = context.run_ui(
+        input(Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }),
+        |ui| {
+            event = dialog.show(
+                ui.ctx(),
+                theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+            );
+        },
+    );
 
     assert_eq!(event, SpaceEditorEvent::Close);
 }
@@ -222,20 +202,11 @@ fn opening_a_modal_replaces_the_previous_modal() {
         config_path: root.path().join("config.toml"),
         ..BoottyConfig::default()
     };
-    let mut state = AppState::new(
-        config,
-        support::backends(),
-        std::sync::Arc::new(|| {}),
-        None,
-        None,
-    )
-    .unwrap();
+    let mut state = AppState::new(config, std::sync::Arc::new(|| {}), None, None).unwrap();
 
     assert!(state.open_session_picker_dialog_from_ui());
     assert!(state.open_create_space_dialog_from_ui());
 
-    assert!(matches!(
-        state.take_modal_dialog(),
-        Some(ModalDialog::SpaceEditor(_))
-    ));
+    assert!(state.take_session_picker_dialog().is_none());
+    assert!(state.take_space_editor_dialog().is_some());
 }

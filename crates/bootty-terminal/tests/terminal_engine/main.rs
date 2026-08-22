@@ -4,7 +4,7 @@ pub use bootty_terminal::{
     terminal_palette::*,
 };
 pub use libghostty_vt::{
-    Terminal, focus, key,
+    Terminal, TerminalOptions, focus, key,
     kitty::graphics,
     mouse, paste,
     render::CursorVisualStyle,

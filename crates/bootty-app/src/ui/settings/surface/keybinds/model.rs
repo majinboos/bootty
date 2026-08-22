@@ -2,7 +2,6 @@ use super::{
     SettingsSurface,
     trigger_edit::{combo_has_modifier_sides, combo_is_prefixed, parse_trigger_flags},
 };
-use bootty_config::config::split_keybind_entry;
 
 /// Which keybind list is being edited: the global list, one of the per-backend lists, or the
 /// sidebar navigation list (which has its own action vocabulary).
@@ -135,7 +134,17 @@ pub(super) fn read_scope_entries(
         }
         _ => None,
     };
-    let Some(entries) = win.writeback.string_array(scope.path()) else {
+    let Some(document) = win.writeback.document() else {
+        return (false, Vec::new());
+    };
+    let path = scope.path();
+    let mut current = document.document().get(path[0]);
+    for key in &path[1..] {
+        current = current
+            .and_then(|item| item.as_table_like())
+            .and_then(|table| table.get(key));
+    }
+    let Some(array) = current.and_then(|item| item.as_array()) else {
         return (false, Vec::new());
     };
 
@@ -185,6 +194,22 @@ pub(super) fn write_scope(
         }
     }
     win.writeback.set_strings(scope.path(), &entries);
+}
+
+/// Split an entry into trigger and action at the action `=`, mirroring the binding parser so
+/// triggers that contain `=` (like `cmd+=`) stay intact.
+pub(super) fn split_entry(entry: &str) -> (String, String) {
+    let bytes = entry.as_bytes();
+    let mut offset = 0;
+    while let Some(rel) = entry[offset..].find('=') {
+        let index = offset + rel;
+        if index + 1 < entry.len() && matches!(bytes[index + 1], b'+' | b'=') {
+            offset = index + 1;
+            continue;
+        }
+        return (entry[..index].to_owned(), entry[index + 1..].to_owned());
+    }
+    (entry.to_owned(), String::new())
 }
 
 /// The shortcuts that actually apply for `scope`: backend scopes show the fully merged view

@@ -17,7 +17,7 @@ Functionality that requires Ghostty internals not exposed through the
 `libghostty-vt` C API is unsupported unless it can be approximated entirely in
 Bootty without modifying the binding crate.
 
-`bootty-config` owns neutral parsed RGBA values. `bootty-app::terminal_config`
+`bootty-config` owns neutral parsed RGBA values. `bootty-app::app::terminal_config`
 owns the conversion from those values into `libghostty-vt` terminal RGB values.
 The conversion intentionally drops alpha because the terminal RGB type has no
 alpha channel.

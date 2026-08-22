@@ -453,3 +453,133 @@ impl Drop for ChildGuard {
         let _ = self.0.wait();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "app")]
+    use crate::controller::{BindingId, SpaceId};
+    #[cfg(feature = "app")]
+    use bootty_mux_model::SshTarget;
+
+    #[cfg(feature = "app")]
+    fn remote() -> SshRemote {
+        SshRemote::new(SshTarget::for_host("devbox"))
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn remote_commands_use_boottys_embedded_protocol() {
+        let (_program, argv) =
+            remote_rmux_argv(&remote(), &RemoteRmuxRequest::Snapshot).expect("remote command");
+        let (remote_program, args, _) =
+            crate::ssh::decode_proxy_command_line(argv.last().expect("command"))
+                .expect("decode command");
+
+        assert_eq!(remote_program, crate::ssh::REMOTE_DAEMON_PROGRAM);
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some(REMOTE_RMUX_SUBCOMMAND)
+        );
+        assert_eq!(args.len(), 2);
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn remote_request_round_trips_hostile_command_arguments() {
+        let request = RemoteRmuxRequest::Execute {
+            command: MuxCommand::RenameSession {
+                session_id: "space ; $HOME".to_owned(),
+                name: "work & play\"".to_owned(),
+            },
+        };
+
+        let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+
+        assert!(matches!(
+            decoded,
+            RemoteRmuxRequest::Execute {
+                command: MuxCommand::RenameSession { session_id, name }
+            } if session_id == "space ; $HOME" && name == "work & play\""
+        ));
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn pane_frames_preserve_binary_output() {
+        let event = RmuxPaneEvent::Restore {
+            capture: vec![0, 0xff, b'\n'],
+            buffered_chunks: vec![PaneOutputChunk::Bytes {
+                sequence: 7,
+                bytes: vec![0x1b, b'[', b'm'],
+            }],
+        };
+
+        let decoded = decode_frame(pane_frame(event)).unwrap();
+
+        assert!(matches!(
+            decoded,
+            RmuxPaneEvent::Restore { capture, buffered_chunks }
+                if capture == vec![0, 0xff, b'\n']
+                    && matches!(buffered_chunks.as_slice(), [PaneOutputChunk::Bytes { bytes, .. }] if bytes == &vec![0x1b, b'[', b'm'])
+        ));
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn pane_frames_preserve_lag_recovery_bytes() {
+        let bytes = vec![0x1b, b'[', b'm'];
+        let event = RmuxPaneEvent::Chunks(vec![PaneOutputChunk::Lag(rmux_sdk::PaneLagNotice {
+            expected_sequence: 1,
+            resume_sequence: 2,
+            missed_events: 1,
+            newest_sequence: 2,
+            recent: rmux_sdk::PaneRecentOutput {
+                bytes: bytes.clone(),
+                oldest_sequence: Some(2),
+                newest_sequence: Some(2),
+            },
+        })]);
+
+        let decoded = decode_frame(pane_frame(event)).unwrap();
+
+        assert!(matches!(
+            decoded,
+            RmuxPaneEvent::Chunks(chunks)
+                if matches!(chunks.as_slice(), [PaneOutputChunk::Bytes { bytes: recovered, .. }] if recovered == &bytes)
+        ));
+    }
+    #[test]
+    fn input_lines_preserve_exact_bytes() {
+        let bytes = [0x00, 0x1b, 0xff];
+        assert_eq!(
+            decode_input_line(&URL_SAFE_NO_PAD.encode(bytes)).unwrap(),
+            bytes
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn a_remote_rmux_binding_claims_rmux_operations() {
+        let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+        let backend = RemoteRmuxBackend::new(remote());
+
+        assert_eq!(
+            backend.capabilities(scope).operations().collect::<Vec<_>>(),
+            rmux_capabilities(scope).operations().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn a_session_without_a_pane_refuses_to_open() {
+        let target = RmuxPaneTarget::new("project".to_owned(), None);
+
+        let error = match open_remote_rmux_pane_io(&remote(), &target, 0) {
+            Ok(_) => panic!("a session with no pane cannot be streamed"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("project"));
+    }
+}

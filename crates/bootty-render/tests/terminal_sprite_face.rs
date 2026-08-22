@@ -1,7 +1,7 @@
 use bootty_render::{
     paint_plan::PlanColor,
     terminal_render::SpriteCommandBatch,
-    terminal_sprite::{SpriteCommand, SpriteFamily, SpriteGlyph, SpritePoint, SpriteShape},
+    terminal_sprite::{SpriteCommand, SpriteFamily, SpritePoint, SpriteRegistry, SpriteShape},
     terminal_text_atlas::{TextAtlasBuilder, TexturedGlyphQuad},
 };
 use bootty_surface::geometry::SurfaceRect;
@@ -910,106 +910,6 @@ fn terminal_sprite_face_owns_representative_native_symbols_before_font_fallback(
     for recorded_not_implemented in ['■', '\u{E0C0}', '\u{1CC00}', '\u{1FBC0}', '\u{F5D0}'] {
         assert_eq!(SpriteGlyph::from_char(recorded_not_implemented), None);
     }
-}
-
-#[test]
-fn terminal_sprite_family_range_edges_are_stable() {
-    let ranges = [
-        (0x2500, 0x257F, SpriteFamily::BoxDrawing),
-        (0x2800, 0x28FF, SpriteFamily::Braille),
-        (0xEE00, 0xEE0B, SpriteFamily::ProgressIndicator),
-        (0x1FB00, 0x1FB67, SpriteFamily::LegacyComputing),
-        (0x1FB68, 0x1FB6F, SpriteFamily::LegacyComputing),
-        (0x1FB70, 0x1FB99, SpriteFamily::LegacyComputing),
-        (0x1FB9A, 0x1FB9F, SpriteFamily::LegacyComputing),
-        (0x1FBA0, 0x1FBAF, SpriteFamily::LegacyComputing),
-        (0x1FBBD, 0x1FBBF, SpriteFamily::LegacyComputing),
-        (0x1FBCE, 0x1FBCF, SpriteFamily::LegacyComputing),
-        (0x1FBD0, 0x1FBDF, SpriteFamily::LegacyComputing),
-        (0x1FBE0, 0x1FBEF, SpriteFamily::LegacyComputing),
-        (0x1CC1B, 0x1CC1E, SpriteFamily::LegacyComputingSupplement),
-        (0x1CC21, 0x1CC2F, SpriteFamily::LegacyComputingSupplement),
-        (0x1CC30, 0x1CC3F, SpriteFamily::LegacyComputingSupplement),
-        (0x1CD00, 0x1CDE5, SpriteFamily::LegacyComputingSupplement),
-        (0x1CE00, 0x1CE01, SpriteFamily::LegacyComputingSupplement),
-        (0x1CE0B, 0x1CE0C, SpriteFamily::LegacyComputingSupplement),
-        (0x1CE16, 0x1CE19, SpriteFamily::LegacyComputingSupplement),
-        (0x1CE51, 0x1CE8F, SpriteFamily::LegacyComputingSupplement),
-        (0x1CE90, 0x1CEAF, SpriteFamily::LegacyComputingSupplement),
-    ];
-
-    for (start, end, family) in ranges {
-        for cp in [start, end] {
-            let ch = char::from_u32(cp).expect("range edge should be a Unicode scalar");
-            assert_eq!(
-                SpriteGlyph::from_char(ch).map(|glyph| glyph.family),
-                Some(family),
-                "U+{cp:04X} should stay in {family:?}"
-            );
-        }
-    }
-
-    for cp in [
-        0x24FF, 0x27FF, 0x2900, 0xEE0C, 0x1FBB0, 0x1FBC0, 0x1CC1F, 0x1CC20, 0x1CC40, 0x1CE02,
-        0x1CE0D, 0x1CE1A, 0x1CE50, 0x1CEB0,
-    ] {
-        let ch = char::from_u32(cp).expect("gap should be a Unicode scalar");
-        assert_eq!(
-            SpriteGlyph::from_char(ch),
-            None,
-            "U+{cp:04X} should stay unowned"
-        );
-    }
-}
-
-#[test]
-fn owned_sprite_commands_fit_cell_bounds() {
-    let cell = SurfaceRect::from_min_size(11.0, 7.0, 19.0, 23.0);
-
-    for cp in 0..=0x10FFFF {
-        let Some(ch) = char::from_u32(cp) else {
-            continue;
-        };
-        let Some(glyph) = SpriteGlyph::from_char(ch) else {
-            continue;
-        };
-        for command in glyph.commands_for(cell) {
-            assert_sprite_command_fits_cell(&command, cell, ch);
-        }
-    }
-}
-
-fn assert_sprite_command_fits_cell(command: &SpriteCommand, cell: SurfaceRect, ch: char) {
-    const EPSILON: f32 = 0.0001;
-    match command {
-        SpriteCommand::FillRect { rect, .. } => {
-            assert_between(rect.min_x, cell.min_x, cell.max_x, EPSILON, ch);
-            assert_between(rect.max_x, cell.min_x, cell.max_x, EPSILON, ch);
-            assert_between(rect.min_y, cell.min_y, cell.max_y, EPSILON, ch);
-            assert_between(rect.max_y, cell.min_y, cell.max_y, EPSILON, ch);
-        }
-        SpriteCommand::FillPolygon { points, .. } => {
-            for point in points {
-                assert_between(point.x, cell.min_x, cell.max_x, EPSILON, ch);
-                assert_between(point.y, cell.min_y, cell.max_y, EPSILON, ch);
-            }
-        }
-        SpriteCommand::StrokePolyline { points, width, .. }
-        | SpriteCommand::ClearStrokePolyline { points, width, .. } => {
-            let margin = *width * 0.5 + EPSILON;
-            for point in points {
-                assert_between(point.x, cell.min_x, cell.max_x, margin, ch);
-                assert_between(point.y, cell.min_y, cell.max_y, margin, ch);
-            }
-        }
-    }
-}
-
-fn assert_between(value: f32, min: f32, max: f32, margin: f32, ch: char) {
-    assert!(
-        value >= min - margin && value <= max + margin,
-        "{ch} emitted coordinate {value} outside [{min}, {max}] with margin {margin}"
-    );
 }
 
 #[test]

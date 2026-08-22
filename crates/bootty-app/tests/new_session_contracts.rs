@@ -1,9 +1,11 @@
 use bootty_app::{
+    config::{AppearanceVariant, BoottyConfig},
     theme::theme_from_config,
-    ui::new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
+    ui::{
+        icons::install_icon_fonts,
+        new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent},
+    },
 };
-use bootty_config::config::{AppearanceVariant, BoottyConfig};
-use bootty_ui::icons::install_icon_fonts;
 use egui::{Event, Key, Modifiers, RawInput};
 
 fn key_event(key: Key) -> Event {
@@ -20,15 +22,13 @@ fn show(dialog: &mut NewMuxSessionDialog, input: RawInput) -> NewSessionPickerEv
     let context = egui::Context::default();
     install_icon_fonts(&context);
     let mut event = NewSessionPickerEvent::None;
-    context
-        .run_ui(input, |ui| {
-            event = dialog.show(
-                ui.ctx(),
-                theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
-                &[],
-            );
-        })
-        .drop_without_applying_deltas();
+    let _ = context.run_ui(input, |ui| {
+        event = dialog.show(
+            ui.ctx(),
+            theme_from_config(&BoottyConfig::default(), AppearanceVariant::Dark),
+            &[],
+        );
+    });
     event
 }
 

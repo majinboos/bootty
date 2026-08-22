@@ -6,11 +6,11 @@ use std::{
     process::Command as ProcessCommand,
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
-use rmux_ipc::{LocalEndpoint, LocalListener, connect_blocking, endpoint_for_label};
+use rmux_ipc::{LocalEndpoint, LocalListener, connect_blocking};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -18,8 +18,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use crate::{
     application_identity::ApplicationIdentity,
     commands::{
-        AppCommandRequest, AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation,
-        CommandCatalog, CommandInvocation,
+        AppCommandSendError, BoundAppCommandSender, Caller, CommandCancellation, CommandCatalog,
+        CommandInvocation,
     },
 };
 
@@ -44,37 +44,29 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
-    pub fn register_extension_topic(&self, package: &str, topic: &str) -> Result<(), String> {
-        if !topic.starts_with(package) || !topic[package.len()..].starts_with('.') {
-            return Err("extension event topic must be namespaced by its package".to_owned());
-        }
-        lock_control_state(&self.state)
-            .topics
-            .insert(topic.to_owned());
-        Ok(())
-    }
-
     pub fn publish_extension_event(
         &self,
-        package: &str,
+        catalog: &CommandCatalog,
+        module: &str,
+        generation: u64,
         topic: &str,
         payload: Value,
     ) -> Result<(), String> {
-        self.register_extension_topic(package, topic)?;
         let scope = self
             .instance_scope
             .lock()
             .map_err(|_| "control plane scope is unavailable".to_owned())?
             .clone()
             .ok_or_else(|| "control plane is not bound to an instance".to_owned())?;
-        lock_control_state(&self.state).publish_event(
-            scope,
-            topic,
-            json!({"extension": package}),
-            Value::Null,
-            payload,
-        );
-        Ok(())
+        catalog.with_active_extension_topic(module, generation, topic, || {
+            lock_control_state(&self.state).publish_event(
+                scope,
+                topic,
+                json!({"extension": module, "generation": generation}),
+                Value::Null,
+                payload,
+            );
+        })
     }
 }
 
@@ -119,8 +111,7 @@ pub struct RpcError {
 pub struct ControlServer {
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
-    descriptor_path: PathBuf,
-    endpoint_path: PathBuf,
+    lease: Option<control_instance_lease::ControlInstanceLease>,
     state: SharedControlState,
 }
 
@@ -131,22 +122,13 @@ impl ControlServer {
         catalog: Arc<CommandCatalog>,
         plane: ControlPlane,
     ) -> Result<Self> {
-        let descriptor = new_instance_descriptor(&window_state_key)?;
-        let descriptor_path = claim_instance_descriptor(&descriptor)?;
+        let mut lease = control_instance_lease::ControlInstanceLease::claim(&window_state_key)?;
+        let descriptor = lease.descriptor().clone();
         let endpoint = LocalEndpoint::from_path(descriptor.endpoint.clone());
-        let endpoint_path = descriptor.endpoint.clone();
-        if let Err(error) = prepare_endpoint(&endpoint) {
-            remove_control_files(&descriptor_path, &endpoint_path);
-            return Err(error);
-        }
         let state = Arc::clone(&plane.state);
-        *plane
-            .instance_scope
-            .lock()
-            .map_err(|_| anyhow::anyhow!("control plane scope is unavailable"))? =
-            Some(instance_scope(&descriptor));
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (published_tx, published_rx) = mpsc::sync_channel(1);
         let server_state = Arc::clone(&state);
         let server_descriptor = descriptor.clone();
         let server_thread = match thread::Builder::new()
@@ -171,6 +153,9 @@ impl ControlServer {
                             return;
                         }
                     };
+                    if published_rx.recv().is_err() {
+                        return;
+                    }
                     let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
                     tokio::pin!(shutdown_rx);
                     loop {
@@ -206,28 +191,52 @@ impl ControlServer {
             }) {
             Ok(thread) => thread,
             Err(error) => {
-                remove_control_files(&descriptor_path, &endpoint_path);
+                lease.abort();
                 return Err(error).context("spawn control server");
             }
         };
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => Ok(Self {
-                shutdown: Some(shutdown_tx),
-                thread: Some(server_thread),
-                descriptor_path,
-                endpoint_path,
-                state,
-            }),
+            Ok(Ok(())) => {
+                if let Err(error) = plane
+                    .instance_scope
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("control plane scope is unavailable"))
+                    .map(|mut scope| *scope = Some(instance_scope(&descriptor)))
+                {
+                    drop(published_tx);
+                    let _ = server_thread.join();
+                    lease.release();
+                    return Err(error);
+                }
+                if let Err(error) = lease.publish() {
+                    drop(published_tx);
+                    let _ = server_thread.join();
+                    lease.abort();
+                    return Err(error).context("publish control descriptor");
+                }
+                if published_tx.send(()).is_err() {
+                    let _ = server_thread.join();
+                    lease.release();
+                    anyhow::bail!("control server stopped before descriptor publication");
+                }
+                Ok(Self {
+                    shutdown: Some(shutdown_tx),
+                    thread: Some(server_thread),
+                    lease: Some(lease),
+                    state,
+                })
+            }
             Ok(Err(error)) => {
                 let _ = shutdown_tx.send(());
                 let _ = server_thread.join();
-                remove_control_files(&descriptor_path, &endpoint_path);
+                lease.abort();
                 anyhow::bail!(error)
             }
             Err(error) => {
+                drop(published_tx);
                 let _ = shutdown_tx.send(());
                 let _ = server_thread.join();
-                remove_control_files(&descriptor_path, &endpoint_path);
+                lease.abort();
                 anyhow::bail!("control server did not start: {error}")
             }
         }
@@ -243,7 +252,9 @@ impl Drop for ControlServer {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        remove_control_files(&self.descriptor_path, &self.endpoint_path);
+        if let Some(lease) = self.lease.take() {
+            lease.release();
+        }
     }
 }
 
@@ -335,9 +346,8 @@ async fn handle_request(
                 "command.describe", "command.invoke", "event.subscribe", "event.unsubscribe",
                 "task.status", "task.cancel"
             ],
-            "event_topics": lock_control_state(&state)
-                .topics
-                .iter()
+            "event_topics": available_event_topics(&state, &catalog)
+                .into_iter()
                 .map(|topic| (topic.clone(), json!({
                     "snapshot": if topic == COMMAND_COMPLETED_TOPIC {
                         Some("instance.describe")
@@ -359,10 +369,10 @@ async fn handle_request(
         "command.invoke" => {
             invoke_command(request.params, descriptor, commands, state, owner_pid).await
         }
-        "event.subscribe" => subscribe_events(request.params, descriptor, state, owner_pid),
-        "event.unsubscribe" => unsubscribe_events(request.params, state, owner_pid),
-        "task.status" => task_status(request.params, state, owner_pid),
-        "task.cancel" => task_cancel(request.params, state, owner_pid),
+        "event.subscribe" => subscribe_events(request.params, descriptor, state, &catalog),
+        "event.unsubscribe" => unsubscribe_events(request.params, state),
+        "task.status" => task_status(request.params, state),
+        "task.cancel" => task_cancel(request.params, state),
         _ => Err(RpcError::new(-32601, "method not found")),
     };
     match result {
@@ -469,7 +479,7 @@ fn start_task(
         state.finish_task(&task_id, outcome.clone());
         state.publish_command_completion(scope, owner_pid, &invocation, outcome);
     }
-    lock_control_state(&state).task_value(&task_id, owner_pid)
+    lock_control_state(&state).task_value(&task_id)
 }
 
 fn enqueue_command(
@@ -477,16 +487,9 @@ fn enqueue_command(
     commands: BoundAppCommandSender,
     cancellation: CommandCancellation,
 ) -> Result<mpsc::Receiver<crate::commands::CommandOutcome>, RpcError> {
-    let (response_tx, response_rx) = mpsc::channel();
     commands
-        .try_send(AppCommandRequest {
-            invocation,
-            deadline: Instant::now() + COMMAND_TIMEOUT,
-            cancellation,
-            response: response_tx,
-        })
-        .map_err(command_send_error)?;
-    Ok(response_rx)
+        .submit(invocation, Instant::now() + COMMAND_TIMEOUT, cancellation)
+        .map_err(command_send_error)
 }
 
 async fn await_command(
@@ -572,46 +575,35 @@ fn subscribe_events(
     params: Value,
     descriptor: InstanceDescriptor,
     state: SharedControlState,
-    owner_pid: u32,
+    catalog: &CommandCatalog,
 ) -> Result<Value, RpcError> {
-    let mut state = lock_control_state(&state);
     if let Some(subscription) = params.get("subscription").and_then(Value::as_str) {
         let cursor = params
             .get("cursor")
             .and_then(Value::as_u64)
             .ok_or_else(|| RpcError::new(-32602, "missing subscription cursor"))?;
-        return state.poll_subscription(subscription, owner_pid, cursor);
+        return lock_control_state(&state).poll_subscription(subscription, cursor);
     }
-    let topics = event_topics(&params, &state)?;
+    let extension_topics = catalog.extension_topics();
+    let mut state = lock_control_state(&state);
+    let topics = event_topics(&params, &state, &extension_topics)?;
     let scope = event_scope(&params, &descriptor)?;
-    state.create_subscription(owner_pid, topics, scope)
+    state.create_subscription(topics, scope)
 }
 
-fn unsubscribe_events(
-    params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
-) -> Result<Value, RpcError> {
+fn unsubscribe_events(params: Value, state: SharedControlState) -> Result<Value, RpcError> {
     let subscription = subscription_id(&params)?;
-    lock_control_state(&state).unsubscribe(subscription, owner_pid)
+    lock_control_state(&state).unsubscribe(subscription)
 }
 
-fn task_status(
-    params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
-) -> Result<Value, RpcError> {
+fn task_status(params: Value, state: SharedControlState) -> Result<Value, RpcError> {
     let task = task_id(&params)?;
-    lock_control_state(&state).task_value(task, owner_pid)
+    lock_control_state(&state).task_value(task)
 }
 
-fn task_cancel(
-    params: Value,
-    state: SharedControlState,
-    owner_pid: u32,
-) -> Result<Value, RpcError> {
+fn task_cancel(params: Value, state: SharedControlState) -> Result<Value, RpcError> {
     let task = task_id(&params)?;
-    lock_control_state(&state).cancel_task(task, owner_pid)
+    lock_control_state(&state).cancel_task(task)
 }
 
 fn task_id(params: &Value) -> Result<&str, RpcError> {
@@ -629,7 +621,17 @@ fn subscription_id(params: &Value) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::new(-32602, "missing subscription"))
 }
 
-fn event_topics(params: &Value, state: &ControlState) -> Result<BTreeSet<String>, RpcError> {
+fn event_topics(
+    params: &Value,
+    state: &ControlState,
+    extension_topics: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, RpcError> {
+    let available = state
+        .topics
+        .iter()
+        .cloned()
+        .chain(extension_topics.iter().cloned())
+        .collect::<BTreeSet<_>>();
     let topics = params
         .get("topics")
         .and_then(Value::as_array)
@@ -643,12 +645,24 @@ fn event_topics(params: &Value, state: &ControlState) -> Result<BTreeSet<String>
             let Some(topic) = topic.as_str() else {
                 return Err(RpcError::new(-32602, "event topic must be a string"));
             };
-            if topic.is_empty() || topic.len() > EVENT_TOPIC_LIMIT || !state.topics.contains(topic)
-            {
+            if topic.is_empty() || topic.len() > EVENT_TOPIC_LIMIT || !available.contains(topic) {
                 return Err(RpcError::new(-32602, "unsupported event topic"));
             }
             Ok(topic.to_owned())
         })
+        .collect()
+}
+
+fn available_event_topics(
+    state: &SharedControlState,
+    catalog: &CommandCatalog,
+) -> BTreeSet<String> {
+    let extension_topics = catalog.extension_topics();
+    lock_control_state(state)
+        .topics
+        .iter()
+        .cloned()
+        .chain(extension_topics)
         .collect()
 }
 
@@ -671,10 +685,8 @@ fn instance_scope(descriptor: &InstanceDescriptor) -> String {
 type SharedControlState = Arc<Mutex<ControlState>>;
 
 struct ControlState {
-    next_task: u64,
     tasks: BTreeMap<String, TaskRecord>,
     completed_tasks: VecDeque<String>,
-    next_subscription: u64,
     subscriptions: BTreeMap<String, SubscriptionRecord>,
     revisions: BTreeMap<String, u64>,
     topics: BTreeSet<String>,
@@ -683,10 +695,8 @@ struct ControlState {
 impl Default for ControlState {
     fn default() -> Self {
         Self {
-            next_task: 1,
             tasks: BTreeMap::new(),
             completed_tasks: VecDeque::new(),
-            next_subscription: 1,
             subscriptions: BTreeMap::new(),
             revisions: BTreeMap::new(),
             topics: BTreeSet::from([COMMAND_COMPLETED_TOPIC.to_owned()]),
@@ -709,7 +719,6 @@ struct TaskRecord {
 }
 
 struct SubscriptionRecord {
-    owner_pid: u32,
     topics: BTreeSet<String>,
     scope: String,
     sequence: u64,
@@ -746,8 +755,12 @@ impl ControlState {
             };
             self.tasks.remove(&completed);
         }
-        let id = format!("task-{}", self.next_task);
-        self.next_task += 1;
+        let id = loop {
+            let candidate = capability_id("task")?;
+            if !self.tasks.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         self.tasks.insert(
             id.clone(),
             TaskRecord {
@@ -773,9 +786,11 @@ impl ControlState {
         }
     }
 
-    fn task_value(&self, task: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_task(task, owner_pid)?;
-        let record = self.tasks.get(task).expect("owned task exists");
+    fn task_value(&self, task: &str) -> Result<Value, RpcError> {
+        let record = self
+            .tasks
+            .get(task)
+            .ok_or_else(|| RpcError::new(-32602, "unknown task"))?;
         Ok(json!({
             "task": {
                 "id": task,
@@ -785,13 +800,15 @@ impl ControlState {
         }))
     }
 
-    fn cancel_task(&mut self, task: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_task(task, owner_pid)?;
-        let record = self.tasks.get_mut(task).expect("owned task exists");
+    fn cancel_task(&mut self, task: &str) -> Result<Value, RpcError> {
+        let record = self
+            .tasks
+            .get_mut(task)
+            .ok_or_else(|| RpcError::new(-32602, "unknown task"))?;
         if matches!(record.state, TaskState::Running) && record.cancellation.cancel() {
             record.state = TaskState::Cancelling;
         }
-        self.task_value(task, owner_pid)
+        self.task_value(task)
     }
 
     fn cancel_all_tasks(&mut self) {
@@ -803,33 +820,24 @@ impl ControlState {
         }
     }
 
-    fn owned_task(&self, task: &str, owner_pid: u32) -> Result<(), RpcError> {
-        let Some(record) = self.tasks.get(task) else {
-            return Err(RpcError::new(-32602, "unknown task"));
-        };
-        if record.owner_pid != owner_pid {
-            return Err(RpcError::new(-32006, "task is owned by another process"));
-        }
-        Ok(())
-    }
-
     fn create_subscription(
         &mut self,
-        owner_pid: u32,
         topics: BTreeSet<String>,
         scope: String,
     ) -> Result<Value, RpcError> {
-        self.reap_dead_subscriptions();
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS {
             return Err(RpcError::new(-32001, "subscription limit reached"));
         }
-        let id = format!("subscription-{}", self.next_subscription);
-        self.next_subscription += 1;
+        let id = loop {
+            let candidate = capability_id("subscription")?;
+            if !self.subscriptions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let revision = *self.revisions.get(&scope).unwrap_or(&0);
         self.subscriptions.insert(
             id.clone(),
             SubscriptionRecord {
-                owner_pid,
                 topics,
                 scope: scope.clone(),
                 sequence: 0,
@@ -847,14 +855,9 @@ impl ControlState {
         }))
     }
 
-    fn poll_subscription(
-        &mut self,
-        subscription: &str,
-        owner_pid: u32,
-        cursor: u64,
-    ) -> Result<Value, RpcError> {
+    fn poll_subscription(&mut self, subscription: &str, cursor: u64) -> Result<Value, RpcError> {
         let (scope, cursor, events) = {
-            let record = self.owned_subscription(subscription, owner_pid)?;
+            let record = self.subscription(subscription)?;
             if let Some(gap) = &record.gap {
                 return Err(rebase_error(
                     subscription,
@@ -908,36 +911,16 @@ impl ControlState {
         }))
     }
 
-    fn reap_dead_subscriptions(&mut self) {
-        let system = sysinfo::System::new_all();
-        self.subscriptions.retain(|_, subscription| {
-            system
-                .process(sysinfo::Pid::from_u32(subscription.owner_pid))
-                .is_some()
-        });
-    }
-
-    fn unsubscribe(&mut self, subscription: &str, owner_pid: u32) -> Result<Value, RpcError> {
-        self.owned_subscription(subscription, owner_pid)?;
+    fn unsubscribe(&mut self, subscription: &str) -> Result<Value, RpcError> {
+        self.subscription(subscription)?;
         self.subscriptions.remove(subscription);
         Ok(json!({"unsubscribed": subscription}))
     }
 
-    fn owned_subscription(
-        &mut self,
-        subscription: &str,
-        owner_pid: u32,
-    ) -> Result<&mut SubscriptionRecord, RpcError> {
-        let Some(record) = self.subscriptions.get_mut(subscription) else {
-            return Err(RpcError::new(-32602, "unknown subscription"));
-        };
-        if record.owner_pid != owner_pid {
-            return Err(RpcError::new(
-                -32006,
-                "subscription is owned by another process",
-            ));
-        }
-        Ok(record)
+    fn subscription(&mut self, subscription: &str) -> Result<&mut SubscriptionRecord, RpcError> {
+        self.subscriptions
+            .get_mut(subscription)
+            .ok_or_else(|| RpcError::new(-32602, "unknown subscription"))
     }
 
     fn publish_command_completion(
@@ -1006,6 +989,17 @@ fn rebase_error(subscription: &str, scope: &str, cursor: u64, sequence: u64) -> 
     error
 }
 
+fn capability_id(prefix: &str) -> Result<String, RpcError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| RpcError::new(-32603, format!("generate capability ID: {error}")))?;
+    let token = bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{prefix}-{token}"))
+}
+
 fn lock_control_state(state: &SharedControlState) -> std::sync::MutexGuard<'_, ControlState> {
     state
         .lock()
@@ -1053,6 +1047,10 @@ fn internal_error(error: serde_json::Error) -> RpcError {
 pub fn invoke_or_start(start: bool, method: &str, params: Value) -> Result<RpcResponse> {
     let descriptor = select_or_start(start)?;
     invoke_instance(&descriptor, method, params)
+}
+
+pub fn running_instance() -> Result<Option<InstanceDescriptor>> {
+    discover_instance()
 }
 
 pub fn select_or_start(start: bool) -> Result<InstanceDescriptor> {
@@ -1133,108 +1131,250 @@ fn select_instance() -> Result<InstanceDescriptor> {
 }
 
 fn discover_instance() -> Result<Option<InstanceDescriptor>> {
-    let path = instance_descriptor_path()?;
-    let Ok(bytes) = fs::read(&path) else {
-        return Ok(None);
-    };
-    let Ok(instance) = serde_json::from_slice::<InstanceDescriptor>(&bytes) else {
-        remove_control_files(&path, &control_endpoint()?);
-        return Ok(None);
-    };
-    let identity = ApplicationIdentity::current();
-    let expected_endpoint = control_endpoint()?;
-    if instance.instance_id != identity.cli_name() || instance.endpoint != expected_endpoint {
-        remove_control_files(&path, &expected_endpoint);
-        return Ok(None);
-    }
-    if instance_process_is_dead(&instance) {
-        remove_control_files(&path, &expected_endpoint);
-        return Ok(None);
-    }
-    Ok(Some(instance))
+    control_instance_lease::ControlInstanceLease::discover()
 }
 
 fn instance_process_is_dead(instance: &InstanceDescriptor) -> bool {
     let system = sysinfo::System::new_all();
     system
         .process(sysinfo::Pid::from_u32(instance.pid))
-        .is_none_or(|process| u128::from(process.start_time()) * 1000 > instance.started_at_ms)
+        .is_none_or(|process| u128::from(process.start_time()) * 1000 != instance.started_at_ms)
 }
 
-fn new_instance_descriptor(window_state_key: &str) -> Result<InstanceDescriptor> {
-    let started_at_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock before epoch")?
-        .as_millis();
-    let pid = std::process::id();
-    let identity = ApplicationIdentity::current();
-    Ok(InstanceDescriptor {
-        instance_id: identity.cli_name().to_owned(),
-        generation: 1,
-        pid,
-        window_state_key: window_state_key.to_owned(),
-        endpoint: control_endpoint()?,
-        started_at_ms,
-        protocol_version: PROTOCOL_VERSION,
-    })
-}
+mod control_instance_lease {
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{self, Write},
+        path::{Path, PathBuf},
+    };
 
-fn claim_instance_descriptor(descriptor: &InstanceDescriptor) -> Result<PathBuf> {
-    let directory = instance_directory()?;
-    fs::create_dir_all(&directory)?;
-    set_owner_only_directory(&directory)?;
-    let path = instance_descriptor_path()?;
-    let temporary = directory.join(format!(
-        ".control-{}-{}.json.tmp",
-        descriptor.pid, descriptor.started_at_ms
-    ));
-    fs::write(&temporary, serde_json::to_vec(descriptor)?)?;
-    set_owner_only_file(&temporary)?;
-    loop {
-        match fs::hard_link(&temporary, &path) {
-            Ok(()) => {
-                let _ = fs::remove_file(&temporary);
-                return Ok(path);
+    use anyhow::{Context, Result};
+    use rmux_ipc::{LocalEndpoint, endpoint_for_label};
+
+    use super::{
+        ApplicationIdentity, InstanceDescriptor, PROTOCOL_VERSION, instance_directory,
+        instance_process_is_dead, set_owner_only_directory, set_owner_only_file,
+    };
+
+    pub(super) struct ControlInstanceLease {
+        descriptor: InstanceDescriptor,
+        descriptor_path: PathBuf,
+        claim_lock: Option<File>,
+        published: bool,
+        released: bool,
+    }
+
+    impl ControlInstanceLease {
+        pub(super) fn claim(window_state_key: &str) -> Result<Self> {
+            let directory = prepare_instance_directory()?;
+            let claim_lock = lock_instance(&directory)?;
+            if Self::discover_locked(&directory)?.is_some() {
+                anyhow::bail!(
+                    "{} is already running",
+                    ApplicationIdentity::current().display_name()
+                );
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let existing = fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<InstanceDescriptor>(&bytes).ok());
-                if existing
-                    .as_ref()
-                    .is_some_and(|instance| !instance_process_is_dead(instance))
+
+            let generation = generation_token()?;
+            let endpoint = endpoint_for_generation(generation)?;
+            prepare_endpoint_parent(&endpoint)?;
+            let started_at_ms = current_process_started_at_ms()?;
+            let descriptor = InstanceDescriptor {
+                instance_id: ApplicationIdentity::current().cli_name().to_owned(),
+                generation,
+                pid: std::process::id(),
+                window_state_key: window_state_key.to_owned(),
+                endpoint: endpoint.into_path(),
+                started_at_ms,
+                protocol_version: PROTOCOL_VERSION,
+            };
+
+            Ok(Self {
+                descriptor,
+                descriptor_path: directory.join("control.json"),
+                claim_lock: Some(claim_lock),
+                published: false,
+                released: false,
+            })
+        }
+
+        pub(super) fn descriptor(&self) -> &InstanceDescriptor {
+            &self.descriptor
+        }
+
+        pub(super) fn publish(&mut self) -> Result<()> {
+            let directory = self
+                .descriptor_path
+                .parent()
+                .context("control descriptor has no parent directory")?;
+            let temporary = directory.join(format!(
+                ".control-{:016x}.json.tmp",
+                self.descriptor.generation
+            ));
+            let result = (|| {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temporary)
+                    .context("create temporary control descriptor")?;
+                serde_json::to_writer(&mut file, &self.descriptor)?;
+                file.flush()?;
+                file.sync_all()?;
+                set_owner_only_file(&temporary)?;
+                fs::rename(&temporary, &self.descriptor_path)
+                    .context("publish control descriptor")?;
+                Ok(())
+            })();
+            if result.is_err() {
+                let _ = fs::remove_file(&temporary);
+            } else {
+                self.published = true;
+            }
+            self.claim_lock.take();
+            result
+        }
+
+        pub(super) fn discover() -> Result<Option<InstanceDescriptor>> {
+            let directory = prepare_instance_directory()?;
+            let _claim_lock = lock_instance(&directory)?;
+            Self::discover_locked(&directory)
+        }
+
+        fn discover_locked(directory: &Path) -> Result<Option<InstanceDescriptor>> {
+            let descriptor_path = directory.join("control.json");
+            let bytes = match fs::read(&descriptor_path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error).context("read control descriptor"),
+            };
+            let Ok(descriptor) = serde_json::from_slice::<InstanceDescriptor>(&bytes) else {
+                remove_descriptor_if_matches(&descriptor_path, &bytes);
+                return Ok(None);
+            };
+            let expected_endpoint = endpoint_for_generation(descriptor.generation)?.into_path();
+            let valid_namespace = descriptor.protocol_version == PROTOCOL_VERSION
+                && descriptor.instance_id == ApplicationIdentity::current().cli_name()
+                && descriptor.endpoint == expected_endpoint;
+            if !valid_namespace {
+                remove_descriptor_if_matches(&descriptor_path, &bytes);
+                return Ok(None);
+            }
+            if instance_process_is_dead(&descriptor) {
+                remove_descriptor_if_matches(&descriptor_path, &bytes);
+                remove_endpoint(&descriptor.endpoint);
+                return Ok(None);
+            }
+            Ok(Some(descriptor))
+        }
+
+        pub(super) fn abort(mut self) {
+            self.cleanup();
+        }
+
+        pub(super) fn release(mut self) {
+            self.cleanup();
+        }
+
+        fn cleanup(&mut self) {
+            if self.released {
+                return;
+            }
+            if self.claim_lock.is_none()
+                && let Some(directory) = self.descriptor_path.parent()
+                && let Ok(claim_lock) = lock_instance(directory)
+            {
+                self.claim_lock = Some(claim_lock);
+            }
+            if self.claim_lock.is_some() {
+                if self.published
+                    && let Ok(expected) = serde_json::to_vec(&self.descriptor)
                 {
-                    let _ = fs::remove_file(&temporary);
-                    anyhow::bail!(
-                        "{} is already running",
-                        ApplicationIdentity::current().display_name()
-                    );
+                    remove_descriptor_if_matches(&self.descriptor_path, &expected);
                 }
-                remove_control_files(&path, &control_endpoint()?);
+                remove_endpoint(&self.descriptor.endpoint);
             }
-            Err(error) => {
-                let _ = fs::remove_file(&temporary);
-                return Err(error).context("claim Bootty application identity");
-            }
+            self.claim_lock.take();
+            self.released = true;
         }
     }
-}
 
-fn instance_descriptor_path() -> Result<PathBuf> {
-    Ok(instance_directory()?.join("control.json"))
-}
+    impl Drop for ControlInstanceLease {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
 
-fn control_endpoint() -> Result<PathBuf> {
-    Ok(endpoint_for_label(format!(
-        "{}-control",
-        ApplicationIdentity::current().cli_name()
-    ))
-    .map(LocalEndpoint::into_path)?)
-}
+    fn prepare_instance_directory() -> Result<PathBuf> {
+        let directory = instance_directory()?;
+        fs::create_dir_all(&directory)?;
+        set_owner_only_directory(&directory)?;
+        Ok(directory)
+    }
 
-fn remove_control_files(descriptor: &Path, endpoint: &Path) {
-    let _ = fs::remove_file(descriptor);
-    let _ = fs::remove_file(endpoint);
+    fn lock_instance(directory: &Path) -> Result<File> {
+        let path = directory.join("control.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .context("open control instance lease")?;
+        set_owner_only_file(&path)?;
+        file.lock().context("lock control instance lease")?;
+        Ok(file)
+    }
+
+    fn generation_token() -> Result<u64> {
+        let mut bytes = [0_u8; 8];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| anyhow::anyhow!("generate control instance generation: {error}"))?;
+        let generation = u64::from_le_bytes(bytes);
+        if generation == 0 {
+            return generation_token();
+        }
+        Ok(generation)
+    }
+
+    fn current_process_started_at_ms() -> Result<u128> {
+        let system = sysinfo::System::new_all();
+        let process = system
+            .process(sysinfo::Pid::from_u32(std::process::id()))
+            .context("current process is missing from the process table")?;
+        Ok(u128::from(process.start_time()) * 1000)
+    }
+
+    fn endpoint_for_generation(generation: u64) -> Result<LocalEndpoint> {
+        let identity = ApplicationIdentity::current();
+        let prefix = if identity == ApplicationIdentity::Production {
+            'b'
+        } else {
+            'd'
+        };
+        Ok(endpoint_for_label(format!("{prefix}{generation:016x}"))?)
+    }
+
+    fn prepare_endpoint_parent(endpoint: &LocalEndpoint) -> Result<()> {
+        if let Some(parent) = endpoint.as_path().parent() {
+            fs::create_dir_all(parent)?;
+            set_owner_only_directory(parent)?;
+        }
+        Ok(())
+    }
+
+    fn remove_descriptor_if_matches(path: &Path, expected: &[u8]) {
+        if fs::read(path).is_ok_and(|current| current == expected) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn remove_endpoint(path: &Path) {
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    fn remove_endpoint(_path: &Path) {}
 }
 
 fn instance_directory() -> Result<PathBuf> {
@@ -1244,17 +1384,6 @@ fn instance_directory() -> Result<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .context("no user-private runtime directory is available")?;
     Ok(base.join(ApplicationIdentity::current().cli_name()))
-}
-
-fn prepare_endpoint(endpoint: &LocalEndpoint) -> Result<()> {
-    if let Some(parent) = endpoint.as_path().parent() {
-        fs::create_dir_all(parent)?;
-        set_owner_only_directory(parent)?;
-    }
-    if endpoint.as_path().exists() {
-        fs::remove_file(endpoint.as_path())?;
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

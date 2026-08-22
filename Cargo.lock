@@ -706,8 +706,6 @@ dependencies = [
  "arboard",
  "bootty-command",
  "bootty-config",
- "bootty-control",
- "bootty-extension",
  "bootty-font",
  "bootty-identity",
  "bootty-mux",
@@ -726,16 +724,19 @@ dependencies = [
  "criterion",
  "eframe",
  "egui",
+ "egui_code_editor",
+ "embed-resource",
+ "fontdb",
+ "getrandom 0.3.4",
  "iconflow",
  "keepawake",
  "libghostty-vt",
  "muda",
  "png",
  "pollster",
- "proptest",
+ "process-wrap",
  "rmux-ipc",
  "rmux-os",
- "rstest",
  "rusqlite",
  "serde_json",
  "strum",
@@ -743,6 +744,7 @@ dependencies = [
  "tokio",
  "ttf-parser",
  "wgpu",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
@@ -779,13 +781,13 @@ dependencies = [
  "bootty-font",
  "bootty-identity",
  "bootty-mux-model",
- "bootty-write",
  "indoc",
  "rstest",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
  "toml_edit 0.25.13+spec-1.1.0",
+ "winsafe",
 ]
 
 [[package]]
@@ -824,24 +826,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tokio",
-]
-
-[[package]]
-name = "bootty-extension"
-version = "0.4.0"
-dependencies = [
- "bootty-command",
- "bootty-workspace-hack",
- "bootty-write",
- "mlua",
- "notify",
- "process-wrap",
- "serde",
- "serde_json",
- "starship-battery",
- "sysinfo",
- "tempfile",
 ]
 
 [[package]]
@@ -856,7 +840,6 @@ name = "bootty-identity"
 version = "0.0.0"
 dependencies = [
  "bootty-workspace-hack",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -864,19 +847,27 @@ name = "bootty-mux"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "bootty-command",
+ "base64",
+ "bootty-identity",
  "bootty-mux-model",
  "bootty-runtime",
  "bootty-surface",
  "bootty-terminal",
  "bootty-write",
  "derive_more",
- "inventory",
+ "getrandom 0.3.4",
+ "libghostty-vt",
+ "rmux-client",
+ "rmux-ipc",
+ "rmux-proto",
+ "rmux-sdk",
+ "rmux-server",
  "serde",
  "serde_json",
- "strum",
+ "sha2 0.10.9",
  "tempfile",
- "thiserror 2.0.20",
+ "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -886,37 +877,6 @@ dependencies = [
  "bootty-workspace-hack",
  "serde",
  "serde_json",
- "strum",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "bootty-native"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bootty-mux",
- "bootty-mux-model",
- "bootty-workspace-hack",
- "inventory",
-]
-
-[[package]]
-name = "bootty-remote"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bootty-mux",
- "bootty-mux-model",
- "bootty-runtime",
- "bootty-workspace-hack",
- "getrandom 0.4.3",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "ureq",
 ]
 
 [[package]]
@@ -1019,12 +979,12 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bootty-app",
+ "bootty-config",
  "bootty-mux",
  "bootty-workspace-hack",
- "egui",
- "rusqlite",
  "serde_json",
  "tempfile",
+ "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -1048,11 +1008,7 @@ dependencies = [
  "bootty-terminal",
  "eframe",
  "libghostty-vt",
- "objc2 0.6.4",
- "objc2-app-kit 0.3.2",
- "objc2-foundation 0.3.2",
- "pollster 0.4.0",
- "thiserror 2.0.20",
+ "pollster",
  "wgpu",
  "winit",
 ]
@@ -1128,7 +1084,6 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
- "rmux-types",
  "rustix 1.1.4",
  "serde",
  "serde_core",
@@ -1149,6 +1104,7 @@ dependencies = [
  "toml_writer",
  "tracing",
  "tracing-core",
+ "ttf-parser",
  "typenum",
  "ureq",
  "uuid",
