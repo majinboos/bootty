@@ -4,9 +4,11 @@ use eframe::egui::{self, Pos2, Rect, TextureHandle, UiBuilder};
 
 use crate::{
     state::AppState,
-    theme::{module_color32, theme_palette_from_config},
+    theme::theme_palette_from_config,
     ui::chrome::{self, SidebarModel, StatusBarModel},
 };
+use bootty_ui::item_paint::module_color32;
+
 use bootty_extension::{
     ExtensionHost, ModulePrimitive, PublishedSurfaceItem, PublishedSurfaceSnapshot,
     SurfacePlacement,
@@ -182,7 +184,21 @@ impl ChromeView<'_> {
                     })
                     .collect::<Vec<_>>();
                 (!items.is_empty()).then_some(chrome::ResolvedSegment {
-                    align: segment.align,
+                    align: match segment.align {
+                        bootty_config::config::SegmentAlign::Left => {
+                            bootty_ui::status_layout::Align::Left
+                        }
+                        bootty_config::config::SegmentAlign::Center => {
+                            bootty_ui::status_layout::Align::Center
+                        }
+                        bootty_config::config::SegmentAlign::Right => {
+                            bootty_ui::status_layout::Align::Right
+                        }
+                    },
+                    // Only the built-in window tabs wrap into extra rows to clear the notch.
+                    wrappable: chrome::is_windows_surface(&surface.snapshot.declaration.id),
+                    // Window tabs close their run with a rounded trailing edge.
+                    round_run_end: chrome::is_windows_surface(&surface.snapshot.declaration.id),
                     source_slot,
                     module: &surface.module,
                     generation: surface.generation,
@@ -509,6 +525,7 @@ impl ChromeView<'_> {
                         sidebar_palette,
                         &space_items,
                         space_transition,
+                        fullscreen_chrome,
                     );
                     if !self.state.sidebar_focused() {
                         let alpha = (self

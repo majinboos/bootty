@@ -266,7 +266,8 @@ fn status_ui_frame(ui: &mut egui::Ui, selected: Option<&str>) {
                 ..Default::default()
             };
             let segments = [chrome::ResolvedSegment {
-                align: bootty_config::config::SegmentAlign::Left,
+                align: bootty_ui::status_layout::Align::Left,
+                wrappable: false,
                 source_slot: 0,
                 items: vec![chrome::ResolvedItem {
                     item: &item,

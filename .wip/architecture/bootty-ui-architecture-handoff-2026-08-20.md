@@ -4,7 +4,8 @@ Date: 2026-08-20
 Repository: `/Users/luan/src/bootty`
 Branch: `luan/cleanups`
 Commit at handoff: `9334d914f78a6f7702f6a299d87ba2c0a65d8717`
-Last update: 2026-08-20, after the chrome and settings ownership cuts (working tree clean)
+Last update: 2026-08-20, after the composition wave: settings as data, extension-contributed
+settings, and the shared chrome mechanics (working tree clean)
 
 ## Objective
 
@@ -51,12 +52,13 @@ Current production metrics:
 
 | Scope | Before | Current | Delta |
 |---|---:|---:|---:|
-| All production Rust LOC | 83,202 | 76,967 | -6,235 |
-| All production complexity | 8,403 | 7,493 | -910 |
-| `bootty-app/src/ui` LOC | 12,925 | 10,474 | -2,451 |
-| `bootty-app/src/ui` complexity | 1,492 | 1,163 | -329 |
+| All production Rust LOC | 83,202 | 77,363 | -5,839 |
+| All production complexity | 8,403 | 7,469 | -934 |
+| `bootty-app/src/ui` LOC | 12,925 | 9,899 | -3,026 |
+| `bootty-app/src/ui` complexity | 1,492 | 1,110 | -382 |
 
-Aggregate production LOC rose by 235 since the 2026-08-20 handoff while `src/ui` fell by 363.
+Aggregate production LOC rose by 631 since the 2026-08-20 handoff while `src/ui` fell by 3,026
+from the campaign baseline (10,475 to 9,899 in the composition wave alone).
 That is the ownership work: `chrome_frame.rs` (the owner-side prepare/apply for the chrome frame)
 and the owner APIs on `ExtensionHost`, `AppConfigRuntime` and `AppState` are new code that replaced
 mixed paint-time paths. Read it as a boundary move, not a deletion, and do not try to buy it back
@@ -335,6 +337,71 @@ Files:
   first paint. `bootty_render::font_database::installed_family_names` and
   `bootty_config::config::available_theme_names` own those lists; the second theme scanner is gone.
 
+### Settings as data (2026-08-20)
+
+Files:
+
+- `crates/bootty-config/src/settings_schema.rs` + `settings_schema/builtin.rs` (new)
+- `crates/bootty-app/src/ui/settings/surface/schema_page.rs` (new)
+- `crates/bootty-app/src/ui/settings/surface.rs`, `surface/{font,session,status_bar}.rs`
+- `crates/bootty-app/src/ui/settings/surface/window.rs` (deleted)
+
+A `SettingSpec` names a config key once: TOML path, kind, labels, section, and a fallback read off
+the default config rather than copied out of `defaults.rs`. Choice tokens come from the config
+enum's own `Serialize` derive (`config_token`), so a writer cannot disagree with the parser.
+
+Thirty built-in settings are now data. `window.rs` (377 lines) is gone entirely, rendered by a
+143-line renderer; the Text, Shell, Sidebar, Status and Diagnostics pages keep hand-written layout
+and call `win.setting(ui, "font.size")` for each plain row, so the rows the schema cannot describe
+stay exactly where they were. `number_row` and `write_optional_text` died with their last callers.
+
+What a new built-in setting costs now: about six lines of spec data, against 13 for the simplest
+text row and 24-32 for an enum row before. Three tests replace what nothing checked: every spec's
+path round-trips through the loader with a probe value that is provably not the default, every
+fallback matches the config default, and every id is unique.
+
+Deliberately not converted: the compound "Chrome visibility" control (three toggles in one row),
+the Auto-override rows (an absent key means automatic), the font stacks, the feature picker, max
+scrollback, the env editor, and the Appearance colors.
+
+### Extension-contributed settings (2026-08-20)
+
+Files:
+
+- `crates/bootty-extension/src/module_runtime.rs`, `host.rs`, `facts.rs`
+- `crates/bootty-config/src/config/{model,raw,resolve}.rs`
+- `crates/bootty-app/src/config_runtime.rs`, `host.rs`
+
+```lua
+bootty.settings.register({ key = "greeting", label = "Greeting", default = "hi" })
+-- later, at render time
+bootty.settings.get("greeting")
+```
+
+The module never names its namespace: the host stamps it from the module's identity, so a
+declaration can only land in `extensions.<module>.<key>` and a read can only see that module's
+table. `config.toml` gained a permissive `[extensions]` table — `RawConfig` is
+`deny_unknown_fields`, so before this no extension key could exist in the user's config at any
+price. Declarations become specs in the same schema the built-ins use, rendered on an Extensions
+page, written through the same draft document and the same `AppConfigRuntime` commit.
+
+`AppConfigRuntime` rebuilds the merged schema only when the extension host's declaration revision
+changes, not per republished generation — a module edit republishes generations continuously.
+
+### Shared chrome mechanics (2026-08-20)
+
+- `bootty_ui::menu::context_menu` renders both context menus from a `MenuEntry` table; each caller
+  keeps its own action vocabulary, and an extension-contributed menu is now a list, not a rewrite.
+- `bootty_ui::reorder::drop_target` answers where a drag lands for both strips. The two no-op rules
+  were checked branch by branch first: the sidebar's three-arm match reduces to exactly the status
+  bar's expression. Characterization tests for the sidebar's edges went in *before* the extraction
+  and pass unchanged after it.
+- `sidebar_panel.rs` split into panel, space switcher and footer (1,113 lines into 775 + 230 + 106).
+- `ModalKind` deleted: it existed only to dodge a borrow, and one match replaces the kind lookup
+  plus nine re-lookups.
+- Fixed a latent bug: the Space switcher derived hover as a fixed 0.045 lift while the session rows
+  lift to 0.13 in fullscreen, so on a notched black background its hover was nearly invisible.
+
 ## Remaining architecture work
 
 ### 1. Finish settings ownership
@@ -444,7 +511,38 @@ Done, and deliberately left alone. Modal closes funnel through one `AppState::di
 `KeybindHelpDialog::show` returns a plain `bool` because that is the smallest truthful result, and
 terminal-find keeps its own owner path. Do not add a dialog trait or a modal event bus.
 
-### 5. Re-evaluate crate boundaries after ownership moves
+### 5. What composition work is left, and what it is worth
+
+Measured, not estimated: `src/ui` is 9,899 code LOC. The earlier "roughly 8,000-8,500" aspiration
+needs about 1,400 more lines, and they are named:
+
+- **Keys, ~1,200 LOC** (`keybinds.rs` 820 + `trigger_edit.rs` 213 + `model.rs` 164). Not a settings
+  page: a raw-input recorder that drains egui key and wheel events out from under the rest of the
+  UI, composes chords against a 0.8 s deadline, encodes a `clear` sentinel as the first element of
+  a string array, and persists behind an explicit Apply. Two of its rows are schema-able; the rest
+  is not, and rewriting the recorder to hit a LOC target would be a bad trade.
+- **`chrome/runtime.rs`, 632 LOC.** Chrome layout: rects, notch offsets, section stacking.
+- **`chrome/status_bar.rs`, ~1,000 LOC**, of which roughly half is notch wrapping, measurement and
+  primitive painting that no library absorbs.
+- **`modules.rs` 395 + `remotes.rs` 340.** A Luau source editor, and a deferred-commit validated
+  record with an async connection test. A schema would have to grow a whole deferred-commit mode to
+  absorb Remotes — more machinery than the page.
+- **Appearance's ANSI palette grid, ~170 LOC.** A bespoke 8-column grid that re-runs the terminal's
+  own Lab-space generator.
+
+Two concrete cuts remain, both recorded in `candidate_targets`:
+
+1. `settings-appearance-colors` (~55 LOC). Needs a `Color` kind with a `PaletteSlot`, because a
+   spec cannot hold a runtime `Color32` and an unset colour shows a palette slot. Picking the wrong
+   slot changes the swatch with nothing to catch it — do it with the app in front of you.
+2. `chrome-drag-strip` (~200 LOC). The drop *decision* is shared; the gesture is not. Persisted
+   drag state, the drag threshold, click suppression after a drag, and indicator painting are still
+   written twice, with a third copy in `bootty-ui/src/settings.rs`'s `reorderable_list`. Landing it
+   also gives extension-published reorder one event shape in both surfaces. No test covers the
+   gesture path, the two surfaces differ in indicator z-order, and only the sidebar paints a preview
+   chip, so this needs manual verification.
+
+### 6. Re-evaluate crate boundaries after ownership moves
 
 `bootty-ui` is clean: its only dependencies are `eframe` and `iconflow`, and it holds no Bootty
 product type. The reverse move — lifting `settings_pane` and `module_selector_row` from

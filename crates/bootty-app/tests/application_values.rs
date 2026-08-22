@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use bootty_ui::push_truncated_label;
+
 use bootty_app::{
     input::{focus::InputFocus, router::route_events},
-    strings::{csv_field, is_uniquified_session_name, push_truncated_label, unique_session_name},
+    strings::{csv_field, is_uniquified_session_name, unique_session_name},
     theme::theme_palette_from_colors,
     ui::session_navigation::BindingSessionGroup,
 };

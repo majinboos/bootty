@@ -22,35 +22,6 @@ pub enum ModalDialog {
     ThemePicker(ThemePickerDialog),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ModalKind {
-    NewSession,
-    SpaceEditor,
-    SessionPicker,
-    RenameSession,
-    RenameTab,
-    DitchSession,
-    KeybindHelp,
-    CommandPalette,
-    ThemePicker,
-}
-
-impl ModalDialog {
-    pub(crate) fn kind(&self) -> ModalKind {
-        match self {
-            Self::NewSession(_) => ModalKind::NewSession,
-            Self::SpaceEditor(_) => ModalKind::SpaceEditor,
-            Self::SessionPicker(_) => ModalKind::SessionPicker,
-            Self::RenameSession(_) => ModalKind::RenameSession,
-            Self::RenameTab(_) => ModalKind::RenameTab,
-            Self::DitchSession(_) => ModalKind::DitchSession,
-            Self::KeybindHelp(_) => ModalKind::KeybindHelp,
-            Self::CommandPalette(_) => ModalKind::CommandPalette,
-            Self::ThemePicker(_) => ModalKind::ThemePicker,
-        }
-    }
-}
-
 #[derive(Default)]
 pub(crate) struct DialogRuntime {
     modal: Option<Box<ModalDialog>>,

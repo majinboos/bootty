@@ -1,8 +1,17 @@
-use bootty_extension::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModulePrimitive};
-use bootty_ui::{icons::paint_icon_slug, mix, readable_color};
+//! Painting a published item's primitives: rectangles, polygons, text and icons placed in the
+//! item's own rect. The vocabulary is the shared item schema, so this knows nothing about who
+//! published the item.
+
+use bootty_item::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModulePrimitive};
 use eframe::egui::{self, Pos2, Rect, Stroke, StrokeKind};
 
-use crate::theme::module_color32;
+use crate::{icons::paint_icon_slug, mix, readable_color};
+
+/// A module color as an egui color.
+#[must_use]
+pub fn module_color32(color: ModuleColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+}
 
 fn coord(origin: f32, length: f32, value: ModuleCoord) -> f32 {
     origin + length * value.frac + value.px
@@ -44,45 +53,22 @@ fn corner_radius(value: ModuleCornerRadius) -> egui::CornerRadius {
     }
 }
 
-pub(super) fn paint_item_primitives(
-    painter: &egui::Painter,
-    item_rect: Rect,
-    primitives: &[ModulePrimitive],
-    default_color: egui::Color32,
-    background: egui::Color32,
-    // Sidebar session rows pick intentionally dim, hue-tinted colors; honor them verbatim instead of
-    // running them through readable_color, whose AAA contrast gate flattens dim tints to white. The
-    // status bar and footer keep the gate so module colors stay legible on varied backgrounds.
-    respect_color: bool,
-    // Fraction of each color to keep before blending the rest toward the background. 1.0 paints the
-    // color as-is; unfocused session rows pass < 1.0 so every element dims in its own hue.
-    keep: f32,
-) {
-    paint_item_primitives_inner(
-        painter,
-        item_rect,
-        primitives,
-        PrimitivePaintStyle {
-            default_color,
-            background,
-            respect_color,
-            keep,
-            round_end: false,
-            hover: None,
-        },
-    );
-}
-
-pub(super) struct PrimitivePaintStyle {
+pub struct PrimitivePaintStyle {
     pub default_color: egui::Color32,
     pub background: egui::Color32,
+    /// Sidebar session rows pick intentionally dim, hue-tinted colors; honor them verbatim instead
+    /// of running them through `readable_color`, whose AAA contrast gate flattens dim tints to
+    /// white. The status bar and footer keep the gate so module colors stay legible on varied
+    /// backgrounds.
     pub respect_color: bool,
+    /// Fraction of each color to keep before blending the rest toward the background. 1.0 paints
+    /// the color as-is; unfocused session rows pass < 1.0 so every element dims in its own hue.
     pub keep: f32,
     pub round_end: bool,
     pub hover: Option<egui::Color32>,
 }
 
-pub(super) fn paint_item_primitives_inner(
+pub fn paint_item_primitives(
     painter: &egui::Painter,
     item_rect: Rect,
     primitives: &[ModulePrimitive],
@@ -247,7 +233,7 @@ fn primitive_align(value: &str) -> egui::Align2 {
     }
 }
 
-pub(super) fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egui::Color32> {
+pub fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egui::Color32> {
     let mut rect = None;
     let mut polygon = None;
     for primitive in primitives.iter().rev() {

@@ -3,14 +3,16 @@ use bootty_app::{
     theme::theme_palette_from_colors,
     ui::chrome::{
         ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState, SpaceSwitcherEvent,
-        StatusBarModel, show_space_switcher, show_status_bar, status_bar_layout,
-        take_sidebar_space_swipe,
+        StatusBarModel, show_space_switcher, show_status_bar, sidebar_drop_target,
+        status_bar_layout, take_sidebar_space_swipe,
     },
 };
-use bootty_config::config::{ColorConfig, SegmentAlign};
+use bootty_config::config::ColorConfig;
 use bootty_extension::ModuleItem;
-use bootty_mux::controller::SpaceId;
+use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
 use bootty_ui::icons::install_icon_fonts;
+use bootty_ui::item_list::ROW_HEIGHT as SIDEBAR_ROW_HEIGHT;
+use bootty_ui::status_layout::Align;
 use egui::{Event, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TouchPhase, Vec2};
 
 fn space(id: i64, name: &str, active: bool) -> SpaceSummary {
@@ -53,7 +55,8 @@ fn window_tabs_move_to_another_row_when_the_notch_crosses_them() {
         ..ModuleItem::default()
     }];
     let segments = [ResolvedSegment {
-        align: SegmentAlign::Left,
+        align: Align::Left,
+        wrappable: true,
         source_slot: 0,
         module: "windows.luau",
         surface: "windows",
@@ -100,13 +103,15 @@ fn notch_wrapping_uses_the_window_span_after_leading_segments() {
     ];
     let segments = [
         ResolvedSegment {
-            align: SegmentAlign::Left,
+            align: Align::Left,
+            wrappable: false,
             module: "prefix",
             items: vec![resolved(&items[0])],
             ..ResolvedSegment::default()
         },
         ResolvedSegment {
-            align: SegmentAlign::Left,
+            align: Align::Left,
+            wrappable: true,
             source_slot: 1,
             module: "windows.luau",
             surface: "windows",
@@ -246,7 +251,7 @@ fn clicking_a_space_switcher_control_activates_that_space() {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(ui, |ui| {
-                            event = show_space_switcher(ui, palette, &spaces, None);
+                            event = show_space_switcher(ui, palette, &spaces, None, false);
                         });
                 },
             )
@@ -270,4 +275,95 @@ fn clicking_a_space_switcher_control_activates_that_space() {
     }]);
 
     assert_eq!(event, Some(SpaceSwitcherEvent::Activate(spaces[1].id)));
+}
+
+/// A sidebar row that participates in reordering, with `anchor` naming its block.
+fn reorder_row<'a>(id: &'a str, anchor: &'a str) -> bootty_app::ui::sidebar::SidebarItem<'a> {
+    bootty_app::ui::sidebar::SidebarItem {
+        id,
+        text: id,
+        number: None,
+        indent: 0,
+        tree: None,
+        selectable: true,
+        session_id: Some(id),
+        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
+        reorder_anchor: Some(anchor),
+        color: egui::Color32::WHITE,
+        dim_color: egui::Color32::GRAY,
+        kind: "session",
+        active: false,
+        current: false,
+        can_return_to_last_session: false,
+        context_position: None,
+        icon: None,
+        primitives: &[],
+        extension_action: None,
+    }
+}
+
+#[test]
+fn a_sidebar_drop_lands_before_the_block_under_the_pointer() {
+    // Three single-row blocks stacked from y = 100, each SIDEBAR_ROW_HEIGHT tall.
+    let items = [
+        reorder_row("a", "a"),
+        reorder_row("b", "b"),
+        reorder_row("c", "c"),
+    ];
+    let top = 100.0;
+    let row = SIDEBAR_ROW_HEIGHT;
+    let at = |y: f32| Pos2::new(20.0, y);
+
+    // Dragging "a" onto the top half of "c" inserts before "c".
+    let (before, indicator) =
+        sidebar_drop_target(&items, Some(at(top + row * 2.2)), 0.0, top, 200.0, "a")
+            .expect("a drop before c");
+    assert_eq!(before, Some("c"));
+    assert_eq!(indicator, top + row * 2.0);
+
+    // The bottom half of the last block means end-of-list.
+    let (before, indicator) =
+        sidebar_drop_target(&items, Some(at(top + row * 2.8)), 0.0, top, 200.0, "a")
+            .expect("a drop at the end");
+    assert_eq!(before, None);
+    assert_eq!(indicator, top + row * 3.0);
+
+    // Dropping a block back onto itself, or immediately after itself, changes nothing.
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 0.2)), 0.0, top, 200.0, "a").is_none());
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 0.8)), 0.0, top, 200.0, "a").is_none());
+    // And the last block cannot be dropped at the end it already occupies.
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 2.8)), 0.0, top, 200.0, "c").is_none());
+
+    // No pointer, or a pointer outside the rows, is not a drop.
+    assert!(sidebar_drop_target(&items, None, 0.0, top, 200.0, "a").is_none());
+    assert!(sidebar_drop_target(&items, Some(at(top - 5.0)), 0.0, top, 200.0, "a").is_none());
+    assert!(sidebar_drop_target(&items, Some(at(top + row * 9.0)), 0.0, top, 200.0, "a").is_none());
+}
+
+#[test]
+fn a_sidebar_block_moves_as_a_whole() {
+    // "b" owns two rows; a drop decided against its midpoint covers both.
+    let items = [
+        reorder_row("a", "a"),
+        reorder_row("b", "b"),
+        reorder_row("b-detail", "b"),
+        reorder_row("c", "c"),
+    ];
+    let top = 0.0;
+    let row = SIDEBAR_ROW_HEIGHT;
+    let at = |y: f32| Pos2::new(20.0, y);
+
+    // The block spans rows 1..=2, so its midpoint is at row 2.0: above it inserts before "b".
+    let (before, indicator) =
+        sidebar_drop_target(&items, Some(at(row * 1.5)), 0.0, top, 200.0, "c")
+            .expect("c drops before b");
+    assert_eq!(before, Some("b"));
+    assert_eq!(indicator, row);
+
+    // Below the midpoint targets the next block, "c" — a no-op for "c" itself.
+    assert!(sidebar_drop_target(&items, Some(at(row * 2.5)), 0.0, top, 200.0, "c").is_none());
+    // ...but a real move for "a".
+    let (before, _) = sidebar_drop_target(&items, Some(at(row * 2.5)), 0.0, top, 200.0, "a")
+        .expect("a drops before c");
+    assert_eq!(before, Some("c"));
 }

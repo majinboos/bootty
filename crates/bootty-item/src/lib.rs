@@ -1,3 +1,9 @@
+//! The drawable-item schema: what a module publishes and a widget paints.
+//!
+//! Its own crate because both sides need it and neither should depend on the other — the Luau
+//! runtime has no business pulling in a rendering stack, and the widget library has no business
+//! knowing about extensions.
+
 /// An opaque RGBA color for extension-owned values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ModuleColor {
