@@ -66,6 +66,8 @@ pub struct PrimitivePaintStyle {
     pub keep: f32,
     pub round_end: bool,
     pub hover: Option<egui::Color32>,
+    /// Frame time in seconds, driving any sweeping primitive.
+    pub time: f64,
 }
 
 pub fn paint_item_primitives(
@@ -81,6 +83,7 @@ pub fn paint_item_primitives(
         keep,
         round_end,
         hover,
+        time,
     } = style;
     let dim = |color: egui::Color32| mix(background, color, keep);
     let resolve = |value: &Option<ModuleColor>| {
@@ -102,13 +105,10 @@ pub fn paint_item_primitives(
                 w,
                 h,
                 radius,
+                sweep,
             } => {
-                let rect = primitive_rect(item_rect, *x, *y, *w, *h);
-                let mut radius = corner_radius(*radius);
-                if round_end {
-                    radius.ne = 6;
-                    radius.se = 6;
-                }
+                let rect = primitive_rect(item_rect, sweep_x(*x, *w, *sweep, time), *y, *w, *h);
+                let radius = rect_radius(*radius, round_end);
                 if let Some(fill) = fill {
                     painter.rect_filled(rect, radius, dim(module_color32(*fill)));
                 }
@@ -194,11 +194,13 @@ pub fn paint_item_primitives(
                     w,
                     h,
                     radius,
+                    sweep,
                     ..
                 } => {
+                    // Same rounding as the base pass, or the hover fill squares off a rounded pill.
                     painter.rect_filled(
-                        primitive_rect(item_rect, *x, *y, *w, *h),
-                        corner_radius(*radius),
+                        primitive_rect(item_rect, sweep_x(*x, *w, *sweep, time), *y, *w, *h),
+                        rect_radius(*radius, round_end),
                         color,
                     );
                 }
@@ -267,4 +269,70 @@ pub fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egui::Colo
         }
     }
     rect.or(polygon)
+}
+
+/// A rect primitive's corners, with the trailing pair rounded off when the item closes a run of
+/// tabs. Both the base fill and the hover overlay resolve it here so they cannot disagree.
+fn rect_radius(radius: ModuleCornerRadius, round_end: bool) -> egui::CornerRadius {
+    let mut radius = corner_radius(radius);
+    if round_end {
+        radius.ne = RUN_END_RADIUS;
+        radius.se = RUN_END_RADIUS;
+    }
+    radius
+}
+
+/// Corner radius applied to the trailing edge of a tab run.
+const RUN_END_RADIUS: u8 = 6;
+
+/// A sweeping rect's left edge: a triangle wave over the width its own `w` leaves free, so the fill
+/// travels to the far edge and back. A non-sweeping rect keeps its declared `x`.
+fn sweep_x(x: ModuleCoord, w: ModuleCoord, sweep: bool, time: f64) -> ModuleCoord {
+    if !sweep {
+        return x;
+    }
+    let phase = ((time % SWEEP_PERIOD) / SWEEP_PERIOD) as f32;
+    let travel = (1.0_f32 - w.frac).max(0.0);
+    ModuleCoord {
+        frac: travel * (1.0 - (2.0 * phase - 1.0).abs()),
+        px: x.px,
+    }
+}
+
+/// Seconds for one there-and-back sweep.
+const SWEEP_PERIOD: f64 = 1.5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coord(frac: f32) -> ModuleCoord {
+        ModuleCoord { frac, px: 0.0 }
+    }
+
+    #[test]
+    fn a_sweeping_rect_travels_the_space_its_width_leaves_free_and_returns() {
+        let width = coord(0.25);
+        let travel = 1.0 - 0.25;
+        // At the start of the period the fill sits at the left edge, at the midpoint it has reached
+        // the far edge, and by the end of the period it is back.
+        assert!(sweep_x(coord(0.0), width, true, 0.0).frac.abs() < 1e-6);
+        assert!((sweep_x(coord(0.0), width, true, SWEEP_PERIOD / 2.0).frac - travel).abs() < 1e-6);
+        assert!(sweep_x(coord(0.0), width, true, SWEEP_PERIOD).frac.abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_rect_that_does_not_sweep_keeps_its_declared_position() {
+        let x = ModuleCoord { frac: 0.4, px: 3.0 };
+        assert_eq!(sweep_x(x, coord(0.25), false, 12.345), x);
+    }
+
+    #[test]
+    fn a_run_end_rounds_the_trailing_corners_only() {
+        let square = ModuleCornerRadius::default();
+        assert_eq!(rect_radius(square, false), corner_radius(square));
+        let rounded = rect_radius(square, true);
+        assert_eq!((rounded.nw, rounded.sw), (0, 0));
+        assert_eq!((rounded.ne, rounded.se), (RUN_END_RADIUS, RUN_END_RADIUS));
+    }
 }

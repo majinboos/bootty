@@ -1,7 +1,7 @@
 //! Bounded supervised subprocesses owned by one extension generation.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     process::{ChildStdin, Command, Stdio},
@@ -11,8 +11,10 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 #[cfg(windows)]
 use process_wrap::std::JobObject;
@@ -28,6 +30,14 @@ const OUTPUT_LINE_LIMIT: usize = 256 * 1024;
 const OUTPUT_QUEUE_LIMIT: usize = 64;
 const WRITE_LIMIT: Duration = Duration::from_millis(250);
 const STOP_LIMIT: Duration = Duration::from_secs(2);
+/// Cap on how many descendants `bootty.descendants` reports, so a runaway process tree cannot
+/// stall a render.
+const DESCENDANT_SCAN_LIMIT: usize = 256;
+/// How long a machine-wide process listing serves `bootty.descendants` calls. Listing every process
+/// costs a syscall per process, and the sidebar walks one session's tree every 500ms, so a TTL that
+/// matched that cadence re-listed the machine for every single call. Four calls now share a listing;
+/// the cost is that an agent started in the last couple of seconds is found on a later refresh.
+const PROCESS_TREE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ProcessEvent {
@@ -523,5 +533,117 @@ fn spawn_supervisor(
 fn join_readers(readers: [thread::JoinHandle<()>; 2]) {
     for reader in readers {
         let _ = reader.join();
+    }
+}
+
+/// One process below a session's pane, as a module sees it.
+pub(super) struct DescendantProcess {
+    /// Executable path when known, otherwise the process name.
+    pub command: String,
+    /// Full argument vector joined by spaces, `argv[0]` first, like `ps -o args=`.
+    pub args: String,
+}
+
+/// The machine's process table, reused across `bootty.descendants` calls.
+#[derive(Default)]
+pub(super) struct ProcessTree {
+    system: System,
+    listed_at: Option<Instant>,
+}
+
+/// Breadth-first walk of the processes below `root_pid`.
+///
+/// Breadth-first because callers want the shallowest interesting descendant (the agent CLI a pane
+/// is running, not a tool that CLI spawned).
+///
+/// Two passes, because reading command lines is the expensive half: the machine-wide pass asks for
+/// parent links only, and command lines are fetched for the handful of processes the walk actually
+/// reaches. Asking for everything up front cost a `sysctl` per process on the machine.
+pub(super) fn descendant_processes(
+    tree: &mut ProcessTree,
+    root_pid: u32,
+) -> Vec<DescendantProcess> {
+    if tree
+        .listed_at
+        .is_none_or(|listed_at| listed_at.elapsed() >= PROCESS_TREE_TTL)
+    {
+        tree.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        tree.listed_at = Some(Instant::now());
+    }
+
+    let mut children: BTreeMap<Pid, Vec<Pid>> = BTreeMap::new();
+    for (pid, process) in tree.system.processes() {
+        if let Some(parent) = process.parent() {
+            children.entry(parent).or_default().push(*pid);
+        }
+    }
+
+    let found = descendant_pids(&children, Pid::from_u32(root_pid));
+    if found.is_empty() {
+        return Vec::new();
+    }
+
+    tree.system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&found),
+        false,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
+    );
+    found
+        .into_iter()
+        .filter_map(|pid| tree.system.process(pid))
+        .map(|process| DescendantProcess {
+            command: process.exe().map_or_else(
+                || process.name().to_string_lossy().into_owned(),
+                |exe| exe.to_string_lossy().into_owned(),
+            ),
+            args: process
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+        })
+        .collect()
+}
+
+fn descendant_pids(children: &BTreeMap<Pid, Vec<Pid>>, root_pid: Pid) -> Vec<Pid> {
+    let mut found = Vec::new();
+    let mut queue = VecDeque::from([root_pid]);
+    let mut visited = BTreeSet::new();
+    while let Some(pid) = queue.pop_front() {
+        if !visited.insert(pid) || found.len() >= DESCENDANT_SCAN_LIMIT {
+            continue;
+        }
+        for child in children.get(&pid).into_iter().flatten() {
+            if found.len() >= DESCENDANT_SCAN_LIMIT {
+                break;
+            }
+            found.push(*child);
+            queue.push_back(*child);
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descendant_scan_caps_a_wide_process_tree() {
+        let root = Pid::from_u32(1);
+        let children = BTreeMap::from([(root, (2..=400).map(Pid::from_u32).collect::<Vec<_>>())]);
+
+        let found = descendant_pids(&children, root);
+
+        assert_eq!(found.len(), DESCENDANT_SCAN_LIMIT);
+        assert_eq!(found.first().map(|pid| pid.as_u32()), Some(2));
+        assert_eq!(found.last().map(|pid| pid.as_u32()), Some(257));
     }
 }

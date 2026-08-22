@@ -193,6 +193,113 @@ fn combo_row_fill(
     }
 }
 
+/// One row of a settings navigation list: a leading icon, a label, and a hover/selected fill. The
+/// selected row keeps its left corners square and grows an accent rail, so it reads as a tab cut
+/// into the page beside it rather than a free-floating button.
+pub fn nav_row(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    icon: &str,
+    label: &str,
+    selected: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), NAV_ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    let fill = if selected {
+        palette.surface
+    } else if response.hovered() {
+        palette.hover
+    } else {
+        palette.mantle
+    };
+    let corners = if selected {
+        egui::CornerRadius {
+            nw: 0,
+            sw: 0,
+            ne: palette.radius,
+            se: palette.radius,
+        }
+    } else {
+        egui::CornerRadius::same(palette.radius)
+    };
+    ui.painter().rect_filled(rect, corners, fill);
+    if selected {
+        let rail = Rect::from_min_max(rect.min, Pos2::new(rect.min.x + 4.0, rect.max.y));
+        ui.painter().rect_filled(rail, 0.0, palette.accent);
+    }
+    let tint = readable_color(
+        fill,
+        if selected {
+            palette.text
+        } else {
+            palette.subtext
+        },
+    );
+    icons::paint_icon_slug(
+        ui.painter(),
+        icon,
+        Pos2::new(rect.min.x + 17.0, rect.center().y),
+        15.0,
+        tint,
+    );
+    ui.painter().text(
+        Pos2::new(rect.min.x + 40.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(13.0),
+        tint,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// Height of a [`nav_row`], so a caller can size a nav list without guessing.
+pub const NAV_ROW_HEIGHT: f32 = 34.0;
+
+/// A borderless button that leads with an icon glyph. The proportional UI font has no arrow glyphs
+/// (they render as tofu), so the icon is laid out in the icon family and the label follows it; a
+/// missing slug degrades to the label alone rather than a blank button.
+pub fn icon_text_button(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    icon: &str,
+    label: &str,
+) -> egui::Response {
+    let color = readable_color(palette.mantle, palette.subtext);
+    let mut job = egui::text::LayoutJob::default();
+    if let Some((glyph, family)) = icons::icon_glyph(icon) {
+        job.append(
+            &glyph.to_string(),
+            0.0,
+            egui::text::TextFormat {
+                font_id: egui::FontId::new(14.0, egui::FontFamily::Name(family.into())),
+                color,
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        );
+    }
+    job.append(
+        &format!("  {label}"),
+        0.0,
+        egui::text::TextFormat {
+            font_id: egui::FontId::proportional(13.0),
+            color,
+            valign: egui::Align::Center,
+            ..Default::default()
+        },
+    );
+    ui.add(
+        egui::Button::new(job)
+            .fill(palette.mantle)
+            .stroke(egui::Stroke::NONE),
+    )
+}
+
 /// A text button with a constant 1px border in every state, so only its fill changes on hover.
 /// egui's default button reads its border in from `hovered`/`active` visuals, which makes the
 /// frame appear to grow under the pointer; this keeps the footprint fixed.
@@ -393,15 +500,181 @@ pub fn settings_icon_button(
     slug: &str,
     tooltip: &str,
 ) -> egui::Response {
+    settings_icon_toggle(ui, palette, slug, tooltip, IconButtonState::default())
+}
+
+/// Whether an icon button's subject is currently carrying something (`active`) and whether the
+/// panel it controls is showing (`open`). A tooltip alone cannot say either at a glance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IconButtonState {
+    pub active: bool,
+    pub open: bool,
+}
+
+/// An icon button that shows its state: tinted `primary` while active, held in the hover fill while
+/// the thing it opens is open.
+pub fn settings_icon_toggle(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    slug: &str,
+    tooltip: &str,
+    state: IconButtonState,
+) -> egui::Response {
     let (rect, response, fill) = settings_button_surface(ui, palette, Vec2::splat(30.0));
-    icons::paint_icon_slug(
-        ui.painter(),
-        slug,
-        rect.center(),
-        15.0,
+    if state.open {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(palette.radius),
+            palette.hover,
+        );
+    }
+    let tint = if state.active {
+        palette.primary
+    } else {
+        readable_color(fill, palette.text)
+    };
+    icons::paint_icon_slug(ui.painter(), slug, rect.center(), 15.0, tint);
+    response.on_hover_text(tooltip)
+}
+
+/// One selectable card in a [`token_card_grid`].
+pub struct TokenCard<'a> {
+    /// The literal value written to config, shown so a user can learn it.
+    pub token: &'a str,
+    pub label: &'a str,
+    pub description: &'a str,
+    pub selected: bool,
+}
+
+/// A two-column grid of selectable cards, each naming a token beside a label and a one-line
+/// description. For a setting whose value is a set of opaque tokens nobody should have to
+/// memorise. Returns the index of the card that was clicked.
+pub fn token_card_grid(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    cards: &[TokenCard<'_>],
+) -> Option<usize> {
+    let card_width = ((ui.available_width() - 14.0) * 0.5).clamp(220.0, 360.0);
+    let mut clicked = None;
+    for (row, chunk) in cards.chunks(2).enumerate() {
+        ui.horizontal(|ui| {
+            for (column, card) in chunk.iter().enumerate() {
+                if token_card(ui, palette, card, card_width) {
+                    clicked = Some(row * 2 + column);
+                }
+            }
+        });
+    }
+    clicked
+}
+
+fn token_card(ui: &mut egui::Ui, palette: ThemePalette, card: &TokenCard<'_>, width: f32) -> bool {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 58.0), egui::Sense::click());
+    let fill = if card.selected {
+        palette.surface
+    } else if response.hovered() {
+        palette.hover
+    } else {
+        palette.pane
+    };
+    let stroke = egui::Stroke::new(
+        if card.selected { 2.0 } else { 1.0 },
+        if card.selected {
+            palette.primary
+        } else {
+            palette.border
+        },
+    );
+    ui.painter().rect_filled(rect, palette.radius, fill);
+    ui.painter()
+        .rect_stroke(rect, palette.radius, stroke, egui::StrokeKind::Inside);
+    ui.painter().text(
+        rect.left_top() + Vec2::new(10.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        format!("{}  {}", card.token, card.label),
+        egui::TextStyle::Button.resolve(ui.style()),
         readable_color(fill, palette.text),
     );
-    response.on_hover_text(tooltip)
+    ui.painter().text(
+        rect.left_top() + Vec2::new(10.0, 31.0),
+        egui::Align2::LEFT_TOP,
+        card.description,
+        egui::TextStyle::Small.resolve(ui.style()),
+        palette.muted,
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+/// A framed block introduced by a heading and a one-line help, with an optional trailing action on
+/// the heading row. Returns whether that action was clicked.
+pub fn settings_panel(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    title: &str,
+    help: &str,
+    action: Option<&str>,
+    body: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let mut acted = false;
+    egui::Frame::NONE
+        .fill(palette.pane)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(egui::CornerRadius::same(palette.radius))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(title).color(palette.text).strong());
+                    ui.label(RichText::new(help).color(palette.muted).size(11.0));
+                });
+                if let Some(action) = action {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        acted = settings_button(ui, palette, action).clicked();
+                    });
+                }
+            });
+            ui.add_space(8.0);
+            body(ui);
+        });
+    acted
+}
+
+/// A framed verdict panel: an icon and headline on the left, a longer detail line right-aligned.
+/// Used where a page needs to state whether a whole set of edits is healthy.
+pub fn status_banner(
+    ui: &mut egui::Ui,
+    palette: ThemePalette,
+    ok: bool,
+    headline: &str,
+    detail: &str,
+) {
+    egui::Frame::NONE
+        .fill(palette.pane)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(egui::CornerRadius::same(palette.radius))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let color = if ok {
+                    palette.success
+                } else {
+                    palette.destructive
+                };
+                if let Some(icon) =
+                    icons::icon_text(if ok { "check" } else { "circle-alert" }, 16.0, color)
+                {
+                    ui.label(icon);
+                }
+                ui.label(RichText::new(headline).color(color).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(detail).color(palette.muted).size(12.0));
+                });
+            });
+        });
+    ui.add_space(12.0);
 }
 
 pub fn settings_page_header(ui: &mut egui::Ui, palette: ThemePalette, context: &str, title: &str) {

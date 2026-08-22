@@ -40,6 +40,8 @@ pub struct BoottyApp {
     /// Whether the window had keyboard focus this frame. Extension hosts throttle themselves while
     /// it is false, so an unfocused window stops animating (and repainting) its chrome.
     window_focused: bool,
+    /// Filter and selection state for each module-declared floating window.
+    extension_windows: crate::ui::extension_window::ExtensionWindows,
 }
 
 impl BoottyApp {
@@ -99,6 +101,7 @@ impl BoottyApp {
             extensions,
             extension_theme,
             window_focused: true,
+            extension_windows: crate::ui::extension_window::ExtensionWindows::default(),
         })
     }
 
@@ -395,20 +398,24 @@ impl BoottyApp {
     }
 
     fn show_extension_surfaces(&mut self, ctx: &egui::Context) {
-        for surface in self.extensions.surfaces(SurfacePlacement::Floating) {
-            let mut action = None;
-            egui::Window::new(surface.snapshot.declaration.id.clone())
-                .id(egui::Id::new((
-                    "extension-floating",
-                    surface.module.clone(),
-                    surface.snapshot.declaration.id.clone(),
-                )))
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    action = show_extension_surface_items(ui, &surface.snapshot.items);
-                });
-            if let Some(action) = action {
-                self.submit_extension_action(surface, action);
+        let floating = self.extensions.surfaces(SurfacePlacement::Floating);
+        self.extension_windows
+            .retain_open(|id| floating.iter().any(|s| s.snapshot.declaration.id == id));
+        let theme = self.state.ui_theme();
+        for surface in floating {
+            // An empty surface is a module choosing not to show a window this frame.
+            if surface.snapshot.items.is_empty() {
+                continue;
+            }
+            let event = self.extension_windows.show(ctx, theme, &surface);
+            match event {
+                Some(crate::ui::extension_window::ExtensionWindowEvent::Action(action)) => {
+                    self.submit_extension_action(surface, action);
+                }
+                Some(crate::ui::extension_window::ExtensionWindowEvent::Dismissed) => {
+                    self.submit_extension_action(surface, DISMISS_ACTION.to_owned());
+                }
+                None => {}
             }
         }
         for surface in self.extensions.surfaces(SurfacePlacement::Docked) {
@@ -442,6 +449,10 @@ impl BoottyApp {
         });
     }
 }
+
+/// The action a floating surface receives when the user dismisses it, so the module can stop
+/// publishing items instead of the window reappearing next frame.
+const DISMISS_ACTION: &str = "dismiss";
 
 fn show_extension_surface_items(ui: &mut egui::Ui, items: &[ModuleItem]) -> Option<String> {
     let mut selected = None;
@@ -489,7 +500,14 @@ impl eframe::App for BoottyApp {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         self.state.drain_direct_input();
         self.state
-            .set_extension_overlay_open(self.extensions.has_surfaces(SurfacePlacement::Floating));
+            // A declaration is permanent; a *shown* window is not. Gate on items, or any module
+            // declaring a floating surface would hold the terminal's keyboard for the session.
+            .set_extension_overlay_open(
+                self.extensions
+                    .surfaces(SurfacePlacement::Floating)
+                    .iter()
+                    .any(|surface| !surface.snapshot.items.is_empty()),
+            );
         if self.state.settings_open() {
             if self.settings.is_recording_keybind() {
                 suppress_egui_events_for_direct_input(

@@ -53,6 +53,7 @@ eframe = { version = "0.36", default-features = false, features = [
   "wgpu_no_default_features",
 ] }
 egui = "0.36"
+egui_code_editor = "0.3.7"
 fontdb = "0.23"
 getrandom = "0.4"
 iconflow = { version = "1", features = [

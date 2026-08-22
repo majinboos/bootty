@@ -38,6 +38,7 @@ fn number(
     SettingKind::Number {
         range,
         control,
+        precision: 1,
         suffix: suffix.into(),
         display_scale: 1.0,
     }
@@ -55,6 +56,7 @@ fn fraction(control: NumberControl) -> SettingKind {
     SettingKind::Number {
         range: 0.0..=1.0,
         control,
+        precision: 1,
         suffix: "%".into(),
         display_scale: 100.0,
     }
@@ -96,10 +98,26 @@ pub(super) fn specs() -> Vec<SettingSpec> {
             "WINDOW",
             SettingKind::Choice {
                 options: vec![
-                    SettingOption::of(&WindowDecoration::Auto, "Automatic"),
-                    SettingOption::of(&WindowDecoration::None, "Borderless"),
-                    SettingOption::of(&WindowDecoration::Client, "Drawn by Bootty"),
-                    SettingOption::of(&WindowDecoration::Server, "Drawn by system"),
+                    SettingOption::described(
+                        &WindowDecoration::Auto,
+                        "Automatic",
+                        "Let the platform pick based on the titlebar style.",
+                    ),
+                    SettingOption::described(
+                        &WindowDecoration::None,
+                        "Borderless",
+                        "No outer border or system window controls.",
+                    ),
+                    SettingOption::described(
+                        &WindowDecoration::Client,
+                        "Drawn by Bootty",
+                        "Bootty paints the window border and controls.",
+                    ),
+                    SettingOption::described(
+                        &WindowDecoration::Server,
+                        "Drawn by system",
+                        "The OS paints the native window border.",
+                    ),
                 ],
             },
             SettingDefault::Field(|config| {
@@ -114,16 +132,30 @@ pub(super) fn specs() -> Vec<SettingSpec> {
             "WINDOW",
             SettingKind::Choice {
                 options: vec![
-                    SettingOption::of(&WindowFullscreen::Disabled, "Disabled"),
-                    SettingOption::of(&WindowFullscreen::Native, "Native"),
-                    SettingOption::of(&WindowFullscreen::NonNative, "Borderless"),
-                    SettingOption::of(
+                    SettingOption::described(
+                        &WindowFullscreen::Disabled,
+                        "Disabled",
+                        "Never enter fullscreen.",
+                    ),
+                    SettingOption::described(
+                        &WindowFullscreen::Native,
+                        "Native",
+                        "Use macOS native Spaces fullscreen.",
+                    ),
+                    SettingOption::described(
+                        &WindowFullscreen::NonNative,
+                        "Borderless",
+                        "Fill the display without native Spaces.",
+                    ),
+                    SettingOption::described(
                         &WindowFullscreen::NonNativeVisibleMenu,
                         "Borderless + menu bar",
+                        "Keep the menu bar visible in borderless fullscreen.",
                     ),
-                    SettingOption::of(
+                    SettingOption::described(
                         &WindowFullscreen::NonNativePaddedNotch,
                         "Borderless + notch padding",
+                        "Reserve space for a notched display.",
                     ),
                 ],
             },

@@ -1,0 +1,34 @@
+Bootty Settings
+  Back to terminal
+Remotes
+Search settings...
+SSH PROFILES
+Core
+Add Remote
+
+General
+Add an SSH profile to connect a Space to another machine.
+
+Remotes
+
+Text
+
+Appearance
+
+Window
+
+Sidebar
+
+Status Bar
+Terminal
+
+Shell
+
+Keys
+Advanced
+
+Config
+
+Diagnostics
+
+Extensions

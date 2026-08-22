@@ -43,6 +43,12 @@ pub struct SurfaceDeclaration {
     pub placement: SurfacePlacement,
     pub order: i32,
     pub interval: Duration,
+    /// Window chrome for a floating surface: what to call it, the icon beside the title, and the
+    /// key hint along the bottom. A bar or sidebar surface has no chrome of its own and leaves
+    /// these unset; a floating surface without a title falls back to its id.
+    pub title: Option<String>,
+    pub icon: Option<String>,
+    pub hint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

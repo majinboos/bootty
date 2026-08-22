@@ -291,3 +291,144 @@ fn key_label(token: &str) -> Cow<'_, str> {
         other => other.into(),
     }
 }
+
+/// Shared control height for a chord recorder and the fields beside it, so a row lines up exactly.
+pub const RECORD_CELL_HEIGHT: f32 = 36.0;
+
+/// The clickable shortcut cell: the bound combo as keycaps, or a pulsing prompt while capturing.
+/// Clicking it toggles capture, which is why it reports a click rather than owning the state.
+pub fn record_cell(
+    ui: &mut egui::Ui,
+    palette: crate::ThemePalette,
+    trigger: &str,
+    recording: bool,
+    capture_text: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::Vec2::new(220.0, RECORD_CELL_HEIGHT),
+        egui::Sense::click(),
+    );
+    let radius = egui::CornerRadius::same(palette.radius);
+    let text_pos = rect.left_center() + egui::vec2(10.0, 0.0);
+    if recording {
+        // The glow has to animate, so the cell asks for the next frame itself.
+        ui.ctx().request_repaint();
+        let pulse = (ui.input(|input| input.time) * 3.0).sin() * 0.5 + 0.5;
+        let glow = egui::Color32::from_rgba_unmultiplied(
+            palette.primary.r(),
+            palette.primary.g(),
+            palette.primary.b(),
+            (pulse * 90.0) as u8 + 45,
+        );
+        ui.painter().rect_filled(rect, radius, palette.mantle);
+        ui.painter().rect_filled(rect, radius, glow);
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, palette.primary),
+            egui::StrokeKind::Inside,
+        );
+        // A prompt is prose; anything else is a partial chord and belongs in keycaps.
+        if capture_text.starts_with("Press keys") {
+            ui.painter().text(
+                text_pos,
+                egui::Align2::LEFT_CENTER,
+                capture_text,
+                egui::FontId::proportional(12.0),
+                palette.text,
+            );
+        } else {
+            paint_trigger(ui, rect, palette, capture_text);
+        }
+    } else {
+        let fill = if response.hovered() {
+            palette.hover
+        } else {
+            palette.mantle
+        };
+        ui.painter().rect_filled(rect, radius, fill);
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(1.0, palette.border),
+            egui::StrokeKind::Inside,
+        );
+        if trigger.trim().is_empty() {
+            ui.painter().text(
+                text_pos,
+                egui::Align2::LEFT_CENTER,
+                "Click to record",
+                egui::FontId::proportional(12.0),
+                palette.muted,
+            );
+        } else {
+            paint_trigger(ui, rect, palette, trigger);
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    response.on_hover_text(if recording {
+        "Recording — press keys or scroll, Esc cancels"
+    } else {
+        "Click to record a shortcut"
+    })
+}
+
+fn paint_trigger(ui: &egui::Ui, rect: egui::Rect, palette: crate::ThemePalette, trigger: &str) {
+    let galley = trigger_galley_from_painter(
+        ui.painter(),
+        palette,
+        trigger,
+        palette.text,
+        rect.width() - 20.0,
+    );
+    let pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y * 0.5);
+    ui.painter().galley(pos, galley, palette.text);
+}
+
+/// The record indicator beside a [`record_cell`]: a red ball at rest, a red square while capturing.
+pub fn record_dot(
+    ui: &mut egui::Ui,
+    palette: crate::ThemePalette,
+    recording: bool,
+) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::Vec2::splat(RECORD_CELL_HEIGHT), egui::Sense::click());
+    let center = rect.center();
+    let red = palette.destructive;
+    if recording {
+        ui.painter().rect_filled(
+            egui::Rect::from_center_size(center, egui::Vec2::splat(12.0)),
+            egui::CornerRadius::same(3),
+            red,
+        );
+    } else {
+        ui.painter().circle_filled(center, 7.0, red);
+        if response.hovered() {
+            ui.painter()
+                .circle_stroke(center, 10.0, egui::Stroke::new(1.5, red));
+        }
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text(if recording {
+        "Stop recording"
+    } else {
+        "Record shortcut"
+    })
+}
+
+/// A read-only keycap pill, for listing a shortcut rather than editing it.
+pub fn chip(ui: &mut egui::Ui, palette: crate::ThemePalette, trigger: &str) {
+    egui::Frame::NONE
+        .fill(palette.surface)
+        .stroke(egui::Stroke::new(1.0, palette.border))
+        .corner_radius(egui::CornerRadius::same(palette.radius))
+        .inner_margin(egui::Margin::symmetric(10, 5))
+        .show(ui, |ui| {
+            let galley = trigger_galley(ui, palette, trigger, palette.text, 320.0);
+            ui.add(egui::Label::new(galley).selectable(false));
+        });
+}

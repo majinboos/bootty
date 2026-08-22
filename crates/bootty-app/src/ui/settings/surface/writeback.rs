@@ -151,6 +151,15 @@ impl SettingsWriteback {
     }
 }
 
+/// `#rrggbb`, widened to `#rrggbbaa` when the colour carries opacity — the parser accepts both, and
+/// dropping the alpha here would silently discard whatever the opacity field was set to.
 fn color_hex(color: Color) -> String {
-    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+    if color.a == 0xff {
+        format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+    } else {
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            color.r, color.g, color.b, color.a
+        )
+    }
 }

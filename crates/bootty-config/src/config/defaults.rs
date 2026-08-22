@@ -42,7 +42,15 @@ impl Default for SidebarConfig {
                 "progress".to_owned(),
             ],
             session_modules_configured: false,
-            modules: vec!["sessions".to_owned(), "codexbar".to_owned()],
+            // Sidebar surfaces are named by the id their module declared, so the agent
+            // integrations are listed under their own namespaces. A surface nobody names is
+            // never rendered.
+            modules: vec![
+                "sessions".to_owned(),
+                "codexbar".to_owned(),
+                "agents.pi".to_owned(),
+                "agents.codex".to_owned(),
+            ],
         }
     }
 }

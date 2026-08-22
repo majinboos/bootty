@@ -85,6 +85,7 @@ pub fn show<T>(
     let mut input = StripInput {
         palette,
         event: None,
+        item_event: false,
         interaction_id: strip.interaction_id,
         identity_salt: strip.identity_salt,
         primary_press_pos,
@@ -161,7 +162,10 @@ struct StripDragState {
 /// Paint context plus per-frame interaction accumulators.
 struct StripInput<'a, T> {
     palette: ThemePalette,
+    /// A hook event (a context-menu choice) outranks a plain click and must not be overwritten by
+    /// one raised later in the same pass.
     event: Option<StripEvent<T>>,
+    item_event: bool,
     interaction_id: &'static str,
     identity_salt: &'a str,
     primary_press_pos: Option<Pos2>,
@@ -205,6 +209,8 @@ fn draw<T>(
 ) {
     let palette = input.palette;
     let font = egui::FontId::monospace(12.0);
+    // A sweeping primitive animates off the frame clock, not off its producer's render interval.
+    let time = ui.input(|input| input.time);
     let hovered_anchor = ui.input(|input| input.pointer.hover_pos()).and_then(|pos| {
         layout.items.iter().find_map(|placed| {
             let item = &layout.segments[placed.segment].items[placed.item];
@@ -261,6 +267,7 @@ fn draw<T>(
             && let Some(event) = on_item(response, placed.segment, placed.item)
         {
             input.event = Some(StripEvent::Item(event));
+            input.item_event = true;
         }
         if interactive.is_some()
             && input
@@ -286,7 +293,9 @@ fn draw<T>(
                 })
             });
 
-        let painter = ui.painter_at(rect);
+        // Clip to this item's own row: a primitive that overshoots must not bleed into the tab row
+        // above or below it.
+        let painter = ui.painter_at(row);
         let primitive_bg = primitive_background(&item.item.primitives);
         let hover_background = hovered.then_some(palette.hover);
         let text_background = hover_background
@@ -341,8 +350,10 @@ fn draw<T>(
                 keep: 1.0,
                 round_end: segment.round_run_end
                     && next.is_none()
+                    && placed.run_complete
                     && item.item.reorder_anchor.is_some(),
                 hover: (hovered && primitive_bg.is_some()).then_some(palette.hover),
+                time,
             },
         );
         let color = readable_color(text_background, item.fg.unwrap_or(palette.subtext));
@@ -377,6 +388,7 @@ fn draw<T>(
             && item.item.action.is_some()
             && resp.clicked_by(egui::PointerButton::Primary)
             && !input.suppress_click
+            && !input.item_event
         {
             input.event = Some(StripEvent::Clicked {
                 segment: placed.segment,

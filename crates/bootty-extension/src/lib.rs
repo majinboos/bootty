@@ -20,8 +20,9 @@ pub use fact_values::{MuxView, SessionProgressView, SessionReorder, SessionView,
 pub use git_helpers::{display_path, head_branch};
 pub use host::ExtensionHost;
 pub use identity::ModuleIdentity;
-pub use items::error_item;
-pub use module_runtime::{ExtensionSettingDeclaration, preview_module_surfaces};
+pub use module_runtime::{
+    ExtensionSettingDeclaration, preview_builtin_surfaces, preview_module_surfaces,
+};
 pub use module_sources::{
     EditableModuleSource, LegacyExtensionModule, ModuleSourceOutcome, ModuleSourceRequest,
     ModuleSources, create_module_source, editable_module_source, import_legacy_extension_module,

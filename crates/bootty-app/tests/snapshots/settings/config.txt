@@ -1,0 +1,46 @@
+Bootty Settings
+  Back to terminal
+Config
+Search settings...
+LOCATIONS
+Core
+
+General
+Config file
+<config-dir>/config.toml
+Read-only location.
+
+Remotes
+Config directory
+<config-dir>
+
+Text
+Read-only location.
+
+Appearance
+Themes directory
+<config-dir>/themes
+
+Window
+Read-only location.
+
+Sidebar
+Extensions directory
+<config-dir>/extensions
+Read-only location.
+
+Status Bar
+RELOAD
+Terminal
+Last write succeeded
+
+Shell
+
+Keys
+Advanced
+
+Config
+
+Diagnostics
+
+Extensions

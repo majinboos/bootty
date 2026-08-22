@@ -72,6 +72,9 @@ impl DitchSessionDialog {
                 show_status(ui, &self.status, self.cwd.as_deref(), palette);
                 let outcome = ListView::new("ditch-session-actions", &rows, self.selected)
                     .row_height(46.0)
+                    // The safe action leads on purpose; the pointer passing over a destructive row
+                    // must not make it what Enter does.
+                    .hover_selects(false)
                     .show(ui, palette);
                 self.selected = outcome.selected;
                 outcome.activated

@@ -148,3 +148,70 @@ fn overlay_search_uses_a_case_insensitive_subsequence() {
     assert!(!fuzzy_match("bootty", "xyz"));
     assert!(!fuzzy_match("ab", "abc"));
 }
+
+/// A confirmation list pre-selects the safe action on purpose; the pointer passing over a
+/// destructive row must not make it what Enter does.
+#[test]
+fn a_list_that_does_not_hover_select_keeps_its_selection_under_the_pointer() {
+    let context = egui::Context::default();
+    let rows = rows(&["Detach worktree", "Delete branch"]);
+    // Settle the list once so the pointer counts as having moved between frames.
+    let pointer_over_second_row = |x: f32, y: f32| RawInput {
+        events: vec![Event::PointerMoved(egui::pos2(x, y))],
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(400.0, 200.0),
+        )),
+        ..RawInput::default()
+    };
+    let mut selected = 0;
+    for frame in 0..2 {
+        let outcome = show_list_hover(
+            &context,
+            &rows,
+            selected,
+            pointer_over_second_row(20.0, 40.0 + frame as f32),
+            false,
+        );
+        selected = outcome.selected;
+    }
+    assert_eq!(selected, 0, "the pointer must not move the selection");
+
+    let context = egui::Context::default();
+    let mut selected = 0;
+    for frame in 0..2 {
+        let outcome = show_list_hover(
+            &context,
+            &rows,
+            selected,
+            pointer_over_second_row(20.0, 40.0 + frame as f32),
+            true,
+        );
+        selected = outcome.selected;
+    }
+    assert_eq!(
+        selected, 1,
+        "a hover-selecting list still follows the pointer"
+    );
+}
+
+fn show_list_hover(
+    context: &egui::Context,
+    rows: &[ListRow],
+    selected: usize,
+    input: RawInput,
+    hover_selects: bool,
+) -> ListOutcome {
+    let mut outcome = None;
+    context
+        .run_ui(input, |ui| {
+            outcome = Some(
+                ListView::new("hover-selects", rows, selected)
+                    .max_height(240.0)
+                    .hover_selects(hover_selects)
+                    .show(ui, ThemePalette::default()),
+            );
+        })
+        .drop_without_applying_deltas();
+    outcome.expect("the list renders")
+}

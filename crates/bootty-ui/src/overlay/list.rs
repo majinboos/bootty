@@ -62,6 +62,7 @@ pub struct ListView<'a> {
     scroll_selected: bool,
     row_height: f32,
     empty_text: &'a str,
+    hover_selects: bool,
 }
 
 impl<'a> ListView<'a> {
@@ -78,7 +79,16 @@ impl<'a> ListView<'a> {
             scroll_selected: false,
             row_height: ROW_HEIGHT,
             empty_text: "no matches",
+            hover_selects: true,
         }
+    }
+
+    /// Stop the pointer from moving the selection. For a confirmation list whose pre-selected row is
+    /// deliberately the safe one: sweeping the cursor must not re-aim Enter at a destructive row.
+    #[must_use]
+    pub fn hover_selects(mut self, hover_selects: bool) -> Self {
+        self.hover_selects = hover_selects;
+        self
     }
 
     /// Cap the scroll viewport so long lists scroll instead of growing the panel.
@@ -172,7 +182,9 @@ impl<'a> ListView<'a> {
                                 || response.is_pointer_button_down_on()
                                 || response.clicked());
                         if !row.section && pointer_selected {
-                            selected = index;
+                            if self.hover_selects {
+                                selected = index;
+                            }
                             hovered = Some(index);
                         }
                         if !row.section && response.clicked() {

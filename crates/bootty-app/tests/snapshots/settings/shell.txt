@@ -1,0 +1,53 @@
+Bootty Settings
+  Back to terminal
+Shell
+Search settings...
+SHELL
+Core
+
+General
+Shell
+default login shell
+Empty uses the macOS account login shell. Applies to new sessions.
+
+Remotes
+
+Text
+Working directory
+inherit from launcher
+Empty starts new sessions in your home directory.
+
+Appearance
+TERMINAL IDENTITY
+
+Window
+TERM
+xterm-bootty
+
+Sidebar
+Advertised terminal type for new shells.
+
+Status Bar
+COLORTERM
+truecolor
+Advertised color capability for new shells.
+Terminal
+
+Shell
+Max scrollback
+1000000
+Lines retained per pane. 0 disables scrollback. Applies to new panes.
+
+Keys
+Advanced
+Glyph protocol
+Expose terminal image/glyph protocol support to new sessions.
+
+Config
+
+Diagnostics
+ENVIRONMENT
+Extra variables exported to every new shell. Incomplete rows are ignored while editing.
+
+Extensions
+Add variable

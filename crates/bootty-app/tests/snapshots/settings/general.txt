@@ -1,0 +1,42 @@
+Bootty Settings
+  Back to terminal
+General
+Search settings...
+DEFAULTS
+Core
+
+General
+Default backend
+native
+rmux
+tmux
+Switches immediately for new mux actions and refreshes live config.
+
+Remotes
+
+Text
+Chrome visibility
+Bottom bar
+Top bar
+Sidebar
+Show or hide persistent app chrome.
+
+Appearance
+
+Window
+
+Sidebar
+
+Status Bar
+Terminal
+
+Shell
+
+Keys
+Advanced
+
+Config
+
+Diagnostics
+
+Extensions

@@ -1,16 +1,6 @@
 use crate::{ModuleColor, ModuleCoord, ModuleCornerRadius, ModuleItem, ModulePrimitive};
 use mlua::{Table, Value};
 
-const ERROR_COLOR: ModuleColor = ModuleColor::rgb(0xf3, 0x8b, 0xa8);
-
-pub fn error_item(message: &str) -> ModuleItem {
-    ModuleItem {
-        text: first_line(message),
-        fg: Some(ERROR_COLOR),
-        ..ModuleItem::default()
-    }
-}
-
 pub(crate) fn items_from_value(value: Value) -> Vec<ModuleItem> {
     match value {
         Value::String(text) => vec![ModuleItem {
@@ -153,6 +143,7 @@ fn primitive_from_table(table: &Table) -> Option<ModulePrimitive> {
             w: coord_from_table(table, "w", "w_px", 1.0),
             h: coord_from_table(table, "h", "h_px", 1.0),
             radius: radius_from_table(table),
+            sweep: table.get::<Option<bool>>("sweep").ok().flatten() == Some(true),
         }),
         "polygon" => {
             let points = table
@@ -268,8 +259,4 @@ pub(super) fn parse_hex_color(value: &str) -> Option<ModuleColor> {
         }
         _ => None,
     }
-}
-
-fn first_line(text: &str) -> String {
-    text.lines().next().unwrap_or(text).to_owned()
 }

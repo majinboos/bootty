@@ -34,6 +34,13 @@ pub struct ExtensionHost {
     /// Every module the last scan discovered, including ones that failed to load: the editor
     /// must be able to open a broken module to fix it.
     discovered: Vec<ModuleIdentity>,
+    /// The subset of `discovered` that came from a file in the extension root: what the user wrote
+    /// or overrode, as opposed to a built-in.
+    customized: BTreeSet<ModuleIdentity>,
+    /// Why the last scan failed, kept so the settings editor can say so.
+    scan_error: Option<String>,
+    /// Modules the last reconcile could not load or publish, with why.
+    failures: Vec<(ModuleIdentity, String)>,
     /// Inactive pre-module extension files awaiting import, refreshed by each scan.
     legacy: Vec<LegacyExtensionModule>,
     /// Settings the loaded modules declared for themselves, in module then declaration order.
@@ -81,6 +88,9 @@ impl ExtensionHost {
             events,
             active: BTreeMap::new(),
             discovered: Vec::new(),
+            customized: BTreeSet::new(),
+            scan_error: None,
+            failures: Vec::new(),
             legacy: Vec::new(),
             settings: Vec::new(),
             settings_revision: 0,
@@ -211,6 +221,38 @@ impl ExtensionHost {
         }
     }
 
+    /// Whether the user's own file replaced the built-in module `name`. A user module that owns its
+    /// whole surface must not have the built-in components layered on top of it.
+    ///
+    /// Every built-in is always *discovered*, so this has to come from provenance: only a file in
+    /// the extension root counts.
+    #[must_use]
+    pub fn is_user_owned(&self, name: &str) -> bool {
+        self.customized.iter().any(|identity| {
+            identity
+                .as_ref()
+                .file_stem()
+                .is_some_and(|stem| stem == name)
+        })
+    }
+
+    /// Every surface the loaded modules are currently publishing, across placements. This is the
+    /// live render — real usage figures, a real agent's state — which is what a preview of an
+    /// unedited module should show rather than a sandbox with invented facts.
+    #[must_use]
+    pub fn published_surfaces(&self) -> Vec<PublishedSurfaceSnapshot> {
+        [
+            SurfacePlacement::Status,
+            SurfacePlacement::Sidebar,
+            SurfacePlacement::Session,
+            SurfacePlacement::Floating,
+            SurfacePlacement::Docked,
+        ]
+        .into_iter()
+        .flat_map(|placement| self.surfaces(placement))
+        .collect()
+    }
+
     /// Modules the settings editor may open, and the legacy files it may import. Both come
     /// from the periodic scan, so painting never walks the extension directory.
     #[must_use]
@@ -218,6 +260,19 @@ impl ExtensionHost {
         ModuleSources {
             identities: &self.discovered,
             legacy: &self.legacy,
+            scan_error: self.scan_error.clone(),
+            failures: self.failures.clone(),
+            declared: self
+                .published_surfaces()
+                .into_iter()
+                .map(|surface| {
+                    (
+                        surface.snapshot.declaration.placement,
+                        surface.snapshot.declaration.id,
+                    )
+                })
+                .collect(),
+            live: self.published_surfaces(),
         }
     }
 
@@ -253,10 +308,24 @@ impl ExtensionHost {
                 }
                 ModuleSourceOutcome::Created(created)
             }
-            ModuleSourceRequest::Save { identity, source } => ModuleSourceOutcome::Saved(
-                save_module_source(&self.root, &identity, &source)
-                    .map_err(|error| error.to_string()),
-            ),
+            ModuleSourceRequest::Save { identity, source } => {
+                // Saving the built-in verbatim would pin a copy that never picks up its updates,
+                // so an unchanged source drops the override instead.
+                if crate::module_sources::matches_builtin(&identity, &source) {
+                    let path = self.root.join(identity.as_ref());
+                    let reset = reset_module_source(&self.root, &identity)
+                        .map(|()| path)
+                        .map_err(|error| error.to_string());
+                    if reset.is_ok() {
+                        self.reconcile(false);
+                    }
+                    return ModuleSourceOutcome::Saved(reset);
+                }
+                ModuleSourceOutcome::Saved(
+                    save_module_source(&self.root, &identity, &source)
+                        .map_err(|error| error.to_string()),
+                )
+            }
             ModuleSourceRequest::Reset(identity) => {
                 let reset = reset_module_source(&self.root, &identity)
                     .map(|()| identity)
@@ -282,6 +351,13 @@ impl ExtensionHost {
         }
     }
 
+    /// Note that `identity` will not render this reconcile, and why. Also logged, because a module
+    /// failing to load is worth a line in the terminal a developer is watching.
+    fn record_failure(&mut self, identity: &ModuleIdentity, error: String) {
+        eprintln!("failed to load extension {identity}: {error}");
+        self.failures.push((identity.clone(), error));
+    }
+
     fn reconcile(&mut self, force: bool) {
         self.reap_retired();
         self.legacy = self
@@ -289,21 +365,36 @@ impl ExtensionHost {
             .parent()
             .and_then(|config_dir| legacy_extension_modules(config_dir).ok())
             .unwrap_or_default();
-        let discovered = match discover_modules(&self.root) {
-            Ok(discovered) => discovered,
+        let scan = match discover_modules(&self.root) {
+            Ok(scan) => scan,
             Err(error) => {
                 eprintln!("failed to scan extensions {}: {error}", self.root.display());
+                self.scan_error = Some(format!("{error}. Modules are showing their last state."));
                 return;
             }
         };
+        if let Some(warning) = &scan.warning {
+            eprintln!("scanned extensions {}: {warning}", self.root.display());
+        }
+        self.scan_error = scan.warning;
+        let discovered = scan.modules;
+        self.failures.clear();
         let present = discovered.keys().cloned().collect::<BTreeSet<_>>();
         self.discovered = present.iter().cloned().collect();
+        self.customized = discovered
+            .iter()
+            .filter(|(_, source)| source.as_ref().is_ok_and(|source| source.from_user_file))
+            .map(|(identity, _)| identity.clone())
+            .collect();
         for (identity, source) in discovered {
             let source = match source {
                 Ok(source) => source,
                 Err(error) => {
-                    eprintln!("failed to load extension {identity}: {error}");
-                    continue;
+                    self.record_failure(&identity, error);
+                    match crate::module_sources::builtin_module(&identity) {
+                        Some(builtin) => builtin,
+                        None => continue,
+                    }
                 }
             };
             if !force
@@ -315,7 +406,7 @@ impl ExtensionHost {
                 continue;
             }
             let Some(next_generation) = self.next_generation.checked_add(1) else {
-                eprintln!("failed to load extension {identity}: extension generation exhausted");
+                self.record_failure(&identity, "extension generation exhausted".to_owned());
                 continue;
             };
             let generation = std::mem::replace(&mut self.next_generation, next_generation);
@@ -324,7 +415,7 @@ impl ExtensionHost {
                 None => match ExtensionStorage::open(&self.root, identity.as_str()) {
                     Ok(storage) => storage,
                     Err(error) => {
-                        eprintln!("failed to load extension {identity}: {error}");
+                        self.record_failure(&identity, error.clone());
                         continue;
                     }
                 },
@@ -340,8 +431,26 @@ impl ExtensionHost {
             ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    eprintln!("failed to load extension {identity}: {error}");
-                    continue;
+                    self.record_failure(&identity, error);
+                    // A broken override must not take the built-in down with it.
+                    let Some(builtin) = crate::module_sources::builtin_module(&identity) else {
+                        continue;
+                    };
+                    match prepare_module(
+                        &builtin,
+                        storage.clone(),
+                        generation,
+                        Arc::clone(&self.catalog),
+                        self.commands.clone(),
+                        self.events.clone(),
+                        self.facts.for_generation(),
+                    ) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            self.record_failure(&identity, error);
+                            continue;
+                        }
+                    }
                 }
             };
             if let Err(error) = self
@@ -356,7 +465,7 @@ impl ExtensionHost {
                 })
             {
                 self.retire_worker(prepared.worker);
-                eprintln!("failed to publish extension {identity}: {error}");
+                self.record_failure(&identity, error);
                 continue;
             }
             let next = ActiveModule {

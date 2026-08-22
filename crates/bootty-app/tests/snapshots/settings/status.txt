@@ -1,0 +1,75 @@
+Bootty Settings
+  Back to terminal
+Status Bar
+Search settings...
+Core
+session
+windows
+sysinfo
+clock
+
+General
+BARS
+
+Remotes
+Top bar
+
+Text
+Show the module bar above the terminal.
+
+Appearance
+Bottom bar
+
+Window
+Show the module bar below the terminal.
+STATUS BARS
+
+Sidebar
+
+Status Bar
+Height
+30.0 px
+Module strip height.
+Terminal
+Hide tmux's own bar
+
+Shell
+Avoid duplicate status bars when the tmux backend is active.
+
+Keys
+MODULES
+Arrange module instances, edit their sources, or create a new module here.
+Advanced
+
+Config
+Top
+Bottom
+
+Diagnostics
+Module
+Alignment
+
+Session · Left
+
+session
+Left
+Center
+Right
+
+Extensions
+
+Windows · Left
+
+Icon (optional)
+Foreground
+Background
+lucide slug or glyph
+
+System info · Right
+
+Loading module source…
+
+Clock · Right
+
+Add segment
+New module

@@ -1,0 +1,32 @@
+Bootty Settings
+  Back to terminal
+Extensions
+Search settings...
+No loaded extension declares a setting. A module registers one with bootty.settings.register.
+Core
+
+General
+
+Remotes
+
+Text
+
+Appearance
+
+Window
+
+Sidebar
+
+Status Bar
+Terminal
+
+Shell
+
+Keys
+Advanced
+
+Config
+
+Diagnostics
+
+Extensions

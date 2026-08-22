@@ -1,4 +1,4 @@
-use bootty_ui::{Theme, settings::settings_icon_button};
+use bootty_ui::{Theme, overlay::icon_button};
 use eframe::egui;
 
 use bootty_terminal::terminal_engine::TerminalSearchDirection;
@@ -75,7 +75,7 @@ impl TerminalFindDialog {
                         ui.horizontal(|ui| {
                             let count_text = self.count_text();
                             let count_width = 48.0;
-                            let button_width = 96.0;
+                            let button_width = 72.0;
                             let field_width =
                                 (width - count_width - button_width - 18.0).max(120.0);
                             let response = bootty_ui::flat_text_edit_singleline(
@@ -134,8 +134,7 @@ impl TerminalFindDialog {
                                 ),
                             );
 
-                            if settings_icon_button(ui, palette, "chevron-up", "Find previous")
-                                .clicked()
+                            if icon_button(ui, palette, "chevron-up", "Find previous").clicked()
                                 && !query.is_empty()
                             {
                                 event = TerminalFindEvent::Search {
@@ -143,8 +142,7 @@ impl TerminalFindDialog {
                                     direction: TerminalSearchDirection::Previous,
                                 };
                             }
-                            if settings_icon_button(ui, palette, "chevron-down", "Find next")
-                                .clicked()
+                            if icon_button(ui, palette, "chevron-down", "Find next").clicked()
                                 && !query.is_empty()
                             {
                                 event = TerminalFindEvent::Search {
@@ -152,7 +150,7 @@ impl TerminalFindDialog {
                                     direction: TerminalSearchDirection::Next,
                                 };
                             }
-                            if settings_icon_button(ui, palette, "x", "Close find").clicked() {
+                            if icon_button(ui, palette, "x", "Close find").clicked() {
                                 event = TerminalFindEvent::Close;
                             }
                         });

@@ -40,6 +40,9 @@ pub struct StatusLayoutItem {
     pub x: f32,
     pub width: f32,
     pub run_start: bool,
+    /// Whether this is the last item of its segment that got placed. A run cut short by the bar's
+    /// edge must not be rounded off, or a half-drawn tab reads as a closed one.
+    pub run_complete: bool,
 }
 
 /// A status segment resolved for this frame: a module's items plus where the segment is aligned.
@@ -412,6 +415,7 @@ impl StatusBarLayout<'_> {
                 x,
                 width,
                 run_start: self.items.len() == item_start,
+                run_complete: index + 1 == range.end,
             });
             x += width;
         }

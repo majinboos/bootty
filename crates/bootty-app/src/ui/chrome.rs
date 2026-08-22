@@ -6,7 +6,9 @@ mod sidebar_panel;
 mod space_switcher;
 mod status_bar;
 
-pub(crate) use runtime::{ChromeEvents, ChromeRuntime, SidebarResize};
+pub(crate) use runtime::{
+    ChromeEvents, ChromeRuntime, SidebarResize, compose_session_module_items,
+};
 
 pub use bootty_ui::status_layout::{
     ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, StatusBarLayout, status_bar_layout,

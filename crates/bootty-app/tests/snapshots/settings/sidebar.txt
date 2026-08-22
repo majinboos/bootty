@@ -1,0 +1,69 @@
+Bootty Settings
+  Back to terminal
+Sidebar
+Search settings...
+NAVIGATION
+Core
+
+General
+Position
+left
+right
+Dock the sidebar on the left or right edge.
+
+Remotes
+Width
+286.0 px
+
+Text
+Width of the session sidebar.
+
+Appearance
+Sidebar colors are edited in the Appearance pane.
+KEYBOARD
+
+Window
+Sidebar navigation shortcuts are edited in the Keys pane with the Sidebar scope.
+
+Sidebar
+Edit sidebar shortcuts
+Loading module source…
+
+Status Bar
+SIDEBAR
+Terminal
+
+Sessions
+
+Shell
+
+Usage footer
+
+Keys
+
+Pi
+Advanced
+
+Config
+
+Codex
+
+Diagnostics
+SESSION
+
+Extensions
+
+Diffs
+
+Process
+
+Agent
+
+Directory
+
+Git branch
+
+Ports
+
+Progress
+New module

@@ -20,6 +20,8 @@ pub(super) fn paint_sidebar_footer(
     border_color: egui::Color32,
 ) -> Option<ExtensionUiAction> {
     let painter = ui.painter_at(rect);
+    // A sweeping primitive animates off the frame clock, not off its producer's render interval.
+    let time = ui.input(|input| input.time);
     let y = rect.max.y - footer_h;
     if separator_visible {
         painter.line_segment(
@@ -72,6 +74,7 @@ pub(super) fn paint_sidebar_footer(
                 keep: 1.0,
                 round_end: false,
                 hover: None,
+                time,
             },
         );
         if item.primitives.is_empty() {

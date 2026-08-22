@@ -71,6 +71,10 @@ pub enum ModulePrimitive {
         w: ModuleCoord,
         h: ModuleCoord,
         radius: ModuleCornerRadius,
+        /// Sweep this rect back and forth across the space its width leaves free, ignoring `x`. The
+        /// painter drives it off the frame clock, so an indeterminate bar animates at the frame rate
+        /// instead of at the producing module's render interval.
+        sweep: bool,
     },
     Polygon {
         fill: Option<ModuleColor>,

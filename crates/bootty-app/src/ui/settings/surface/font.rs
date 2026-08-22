@@ -1,9 +1,10 @@
 use eframe::egui;
 
 use bootty_ui::font_stack::{FontStackSpec, font_stack_editor};
+use bootty_ui::settings::{TokenCard, settings_panel, token_card_grid};
 
 use super::SettingsSurface;
-use bootty_font::parse_font_features;
+use bootty_font::{FontFeature, parse_font_features};
 
 pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
@@ -107,6 +108,9 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     font_feature_picker(win, ui);
 }
 
+/// The OpenType features in force, as toggleable cards over the tags worth naming, with a raw field
+/// underneath for anything the cards do not cover. Feature tags are opaque; a bare text field makes
+/// the whole setting undiscoverable.
 fn font_feature_picker(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     let mut features = win
@@ -115,20 +119,87 @@ fn font_feature_picker(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         .features
         .iter()
         .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    super::settings_row(
+        .collect::<Vec<_>>();
+
+    let mut toggled = None;
+    let mut raw_edit = None;
+    let cleared = settings_panel(
         ui,
         palette,
-        "OpenType features",
-        "Comma-separated tags such as +liga, -kern, +zero, or +ss01.",
+        "Font features",
+        "OpenType feature tags written to font.features.",
+        Some("Clear"),
         |ui| {
-            if super::settings_text_edit(ui, palette, &mut features, "+liga, -kern").changed() {
-                write_features(win, &features);
-            }
+            let cards = FONT_FEATURES
+                .iter()
+                .map(|feature| TokenCard {
+                    token: feature.token,
+                    label: feature.label,
+                    description: feature.description,
+                    selected: feature_enabled(&features, feature.token),
+                })
+                .collect::<Vec<_>>();
+            toggled = token_card_grid(ui, palette, &cards);
+            ui.add_space(8.0);
+            let mut raw = features.join(", ");
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Advanced").color(palette.muted));
+                if super::settings_text_edit_width(ui, palette, &mut raw, "+liga, -kern", 300.0)
+                    .changed()
+                {
+                    raw_edit = Some(raw);
+                }
+            });
         },
     );
+
+    if cleared {
+        write_features(win, "");
+    } else if let Some(index) = toggled {
+        let token = FONT_FEATURES[index].token;
+        if feature_enabled(&features, token) {
+            features.retain(|value| !same_feature(value, token));
+        } else {
+            features.push(token.to_owned());
+        }
+        write_features(win, &features.join(", "));
+    } else if let Some(raw) = raw_edit {
+        write_features(win, &raw);
+    }
 }
+
+/// Whether `features` already carries `token`, compared through the parser so `'liga' 1` and
+/// `+liga` count as the same feature.
+fn feature_enabled(features: &[String], token: &str) -> bool {
+    features.iter().any(|value| same_feature(value, token))
+}
+
+fn same_feature(left: &str, right: &str) -> bool {
+    match (FontFeature::parse(left), FontFeature::parse(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+struct FontFeatureOption {
+    token: &'static str,
+    label: &'static str,
+    description: &'static str,
+}
+
+#[rustfmt::skip]
+const FONT_FEATURES: &[FontFeatureOption] = &[
+    FontFeatureOption { token: "+liga", label: "Standard ligatures", description: "Combines common glyph sequences such as fi and fl." },
+    FontFeatureOption { token: "-liga", label: "Disable ligatures", description: "Keeps all characters separate when a font enables ligatures." },
+    FontFeatureOption { token: "+calt", label: "Contextual alternates", description: "Allows glyphs to adapt based on neighboring characters." },
+    FontFeatureOption { token: "+dlig", label: "Discretionary ligatures", description: "Enables optional decorative ligatures when the font has them." },
+    FontFeatureOption { token: "+kern", label: "Kerning", description: "Applies pair spacing supplied by the font." },
+    FontFeatureOption { token: "+zero", label: "Slashed zero", description: "Distinguishes zero from capital O when supported." },
+    FontFeatureOption { token: "+tnum", label: "Tabular numbers", description: "Uses equal-width digits for aligned columns." },
+    FontFeatureOption { token: "+onum", label: "Oldstyle numbers", description: "Uses text-style numerals when available." },
+    FontFeatureOption { token: "+ss01", label: "Stylistic set 1", description: "Enables the font's first stylistic alternate set." },
+    FontFeatureOption { token: "+ss02", label: "Stylistic set 2", description: "Enables the font's second stylistic alternate set." },
+];
 
 fn write_features(win: &mut SettingsSurface, features: &str) {
     let mut parsed = Vec::new();
