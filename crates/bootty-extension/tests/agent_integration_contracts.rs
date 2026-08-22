@@ -149,7 +149,7 @@ done
 }
 
 #[test]
-fn native_pi_and_codex_events_preserve_opaque_identities() {
+fn reported_agent_events_preserve_opaque_identities_per_pane() {
     let directory = tempfile::tempdir().expect("temporary extension root");
     let catalog = Arc::new(ExtensionCatalog::default());
     let (sender, _receiver) = app_command_channel(4, Arc::new(|| {}));
@@ -171,6 +171,7 @@ fn native_pi_and_codex_events_preserve_opaque_identities() {
                 "toolName": "read"
             })
             .to_string(),
+            "%1".to_owned(),
         ],
     ));
     assert_eq!(pi["source"], json!("existing"));
@@ -189,16 +190,105 @@ fn native_pi_and_codex_events_preserve_opaque_identities() {
                 "transcript_path": "/must/not/be/read"
             })
             .to_string(),
+            "%2".to_owned(),
         ],
     ));
     assert_eq!(codex["source"], json!("existing"));
     assert_eq!(codex["thread_id"], json!("thread/opaque"));
     assert_eq!(codex["turn_id"], json!("turn#9"));
     assert_eq!(codex["status"], json!("tool:Bash"));
+
+    let claude = success_value(invoke(
+        &catalog,
+        "agents.claude.ingest",
+        vec![
+            json!({
+                "hook_event_name": "PreToolUse",
+                "session_id": "claude/opaque",
+                "tool_name": "Edit",
+                "transcript_path": "/must/not/be/read"
+            })
+            .to_string(),
+            "%3".to_owned(),
+        ],
+    ));
+    assert_eq!(claude["source"], json!("existing"));
+    assert_eq!(claude["session_id"], json!("claude/opaque"));
+    assert_eq!(claude["status"], json!("tool:Edit"));
+
+    // Each pane keeps its own state, and the managed slot a pane never reported into stays empty.
+    assert_eq!(
+        success_value(invoke(
+            &catalog,
+            "agents.codex.state",
+            vec!["%2".to_owned()]
+        ))["status"],
+        json!("tool:Bash")
+    );
+    assert_eq!(
+        success_value(invoke(&catalog, "agents.codex.state", Vec::new()))["source"],
+        json!("none")
+    );
+
+    // A session that ends leaves nothing behind for its pane.
+    let ended = success_value(invoke(
+        &catalog,
+        "agents.claude.ingest",
+        vec![
+            json!({ "hook_event_name": "SessionEnd", "session_id": "claude/opaque" }).to_string(),
+            "%3".to_owned(),
+        ],
+    ));
+    assert_eq!(ended["status"], json!("stopped"));
+    assert_eq!(
+        success_value(invoke(
+            &catalog,
+            "agents.claude.state",
+            vec!["%3".to_owned()]
+        ))["source"],
+        json!("none")
+    );
+}
+
+/// Every agent module ships the adapter the other tool needs, and `integrations/` on disk is that
+/// same text — the docs point people at those paths.
+#[test]
+fn every_agent_module_declares_the_adapter_it_reads_events_from() {
+    let directory = tempfile::tempdir().expect("temporary extension root");
+    let catalog = Arc::new(ExtensionCatalog::default());
+    let (sender, _receiver) = app_command_channel(4, Arc::new(|| {}));
+    let host = ExtensionHost::load(
+        directory.path(),
+        Arc::clone(&catalog),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+    let sources = host.module_sources();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+    for module in ["agents.pi", "agents.codex", "agents.claude"] {
+        let declared = sources
+            .integrations
+            .iter()
+            .filter(|state| state.declaration.module == module)
+            .collect::<Vec<_>>();
+        assert_eq!(declared.len(), 1, "{module} declares one adapter");
+        let files = &declared[0].declaration.files;
+        assert!(!files.is_empty(), "{module} declares adapter files");
+        for file in files {
+            assert_eq!(
+                fs::read_to_string(repository.join("integrations").join(&file.path))
+                    .unwrap_or_else(|_| panic!("integrations/{} is missing", file.path)),
+                file.contents,
+                "integrations/{} drifted from the module that declares it",
+                file.path
+            );
+        }
+    }
 }
 
 #[test]
-fn codex_hook_forwards_native_json_without_changing_hook_output() {
+fn agent_hooks_forward_native_json_with_the_reporting_pane() {
     let directory = tempfile::tempdir().expect("temporary Codex hook root");
     let arguments = directory.path().join("arguments");
     executable(
@@ -206,37 +296,47 @@ fn codex_hook_forwards_native_json_without_changing_hook_output() {
         "bootty",
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BOOTTY_HOOK_ARGUMENTS\"\n",
     );
-    let hook =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../integrations/codex/bootty-hook.sh");
     let path = env::var_os("PATH").unwrap_or_default();
-    let mut child = Command::new("/bin/sh")
-        .arg(&hook)
-        .env("BOOTTY_HOOK_ARGUMENTS", &arguments)
-        .env(
-            "PATH",
-            env::join_paths(
-                std::iter::once(directory.path().to_path_buf()).chain(env::split_paths(&path)),
-            )
-            .expect("fixture PATH"),
-        )
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start Codex hook");
-    child
-        .stdin
-        .take()
-        .expect("hook stdin")
-        .write_all(br#"{"hook_event_name":"Stop","session_id":"opaque/thread"}"#)
-        .expect("write native hook event");
-    let output = child.wait_with_output().expect("finish Codex hook");
+    let path = env::join_paths(
+        std::iter::once(directory.path().to_path_buf()).chain(env::split_paths(&path)),
+    )
+    .expect("fixture PATH");
 
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"{}\n");
-    assert_eq!(
-        fs::read_to_string(arguments).expect("captured Bootty arguments"),
-        "--json\ncommand\nagents.codex.ingest\n{\"hook_event_name\":\"Stop\",\"session_id\":\"opaque/thread\"}\n"
-    );
+    for (agent, command) in [
+        ("codex", "agents.codex.ingest"),
+        ("claude", "agents.claude.ingest"),
+    ] {
+        let hook = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../integrations/{agent}/bootty-hook.sh"));
+        let mut child = Command::new("/bin/sh")
+            .arg(&hook)
+            .env("BOOTTY_HOOK_ARGUMENTS", &arguments)
+            .env("PATH", &path)
+            // tmux names the pane the hook ran in; a pane bootty spawned itself is named by
+            // `BOOTTY_PANE`, which the hook only falls back to.
+            .env("TMUX_PANE", "%4")
+            .env("BOOTTY_PANE", "pane-1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("start hook");
+        child
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(br#"{"hook_event_name":"Stop","session_id":"opaque/thread"}"#)
+            .expect("write native hook event");
+        let output = child.wait_with_output().expect("finish hook");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"{}\n");
+        assert_eq!(
+            fs::read_to_string(&arguments).expect("captured Bootty arguments"),
+            format!(
+                "--json\ncommand\n{command}\n{{\"hook_event_name\":\"Stop\",\"session_id\":\"opaque/thread\"}}\n%4\n"
+            )
+        );
+    }
 }
 
 #[test]

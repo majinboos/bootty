@@ -51,6 +51,9 @@ pub struct ModuleSources<'a> {
     /// Modules that failed to load or publish, with why. A broken module is skipped so the rest
     /// still load, which means nothing renders it and nothing says why unless this is shown.
     pub failures: Vec<(ModuleIdentity, String)>,
+    /// Adapters the loaded modules declare for other tools, with whether each is installed. The
+    /// status comes from the last reconcile, so the editor never stats a file while painting.
+    pub integrations: Vec<crate::IntegrationState>,
     /// What the loaded modules are publishing right now. A preview of an unedited module shows this
     /// instead of a sandbox render, so a module that reads the machine previews as itself.
     pub live: Vec<crate::PublishedSurfaceSnapshot>,
@@ -94,6 +97,15 @@ pub enum ModuleSourceRequest {
     },
     Reset(ModuleIdentity),
     ImportLegacy(LegacyExtensionModule),
+    /// Write the adapter `id` that `module` declared, or take it back out.
+    InstallIntegration {
+        module: String,
+        id: String,
+    },
+    UninstallIntegration {
+        module: String,
+        id: String,
+    },
 }
 
 /// The result of one [`ModuleSourceRequest`], applied to the editor after painting.
@@ -108,6 +120,7 @@ pub enum ModuleSourceOutcome {
     Saved(Result<PathBuf, String>),
     Reset(Result<ModuleIdentity, String>),
     Imported(Result<ModuleIdentity, String>),
+    Integration(Result<(), String>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

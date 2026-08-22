@@ -69,6 +69,10 @@ pub struct SessionLaunchConfig {
     pub shell: Option<String>,
     pub args: Vec<String>,
     pub working_directory: Option<PathBuf>,
+    /// The mux pane this terminal is the front end for, exported as `BOOTTY_PANE`. Only backends
+    /// that spawn the pane's own PTY know it, so it stays unset for a tmux attach, where tmux
+    /// exports the same id as `$TMUX_PANE`.
+    pub pane_id: Option<String>,
     pub env: Vec<(String, String)>,
     pub env_remove: Vec<String>,
     pub term: String,
@@ -81,6 +85,7 @@ impl Default for SessionLaunchConfig {
             shell: None,
             args: Vec::new(),
             working_directory: None,
+            pane_id: None,
             env: Vec::new(),
             env_remove: Vec::new(),
             term: TERMINAL_TERM.to_owned(),

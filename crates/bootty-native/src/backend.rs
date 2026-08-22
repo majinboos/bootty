@@ -647,6 +647,7 @@ impl BackendPanePolicy for NativePanePolicy {
         let mut config = request.terminal_config.clone();
         config.launch.working_directory =
             request.target.cwd().map(Path::new).map(Path::to_path_buf);
+        config.launch.pane_id = request.target.pane_id().map(str::to_owned);
         config.side_effect_pane_id = request.target.side_effect_pane_id();
         Ok(Some(Box::new(StartingNativeTerminal::spawn(
             request.spawn_geometry,

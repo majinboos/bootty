@@ -35,6 +35,8 @@ pub(super) fn terminal_session_config_with_side_effects(
                 .working_directory
                 .clone()
                 .or_else(default_working_directory),
+            // Filled in by the backend that starts the pane, which is the one that knows it.
+            pane_id: None,
             env: config.session.env.clone(),
             env_remove: Vec::new(),
             term: config.session.term.clone(),

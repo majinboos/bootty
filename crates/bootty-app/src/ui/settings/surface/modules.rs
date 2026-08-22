@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use bootty_extension::{
-    LegacyExtensionModule, ModuleIdentity, ModuleSourceOutcome, ModuleSourceRequest, ModuleSources,
-    PublishedSurfaceSnapshot, SurfacePlacement, SurfaceSnapshot, preview_builtin_surfaces,
-    preview_module_surfaces,
+    IntegrationStatus, LegacyExtensionModule, ModuleIdentity, ModuleSourceOutcome,
+    ModuleSourceRequest, ModuleSources, PublishedSurfaceSnapshot, SurfacePlacement,
+    SurfaceSnapshot, preview_builtin_surfaces, preview_module_surfaces,
 };
 use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
 use bootty_ui::code_editor::{CodeEditorSpec, code_editor};
@@ -142,6 +142,10 @@ impl EditorState {
             }
             ModuleSourceOutcome::Imported(Err(error)) => {
                 self.error = Some(format!("Import failed: {error}"));
+            }
+            ModuleSourceOutcome::Integration(Ok(())) => self.error = None,
+            ModuleSourceOutcome::Integration(Err(error)) => {
+                self.error = Some(format!("Integration failed: {error}"));
             }
         }
     }
@@ -584,6 +588,7 @@ fn source_editor(
                 ui.add_space(6.0);
                 ui.label(RichText::new(error).color(palette.destructive).size(11.0));
             }
+            module_integrations(ui, palette, state, sources, identity);
             module_preview(
                 ui,
                 palette,
@@ -978,6 +983,58 @@ fn module_toolbar(
             }
         });
     });
+}
+
+/// The adapters this module needs installed in another tool. The module owns every path and every
+/// payload; the button only asks the host to write them or take them back out, through the same
+/// request queue a save goes through.
+fn module_integrations(
+    ui: &mut egui::Ui,
+    palette: bootty_ui::ThemePalette,
+    state: &mut EditorState,
+    sources: &ModuleSources<'_>,
+    identity: &ModuleIdentity,
+) {
+    let module = identity.namespace();
+    for integration in sources
+        .integrations
+        .iter()
+        .filter(|integration| integration.declaration.module == module)
+    {
+        let (status, color) = match integration.status {
+            IntegrationStatus::Installed => ("Installed", palette.success),
+            IntegrationStatus::Partial => ("Partly installed", palette.warning),
+            IntegrationStatus::Missing => ("Not installed", palette.muted),
+        };
+        let installed = integration.status == IntegrationStatus::Installed;
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new(&integration.declaration.title)
+                    .color(palette.text)
+                    .strong()
+                    .size(12.0),
+            );
+            ui.label(RichText::new(status).color(color).size(11.0));
+            let action = if installed { "Remove" } else { "Install" };
+            if super::settings_button(ui, palette, action).clicked() {
+                let module = integration.declaration.module.clone();
+                let id = integration.declaration.id.clone();
+                state.request(if installed {
+                    ModuleSourceRequest::UninstallIntegration { module, id }
+                } else {
+                    ModuleSourceRequest::InstallIntegration { module, id }
+                });
+            }
+        });
+        if !integration.declaration.summary.is_empty() {
+            ui.label(
+                RichText::new(&integration.declaration.summary)
+                    .color(palette.subtext)
+                    .size(11.0),
+            );
+        }
+    }
 }
 
 fn source_edit(

@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
+    path::PathBuf,
     rc::Rc,
     sync::{
         Arc, Mutex,
@@ -12,6 +13,7 @@ use std::{
 };
 
 use crate::facts::{ExtensionFactGeneration, ExtensionFacts};
+use crate::integrations::IntegrationDeclaration;
 use crate::module_sources::ModuleSource;
 use crate::queue::{
     self, ExtensionInvocationRequest, ExtensionInvocationSender, ExtensionWorkerMessage,
@@ -38,6 +40,7 @@ const MODULE_COMMAND_LIMIT: usize = 64;
 const MODULE_TOPIC_LIMIT: usize = 64;
 const MODULE_SURFACE_LIMIT: usize = 64;
 const MODULE_SETTING_LIMIT: usize = 32;
+const MODULE_INTEGRATION_LIMIT: usize = 8;
 
 #[derive(Clone)]
 pub(crate) struct ActiveInvocation {
@@ -79,6 +82,8 @@ pub(crate) struct ActiveModule {
     pub(crate) storage: ExtensionStorage,
     /// What this module declared through `bootty.settings.register`.
     pub(crate) settings: Vec<ExtensionSettingDeclaration>,
+    /// What this module declared through `bootty.integration.register`.
+    pub(crate) integrations: Vec<IntegrationDeclaration>,
 }
 
 /// A setting an extension declared for itself. The host stamps `module` from the module's own
@@ -131,6 +136,17 @@ struct ModuleDeclarations {
     topics: Vec<String>,
     surfaces: Vec<SurfaceSnapshot>,
     settings: Vec<ExtensionSettingDeclaration>,
+    integrations: Vec<IntegrationDeclaration>,
+}
+
+/// What every module gets from the host, identical for all of them: the shared catalog and
+/// channels, plus where an integration installs its files.
+#[derive(Clone)]
+pub(crate) struct ModuleEnvironment {
+    pub(crate) catalog: Arc<ExtensionCatalog>,
+    pub(crate) commands: BoundAppCommandSender,
+    pub(crate) events: ExtensionEventSender,
+    pub(crate) integration_dir: PathBuf,
 }
 
 pub(crate) struct PreparedModule {
@@ -138,6 +154,7 @@ pub(crate) struct PreparedModule {
     pub(crate) topics: Vec<String>,
     pub(crate) surfaces: Vec<SurfaceSnapshot>,
     pub(crate) settings: Vec<ExtensionSettingDeclaration>,
+    pub(crate) integrations: Vec<IntegrationDeclaration>,
     pub(crate) worker: ModuleWorker,
 }
 
@@ -150,6 +167,7 @@ struct SurfaceHandler {
 struct ModuleRegistry {
     handlers: RefCell<BTreeMap<String, RegistryKey>>,
     settings: RefCell<Vec<ExtensionSettingDeclaration>>,
+    integrations: RefCell<Vec<IntegrationDeclaration>>,
     descriptors: RefCell<Vec<CommandDescriptor>>,
     topics: RefCell<Vec<String>>,
     surface_handlers: RefCell<BTreeMap<String, SurfaceHandler>>,
@@ -167,6 +185,9 @@ struct ModuleHost {
     control: Arc<WorkerControl>,
     storage: ExtensionStorage,
     facts: ExtensionFacts,
+    /// Where `bootty.integration.register` files land. A module reads it to compose the absolute
+    /// paths it writes into another tool's config.
+    integration_dir: PathBuf,
 }
 
 /// Preview a built-in module by name, so a caller can show a draft module composed over the
@@ -228,6 +249,12 @@ fn install_preview_noop_tables(lua: &Lua, bootty: &Table) -> mlua::Result<()> {
     settings.set_readonly(true);
     bootty.set("settings", settings)?;
 
+    let integration = lua.create_table()?;
+    integration.set("dir", String::new())?;
+    integration.set("register", lua.create_function(|_, _: Table| Ok(()))?)?;
+    integration.set_readonly(true);
+    bootty.set("integration", integration)?;
+
     let commands = lua.create_table()?;
     commands.set(
         "register",
@@ -254,10 +281,8 @@ pub(crate) fn prepare_module(
     module: &ModuleSource,
     storage: ExtensionStorage,
     generation: u64,
-    catalog: Arc<ExtensionCatalog>,
-    commands: BoundAppCommandSender,
-    events: ExtensionEventSender,
     facts: ExtensionFacts,
+    environment: ModuleEnvironment,
 ) -> Result<PreparedModule, String> {
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let (tx, rx) = queue::worker_queue();
@@ -271,12 +296,13 @@ pub(crate) fn prepare_module(
         identity: module.identity.clone(),
         namespace: module.namespace.clone(),
         generation,
-        commands,
-        events,
-        catalog,
+        commands: environment.commands,
+        events: environment.events,
+        catalog: environment.catalog,
         control: Arc::clone(&control),
         storage,
         facts: facts.clone(),
+        integration_dir: environment.integration_dir,
     };
     let source = module.source.clone();
     let thread_name = format!("bootty-extension-{}", host.namespace);
@@ -310,6 +336,11 @@ pub(crate) fn prepare_module(
         ("event topic", declarations.topics.len(), MODULE_TOPIC_LIMIT),
         ("surface", declarations.surfaces.len(), MODULE_SURFACE_LIMIT),
         ("setting", declarations.settings.len(), MODULE_SETTING_LIMIT),
+        (
+            "integration",
+            declarations.integrations.len(),
+            MODULE_INTEGRATION_LIMIT,
+        ),
     ] {
         if count > limit {
             let _ = worker.retire();
@@ -327,6 +358,14 @@ pub(crate) fn prepare_module(
             ..declaration
         })
         .collect();
+    let integrations = declarations
+        .integrations
+        .into_iter()
+        .map(|declaration| IntegrationDeclaration {
+            module: module_namespace.clone(),
+            ..declaration
+        })
+        .collect();
     let registrations = declarations
         .commands
         .into_iter()
@@ -337,6 +376,7 @@ pub(crate) fn prepare_module(
         topics: declarations.topics,
         surfaces: declarations.surfaces,
         settings,
+        integrations,
         worker,
     })
 }
@@ -364,6 +404,7 @@ fn run_module_worker(
         topics: std::mem::take(&mut *registry.topics.borrow_mut()),
         surfaces,
         settings: std::mem::take(&mut *registry.settings.borrow_mut()),
+        integrations: std::mem::take(&mut *registry.integrations.borrow_mut()),
     });
     host.control.setup_complete.store(true, Ordering::Release);
     if ready.send(registered).is_err() {
@@ -511,6 +552,29 @@ fn install_host_interface(
     )?;
     settings.set_readonly(true);
     bootty.set("settings", settings)?;
+
+    // `bootty.integration`: the adapter another tool needs before this module can see anything.
+    // `dir` is where Bootty writes the files, so a module composes the absolute path it references
+    // from its own `merge` value. The host knows only "write these files" and "merge this JSON" —
+    // every hook name, agent name and config path belongs to the module.
+    let integration = lua.create_table()?;
+    integration.set("dir", host.integration_dir.to_string_lossy().into_owned())?;
+    let integration_setup = Arc::clone(&host.control);
+    let integration_registry = Rc::clone(&registry);
+    integration.set(
+        "register",
+        lua.create_function(move |_, spec: Table| {
+            require_setup_phase(&integration_setup)?;
+            let declaration = crate::integrations::declaration_from_table(&spec)?;
+            integration_registry
+                .integrations
+                .borrow_mut()
+                .push(declaration);
+            Ok(())
+        })?,
+    )?;
+    integration.set_readonly(true);
+    bootty.set("integration", integration)?;
 
     let events = lua.create_table()?;
     let event_namespace = host.namespace.clone();
