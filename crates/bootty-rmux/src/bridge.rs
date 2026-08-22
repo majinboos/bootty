@@ -17,7 +17,9 @@ const TERMINAL_PROGRAM_VERSION: &str = concat!("Bootty ", env!("CARGO_PKG_VERSIO
 #[cfg(not(feature = "app"))]
 const TERMINAL_TERM: &str = "xterm-bootty";
 use rmux_proto::{
-    LastWindowRequest, RenameSessionRequest, Request, SwapWindowRequest, WindowTarget,
+    LastWindowRequest, PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment,
+    ResizePaneRequest, SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest,
+    SwapWindowRequest, WindowTarget,
 };
 use rmux_sdk::{
     EnsureSession, EnsureSessionPolicy, Rmux, RmuxEndpoint, SessionName,
@@ -26,12 +28,12 @@ use rmux_sdk::{
 use tokio::runtime::Builder;
 
 use crate::backend::{
-    RmuxWindowRow, list_pane_rows, list_session_tags, list_window_rows, rmux_request_checked,
-    session_from_rows, stamp_session_tag,
+    RmuxPaneRow, RmuxWindowRow, list_pane_rows, list_session_tags, list_window_rows,
+    rmux_request_checked, session_from_rows, stamp_session_tag,
 };
 use crate::pane_io::{RmuxPaneTarget, pane_for_target};
 use bootty_mux::{
-    command::{MuxCommand, MuxSplitDirection},
+    command::{MuxCommand, MuxDirection, MuxSplitDirection},
     snapshot::{MuxSessionTag, MuxSnapshot},
 };
 
@@ -483,12 +485,32 @@ impl RmuxBridgeState {
                 session_id,
                 pane_id,
             } => self.close_pane(&session_id, pane_id.as_deref()).await,
-            MuxCommand::SelectPane { .. }
-            | MuxCommand::SelectNextPane { .. }
-            | MuxCommand::SelectPreviousPane { .. }
-            | MuxCommand::TogglePaneZoom { .. } => {
-                anyhow::bail!("rmux backend does not support mux command {command:?}")
+            MuxCommand::SelectPane {
+                session_id,
+                window_id,
+                direction,
+            } => {
+                self.select_pane(&session_id, window_id.as_deref(), direction)
+                    .await
             }
+            MuxCommand::SelectNextPane {
+                session_id,
+                window_id,
+            } => {
+                self.select_relative_pane(&session_id, window_id.as_deref(), 1)
+                    .await
+            }
+            MuxCommand::SelectPreviousPane {
+                session_id,
+                window_id,
+            } => {
+                self.select_relative_pane(&session_id, window_id.as_deref(), -1)
+                    .await
+            }
+            MuxCommand::TogglePaneZoom {
+                session_id,
+                pane_id,
+            } => self.toggle_pane_zoom(&session_id, pane_id.as_deref()).await,
         }
     }
 
@@ -674,6 +696,111 @@ impl RmuxBridgeState {
         Ok(())
     }
 
+    async fn select_pane(
+        &mut self,
+        session_name: &str,
+        window_id: Option<&str>,
+        direction: MuxDirection,
+    ) -> Result<()> {
+        let target = self.pane_target(session_name, window_id, None).await?;
+        let direction = match direction {
+            MuxDirection::Left => SelectPaneDirection::Left,
+            MuxDirection::Down => SelectPaneDirection::Down,
+            MuxDirection::Up => SelectPaneDirection::Up,
+            MuxDirection::Right => SelectPaneDirection::Right,
+        };
+        self.rmux().await?;
+        rmux_request_checked(Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
+            target,
+            direction,
+            preserve_zoom: true,
+        }))
+        .await
+    }
+
+    async fn select_relative_pane(
+        &mut self,
+        session_name: &str,
+        window_id: Option<&str>,
+        delta: i32,
+    ) -> Result<()> {
+        let (name, windows, panes) = self.session_rows(session_name).await?;
+        let active_window = window_for_target(&windows, window_id)
+            .context("rmux pane navigation requires an active window")?;
+        let mut candidates = panes
+            .iter()
+            .filter(|pane| pane.window_id == active_window.id)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|pane| pane.index);
+        if candidates.is_empty() {
+            anyhow::bail!("rmux pane navigation requires an active window with panes");
+        }
+        let active = candidates
+            .iter()
+            .position(|pane| pane.active)
+            .context("rmux pane navigation requires an active pane")?;
+        let next = (active as i32 + delta).rem_euclid(candidates.len() as i32) as usize;
+        self.rmux().await?;
+        rmux_request_checked(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: PaneTarget::with_window(name, active_window.index, candidates[next].index),
+            title: None,
+            input_disabled: None,
+            preserve_zoom: true,
+            style: None,
+        })))
+        .await
+    }
+
+    async fn toggle_pane_zoom(&mut self, session_name: &str, pane_id: Option<&str>) -> Result<()> {
+        let target = self.pane_target(session_name, None, pane_id).await?;
+        self.rmux().await?;
+        rmux_request_checked(Request::ResizePane(ResizePaneRequest {
+            target,
+            adjustment: ResizePaneAdjustment::Zoom,
+        }))
+        .await
+    }
+
+    async fn pane_target(
+        &mut self,
+        session_name: &str,
+        window_id: Option<&str>,
+        pane_id: Option<&str>,
+    ) -> Result<PaneTarget> {
+        let (name, windows, panes) = self.session_rows(session_name).await?;
+        let active_window = window_for_target(&windows, window_id)
+            .context("rmux pane target requires an active window")?;
+        let pane = match pane_id {
+            Some(pane_id) => panes.iter().find(|pane| pane.pane_id == pane_id),
+            None => panes
+                .iter()
+                .find(|pane| pane.window_id == active_window.id && pane.active),
+        }
+        .context("rmux pane target requires an active pane")?;
+        let window = windows
+            .iter()
+            .find(|window| window.id == pane.window_id)
+            .context("rmux pane target window was not found")?;
+        if let Some(window_id) = window_id {
+            anyhow::ensure!(
+                window.id == window_id,
+                "rmux pane target {pane_id:?} is not in window {window_id}"
+            );
+        }
+        Ok(PaneTarget::with_window(name, window.index, pane.index))
+    }
+
+    async fn session_rows(
+        &mut self,
+        session_name: &str,
+    ) -> Result<(SessionName, Vec<RmuxWindowRow>, Vec<RmuxPaneRow>)> {
+        let name = SessionName::new(session_name).context("invalid rmux session name")?;
+        let rmux = self.rmux().await?;
+        let windows = list_window_rows(rmux, &name).await?;
+        let panes = list_pane_rows(rmux, &name).await?;
+        Ok((name, windows, panes))
+    }
+
     #[cfg(feature = "app")]
     async fn resize_window(&mut self, window_id: &str, cols: u16, rows: u16) -> Result<()> {
         retry_rmux_operation!(
@@ -732,6 +859,16 @@ impl RmuxBridgeState {
         rmux.window(WindowRef::new(name, index))
             .await
             .map_err(Into::into)
+    }
+}
+
+fn window_for_target<'a>(
+    windows: &'a [RmuxWindowRow],
+    window_id: Option<&str>,
+) -> Option<&'a RmuxWindowRow> {
+    match window_id {
+        Some(window_id) => windows.iter().find(|window| window.id == window_id),
+        None => windows.iter().find(|window| window.active),
     }
 }
 

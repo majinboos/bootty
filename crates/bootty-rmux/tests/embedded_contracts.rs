@@ -3,10 +3,10 @@
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bootty_identity::ApplicationIdentity;
 use bootty_mux::{
-    command::MuxCommand,
+    command::{MuxCommand, MuxDirection, MuxSplitDirection},
     provider::MuxBackendRegistry,
     snapshot::{MuxSessionTag, new_session_identity},
     terminal::ActiveTerminal,
@@ -133,6 +133,68 @@ fn embedded_rmux_fresh_reader_restore_does_not_block_later_live_output() -> Resu
     run_embedded_helper(
         "embedded_rmux_fresh_reader_restore_does_not_block_later_live_output_helper",
     )
+}
+
+#[test]
+fn embedded_rmux_supports_pane_navigation_and_zoom() -> Result<()> {
+    run_embedded_helper("embedded_rmux_supports_pane_navigation_and_zoom_helper")
+}
+
+#[test]
+fn embedded_rmux_supports_pane_navigation_and_zoom_helper() -> Result<()> {
+    if std::env::var_os(HELPER_ENV).is_none() {
+        return Ok(());
+    }
+
+    let (mut backend, _registry, session_id, window_id, _pane) = create_embedded_session()?;
+    let initial = active_pane_id(&backend, &session_id)?;
+    backend.execute(MuxCommand::SplitPane {
+        session_id: session_id.clone(),
+        pane_id: Some(initial.clone()),
+        direction: MuxSplitDirection::Down,
+    })?;
+
+    let after_split = pane_ids(&backend, &session_id)?;
+    assert_eq!(after_split.len(), 2, "split created a second rmux pane");
+    let active_after_split = active_pane_id(&backend, &session_id)?;
+
+    backend.execute(MuxCommand::SelectNextPane {
+        session_id: session_id.clone(),
+        window_id: Some(window_id.clone()),
+    })?;
+    let after_next = active_pane_id(&backend, &session_id)?;
+    assert_ne!(
+        after_next, active_after_split,
+        "next pane changed the active pane"
+    );
+
+    backend.execute(MuxCommand::SelectPreviousPane {
+        session_id: session_id.clone(),
+        window_id: Some(window_id.clone()),
+    })?;
+    assert_eq!(active_pane_id(&backend, &session_id)?, active_after_split);
+
+    backend.execute(MuxCommand::SelectPane {
+        session_id: session_id.clone(),
+        window_id: Some(window_id),
+        direction: if active_after_split == after_split[0] {
+            MuxDirection::Down
+        } else {
+            MuxDirection::Up
+        },
+    })?;
+    assert_ne!(active_pane_id(&backend, &session_id)?, active_after_split);
+
+    backend.execute(MuxCommand::TogglePaneZoom {
+        session_id: session_id.clone(),
+        pane_id: None,
+    })?;
+    backend.execute(MuxCommand::TogglePaneZoom {
+        session_id: session_id.clone(),
+        pane_id: None,
+    })?;
+
+    ditch_session(&mut backend, &session_id)
 }
 
 #[test]
@@ -343,6 +405,39 @@ fn ditch_session(backend: &mut RmuxBackend, session_id: &str) -> Result<()> {
             .any(|session| session.id == session_id)
     );
     Ok(())
+}
+
+fn active_pane_id(backend: &RmuxBackend, session_id: &str) -> Result<String> {
+    backend
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .context("rmux test session was not found")?
+        .windows
+        .into_iter()
+        .find(|window| window.active)
+        .context("rmux test active window was not found")?
+        .anchor
+        .pane_id
+        .context("rmux test active pane was not found")
+}
+
+fn pane_ids(backend: &RmuxBackend, session_id: &str) -> Result<Vec<String>> {
+    Ok(backend
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .context("rmux test session was not found")?
+        .windows
+        .into_iter()
+        .find(|window| window.active)
+        .context("rmux test active window was not found")?
+        .panes
+        .into_iter()
+        .filter_map(|pane| pane.pane_id)
+        .collect())
 }
 
 fn wait_for_terminal_text(terminal: &mut ActiveTerminal, expected: &str) -> Result<()> {
