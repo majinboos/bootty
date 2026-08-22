@@ -210,7 +210,7 @@ glyph-protocol = false
     assert!(
         state
             .last_error()
-            .is_some_and(|error| error.contains("terminal config publication failed for MuxScope"))
+            .is_some_and(|error| error.contains("terminal config publication failed for SpaceId"))
     );
 
     state.terminal_mut().discard_active_pane();

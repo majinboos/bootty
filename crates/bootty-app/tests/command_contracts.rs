@@ -415,7 +415,8 @@ fn ditch_session_commits_membership_after_authoritative_command() {
     drop(state);
     let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
     assert!(
-        !reopened.spaces()[0].bindings()[0]
+        !reopened.spaces()[0]
+            .binding()
             .sessions()
             .backend_names()
             .contains(&original_name)

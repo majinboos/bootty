@@ -1,7 +1,5 @@
 use bootty_mux::{
-    MuxBackendKind, MuxBindingConfig,
-    capability::BindingOperation,
-    controller::{BindingId, MuxScope, SpaceId},
+    MuxBackendKind, MuxBindingConfig, capability::BindingOperation, controller::SpaceId,
     provider::MuxCommandDispatch,
 };
 
@@ -72,7 +70,7 @@ fn windows_keeps_remote_tmux_and_replaces_only_local_tmux() {
 #[test]
 fn built_backends_publish_the_exact_capability_matrix() {
     let registry = support::backends();
-    let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(2));
+    let scope = SpaceId::from_persistence(1);
     for (backend, expected) in [
         (
             MuxBackendKind::Native,

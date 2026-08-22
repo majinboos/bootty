@@ -19,7 +19,7 @@ use bootty_mux::{
 #[cfg(feature = "app")]
 use bootty_mux::{
     capability::{BindingCapabilityDescriptor, BindingOperation},
-    controller::MuxScope,
+    controller::SpaceId,
     terminal::{
         AttachLaunch, BackendPanePolicy, PaneLayoutResizeRequest, PaneStartRequest,
         ScopedMuxPaneTarget, TerminalRuntime, resolve_launch_program, start_attach_terminal,
@@ -332,6 +332,11 @@ impl<R> TmuxBackend<R> {
             runner,
         }
     }
+
+    /// The runner this backend drives, so a test can read back what tmux was asked for.
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
 }
 
 impl<R: CommandRunner> TmuxBackend<R> {
@@ -615,7 +620,7 @@ impl<R: CommandRunner> MuxBackend for TmuxBackend<R> {
 }
 
 #[cfg(feature = "app")]
-pub fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+pub fn tmux_capabilities(scope: SpaceId) -> BindingCapabilityDescriptor {
     BindingCapabilityDescriptor::new(
         scope,
         [
@@ -640,7 +645,7 @@ pub fn tmux_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
 /// Whether tmux reported that its server is not there. Two different messages mean it: a server
 /// that was never started, and one that died — the second is what a crashed server leaves behind,
 /// and treating only the first as "gone" turned a tmux crash into a fatal bootty error.
-fn tmux_server_exited(stderr: &str) -> bool {
+pub fn tmux_server_exited(stderr: &str) -> bool {
     stderr.contains("no server running") || stderr.contains("server exited unexpectedly")
 }
 
@@ -658,7 +663,7 @@ fn clear_stale_local_socket() -> bool {
 /// Remove `path` only if it is a socket nothing is listening on. A live server answers `connect`,
 /// and deleting its socket would strand every client that has not connected yet.
 #[cfg(unix)]
-fn clear_dead_socket(path: &std::path::Path) -> bool {
+pub fn clear_dead_socket(path: &std::path::Path) -> bool {
     let is_socket = path
         .symlink_metadata()
         .is_ok_and(|metadata| std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()));
@@ -944,127 +949,5 @@ fn add_tmux_windows(sessions: &mut [MuxSession], pane_listing: &str) {
     }
     for session in sessions {
         session.windows.sort_by_key(|window| window.index);
-    }
-}
-
-#[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-
-    /// A stamp is one invocation: the leading command carries no separator, and a claim being
-    /// dropped unsets its option rather than writing an empty value that still reads as set.
-    #[test]
-    fn stamping_a_session_writes_both_halves_and_unsets_the_ones_being_dropped() {
-        assert_eq!(
-            stamp_session_args(
-                "$3",
-                &MuxSessionTag {
-                    identity: Some("9f3a".to_owned()),
-                    space: Some("space-7".to_owned()),
-                },
-            ),
-            [
-                "set-option",
-                "-t",
-                "$3",
-                "@bootty_id",
-                "9f3a",
-                ";",
-                "set-option",
-                "-t",
-                "$3",
-                "@bootty_space",
-                "space-7",
-            ]
-        );
-        assert_eq!(
-            stamp_session_args(
-                "$3",
-                &MuxSessionTag {
-                    identity: Some("9f3a".to_owned()),
-                    space: None,
-                },
-            ),
-            [
-                "set-option",
-                "-t",
-                "$3",
-                "@bootty_id",
-                "9f3a",
-                ";",
-                "set-option",
-                "-u",
-                "-t",
-                "$3",
-                "@bootty_space",
-            ]
-        );
-    }
-
-    /// tmux renders an option nothing set as the empty string, so an untagged session and a
-    /// tagged one arrive down the same listing and have to be told apart by field, not by shape.
-    #[test]
-    fn a_session_listing_carries_the_bootty_tag_and_leaves_untagged_sessions_unclaimed() {
-        let listing = concat!(
-            "$0\x1fwork\x1f9f3a\x1fspace-7\x1f1\x1f2\x1f%1\x1f4242\x1f/repo\x1fzsh\n",
-            "$1\x1fscratch\x1f\x1f\x1f0\x1f1\x1f%2\x1f4243\x1f/tmp\x1fbash\n",
-        );
-        let snapshot = parse_tmux_snapshot(listing, "").expect("parse the session listing");
-
-        assert_eq!(
-            snapshot.sessions[0].tag,
-            MuxSessionTag {
-                identity: Some("9f3a".to_owned()),
-                space: Some("space-7".to_owned()),
-            }
-        );
-        assert!(snapshot.sessions[1].tag.is_empty());
-        // The fields after the tag still have to land where they did before it existed.
-        assert_eq!(snapshot.sessions[0].name, "work");
-        assert!(snapshot.sessions[0].active, "session_attached was 1");
-        assert!(!snapshot.sessions[1].active);
-        assert_eq!(snapshot.sessions[0].anchor.cwd.as_deref(), Some("/repo"));
-        assert_eq!(snapshot.sessions[0].anchor.pane_pid, Some(4242));
-        assert_eq!(snapshot.sessions[1].anchor.process.as_deref(), Some("bash"));
-    }
-
-    /// The two ways tmux says its server is not there. Only matching the first turned a crashed
-    /// server into a fatal bootty error instead of something to recover from.
-    #[test]
-    fn a_crashed_server_reads_as_gone_the_same_as_one_never_started() {
-        assert!(tmux_server_exited(
-            "no server running on /tmp/tmux-1/default"
-        ));
-        assert!(tmux_server_exited("server exited unexpectedly"));
-        assert!(!tmux_server_exited("can't find session: bogus"));
-    }
-
-    #[test]
-    fn a_dead_socket_is_cleared_and_a_live_one_is_left_alone() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-
-        let dead = directory.path().join("dead");
-        drop(std::os::unix::net::UnixListener::bind(&dead).expect("bind the dead socket"));
-        assert!(
-            clear_dead_socket(&dead),
-            "a socket nobody answers is cleared"
-        );
-        assert!(!dead.exists());
-
-        let alive = directory.path().join("alive");
-        let _listener = std::os::unix::net::UnixListener::bind(&alive).expect("bind a live socket");
-        assert!(
-            !clear_dead_socket(&alive),
-            "a server that answers keeps its socket"
-        );
-        assert!(alive.exists());
-
-        let regular = directory.path().join("regular");
-        std::fs::write(&regular, "not a socket").expect("write a regular file");
-        assert!(
-            !clear_dead_socket(&regular),
-            "only a socket is ever removed"
-        );
-        assert!(regular.exists());
     }
 }

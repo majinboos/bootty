@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
-use bootty_mux::{controller::MuxScope, snapshot::MuxSession};
+use bootty_mux::{controller::SpaceId, snapshot::MuxSession};
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ScopedSessionTarget {
-    pub scope: MuxScope,
+    pub scope: SpaceId,
     pub session_id: String,
 }
 
 impl ScopedSessionTarget {
-    pub fn new(scope: MuxScope, session_id: impl Into<String>) -> Self {
+    pub fn new(scope: SpaceId, session_id: impl Into<String>) -> Self {
         Self {
             scope,
             session_id: session_id.into(),
@@ -19,7 +19,7 @@ impl ScopedSessionTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BindingSessionGroup {
-    pub scope: MuxScope,
+    pub scope: SpaceId,
     pub label: String,
     pub sessions: Vec<MuxSession>,
     pub selected_session: Option<String>,

@@ -12,7 +12,7 @@ pub(crate) enum RenameSessionOutcome {
     Started,
 }
 
-pub(super) fn session_cwd(cwd: &str, remote: bool) -> String {
+fn resolve_session_cwd(cwd: &str, remote: bool) -> String {
     if remote {
         cwd.to_owned()
     } else {
@@ -29,6 +29,24 @@ fn suggested_session_name(cwd: &str, remote: bool) -> String {
 }
 
 impl BindingRuntime {
+    /// Where a session lives, as bootty records it: the worktree root for a local session, and
+    /// whatever the far side reported for a remote one.
+    ///
+    /// Memoised, because this is on the frame path and resolving a local one forks `git`.
+    pub(super) fn session_cwd(&self, cwd: &str) -> String {
+        if self.multiplexer.remote.is_some() {
+            return resolve_session_cwd(cwd, true);
+        }
+        if let Some(resolved) = self.session_roots.borrow().get(cwd) {
+            return resolved.clone();
+        }
+        let resolved = resolve_session_cwd(cwd, false);
+        self.session_roots
+            .borrow_mut()
+            .insert(cwd.to_owned(), resolved.clone());
+        resolved
+    }
+
     pub(super) fn poll_membership_command(&mut self) {
         let Some(result) = self.mux.poll_command() else {
             return;
@@ -104,11 +122,10 @@ impl WorkspaceRuntime {
             let Some(claimed) = candidate.sessions.get(identity) else {
                 continue;
             };
-            let cwd = session
-                .anchor
-                .cwd
-                .as_deref()
-                .map_or_else(|| claimed.cwd.clone(), |cwd| session_cwd(cwd, remote));
+            let cwd = session.anchor.cwd.as_deref().map_or_else(
+                || claimed.cwd.clone(),
+                |cwd| self.active.binding.session_cwd(cwd),
+            );
             let explicit = claimed.explicit;
             let suggested = suggested_session_name(&cwd, remote);
 
@@ -175,7 +192,7 @@ impl WorkspaceRuntime {
 
     pub(crate) fn project_session_command(&self, cwd: &str) -> MuxCommand {
         let remote = self.active.binding.multiplexer.remote.is_some();
-        let cwd = session_cwd(cwd, remote);
+        let cwd = self.active.binding.session_cwd(cwd);
         let display_name = suggested_session_name(&cwd, remote);
         let session_id = crate::strings::unique_session_name(
             &display_name,

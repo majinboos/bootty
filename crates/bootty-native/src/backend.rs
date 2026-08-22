@@ -10,7 +10,7 @@ use bootty_mux::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation},
     command::MuxCommand,
-    controller::MuxScope,
+    controller::SpaceId,
     snapshot::{MuxPaneAnchor, MuxSession, MuxSessionTag, MuxSnapshot, MuxWindow},
     terminal::{
         BackendPanePolicy, MuxPaneTarget, PaneLayoutResizeRequest, PaneStartRequest,
@@ -642,7 +642,7 @@ impl MuxBackend for NativeBackend {
     }
 }
 
-pub fn native_capabilities(scope: MuxScope) -> BindingCapabilityDescriptor {
+pub fn native_capabilities(scope: SpaceId) -> BindingCapabilityDescriptor {
     BindingCapabilityDescriptor::new(
         scope,
         [

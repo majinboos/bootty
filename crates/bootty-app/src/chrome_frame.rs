@@ -147,11 +147,7 @@ pub(crate) fn prepare(
         mux: MuxView {
             windows,
             sessions: session_views,
-            scope_key: format!(
-                "{}:{}",
-                scope.space_id().persistence_value(),
-                scope.binding_id().persistence_value()
-            ),
+            scope_key: scope.persistence_value().to_string(),
             session: selected_name,
             sidebar_visible,
             session_color: Some(selected_color.unwrap_or(fallback_color)),
@@ -198,6 +194,11 @@ pub(crate) fn apply(
             }
             chrome::SpaceSwitcherEvent::Close(space_id) => {
                 state.close_space_from_ui(space_id);
+            }
+            chrome::SpaceSwitcherEvent::MoveSessions { sessions, to } => {
+                for session in &sessions {
+                    state.move_scoped_session_to_space(session, to);
+                }
             }
         }
         ctx.request_repaint();
@@ -313,6 +314,9 @@ fn apply_sidebar_event(
             state.activate_scoped_session_from_ui(&target);
             false
         }
+        chrome::SidebarEvent::AdoptSession(target) => {
+            state.adopt_and_activate_scoped_session(&target)
+        }
         chrome::SidebarEvent::Reorder { source, before } => {
             state.reorder_session_before(&source, before.as_deref())
         }
@@ -327,8 +331,7 @@ fn apply_sidebar_event(
             Action::Rename => state.open_rename_session_dialog_for(&target.session_id),
             Action::MoveUp => state.move_session_from_ui(&target.session_id, -1),
             Action::MoveDown => state.move_session_from_ui(&target.session_id, 1),
-            Action::Detach => state.detach_scoped_session_from_space(&target),
-            Action::MoveToSpace(space_id) => state.move_scoped_session_to_space(&target, space_id),
+            Action::MoveToSpace => state.open_space_picker_for(&target),
             Action::Ditch => state.open_ditch_session_dialog_for(&target.session_id),
         },
     }

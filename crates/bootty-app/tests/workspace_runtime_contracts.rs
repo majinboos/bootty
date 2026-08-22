@@ -26,7 +26,7 @@ use bootty_mux::{
     backend::MuxBackend,
     capability::{BindingCapabilityDescriptor, BindingOperation},
     command::MuxCommand,
-    controller::MuxScope,
+    controller::SpaceId,
     provider::{
         GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider, MuxBackendProvider,
         MuxBackendRegistry, MuxCommandDispatch, PaneBehavior, PaneTopology, PersistedSessionPolicy,
@@ -211,7 +211,7 @@ impl MuxAppBackendProvider for RestoreProvider {
         }
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor {
         BindingCapabilityDescriptor::new(
             scope,
             [
@@ -438,8 +438,8 @@ fn a_session_moves_between_spaces_on_one_multiplexer_and_stays_put_across_a_rest
 
     let (mut repository, snapshot) = WorkspaceRepository::open(&config_path).expect("workspace");
     let first_space = snapshot.spaces()[0].clone();
-    let first_scope = first_space.bindings()[0].mux_scope();
-    let mut claimed = first_space.bindings()[0].sessions().clone();
+    let first_scope = first_space.binding().mux_scope();
+    let mut claimed = first_space.binding().sessions().clone();
     assert!(claimed.claim(claimed_session("moving-id", "moving", &cwd)));
     repository
         .commit_binding_state(first_scope, &claimed)
@@ -456,7 +456,23 @@ fn a_session_moves_between_spaces_on_one_multiplexer_and_stays_put_across_a_rest
         .expect("create second Space")
         .expect("valid second Space");
     let second_id = second_space.id();
-    let second_scope = second_space.bindings()[0].mux_scope();
+    let second_scope = second_space.binding().mux_scope();
+    // A Space on another multiplexer: a session cannot follow it there.
+    let elsewhere = repository
+        .create_space(
+            "Elsewhere",
+            "3",
+            [0x33, 0x55, 0x77],
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Rmux),
+                remote: SpaceRemoteOverride::Local,
+            },
+            config.multiplexer.hide_tmux_status,
+        )
+        .expect("create the far Space")
+        .expect("valid far Space");
+    let elsewhere_id = elsewhere.id();
     drop(repository);
 
     let sessions = Arc::new(Mutex::new(vec![MuxSession {
@@ -476,18 +492,24 @@ fn a_session_moves_between_spaces_on_one_multiplexer_and_stays_put_across_a_rest
         windows: Vec::new(),
     }]));
     let create_calls = Arc::new(AtomicUsize::new(0));
+    let provider = |kind| {
+        Arc::new(RestoreProvider {
+            kind,
+            dispatch: MuxCommandDispatch::CallerThread,
+            sessions: Arc::clone(&sessions),
+            create_calls: Arc::clone(&create_calls),
+            release: None,
+            native_panes: false,
+            selection_publication: SelectionPublicationPolicy::Direct,
+        })
+    };
     let backends = Arc::new(
         MuxBackendRegistry::from_app_providers(
-            [Arc::new(RestoreProvider {
-                kind: MuxBackendKind::Tmux,
-                dispatch: MuxCommandDispatch::CallerThread,
-                sessions: Arc::clone(&sessions),
-                create_calls,
-                release: None,
-                native_panes: false,
-                selection_publication: SelectionPublicationPolicy::Direct,
-            })],
-            [MuxBackendKind::Tmux],
+            [
+                provider(MuxBackendKind::Tmux),
+                provider(MuxBackendKind::Rmux),
+            ],
+            [MuxBackendKind::Tmux, MuxBackendKind::Rmux],
         )
         .expect("move test registry"),
     );
@@ -510,12 +532,20 @@ fn a_session_moves_between_spaces_on_one_multiplexer_and_stays_put_across_a_rest
     assert!(
         targets
             .iter()
-            .any(|space| space.id == first_scope.space_id() && space.current)
+            .any(|space| space.id == first_scope && space.current)
     );
+    // Listed, so the answer is "not from here" rather than a Space that seems not to exist.
+    assert!(
+        targets
+            .iter()
+            .any(|space| space.id == elsewhere_id && !space.reachable),
+        "a Space on another multiplexer is offered and refused, not hidden"
+    );
+    assert!(!state.move_scoped_session_to_space(&target, elsewhere_id));
 
     assert!(state.move_scoped_session_to_space(&target, second_id));
     assert!(
-        !state.move_scoped_session_to_space(&target, first_scope.space_id()),
+        !state.move_scoped_session_to_space(&target, first_scope),
         "the session no longer belongs to the Space it came from"
     );
 
@@ -527,17 +557,114 @@ fn a_session_moves_between_spaces_on_one_multiplexer_and_stays_put_across_a_rest
             .iter()
             .find(|space| space.id() == space_id)
             .expect("Space")
-            .bindings()[0]
+            .binding()
             .sessions()
             .backend_names()
     };
-    assert!(claims(first_scope.space_id()).is_empty());
-    assert_eq!(claims(second_scope.space_id()), vec!["moving"]);
+    assert!(claims(first_scope).is_empty());
+    assert_eq!(claims(second_scope), vec!["moving"]);
     assert_eq!(
         sessions.lock().expect("sessions")[0].tag.space.as_deref(),
         Some(second_space.remote_id()),
         "the multiplexer carries the new claim, so every bootty window agrees"
     );
+}
+
+/// Letting go of a session must not make it disappear. Membership is explicit, so a session no
+/// Space claims has to be somewhere the sidebar can show it.
+#[test]
+fn an_unassigned_session_keeps_running_and_stays_visible_as_unclaimed() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_config::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..bootty_config::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let cwd = directory.path().to_string_lossy().into_owned();
+
+    let (mut repository, snapshot) = WorkspaceRepository::open(&config_path).expect("workspace");
+    let space = snapshot.spaces()[0].clone();
+    let scope = space.binding().mux_scope();
+    let mut claimed = space.binding().sessions().clone();
+    assert!(claimed.claim(claimed_session("kept-id", "kept", &cwd)));
+    repository
+        .commit_binding_state(scope, &claimed)
+        .expect("persist the session");
+    drop(repository);
+
+    let sessions = Arc::new(Mutex::new(vec![MuxSession {
+        anchor: MuxPaneAnchor {
+            session_id: "kept".to_owned(),
+            cwd: Some(cwd.clone()),
+            ..MuxPaneAnchor::default()
+        },
+        id: "kept".to_owned(),
+        name: "kept".to_owned(),
+        active: true,
+        active_window_id: None,
+        tag: MuxSessionTag {
+            identity: Some("kept-id".to_owned()),
+            space: Some(space.remote_id().to_owned()),
+        },
+        windows: Vec::new(),
+    }]));
+    let backends = Arc::new(
+        MuxBackendRegistry::from_app_providers(
+            [Arc::new(RestoreProvider {
+                kind: MuxBackendKind::Tmux,
+                dispatch: MuxCommandDispatch::CallerThread,
+                sessions: Arc::clone(&sessions),
+                create_calls: Arc::new(AtomicUsize::new(0)),
+                release: None,
+                native_panes: false,
+                selection_publication: SelectionPublicationPolicy::Direct,
+            })],
+            [MuxBackendKind::Tmux],
+        )
+        .expect("unassign test registry"),
+    );
+
+    let mut state =
+        AppState::new(config, backends, Arc::new(|| {}), None, None).expect("app state");
+    state.update_frame(frame(Instant::now()));
+    let target =
+        bootty_app::ui::session_navigation::ScopedSessionTarget::new(scope, "kept".to_owned());
+    assert!(state.unclaimed_sessions().is_empty());
+
+    assert!(state.detach_scoped_session_from_space(&target));
+    state.update_frame(frame(Instant::now()));
+
+    assert_eq!(
+        sessions.lock().expect("sessions")[0].tag.space,
+        None,
+        "the session is running and claimed by nobody"
+    );
+    assert_eq!(
+        sessions.lock().expect("sessions")[0]
+            .tag
+            .identity
+            .as_deref(),
+        Some("kept-id"),
+        "its identity survives, so a Space can take it back without minting a new one"
+    );
+    let unclaimed = state.unclaimed_sessions();
+    assert_eq!(
+        unclaimed
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>(),
+        ["kept"],
+        "an unassigned session is visible, not gone"
+    );
+
+    // And taking it back is one click.
+    assert!(state.adopt_and_activate_scoped_session(&target));
+    state.update_frame(frame(Instant::now()));
+    assert!(state.unclaimed_sessions().is_empty());
 }
 
 #[test]
@@ -599,8 +726,8 @@ fn pending_ditch_completes_in_its_original_space() {
 
     let (mut repository, snapshot) = WorkspaceRepository::open(&config_path).expect("workspace");
     let first_space = snapshot.spaces()[0].clone();
-    let first_scope = first_space.bindings()[0].mux_scope();
-    let mut sessions = first_space.bindings()[0].sessions().clone();
+    let first_scope = first_space.binding().mux_scope();
+    let mut sessions = first_space.binding().sessions().clone();
     assert!(sessions.claim(claimed_session("delayed-id", "delayed", &cwd)));
     repository
         .commit_binding_state(first_scope, &sessions)
@@ -626,7 +753,7 @@ fn pending_ditch_completes_in_its_original_space() {
         .expect("create second Space")
         .expect("valid second Space");
     let second_id = second_space.id();
-    let second_scope = second_space.bindings()[0].mux_scope();
+    let second_scope = second_space.binding().mux_scope();
     drop(repository);
 
     let mut state =
@@ -660,7 +787,7 @@ fn pending_ditch_completes_in_its_original_space() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(state.last_error().is_none(), "{:#?}", state.last_error());
-    assert!(state.activate_space_from_ui(first_scope.space_id()));
+    assert!(state.activate_space_from_ui(first_scope));
     let removed = (0..250).any(|tick| {
         state.update_frame(frame(Instant::now() + Duration::from_millis(tick)));
         std::thread::sleep(Duration::from_millis(1));
@@ -673,15 +800,15 @@ fn pending_ditch_completes_in_its_original_space() {
     let first = reopened
         .spaces()
         .iter()
-        .find(|space| space.id() == first_scope.space_id())
+        .find(|space| space.id() == first_scope)
         .expect("first Space");
     let second = reopened
         .spaces()
         .iter()
-        .find(|space| space.id() == second_scope.space_id())
+        .find(|space| space.id() == second_scope)
         .expect("second Space");
-    assert!(first.bindings()[0].sessions().is_empty());
-    assert!(second.bindings()[0].sessions().is_empty());
+    assert!(first.binding().sessions().is_empty());
+    assert!(second.binding().sessions().is_empty());
 }
 
 #[test]
@@ -724,7 +851,7 @@ fn a_failed_placement_commit_preserves_the_live_and_durable_binding() {
     lock.execute_batch("ROLLBACK").expect("release write lock");
     drop(lock);
     let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
-    let binding = &reopened.spaces()[0].bindings()[0];
+    let binding = &reopened.spaces()[0].binding();
     assert_eq!(binding.backend_override(), None);
     assert_eq!(binding.remote_override(), &SpaceRemoteOverride::Inherit);
 }
@@ -803,7 +930,8 @@ fn a_failed_session_membership_commit_preserves_the_live_runtime_and_database() 
     drop(lock);
     let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
     assert!(
-        reopened.spaces()[0].bindings()[0]
+        reopened.spaces()[0]
+            .binding()
             .sessions()
             .backend_names()
             .contains(&original_name)
@@ -923,8 +1051,8 @@ fn one_frame_recovers_active_and_inactive_binding_membership() {
     };
     let (mut repository, snapshot) =
         WorkspaceRepository::open(&config_path).expect("workspace repository");
-    let first_scope = snapshot.spaces()[0].bindings()[0].mux_scope();
-    let first_binding = snapshot.spaces()[0].bindings()[0].clone();
+    let first_scope = snapshot.spaces()[0].binding().mux_scope();
+    let first_binding = snapshot.spaces()[0].binding().clone();
     let mut sessions = first_binding.sessions().clone();
     assert!(sessions.claim(claimed_session(
         "persisted-first-id",
@@ -945,7 +1073,7 @@ fn one_frame_recovers_active_and_inactive_binding_membership() {
         )
         .expect("create second Space")
         .expect("valid second Space");
-    let second_scope = second_space.bindings()[0].mux_scope();
+    let second_scope = second_space.binding().mux_scope();
     for (scope, name) in [
         (first_scope, "interrupted-first"),
         (second_scope, "interrupted-second"),
@@ -978,12 +1106,12 @@ fn one_frame_recovers_active_and_inactive_binding_membership() {
     let spaces = state.space_summaries();
     let first_space = spaces
         .iter()
-        .find(|space| space.id == first_scope.space_id())
+        .find(|space| space.id == first_scope)
         .expect("first Space")
         .clone();
     let second_space = spaces
         .iter()
-        .find(|space| space.id == second_scope.space_id())
+        .find(|space| space.id == second_scope)
         .expect("second Space")
         .clone();
     let local_override = SpaceMuxOverride {
@@ -1055,7 +1183,7 @@ fn one_frame_recovers_active_and_inactive_binding_membership() {
         reopened
             .spaces()
             .iter()
-            .all(|space| { space.bindings()[0].remote_override() == &SpaceRemoteOverride::Local })
+            .all(|space| { space.binding().remote_override() == &SpaceRemoteOverride::Local })
     );
 }
 
@@ -1089,9 +1217,9 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
     let (mut repository, snapshot) =
         WorkspaceRepository::open(&config_path).expect("workspace repository");
     let space = &snapshot.spaces()[0];
-    let scope = space.bindings()[0].mux_scope();
+    let scope = space.binding().mux_scope();
     repository
-        .update_space_and_binding(
+        .update_space(
             scope,
             space.name(),
             space.icon(),
@@ -1157,7 +1285,7 @@ fn a_deferred_profile_rebuild_preserves_the_intended_display_name() {
     }));
     let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
     // The server needed a suffix to tell the two apart; bootty shows the name it asked for.
-    let sessions = reopened.spaces()[0].bindings()[0].sessions();
+    let sessions = reopened.spaces()[0].binding().sessions();
     let claimed = sessions
         .sessions()
         .iter()
@@ -1177,9 +1305,9 @@ fn a_corrected_ssh_profile_rebuilds_an_unavailable_binding() {
     let (mut repository, snapshot) =
         WorkspaceRepository::open(&config_path).expect("workspace repository");
     let space = &snapshot.spaces()[0];
-    let scope = space.bindings()[0].mux_scope();
+    let scope = space.binding().mux_scope();
     repository
-        .update_space_and_binding(
+        .update_space(
             scope,
             space.name(),
             space.icon(),
@@ -1196,7 +1324,7 @@ fn a_corrected_ssh_profile_rebuilds_an_unavailable_binding() {
             },
         )
         .expect("configure missing profile binding");
-    let binding = space.bindings()[0].clone();
+    let binding = space.binding().clone();
     let mut sessions = binding.sessions().clone();
     assert!(sessions.claim(claimed_session(
         "fallback-id",
@@ -1266,7 +1394,7 @@ fn a_binding_persisted_as_unavailable_recovers_on_a_successful_refresh() {
     };
     let (mut repository, snapshot) =
         WorkspaceRepository::open(&config_path).expect("workspace repository");
-    let scope = snapshot.spaces()[0].bindings()[0].mux_scope();
+    let scope = snapshot.spaces()[0].binding().mux_scope();
     repository
         .set_binding_restore_state(scope, true, None, None)
         .expect("persist the binding as unavailable");
@@ -1290,4 +1418,88 @@ fn a_binding_persisted_as_unavailable_recovers_on_a_successful_refresh() {
         "a refresh that works clears the flag: {:?}",
         state.space_summaries()[0].error
     );
+}
+
+/// A steady-state frame forks nothing.
+///
+/// Resolving a session's directory means asking `git` for its worktree root, which forks and blocks
+/// the frame thread for as long as the child takes. The reconciler asks for every session's
+/// directory on every frame, so without a memo that is one fork per session per frame and typing
+/// visibly lags. `guard_frame_path` panics naming whatever spawns, so this fails at the offender
+/// rather than as a slow frame nobody measures.
+#[test]
+fn steady_state_frames_do_not_fork_a_subprocess() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_config::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Tmux,
+            ..bootty_config::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let cwd = directory.path().to_string_lossy().into_owned();
+    let (_, snapshot) = WorkspaceRepository::open(&config_path).expect("workspace repository");
+    let space_tag = snapshot.spaces()[0].remote_id().to_owned();
+    // Two sessions in one directory and one in another: the memo has to answer for a directory it
+    // has already resolved, whoever asks for it.
+    let sessions = Arc::new(Mutex::new(
+        [
+            ("work", cwd.clone()),
+            ("review", cwd.clone()),
+            ("docs", cwd),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, cwd))| MuxSession {
+            anchor: MuxPaneAnchor {
+                session_id: name.to_owned(),
+                cwd: Some(cwd),
+                ..MuxPaneAnchor::default()
+            },
+            id: name.to_owned(),
+            name: name.to_owned(),
+            active: index == 0,
+            active_window_id: None,
+            tag: MuxSessionTag {
+                identity: Some(format!("{name}-id")),
+                space: Some(space_tag.clone()),
+            },
+            windows: Vec::new(),
+        })
+        .collect::<Vec<_>>(),
+    ));
+    let backends = Arc::new(
+        MuxBackendRegistry::from_app_providers(
+            [Arc::new(RestoreProvider {
+                kind: MuxBackendKind::Tmux,
+                dispatch: MuxCommandDispatch::CallerThread,
+                sessions: Arc::clone(&sessions),
+                create_calls: Arc::new(AtomicUsize::new(0)),
+                release: None,
+                native_panes: false,
+                selection_publication: SelectionPublicationPolicy::Direct,
+            })],
+            [MuxBackendKind::Tmux],
+        )
+        .expect("test backend registry"),
+    );
+
+    let mut state =
+        AppState::new(config, backends, Arc::new(|| {}), None, None).expect("app state");
+    // Settle first: claiming these sessions resolves each directory once, which is allowed to fork.
+    for tick in 0..40 {
+        state.update_frame(frame(Instant::now() + Duration::from_millis(tick)));
+    }
+    assert_eq!(
+        state.binding_session_groups()[0].sessions.len(),
+        3,
+        "the Space claims the sessions its tag names"
+    );
+
+    let _guard = bootty_runtime::perf::guard_frame_path();
+    for tick in 40..80 {
+        state.update_frame(frame(Instant::now() + Duration::from_millis(tick)));
+    }
 }

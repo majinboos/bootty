@@ -9,7 +9,7 @@ use bootty_command::{
 };
 use bootty_control::ControlCatalog;
 use bootty_extension::{ExtensionCatalog, ExtensionInvocationSender};
-use bootty_mux::controller::MuxScope;
+use bootty_mux::controller::SpaceId;
 
 use crate::{
     action_catalog::Command,
@@ -22,18 +22,18 @@ pub(crate) use runtime::CommandRuntime;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExactMuxTarget {
-    Binding(MuxScope),
-    Session(MuxScope, String),
-    Window(MuxScope, String, String),
-    Pane(MuxScope, String, String, String),
+    Binding(SpaceId),
+    Session(SpaceId, String),
+    Window(SpaceId, String, String),
+    Pane(SpaceId, String, String, String),
 }
 
 impl ExactMuxTarget {
-    pub(crate) fn window(scope: MuxScope, session_id: &str, window_id: &str) -> Self {
+    pub(crate) fn window(scope: SpaceId, session_id: &str, window_id: &str) -> Self {
         Self::Window(scope, session_id.to_owned(), window_id.to_owned())
     }
 
-    pub(crate) fn scope(&self) -> MuxScope {
+    pub(crate) fn scope(&self) -> SpaceId {
         match self {
             Self::Binding(scope)
             | Self::Session(scope, ..)

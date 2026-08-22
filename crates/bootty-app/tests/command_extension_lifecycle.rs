@@ -12,7 +12,7 @@ use bootty_command::{
     AppCommandReceiver, AppCommandSender, Caller, app_command_channel as command_channel,
 };
 use bootty_extension::{ExtensionHost, ExtensionUiAction, SurfacePlacement, event_queue};
-use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
+use bootty_mux::controller::SpaceId;
 use egui::{Event, PointerButton, Pos2, RawInput, Rect};
 
 fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
@@ -113,7 +113,7 @@ fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction
         .expect("published sidebar surface")
         .items()
         .partition(|item| item.item.kind.as_deref() == Some("footer"));
-    let scope = MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1));
+    let scope = SpaceId::from_persistence(1);
     let rows = build_sidebar_items_from_published_items(&body_items, scope, None, false);
     let context = egui::Context::default();
     let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 160.0));
@@ -140,7 +140,6 @@ fn click_sidebar_action(host: &ExtensionHost, footer: bool) -> ExtensionUiAction
                                 bootty_ui::ThemePalette::default(),
                                 screen.height(),
                                 SidebarModel {
-                                    move_targets: &[],
                                     items: &rows,
                                     footer_items: &footer_items,
                                     session_count: 1,

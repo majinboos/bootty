@@ -33,6 +33,7 @@ pub enum AppAction {
     ChangeAppearance(bootty_config::config::AppearanceMode),
     SwitchTheme,
     RenameSession,
+    MoveSessionToSpace,
     RenameTab,
     DitchSession,
     CreateSpace,
@@ -429,6 +430,7 @@ fn keybind_action(action: BindingAction) -> Result<KeybindAction> {
         }
         Binding::SwitchTheme => Keybind::App(AppAction::SwitchTheme),
         Binding::RenameSession => Keybind::App(AppAction::RenameSession),
+        Binding::MoveSessionToSpace => Keybind::App(AppAction::MoveSessionToSpace),
         Binding::RenameTab => Keybind::App(AppAction::RenameTab),
         Binding::NewTab => Keybind::Mux(Mux::NewTab),
         Binding::NextTab => Keybind::Mux(Mux::NextTab),

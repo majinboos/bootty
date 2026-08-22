@@ -22,7 +22,7 @@ use bootty_terminal::{
 };
 
 use crate::{
-    controller::MuxScope,
+    controller::SpaceId,
     provider::{MuxBackendRegistry, PaneBehavior, PaneTopology},
     snapshot::MuxPaneAnchor,
 };
@@ -70,7 +70,7 @@ pub struct BackendPaneTerminal {
     native_window_targets: Vec<ScopedMuxPaneTarget>,
     native_window_spawn_geometry: Option<TerminalGeometry>,
     native_window_id: Option<String>,
-    native_window_scope: Option<MuxScope>,
+    native_window_scope: Option<SpaceId>,
     /// Set when a runtime is swapped into the slot, cleared by the render resize that follows it.
     terminal_awaits_resize: bool,
     #[deref]
@@ -379,7 +379,7 @@ impl BackendPaneTerminal {
 
     pub fn sync_scoped_mux_anchor(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         config: &MuxBindingConfig,
         anchor: Option<&MuxPaneAnchor>,
     ) -> Result<()> {
@@ -388,7 +388,7 @@ impl BackendPaneTerminal {
 
     fn sync_mux_anchor_in_scope(
         &mut self,
-        scope: Option<MuxScope>,
+        scope: Option<SpaceId>,
         config: &MuxBindingConfig,
         anchor: Option<&MuxPaneAnchor>,
     ) -> Result<()> {
@@ -533,7 +533,7 @@ impl BackendPaneTerminal {
 
     pub fn sync_scoped_native_window(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         window_panes: &[MuxPaneAnchor],
         focused: Option<&MuxPaneAnchor>,
         window_id: Option<&str>,
@@ -552,7 +552,7 @@ impl BackendPaneTerminal {
 
     fn sync_native_window_in_scope(
         &mut self,
-        scope: Option<MuxScope>,
+        scope: Option<SpaceId>,
         window_panes: &[MuxPaneAnchor],
         focused: Option<&MuxPaneAnchor>,
         window_id: Option<&str>,
@@ -994,12 +994,12 @@ impl From<MuxPaneAnchor> for MuxPaneTarget {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ScopedMuxPaneTarget {
-    scope: Option<MuxScope>,
+    scope: Option<SpaceId>,
     target: MuxPaneTarget,
 }
 
 impl ScopedMuxPaneTarget {
-    fn from_anchor(scope: Option<MuxScope>, anchor: MuxPaneAnchor) -> Self {
+    fn from_anchor(scope: Option<SpaceId>, anchor: MuxPaneAnchor) -> Self {
         Self {
             scope,
             target: MuxPaneTarget::from(anchor),
@@ -1046,31 +1046,23 @@ impl From<MuxPaneTarget> for ScopedMuxPaneTarget {
 
 const SCOPED_PANE_PREFIX: &str = "bootty-scope:";
 
-pub fn encode_scoped_pane_id(scope: MuxScope, pane_id: &str) -> String {
+pub fn encode_scoped_pane_id(scope: SpaceId, pane_id: &str) -> String {
     format!(
-        "{SCOPED_PANE_PREFIX}{}:{}:{pane_id}",
-        scope.space_id().persistence_value(),
-        scope.binding_id().persistence_value()
+        "{SCOPED_PANE_PREFIX}{}:{pane_id}",
+        scope.persistence_value()
     )
 }
 
-pub fn decode_scoped_pane_id(value: &str) -> Option<(MuxScope, String)> {
-    let mut parts = value.strip_prefix(SCOPED_PANE_PREFIX)?.splitn(3, ':');
+pub fn decode_scoped_pane_id(value: &str) -> Option<(SpaceId, String)> {
+    let mut parts = value.strip_prefix(SCOPED_PANE_PREFIX)?.splitn(2, ':');
     let space_id = parts.next()?.parse().ok()?;
-    let binding_id = parts.next()?.parse().ok()?;
     let pane_id = parts.next()?.to_owned();
-    Some((
-        MuxScope::new(
-            crate::controller::SpaceId::from_persistence(space_id),
-            crate::controller::BindingId::from_persistence(binding_id),
-        ),
-        pane_id,
-    ))
+    Some((SpaceId::from_persistence(space_id), pane_id))
 }
 
 fn scoped_target_matches_anchor(
     topology: PaneTopology,
-    scope: Option<MuxScope>,
+    scope: Option<SpaceId>,
     target: Option<&ScopedMuxPaneTarget>,
     anchor: Option<&MuxPaneAnchor>,
 ) -> bool {

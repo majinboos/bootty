@@ -22,7 +22,7 @@ use bootty_mux::{
     RepaintHandle,
     capability::BindingOperationOutcome,
     command::MuxCommand,
-    controller::{MuxCommandCompletion, MuxCommandError, MuxCommandResult, MuxScope},
+    controller::{MuxCommandCompletion, MuxCommandError, MuxCommandResult, SpaceId},
     provider::PaneTopology,
     terminal::decode_scoped_pane_id,
 };
@@ -88,7 +88,7 @@ fn process_handle() -> String {
 
 pub(crate) enum PendingCommandResult {
     Mux {
-        scope: MuxScope,
+        scope: SpaceId,
         command: MuxCommand,
         membership: Option<Box<BindingMembershipMutation>>,
         result: mpsc::Receiver<MuxCommandResult>,
@@ -760,8 +760,7 @@ impl AppState {
     pub(crate) fn prepare_ditch_session_command(
         &mut self,
         session_id: String,
-    ) -> Result<(MuxScope, MuxCommand, Option<Box<BindingMembershipMutation>>), CommandOutcome>
-    {
+    ) -> Result<(SpaceId, MuxCommand, Option<Box<BindingMembershipMutation>>), CommandOutcome> {
         let command = MuxCommand::DitchSession { session_id };
         let scope = self.workspace.active.binding.scope;
         if let Some(outcome) = self.preflight_mux_command(&command) {
@@ -774,11 +773,7 @@ impl AppState {
 
     pub(crate) fn submit_prepared_ditch_session_command(
         &mut self,
-        (scope, command, membership): (
-            MuxScope,
-            MuxCommand,
-            Option<Box<BindingMembershipMutation>>,
-        ),
+        (scope, command, membership): (SpaceId, MuxCommand, Option<Box<BindingMembershipMutation>>),
     ) {
         debug_assert_eq!(scope, self.workspace.active.binding.scope);
         let (deadline, cancellation) = command_execution(None);
@@ -877,7 +872,7 @@ impl AppState {
 
     fn command_outcome_for_mux_result(
         &mut self,
-        scope: MuxScope,
+        scope: SpaceId,
         command: &MuxCommand,
         membership: Option<&BindingMembershipMutation>,
         result: MuxCommandResult,
@@ -939,7 +934,7 @@ impl AppState {
 
     fn mux_command_completion_value(
         &self,
-        scope: MuxScope,
+        scope: SpaceId,
         command: &MuxCommand,
         completion: &MuxCommandCompletion,
     ) -> Option<serde_json::Value> {
@@ -991,7 +986,7 @@ impl AppState {
 
     fn mux_resource_target(
         &self,
-        scope: MuxScope,
+        scope: SpaceId,
         kind: ResourceKind,
         session_id: &str,
         window_id: Option<&str>,
@@ -1026,14 +1021,13 @@ impl AppState {
         })
     }
 
-    fn binding_target_handle(&self, scope: MuxScope, generation: u64) -> String {
+    fn binding_target_handle(&self, scope: SpaceId, generation: u64) -> String {
         let (process, _, window_generation) = self.commands.target_identity();
         serde_json::to_string(&(
             process,
             &self.window_state_key,
             window_generation,
-            scope.space_id().persistence_value().to_string(),
-            scope.binding_id().persistence_value().to_string(),
+            scope.persistence_value().to_string(),
             generation,
         ))
         .expect("serialize binding target")

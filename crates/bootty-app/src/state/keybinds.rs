@@ -74,6 +74,10 @@ impl AppState {
                 self.open_rename_session_dialog();
                 effects.push(AppEffect::RequestRepaint);
             }
+            KeybindAction::App(AppAction::MoveSessionToSpace) => {
+                self.open_space_picker_for_current_session();
+                effects.push(AppEffect::RequestRepaint);
+            }
             KeybindAction::App(AppAction::RenameTab) => {
                 self.open_rename_tab_dialog();
                 effects.push(AppEffect::RequestRepaint);

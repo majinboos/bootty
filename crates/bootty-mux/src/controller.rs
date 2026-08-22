@@ -147,7 +147,7 @@ struct CommandConfigState {
 }
 
 struct MuxCommandJob {
-    scope: Option<MuxScope>,
+    scope: Option<SpaceId>,
     config: MuxBindingConfig,
     command: MuxCommand,
     completion: MuxCommandCompletion,
@@ -161,7 +161,7 @@ fn execute_backend_command(
     registry: &MuxBackendRegistry,
     backend: &mut dyn MuxBackend,
     config: &MuxBindingConfig,
-    scope: Option<MuxScope>,
+    scope: Option<SpaceId>,
     command: MuxCommand,
 ) -> Result<(), MuxCommandError> {
     let Some(scope) = scope else {
@@ -358,42 +358,6 @@ impl SpaceId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
-pub struct BindingId(i64);
-
-impl BindingId {
-    pub fn from_persistence(value: i64) -> Self {
-        Self(value)
-    }
-
-    pub fn persistence_value(self) -> i64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
-pub struct MuxScope {
-    space_id: SpaceId,
-    binding_id: BindingId,
-}
-
-impl MuxScope {
-    pub fn new(space_id: SpaceId, binding_id: BindingId) -> Self {
-        Self {
-            space_id,
-            binding_id,
-        }
-    }
-
-    pub fn space_id(self) -> SpaceId {
-        self.space_id
-    }
-
-    pub fn binding_id(self) -> BindingId {
-        self.binding_id
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum MuxResourceKey {
     Session(String),
@@ -436,7 +400,7 @@ pub struct MuxController {
     resource_generations: BTreeMap<MuxResourceKey, u64>,
     observed_resources: BTreeMap<MuxResourceKey, String>,
     observed_backend: Option<MuxBackendKind>,
-    scope: Option<MuxScope>,
+    scope: Option<SpaceId>,
     sessions: Vec<MuxSession>,
     all_sessions: Vec<MuxSession>,
     backend_session_names: Vec<String>,
@@ -465,7 +429,7 @@ pub struct MuxController {
 
 impl MuxController {
     pub fn new(
-        scope: MuxScope,
+        scope: SpaceId,
         registry: Arc<MuxBackendRegistry>,
         workspace: Option<PathBuf>,
     ) -> Self {

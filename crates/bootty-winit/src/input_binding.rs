@@ -484,6 +484,7 @@ binding_actions! {
     MoveSession(value: i32) => "move_session" [number(parse_i32)],
     DitchSession => "ditch_session" [unit],
     RenameSession => "rename_session" [unit],
+    MoveSessionToSpace => "move_session_to_space" [unit],
     RenameTab => "rename_tab" [unit],
     ShowKeybinds => "show_keybinds" [unit],
     WriteScreenFile(value: WriteScreen) => "write_screen_file" [write_screen],

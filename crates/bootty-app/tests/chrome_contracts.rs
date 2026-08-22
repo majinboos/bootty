@@ -2,14 +2,14 @@ use bootty_app::{
     SpaceSummary,
     theme::theme_palette_from_colors,
     ui::chrome::{
-        ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarSpaceSwipeState, SpaceSwitcherEvent,
-        StatusBarModel, show_space_switcher, show_status_bar, sidebar_drop_target,
-        status_bar_layout, take_sidebar_space_swipe,
+        ResolvedItem, ResolvedSegment, STATUS_EDGE_PAD, SidebarModel, SidebarSpaceSwipeState,
+        SpaceSwitcherEvent, StatusBarModel, show_sidebar, show_space_switcher, show_status_bar,
+        sidebar_drop_target, status_bar_layout, take_sidebar_space_swipe,
     },
 };
 use bootty_config::config::ColorConfig;
 use bootty_extension::ModuleItem;
-use bootty_mux::controller::{BindingId, MuxScope, SpaceId};
+use bootty_mux::controller::SpaceId;
 use bootty_ui::icons::install_icon_fonts;
 use bootty_ui::item_list::ROW_HEIGHT as SIDEBAR_ROW_HEIGHT;
 use bootty_ui::status_layout::Align;
@@ -24,6 +24,7 @@ fn space(id: i64, name: &str, active: bool) -> SpaceSummary {
         tint_sidebar: false,
         active,
         error: None,
+        accepts_moves: !active,
     }
 }
 
@@ -287,7 +288,7 @@ fn reorder_row<'a>(id: &'a str, anchor: &'a str) -> bootty_app::ui::sidebar::Sid
         tree: None,
         selectable: true,
         session_id: Some(id),
-        scope: MuxScope::new(SpaceId::from_persistence(1), BindingId::from_persistence(1)),
+        scope: SpaceId::from_persistence(1),
         reorder_anchor: Some(anchor),
         color: egui::Color32::WHITE,
         dim_color: egui::Color32::GRAY,
@@ -366,4 +367,142 @@ fn a_sidebar_block_moves_as_a_whole() {
     let (before, _) = sidebar_drop_target(&items, Some(at(row * 2.5)), 0.0, top, 200.0, "a")
         .expect("a drops before c");
     assert_eq!(before, Some("c"));
+}
+
+/// One frame of the real chrome: the session list, then the Space switcher beneath it, sharing the
+/// drag the sidebar hands over when the pointer leaves through its bottom edge.
+fn sidebar_and_switcher_frame(
+    context: &egui::Context,
+    screen: Rect,
+    list_height: f32,
+    spaces: &[SpaceSummary],
+    items: &[bootty_app::ui::sidebar::SidebarItem<'_>],
+    events: Vec<Event>,
+) -> Option<SpaceSwitcherEvent> {
+    let palette = theme_palette_from_colors(&ColorConfig::default());
+    let mut switcher = None;
+    context
+        .run_ui(
+            RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..RawInput::default()
+            },
+            |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        show_sidebar(
+                            ui,
+                            palette,
+                            list_height,
+                            SidebarModel {
+                                items,
+                                footer_items: &[],
+                                session_count: items.len(),
+                                title_visible: false,
+                                reserve_titlebar_buttons: false,
+                                title_icon: None,
+                                top_inset: 0.0,
+                                border_visible: false,
+                                border_bottom: false,
+                                separator_visible: false,
+                                focused: true,
+                                hovered_session: None,
+                                fullscreen: false,
+                                hover_override: None,
+                                current_override: None,
+                                border_override: None,
+                            },
+                        );
+                        switcher = show_space_switcher(ui, palette, spaces, None, false);
+                    });
+            },
+        )
+        .drop_without_applying_deltas();
+    switcher
+}
+
+/// Drags the first row out of the list and drops it at `target`, returning the switcher's answer.
+fn drag_first_row_onto(
+    context: &egui::Context,
+    screen: Rect,
+    list_height: f32,
+    spaces: &[SpaceSummary],
+    items: &[bootty_app::ui::sidebar::SidebarItem<'_>],
+    target: Pos2,
+) -> Option<SpaceSwitcherEvent> {
+    let grab = Pos2::new(120.0, SIDEBAR_ROW_HEIGHT * 0.5);
+    let button = |pos: Pos2, pressed: bool| Event::PointerButton {
+        pos,
+        button: PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let frame = |events: Vec<Event>| {
+        sidebar_and_switcher_frame(context, screen, list_height, spaces, items, events)
+    };
+    frame(vec![Event::PointerMoved(grab)]);
+    frame(vec![button(grab, true)]);
+    frame(vec![Event::PointerMoved(target)]);
+    frame(vec![button(target, false)])
+}
+
+/// Dropping a session on a Space icon hands it over, and a grouped row takes its group with it --
+/// the same cohesion a reorder has, so a drop cannot split a group across two Spaces.
+#[test]
+fn dropping_a_session_on_a_space_icon_moves_it_there() {
+    let context = egui::Context::default();
+    install_icon_fonts(&context);
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 244.0));
+    let list_height = 200.0;
+    let items = [
+        reorder_row("agents-main", "agents"),
+        reorder_row("agents-review", "agents"),
+        reorder_row("scratch", "scratch"),
+    ];
+    let spaces = [space(1, "Work", true), space(2, "Review", false)];
+    // Three buttons laid out from the strip centre put the second Space here.
+    let target = Pos2::new(120.0, list_height + 22.0);
+
+    let event = drag_first_row_onto(&context, screen, list_height, &spaces, &items, target);
+
+    let Some(SpaceSwitcherEvent::MoveSessions { sessions, to }) = event else {
+        panic!("a drop on a Space icon moves sessions, got {event:?}");
+    };
+    assert_eq!(to, spaces[1].id);
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect::<Vec<_>>(),
+        ["agents-main", "agents-review"]
+    );
+}
+
+/// A Space on another multiplexer cannot take the session, so the drop is refused rather than
+/// reported as a move that then fails.
+#[test]
+fn dropping_a_session_on_an_unreachable_space_moves_nothing() {
+    let context = egui::Context::default();
+    install_icon_fonts(&context);
+    let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(240.0, 244.0));
+    let list_height = 200.0;
+    let items = [reorder_row("scratch", "scratch")];
+    let mut spaces = [space(1, "Work", true), space(2, "Remote", false)];
+    spaces[1].accepts_moves = false;
+    let target = Pos2::new(120.0, list_height + 22.0);
+
+    let event = drag_first_row_onto(&context, screen, list_height, &spaces, &items, target);
+    assert_eq!(event, None);
+
+    // The same drop on the same icon, once that Space can take it, is a move -- so the refusal
+    // above is the reachability rule and not a drag that never arrived.
+    spaces[1].accepts_moves = true;
+    let event = drag_first_row_onto(&context, screen, list_height, &spaces, &items, target);
+    assert!(matches!(
+        event,
+        Some(SpaceSwitcherEvent::MoveSessions { .. })
+    ));
 }

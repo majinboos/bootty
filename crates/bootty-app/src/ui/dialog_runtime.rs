@@ -6,6 +6,7 @@ use crate::ui::{
     rename::{RenameSessionDialog, RenameTabDialog},
     session_picker::SessionPickerDialog,
     space::SpaceEditorDialog,
+    space_picker::SpacePickerDialog,
     theme_picker::ThemePickerDialog,
 };
 
@@ -20,6 +21,7 @@ pub enum ModalDialog {
     KeybindHelp(KeybindHelpDialog),
     CommandPalette(CommandPaletteDialog),
     ThemePicker(ThemePickerDialog),
+    SpacePicker(SpacePickerDialog),
 }
 
 #[derive(Default)]

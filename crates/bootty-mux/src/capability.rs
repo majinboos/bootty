@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::controller::MuxScope;
+use crate::controller::SpaceId;
 
 pub const BINDING_CAPABILITY_DESCRIPTOR_VERSION: u16 = 1;
 
@@ -30,12 +30,12 @@ pub enum BindingOperation {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BindingCapabilityDescriptor {
     version: u16,
-    scope: MuxScope,
+    scope: SpaceId,
     operations: BTreeSet<BindingOperation>,
 }
 
 impl BindingCapabilityDescriptor {
-    pub fn new(scope: MuxScope, operations: impl IntoIterator<Item = BindingOperation>) -> Self {
+    pub fn new(scope: SpaceId, operations: impl IntoIterator<Item = BindingOperation>) -> Self {
         Self {
             version: BINDING_CAPABILITY_DESCRIPTOR_VERSION,
             scope,
@@ -47,7 +47,7 @@ impl BindingCapabilityDescriptor {
         self.version
     }
 
-    pub fn scope(&self) -> MuxScope {
+    pub fn scope(&self) -> SpaceId {
         self.scope
     }
 
@@ -91,7 +91,7 @@ impl BindingCapabilityDescriptor {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct BindingOperationRequest {
     pub descriptor_version: u16,
-    pub scope: MuxScope,
+    pub scope: SpaceId,
     pub operation: BindingOperation,
 }
 

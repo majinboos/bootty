@@ -377,7 +377,7 @@ fn resolved_entries(
 
 /// The label the command palette would show for `action`, so the same command reads the same in
 /// both places. A trailing `:param` is kept.
-fn action_title(action: &str) -> String {
+pub fn action_title(action: &str) -> String {
     if let Some(command) = crate::action_catalog::Command::from_action(action) {
         return command.title().to_owned();
     }
@@ -396,7 +396,7 @@ fn action_title(action: &str) -> String {
 }
 
 /// Sentence-case a snake_case action the catalog does not carry (sidebar actions, `text`, `csi`).
-fn humanize_action(name: &str) -> String {
+pub fn humanize_action(name: &str) -> String {
     let mut title = String::with_capacity(name.len());
     for (index, word) in name.split('_').filter(|word| !word.is_empty()).enumerate() {
         if index > 0 {
@@ -1105,29 +1105,5 @@ fn split_action_for_editor(
     match action.split_once(':') {
         Some((base, params)) => (base.to_owned(), params.to_owned()),
         None => (action.to_owned(), String::new()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn action_titles_prefer_catalog_titles_and_keep_params() {
-        assert_eq!(action_title("reload_config"), "Reload Config");
-        assert_eq!(action_title("paste_from_clipboard"), "Paste");
-        assert_eq!(
-            action_title("decrease_font_size:1"),
-            "Decrease Font Size: 1"
-        );
-        assert_eq!(
-            action_title("change_appearance:dark"),
-            "Use Dark Appearance"
-        );
-    }
-
-    #[test]
-    fn humanize_action_sentence_cases_names_off_the_catalog() {
-        assert_eq!(humanize_action("focus_terminal"), "Focus terminal");
     }
 }

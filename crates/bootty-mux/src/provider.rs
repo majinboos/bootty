@@ -13,7 +13,7 @@ use crate::{
     capability::{
         BindingCapabilityDescriptor, BindingOperationAvailability, BindingOperationOutcome,
     },
-    controller::MuxScope,
+    controller::SpaceId,
     terminal::BackendPanePolicy,
 };
 
@@ -110,7 +110,7 @@ pub trait MuxAppBackendProvider: MuxBackendProvider {
 
     fn app_policy(&self) -> MuxAppBackendPolicy;
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor;
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor;
 }
 
 #[derive(Clone)]
@@ -320,7 +320,7 @@ impl MuxBackendRegistry {
     pub fn capabilities(
         &self,
         config: &MuxBindingConfig,
-        scope: MuxScope,
+        scope: SpaceId,
     ) -> BindingCapabilityDescriptor {
         let kind = self.selected_kind(config);
         self.providers
@@ -336,7 +336,7 @@ impl MuxBackendRegistry {
     pub fn execute_checked(
         &self,
         config: &MuxBindingConfig,
-        scope: MuxScope,
+        scope: SpaceId,
         backend: &mut dyn MuxBackend,
         command: MuxCommand,
     ) -> BindingOperationOutcome<Result<()>> {

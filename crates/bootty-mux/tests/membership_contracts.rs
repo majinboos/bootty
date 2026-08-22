@@ -59,3 +59,27 @@ fn an_operation_is_settled_by_the_identity_and_not_by_any_name() {
     assert!(ditch.effect_occurred(&[membership("$4", "after", Some("id-2"))]));
     assert!(!ditch.effect_occurred(&[membership("$4", "renamed", Some("id-1"))]));
 }
+
+/// A create is answered by the identity, so a session of the same name that bootty did not make
+/// cannot be mistaken for the one it asked for.
+#[test]
+fn someone_elses_session_of_the_same_name_is_not_this_create_landing() {
+    let create = MembershipOperation::Create {
+        identity: "id-1".to_owned(),
+        session_name: "agents/main".to_owned(),
+    };
+    assert!(!create.effect_occurred(&[membership("$4", "agents/main", None)]));
+    assert!(create.effect_occurred(&[membership("$4", "agents/main", Some("id-1"))]));
+}
+
+/// A ditch only holds once nothing carries the identity: a session that was renamed rather than
+/// killed still carries it.
+#[test]
+fn a_ditch_is_not_settled_by_a_session_that_was_only_renamed() {
+    let ditch = MembershipOperation::Ditch {
+        identity: "id-1".to_owned(),
+        old_name: "gone".to_owned(),
+    };
+    assert!(!ditch.effect_occurred(&[membership("$4", "renamed-not-killed", Some("id-1"))]));
+    assert!(ditch.effect_occurred(&[membership("$4", "gone", Some("id-2"))]));
+}

@@ -13,8 +13,10 @@ use crate::ui::ditch::{DitchSessionDialog, DitchSessionEvent};
 use crate::ui::keybind_help::KeybindHelpDialog;
 use crate::ui::new_session_picker::{NewMuxSessionDialog, NewSessionPickerEvent};
 use crate::ui::rename::{RenameSessionDialog, RenameSessionEvent, RenameTabDialog, RenameTabEvent};
+use crate::ui::session_navigation::ScopedSessionTarget;
 use crate::ui::session_picker::{SessionPickerDialog, SessionPickerEvent};
 use crate::ui::space::{SpaceEditorDialog, SpaceEditorIntent, default_space_icon};
+use crate::ui::space_picker::{SpacePickerDialog, SpacePickerEvent};
 use crate::ui::theme_picker::{ThemePickerDialog, ThemePickerEvent};
 use crate::workspace_runtime::RenameSessionOutcome;
 impl AppState {
@@ -88,6 +90,40 @@ impl AppState {
             }
         }
     }
+    pub fn apply_space_picker_event(&mut self, event: SpacePickerEvent) {
+        match event {
+            SpacePickerEvent::Close => self.dismiss_modal_dialog(),
+            SpacePickerEvent::Move { session, space } => {
+                let moved = match space {
+                    Some(space) => self.move_scoped_session_to_space(&session, space),
+                    None => self.detach_scoped_session_from_space(&session),
+                };
+                if moved {
+                    self.dismiss_modal_dialog();
+                }
+            }
+        }
+    }
+
+    /// Opens the Space picker for a session, or reports why it cannot move.
+    pub fn open_space_picker_for(&mut self, target: &ScopedSessionTarget) -> bool {
+        let Some(name) = self.session_display_name(target) else {
+            self.last_error = Some("this session is no longer available".to_owned());
+            return false;
+        };
+        let spaces = self.session_move_targets(target);
+        if spaces.iter().all(|space| space.current) {
+            self.last_error = Some("there is nowhere else to move it yet".to_owned());
+            return false;
+        }
+        self.open_overlay(ModalDialog::SpacePicker(SpacePickerDialog::open(
+            target.clone(),
+            name,
+            spaces,
+        )));
+        true
+    }
+
     pub fn apply_session_picker_event(&mut self, event: SessionPickerEvent) {
         match event {
             SessionPickerEvent::Close => self.dismiss_modal_dialog(),
@@ -339,6 +375,14 @@ impl AppState {
             self.open_session_picker_dialog();
         }
     }
+    pub(super) fn open_space_picker_for_current_session(&mut self) -> bool {
+        let Some(selected) = self.selected_session_id() else {
+            return false;
+        };
+        let target = ScopedSessionTarget::new(self.workspace.active.binding.scope, selected);
+        self.open_space_picker_for(&target)
+    }
+
     pub(super) fn open_rename_session_dialog(&mut self) {
         let Some(selected) = self.selected_session_id() else {
             return;

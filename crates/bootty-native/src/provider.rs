@@ -3,7 +3,7 @@ use std::path::Path;
 use bootty_mux::{
     backend::MuxBackend,
     capability::BindingCapabilityDescriptor,
-    controller::MuxScope,
+    controller::SpaceId,
     provider::{
         GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider, MuxBackendProvider,
         MuxCommandDispatch, PaneBehavior, PaneTopology, PersistedSessionPolicy,
@@ -58,7 +58,7 @@ impl MuxAppBackendProvider for NativeProvider {
         Box::new(NativePanePolicy)
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor {
         native_capabilities(scope)
     }
 }

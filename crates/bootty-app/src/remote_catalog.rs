@@ -112,7 +112,7 @@ pub fn list(config: &BoottyConfig) -> Result<Vec<RemoteSpaceSummary>> {
         .spaces()
         .iter()
         .filter_map(|space| {
-            let binding = space.bindings().first()?;
+            let binding = space.binding();
             if !binding_is_local(binding, config) {
                 return None;
             }
@@ -225,10 +225,7 @@ fn remote_space_runtime(
         .iter()
         .find(|space| space.remote_id() == space_id)
         .ok_or_else(|| anyhow::anyhow!("remote Space {space_id} is unavailable"))?;
-    let binding = space
-        .bindings()
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("remote Space {space_id} has no backend binding"))?;
+    let binding = space.binding();
     if !binding_is_local(binding, config) {
         bail!("remote Space {space_id} points to another SSH host")
     }

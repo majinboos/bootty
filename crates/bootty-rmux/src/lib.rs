@@ -9,7 +9,9 @@ mod remote;
 
 #[cfg(feature = "app")]
 pub use backend::rmux_capabilities;
-pub use backend::{RmuxBackend, RmuxControl};
+pub use backend::{
+    RmuxBackend, RmuxControl, numeric_session_id, session_tag_option, tag_option_id,
+};
 pub use bridge::{prepare_local_rmux_daemon, run_embedded_rmux_daemon};
 pub use local::{endpoint_path_for, socket_name};
 #[cfg(feature = "app")]

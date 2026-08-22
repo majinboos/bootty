@@ -153,7 +153,7 @@ fn session_names(count: usize) -> Vec<String> {
 
 fn session_membership(config_path: &std::path::Path, names: &[String]) -> SessionMembership {
     let (_, snapshot) = WorkspaceRepository::open(config_path).expect("workspace repository");
-    let mut sessions = snapshot.spaces()[0].bindings()[0].sessions().clone();
+    let mut sessions = snapshot.spaces()[0].binding().sessions().clone();
     for (index, name) in names.iter().enumerate() {
         sessions.claim(WorkspaceSession {
             identity: format!("id-{index:03}"),

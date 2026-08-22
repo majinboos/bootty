@@ -5,8 +5,8 @@
 
 mod appearance;
 mod font;
-mod keybinds;
-mod modules;
+pub mod keybinds;
+pub mod modules;
 mod remotes;
 mod schema_page;
 mod session;
@@ -277,6 +277,11 @@ impl SettingsSurface {
     /// Every page, in nav order — so a caller can walk the whole surface.
     pub fn pages() -> impl Iterator<Item = SettingsPage> {
         PAGE_META.iter().map(|meta| meta.page)
+    }
+
+    /// The icon slug the nav row draws for `page`.
+    pub fn page_icon(page: SettingsPage) -> &'static str {
+        page_meta(page).icon
     }
 
     pub fn show(
@@ -981,32 +986,5 @@ pub(super) fn module_display_name(module: &str) -> String {
         "sysinfo" => "System info".to_owned(),
         "clock" => "Clock".to_owned(),
         other => other.replace(['-', '_'], " "),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A nav row draws its icon from a slug. An unresolved slug paints nothing at all, which is how
-    /// the nav quietly lost every icon once before.
-    #[test]
-    fn every_settings_page_names_a_drawable_icon() {
-        for meta in PAGE_META {
-            assert!(
-                bootty_ui::icons::has_slug(meta.icon),
-                "the {} page's icon slug `{}` does not resolve",
-                meta.label,
-                meta.icon
-            );
-        }
-    }
-
-    #[test]
-    fn a_page_exists_for_every_nav_entry_and_the_reverse() {
-        for page in SettingsSurface::pages() {
-            assert_eq!(page_meta(page).page, page);
-        }
-        assert_eq!(PAGE_META.len(), SettingsSurface::pages().count());
     }
 }

@@ -7,7 +7,7 @@ use bootty_mux::{
 #[cfg(feature = "app")]
 use bootty_mux::{
     capability::BindingCapabilityDescriptor,
-    controller::MuxScope,
+    controller::SpaceId,
     provider::{
         GeneratedSessionNamePolicy, MuxAppBackendPolicy, MuxAppBackendProvider, PaneBehavior,
         PaneTopology, PersistedSessionPolicy, SelectionPublicationPolicy, TerminalProgressPolicy,
@@ -85,7 +85,7 @@ impl MuxAppBackendProvider for TmuxProvider {
         ))
     }
 
-    fn capabilities(&self, scope: MuxScope) -> BindingCapabilityDescriptor {
+    fn capabilities(&self, scope: SpaceId) -> BindingCapabilityDescriptor {
         tmux_capabilities(scope)
     }
 }

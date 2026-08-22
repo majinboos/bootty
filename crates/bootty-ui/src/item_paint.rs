@@ -44,7 +44,8 @@ fn primitive_points(rect: Rect, points: &[(ModuleCoord, ModuleCoord)]) -> Vec<Po
         .collect()
 }
 
-fn corner_radius(value: ModuleCornerRadius) -> egui::CornerRadius {
+/// The egui radius a declared module corner radius resolves to.
+pub fn corner_radius(value: ModuleCornerRadius) -> egui::CornerRadius {
     egui::CornerRadius {
         nw: value.nw,
         ne: value.ne,
@@ -273,7 +274,8 @@ pub fn primitive_background(primitives: &[ModulePrimitive]) -> Option<egui::Colo
 
 /// A rect primitive's corners, with the trailing pair rounded off when the item closes a run of
 /// tabs. Both the base fill and the hover overlay resolve it here so they cannot disagree.
-fn rect_radius(radius: ModuleCornerRadius, round_end: bool) -> egui::CornerRadius {
+/// The corner radius a run member draws with: only the last one rounds its trailing corners.
+pub fn rect_radius(radius: ModuleCornerRadius, round_end: bool) -> egui::CornerRadius {
     let mut radius = corner_radius(radius);
     if round_end {
         radius.ne = RUN_END_RADIUS;
@@ -283,11 +285,14 @@ fn rect_radius(radius: ModuleCornerRadius, round_end: bool) -> egui::CornerRadiu
 }
 
 /// Corner radius applied to the trailing edge of a tab run.
-const RUN_END_RADIUS: u8 = 6;
+/// The radius the trailing corners of a run take.
+pub const RUN_END_RADIUS: u8 = 6;
 
 /// A sweeping rect's left edge: a triangle wave over the width its own `w` leaves free, so the fill
 /// travels to the far edge and back. A non-sweeping rect keeps its declared `x`.
-fn sweep_x(x: ModuleCoord, w: ModuleCoord, sweep: bool, time: f64) -> ModuleCoord {
+/// Where a sweeping rect sits at `time`: it travels the space its own width leaves free and
+/// returns, so an indeterminate bar needs no state of its own.
+pub fn sweep_x(x: ModuleCoord, w: ModuleCoord, sweep: bool, time: f64) -> ModuleCoord {
     if !sweep {
         return x;
     }
@@ -300,39 +305,4 @@ fn sweep_x(x: ModuleCoord, w: ModuleCoord, sweep: bool, time: f64) -> ModuleCoor
 }
 
 /// Seconds for one there-and-back sweep.
-const SWEEP_PERIOD: f64 = 1.5;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn coord(frac: f32) -> ModuleCoord {
-        ModuleCoord { frac, px: 0.0 }
-    }
-
-    #[test]
-    fn a_sweeping_rect_travels_the_space_its_width_leaves_free_and_returns() {
-        let width = coord(0.25);
-        let travel = 1.0 - 0.25;
-        // At the start of the period the fill sits at the left edge, at the midpoint it has reached
-        // the far edge, and by the end of the period it is back.
-        assert!(sweep_x(coord(0.0), width, true, 0.0).frac.abs() < 1e-6);
-        assert!((sweep_x(coord(0.0), width, true, SWEEP_PERIOD / 2.0).frac - travel).abs() < 1e-6);
-        assert!(sweep_x(coord(0.0), width, true, SWEEP_PERIOD).frac.abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_rect_that_does_not_sweep_keeps_its_declared_position() {
-        let x = ModuleCoord { frac: 0.4, px: 3.0 };
-        assert_eq!(sweep_x(x, coord(0.25), false, 12.345), x);
-    }
-
-    #[test]
-    fn a_run_end_rounds_the_trailing_corners_only() {
-        let square = ModuleCornerRadius::default();
-        assert_eq!(rect_radius(square, false), corner_radius(square));
-        let rounded = rect_radius(square, true);
-        assert_eq!((rounded.nw, rounded.sw), (0, 0));
-        assert_eq!((rounded.ne, rounded.se), (RUN_END_RADIUS, RUN_END_RADIUS));
-    }
-}
+pub const SWEEP_PERIOD: f64 = 1.5;

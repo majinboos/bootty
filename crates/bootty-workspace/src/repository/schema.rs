@@ -29,9 +29,7 @@ pub(super) fn classify_schema(
         return Ok(WorkspaceSchemaKind::Fresh);
     }
 
-    let has_spaces = tables.contains("workspace_spaces");
-    let has_bindings = tables.contains("workspace_bindings");
-    if !has_spaces && !has_bindings {
+    if !tables.contains("workspace_spaces") {
         let legacy = ["session_groups", "sessions", "session_name_metadata"]
             .iter()
             .all(|table| tables.contains(*table));
@@ -39,94 +37,78 @@ pub(super) fn classify_schema(
             .then_some(WorkspaceSchemaKind::LegacyTables)
             .ok_or(rusqlite::Error::InvalidQuery);
     }
-    if !has_spaces || !has_bindings {
+    // Every revision before 5 kept the connection in a table of its own, so a database missing it
+    // is corrupt rather than merely old.
+    if revision < WORKSPACE_SNAPSHOT_REVISION && !tables.contains("workspace_bindings") {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    if !table_has_columns(conn, "workspace_spaces", &["id", "name", "position"])? {
         return Err(rusqlite::Error::InvalidQuery);
     }
 
-    if !table_has_columns(conn, "workspace_spaces", &["id", "name", "position"])?
-        || !table_has_columns(
-            conn,
-            "workspace_bindings",
-            &["id", "space_id", "name", "backend", "hide_tmux_status"],
-        )?
-    {
-        return Err(rusqlite::Error::InvalidQuery);
+    if revision != WORKSPACE_SNAPSHOT_REVISION {
+        return Ok(WorkspaceSchemaKind::LegacyWorkspace);
     }
-
-    if revision == WORKSPACE_SNAPSHOT_REVISION {
-        for (table, columns) in [
-            (
-                "workspace_spaces",
-                [
-                    "id",
-                    "remote_id",
-                    "name",
-                    "icon",
-                    "color",
-                    "tint_sidebar",
-                    "position",
-                ]
-                .as_slice(),
-            ),
-            (
-                "workspace_bindings",
-                [
-                    "id",
-                    "space_id",
-                    "name",
-                    "backend",
-                    "hide_tmux_status",
-                    "remote",
-                    "unavailable",
-                    "selected_session_id",
-                    "selected_window_id",
-                ]
-                .as_slice(),
-            ),
-            (
-                "workspace_sessions",
-                [
-                    "identity",
-                    "binding_id",
-                    "backend_name",
-                    "display_name",
-                    "explicit",
-                    "cwd",
-                    "position",
-                ]
-                .as_slice(),
-            ),
-            (
-                "workspace_window_state",
-                ["window_key", "selected_space_id"].as_slice(),
-            ),
-            (
-                "workspace_pending_binding_operations",
-                [
-                    "identity",
-                    "space_id",
-                    "binding_id",
-                    "operation",
-                    "old_name",
-                    "new_name",
-                    "display_name",
-                    "explicit",
-                    "cwd",
-                ]
-                .as_slice(),
-            ),
-        ] {
-            if !tables.contains(table) {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
-            if !table_has_columns(conn, table, columns)? {
-                return Err(rusqlite::Error::InvalidQuery);
-            }
+    for (table, columns) in [
+        (
+            "workspace_spaces",
+            [
+                "id",
+                "remote_id",
+                "name",
+                "icon",
+                "color",
+                "tint_sidebar",
+                "position",
+                "backend",
+                "remote",
+                "hide_tmux_status",
+                "unavailable",
+                "selected_session_id",
+                "selected_window_id",
+            ]
+            .as_slice(),
+        ),
+        (
+            "workspace_sessions",
+            [
+                "identity",
+                "space_id",
+                "backend_name",
+                "display_name",
+                "explicit",
+                "cwd",
+                "position",
+            ]
+            .as_slice(),
+        ),
+        (
+            "workspace_window_state",
+            ["window_key", "selected_space_id"].as_slice(),
+        ),
+        (
+            "workspace_pending_binding_operations",
+            [
+                "identity",
+                "space_id",
+                "operation",
+                "old_name",
+                "new_name",
+                "display_name",
+                "explicit",
+                "cwd",
+            ]
+            .as_slice(),
+        ),
+    ] {
+        if !tables.contains(table) {
+            return Err(rusqlite::Error::InvalidQuery);
         }
-        Ok(WorkspaceSchemaKind::Current)
-    } else {
-        Ok(WorkspaceSchemaKind::LegacyWorkspace)
+        if !table_has_columns(conn, table, columns)? {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
     }
+    Ok(WorkspaceSchemaKind::Current)
 }
 
 fn user_tables(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
@@ -284,6 +266,123 @@ pub(super) fn migrate_workspace_sessions_to_identities(
     Ok(())
 }
 
+/// Fold each Space's connection into the Space itself (revision 5).
+///
+/// A Space has exactly one connection, so its own row is where the backend, the remote and the
+/// restore state belong. A database that somehow holds several keeps the first and every session
+/// claimed through any of them, rather than losing the Space.
+pub(super) fn migrate_workspace_bindings_into_spaces(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let tables = user_tables(tx)?;
+    if !tables.contains("workspace_spaces") {
+        return Ok(());
+    }
+    let space_columns = table_columns(tx, "workspace_spaces")?;
+    for (column, sql) in [
+        (
+            "backend",
+            "ALTER TABLE workspace_spaces ADD COLUMN backend TEXT NOT NULL DEFAULT 'inherit'",
+        ),
+        (
+            "remote",
+            "ALTER TABLE workspace_spaces ADD COLUMN remote TEXT",
+        ),
+        (
+            "hide_tmux_status",
+            "ALTER TABLE workspace_spaces ADD COLUMN hide_tmux_status INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "unavailable",
+            "ALTER TABLE workspace_spaces ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "selected_session_id",
+            "ALTER TABLE workspace_spaces ADD COLUMN selected_session_id TEXT",
+        ),
+        (
+            "selected_window_id",
+            "ALTER TABLE workspace_spaces ADD COLUMN selected_window_id TEXT",
+        ),
+    ] {
+        add_column_if_missing(tx, &space_columns, column, sql)?;
+    }
+    if !tables.contains("workspace_bindings") {
+        return Ok(());
+    }
+
+    let columns = table_columns(tx, "workspace_bindings")?;
+    let column_or = |column: &'static str, fallback| {
+        if columns.contains(column) {
+            format!("b.{column}")
+        } else {
+            String::from(fallback)
+        }
+    };
+    let remote = column_or("remote", "NULL");
+    let unavailable = column_or("unavailable", "0");
+    let selected_session_id = column_or("selected_session_id", "NULL");
+    let selected_window_id = column_or("selected_window_id", "NULL");
+
+    tx.execute_batch(&format!(
+        "UPDATE workspace_spaces AS s
+         SET backend = b.backend,
+             remote = {remote},
+             hide_tmux_status = b.hide_tmux_status,
+             unavailable = {unavailable},
+             selected_session_id = {selected_session_id},
+             selected_window_id = {selected_window_id}
+         FROM (SELECT space_id, MIN(id) AS id FROM workspace_bindings GROUP BY space_id) first
+         JOIN workspace_bindings b ON b.id = first.id
+         WHERE s.id = first.space_id;
+
+         CREATE TABLE workspace_sessions_by_space (
+             identity TEXT PRIMARY KEY,
+             space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
+             backend_name TEXT NOT NULL,
+             display_name TEXT NOT NULL DEFAULT '',
+             explicit INTEGER NOT NULL DEFAULT 0,
+             cwd TEXT NOT NULL DEFAULT '',
+             position INTEGER NOT NULL,
+             UNIQUE(space_id, position)
+         );
+         INSERT INTO workspace_sessions_by_space
+             (identity, space_id, backend_name, display_name, explicit, cwd, position)
+         SELECT s.identity, b.space_id, s.backend_name, s.display_name, s.explicit, s.cwd,
+                ROW_NUMBER() OVER (
+                    PARTITION BY b.space_id ORDER BY s.binding_id, s.position
+                ) - 1
+         FROM workspace_sessions s
+         JOIN workspace_bindings b ON b.id = s.binding_id;
+         DROP TABLE workspace_sessions;
+         ALTER TABLE workspace_sessions_by_space RENAME TO workspace_sessions;
+         DROP TABLE workspace_bindings;"
+    ))
+}
+
+/// Rebuild the intent journal when it still carries a column from a shape that is gone.
+///
+/// The journal is only ever a log of operations in flight, so rebuilding it costs at most one
+/// reconcile. Leaving a stale one costs every membership change: a database that came from before
+/// the identity-keyed journal kept a `binding_id` foreign key, and once the connection folded into
+/// the Space that key pointed at a table that no longer exists, so every insert failed with
+/// `no such table: main.workspace_bindings`.
+pub(super) fn migrate_workspace_journal(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !user_tables(tx)?.contains(WORKSPACE_JOURNAL_TABLE) {
+        return Ok(());
+    }
+    let columns = table_columns(tx, WORKSPACE_JOURNAL_TABLE)?;
+    let current = ["identity", "space_id", "operation"];
+    if current.iter().all(|column| columns.contains(*column))
+        && columns.len() == current.len() + JOURNAL_PAYLOAD_COLUMNS.len()
+    {
+        return Ok(());
+    }
+    tx.execute_batch(&format!("DROP TABLE {WORKSPACE_JOURNAL_TABLE}"))
+}
+
+const WORKSPACE_JOURNAL_TABLE: &str = "workspace_pending_binding_operations";
+const JOURNAL_PAYLOAD_COLUMNS: [&str; 5] =
+    ["old_name", "new_name", "display_name", "explicit", "cwd"];
+
 pub(super) fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS workspace_spaces (
@@ -293,28 +392,23 @@ pub(super) fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<
             icon TEXT NOT NULL DEFAULT 'folder',
             color TEXT NOT NULL DEFAULT '#7AA2F7',
             tint_sidebar INTEGER NOT NULL DEFAULT 0,
-            position INTEGER NOT NULL UNIQUE
-        );
-        CREATE TABLE IF NOT EXISTS workspace_bindings (
-            id INTEGER PRIMARY KEY,
-            space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            backend TEXT NOT NULL,
-            hide_tmux_status INTEGER NOT NULL,
+            position INTEGER NOT NULL UNIQUE,
+            backend TEXT NOT NULL DEFAULT 'inherit',
             remote TEXT,
+            hide_tmux_status INTEGER NOT NULL DEFAULT 0,
             unavailable INTEGER NOT NULL DEFAULT 0,
             selected_session_id TEXT,
             selected_window_id TEXT
         );
         CREATE TABLE IF NOT EXISTS workspace_sessions (
             identity TEXT PRIMARY KEY,
-            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
+            space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
             backend_name TEXT NOT NULL,
             display_name TEXT NOT NULL DEFAULT '',
             explicit INTEGER NOT NULL DEFAULT 0,
             cwd TEXT NOT NULL DEFAULT '',
             position INTEGER NOT NULL,
-            UNIQUE(binding_id, position)
+            UNIQUE(space_id, position)
         );
         CREATE TABLE IF NOT EXISTS workspace_window_state (
             window_key TEXT PRIMARY KEY,
@@ -323,7 +417,6 @@ pub(super) fn create_workspace_schema(tx: &Transaction<'_>) -> rusqlite::Result<
         CREATE TABLE IF NOT EXISTS workspace_pending_binding_operations (
             identity TEXT PRIMARY KEY,
             space_id INTEGER NOT NULL REFERENCES workspace_spaces(id) ON DELETE CASCADE,
-            binding_id INTEGER NOT NULL REFERENCES workspace_bindings(id) ON DELETE CASCADE,
             operation TEXT NOT NULL,
             old_name TEXT,
             new_name TEXT,
@@ -395,34 +488,5 @@ pub(super) fn migrate_workspace_space_appearance(tx: &Transaction<'_>) -> rusqli
         &columns,
         "tint_sidebar",
         "ALTER TABLE workspace_spaces ADD COLUMN tint_sidebar INTEGER NOT NULL DEFAULT 0",
-    )
-}
-
-pub(super) fn migrate_workspace_snapshot_state(tx: &Transaction<'_>) -> rusqlite::Result<()> {
-    let columns = table_columns(tx, "workspace_bindings")?;
-    add_column_if_missing(
-        tx,
-        &columns,
-        "unavailable",
-        "ALTER TABLE workspace_bindings
-         ADD COLUMN unavailable INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(
-        tx,
-        &columns,
-        "selected_session_id",
-        "ALTER TABLE workspace_bindings ADD COLUMN selected_session_id TEXT",
-    )?;
-    add_column_if_missing(
-        tx,
-        &columns,
-        "selected_window_id",
-        "ALTER TABLE workspace_bindings ADD COLUMN selected_window_id TEXT",
-    )?;
-    add_column_if_missing(
-        tx,
-        &columns,
-        "remote",
-        "ALTER TABLE workspace_bindings ADD COLUMN remote TEXT",
     )
 }

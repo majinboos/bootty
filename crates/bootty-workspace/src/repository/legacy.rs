@@ -6,7 +6,7 @@ use super::*;
 
 pub(super) fn migrate_legacy_metadata(
     tx: &Transaction<'_>,
-    binding_id: i64,
+    space_id: i64,
     path: &Path,
 ) -> rusqlite::Result<()> {
     let imported_sessions = if table_exists(tx, "session_groups")? && table_exists(tx, "sessions")?
@@ -15,7 +15,7 @@ pub(super) fn migrate_legacy_metadata(
         // first successful refresh finds each by name and stamps a real one.
         tx.execute(
             "INSERT INTO workspace_sessions
-                (identity, binding_id, backend_name, display_name, explicit, cwd, position)
+                (identity, space_id, backend_name, display_name, explicit, cwd, position)
              SELECT
                  'legacy:' || ?1 || ':' || old_session.name,
                  ?1,
@@ -29,20 +29,20 @@ pub(super) fn migrate_legacy_metadata(
              LEFT JOIN session_name_metadata metadata
                  ON metadata.generated_name = old_session.name
                  OR metadata.session_id = old_session.name",
-            [binding_id],
+            [space_id],
         )? > 0
     } else {
         false
     };
     if !imported_sessions {
-        migrate_legacy_order_file(tx, binding_id, path)?;
+        migrate_legacy_order_file(tx, space_id, path)?;
     }
     Ok(())
 }
 
 fn migrate_legacy_order_file(
     tx: &Transaction<'_>,
-    binding_id: i64,
+    space_id: i64,
     database_path: &Path,
 ) -> rusqlite::Result<()> {
     let Some(names) = legacy_order_paths(database_path)
@@ -85,9 +85,9 @@ fn migrate_legacy_order_file(
     {
         tx.execute(
             "INSERT INTO workspace_sessions
-                (identity, binding_id, backend_name, position)
+                (identity, space_id, backend_name, position)
              VALUES ('legacy:' || ?1 || ':' || ?2, ?1, ?2, ?3)",
-            params![binding_id, session, position as i64],
+            params![space_id, session, position as i64],
         )?;
     }
     Ok(())
