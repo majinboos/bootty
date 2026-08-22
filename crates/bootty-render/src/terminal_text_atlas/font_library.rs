@@ -116,7 +116,7 @@ impl FontLibrary {
     }
 
     #[cfg(windows)]
-    fn font_family_name_for_cluster(
+    pub(super) fn font_family_name_for_cluster(
         &mut self,
         face: &ResolvedFontFace,
         cluster: &ShapedCluster,
