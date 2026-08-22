@@ -206,14 +206,13 @@ impl PaintPlanner {
         )
     }
 
-    pub fn plan_with_cursor_blink_phase(
+    pub fn plan_with_minimum_contrast(
         &mut self,
         surface: TerminalSurface,
         frame: &RenderFrame,
         font_size: f32,
-        cursor_blink_phase: CursorBlinkPhase,
     ) -> &TerminalPaintPlan {
-        self.plan_with_cursor_blink_phase_and_text_cell_height(
+        self.plan_with_options(
             surface,
             frame,
             font_size,

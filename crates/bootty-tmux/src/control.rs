@@ -45,7 +45,7 @@ pub struct TmuxControlRunner {
 
 impl TmuxControlRunner {
     pub fn for_identity(identity: bootty_identity::ApplicationIdentity) -> Self {
-        let prefix_args = crate::tmux::local_server_args(identity);
+        let prefix_args = crate::backend::local_server_args(identity);
         Self {
             clients: Arc::default(),
             prefix_args: prefix_args.into(),
@@ -249,15 +249,14 @@ impl TmuxControlRunner {
             if slot.retry_after.is_some_and(|at| Instant::now() < at) {
                 return None;
             }
-            match TmuxControlClient::start(program, &self.prefix_args, self.remote.as_ref()) {
-                Ok(client) => {
-                    slot.client = Some(client);
-                    slot.retry_after = None;
-                }
-                Err(_) => {
-                    slot.retry_after = Some(Instant::now() + RESTART_BACKOFF);
-                    return None;
-                }
+            if let Ok(client) =
+                TmuxControlClient::start(program, &self.prefix_args, self.remote.as_ref())
+            {
+                slot.client = Some(client);
+                slot.retry_after = None;
+            } else {
+                slot.retry_after = Some(Instant::now() + RESTART_BACKOFF);
+                return None;
             }
         }
 
@@ -280,10 +279,10 @@ impl TmuxControlRunner {
 impl TmuxControlRunner {
     /// A client answers for one tmux server, so the host it runs on is part of its identity.
     fn client_key(&self, program: &str) -> String {
-        match &self.remote {
-            Some(remote) => format!("{}@{program}", remote.destination()),
-            None => format!("{program}\0{}", self.prefix_args.join("\0")),
-        }
+        self.remote.as_ref().map_or_else(
+            || format!("{program}\0{}", self.prefix_args.join("\0")),
+            |remote| format!("{}@{program}", remote.destination()),
+        )
     }
 }
 

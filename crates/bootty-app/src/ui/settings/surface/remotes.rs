@@ -373,69 +373,15 @@ fn save_profile(win: &mut SettingsSurface, id: &str, profile: &SshProfileConfig)
         .insert(id.to_owned(), profile.clone());
     let id = id.to_owned();
     let profile = profile.clone();
-    win.writeback.mutate(move |document| {
-        let root = ["ssh-profiles", id.as_str()];
-        document.remove_item(&root)?;
-        document.set_item(&[root[0], root[1], "name"], toml_edit::value(&profile.name))?;
-        document.set_item(&[root[0], root[1], "host"], toml_edit::value(&profile.host))?;
-        if let Some(user) = &profile.user {
-            document.set_item(&[root[0], root[1], "user"], toml_edit::value(user))?;
-        }
-        if let Some(port) = profile.port {
-            document.set_item(
-                &[root[0], root[1], "port"],
-                toml_edit::value(i64::from(port)),
-            )?;
-        }
-        let authentication = match profile.authentication {
-            SshAuthenticationConfig::Auto => "auto",
-            SshAuthenticationConfig::Agent => "agent",
-            SshAuthenticationConfig::KeyFile => "key-file",
-        };
-        document.set_item(
-            &[root[0], root[1], "authentication"],
-            toml_edit::value(authentication),
-        )?;
-        let host_key_policy = match profile.host_key_policy {
-            SshHostKeyPolicyConfig::Strict => "strict",
-            SshHostKeyPolicyConfig::AcceptNew => "accept-new",
-        };
-        document.set_item(
-            &[root[0], root[1], "host-key-policy"],
-            toml_edit::value(host_key_policy),
-        )?;
-        if let Some(identity_file) = &profile.identity_file {
-            document.set_item(
-                &[root[0], root[1], "identity-file"],
-                toml_edit::value(identity_file.display().to_string()),
-            )?;
-        }
-        if let Some(proxy_jump) = &profile.proxy_jump {
-            document.set_item(
-                &[root[0], root[1], "proxy-jump"],
-                toml_edit::value(proxy_jump),
-            )?;
-        }
-        document.set_item(
-            &[root[0], root[1], "program"],
-            toml_edit::value(&profile.program),
-        )?;
-        if !profile.args.is_empty() {
-            let mut args = toml_edit::Array::new();
-            for arg in &profile.args {
-                args.push(arg.as_str());
-            }
-            document.set_item(&[root[0], root[1], "args"], toml_edit::value(args))?;
-        }
-        Ok(())
-    });
+    win.writeback
+        .mutate(move |document| document.set_ssh_profile(&id, &profile));
 }
 
 fn delete_profile(win: &mut SettingsSurface, id: &str) {
     win.config.ssh_profiles.remove(id);
     let id = id.to_owned();
     win.writeback
-        .mutate(move |document| document.remove_item(&["ssh-profiles", id.as_str()]));
+        .mutate(move |document| document.remove_ssh_profile(&id));
 }
 
 fn nonempty(value: &str) -> Option<String> {

@@ -1,21 +1,19 @@
 use std::collections::HashMap;
 
-use bootty_app::{
-    command_extensions::{ModuleCoord, ModuleItem, ModulePrimitive, PublishedSurfaceItem},
-    mux::{
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession},
+use bootty_app::ui::{
+    session_navigation::BindingSessionGroup,
+    sidebar::{
+        SidebarDisplay, SidebarItemKind, SidebarTree, build_binding_sidebar_items,
+        build_sidebar_items_from_published_items, session_group, session_suffix,
+        sidebar_session_colors,
     },
-    ui::{
-        icons::{has_slug, icon_glyph, resolve_slug},
-        overlay::{fuzzy_match, parse_keybind},
-        session_navigation::BindingSessionGroup,
-        sidebar::{
-            SidebarDisplay, SidebarItemKind, SidebarTree, build_binding_sidebar_items,
-            build_sidebar_items_from_published_items, session_group, session_suffix,
-            sidebar_session_colors,
-        },
-    },
+};
+use bootty_extension::{
+    ModuleColor, ModuleCoord, ModuleItem, ModulePrimitive, PublishedSurfaceItem,
+};
+use bootty_mux::{
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession},
 };
 use egui::Color32;
 
@@ -42,83 +40,10 @@ fn session(id: &str, name: &str, process: &str) -> MuxSession {
 }
 
 #[test]
-fn public_chrome_icon_slugs_resolve_to_drawable_glyphs() {
-    for slug in [
-        "folder",
-        "coffee-cup",
-        "coffee-cup-filled",
-        "plug",
-        "plug-zap",
-        "battery-charging",
-        "battery-full",
-        "cpu",
-        "memory-stick",
-        "calendar",
-        "clock",
-        "openai",
-        "claude",
-        "anthropic",
-        "bootstrap:openai",
-        "phosphor:alarm",
-        "command",
-        "option",
-        "arrow-big-up",
-        "chevron-up",
-        "chevron-right",
-        "grip-vertical",
-        "sliders-horizontal",
-        "arrow-left",
-        "arrow-right",
-        "check",
-        "circle-alert",
-        "plus",
-    ] {
-        assert!(has_slug(slug), "missing public icon {slug}");
-        assert!(
-            resolve_slug(slug).is_some(),
-            "unresolved public icon {slug}"
-        );
-        assert!(icon_glyph(slug).is_some(), "undrawable public icon {slug}");
-    }
-    assert!(!has_slug("not-a-real-lucide-icon"));
-}
-
-#[test]
-fn keybind_text_preserves_literal_equals_leaders_and_flags() {
-    assert_eq!(
-        parse_keybind("cmd+p=command_palette"),
-        Some(("cmd+p".to_owned(), "command_palette".to_owned()))
-    );
-    assert_eq!(
-        parse_keybind("cmd+==increase_font_size:1"),
-        Some(("cmd+=".to_owned(), "increase_font_size:1".to_owned()))
-    );
-    assert_eq!(
-        parse_keybind("performable:cmd+v=paste_from_clipboard"),
-        Some(("cmd+v".to_owned(), "paste_from_clipboard".to_owned()))
-    );
-    assert_eq!(
-        parse_keybind("ctrl+space>r=rename_session"),
-        Some(("ctrl+space>r".to_owned(), "rename_session".to_owned()))
-    );
-    assert_eq!(parse_keybind("no-equals"), None);
-    assert_eq!(parse_keybind("cmd+x="), None);
-}
-
-#[test]
-fn overlay_search_uses_a_case_insensitive_subsequence() {
-    assert!(fuzzy_match("bootty", "bty"));
-    assert!(fuzzy_match("Dotfiles", "df"));
-    assert!(fuzzy_match("anything", ""));
-    assert!(!fuzzy_match("bootty", "xyz"));
-    assert!(!fuzzy_match("ab", "abc"));
-}
-
-#[test]
 fn extension_session_rows_keep_identity_style_and_selection() {
     let primitive = ModulePrimitive::Text {
         text: "right".to_owned(),
-        color: Some(Color32::from_rgb(0xa6, 0xe3, 0xa1)),
+        color: Some(ModuleColor::rgb(0xa6, 0xe3, 0xa1)),
         x: ModuleCoord {
             frac: 1.0,
             px: -8.0,
@@ -135,8 +60,8 @@ fn extension_session_rows_keep_identity_style_and_selection() {
             number: Some(1),
             session_id: Some("$1".to_owned()),
             reorder_anchor: Some("work/api".to_owned()),
-            fg: Some(Color32::from_rgb(0x89, 0xb4, 0xfa)),
-            dim_fg: Some(Color32::from_rgb(0x45, 0x5a, 0x7d)),
+            fg: Some(ModuleColor::rgb(0x89, 0xb4, 0xfa)),
+            dim_fg: Some(ModuleColor::rgb(0x45, 0x5a, 0x7d)),
             current: Some(true),
             active: Some(true),
             primitives: vec![primitive.clone()],
@@ -176,6 +101,14 @@ fn extension_session_rows_keep_identity_style_and_selection() {
         rows[0].kind,
         SidebarItemKind::Session { active: true }
     ));
+    assert_eq!(
+        rows[0].color,
+        Color32::from_rgba_unmultiplied(0x89, 0xb4, 0xfa, 0xff)
+    );
+    assert_eq!(
+        rows[0].dim_color,
+        Color32::from_rgba_unmultiplied(0x45, 0x5a, 0x7d, 0xff)
+    );
     assert_eq!(rows[0].primitives.len(), 1);
 }
 

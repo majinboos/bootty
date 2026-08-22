@@ -24,21 +24,9 @@ use eframe::{
     wgpu,
 };
 
-use crate::{
-    geometry::{
-        CellMetrics, SurfacePoint, SurfaceRect, TerminalPadding, TerminalSurface, ViewTransform,
-        fit_cell_height_to_available_space, fit_cell_width_to_available_space,
-    },
-    paint_plan::{CursorBlinkPhase, PaintPlanner, TerminalPaintPlan},
-    scheduler::CURSOR_BLINK_REFRESH_INTERVAL,
-    terminal::{CursorSnapshot, RenderCell, RenderFrame},
-    terminal_image::KittyImageFrame,
-    terminal_render::{RenderFramePool, TerminalRenderCommand, TerminalRenderFrame},
-    terminal_text::{TerminalTextConfig, TerminalTextContract},
-    terminal_wgpu::{
-        TerminalRendererId, terminal_render_callback_for_renderer, terminal_text_cell_metrics,
-    },
-};
+mod workspace_view;
+
+pub(crate) use workspace_view::{TerminalWorkspaceView, animate_indeterminate_progress};
 
 fn surface_rect(rect: Rect) -> SurfaceRect {
     SurfaceRect {
@@ -157,7 +145,7 @@ impl TerminalWidget {
                 .is_some_and(|source| Arc::ptr_eq(source, frame))
     }
 
-    pub fn initial_geometry() -> crate::geometry::TerminalGeometry {
+    pub fn initial_geometry() -> bootty_render::geometry::TerminalGeometry {
         TerminalSurface::for_logical_size(
             1000.0,
             672.0,
@@ -230,7 +218,7 @@ impl TerminalWidget {
         (self.cell.width, self.cell.height)
     }
 
-    pub fn geometry_for_rect(&self, rect: Rect) -> crate::geometry::TerminalGeometry {
+    pub fn geometry_for_rect(&self, rect: Rect) -> bootty_render::geometry::TerminalGeometry {
         TerminalSurface::for_rect(surface_rect(rect), self.cell_metrics_for_rect(rect)).geometry()
     }
     fn cell_metrics_for_rect(&self, rect: Rect) -> CellMetrics {
@@ -383,7 +371,7 @@ impl TerminalWidget {
         ui: &mut egui::Ui,
         widget_id: egui::Id,
         surface: TerminalSurface,
-        frame: &crate::terminal::RenderFrame,
+        frame: &RenderFrame,
     ) -> isize {
         let Some(scrollbar) = frame.scrollbar else {
             self.scrollbar.thumb_hovered = false;

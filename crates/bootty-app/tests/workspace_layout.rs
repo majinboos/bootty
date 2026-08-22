@@ -1,7 +1,5 @@
-use bootty_app::{
-    layout::{Direction, PaneId, PaneLayout, SplitDirection},
-    mux::snapshot::{MuxPaneLayout, MuxPaneSplitDirection},
-};
+use bootty_app::layout::{Direction, PaneId, PaneLayout, SplitDirection};
+use bootty_mux::snapshot::{MuxPaneLayout, MuxPaneSplitDirection};
 use egui::{Pos2, Rect, Vec2};
 
 fn area() -> Rect {

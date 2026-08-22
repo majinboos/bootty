@@ -4,6 +4,7 @@ use bootty_render::{
     terminal_render::TerminalRenderFrame,
     terminal_text::{TerminalTextConfig, TerminalTextContract},
 };
+use bootty_terminal::{terminal_engine::TerminalEngine, terminal_frame::RenderFrame};
 
 pub type ScenarioBuilder = (&'static str, fn() -> TerminalEngine);
 

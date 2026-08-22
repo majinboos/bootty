@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fmt::{self, Display, Formatter},
     io::{Read, Write},
     path::PathBuf,
@@ -37,7 +36,6 @@ const INPUT_FAST_PATH_DRAIN_TIME_US: u128 = 2_000;
 const MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
 const MAX_READER_QUEUE_CHUNKS: usize = MAX_COLLECT_CHUNKS_PER_TICK * 2;
-const CURSOR_HOME: &[u8; 3] = b"\x1b[H";
 pub use crate::terminal_launch::{BOOTTY_SHELL_ENV, configured_user_shell};
 pub(crate) const WORKER_READY_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 pub(crate) const WORKER_BACKLOG_FRAME_INTERVAL: Duration = Duration::from_millis(64);
@@ -101,7 +99,6 @@ pub struct TerminalSession {
     geometry: TerminalGeometry,
     display_scale: f32,
     render_cell: CellMetrics,
-    pty_master: Box<dyn MasterPty + Send>,
     child: crate::terminal_launch::OwnedChild,
     tty_name: Option<String>,
 }
@@ -335,7 +332,10 @@ enum TerminalCommand {
     DisplayScale(f32),
     RenderCellMetrics(CellMetrics),
     ApplyLiveConfig(TerminalLiveConfig),
-    Resize(TerminalGeometry),
+    Resize {
+        geometry: TerminalGeometry,
+        done: Option<WorkerRequest<()>>,
+    },
     Key(KeyInput),
     Focus(bool),
     Mouse(MouseInput),
@@ -393,28 +393,9 @@ impl TerminalSession {
         let (pty_tx, pty_rx) = mpsc::sync_channel(MAX_READER_QUEUE_CHUNKS);
         thread::spawn(move || {
             let mut buf = [0_u8; 8192];
-            let mut compactor = CursorHomeFloodCompactor::default();
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        if let Some(bytes) = compactor.finish() {
-                            let _ = pty_tx.send(bytes);
-                        }
-                        break;
-                    }
-                    Ok(n) => {
-                        if let Some(bytes) = compactor.compact(buf[..n].to_vec())
-                            && pty_tx.send(bytes).is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        if let Some(bytes) = compactor.finish() {
-                            let _ = pty_tx.send(bytes);
-                        }
-                        break;
-                    }
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || pty_tx.send(buf[..n].to_vec()).is_err() {
+                    break;
                 }
             }
         });
@@ -460,7 +441,6 @@ impl TerminalSession {
             geometry,
             display_scale: 1.0,
             render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
-            pty_master,
             child,
             tty_name,
         })
@@ -475,13 +455,13 @@ impl TerminalSession {
             return Ok(());
         }
 
-        self.send_command(TerminalCommand::Resize(geometry))?;
-        self.pty_master.resize(PtySize {
-            rows: geometry.rows,
-            cols: geometry.cols,
-            pixel_width: geometry.pixel_width(),
-            pixel_height: geometry.pixel_height(),
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::Resize {
+            geometry,
+            done: Some(done),
         })?;
+        response.receive("resizing")?;
+        self.check_worker_error()?;
         self.geometry = geometry;
 
         Ok(())
@@ -929,12 +909,24 @@ impl TerminalWorker {
                     self.engine.set_render_cell_metrics(cell);
                     stats.terminal_changed = true;
                 }
-                TerminalCommand::Resize(geometry) => match self.engine.resize(geometry) {
-                    Ok(()) => stats.terminal_changed = true,
-                    Err(error) => self
-                        .worker_health
-                        .record(TerminalWorkerOperation::Resize, error),
-                },
+                TerminalCommand::Resize { geometry, done } => {
+                    if let Some(done) = done.as_ref()
+                        && !done.try_claim()
+                    {
+                        continue;
+                    }
+                    let result = self.resize(geometry);
+                    if let Err(error) = result {
+                        self.worker_health
+                            .record(TerminalWorkerOperation::Resize, error);
+                        if let Some(done) = done {
+                            done.send(());
+                        }
+                    } else {
+                        stats.terminal_changed = true;
+                        self.pending_resize_ack = done;
+                    }
+                }
                 TerminalCommand::ApplyLiveConfig(config) => {
                     match self.engine.apply_live_config(config) {
                         Ok(()) => stats.terminal_changed = true,
@@ -1241,9 +1233,9 @@ impl TerminalWorker {
         let engine = &mut self.engine;
         let worker_health = Arc::clone(&self.worker_health);
         let mut observed_sync_output = synchronized_output_state(engine, &worker_health);
-        let mut sync_output_escape_prefix_len = self.sync_output_escape_prefix_len;
         let mut write = |bytes: &[u8]| {
             engine.write_vt(bytes);
+            observed_sync_output |= engine.take_synchronized_output_observed();
             observed_sync_output |= synchronized_output_state(engine, &worker_health);
         };
         let stats = if self.force_next_frame_publish {
@@ -1316,6 +1308,7 @@ impl TerminalWorker {
             Err(error) => {
                 self.worker_health
                     .record(TerminalWorkerOperation::ExtractFrame, error);
+                self.acknowledge_resize();
                 return;
             }
         };
@@ -1352,6 +1345,7 @@ impl TerminalWorker {
         if let Err(error) = self.latest_frame.publish(frame) {
             self.worker_health
                 .record(TerminalWorkerOperation::PublishFrame, error);
+            self.acknowledge_resize();
             return;
         }
         if let Some(trace) = &trace {
@@ -1362,7 +1356,14 @@ impl TerminalWorker {
         }
         self.force_next_frame_publish = false;
         self.has_unpublished_frame = false;
+        self.acknowledge_resize();
         (self.repaint_wakeup)();
+    }
+
+    fn acknowledge_resize(&mut self) {
+        if let Some(done) = self.pending_resize_ack.take() {
+            done.send(());
+        }
     }
 
     fn trace_event(&self, event: &str, fields: &[(&str, TraceValue<'_>)]) {
@@ -1403,85 +1404,9 @@ fn write_pty(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8], health: &
         health.record(TerminalWorkerOperation::PtyWriteAll, error);
         return;
     }
-
-    stats.elapsed_us = start.elapsed().as_micros() as u64;
-    stats
-}
-
-fn synchronized_output_state(engine: &TerminalEngine, health: &WorkerHealth) -> bool {
-    match engine.is_synchronized_output() {
-        Ok(active) => active,
-        Err(error) => {
-            health.record(TerminalWorkerOperation::SynchronizedOutput, error);
-            false
-        }
-    }
-}
-
-fn write_pty(writer: &Arc<Mutex<Box<dyn Write + Send>>>, bytes: &[u8], health: &WorkerHealth) {
-    let mut writer = match writer.lock() {
-        Ok(writer) => writer,
-        Err(_) => {
-            health.record(
-                TerminalWorkerOperation::PtyWriteLock,
-                "writer lock poisoned",
-            );
-            return;
-        }
-    };
-    if let Err(error) = writer.write_all(bytes) {
-        health.record(TerminalWorkerOperation::PtyWriteAll, error);
-        return;
-    }
     if let Err(error) = writer.flush() {
         health.record(TerminalWorkerOperation::PtyFlush, error);
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DrainStats {
-    pub chunks: usize,
-    pub bytes: usize,
-    pub elapsed_us: u64,
-}
-
-fn drain_bytes_remaining_with_limit(stats: DrainStats, max_bytes: usize) -> usize {
-    max_bytes.saturating_sub(stats.bytes)
-}
-
-fn drain_slice_len_with_limit(stats: DrainStats, max_bytes: usize, available: usize) -> usize {
-    drain_bytes_remaining_with_limit(stats, max_bytes)
-        .min(MAX_DRAIN_SLICE_BYTES)
-        .min(available)
-}
-
-fn drain_time_exhausted(start: Instant, max_time_us: u128) -> bool {
-    start.elapsed().as_micros() >= max_time_us
-}
-
-fn drain_budget_exhausted_with_limits(
-    stats: DrainStats,
-    max_bytes: usize,
-    max_chunks: usize,
-) -> bool {
-    stats.bytes >= max_bytes || stats.chunks >= max_chunks
-}
-
-fn observe_sync_output_start(bytes: &[u8], matched_prefix_len: &mut usize) -> bool {
-    const START: &[u8] = b"\x1b[?2026h";
-    let mut observed = false;
-    for byte in bytes {
-        if *byte == START[*matched_prefix_len] {
-            *matched_prefix_len += 1;
-            if *matched_prefix_len == START.len() {
-                observed = true;
-                *matched_prefix_len = 0;
-            }
-        } else {
-            *matched_prefix_len = usize::from(*byte == START[0]);
-        }
-    }
-    observed
 }
 
 // DEC mode 2026 (synchronized output): applications wrap multi-step redraws

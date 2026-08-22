@@ -2,9 +2,19 @@ use std::{collections::HashMap, hint::black_box};
 
 mod paint_plan_fixtures;
 
-use bootty_app::{
-    command_extensions::{ModuleItem, PublishedSurfaceItem},
-    config::{BoottyConfig, MultiplexerBackendConfig},
+use bootty_app::ui::{
+    chrome::{self, SidebarModel},
+    session_navigation::BindingSessionGroup,
+    session_picker::SessionPickerDialog,
+    sidebar::build_binding_sidebar_items,
+};
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_extension::{ModuleItem, PublishedSurfaceItem};
+use bootty_mux::{
+    controller::{BindingId, MuxScope, SpaceId},
+    snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
+};
+use bootty_render::{
     geometry::ViewTransform,
     paint_plan::PaintPlanner,
     terminal_render::TerminalRenderFrame,
@@ -16,15 +26,6 @@ use bootty_terminal::{
     terminal_input_model::{
         KeyInput, KeyMods, MacosOptionAsAlt, MouseAction, MouseButton, MouseEncoderSize,
         MouseInput, TerminalKey,
-    },
-    terminal_render::TerminalRenderFrame,
-    terminal_text::{TerminalTextConfig, TerminalTextContract},
-    ui::{
-        chrome::{self, SidebarModel},
-        icons,
-        session_navigation::BindingSessionGroup,
-        session_picker::SessionPickerDialog,
-        sidebar::build_binding_sidebar_items,
     },
 };
 use bootty_ui::icons;

@@ -54,7 +54,7 @@ eframe = { version = "0.36", default-features = false, features = [
 ] }
 egui = "0.36"
 fontdb = "0.23"
-getrandom = "0.3"
+getrandom = "0.4"
 iconflow = { version = "1", features = [
   "pack-bootstrap",
   "pack-lucide",
@@ -92,7 +92,7 @@ process-wrap = { version = "9.1", default-features = false, features = [
   "process-group",
   "std",
 ] }
-portable-pty = "0.9"
+portable-pty = { git = "https://github.com/wezterm/wezterm.git", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
 proptest = "1"
 rmux-client = "0.10"
 rmux-sdk = "0.10"
@@ -179,13 +179,14 @@ opt-level = 2
 debug = false
 
 [dev-dependencies]
-anyhow.workspace = true
 bootty-app = { path = "crates/bootty-app" }
+bootty-command = { path = "crates/bootty-command" }
 bootty-config = { path = "crates/bootty-config" }
+bootty-identity = { path = "crates/bootty-identity" }
 bootty-mux = { path = "crates/bootty-mux" }
+bootty-rmux = { path = "crates/bootty-rmux" }
 serde_json.workspace = true
 tempfile.workspace = true
-toml_edit.workspace = true
 
 [dependencies]
 bootty-workspace-hack = { version = "0.1", path = "crates/bootty-workspace-hack" }

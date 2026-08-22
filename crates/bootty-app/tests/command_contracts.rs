@@ -1,31 +1,35 @@
 use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
-use bootty_app::commands::{
-    AppCommandRequest, Caller, CommandCancellation, CommandCatalog, CommandDescriptor,
-    CommandExecutor, CommandInvocation, CommandOutcome, CommandTarget, CompactSchema,
-    ExtensionGenerationCandidate, ExtensionGenerationToken, MutationClass, ResourceKind,
-    app_command_channel_with_repaint,
-};
+use bootty_app::commands::{CommandCatalog, CommandExecutor};
 use bootty_app::{
-    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
-    command_extensions::{ExtensionHost, ModuleIdentity},
-    config::{BoottyConfig, MultiplexerBackendConfig},
-    control::ControlPlane,
-    geometry::ViewTransform,
+    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     renderer::RendererMetrics,
-    ui::new_session_picker::NewSessionPickerEvent,
+    ui::{
+        ditch::{DitchAction, DitchSessionDialog, DitchSessionEvent},
+        new_session_picker::NewSessionPickerEvent,
+    },
 };
+use bootty_command::{
+    AppCommandReceiver, AppCommandRequest, AppCommandSender, Caller, CommandCancellation,
+    CommandInvocation, CommandOutcome, CommandTarget, MutationClass, ResourceKind,
+    app_command_channel as command_channel,
+};
+use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
+use bootty_extension::{ExtensionHost, event_queue};
+use bootty_render::geometry::ViewTransform;
+use bootty_workspace::WorkspaceRepository;
+use rusqlite::Connection;
 
-fn app_command_channel(
-    capacity: usize,
-) -> (
-    bootty_app::commands::AppCommandSender,
-    bootty_app::commands::AppCommandReceiver,
-) {
-    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+mod support;
+
+fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
+    command_channel(capacity, Arc::new(|| {}))
 }
 
 fn frame(now: Instant) -> FrameInputs {
@@ -66,6 +70,16 @@ fn core_commands_share_one_typed_catalog_contract() {
     assert_eq!(resource.mutation, MutationClass::Read);
     assert_eq!(resource.target, None);
     assert!(matches!(
+        catalog
+            .resolve(CommandInvocation::from_action(
+                "terminal.read",
+                Caller::Socket,
+            ))
+            .expect("resolve core command")
+            .executor,
+        CommandExecutor::Core(_)
+    ));
+    assert!(matches!(
         catalog.resolve(CommandInvocation::from_action(
             "terminal.write",
             Caller::Socket,
@@ -82,19 +96,77 @@ fn core_commands_share_one_typed_catalog_contract() {
 }
 
 #[test]
+fn extension_command_cannot_shadow_core_resolution() {
+    let directory = tempfile::tempdir().expect("temporary extensions");
+    std::fs::write(
+        directory.path().join("terminal.luau"),
+        r#"
+bootty.commands.register({
+    id = "terminal.read",
+    title = "Shadowed Terminal Read",
+    description = "An extension replacement.",
+    mutation = "destructive",
+    target = "pane",
+}, function() return { shadowed = true } end)
+"#,
+    )
+    .expect("write extension source");
+
+    let catalog = Arc::new(CommandCatalog::default());
+    let core_descriptor = catalog
+        .describe("terminal.read")
+        .expect("core terminal read command");
+    let (sender, _receiver) = app_command_channel(4);
+    let _host = ExtensionHost::load(
+        directory.path(),
+        catalog.extensions_arc(),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+
+    assert_eq!(
+        catalog
+            .list()
+            .iter()
+            .filter(|descriptor| descriptor.id == "terminal.read")
+            .count(),
+        1
+    );
+    assert_eq!(catalog.extensions().describe("terminal.read"), None);
+    assert_eq!(
+        catalog.describe("terminal.read"),
+        Some(core_descriptor.clone())
+    );
+    let resolved = catalog
+        .resolve(CommandInvocation::from_action(
+            "terminal.read",
+            Caller::Socket,
+        ))
+        .expect("resolve core command");
+    assert_eq!(resolved.descriptor, core_descriptor);
+    assert!(matches!(resolved.executor, CommandExecutor::Core(_)));
+}
+
+#[test]
 fn discovered_resource_target_cannot_retarget_a_replacement_binding() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
     let started = Instant::now();
-    let mut first =
-        AppState::new(config.clone(), Arc::new(|| {}), None, None).expect("first app state");
+    let mut first = AppState::new(
+        config.clone(),
+        support::backends(),
+        Arc::new(|| {}),
+        None,
+        None,
+    )
+    .expect("first app state");
     let current = submit_command(
         &mut first,
         CommandInvocation::new(
@@ -111,8 +183,8 @@ fn discovered_resource_target_cannot_retarget_a_replacement_binding() {
         serde_json::from_value(value["target"].clone()).expect("current binding target");
     drop(first);
 
-    let mut replacement =
-        AppState::new(config, Arc::new(|| {}), None, None).expect("replacement app state");
+    let mut replacement = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
+        .expect("replacement app state");
     let mut invocation = CommandInvocation::new("edit_space", Vec::new(), Caller::Socket);
     invocation.target = Some(target);
     let outcome = submit_command(
@@ -128,14 +200,15 @@ fn native_split_command_publishes_the_binding_owned_layout() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
     let started = Instant::now();
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
     let open = submit_command(
         &mut state,
         CommandInvocation::from_action("new_mux_session", Caller::Socket),
@@ -177,6 +250,278 @@ fn native_split_command_publishes_the_binding_owned_layout() {
         2
     );
     assert!(state.focused_pane().is_some());
+
+    let direct = submit_command(
+        &mut state,
+        CommandInvocation::from_action("split_right", Caller::Keybinding),
+        started + Duration::from_millis(15),
+    );
+    assert!(
+        matches!(direct, CommandOutcome::Success { .. }),
+        "{direct:?}"
+    );
+    assert_eq!(
+        state
+            .pane_rects(
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0)),
+                4.0,
+            )
+            .len(),
+        3,
+        "direct keybindings and target commands must share mux action planning"
+    );
+
+    let unsupported = submit_command(
+        &mut state,
+        CommandInvocation::from_action("toggle_pane_zoom", Caller::Socket),
+        started + Duration::from_millis(20),
+    );
+    assert!(matches!(unsupported, CommandOutcome::Unsupported { .. }));
+    assert_eq!(
+        state
+            .pane_rects(
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(200.0, 100.0)),
+                4.0,
+            )
+            .len(),
+        3,
+        "unsupported mux commands must not mutate the native layout"
+    );
+}
+
+#[test]
+fn ditch_session_commits_membership_after_authoritative_command() {
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config_path = directory.path().join("config.toml");
+    let config = BoottyConfig {
+        config_path: config_path.clone(),
+        multiplexer: bootty_config::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_config::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let started = Instant::now();
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
+    let created = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_tab", Caller::Socket),
+        started,
+    );
+    assert!(
+        matches!(created, CommandOutcome::Success { .. }),
+        "{created:?}"
+    );
+
+    let target = (0..250)
+        .find_map(|tick| {
+            state.update_frame(frame(started + Duration::from_millis(250 + tick)));
+            std::thread::sleep(Duration::from_millis(1));
+            state
+                .binding_session_groups()
+                .into_iter()
+                .find_map(|group| group.sessions.first().map(|session| group.target(session)))
+        })
+        .expect("native session becomes available");
+    let original_name = state
+        .binding_session_groups()
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .find(|session| session.id == target.session_id)
+        .expect("live session")
+        .name
+        .clone();
+
+    assert!(state.open_ditch_session_dialog_for(&target.session_id));
+    let ModalDialog::DitchSession(dialog) = state.take_modal_dialog().expect("ditch dialog") else {
+        panic!("expected ditch dialog");
+    };
+    state.apply_ditch_session_event(
+        dialog,
+        DitchSessionEvent::Ditch {
+            session_id: target.session_id.clone(),
+            cwd: None,
+            action: DitchAction::KillOnly,
+        },
+    );
+
+    let removed = (0..250).any(|tick| {
+        state.update_frame(frame(started + Duration::from_millis(500 + tick)));
+        std::thread::sleep(Duration::from_millis(1));
+        !state
+            .binding_session_groups()
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .any(|session| session.id == target.session_id)
+    });
+    assert!(
+        removed,
+        "authoritative ditch result must remove the live session"
+    );
+
+    drop(state);
+    let (_, reopened) = WorkspaceRepository::open(&config_path).expect("reopen workspace");
+    assert!(
+        !reopened.spaces()[0].bindings()[0]
+            .session_order()
+            .session_names()
+            .contains(&original_name)
+    );
+}
+
+#[test]
+fn ditch_submits_after_worktree_removal_when_branch_deletion_fails() {
+    let (_repository, main, worktree, duplicate) = repo_with_duplicate_branch();
+    let directory = tempfile::tempdir().expect("temporary workspace");
+    let config = BoottyConfig {
+        config_path: directory.path().join("config.toml"),
+        multiplexer: bootty_config::config::MultiplexerConfig {
+            backend: MultiplexerBackendConfig::Native,
+            ..bootty_config::config::MultiplexerConfig::default()
+        },
+        ..BoottyConfig::default()
+    };
+    let started = Instant::now();
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
+    let open = submit_command(
+        &mut state,
+        CommandInvocation::from_action("new_mux_session", Caller::Socket),
+        started,
+    );
+    assert!(matches!(open, CommandOutcome::Success { .. }), "{open:?}");
+    let ModalDialog::NewSession(dialog) = state.take_modal_dialog().expect("new session dialog")
+    else {
+        panic!("expected new session dialog");
+    };
+    state.apply_picker_event(
+        dialog,
+        NewSessionPickerEvent::CreateSession {
+            cwd: worktree.to_string_lossy().into_owned(),
+        },
+    );
+    for tick in 1..5 {
+        state.update_frame(frame(started + Duration::from_millis(tick)));
+    }
+    let session_id = state.mux().sessions()[0].id.clone();
+
+    let cwd = worktree.to_string_lossy().into_owned();
+    let action = DitchAction::RemoveWorktreeAndBranch {
+        force: true,
+        branch: "feature".to_owned(),
+        repo: main.to_string_lossy().into_owned(),
+    };
+    let ditch_event = || DitchSessionEvent::Ditch {
+        session_id: session_id.clone(),
+        cwd: Some(cwd.clone()),
+        action: action.clone(),
+    };
+    let database = directory.path().join("session-order.sqlite3");
+    let lock = Connection::open(&database).expect("open lock connection");
+    lock.execute_batch("BEGIN IMMEDIATE")
+        .expect("hold workspace write lock");
+    state.apply_ditch_session_event(
+        DitchSessionDialog::open(session_id.clone(), Some(cwd.clone())),
+        ditch_event(),
+    );
+    assert!(
+        worktree.exists(),
+        "failed Ditch preparation must not remove the worktree"
+    );
+    let reopened = match state.take_modal_dialog() {
+        Some(ModalDialog::DitchSession(dialog)) => dialog,
+        _ => panic!("expected reopened Ditch dialog"),
+    };
+    lock.execute_batch("ROLLBACK")
+        .expect("release workspace write lock");
+    drop(lock);
+
+    state.apply_ditch_session_event(reopened, ditch_event());
+
+    assert!(!worktree.exists(), "ditch must remove the linked worktree");
+    assert!(
+        state
+            .last_error()
+            .is_some_and(|warning| warning.contains("branch 'feature' remains")),
+        "partial cleanup warning must name the remaining branch"
+    );
+    assert!(
+        (0..250).any(|tick| {
+            state.update_frame(frame(started + Duration::from_millis(10 + tick)));
+            std::thread::sleep(Duration::from_millis(1));
+            !state
+                .binding_session_groups()
+                .iter()
+                .flat_map(|group| group.sessions.iter())
+                .any(|session| session.id == session_id)
+        }),
+        "partial cleanup must still submit Ditch"
+    );
+    assert!(duplicate.exists(), "duplicate branch checkout must remain");
+    assert!(git_read(&main, &["branch", "--list", "feature"]).contains("feature"));
+}
+
+fn repo_with_duplicate_branch() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().expect("temporary repository root");
+    let main = root.path().join("main");
+    let worktree = root.path().join("worktree");
+    let duplicate = root.path().join("duplicate");
+    fs::create_dir(&main).expect("create main worktree");
+    git_ok(&main, &["init", "-q", "-b", "main"]);
+    git_ok(&main, &["config", "user.email", "test@bootty.dev"]);
+    git_ok(&main, &["config", "user.name", "Bootty Test"]);
+    fs::write(main.join("README"), "hello").expect("write initial file");
+    git_ok(&main, &["add", "."]);
+    git_ok(&main, &["commit", "-q", "-m", "init"]);
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            worktree.to_str().expect("UTF-8 worktree path"),
+        ],
+    );
+    git_ok(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--force",
+            duplicate.to_str().expect("UTF-8 duplicate path"),
+            "feature",
+        ],
+    );
+    (root, main, worktree, duplicate)
+}
+
+fn git_ok(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_read(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 #[test]
@@ -184,14 +529,15 @@ fn native_window_actions_use_the_binding_owned_plan() {
     let directory = tempfile::tempdir().expect("temporary workspace");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
-        multiplexer: bootty_app::config::MultiplexerConfig {
+        multiplexer: bootty_config::config::MultiplexerConfig {
             backend: MultiplexerBackendConfig::Native,
-            ..bootty_app::config::MultiplexerConfig::default()
+            ..bootty_config::config::MultiplexerConfig::default()
         },
         ..BoottyConfig::default()
     };
     let started = Instant::now();
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
     let open = submit_command(
         &mut state,
         CommandInvocation::from_action("new_mux_session", Caller::Socket),
@@ -245,93 +591,80 @@ fn native_window_actions_use_the_binding_owned_plan() {
 
 #[test]
 fn extension_commands_are_namespaced_and_removed_by_generation() {
-    let catalog = CommandCatalog::default();
-    let descriptor = CommandDescriptor {
-        id: "agent.inspect".to_owned(),
-        title: "Inspect Agent".to_owned(),
-        description: "Inspect one agent session.".to_owned(),
-        mutation: MutationClass::Read,
-        arguments: CompactSchema::default(),
-        target: Some(ResourceKind::Session),
-        palette: false,
-    };
-    let handler = Arc::new(|_, _, _| {
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(CommandOutcome::success())
-            .expect("send extension outcome");
-        receiver
-    });
-
-    assert!(
-        catalog
-            .publish_extension_generation(ExtensionGenerationCandidate {
-                identity: ModuleIdentity::parse("other/agent.luau").expect("module identity"),
-                generation: 7,
-                token: ExtensionGenerationToken::new(),
-                commands: vec![(descriptor.clone(), handler.clone())],
-                topics: Vec::new(),
-                surfaces: Vec::new(),
-            })
-            .is_err()
+    let directory = tempfile::tempdir().expect("temporary extensions");
+    std::fs::write(
+        directory.path().join("agent.luau"),
+        r#"
+bootty.commands.register({
+    id = "agent.inspect",
+    title = "Inspect Agent",
+    description = "Inspect one agent session.",
+    target = "session",
+}, function() return { ok = true } end)
+"#,
+    )
+    .expect("write extension source");
+    let catalog = Arc::new(CommandCatalog::default());
+    let (sender, _receiver) = app_command_channel(4);
+    let mut host = ExtensionHost::load(
+        directory.path(),
+        catalog.extensions_arc(),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
     );
-    catalog
-        .publish_extension_generation(ExtensionGenerationCandidate {
-            identity: ModuleIdentity::parse("agent.luau").expect("module identity"),
-            generation: 7,
-            token: ExtensionGenerationToken::new(),
-            commands: vec![(descriptor, handler)],
-            topics: Vec::new(),
-            surfaces: Vec::new(),
-        })
-        .expect("register namespaced extension command");
     assert!(catalog.describe("agent.inspect").is_some());
+    assert!(matches!(
+        catalog
+            .resolve(CommandInvocation::from_action(
+                "agent.inspect",
+                Caller::Socket,
+            ))
+            .expect("resolve extension command")
+            .executor,
+        CommandExecutor::Extension(_)
+    ));
 
-    catalog.remove_extension_generation("agent.luau", 6);
-    assert!(catalog.describe("agent.inspect").is_some());
-    catalog.remove_extension_generation("agent.luau", 7);
+    std::fs::remove_file(directory.path().join("agent.luau")).expect("remove extension source");
+    host.refresh(Instant::now() + Duration::from_secs(1));
+    host.refresh(Instant::now() + Duration::from_secs(2));
     assert!(catalog.describe("agent.inspect").is_none());
 }
 
 #[test]
 fn destructive_policy_is_identical_for_core_and_extension_commands() {
     let directory = tempfile::tempdir().expect("temporary workspace");
+    std::fs::create_dir(directory.path().join("extensions")).expect("extension directory");
+    std::fs::write(
+        directory.path().join("extensions/test.luau"),
+        r#"
+bootty.commands.register({
+    id = "test.destroy",
+    title = "Destroy Test",
+    mutation = "destructive",
+}, function() return { ok = true } end)
+"#,
+    )
+    .expect("write extension source");
     let config = BoottyConfig {
         config_path: directory.path().join("config.toml"),
         ..BoottyConfig::default()
     };
-    let mut state = AppState::new(config, Arc::new(|| {}), None, None).expect("app state");
-    let descriptor = CommandDescriptor {
-        id: "test.destroy".to_owned(),
-        title: "Destroy Test".to_owned(),
-        description: String::new(),
-        mutation: MutationClass::Destructive,
-        arguments: CompactSchema::default(),
-        target: None,
-        palette: false,
-    };
-    state
-        .command_catalog()
-        .publish_extension_generation(ExtensionGenerationCandidate {
-            identity: ModuleIdentity::parse("test.luau").expect("module identity"),
-            generation: 1,
-            token: ExtensionGenerationToken::new(),
-            commands: vec![(
-                descriptor,
-                Arc::new(|_, _, _| {
-                    let (sender, receiver) = mpsc::channel();
-                    sender
-                        .send(CommandOutcome::success())
-                        .expect("send extension outcome");
-                    receiver
-                }),
-            )],
-            topics: Vec::new(),
-            surfaces: Vec::new(),
-        })
-        .expect("register extension command");
+    let mut state =
+        AppState::new(config, support::backends(), Arc::new(|| {}), None, None).expect("app state");
+    let _host = ExtensionHost::load(
+        &directory.path().join("extensions"),
+        state.command_catalog().extensions_arc(),
+        state.app_command_sender(Caller::Luau),
+        event_queue().0,
+    );
+    assert_eq!(
+        state
+            .command_catalog()
+            .describe("test.destroy")
+            .map(|command| command.mutation),
+        Some(MutationClass::Destructive)
+    );
 
-    let started = Instant::now();
     for (caller, expected_confirmation) in [
         (Caller::CommandPalette, false),
         (Caller::Keybinding, false),
@@ -341,20 +674,28 @@ fn destructive_policy_is_identical_for_core_and_extension_commands() {
     ] {
         let commands = state.app_command_sender(caller);
         let (response, outcomes) = mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(1);
         commands
             .try_send(AppCommandRequest {
                 invocation: CommandInvocation::from_action("test.destroy", caller),
-                deadline: Instant::now() + Duration::from_secs(1),
+                deadline,
                 cancellation: CommandCancellation::new(),
                 response,
             })
             .expect("submit extension command");
-        let outcome = (0..10)
-            .find_map(|tick| {
-                state.update_frame(frame(started + Duration::from_millis(tick)));
-                outcomes.try_recv().ok()
-            })
-            .expect("extension command outcome");
+        let outcome = loop {
+            state.update_frame(frame(Instant::now()));
+            match outcomes.try_recv() {
+                Ok(outcome) => break outcome,
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(mpsc::TryRecvError::Empty) => panic!("extension command outcome timed out"),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("extension command response channel closed")
+                }
+            }
+        };
         assert_eq!(
             matches!(outcome, CommandOutcome::ConfirmationRequired { .. }),
             expected_confirmation,
@@ -394,9 +735,9 @@ end)
     let (sender, receiver) = app_command_channel(4);
     let _host = ExtensionHost::load(
         directory.path(),
-        Arc::clone(&catalog),
+        catalog.extensions_arc(),
         sender.for_caller(Caller::Luau),
-        ControlPlane::default(),
+        event_queue().0,
     );
     let resolved = catalog
         .resolve(CommandInvocation::from_action(
@@ -409,7 +750,7 @@ end)
     };
     let deadline = Instant::now() + Duration::from_secs(1);
     let cancellation = CommandCancellation::new();
-    let outcome = handler(resolved.invocation, deadline, cancellation.clone());
+    let outcome = handler.invoke(resolved.invocation, deadline, cancellation.clone());
     let nested = (0..100)
         .find_map(|_| {
             let request = receiver.try_recv().ok();
@@ -462,7 +803,7 @@ end)
         panic!("extension executor");
     };
     let cancellation = CommandCancellation::new();
-    let outcome = handler(
+    let outcome = handler.invoke(
         resolved.invocation,
         Instant::now() + Duration::from_secs(1),
         cancellation.clone(),

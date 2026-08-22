@@ -2,7 +2,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::application_identity::ApplicationIdentity;
+use bootty_identity::ApplicationIdentity;
 
 const REPOSITORY_OWNER: &str = "majindotboo";
 const REPOSITORY_NAME: &str = "bootty";

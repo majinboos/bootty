@@ -1,24 +1,12 @@
-use std::{error::Error, fmt};
-
 use bootty_winit::modifier_remap::{ModifierRemapParseError, ModifierRemapSet};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
+#[error("invalid modifier-remap {entry:?}: {source}")]
 pub struct ModifierRemapConfigError {
     entry: String,
-    source: ModifierRemapParseError,
+    r#source: ModifierRemapParseError,
 }
-
-impl fmt::Display for ModifierRemapConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid modifier-remap {:?}: {}",
-            self.entry, self.source
-        )
-    }
-}
-
-impl Error for ModifierRemapConfigError {}
 
 pub fn resolve_modifier_remaps(
     entries: &[String],

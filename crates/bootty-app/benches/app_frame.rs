@@ -2,24 +2,14 @@ use std::{collections::HashMap, hint::black_box, path::PathBuf, sync::Arc, time:
 
 use anyhow::Result;
 use bootty_app::{
-    app::{AppState, FrameInputs, ModalDialog, ViewportSnapshot},
-    config::{BoottyConfig, MultiplexerBackendConfig},
-    geometry::{TerminalGeometry, ViewTransform},
-    mux::{
-        RepaintHandle,
-        controller::{BindingId, MuxScope, SpaceId},
-        snapshot::{MuxPaneAnchor, MuxSession, MuxWindow},
-    },
+    AppState, FrameInputs, ModalDialog, ViewportSnapshot,
     renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget},
-    terminal::{RenderFrame, TerminalEngine},
     ui::{
         chrome::{self, SidebarModel, StatusBarModel},
-        icons,
         session_navigation::BindingSessionGroup,
         sidebar::build_binding_sidebar_items,
         space::SpaceEditorEvent,
     },
-    workspace::SpaceMuxOverride,
 };
 use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig};
 use bootty_mux::{
@@ -68,7 +58,10 @@ impl TerminalFrameSource for BenchTerminal {
         Ok(())
     }
 
-    fn set_render_cell_metrics(&mut self, cell: bootty_app::geometry::CellMetrics) -> Result<()> {
+    fn set_render_cell_metrics(
+        &mut self,
+        cell: bootty_render::geometry::CellMetrics,
+    ) -> Result<()> {
         self.engine.set_render_cell_metrics(cell);
         Ok(())
     }

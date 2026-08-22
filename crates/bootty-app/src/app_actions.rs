@@ -3,9 +3,12 @@ use std::str::FromStr;
 use anyhow::Result;
 use eframe::egui;
 
-use crate::{
-    commands::{Caller, CommandInvocation},
-    config::InputConfig,
+use crate::input::terminal_key;
+use bootty_command::{Caller, CommandInvocation};
+use bootty_config::config::{InputConfig, split_keybind_entry};
+use bootty_mux::command::MuxDirection;
+use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, TerminalKey};
+use bootty_winit::{
     direct_input::ModifierSideState,
     input_binding::{
         AppearanceChoice, BindingAction, BindingElement, BindingKey, BindingTrigger,

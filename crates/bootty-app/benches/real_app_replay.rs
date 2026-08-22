@@ -62,8 +62,8 @@ fn surface_for(cols: u16, rows: u16) -> TerminalSurface {
     TerminalSurface::for_logical_size(
         f32::from(cols) * 9.0 + 20.0,
         f32::from(rows) * 22.0 + 20.0,
-        bootty_app::geometry::CellMetrics::new(9.0, 22.0),
-        bootty_app::geometry::TerminalPadding::uniform(10.0),
+        bootty_render::geometry::CellMetrics::new(9.0, 22.0),
+        bootty_render::geometry::TerminalPadding::uniform(10.0),
     )
 }
 

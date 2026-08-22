@@ -30,9 +30,9 @@ pub use copy_mode::{
 use logical_search::frame_search_matches;
 use write_ingress::{
     CURSOR_HOME, SanitizedKittyGraphics, SgrOptimizer, complete_streaming_control_prefix_len,
-    contains_tracked_streaming_control, find_osc_terminator, find_subslice,
-    repeated_cursor_home_prefix_len, sanitize_kitty_graphics_commands, split_osc_payload,
-    terminal_write_features, unwrap_tmux_passthrough_commands,
+    contains_tracked_streaming_control, find_osc_terminator, repeated_cursor_home_prefix_len,
+    sanitize_kitty_graphics_commands, split_osc_payload, terminal_write_features,
+    unwrap_tmux_passthrough_commands,
 };
 
 use crate::terminal_frame::{
@@ -619,11 +619,6 @@ fn default_device_attributes() -> DeviceAttributes {
         },
         tertiary: TertiaryDeviceAttributes { unit_id: 0 },
     }
-}
-
-fn parse_palette_index(bytes: &[u8]) -> Option<u8> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    text.parse().ok()
 }
 
 fn parse_osc_number(bytes: &[u8]) -> Option<u16> {

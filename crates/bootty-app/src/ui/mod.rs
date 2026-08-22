@@ -2,7 +2,7 @@ pub mod chrome;
 pub mod command_palette;
 pub mod ditch;
 pub mod keybind_help;
-pub mod keycaps;
+mod keybind_source;
 pub mod new_session_picker;
 pub mod rename;
 pub mod session_navigation;

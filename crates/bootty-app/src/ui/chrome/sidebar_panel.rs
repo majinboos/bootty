@@ -7,8 +7,6 @@ use eframe::egui::{self, Pos2, Rect, Stroke, TextureHandle};
 
 use crate::{
     assets,
-    command_extensions::{ExtensionUiAction, ModuleItem, PublishedSurfaceItem},
-    mux::controller::{MuxScope, SpaceId},
     strings::truncate_label,
     theme::module_color32,
     ui::{
@@ -1291,7 +1289,10 @@ fn paint_sidebar_footer(
         if action.is_none() && response.clicked_by(egui::PointerButton::Primary) {
             action = published.action();
         }
-        let color = readable_color(palette.base, item.fg.unwrap_or(palette.subtext));
+        let color = readable_color(
+            palette.base,
+            item.fg.map(module_color32).unwrap_or(palette.subtext),
+        );
         paint_item_primitives(
             &painter,
             item_rect,
