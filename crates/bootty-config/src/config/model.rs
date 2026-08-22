@@ -20,6 +20,10 @@ pub struct BoottyConfig {
     pub sidebar: SidebarConfig,
     pub multiplexer: MultiplexerConfig,
     pub ssh_profiles: BTreeMap<String, SshProfileConfig>,
+    /// Settings extensions declared for themselves, keyed by module stem then setting key. The
+    /// loader accepts any of the three value shapes; what a key *means* is the declaring module's
+    /// business, and a module may only ever read or write its own table.
+    pub extensions: BTreeMap<String, BTreeMap<String, ExtensionSettingValue>>,
     pub input: InputConfig,
     pub session: SessionConfig,
     pub diagnostics: DiagnosticsConfig,
@@ -50,7 +54,37 @@ pub struct WindowConfig {
     pub macos_titlebar_style: MacosTitlebarStyle,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A value an extension stores in its own settings table.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ExtensionSettingValue {
+    Bool(bool),
+    Number(f64),
+    Text(String),
+}
+
+/// Where an extension's setting lives in the config: `extensions.<module>.<key>`. The module part
+/// is supplied by the host from the module's own identity, never by the module itself.
+#[must_use]
+pub fn extension_setting_path(module: &str, key: &str) -> [String; 3] {
+    ["extensions".to_owned(), module.to_owned(), key.to_owned()]
+}
+
+/// The TOML token for a config enum value, taken from its own `Serialize` derive so a writer can
+/// never disagree with the parser about spelling. The loader normalizes `-` to `_` and lowercases
+/// before matching, so a kebab token and the historic snake token both load to the same variant.
+///
+/// Only unit variants have a token; anything else returns `None`.
+#[must_use]
+pub fn config_token<T: Serialize>(value: &T) -> Option<String> {
+    match value.serialize(toml_edit::ser::ValueSerializer::new()) {
+        Ok(toml_edit::Value::String(token)) => Some(token.into_value()),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum WindowFullscreen {
     #[default]
     Disabled,
@@ -60,7 +94,8 @@ pub enum WindowFullscreen {
     NonNativePaddedNotch,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum WindowDecoration {
     None,
     #[default]
@@ -69,7 +104,8 @@ pub enum WindowDecoration {
     Server,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MacosTitlebarStyle {
     Native,
     #[default]
@@ -146,7 +182,7 @@ pub struct SidebarConfig {
     /// `<config>/sidebar/`.
     pub modules: Vec<String>,
 }
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SidebarPosition {
     #[default]
@@ -172,7 +208,7 @@ pub struct StatusSegment {
     pub icon: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SegmentAlign {
     #[default]
@@ -391,7 +427,7 @@ pub struct ResolvedTheme {
     pub info: ThemeInfo,
     pub colors: ColorConfig,
 }
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AppearanceMode {
     #[default]

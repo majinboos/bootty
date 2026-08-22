@@ -80,50 +80,11 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui, sources: ModuleSo
             win.set_top_bar(enabled);
         },
     );
-    super::settings_toggle_row(
-        ui,
-        palette,
-        "Bottom bar",
-        "Show the module bar below the terminal.",
-        win.config.chrome.bottom_bar,
-        |enabled| {
-            win.config.chrome.bottom_bar = enabled;
-            win.writeback.set_bool(&["chrome", "bottom-bar"], enabled);
-        },
-    );
+    win.setting(ui, "chrome.bottom-bar");
 
     super::section(ui, palette, "STATUS BARS");
-    if super::number_row(
-        ui,
-        palette,
-        &mut win.config.chrome.status_height,
-        super::NumberRow {
-            label: "Height",
-            help: "Module strip height.",
-            path: &["chrome", "status-height"],
-            range: 20.0..=80.0,
-            suffix: " px",
-            scale: 1.0,
-            control: super::NumberControl::Slider,
-        },
-    ) {
-        win.writeback.set_f32(
-            &["chrome", "status-height"],
-            win.config.chrome.status_height,
-        );
-    }
-    super::settings_toggle_row(
-        ui,
-        palette,
-        "Hide tmux's own bar",
-        "Avoid duplicate status bars when the tmux backend is active.",
-        win.config.multiplexer.hide_tmux_status,
-        |enabled| {
-            win.config.multiplexer.hide_tmux_status = enabled;
-            win.writeback
-                .set_bool(&["multiplexer", "hide-tmux-status"], enabled);
-        },
-    );
+    win.setting(ui, "chrome.status-height");
+    win.setting(ui, "multiplexer.hide-tmux-status");
 
     super::section(ui, palette, "MODULES");
     super::settings_notice(

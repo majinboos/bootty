@@ -143,6 +143,28 @@ impl BoottyApp {
         ctx.request_repaint();
     }
 
+    /// Keep the settings schema and the modules' accepted values in step with the extension host.
+    /// Cheap per frame: the schema rebuilds only when the declaration set changes, and publishing
+    /// values is a no-op when they match.
+    fn sync_extension_settings(&mut self) {
+        let (declarations, revision) = self.extensions.setting_declarations();
+        let declarations: Vec<bootty_config::settings_schema::ExtensionSetting> = declarations
+            .iter()
+            .map(
+                |declaration| bootty_config::settings_schema::ExtensionSetting {
+                    module: declaration.module.clone(),
+                    key: declaration.key.clone(),
+                    label: declaration.label.clone(),
+                    help: declaration.help.clone(),
+                    default: declaration.default.clone(),
+                },
+            )
+            .collect();
+        self.state.sync_settings_schema(&declarations, revision);
+        self.extensions
+            .update_settings(self.state.extension_settings());
+    }
+
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         if !self.state.settings_open() {
             // Covers closes that bypass the Close return below (e.g. a toggle
@@ -150,6 +172,7 @@ impl BoottyApp {
             self.settings.restore_global_style(ui.ctx());
             return;
         }
+        self.settings.set_schema(self.state.settings_schema());
         let revision = self.state.config_revision();
         if self.settings.needs_accepted_config(revision) {
             self.settings.sync_accepted_config(
@@ -535,6 +558,7 @@ impl eframe::App for BoottyApp {
 
         let now = Instant::now();
         self.extensions.refresh(now);
+        self.sync_extension_settings();
         let inputs = FrameInputs {
             now,
             events,

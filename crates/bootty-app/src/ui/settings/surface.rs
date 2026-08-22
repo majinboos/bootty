@@ -8,18 +8,18 @@ mod font;
 mod keybinds;
 mod modules;
 mod remotes;
+mod schema_page;
 mod session;
 mod status_bar;
-mod window;
 mod writeback;
 
-use std::path::PathBuf;
-
+use bootty_config::settings_schema::SettingsSchema;
 use bootty_extension::{ModuleSourceOutcome, ModuleSourceRequest, ModuleSources};
+use std::sync::Arc;
 
 use bootty_config::{
     color::Color,
-    config::{BoottyConfig, ConfigDocument, MultiplexerBackendConfig, SidebarPosition},
+    config::{BoottyConfig, ConfigDocument, MultiplexerBackendConfig},
 };
 use bootty_ui::settings::{
     DragHandle, NumberEditSpec, apply_reorder, path_row, reorderable_list, searchable_combo,
@@ -48,6 +48,28 @@ pub enum SettingsPage {
     Keys,
     Config,
     Diagnostics,
+    Extensions,
+}
+
+impl SettingsPage {
+    /// Identity a [`SettingSpec`](bootty_config::settings_schema::SettingSpec) names to place
+    /// itself on this page.
+    const fn id(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Remotes => "remotes",
+            Self::Text => "text",
+            Self::Appearance => "appearance",
+            Self::Window => "window",
+            Self::Sidebar => "sidebar",
+            Self::Shell => "shell",
+            Self::Status => "status",
+            Self::Keys => "keys",
+            Self::Config => "config",
+            Self::Diagnostics => "diagnostics",
+            Self::Extensions => "extensions",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +92,7 @@ macro_rules! page {
 }
 
 #[rustfmt::skip]
-const PAGE_META: [PageMeta; 11] = [
+const PAGE_META: [PageMeta; 12] = [
     page!(General, "Core", "General", "default profile|multiplexer|backend|sidebar|status bar|new windows|terminal preview"),
     page!(Remotes, "Core", "Remotes", "ssh|remote|profile|host|port|user|authentication|private key|proxy|test connection"),
     page!(Text, "Core", "Text", "font|family|fallback|size|cell width|cell height|baseline|underline|glyph|features"),
@@ -82,6 +104,7 @@ const PAGE_META: [PageMeta; 11] = [
     page!(Keys, "Terminal", "Keys", "keybindings|shortcuts|scope|global|native|tmux|sidebar|modifier remap|option as alt|record shortcut"),
     page!(Config, "Advanced", "Config", "config|path|directory|themes|status modules|reload|last write error"),
     page!(Diagnostics, "Advanced", "Diagnostics", "diagnostics|stability trace|trace|reload|errors"),
+    page!(Extensions, "Advanced", "Extensions", "extension|module|luau|setting|option"),
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,6 +143,8 @@ pub struct SettingsSurface {
     /// The accepted-config revision `config` and the writeback document were taken from.
     /// `None` until the first sync, so a freshly opened surface always refreshes once.
     synced_revision: Option<u64>,
+    /// Built-in settings plus the ones extensions declared, installed by the shell.
+    schema: Arc<SettingsSchema>,
 }
 
 impl SettingsSurface {
@@ -143,7 +168,13 @@ impl SettingsSurface {
             base_style: None,
             module_editor: modules::EditorState::default(),
             synced_revision: None,
+            schema: Arc::new(SettingsSchema::with_extensions(&[])),
         }
+    }
+
+    /// Install the settings schema for this frame: built-ins plus extension declarations.
+    pub fn set_schema(&mut self, schema: Arc<SettingsSchema>) {
+        self.schema = schema;
     }
 
     /// Install the font and theme catalogs for this settings session.
@@ -449,18 +480,69 @@ impl SettingsSurface {
                                         SettingsPage::Remotes => remotes::ui(self, ui),
                                         SettingsPage::Text => font::ui(self, ui),
                                         SettingsPage::Appearance => appearance::ui(self, ui),
-                                        SettingsPage::Window => window::ui(self, ui),
+                                        SettingsPage::Window => self.schema_ui(ui),
                                         SettingsPage::Sidebar => self.sidebar_ui(ui, sources),
                                         SettingsPage::Shell => session::ui(self, ui),
                                         SettingsPage::Status => status_bar::ui(self, ui, sources),
                                         SettingsPage::Keys => keybinds::ui(self, ui),
                                         SettingsPage::Config => self.config_ui(ui),
                                         SettingsPage::Diagnostics => self.diagnostics_ui(ui),
+                                        SettingsPage::Extensions => self.extensions_ui(ui),
                                     },
                                 );
                             });
                         });
                 });
+        });
+    }
+
+    /// Settings the loaded extensions declared for themselves, sectioned by module.
+    fn extensions_ui(&mut self, ui: &mut egui::Ui) {
+        if self
+            .schema
+            .page(bootty_config::settings_schema::ExtensionSetting::PAGE)
+            .next()
+            .is_none()
+        {
+            settings_notice(
+                ui,
+                self.palette.muted,
+                "No loaded extension declares a setting. A module registers one with bootty.settings.register.",
+            );
+            return;
+        }
+        self.schema_ui(ui);
+    }
+
+    /// Render one schema setting by id, for a page whose layout stays hand-written because it
+    /// interleaves controls the schema does not describe.
+    fn setting(&mut self, ui: &mut egui::Ui, id: &str) {
+        let Some(spec) = self.schema.get(id).cloned() else {
+            debug_assert!(false, "unknown setting {id}");
+            return;
+        };
+        let mut ctx = schema_page::SettingsRenderContext {
+            palette: self.palette,
+            draft: &mut self.writeback,
+            accepted: &self.config,
+        };
+        schema_page::render_setting(ui, &mut ctx, &spec);
+    }
+
+    /// Render the current page from the settings schema, plus the few controls on it that are not
+    /// a plain key-to-widget mapping.
+    fn schema_ui(&mut self, ui: &mut egui::Ui) {
+        let page = self.page.id();
+        let schema = Arc::clone(&self.schema);
+        let mut ctx = schema_page::SettingsRenderContext {
+            palette: self.palette,
+            draft: &mut self.writeback,
+            accepted: &self.config,
+        };
+        schema_page::render_page(ui, &mut ctx, &schema, page, |ui, ctx, section| {
+            if section == "FULLSCREEN NOTCH" {
+                fullscreen_top_offset_row(ui, ctx);
+            }
         });
     }
 
@@ -551,52 +633,8 @@ impl SettingsSurface {
 
     fn sidebar_ui(&mut self, ui: &mut egui::Ui, sources: ModuleSources<'_>) {
         section(ui, self.palette, "NAVIGATION");
-        settings_row(
-            ui,
-            self.palette,
-            "Position",
-            "Dock the sidebar on the left or right edge.",
-            |ui| {
-                let mut position = self.config.sidebar.position;
-                let options = [
-                    (SidebarPosition::Left, "left"),
-                    (SidebarPosition::Right, "right"),
-                ];
-                let labels = ["left", "right"];
-                let current = options
-                    .iter()
-                    .position(|(candidate, _)| *candidate == position)
-                    .unwrap_or(0);
-                if let Some(index) = settings_segmented(ui, self.palette, &labels, current) {
-                    position = options[index].0;
-                    self.config.sidebar.position = position;
-                    let token = match position {
-                        SidebarPosition::Left => "left",
-                        SidebarPosition::Right => "right",
-                    };
-                    self.writeback.set_str(&["sidebar", "position"], token);
-                }
-            },
-        );
-        if number_row(
-            ui,
-            self.palette,
-            &mut self.config.chrome.sidebar_width,
-            NumberRow {
-                label: "Width",
-                help: "Width of the session sidebar.",
-                path: &["chrome", "sidebar-width"],
-                range: 120.0..=600.0,
-                suffix: " px",
-                scale: 1.0,
-                control: NumberControl::Slider,
-            },
-        ) {
-            self.writeback.set_f32(
-                &["chrome", "sidebar-width"],
-                self.config.chrome.sidebar_width,
-            );
-        }
+        self.setting(ui, "sidebar.position");
+        self.setting(ui, "chrome.sidebar-width");
         settings_notice(
             ui,
             self.palette.muted,
@@ -618,29 +656,7 @@ impl SettingsSurface {
 
     fn diagnostics_ui(&mut self, ui: &mut egui::Ui) {
         section(ui, self.palette, "TRACE");
-        settings_row(
-            ui,
-            self.palette,
-            "Stability trace",
-            "Writes frame-timing diagnostics to this file. Leave empty to disable.",
-            |ui| {
-                let mut trace = self
-                    .config
-                    .diagnostics
-                    .stability_trace
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default();
-                if settings_text_edit(ui, self.palette, &mut trace, "path to trace log").changed() {
-                    self.config.diagnostics.stability_trace = nonempty(&trace).map(PathBuf::from);
-                    write_optional_text(
-                        &mut self.writeback,
-                        &["diagnostics", "stability-trace"],
-                        &trace,
-                    );
-                }
-            },
-        );
+        self.setting(ui, "diagnostics.stability-trace");
         section(ui, self.palette, "STATE");
         path_row(ui, self.palette, "Config file", &self.config.config_path);
         if let Some(error) = self.writeback.last_error().map(str::to_owned) {
@@ -675,6 +691,45 @@ fn page_meta(page: SettingsPage) -> PageMeta {
         .expect("settings page metadata exists")
 }
 
+/// The fullscreen top offset: an optional override where "Auto" means the key is absent, and the
+/// number stays visible but disabled rather than hidden. Not a plain key-to-widget mapping, so it
+/// stays hand-written beside the schema rows.
+fn fullscreen_top_offset_row(ui: &mut egui::Ui, ctx: &mut schema_page::SettingsRenderContext<'_>) {
+    const PATH: [&str; 2] = ["window", "fullscreen-top-offset"];
+    let palette = ctx.palette;
+    let current = ctx.draft.f32_at(&PATH);
+    settings_row(
+        ui,
+        palette,
+        "Top offset",
+        "Leave automatic unless a notched display needs an exact override.",
+        |ui| {
+            let mut auto = current.is_none();
+            if settings_toggle(ui, palette, &mut auto) && auto {
+                ctx.draft.remove(&PATH);
+            }
+            ui.label(RichText::new("Auto").color(palette.muted));
+            let mut offset = current.unwrap_or(0.0);
+            ui.add_enabled_ui(!auto, |ui| {
+                if settings_number_edit(
+                    ui,
+                    palette,
+                    &mut offset,
+                    NumberEditSpec {
+                        id_salt: &PATH,
+                        range: 0.0..=160.0,
+                        suffix: " px",
+                        precision: 1,
+                        display_scale: 1.0,
+                    },
+                ) {
+                    ctx.draft.set_f32(&PATH, offset);
+                }
+            });
+        },
+    );
+}
+
 fn page_matches(meta: PageMeta, query: &str) -> bool {
     meta.group.to_ascii_lowercase().contains(query)
         || meta.label.to_ascii_lowercase().contains(query)
@@ -684,13 +739,6 @@ fn page_matches(meta: PageMeta, query: &str) -> bool {
 pub(super) fn nonempty(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_owned())
-}
-
-fn write_optional_text(writeback: &mut writeback::SettingsWriteback, path: &[&str], value: &str) {
-    match nonempty(value) {
-        Some(value) => writeback.set_str(path, &value),
-        None => writeback.remove(path),
-    }
 }
 
 #[cfg(windows)]
@@ -718,12 +766,6 @@ fn backend_token(backend: MultiplexerBackendConfig) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(super) enum NumberControl {
-    Edit,
-    Slider,
-}
-
 pub(super) struct NumberRow<'a> {
     pub label: &'a str,
     pub help: &'a str,
@@ -731,30 +773,6 @@ pub(super) struct NumberRow<'a> {
     pub range: std::ops::RangeInclusive<f32>,
     pub suffix: &'a str,
     pub scale: f32,
-    pub control: NumberControl,
-}
-
-pub(super) fn number_row(
-    ui: &mut egui::Ui,
-    palette: ThemePalette,
-    value: &mut f32,
-    row: NumberRow<'_>,
-) -> bool {
-    let mut changed = false;
-    settings_row(ui, palette, row.label, row.help, |ui| {
-        let edit = NumberEditSpec {
-            id_salt: row.path,
-            range: row.range,
-            suffix: row.suffix,
-            precision: 1,
-            display_scale: row.scale,
-        };
-        changed = match row.control {
-            NumberControl::Edit => settings_number_edit(ui, palette, value, edit),
-            NumberControl::Slider => settings_slider_with_edit(ui, palette, value, edit),
-        };
-    });
-    changed
 }
 
 pub(super) fn optional_number_row(
@@ -775,10 +793,7 @@ pub(super) fn optional_number_row(
             precision: 1,
             display_scale: row.scale,
         };
-        let edited = match row.control {
-            NumberControl::Edit => settings_number_edit(ui, palette, &mut concrete, edit),
-            NumberControl::Slider => settings_slider_with_edit(ui, palette, &mut concrete, edit),
-        };
+        let edited = settings_slider_with_edit(ui, palette, &mut concrete, edit);
         if edited {
             *value = Some(concrete);
             changed = true;

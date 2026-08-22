@@ -1,6 +1,7 @@
 use bootty_config::{
     color::Color,
     config::{ConfigDocument, ConfigResult},
+    settings_schema::{SettingKind, SettingSpec, SettingValue},
 };
 
 macro_rules! draft_setter {
@@ -94,6 +95,48 @@ impl SettingsWriteback {
     }
 
     draft_setter!(set_strings(value: &[String]));
+
+    /// The draft's value for `spec`, if the document says anything about that key. This is the
+    /// display source for a schema-rendered row: it shows what the user typed before the owner has
+    /// accepted it, which is what the per-page `BoottyConfig` mirrors used to do.
+    pub(super) fn value_of(&self, spec: &SettingSpec) -> Option<SettingValue> {
+        let path = spec.path_parts();
+        match &spec.kind {
+            SettingKind::Bool => self.document.bool_at(&path).map(SettingValue::Bool),
+            SettingKind::Text { .. } => self
+                .document
+                .str_at(&path)
+                .map(|value| SettingValue::Text(value.to_owned())),
+            SettingKind::Number { .. } => self
+                .document
+                .f64_at(&path)
+                .map(|value| SettingValue::Number(value as f32)),
+            SettingKind::Choice { .. } => self
+                .document
+                .str_at(&path)
+                .map(|value| SettingValue::Token(value.to_owned())),
+        }
+    }
+
+    /// Write `value` for `spec`, dropping any legacy key it supersedes first so an old spelling
+    /// cannot win the next load. Routed through [`Self::mutate`] like every other draft edit.
+    pub(super) fn write(&mut self, spec: &SettingSpec, value: &SettingValue) {
+        for legacy in &spec.supersedes {
+            let legacy: Vec<&str> = legacy.iter().map(std::convert::AsRef::as_ref).collect();
+            self.remove(&legacy);
+        }
+        let path = spec.path_parts();
+        match value {
+            SettingValue::Bool(value) => self.set_bool(&path, *value),
+            SettingValue::Number(value) => self.set_f32(&path, *value),
+            SettingValue::Text(value) | SettingValue::Token(value) => self.set_str(&path, value),
+        }
+    }
+
+    /// The draft's number at `path`, for a hand-written row that is not a plain spec mapping.
+    pub(super) fn f32_at(&self, path: &[&str]) -> Option<f32> {
+        self.document.f64_at(path).map(|value| value as f32)
+    }
 
     pub(super) fn contains(&self, path: &[&str]) -> bool {
         self.document.contains(path)

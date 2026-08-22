@@ -114,27 +114,47 @@ impl ConfigDocument {
         Ok(())
     }
 
-    pub fn contains(&self, path: &[&str]) -> bool {
-        let Some((leaf, parents)) = path.split_last() else {
-            return false;
-        };
-        let mut table = self.document.as_table();
-        for key in parents {
-            let Some(next) = table.get(key).and_then(Item::as_table) else {
-                return false;
-            };
-            table = next;
-        }
-        table.contains_key(leaf)
-    }
-
-    pub fn string_array(&self, path: &[&str]) -> Option<Vec<String>> {
+    /// The item at `path`, if the whole path exists. One table walk for every reader below.
+    fn item_at(&self, path: &[&str]) -> Option<&Item> {
         let (leaf, parents) = path.split_last()?;
         let mut table: &dyn TableLike = self.document.as_table();
         for key in parents {
             table = table.get(key).and_then(Item::as_table_like)?;
         }
-        table.get(leaf).and_then(Item::as_array).map(|array| {
+        table.get(leaf)
+    }
+
+    pub fn contains(&self, path: &[&str]) -> bool {
+        self.item_at(path).is_some()
+    }
+
+    /// The value written at `path`, in the shape the config schema expects there. Returns `None`
+    /// for a missing key, and for a key whose value is of another type; a caller that needs to
+    /// tell those apart uses [`Self::contains`] as well.
+    #[must_use]
+    pub fn bool_at(&self, path: &[&str]) -> Option<bool> {
+        self.item_at(path)?.as_bool()
+    }
+
+    #[must_use]
+    pub fn f64_at(&self, path: &[&str]) -> Option<f64> {
+        let item = self.item_at(path)?;
+        item.as_float()
+            .or_else(|| item.as_integer().map(|value| value as f64))
+    }
+
+    #[must_use]
+    pub fn i64_at(&self, path: &[&str]) -> Option<i64> {
+        self.item_at(path)?.as_integer()
+    }
+
+    #[must_use]
+    pub fn str_at(&self, path: &[&str]) -> Option<&str> {
+        self.item_at(path)?.as_str()
+    }
+
+    pub fn string_array(&self, path: &[&str]) -> Option<Vec<String>> {
+        self.item_at(path)?.as_array().map(|array| {
             array
                 .iter()
                 .filter_map(|value| value.as_str())

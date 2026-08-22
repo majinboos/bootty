@@ -13,6 +13,42 @@ use bootty_config::config::{
 };
 
 #[test]
+fn document_readers_answer_what_the_document_holds() {
+    let directory = tempfile::tempdir().expect("temporary config directory");
+    let path = directory.path().join("config.toml");
+    fs::write(
+        &path,
+        "sidebar = { position = \"right\" }\n\n[window]\ntitle = \"Keep\"\nwidth = 120\n\n[chrome]\nsidebar = true\ngap = 4.5\n\n[input]\nkeybind = []\n",
+    )
+    .expect("write config");
+    let document = load_config_document(&path)
+        .expect("load document")
+        .expect("config file exists");
+
+    assert_eq!(document.str_at(&["window", "title"]), Some("Keep"));
+    assert_eq!(document.i64_at(&["window", "width"]), Some(120));
+    assert_eq!(document.bool_at(&["chrome", "sidebar"]), Some(true));
+    assert_eq!(document.f64_at(&["chrome", "gap"]), Some(4.5));
+    // An integer answers a float read: TOML writes 4 for a whole number a float field owns.
+    assert_eq!(document.f64_at(&["window", "width"]), Some(120.0));
+
+    // A missing key and a present-but-empty array stay distinguishable.
+    assert_eq!(
+        document.string_array(&["input", "keybind"]),
+        Some(Vec::new())
+    );
+    assert_eq!(document.string_array(&["input", "sidebar-keybind"]), None);
+
+    // Reading the wrong type is None, but the key still exists.
+    assert_eq!(document.bool_at(&["window", "title"]), None);
+    assert!(document.contains(&["window", "title"]));
+    assert!(!document.contains(&["window", "missing"]));
+    // Inline tables are walked like tables, the way the loader parses them.
+    assert_eq!(document.str_at(&["sidebar", "position"]), Some("right"));
+    assert!(document.contains(&["sidebar", "position"]));
+}
+
+#[test]
 fn atomic_writeback_preserves_structure_and_unix_mode() {
     let directory = tempfile::tempdir().expect("temporary config directory");
     let path = directory.path().join("config.toml");
