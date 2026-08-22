@@ -453,4 +453,9 @@ bootty.integration.register({
 	files = {
 		{ path = "pi/bootty.ts", contents = ADAPTER },
 	},
+	-- Pi loads extensions from its own directory, so the adapter has to be in it. Nothing in Pi
+	-- points at a file elsewhere the way a hooks entry does.
+	place = {
+		{ path = "~/.pi/agent/extensions/bootty.ts", file = "pi/bootty.ts" },
+	},
 })

@@ -27,6 +27,7 @@ pub struct IntegrationDeclaration {
     pub summary: String,
     pub files: Vec<IntegrationFile>,
     pub merge: Vec<IntegrationMerge>,
+    pub place: Vec<IntegrationPlacement>,
 }
 
 /// A file written under the integration directory. `path` is relative to it and may not escape it.
@@ -35,6 +36,18 @@ pub struct IntegrationFile {
     pub path: String,
     pub contents: String,
     pub executable: bool,
+}
+
+/// A copy of one declared file, placed where the tool it adapts will find it.
+///
+/// A tool that loads adapters from a directory of its own cannot be pointed at Bootty's copy the
+/// way a JSON `merge` points at a script, so the file has to be in that directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationPlacement {
+    /// Where the copy goes: absolute, or `~/` against the home directory.
+    pub path: String,
+    /// Which of this declaration's `files` is copied there.
+    pub file: String,
 }
 
 /// A JSON file somewhere else on the machine that gains `value`, additively.
@@ -102,7 +115,29 @@ pub(crate) fn declaration_from_table(spec: &Table) -> mlua::Result<IntegrationDe
             });
         }
     }
-    for (kind, count) in [("file", files.len()), ("merge", merge.len())] {
+    let mut place = Vec::new();
+    if let Some(table) = spec.get::<Option<Table>>("place")? {
+        for entry in table.sequence_values::<Table>() {
+            let entry = entry?;
+            let file: String = entry.get("file")?;
+            // Named at declaration time, so a placement can only ever copy a file this same
+            // declaration writes -- never anything else on the machine.
+            if !files.iter().any(|declared| declared.path == file) {
+                return Err(mlua::Error::runtime(format!(
+                    "integration placement names `{file}`, which this integration does not declare"
+                )));
+            }
+            place.push(IntegrationPlacement {
+                path: entry.get("path")?,
+                file,
+            });
+        }
+    }
+    for (kind, count) in [
+        ("file", files.len()),
+        ("merge", merge.len()),
+        ("placement", place.len()),
+    ] {
         if count > INTEGRATION_ENTRY_LIMIT {
             return Err(mlua::Error::runtime(format!(
                 "integration {kind} count exceeds the limit of {INTEGRATION_ENTRY_LIMIT}"
@@ -117,6 +152,7 @@ pub(crate) fn declaration_from_table(spec: &Table) -> mlua::Result<IntegrationDe
         summary: spec.get::<Option<String>>("summary")?.unwrap_or_default(),
         files,
         merge,
+        place,
     })
 }
 
@@ -143,6 +179,14 @@ pub(crate) fn status(
             .and_then(|text| serde_json::from_str::<Value>(&text).ok())
             .is_some_and(|existing| contains(&existing, &entry.value));
         if installed {
+            applied += 1;
+        }
+    }
+    for placement in &declaration.place {
+        total += 1;
+        if placed_file(home, declaration, placement).is_some_and(|(path, contents)| {
+            fs::read_to_string(path).is_ok_and(|existing| existing == contents)
+        }) {
             applied += 1;
         }
     }
@@ -191,6 +235,19 @@ pub(crate) fn install(
             set_executable(&path)?;
         }
     }
+    for placement in &declaration.place {
+        let (path, contents) = placed_file(home, declaration, placement)
+            .ok_or_else(|| format!("integration placement `{}` is unresolved", placement.path))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("integration placement `{}` has no parent", placement.path))?;
+        fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        // Overwritten rather than refused, unlike a merge: the declaration chose this path and this
+        // name, so what is there is either nothing or an older copy of the same adapter. Uninstall
+        // is the careful half -- it takes back only a file that still matches what it wrote.
+        crate::source_writer::save_bytes(&path, contents.as_bytes())
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
     for (path, value) in merged {
         write_json(&path, &value)?;
     }
@@ -212,6 +269,15 @@ pub(crate) fn uninstall(
             Err(error) => return Err(format!("{}: {error}", path.display())),
         }
     }
+    for placement in &declaration.place {
+        let Some((path, contents)) = placed_file(home, declaration, placement) else {
+            continue;
+        };
+        // Only a copy that is still ours: a file the user replaced with their own is theirs now.
+        if fs::read_to_string(&path).is_ok_and(|existing| existing == contents) {
+            fs::remove_file(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+    }
     for entry in &declaration.merge {
         let path = resolve_merge_path(home, &entry.path)?;
         if !path.exists() {
@@ -223,6 +289,21 @@ pub(crate) fn uninstall(
         }
     }
     Ok(())
+}
+
+/// Where a placement's copy goes and what it should hold.
+fn placed_file<'a>(
+    home: Option<&Path>,
+    declaration: &'a IntegrationDeclaration,
+    placement: &IntegrationPlacement,
+) -> Option<(PathBuf, &'a str)> {
+    let path = resolve_merge_path(home, &placement.path).ok()?;
+    let contents = declaration
+        .files
+        .iter()
+        .find(|file| file.path == placement.file)
+        .map(|file| file.contents.as_str())?;
+    Some((path, contents))
 }
 
 fn file_installed(dir: &Path, file: &IntegrationFile) -> bool {
