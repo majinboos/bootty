@@ -39,6 +39,7 @@ too_many_lines = "allow"
 ab_glyph = "0.2"
 anyhow = "1"
 arboard = "3"
+assert_fs = "1.1.4"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 criterion = "0.8"
@@ -94,6 +95,7 @@ process-wrap = { version = "9.1", default-features = false, features = [
   "std",
 ] }
 portable-pty = { git = "https://github.com/wezterm/wezterm.git", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
+pretty_assertions = "1.4.1"
 proptest = "1"
 rmux-client = "0.10"
 rmux-sdk = "0.10"

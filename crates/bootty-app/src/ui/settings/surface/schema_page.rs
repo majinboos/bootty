@@ -42,6 +42,12 @@ pub(super) fn render_page(
 ) {
     let mut current_section: Option<String> = None;
     for spec in schema.page(page) {
+        if let SettingKind::Custom(editor) = &spec.kind {
+            // The owning hand-written page renders this control. Keep the registry entry in the
+            // page ordering without asking the scalar renderer for a default it does not own.
+            let _ = editor.name();
+            continue;
+        }
         if current_section.as_deref() != Some(spec.section.as_ref()) {
             if let Some(previous) = current_section.take() {
                 after_section(ui, ctx, &previous);
@@ -63,6 +69,10 @@ pub(super) fn render_setting(
     ctx: &mut SettingsRenderContext<'_>,
     spec: &SettingSpec,
 ) {
+    if let SettingKind::Custom(editor) = &spec.kind {
+        let _ = editor.name();
+        return;
+    }
     let path = spec.path_parts();
     let current = ctx
         .draft
@@ -180,5 +190,6 @@ pub(super) fn render_setting(
                 }
             });
         }
+        SettingKind::Custom(_) => unreachable!("custom settings are not scalar rows"),
     }
 }

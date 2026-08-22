@@ -15,6 +15,8 @@ bootty-identity = { path = "../bootty-identity" }
 thiserror.workspace = true
 
 [dev-dependencies]
+assert_fs.workspace = true
 indoc.workspace = true
+pretty_assertions.workspace = true
 rstest.workspace = true
 tempfile.workspace = true

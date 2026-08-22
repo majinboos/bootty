@@ -1,6 +1,7 @@
 use super::model::BoottyConfig;
 use super::raw::RawConfig;
 use super::resolve::ConfigResolver;
+use crate::settings_schema::SettingsSchema;
 use std::{
     collections::HashSet,
     fs, io,
@@ -342,6 +343,7 @@ impl ConfigGraphTraversal {
 fn resolve_loaded_document(document: &mut DocumentMut, path: &Path) -> ConfigResult<BoottyConfig> {
     let compatibility_warnings = take_ghostty_compatibility_warnings(document);
     document.as_table_mut().remove("include");
+    validate_setting_paths(document, path)?;
     let raw = parse_raw_config_document(document.clone(), path)?;
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut config = ConfigResolver {
@@ -351,6 +353,40 @@ fn resolve_loaded_document(document: &mut DocumentMut, path: &Path) -> ConfigRes
     .resolve(raw)?;
     config.compatibility_warnings = compatibility_warnings;
     Ok(config)
+}
+
+/// Keep the parser and settings surface on one contract: every user-config leaf must be declared
+/// by `SettingsSchema`. The serde patch structs still provide typed resolution, but adding a field
+/// there without adding its settings declaration now makes the config fail loudly.
+fn validate_setting_paths(document: &DocumentMut, path: &Path) -> ConfigResult<()> {
+    let schema = SettingsSchema::builtin();
+    validate_table(document.as_table(), &mut Vec::new(), schema, path)
+}
+
+fn validate_table<'a>(
+    table: &'a dyn TableLike,
+    prefix: &mut Vec<&'a str>,
+    schema: &SettingsSchema,
+    file: &Path,
+) -> ConfigResult<()> {
+    for (key, item) in table.iter() {
+        prefix.push(key);
+        if schema.allows_path(prefix) {
+            prefix.pop();
+            continue;
+        }
+        if let Some(child) = item.as_table_like() {
+            validate_table(child, prefix, schema, file)?;
+        } else {
+            return Err(ConfigLoadError::new(format!(
+                "unsupported config setting {} in {}: declare it in SettingsSchema before adding it",
+                prefix.join("."),
+                file.display()
+            )));
+        }
+        prefix.pop();
+    }
+    Ok(())
 }
 
 fn merge_toml_tables(target: &mut Table, overlay: &Table) {

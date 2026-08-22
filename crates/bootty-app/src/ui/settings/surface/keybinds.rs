@@ -455,6 +455,21 @@ fn shortcut_options(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         },
     );
 
+    let mut copy_on_select = win.config.input.copy_on_select;
+    super::settings_row(
+        ui,
+        palette,
+        "Copy on select",
+        "Copy a completed terminal selection to the system clipboard.",
+        |ui| {
+            if super::settings_toggle(ui, palette, &mut copy_on_select) {
+                win.config.input.copy_on_select = copy_on_select;
+                win.writeback
+                    .set_bool(&["input", "copy-on-select"], copy_on_select);
+            }
+        },
+    );
+
     super::settings_row(
         ui,
         palette,

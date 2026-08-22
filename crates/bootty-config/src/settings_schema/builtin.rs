@@ -6,7 +6,10 @@
 
 use crate::config::{MacosTitlebarStyle, SidebarPosition, WindowDecoration, WindowFullscreen};
 
-use super::{NumberControl, SettingDefault, SettingKind, SettingOption, SettingSpec, SettingValue};
+use super::{
+    NumberControl, SettingDefault, SettingEditor, SettingKind, SettingOption, SettingSpec,
+    SettingValue,
+};
 
 /// Build a spec with the fields every entry sets.
 fn spec(
@@ -60,6 +63,36 @@ fn fraction(control: NumberControl) -> SettingKind {
         suffix: "%".into(),
         display_scale: 100.0,
     }
+}
+
+fn custom(
+    path: &[&'static str],
+    page: &'static str,
+    section: &'static str,
+    editor: SettingEditor,
+) -> SettingSpec {
+    SettingSpec {
+        path: path.iter().map(|part| (*part).into()).collect(),
+        label: String::new().into(),
+        help: String::new().into(),
+        page: page.into(),
+        section: section.into(),
+        kind: SettingKind::Custom(editor),
+        supersedes: Vec::new(),
+        default: SettingDefault::Unused,
+    }
+}
+
+/// Every accepted compatibility spelling that is not itself a settings-surface control.
+pub(super) fn compatibility_paths() -> &'static [&'static [&'static str]] {
+    &[
+        &["font-feature"],
+        &["chrome", "status-bar"],
+        &["chrome", "status-segment"],
+        &["chrome", "window-tabs"],
+        &["sidebar", "fullscreen-background"],
+        &["sidebar", "fullscreen-hover"],
+    ]
 }
 
 pub(super) fn specs() -> Vec<SettingSpec> {
@@ -427,6 +460,347 @@ pub(super) fn specs() -> Vec<SettingSpec> {
                         .unwrap_or_default(),
                 )
             }),
+        ),
+        custom(&["theme"], "appearance", "THEME", SettingEditor::Appearance),
+        custom(
+            &["colors", "*"],
+            "appearance",
+            "COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["appearance", "mode"],
+            "appearance",
+            "THEME",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["appearance", "light", "theme"],
+            "appearance",
+            "THEME",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["appearance", "light", "colors", "*"],
+            "appearance",
+            "COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["appearance", "dark", "theme"],
+            "appearance",
+            "THEME",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["appearance", "dark", "colors", "*"],
+            "appearance",
+            "COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(&["cursor", "style"], "text", "CURSOR", SettingEditor::Text),
+        custom(&["cursor", "blink"], "text", "CURSOR", SettingEditor::Text),
+        custom(&["font", "family"], "text", "FONT", SettingEditor::Text),
+        custom(&["font", "ui-family"], "text", "FONT", SettingEditor::Text),
+        custom(
+            &["font", "ui-use-terminal-family"],
+            "text",
+            "FONT",
+            SettingEditor::Text,
+        ),
+        custom(
+            &["font", "features"],
+            "text",
+            "FEATURES",
+            SettingEditor::Text,
+        ),
+        custom(
+            &["font", "cell-width"],
+            "text",
+            "TERMINAL METRICS",
+            SettingEditor::Text,
+        ),
+        custom(
+            &["font", "cell-height"],
+            "text",
+            "TERMINAL METRICS",
+            SettingEditor::Text,
+        ),
+        custom(
+            &["chrome", "sidebar"],
+            "general",
+            "CHROME",
+            SettingEditor::General,
+        ),
+        custom(
+            &["chrome", "top-bar"],
+            "status",
+            "BARS",
+            SettingEditor::Status,
+        ),
+        custom(
+            &["chrome", "status-background"],
+            "appearance",
+            "CHROME COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["chrome", "pane-divider-color"],
+            "appearance",
+            "CHROME COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["chrome", "notched-fullscreen-black-chrome"],
+            "appearance",
+            "CHROME COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["chrome", "pane-focus-border-color"],
+            "appearance",
+            "CHROME COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["chrome", "top-segment"],
+            "status",
+            "SEGMENTS",
+            SettingEditor::Status,
+        ),
+        custom(
+            &["chrome", "bottom-segment"],
+            "status",
+            "SEGMENTS",
+            SettingEditor::Status,
+        ),
+        custom(
+            &["sidebar", "background"],
+            "appearance",
+            "SIDEBAR COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["sidebar", "foreground"],
+            "appearance",
+            "SIDEBAR COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["sidebar", "selected"],
+            "appearance",
+            "SIDEBAR COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["sidebar", "hover"],
+            "appearance",
+            "SIDEBAR COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["sidebar", "border"],
+            "appearance",
+            "SIDEBAR COLORS",
+            SettingEditor::Appearance,
+        ),
+        custom(
+            &["sidebar", "session-modules"],
+            "sidebar",
+            "MODULES",
+            SettingEditor::Sidebar,
+        ),
+        custom(
+            &["sidebar", "modules"],
+            "sidebar",
+            "MODULES",
+            SettingEditor::Sidebar,
+        ),
+        custom(
+            &["multiplexer", "backend"],
+            "general",
+            "MULTIPLEXER",
+            SettingEditor::General,
+        ),
+        custom(
+            &["multiplexer", "remote", "host"],
+            "remotes",
+            "DEFAULT REMOTE",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["multiplexer", "remote", "user"],
+            "remotes",
+            "DEFAULT REMOTE",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["multiplexer", "remote", "port"],
+            "remotes",
+            "DEFAULT REMOTE",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["multiplexer", "remote", "program"],
+            "remotes",
+            "DEFAULT REMOTE",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["multiplexer", "remote", "args"],
+            "remotes",
+            "DEFAULT REMOTE",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "name"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "host"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "user"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "port"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "authentication"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "host-key-policy"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "identity-file"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "proxy-jump"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "program"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["ssh-profiles", "*", "args"],
+            "remotes",
+            "SSH PROFILES",
+            SettingEditor::Remotes,
+        ),
+        custom(
+            &["input", "modifier-remap"],
+            "keys",
+            "INPUT",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "macos-option-as-alt"],
+            "keys",
+            "INPUT",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "hide-mouse-pointer-while-typing"],
+            "keys",
+            "INPUT",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "copy-on-select"],
+            "keys",
+            "INPUT",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "preset"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "prefix"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "keybind"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "sidebar-keybind"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "backend-keybind", "native"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "backend-keybind", "rmux"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "backend-keybind", "tmux"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["session", "env"],
+            "shell",
+            "ENVIRONMENT",
+            SettingEditor::Shell,
+        ),
+        custom(
+            &["session", "max-scrollback"],
+            "shell",
+            "SCROLLBACK",
+            SettingEditor::Shell,
+        ),
+        custom(
+            &["window", "fullscreen-top-offset"],
+            "window",
+            "FULLSCREEN NOTCH",
+            SettingEditor::Window,
+        ),
+        custom(
+            &["extensions", "*"],
+            "extensions",
+            "EXTENSIONS",
+            SettingEditor::Extensions,
         ),
     ]
 }

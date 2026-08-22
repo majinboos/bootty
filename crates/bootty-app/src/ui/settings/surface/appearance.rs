@@ -33,6 +33,9 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
         ("Highlight text", "Search or match highlight foreground.", "highlight-foreground", palette.text, |c| &mut c.highlight_foreground),
         ("Pointer foreground", "Pointer text/foreground override.", "pointer-foreground", palette.base, |c| &mut c.pointer_foreground),
         ("Pointer background", "Pointer background override.", "pointer-background", palette.text, |c| &mut c.pointer_background),
+        ("Tektronix foreground", "Tektronix vector-display foreground override.", "tektronix-foreground", palette.text, |c| &mut c.tektronix_foreground),
+        ("Tektronix background", "Tektronix vector-display background override.", "tektronix-background", palette.base, |c| &mut c.tektronix_background),
+        ("Tektronix cursor", "Tektronix vector-display cursor override.", "tektronix-cursor", palette.primary, |c| &mut c.tektronix_cursor),
     ];
     for &(label, help, key, seed, field) in colors {
         terminal_color_row(win, ui, label, help, key, seed, field);

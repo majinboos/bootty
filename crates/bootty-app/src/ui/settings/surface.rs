@@ -54,7 +54,7 @@ pub enum SettingsPage {
 impl SettingsPage {
     /// Identity a [`SettingSpec`](bootty_config::settings_schema::SettingSpec) names to place
     /// itself on this page.
-    const fn id(self) -> &'static str {
+    pub const fn id(self) -> &'static str {
         match self {
             Self::General => "general",
             Self::Remotes => "remotes",
@@ -153,7 +153,8 @@ pub struct SettingsSurface {
 impl SettingsSurface {
     #[must_use]
     pub fn new(config: BoottyConfig, document: ConfigDocument) -> Self {
-        let writeback = writeback::SettingsWriteback::new(document);
+        let schema = Arc::new(SettingsSchema::with_extensions(&[]));
+        let writeback = writeback::SettingsWriteback::new(document, Arc::clone(&schema));
         Self {
             config,
             writeback,
@@ -171,12 +172,13 @@ impl SettingsSurface {
             base_style: None,
             module_editor: modules::EditorState::default(),
             synced_revision: None,
-            schema: Arc::new(SettingsSchema::with_extensions(&[])),
+            schema,
         }
     }
 
     /// Install the settings schema for this frame: built-ins plus extension declarations.
     pub fn set_schema(&mut self, schema: Arc<SettingsSchema>) {
+        self.writeback.set_schema(Arc::clone(&schema));
         self.schema = schema;
     }
 
@@ -528,8 +530,12 @@ impl SettingsSurface {
         if self
             .schema
             .page(bootty_config::settings_schema::ExtensionSetting::PAGE)
-            .next()
-            .is_none()
+            .all(|spec| {
+                matches!(
+                    &spec.kind,
+                    bootty_config::settings_schema::SettingKind::Custom(_)
+                )
+            })
         {
             settings_notice(
                 ui,
@@ -696,16 +702,25 @@ impl SettingsSurface {
 
     fn set_top_bar(&mut self, enabled: bool) {
         self.writeback
-            .mutate(move |document| document.set_top_bar_enabled(enabled));
+            .mutate_setting(&["chrome", "top-bar"], move |document| {
+                document.set_top_bar_enabled(enabled)
+            });
     }
 
     /// Write one bar's ordered module segments from the working copy.
     fn set_status_segments(&mut self, position: status_bar::StatusBarPosition) {
         let segments = position.segments(&self.config.chrome).to_owned();
-        self.writeback.mutate(move |document| match position {
-            status_bar::StatusBarPosition::Top => document.set_top_status_segments(&segments),
-            status_bar::StatusBarPosition::Bottom => document.set_bottom_status_segments(&segments),
-        });
+        let path = match position {
+            status_bar::StatusBarPosition::Top => ["chrome", "top-segment"],
+            status_bar::StatusBarPosition::Bottom => ["chrome", "bottom-segment"],
+        };
+        self.writeback
+            .mutate_setting(&path, move |document| match position {
+                status_bar::StatusBarPosition::Top => document.set_top_status_segments(&segments),
+                status_bar::StatusBarPosition::Bottom => {
+                    document.set_bottom_status_segments(&segments)
+                }
+            });
     }
 }
 

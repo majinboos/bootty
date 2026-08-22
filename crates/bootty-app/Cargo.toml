@@ -54,7 +54,9 @@ bootty-winit = { path = "../bootty-winit", features = ["bare-host"] }
 criterion.workspace = true
 egui.workspace = true
 pollster.workspace = true
+pretty_assertions.workspace = true
 rusqlite.workspace = true
+rstest.workspace = true
 tempfile.workspace = true
 
 [[bench]]

@@ -17,11 +17,14 @@ publish = false
 [dependencies]
 accesskit = { version = "0.24", default-features = false, features = ["serde"] }
 ahash = { version = "0.8", default-features = false, features = ["no-rng", "serde", "std"] }
+aho-corasick = { version = "1" }
 bit-set = { version = "0.8" }
 bit-vec = { version = "0.8" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
+bstr = { version = "1", default-features = false, features = ["serde", "std"] }
 clap = { version = "4", features = ["derive"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "help", "std", "suggestions", "usage"] }
+crossbeam-utils = { version = "0.8" }
 ecolor = { version = "0.36", default-features = false, features = ["bytemuck", "serde"] }
 egui = { version = "0.36", features = ["bytemuck", "serde"] }
 either = { version = "1", features = ["use_std"] }
@@ -68,6 +71,7 @@ winnow = { version = "1" }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 
 [build-dependencies]
+aho-corasick = { version = "1" }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 indexmap = { version = "2" }
 memchr = { version = "2" }
@@ -91,7 +95,6 @@ arboard = { version = "3" }
 bitflags = { version = "2", default-features = false, features = ["serde"] }
 block2 = { version = "0.6" }
 core-foundation-sys = { version = "0.8" }
-crossbeam-utils = { version = "0.8" }
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
 half = { version = "2", features = ["num-traits"] }
@@ -113,8 +116,7 @@ wgpu-hal = { version = "30", default-features = false, features = ["metal", "por
 [target.aarch64-unknown-linux-gnu.dependencies]
 ahash = { version = "0.8" }
 arboard = { version = "3" }
-bstr = { version = "1", features = ["serde"] }
-crossbeam-utils = { version = "0.8" }
+bstr = { version = "1" }
 fastrand = { version = "2" }
 futures-core = { version = "0.3" }
 getrandom = { version = "0.3", default-features = false, features = ["std"] }
@@ -152,7 +154,6 @@ syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", default-features = fals
 zbus_macros = { version = "5", features = ["blocking-api"] }
 
 [target.wasm32-unknown-unknown.dependencies]
-crossbeam-utils = { version = "0.8" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 js-sys = { version = "0.3" }
 time = { version = "0.3", features = ["formatting", "parsing", "wasm-bindgen"] }
@@ -165,7 +166,6 @@ arboard = { version = "3" }
 bitflags = { version = "2", default-features = false, features = ["serde"] }
 block2 = { version = "0.6" }
 core-foundation-sys = { version = "0.8" }
-crossbeam-utils = { version = "0.8" }
 dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
 half = { version = "2", features = ["num-traits"] }
@@ -230,8 +230,7 @@ libc = { version = "0.2", features = ["extra_traits"] }
 [target.x86_64-unknown-linux-gnu.dependencies]
 ahash = { version = "0.8" }
 arboard = { version = "3" }
-bstr = { version = "1", features = ["serde"] }
-crossbeam-utils = { version = "0.8" }
+bstr = { version = "1" }
 fastrand = { version = "2" }
 futures-core = { version = "0.3" }
 getrandom = { version = "0.3", default-features = false, features = ["std"] }

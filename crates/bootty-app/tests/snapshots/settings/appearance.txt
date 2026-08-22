@@ -64,9 +64,9 @@ Pointer foreground
 Pointer text/foreground override.
 Pointer background
 Pointer background override.
-SIDEBAR COLORS
-Unset colors inherit from the active theme.
-Background
+Tektronix foreground
+Tektronix vector-display foreground override.
+Tektronix background
 Use standard 16
 Use xterm 256
 Add empty slot
