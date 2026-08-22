@@ -463,7 +463,6 @@ impl MuxController {
             command_config: Arc::new(Mutex::new(CommandConfigState::default())),
         }
     }
-}
 
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()

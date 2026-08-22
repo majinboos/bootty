@@ -765,32 +765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootty-cli"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bootty-config",
- "bootty-font",
- "bootty-identity",
- "bootty-mux-model",
- "bootty-runtime",
- "bootty-terminal",
- "bootty-workspace-hack",
- "clap",
- "self_update",
- "tempfile",
-]
-
-[[package]]
-name = "bootty-command"
-version = "0.4.0"
-dependencies = [
- "bootty-workspace-hack",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "bootty-config"
 version = "0.0.0"
 dependencies = [
@@ -804,25 +778,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "toml_edit 0.25.13+spec-1.1.0",
-]
-
-[[package]]
-name = "bootty-control"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bootty-command",
- "bootty-extension",
- "bootty-identity",
- "bootty-workspace-hack",
- "getrandom 0.4.3",
- "rmux-ipc",
- "rmux-os",
- "serde",
- "serde_json",
- "sysinfo",
- "tempfile",
- "tokio",
 ]
 
 [[package]]
