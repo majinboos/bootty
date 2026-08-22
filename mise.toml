@@ -25,24 +25,8 @@ bun run build:web
 """
 
 [tasks.test]
-description = "Run workspace lib and integration tests with nextest"
-run = "cargo nextest run --workspace --lib --tests"
-
-[tasks."test:cargo"]
-description = "Run workspace lib and integration tests with cargo's built-in runner"
-run = "cargo test --workspace --lib --tests"
-
-[tasks."test:doc"]
-description = "Run workspace doc-tests"
-run = "cargo test --workspace --doc"
-
-[tasks."test:wgpu"]
-description = "Run WGPU offscreen pixel readback tests"
-run = "cargo test -p bootty-app --test terminal_background_wgpu"
-
-[tasks."test:full"]
-description = "Run the full Cargo test suite including doc-tests"
-run = "cargo test --workspace"
+description = "Run workspace tests with nextest"
+run = "cargo nextest run"
 
 [tasks.fmt]
 description = "Check formatting"

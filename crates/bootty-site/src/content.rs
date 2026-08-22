@@ -150,7 +150,7 @@ change that affects Rust behavior outside the website/package boundary.
 ## Fast site loop
 
 ```sh
-cargo test -p bootty-site --lib
+cargo nextest run -p bootty-site
 bun run build:web
 ```
 
@@ -163,12 +163,12 @@ export, and selection serialization. The web build proves the Rust wasm package,
 ```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --lib --tests
+mise run test
 cargo test -p bootty-app --bench paint_plan --no-run
 ```
 
-Run doc-tests, offscreen WGPU readback tests, or full Criterion measurement only
-when those surfaces changed.
+The default test task includes offscreen WGPU readback tests. Keep executable
+documentation examples in integration tests so Nextest runs them.
 "#;
 
 const DOCS_JAVASCRIPT: &str = r##"# JavaScript package
