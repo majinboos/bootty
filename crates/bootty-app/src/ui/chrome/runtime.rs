@@ -402,10 +402,22 @@ impl ChromeView<'_> {
             // A user's own `sessions` module publishes its rows itself. Layering the built-in
             // session components over it duplicates every detail row, so they only apply when the
             // user either kept the built-in module or listed session modules explicitly.
+            let mut discovered_session_modules;
             let session_modules: &[String] = if self.extensions.is_user_owned("sessions")
                 && !sidebar_cfg.session_modules_configured
             {
                 &[]
+            } else if !sidebar_cfg.session_modules_configured {
+                discovered_session_modules = sidebar_cfg.session_modules.clone();
+                for id in session_surfaces
+                    .iter()
+                    .map(|surface| &surface.snapshot.declaration.id)
+                {
+                    if !discovered_session_modules.contains(id) {
+                        discovered_session_modules.push(id.clone());
+                    }
+                }
+                &discovered_session_modules
             } else {
                 &sidebar_cfg.session_modules
             };

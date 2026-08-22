@@ -26,6 +26,10 @@ use bootty_mux::{
     provider::PaneTopology,
     terminal::decode_scoped_pane_id,
 };
+use bootty_winit::{
+    input::TerminalInputCommand,
+    terminal::{KeyInput, KeyMods, TerminalKey},
+};
 use bootty_workspace::BindingMembershipMutation;
 
 fn command_outcome_message(outcome: &CommandOutcome) -> Option<String> {
@@ -311,6 +315,7 @@ impl AppState {
         effects: &mut Vec<AppEffect>,
         execution: Option<(Instant, CommandCancellation)>,
     ) -> CommandDispatch {
+        let target_supplied = invocation.target.is_some();
         let mut resolved = match self.commands.catalog.resolve(invocation) {
             Ok(resolved) => resolved,
             Err(outcome) => return self.reject_command(outcome),
@@ -347,6 +352,20 @@ impl AppState {
         {
             return self.reject_command(outcome);
         }
+        if target_supplied
+            && matches!(
+                &resolved.executor,
+                CommandExecutor::Core(
+                    CoreCommandExecutor::Keybind(KeybindAction::Write(_))
+                        | CoreCommandExecutor::PasteTerminal(_)
+                        | CoreCommandExecutor::SubmitTerminal
+                )
+            )
+            && let Some(exact_target) = exact_target.as_ref()
+            && let Err(outcome) = self.activate_terminal_target(exact_target)
+        {
+            return self.reject_command(outcome);
+        }
         let caller = resolved.invocation.caller;
         match resolved.executor {
             CommandExecutor::Core(executor) => self.dispatch_resolved_command(
@@ -359,10 +378,11 @@ impl AppState {
             ),
             CommandExecutor::Extension(handler) => {
                 let (deadline, cancellation) = command_execution(execution);
-                CommandDispatch::Pending(PendingCommandResult::Outcome(handler.invoke(
+                CommandDispatch::Pending(PendingCommandResult::Outcome(handler.invoke_with_target(
                     resolved.invocation,
                     deadline,
                     cancellation,
+                    target_supplied,
                 )))
             }
         }
@@ -400,20 +420,128 @@ impl AppState {
                 message: format!("command requires a {expected:?} target"),
             });
         }
+        if let Some(supplied) = supplied {
+            if self
+                .current_command_target_for(command, expected)
+                .is_some_and(|current| current == *supplied)
+            {
+                return Ok((
+                    Some(supplied.clone()),
+                    self.current_exact_mux_target_for(command, expected),
+                ));
+            }
+            if let Some(exact) = self.exact_mux_target(supplied) {
+                return Ok((Some(supplied.clone()), Some(exact)));
+            }
+            return Err(CommandOutcome::StaleTarget {
+                message: format!("the {expected:?} target is stale"),
+            });
+        }
         let Some(current) = self.current_command_target_for(command, expected) else {
             return Err(CommandOutcome::Unavailable {
                 message: format!("no current {expected:?} target is available"),
             });
         };
-        if supplied.is_some_and(|target| target != &current) {
-            return Err(CommandOutcome::StaleTarget {
-                message: format!("the {expected:?} target is stale"),
-            });
-        }
         // The opaque handle is only an equality token. Build the typed target from current mux
         // state after the complete wire target (kind, handle, and generation) has matched.
         let exact = self.current_exact_mux_target_for(command, expected);
         Ok((Some(current), exact))
+    }
+
+    fn exact_mux_target(&self, target: &CommandTarget) -> Option<ExactMuxTarget> {
+        let scope = self.workspace.active.binding.scope;
+        let mux = &self.workspace.active.binding.mux;
+        let binding = self.binding_target_handle(scope, mux.binding_generation());
+        for session in mux.sessions() {
+            if let Some(generation) = mux.session_generation(&session.id) {
+                let session_target = CommandTarget {
+                    kind: ResourceKind::Session,
+                    handle: serde_json::to_string(&[&binding, &session.id])
+                        .expect("serialize session target"),
+                    generation,
+                };
+                if target == &session_target {
+                    return Some(ExactMuxTarget::Session(scope, session.id.clone()));
+                }
+            }
+            for window in &session.windows {
+                if let Some(generation) = mux.window_generation(&session.id, &window.id) {
+                    let window_target = CommandTarget {
+                        kind: ResourceKind::MuxWindow,
+                        handle: serde_json::to_string(&[&binding, &session.id, &window.id])
+                            .expect("serialize window target"),
+                        generation,
+                    };
+                    if target == &window_target {
+                        return Some(ExactMuxTarget::Window(
+                            scope,
+                            session.id.clone(),
+                            window.id.clone(),
+                        ));
+                    }
+                }
+                for pane in std::iter::once(&window.anchor).chain(&window.panes) {
+                    let Some(pane_id) = pane.pane_id.as_deref() else {
+                        continue;
+                    };
+                    let exact = ExactMuxTarget::Pane(
+                        scope,
+                        session.id.clone(),
+                        window.id.clone(),
+                        pane_id.to_owned(),
+                    );
+                    let Some(generation) = mux.pane_generation(&session.id, &window.id, pane_id)
+                    else {
+                        continue;
+                    };
+                    let pane_target = CommandTarget {
+                        kind: ResourceKind::Pane,
+                        handle: serde_json::to_string(&[
+                            &binding,
+                            &session.id,
+                            &window.id,
+                            pane_id,
+                        ])
+                        .expect("serialize pane target"),
+                        generation,
+                    };
+                    if target == &pane_target {
+                        return Some(exact);
+                    }
+                    let terminal_target = CommandTarget {
+                        kind: ResourceKind::Terminal,
+                        handle: pane_target.handle,
+                        generation,
+                    };
+                    if target == &terminal_target {
+                        return Some(exact);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn activate_terminal_target(&mut self, target: &ExactMuxTarget) -> Result<(), CommandOutcome> {
+        let scope = target.scope();
+        let (session, window, pane) = target.ids();
+        let Some(session) = session.map(str::to_owned) else {
+            return Ok(());
+        };
+        let window = window.map(str::to_owned);
+        let pane = pane.map(str::to_owned);
+        self.workspace
+            .activate_target(scope, &session, window.as_deref(), &self.repaint)
+            .map_err(|error| CommandOutcome::Failed {
+                code: "execution_failed".to_owned(),
+                message: error.to_string(),
+            })?;
+        if let Some(pane) = pane {
+            self.workspace.active.binding.focus_pane(&pane);
+        }
+        self.sync_native_layout_terminal_now();
+        (self.repaint)();
+        Ok(())
     }
 
     pub(crate) fn current_exact_mux_target_for(
@@ -435,9 +563,17 @@ impl AppState {
                 window_id?,
                 pane_id?,
             )),
-            ResourceKind::Instance | ResourceKind::ApplicationWindow | ResourceKind::Terminal => {
-                None
-            }
+            ResourceKind::Terminal => match (session_id, window_id, pane_id) {
+                (Some(session), Some(window), Some(pane)) => {
+                    Some(ExactMuxTarget::Pane(scope, session, window, pane))
+                }
+                (Some(session), Some(window), None) => {
+                    Some(ExactMuxTarget::Window(scope, session, window))
+                }
+                (Some(session), None, _) => Some(ExactMuxTarget::Session(scope, session)),
+                (None, _, _) => Some(ExactMuxTarget::Binding(scope)),
+            },
+            ResourceKind::Instance | ResourceKind::ApplicationWindow => None,
         }
     }
 
@@ -691,6 +827,46 @@ impl AppState {
             }
             CoreCommandExecutor::ReadTerminal => {
                 CommandDispatch::Complete(self.read_active_terminal())
+            }
+            CoreCommandExecutor::PasteTerminal(text) => {
+                let previous_error = self.last_error.take();
+                self.apply_terminal_input(TerminalInputCommand::Paste(text), effects);
+                let outcome = self.last_error.clone().map_or_else(
+                    || {
+                        self.last_error = previous_error;
+                        CommandOutcome::success()
+                    },
+                    |message| CommandOutcome::Failed {
+                        code: "execution_failed".to_owned(),
+                        message,
+                    },
+                );
+                CommandDispatch::Complete(outcome)
+            }
+            CoreCommandExecutor::SubmitTerminal => {
+                let previous_error = self.last_error.take();
+                let key = TerminalKey::Enter;
+                self.apply_terminal_input(
+                    TerminalInputCommand::Key(KeyInput {
+                        key,
+                        mods: KeyMods::default(),
+                        repeat: false,
+                        utf8: None,
+                        unshifted: None,
+                    }),
+                    effects,
+                );
+                let outcome = self.last_error.clone().map_or_else(
+                    || {
+                        self.last_error = previous_error;
+                        CommandOutcome::success()
+                    },
+                    |message| CommandOutcome::Failed {
+                        code: "execution_failed".to_owned(),
+                        message,
+                    },
+                );
+                CommandDispatch::Complete(outcome)
             }
             CoreCommandExecutor::Keybind(_) => unreachable!("keybind executors return above"),
         }
@@ -967,6 +1143,11 @@ impl AppState {
                     Some(window_id),
                 )?),
             );
+            if matches!(command, MuxCommand::NewWindow { .. })
+                && let Some(created) = self.mux_terminal_target(scope, session_id, window_id)
+            {
+                value.insert("created".to_owned(), command_target_value(created));
+            }
         }
         if !value.contains_key("focused")
             && let Some(session_id) = completion.selected_session.as_deref()
@@ -1018,6 +1199,35 @@ impl AppState {
             kind,
             handle,
             generation,
+        })
+    }
+
+    fn mux_terminal_target(
+        &self,
+        scope: SpaceId,
+        session_id: &str,
+        window_id: &str,
+    ) -> Option<CommandTarget> {
+        let binding_runtime = self.workspace.binding(scope)?;
+        let pane_id = binding_runtime
+            .mux
+            .sessions()
+            .iter()
+            .find(|session| session.id == session_id)?
+            .windows
+            .iter()
+            .find(|window| window.id == window_id)?
+            .anchor
+            .pane_id
+            .as_deref()?;
+        let binding = self.binding_target_handle(scope, binding_runtime.mux.binding_generation());
+        Some(CommandTarget {
+            kind: ResourceKind::Terminal,
+            handle: serde_json::to_string(&[&binding, session_id, window_id, pane_id])
+                .expect("serialize terminal target"),
+            generation: binding_runtime
+                .mux
+                .pane_generation(session_id, window_id, pane_id)?,
         })
     }
 

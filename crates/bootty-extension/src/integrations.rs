@@ -1,7 +1,6 @@
 //! Adapters a module needs installed in *another* tool: a hook script on disk, and a JSON config
-//! entry pointing at it. Nothing here knows what an agent is. A module declares the files and the
-//! JSON, and the host only writes files and merges JSON — every tool-specific name, path and event
-//! stays in the Luau module that owns it.
+//! entry pointing at it. A module declares the files and JSON, and the host only writes files and
+//! merges JSON — every tool-specific name, path, and event stays in its owning Luau module.
 
 use std::{
     fs,

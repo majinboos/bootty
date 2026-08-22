@@ -66,7 +66,9 @@ pub enum CoreCommandExecutor {
     Keybind(KeybindAction),
     Sidebar(SidebarAction),
     CurrentResource(ResourceKind),
+    PasteTerminal(String),
     ReadTerminal,
+    SubmitTerminal,
 }
 
 #[derive(Clone, Debug)]
@@ -80,7 +82,9 @@ enum CommandExecutorResolver {
     Keybind,
     Sidebar(SidebarAction),
     CurrentResource,
+    PasteTerminal,
     ReadTerminal,
+    SubmitTerminal,
     WriteTerminal,
 }
 
@@ -138,7 +142,11 @@ impl CommandRegistry {
                 resource_kind(&invocation.arguments[0])
                     .expect("validated resource kind has a runtime value"),
             ),
+            CommandExecutorResolver::PasteTerminal => {
+                CoreCommandExecutor::PasteTerminal(invocation.arguments[0].clone())
+            }
             CommandExecutorResolver::ReadTerminal => CoreCommandExecutor::ReadTerminal,
+            CommandExecutorResolver::SubmitTerminal => CoreCommandExecutor::SubmitTerminal,
             CommandExecutorResolver::WriteTerminal => CoreCommandExecutor::Keybind(
                 KeybindAction::Write(invocation.arguments[0].as_bytes().to_vec()),
             ),
@@ -233,6 +241,32 @@ impl CommandRegistry {
                     palette: false,
                 },
                 CommandExecutorResolver::WriteTerminal,
+            ),
+            (
+                CommandDescriptor {
+                    id: "terminal.paste".to_owned(),
+                    title: "Paste Terminal Text".to_owned(),
+                    description: "Paste text into the active terminal.".to_owned(),
+                    mutation: MutationClass::Write,
+                    arguments: CompactSchema {
+                        arguments: vec![argument("text", ValueType::String)],
+                    },
+                    target: Some(ResourceKind::Terminal),
+                    palette: false,
+                },
+                CommandExecutorResolver::PasteTerminal,
+            ),
+            (
+                CommandDescriptor {
+                    id: "terminal.submit".to_owned(),
+                    title: "Submit Terminal Input".to_owned(),
+                    description: "Send the terminal's encoded Enter key.".to_owned(),
+                    mutation: MutationClass::Write,
+                    arguments: CompactSchema::default(),
+                    target: Some(ResourceKind::Terminal),
+                    palette: false,
+                },
+                CommandExecutorResolver::SubmitTerminal,
             ),
         ] {
             commands.insert(

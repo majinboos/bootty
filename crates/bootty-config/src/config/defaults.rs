@@ -35,18 +35,12 @@ impl Default for SidebarConfig {
             session_modules: vec![
                 "diffs".to_owned(),
                 "process".to_owned(),
-                "agents.pi".to_owned(),
-                "agents.codex".to_owned(),
-                "agents.claude".to_owned(),
                 "directory".to_owned(),
                 "branch".to_owned(),
                 "ports".to_owned(),
                 "progress".to_owned(),
             ],
             session_modules_configured: false,
-            // Sidebar surfaces are named by the id their module declared. A surface nobody names
-            // is never rendered; the agent integrations render one row per session, so they are
-            // named among the session modules above.
             modules: vec!["sessions".to_owned(), "codexbar".to_owned()],
         }
     }

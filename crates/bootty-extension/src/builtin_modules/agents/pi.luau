@@ -1,17 +1,10 @@
 --!strict
--- Pi owns the RPC schema. Bootty supplies only bounded JSONL process transport.
+-- Pi owns its interactive session. Bootty targets the visible terminal that owns it.
 
 local ui = bootty.ui
-local PROCESS = "pi-rpc"
 local ICON = "bot"
 local COLOR = bootty.theme.primary
--- An agent runs in a session, so state is kept per pane: every reported event names the pane it
--- came from, and the sidebar row for that session reads the pane's state. The RPC session bootty
--- starts itself belongs to no pane and keeps its own key.
-local MANAGED_PANE = "managed"
 local panes = {}
-local running = false
-local next_request = 0
 
 bootty.events.register("agents.pi.event")
 
@@ -75,148 +68,122 @@ local function apply_native_event(state, event)
 	end
 end
 
-local function apply_rpc_message(message)
-	local state = state_for(MANAGED_PANE)
-	if message.type == "response" then
-		if message.success == false then
-			state.status = "error"
-			state.error = message.error or "Pi RPC request failed"
-		elseif message.command == "get_state" and message.data then
-			state.session_id = message.data.sessionId
-			state.session_name = message.data.sessionName
-			state.status = if message.data.isStreaming then "working" else "idle"
-			state.error = nil
-		end
-	else
-		apply_native_event(state, message)
+local function invoke(invocation)
+	local outcome = bootty.commands.invoke(invocation)
+	if outcome.status ~= "success" then
+		error(outcome.message or ("command failed: " .. tostring(outcome.status)))
 	end
-	publish(MANAGED_PANE, "rpc", message)
+	return outcome.value
 end
 
-local function drain()
-	if not running then
-		return
+local function write(context, text)
+	local invocation = {
+		command = "terminal.write",
+		arguments = { text },
+	}
+	if context.target_supplied then
+		invocation.target = context.target
 	end
-	local state = state_for(MANAGED_PANE)
-	local ok, events = pcall(function()
-		return bootty.process.poll(PROCESS, 64)
-	end)
-	if not ok then
-		running = false
-		state.status = "error"
-		state.error = tostring(events)
-		return
-	end
-	for _, event in ipairs(events) do
-		if event.stream == "stdout" then
-			local decoded, message = pcall(function()
-				return bootty.json.decode(event.line)
-			end)
-			if decoded then
-				apply_rpc_message(message)
-			else
-				state.status = "error"
-				state.error = "Pi emitted invalid JSONL"
-				publish(MANAGED_PANE, "protocol_error", { line = event.line })
-			end
-		elseif event.stream == "stderr" or event.stream == "error" then
-			state.error = event.line
-			publish(MANAGED_PANE, event.stream, { line = event.line })
-		elseif event.stream == "exit" then
-			running = false
-			state.status = "stopped"
-			publish(MANAGED_PANE, "exit", { code = event.code })
-		elseif event.stream == "dropped" then
-			publish(MANAGED_PANE, "dropped", { count = event.count })
-		end
-	end
+	invoke(invocation)
+	return { sent = true }
 end
 
-local function send(command)
-	if not running then
-		error("Pi RPC session is not running")
+local function submit(context, text)
+	local invocation = { command = "terminal.paste", arguments = { text } }
+	if context.target_supplied then
+		invocation.target = context.target
 	end
-	next_request += 1
-	command.id = "bootty-" .. tostring(next_request)
-	bootty.process.write(PROCESS, bootty.json.encode(command))
-	return command.id
+	invoke(invocation)
+	invocation = { command = "terminal.submit" }
+	if context.target_supplied then
+		invocation.target = context.target
+	end
+	invoke(invocation)
+	return { sent = true }
 end
 
 bootty.commands.register({
 	id = "agents.pi.start",
-	title = "Start managed Pi",
+	title = "Start Pi",
 	mutation = "write",
+	target = "terminal",
 	arguments = {
 		{ name = "cwd", type = "string" },
 		{ name = "program", type = "string" },
 	},
 }, function(context)
+	if not context.target_supplied then
+		local created = invoke({ command = "new_tab" }).created
+		if not created then
+			error("new tab did not return its terminal target")
+		end
+		context.target = created
+		context.target_supplied = true
+	end
 	local cwd = context.arguments[1]
 	local program = context.arguments[2] or "pi"
-	bootty.process.start({ id = PROCESS, argv = { program, "--mode", "rpc" }, cwd = cwd })
-	running = true
-	local state = state_for(MANAGED_PANE)
-	state.source = "managed"
-	state.status = "starting"
-	state.error = nil
-	send({ type = "get_state" })
-	return snapshot(MANAGED_PANE)
+	local command = bootty.shell.quote(program)
+	if cwd and cwd ~= "" then
+		command = "cd " .. bootty.shell.quote(cwd) .. " && exec " .. command
+	else
+		command = "exec " .. command
+	end
+	return submit(context, command)
 end)
 
 bootty.commands.register({
 	id = "agents.pi.prompt",
-	title = "Prompt managed Pi",
+	title = "Prompt Pi",
 	mutation = "write",
+	target = "terminal",
 	arguments = { { name = "message", type = "string", required = true } },
 }, function(context)
-	drain()
-	local id = send({ type = "prompt", message = context.arguments[1] })
-	state_for(MANAGED_PANE).status = "working"
-	return { request_id = id, state = snapshot(MANAGED_PANE) }
+	return submit(context, context.arguments[1])
 end)
 
 for _, command_type in ipairs({ "steer", "follow_up" }) do
 	local current = command_type
 	bootty.commands.register({
 		id = "agents.pi." .. current,
-		title = if current == "steer" then "Steer managed Pi" else "Follow up with managed Pi",
+		title = if current == "steer" then "Steer Pi" else "Follow up with Pi",
 		mutation = "write",
+		target = "terminal",
 		arguments = { { name = "message", type = "string", required = true } },
 	}, function(context)
-		drain()
-		return { request_id = send({ type = current, message = context.arguments[1] }) }
+		return submit(context, context.arguments[1])
 	end)
 end
 
 bootty.commands.register({
 	id = "agents.pi.abort",
-	title = "Abort managed Pi",
+	title = "Abort Pi",
 	mutation = "destructive",
-}, function()
-	drain()
-	return { request_id = send({ type = "abort" }) }
+	target = "terminal",
+}, function(context)
+	return write(context, "\003")
 end)
 
 bootty.commands.register({
 	id = "agents.pi.state",
 	title = "Inspect Pi state",
-	-- Without a pane this answers for the RPC session bootty manages itself.
+	-- Without a pane this answers for the most recently reported visible session.
 	arguments = { { name = "pane", type = "string" } },
 }, function(context)
-	drain()
 	local pane = context.arguments[1]
-	return snapshot(if pane and pane ~= "" then pane else MANAGED_PANE)
+	return snapshot(if pane and pane ~= "" then pane else next(panes))
 end)
 
 bootty.commands.register({
 	id = "agents.pi.stop",
-	title = "Stop managed Pi",
+	title = "Stop Pi pane",
 	mutation = "destructive",
-}, function()
-	bootty.process.stop(PROCESS)
-	running = false
-	state_for(MANAGED_PANE).status = "stopped"
-	return snapshot(MANAGED_PANE)
+	target = "pane",
+}, function(context)
+	invoke({
+		command = "kill_pane",
+		target = context.target,
+	})
+	return { stopped = true }
 end)
 
 bootty.commands.register({
@@ -231,7 +198,7 @@ bootty.commands.register({
 }, function(context)
 	local event = bootty.json.decode(context.arguments[1])
 	local reported = context.arguments[2]
-	local pane = if reported and reported ~= "" then reported else MANAGED_PANE
+	local pane = if reported and reported ~= "" then reported else "unknown"
 	local state = state_for(pane)
 	state.source = "existing"
 	state.error = nil
@@ -241,14 +208,13 @@ bootty.commands.register({
 	local result = snapshot(pane)
 	-- A finished session has nothing left to show, and keeping it would grow one entry per pane
 	-- bootty ever hosted.
-	if pane ~= MANAGED_PANE and state.status == "stopped" then
+	if state.status == "stopped" then
 		panes[pane] = nil
 	end
 	return result
 end)
 
 bootty.ui.register({ id = "agents.pi", placement = "session", order = 900, interval = 0.1 }, function()
-	drain()
 	return ui.session_components({
 		sessions = bootty.sessions(),
 		render = function(ctx)

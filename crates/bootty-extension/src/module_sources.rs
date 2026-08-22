@@ -350,7 +350,7 @@ pub(crate) fn builtin_module(identity: &ModuleIdentity) -> Option<ModuleSource> 
 
 fn builtin_source(identity: &ModuleIdentity) -> Option<String> {
     if let Some(builtin) =
-        builtins::agent_modules().find(|builtin| identity.as_str() == builtin.identity)
+        builtins::discovered_modules().find(|builtin| identity.as_str() == builtin.identity)
     {
         return Some(builtin.source.to_owned());
     }
@@ -378,8 +378,8 @@ pub(crate) fn discover_modules(root: &Path) -> Result<ModuleScan, String> {
             (identity, loaded)
         })
         .collect::<BTreeMap<_, _>>();
-    modules.extend(builtins::agent_modules().map(|builtin| {
-        let identity = ModuleIdentity::parse(builtin.identity).expect("built-in agent identity");
+    modules.extend(builtins::discovered_modules().map(|builtin| {
+        let identity = ModuleIdentity::parse(builtin.identity).expect("built-in module identity");
         let loaded = Ok(module_source_from_text(
             identity.clone(),
             builtin.source.to_owned(),

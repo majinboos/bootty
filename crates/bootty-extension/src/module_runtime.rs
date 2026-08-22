@@ -517,6 +517,8 @@ fn install_host_interface(
             let invocation = serde_json::from_value(value)
                 .map_err(|error| mlua::Error::runtime(error.to_string()))?;
             let outcome = submit_app_command(&app_commands, invocation, &active);
+            let outcome = serde_json::to_value(outcome)
+                .map_err(|error| mlua::Error::runtime(error.to_string()))?;
             lua.to_value(&outcome)
         })?,
     )?;
@@ -556,7 +558,7 @@ fn install_host_interface(
     // `bootty.integration`: the adapter another tool needs before this module can see anything.
     // `dir` is where Bootty writes the files, so a module composes the absolute path it references
     // from its own `merge` value. The host knows only "write these files" and "merge this JSON" —
-    // every hook name, agent name and config path belongs to the module.
+    // every tool-specific name and config path belongs to the module.
     let integration = lua.create_table()?;
     integration.set("dir", host.integration_dir.to_string_lossy().into_owned())?;
     let integration_setup = Arc::clone(&host.control);
@@ -919,6 +921,15 @@ fn invoke_handler(
                     context
                         .set("arguments", arguments)
                         .map_err(|error| error.to_string())?;
+                    let target = lua
+                        .to_value(&work.invocation.target)
+                        .map_err(|error| error.to_string())?;
+                    context
+                        .set("target", target)
+                        .map_err(|error| error.to_string())?;
+                    context
+                        .set("target_supplied", work.target_supplied)
+                        .map_err(|error| error.to_string())?;
                     handler
                         .call::<LuaValue>(context)
                         .map_err(|error| error.to_string())
@@ -959,7 +970,8 @@ fn submit_app_command(
     invocation: CommandInvocation,
     active: &ActiveInvocation,
 ) -> CommandOutcome {
-    let receiver = match commands.submit(invocation, active.deadline, active.cancellation.clone()) {
+    let cancellation = CommandCancellation::new();
+    let receiver = match commands.submit(invocation, active.deadline, cancellation.clone()) {
         Ok(receiver) => receiver,
         Err(error) => {
             return match error {
@@ -974,11 +986,12 @@ fn submit_app_command(
     };
     loop {
         if active.cancellation.is_cancelled() {
+            cancellation.cancel();
             return command_failure("cancelled", "command was cancelled");
         }
         let remaining = active.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            active.cancellation.cancel();
+            cancellation.cancel();
             return command_failure("deadline_exceeded", "command deadline expired");
         }
         match receiver.recv_timeout(remaining.min(Duration::from_millis(5))) {

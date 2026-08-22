@@ -408,7 +408,7 @@ impl AppState {
                 ScopedSessionTarget::new(self.workspace.active.binding.scope, session.id.clone())
             })
     }
-    pub(super) fn apply_terminal_input(
+    pub(crate) fn apply_terminal_input(
         &mut self,
         command: TerminalInputCommand,
         effects: &mut Vec<AppEffect>,

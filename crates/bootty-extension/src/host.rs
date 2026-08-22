@@ -246,7 +246,7 @@ impl ExtensionHost {
     }
 
     /// Every surface the loaded modules are currently publishing, across placements. This is the
-    /// live render — real usage figures, a real agent's state — which is what a preview of an
+    /// live render — real usage figures, live process state — which is what a preview of an
     /// unedited module should show rather than a sandbox with invented facts.
     #[must_use]
     pub fn published_surfaces(&self) -> Vec<PublishedSurfaceSnapshot> {

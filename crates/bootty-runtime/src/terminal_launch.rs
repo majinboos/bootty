@@ -94,9 +94,9 @@ pub(crate) fn spawn(
     command.env(COLORTERM_ENV, &config.colorterm);
     command.env(TERM_PROGRAM_ENV, TERMINAL_PROGRAM);
     command.env(TERM_PROGRAM_VERSION_ENV, TERMINAL_PROGRAM_VERSION);
-    // Pane identity for everything the pane runs, so a coding agent reporting an event can name the
-    // session it came from. Only backends that spawn the pane's own PTY know it; a tmux attach
-    // leaves it unset because tmux exports the same id as `$TMUX_PANE` inside each of its panes.
+    // Pane identity for programs that report which visible terminal they run in. Only backends that
+    // spawn the pane's own PTY know it; a tmux attach leaves it unset because tmux exports the same
+    // id as `$TMUX_PANE` inside each of its panes.
     if let Some(pane_id) = &config.pane_id {
         command.env(BOOTTY_PANE_ENV, pane_id);
     }

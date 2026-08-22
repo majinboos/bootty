@@ -66,6 +66,91 @@ local function apply_hook(state, event)
 	end
 end
 
+local function invoke(invocation)
+	local outcome = bootty.commands.invoke(invocation)
+	if outcome.status ~= "success" then
+		error(outcome.message or ("command failed: " .. tostring(outcome.status)))
+	end
+	return outcome.value
+end
+
+local function write(context, text)
+	local invocation = {
+		command = "terminal.write",
+		arguments = { text },
+	}
+	if context.target_supplied then
+		invocation.target = context.target
+	end
+	invoke(invocation)
+	return { sent = true }
+end
+
+local function submit(context, text)
+	local invocation = { command = "terminal.paste", arguments = { text } }
+	if context.target_supplied then
+		invocation.target = context.target
+	end
+	invoke(invocation)
+	invocation = { command = "terminal.submit" }
+	if context.target_supplied then
+		invocation.target = context.target
+	end
+	invoke(invocation)
+	return { sent = true }
+end
+
+bootty.commands.register({
+	id = "agents.claude.start",
+	title = "Start Claude Code",
+	mutation = "write",
+	target = "terminal",
+	arguments = {
+		{ name = "cwd", type = "string" },
+		{ name = "program", type = "string" },
+	},
+}, function(context)
+	if not context.target_supplied then
+		local created = invoke({ command = "new_tab" }).created
+		if not created then
+			error("new tab did not return its terminal target")
+		end
+		context.target = created
+		context.target_supplied = true
+	end
+	local cwd = context.arguments[1]
+	local program = context.arguments[2] or "claude"
+	local command = bootty.shell.quote(program)
+	if cwd and cwd ~= "" then
+		command = "cd " .. bootty.shell.quote(cwd) .. " && exec " .. command
+	else
+		command = "exec " .. command
+	end
+	return submit(context, command)
+end)
+
+for _, command_type in ipairs({ "prompt", "steer", "follow_up" }) do
+	local current = command_type
+	bootty.commands.register({
+		id = "agents.claude." .. current,
+		title = "Send text to Claude Code",
+		mutation = "write",
+		target = "terminal",
+		arguments = { { name = "message", type = "string", required = true } },
+	}, function(context)
+		return submit(context, context.arguments[1])
+	end)
+end
+
+bootty.commands.register({
+	id = "agents.claude.abort",
+	title = "Interrupt Claude Code",
+	mutation = "destructive",
+	target = "terminal",
+}, function(context)
+	return write(context, "\003")
+end)
+
 bootty.commands.register({
 	id = "agents.claude.ingest",
 	title = "Ingest a Claude Code hook event",

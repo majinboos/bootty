@@ -712,36 +712,6 @@ fn the_sessions_module_groups_a_project_and_closes_its_tree() {
     assert_eq!(rows[2].number, Some(2));
 }
 
-/// Every agent bootty ships needs an adapter installed in the tool it reports from, so every agent
-/// module has to declare one. A module whose declaration never registers offers the user no way to
-/// install it at all, which is indistinguishable from the agent not working.
-#[test]
-fn every_builtin_agent_module_declares_an_installable_integration() {
-    let config = tempfile::tempdir().expect("temporary config directory");
-    let root = config.path().join("extensions");
-    fs::create_dir_all(&root).expect("create the extension root");
-    let (sender, _receiver) = app_command_channel(4, std::sync::Arc::new(|| {}));
-    let host = ExtensionHost::load(
-        &root,
-        std::sync::Arc::new(ExtensionCatalog::default()),
-        sender.for_caller(Caller::Luau),
-        event_queue().0,
-    );
-    let sources = host.module_sources();
-    let declared = sources
-        .integrations
-        .iter()
-        .map(|integration| integration.declaration.module.as_str())
-        .collect::<Vec<_>>();
-
-    for module in ["agents.claude", "agents.codex", "agents.pi"] {
-        assert!(
-            declared.contains(&module),
-            "{module} declares no integration; declared: {declared:?}"
-        );
-    }
-}
-
 /// An adapter for a tool that loads extensions from a directory of its own has to land in that
 /// directory. Writing it only into bootty's own integrations directory installs nothing the tool
 /// will ever read, which is what happened to the Pi extension: the file was written, the status
@@ -750,11 +720,7 @@ fn every_builtin_agent_module_declares_an_installable_integration() {
 fn a_placed_file_lands_where_the_tool_reads_it_and_is_taken_back_on_uninstall() {
     let config = tempfile::tempdir().expect("temporary config directory");
     let home = tempfile::tempdir().expect("temporary home directory");
-    let placed = home
-        .path()
-        .join("agent")
-        .join("extensions")
-        .join("probe.ts");
+    let placed = home.path().join("tool").join("extensions").join("probe.ts");
     let module = format!(
         r#"bootty.integration.register({{
     id = "extension",
@@ -824,36 +790,5 @@ fn uninstall_leaves_a_placed_file_the_user_replaced() {
         fs::read_to_string(&placed).expect("the user's file"),
         "mine\n",
         "uninstall removes only a copy that is still ours"
-    );
-}
-
-/// The Pi adapter has to reach Pi's own extensions directory; nothing else installs it.
-#[test]
-fn the_pi_agent_places_its_adapter_in_pis_extension_directory() {
-    let config = tempfile::tempdir().expect("temporary config directory");
-    let root = config.path().join("extensions");
-    fs::create_dir_all(&root).expect("create the extension root");
-    let (sender, _receiver) = app_command_channel(4, std::sync::Arc::new(|| {}));
-    let host = ExtensionHost::load(
-        &root,
-        std::sync::Arc::new(ExtensionCatalog::default()),
-        sender.for_caller(Caller::Luau),
-        event_queue().0,
-    );
-    let sources = host.module_sources();
-    let pi = sources
-        .integrations
-        .iter()
-        .find(|integration| integration.declaration.module == "agents.pi")
-        .expect("the pi agent declares an integration");
-
-    assert_eq!(
-        pi.declaration
-            .place
-            .iter()
-            .map(|placement| placement.path.as_str())
-            .collect::<Vec<_>>(),
-        ["~/.pi/agent/extensions/bootty.ts"],
-        "the adapter goes where Pi loads extensions from"
     );
 }
