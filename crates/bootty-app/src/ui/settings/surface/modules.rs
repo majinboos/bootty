@@ -329,7 +329,12 @@ fn module_list(
     selected: &mut Option<ModuleIdentity>,
 ) {
     let palette = win.palette;
-    let mut modules = configured_modules(win, list).clone();
+    let mut modules =
+        if list == SidebarList::Session && !win.config.sidebar.session_modules_configured {
+            available.to_vec()
+        } else {
+            configured_modules(win, list).clone()
+        };
     let mut toggled = None;
     let reorder = super::reorderable_list(
         ui,
@@ -445,7 +450,7 @@ fn module_toggle_row(
 }
 
 /// The module file a surface name is edited through. A loaded module claims the name by its
-/// namespace (`agents.pi` for `agents/pi.luau`) or by its file stem; with no module set to consult,
+/// namespace (`tools.probe` for `tools/probe.luau`) or by its file stem; with no module set to consult,
 /// fall back to the like-named file at the extension root. A surface declared under a name that
 /// matches no module file is not reachable this way — open its module under OTHER MODULES.
 fn surface_identity(identities: &[ModuleIdentity], name: &str) -> Option<ModuleIdentity> {
@@ -772,7 +777,7 @@ pub fn module_preview(
         ui.label(RichText::new(error).color(palette.destructive).size(11.0));
     }
     for surface in surfaces {
-        // A module that reads the machine — a usage query, an agent's state — has nothing to draw
+        // A module that reads the machine has nothing to draw
         // from example data. Say that, or its preview looks broken rather than empty.
         if surface.items.is_empty() {
             super::settings_notice(

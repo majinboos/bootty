@@ -53,7 +53,7 @@ Cargo test shape:
 
 ```bash
 cargo test --workspace --doc
-cargo test -p bootty-app --test terminal_background_wgpu -- --ignored
+cargo test -p bootty-app --test terminal_background_wgpu
 cargo test --workspace
 ```
 

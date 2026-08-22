@@ -38,7 +38,7 @@ run = "cargo test --workspace --doc"
 
 [tasks."test:wgpu"]
 description = "Run WGPU offscreen pixel readback tests"
-run = "cargo test -p bootty-app --test terminal_background_wgpu -- --ignored"
+run = "cargo test -p bootty-app --test terminal_background_wgpu"
 
 [tasks."test:full"]
 description = "Run the full Cargo test suite including doc-tests"

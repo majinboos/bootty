@@ -155,9 +155,6 @@ fn sidebar_modules_default_and_override_in_order() {
         [
             "diffs",
             "process",
-            "agents.pi",
-            "agents.codex",
-            "agents.claude",
             "directory",
             "branch",
             "ports",

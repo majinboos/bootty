@@ -11,6 +11,7 @@ pub const EVENT_QUEUE_LIMIT: usize = 64;
 
 pub(crate) struct ExtensionInvocationRequest {
     pub(crate) invocation: CommandInvocation,
+    pub(crate) target_supplied: bool,
     pub(crate) deadline: Instant,
     pub(crate) cancellation: CommandCancellation,
     pub(crate) response: mpsc::Sender<CommandOutcome>,
@@ -105,6 +106,16 @@ impl ExtensionInvocationSender {
         deadline: Instant,
         cancellation: CommandCancellation,
     ) -> mpsc::Receiver<CommandOutcome> {
+        self.invoke_with_target(invocation, deadline, cancellation, false)
+    }
+
+    pub fn invoke_with_target(
+        &self,
+        invocation: CommandInvocation,
+        deadline: Instant,
+        cancellation: CommandCancellation,
+        target_supplied: bool,
+    ) -> mpsc::Receiver<CommandOutcome> {
         let (response, receiver) = mpsc::channel();
         if cancellation.is_cancelled() {
             let _ = response.send(cancelled_outcome());
@@ -112,6 +123,7 @@ impl ExtensionInvocationSender {
         }
         let request = ExtensionInvocationRequest {
             invocation,
+            target_supplied,
             deadline,
             cancellation,
             response,

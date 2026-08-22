@@ -53,12 +53,6 @@ Process
 
 Extensions
 
-Pi
-
-Codex
-
-Claude
-
 Directory
 
 Git branch

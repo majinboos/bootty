@@ -19,28 +19,18 @@ const SESSION: &[(&str, &str)] = &[
     ("progress", include_str!("session_defaults/progress.luau")),
 ];
 
-const AGENTS: &[(&str, &str)] = &[
-    ("agents/pi.luau", include_str!("agent_integrations/pi.luau")),
-    (
-        "agents/codex.luau",
-        include_str!("agent_integrations/codex.luau"),
-    ),
-    (
-        "agents/claude.luau",
-        include_str!("agent_integrations/claude.luau"),
-    ),
-];
-
 pub(super) struct BuiltinExtensionModule {
     pub identity: &'static str,
     pub placement: &'static str,
     pub source: &'static str,
 }
 
-pub(super) struct BuiltinAgentModule {
+pub(super) struct BuiltinModule {
     pub identity: &'static str,
     pub source: &'static str,
 }
+
+include!(concat!(env!("OUT_DIR"), "/builtin_modules.rs"));
 
 pub(super) fn modules() -> Vec<BuiltinExtensionModule> {
     let mut modules = Vec::new();
@@ -62,8 +52,6 @@ pub(super) fn modules() -> Vec<BuiltinExtensionModule> {
     modules
 }
 
-pub(super) fn agent_modules() -> impl Iterator<Item = BuiltinAgentModule> {
-    AGENTS
-        .iter()
-        .map(|(identity, source)| BuiltinAgentModule { identity, source })
+pub(super) fn discovered_modules() -> impl Iterator<Item = &'static BuiltinModule> {
+    DISCOVERED.iter()
 }

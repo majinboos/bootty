@@ -1,6 +1,7 @@
 # Agent integrations
 
-Bootty uses native agent protocols.
+Bootty manages visible agent sessions. It does not hide an agent behind a
+headless RPC subprocess.
 
 Bootty does not infer agent state from process names, terminal output, screen
 content, or transcript files. An agent reports, or Bootty shows nothing.
@@ -18,15 +19,16 @@ Each adapter reads `${TMUX_PANE:-${BOOTTY_PANE:-}}` and passes it as the
 second argument of its `ingest` command. An event with no pane lands on no
 session row.
 
-Every module declares its adapter through `bootty.integration.register`, so
-the files under `integrations/` are the same text Bootty installs.
+Every module declares and owns its adapter through
+`bootty.integration.register`. Install or remove it from that module's entry in
+Settings. Bootty writes the adapter and updates the tool's configuration.
 
 ## Pi
 
-The built-in `agents/pi.luau` module starts managed Pi sessions with:
+The built-in `agents/pi.luau` module starts Pi in the selected visible terminal:
 
 ```sh
-pi --mode rpc
+pi
 ```
 
 Use these commands through the Bootty CLI or socket:
@@ -41,8 +43,12 @@ bootty command agents.pi.state
 bootty command agents.pi.stop --yes
 ```
 
-Copy `integrations/pi/bootty.ts` to `~/.pi/agent/extensions/bootty.ts` to
-publish native events from existing interactive Pi sessions.
+With an explicit target, `start` launches in that visible terminal. Without a
+target, it creates a new visible tab first. `prompt`, `steer`, `follow_up`, and
+`abort` operate on their selected visible terminal.
+
+Install the Pi extension from the `agents.pi` module in Settings to publish
+native events from existing interactive Pi sessions.
 
 A project can use `.pi/extensions/bootty.ts` after Pi trusts that project.
 
@@ -57,15 +63,12 @@ It reports any dropped event count through `extension_error`.
 
 ## Codex
 
-The built-in `agents/codex.luau` module starts managed Codex sessions with:
+The built-in `agents/codex.luau` module starts Codex in the selected visible
+terminal:
 
 ```sh
-codex app-server --listen stdio://
+codex
 ```
-
-The managed thread uses `approvalPolicy = "never"`.
-The managed request fails instead of waiting for an approval response that
-Bootty does not own.
 
 Use these commands through the Bootty CLI or socket:
 
@@ -78,36 +81,8 @@ bootty command agents.codex.state
 bootty command agents.codex.stop --yes
 ```
 
-Copy `integrations/codex/bootty-hook.sh` to a stable executable path.
-
-Add that path as a command hook for the native Codex events that Bootty must
-show.
-
-For example, `~/.codex/hooks.json` can contain:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{
-      "matcher": "startup|resume|clear|compact",
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "UserPromptSubmit": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "PreToolUse": [{
-      "matcher": ".*",
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "Stop": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "SessionEnd": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 1}]
-    }]
-  }
-}
-```
+Install the Codex hooks from the `agents.codex` module in Settings. The module
+owns both the hook script and the native hook configuration Bootty merges.
 
 The hook reads one native hook JSON object from stdin.
 
@@ -116,53 +91,20 @@ pane it ran in as the second argument.
 
 ## Claude Code
 
-Claude Code reports through command hooks, like Codex.
+Claude Code reports through command hooks, like Codex, and can also be started
+in the selected visible terminal.
 
-Bootty starts no managed Claude Code process; `agents.claude.state` inspects
-what the hooks reported:
+`agents.claude.state` inspects what the hooks reported:
 
 ```sh
 bootty command agents.claude.state
 bootty command agents.claude.state %3
+bootty command agents.claude.start /path/to/worktree
 ```
 
-Copy `integrations/claude/bootty-hook.sh` to a stable executable path.
-
-Add that path as a command hook for the native Claude Code events that Bootty
-must show.
-
-For example, `~/.claude/settings.json` can contain:
-
-```json
-{
-  "hooks": {
-    "SessionStart": [{
-      "matcher": "startup|resume|clear|compact",
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "UserPromptSubmit": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "PreToolUse": [{
-      "matcher": "*",
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "PostToolUse": [{
-      "matcher": "*",
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "Notification": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "Stop": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 2}]
-    }],
-    "SessionEnd": [{
-      "hooks": [{"type": "command", "command": "/absolute/path/bootty-hook.sh", "timeout": 1}]
-    }]
-  }
-}
-```
+Install the Claude Code hooks from the `agents.claude` module in Settings. The
+module owns both the hook script and the native hook configuration Bootty
+merges.
 
 The hook reads one native hook JSON object from stdin and calls
 `agents.claude.ingest` through the live Bootty owner.
@@ -171,12 +113,9 @@ The hook reads one native hook JSON object from stdin and calls
 
 ## Limits and cleanup
 
-Each extension generation owns at most four managed processes.
+Agent processes are owned by the visible mux pane that launched them. Closing
+that pane stops its agent process tree. Reloading an integration does not stop
+the interactive session.
 
-Each process has bounded input and output queues.
-
-Extension replacement and removal stop the process trees owned by the retired
-generation.
-
-Agent-specific JSON schemas and lifecycle rules stay in the Luau modules and
-adapter files.
+Agent-specific JSON schemas, lifecycle rules, and adapter source stay in the
+Luau modules.

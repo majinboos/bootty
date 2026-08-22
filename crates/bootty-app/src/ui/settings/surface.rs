@@ -971,9 +971,6 @@ fn chrome_color_row_with_alpha(
 pub(super) fn module_display_name(module: &str) -> String {
     match module {
         "sessions" => "Sessions".to_owned(),
-        "agents.codex" => "Codex".to_owned(),
-        "agents.pi" => "Pi".to_owned(),
-        "agents.claude" => "Claude".to_owned(),
         "codexbar" => "Usage footer".to_owned(),
         "diffs" => "Diffs".to_owned(),
         "process" => "Process".to_owned(),
@@ -985,6 +982,17 @@ pub(super) fn module_display_name(module: &str) -> String {
         "windows" => "Windows".to_owned(),
         "sysinfo" => "System info".to_owned(),
         "clock" => "Clock".to_owned(),
-        other => other.replace(['-', '_'], " "),
+        other => {
+            let name = other
+                .rsplit('.')
+                .next()
+                .unwrap_or(other)
+                .replace(['-', '_'], " ");
+            let mut chars = name.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().chain(chars).collect())
+                .unwrap_or_default()
+        }
     }
 }

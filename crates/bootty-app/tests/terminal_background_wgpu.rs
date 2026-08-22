@@ -467,7 +467,6 @@ fn terminal_frame_command_variants_produce_wgpu_callback_shape() {
 }
 
 #[test]
-#[ignore = "requires WGPU offscreen readback; run `mise run test:wgpu`"]
 fn kitty_apc_image_renders_visible_pixels_through_bare_host_wgpu_path() {
     let viewport = BareTerminalViewport::new(
         10,
@@ -541,7 +540,6 @@ fn kitty_apc_image_renders_visible_pixels_through_bare_host_wgpu_path() {
 }
 
 #[test]
-#[ignore = "requires WGPU offscreen readback; run `mise run test:wgpu`"]
 fn image_only_frame_renders_visible_pixels_offscreen() {
     let pixels = render_frame_to_pixels(&image_only_frame(), 10, 10);
 
@@ -556,7 +554,6 @@ fn image_only_frame_renders_visible_pixels_offscreen() {
 }
 
 #[test]
-#[ignore = "requires WGPU offscreen readback; run `mise run test:wgpu`"]
 fn image_after_surface_background_renders_visible_pixels_offscreen() {
     let pixels = render_frame_to_pixels(&background_then_image_frame(), 10, 10);
 
@@ -571,7 +568,6 @@ fn image_after_surface_background_renders_visible_pixels_offscreen() {
 }
 
 #[test]
-#[ignore = "requires WGPU offscreen readback; run `mise run test:wgpu`"]
 fn reused_renderer_prepares_same_frame_without_pixel_drift() {
     let frame = background_then_image_frame();
     let pixels = render_frames_with_reused_renderer(&[frame.clone(), frame], 10, 10);
@@ -580,7 +576,6 @@ fn reused_renderer_prepares_same_frame_without_pixel_drift() {
 }
 
 #[test]
-#[ignore = "requires WGPU offscreen readback; run `mise run test:wgpu`"]
 fn reused_renderer_preserves_mixed_layer_order_without_pixel_drift() {
     let frame = mixed_background_image_text_cursor_frame();
     let pixels = render_frames_with_reused_renderer(&[frame.clone(), frame], 40, 20);

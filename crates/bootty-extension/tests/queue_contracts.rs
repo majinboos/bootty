@@ -67,6 +67,12 @@ bootty.commands.register({ id = "probe.echo", title = "Echo" }, function()
 end)
 "#;
 
+const TARGET_PROBE: &str = r#"
+bootty.commands.register({ id = "probe.echo", title = "Echo" }, function(context)
+    return { target_supplied = context.target_supplied }
+end)
+"#;
+
 fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
     command_channel(capacity, Arc::new(|| {}))
 }
@@ -127,6 +133,38 @@ fn success_version(version: u64) -> CommandOutcome {
     CommandOutcome::Success {
         value: serde_json::json!({"version": version}),
         warnings: Vec::new(),
+    }
+}
+
+#[test]
+fn invocation_context_distinguishes_an_explicit_target() {
+    let directory = tempfile::tempdir().expect("temporary extension root");
+    fs::write(directory.path().join("probe.luau"), TARGET_PROBE).expect("write target probe");
+    let catalog = Arc::new(ExtensionCatalog::default());
+    let (sender, _receiver) = app_command_channel(4);
+    let _host = ExtensionHost::load(
+        directory.path(),
+        Arc::clone(&catalog),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+    let command = command_sender(&catalog);
+
+    for supplied in [false, true] {
+        let CommandOutcome::Success { value, warnings } = command
+            .invoke_with_target(
+                CommandInvocation::new("probe.echo", Vec::new(), Caller::Socket),
+                Instant::now() + Duration::from_secs(1),
+                CommandCancellation::new(),
+                supplied,
+            )
+            .recv_timeout(Duration::from_secs(1))
+            .expect("target probe outcome")
+        else {
+            panic!("target probe failed");
+        };
+        assert!(warnings.is_empty());
+        assert_eq!(value["target_supplied"], supplied);
     }
 }
 

@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use bootty_render::{
     geometry::{CellMetrics, SurfaceRect, TerminalGeometry, TerminalPadding},
@@ -926,22 +922,20 @@ fn bare_host_routes_sprite_families_through_sprite_commands() {
 }
 
 #[test]
-#[ignore = "requires Ghostty sprite range fixture that is not vendored in this rewrite"]
-fn bare_host_routes_all_legacy_computing_supplement_draw_ranges_through_sprite_commands() {
-    for cp in ghostty_legacy_computing_supplement_draw_codepoints() {
+fn bare_host_routes_all_owned_legacy_computing_supplement_ranges_through_sprite_commands() {
+    for cp in legacy_computing_supplement_codepoints() {
         assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid upstream U+{cp:04X}")),
+            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
             SpriteFamily::LegacyComputingSupplement,
         );
     }
 }
 
 #[test]
-#[ignore = "requires Ghostty sprite range fixture that is not vendored in this rewrite"]
-fn bare_host_routes_all_legacy_computing_draw_ranges_through_sprite_commands() {
-    for cp in ghostty_legacy_computing_draw_codepoints() {
+fn bare_host_routes_all_owned_legacy_computing_ranges_through_sprite_commands() {
+    for cp in legacy_computing_codepoints() {
         assert_bare_host_routes_sprite_family(
-            char::from_u32(cp).unwrap_or_else(|| panic!("invalid upstream U+{cp:04X}")),
+            char::from_u32(cp).unwrap_or_else(|| panic!("invalid U+{cp:04X}")),
             SpriteFamily::LegacyComputing,
         );
     }
@@ -986,32 +980,20 @@ fn assert_bare_host_routes_sprite_family(ch: char, family: SpriteFamily) -> usiz
     sprite
 }
 
-fn ghostty_legacy_computing_draw_codepoints() -> Vec<u32> {
-    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/ghostty/src/font/sprite/draw/symbols_for_legacy_computing.zig");
-    let source = fs::read_to_string(&source_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_path.display()));
-    let mut codepoints = Vec::new();
-
-    for line in source.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("pub fn draw") else {
-            continue;
-        };
-        let Some(name) = rest.split('(').next() else {
-            continue;
-        };
-        let Some((start, end)) = parse_draw_range(name) else {
-            continue;
-        };
-        if !(0x1FB00..=0x1FBFF).contains(&start) {
-            continue;
-        }
-        codepoints.extend(start..=end);
-    }
-
-    codepoints.sort_unstable();
-    codepoints.dedup();
-    codepoints
+fn legacy_computing_codepoints() -> impl Iterator<Item = u32> {
+    [
+        0x1FB00..=0x1FB67,
+        0x1FB68..=0x1FB6F,
+        0x1FB70..=0x1FB99,
+        0x1FB9A..=0x1FB9F,
+        0x1FBA0..=0x1FBAF,
+        0x1FBBD..=0x1FBBF,
+        0x1FBCE..=0x1FBCF,
+        0x1FBD0..=0x1FBDF,
+        0x1FBE0..=0x1FBEF,
+    ]
+    .into_iter()
+    .flatten()
 }
 
 fn box_line_junction_codepoints() -> impl Iterator<Item = u32> {
@@ -1032,40 +1014,20 @@ fn box_double_line_codepoints() -> impl Iterator<Item = u32> {
     0x2550..=0x256C
 }
 
-fn ghostty_legacy_computing_supplement_draw_codepoints() -> Vec<u32> {
-    let source_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../vendor/ghostty/src/font/sprite/draw/symbols_for_legacy_computing_supplement.zig",
-    );
-    let source = fs::read_to_string(&source_path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", source_path.display()));
-    let mut codepoints = Vec::new();
-
-    for line in source.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("pub fn draw") else {
-            continue;
-        };
-        let Some(name) = rest.split('(').next() else {
-            continue;
-        };
-        let Some((start, end)) = parse_draw_range(name) else {
-            continue;
-        };
-        if !(0x1CC00..=0x1CEBF).contains(&start) {
-            continue;
-        }
-        codepoints.extend(start..=end);
-    }
-
-    codepoints.sort_unstable();
-    codepoints.dedup();
-    codepoints
-}
-
-fn parse_draw_range(name: &str) -> Option<(u32, u32)> {
-    let (start, end) = name.split_once('_').unwrap_or((name, name));
-    let start = u32::from_str_radix(start, 16).ok()?;
-    let end = u32::from_str_radix(end, 16).ok()?;
-    Some((start, end))
+fn legacy_computing_supplement_codepoints() -> impl Iterator<Item = u32> {
+    [
+        0x1CC1B..=0x1CC1E,
+        0x1CC21..=0x1CC2F,
+        0x1CC30..=0x1CC3F,
+        0x1CD00..=0x1CDE5,
+        0x1CE00..=0x1CE01,
+        0x1CE0B..=0x1CE0C,
+        0x1CE16..=0x1CE19,
+        0x1CE51..=0x1CE8F,
+        0x1CE90..=0x1CEAF,
+    ]
+    .into_iter()
+    .flatten()
 }
 
 fn render_frame_with_text(ch: char) -> RenderFrame {

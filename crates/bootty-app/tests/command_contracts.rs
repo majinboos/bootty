@@ -59,11 +59,21 @@ fn core_commands_share_one_typed_catalog_contract() {
     let write = catalog
         .describe("terminal.write")
         .expect("terminal write command");
+    let paste = catalog
+        .describe("terminal.paste")
+        .expect("terminal paste command");
+    let submit = catalog
+        .describe("terminal.submit")
+        .expect("terminal submit command");
 
     assert_eq!(read.mutation, MutationClass::Read);
     assert_eq!(read.target, Some(ResourceKind::Terminal));
     assert_eq!(write.mutation, MutationClass::Write);
     assert_eq!(write.target, Some(ResourceKind::Terminal));
+    assert_eq!(paste.mutation, MutationClass::Write);
+    assert_eq!(paste.target, Some(ResourceKind::Terminal));
+    assert_eq!(submit.mutation, MutationClass::Write);
+    assert_eq!(submit.target, Some(ResourceKind::Terminal));
     let resource = catalog
         .describe("resource.current")
         .expect("current resource command");
@@ -610,10 +620,12 @@ fn native_window_actions_use_the_binding_owned_plan() {
         CommandInvocation::from_action("new_tab", Caller::Keybinding),
         started + Duration::from_millis(5),
     );
-    assert!(
-        matches!(outcome, CommandOutcome::Success { .. }),
-        "{outcome:?}"
-    );
+    let CommandOutcome::Success { value, .. } = outcome else {
+        panic!("new tab outcome: {outcome:?}");
+    };
+    let created: CommandTarget =
+        serde_json::from_value(value["created"].clone()).expect("created terminal target");
+    assert_eq!(created.kind, ResourceKind::Terminal);
     for tick in 5..10 {
         state.update_frame(frame(started + Duration::from_millis(tick)));
     }
@@ -642,6 +654,20 @@ fn native_window_actions_use_the_binding_owned_plan() {
         "{outcome:?}"
     );
     assert_eq!(state.mux().selected_window(), Some(first_window.as_str()));
+    let current = submit_command(
+        &mut state,
+        CommandInvocation::new(
+            "resource.current",
+            vec!["terminal".to_owned()],
+            Caller::Socket,
+        ),
+        started + Duration::from_millis(10),
+    );
+    let CommandOutcome::Success { value, .. } = current else {
+        panic!("current terminal outcome: {current:?}");
+    };
+    let first_terminal: CommandTarget =
+        serde_json::from_value(value["target"].clone()).expect("first terminal target");
     let outcome = submit_command(
         &mut state,
         CommandInvocation::from_action("last_tab", Caller::Keybinding),
@@ -652,18 +678,27 @@ fn native_window_actions_use_the_binding_owned_plan() {
         "{outcome:?}"
     );
     assert_eq!(state.mux().selected_window(), Some(second_window.as_str()));
+
+    let mut write = CommandInvocation::new("terminal.write", vec![" ".to_owned()], Caller::Socket);
+    write.target = Some(first_terminal);
+    let outcome = submit_command(&mut state, write, started + Duration::from_millis(12));
+    assert!(
+        matches!(outcome, CommandOutcome::Success { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(state.mux().selected_window(), Some(first_window.as_str()));
 }
 
 #[test]
 fn extension_commands_are_namespaced_and_removed_by_generation() {
     let directory = tempfile::tempdir().expect("temporary extensions");
     std::fs::write(
-        directory.path().join("agent.luau"),
+        directory.path().join("probe.luau"),
         r#"
 bootty.commands.register({
-    id = "agent.inspect",
-    title = "Inspect Agent",
-    description = "Inspect one agent session.",
+    id = "probe.inspect",
+    title = "Inspect Probe",
+    description = "Inspect one session.",
     target = "session",
 }, function() return { ok = true } end)
 "#,
@@ -677,11 +712,11 @@ bootty.commands.register({
         sender.for_caller(Caller::Luau),
         event_queue().0,
     );
-    assert!(catalog.describe("agent.inspect").is_some());
+    assert!(catalog.describe("probe.inspect").is_some());
     assert!(matches!(
         catalog
             .resolve(CommandInvocation::from_action(
-                "agent.inspect",
+                "probe.inspect",
                 Caller::Socket,
             ))
             .expect("resolve extension command")
@@ -689,10 +724,10 @@ bootty.commands.register({
         CommandExecutor::Extension(_)
     ));
 
-    std::fs::remove_file(directory.path().join("agent.luau")).expect("remove extension source");
+    std::fs::remove_file(directory.path().join("probe.luau")).expect("remove extension source");
     host.refresh(Instant::now() + Duration::from_secs(1));
     host.refresh(Instant::now() + Duration::from_secs(2));
-    assert!(catalog.describe("agent.inspect").is_none());
+    assert!(catalog.describe("probe.inspect").is_none());
 }
 
 #[test]
@@ -883,7 +918,14 @@ end)
         })
         .expect("nested cancellable command");
     cancellation.cancel();
-    assert!(nested.cancellation.is_cancelled());
+    assert!((0..100).any(|_| {
+        if nested.cancellation.is_cancelled() {
+            true
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+            false
+        }
+    }));
     let outer = outcome
         .recv_timeout(Duration::from_secs(1))
         .expect("cancelled extension outcome");
