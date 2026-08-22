@@ -1,39 +1,266 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock, RwLock,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
+    time::Instant,
 };
 
-use bootty_command::{
-    ArgumentSchema, Caller, CommandDescriptor, CommandInvocation, CommandOutcome, CompactSchema,
-    MutationClass, ResourceKind, ValueType,
-};
-use bootty_control::ControlCatalog;
-use bootty_extension::{ExtensionCatalog, ExtensionInvocationSender};
+pub use crate::mux::controller::CommandCancellation;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     action_catalog::Command,
     app_actions::{KeybindAction, SidebarAction, keybind_action_for_name},
+    mux::RepaintHandle,
 };
 
-mod runtime;
+mod decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
-pub(crate) use runtime::CommandRuntime;
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
 
-pub fn command_invocation_from_catalog(
-    command: Command,
-    caller: Caller,
-) -> Option<CommandInvocation> {
-    command
-        .palette_action()
-        .map(|action| CommandInvocation::from_action(action, caller))
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Caller {
+    CommandPalette,
+    Keybinding,
+    BuiltinKeybinding,
+    Cli,
+    Socket,
+    Luau,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationClass {
+    Read,
+    Write,
+    Destructive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    String,
+    Integer,
+    Number,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgumentSchema {
+    pub name: String,
+    pub value_type: ValueType,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactSchema {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<ArgumentSchema>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandDescriptor {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub mutation: MutationClass,
+    pub arguments: CompactSchema,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<ResourceKind>,
+    #[serde(default)]
+    pub palette: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceKind {
+    Instance,
+    ApplicationWindow,
+    Binding,
+    Session,
+    MuxWindow,
+    Pane,
+    Terminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandTarget {
+    pub kind: ResourceKind,
+    /// Host-issued scoped identifier. Callers must treat this value as opaque.
+    pub handle: String,
+    #[serde(with = "decimal_u64")]
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmation {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CommandTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInvocation {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<String>,
+    pub caller: Caller,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<CommandTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<Confirmation>,
+}
+
+impl CommandInvocation {
+    // ponytail: action-string arguments bridge existing keybindings; replace them with schema values
+    // when the external command parser lands.
+    pub fn from_action(action: &str, caller: Caller) -> Self {
+        let (command, arguments) = action
+            .split_once(':')
+            .map_or((action, Vec::new()), |(command, arguments)| {
+                (command, vec![arguments.to_owned()])
+            });
+        Self {
+            command: command.to_owned(),
+            arguments,
+            caller,
+            target: None,
+            confirmation: None,
+        }
+    }
+
+    pub fn from_catalog(command: Command, caller: Caller) -> Option<Self> {
+        command
+            .palette_action()
+            .map(|action| Self::from_action(action, caller))
+    }
+
+    pub fn confirmation(&self) -> Confirmation {
+        Confirmation {
+            command: self.command.clone(),
+            arguments: self.arguments.clone(),
+            target: self.target.clone(),
+        }
+    }
+
+    fn action_name(&self) -> String {
+        match self.arguments.as_slice() {
+            [] => self.command.clone(),
+            arguments => format!("{}:{}", self.command, arguments.join(":")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandWarning {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CommandOutcome {
+    Success {
+        #[serde(default)]
+        value: Value,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        warnings: Vec<CommandWarning>,
+    },
+    Unsupported {
+        message: String,
+    },
+    Unavailable {
+        message: String,
+    },
+    Denied {
+        message: String,
+    },
+    StaleTarget {
+        message: String,
+    },
+    ConfirmationRequired {
+        confirmation: Box<Confirmation>,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+}
+
+impl CommandOutcome {
+    pub fn success() -> Self {
+        Self::Success {
+            value: Value::Null,
+            warnings: Vec::new(),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self::Failed {
+            code: "cancelled".to_owned(),
+            message: "command was cancelled".to_owned(),
+        }
+    }
+
+    pub fn deadline_exceeded() -> Self {
+        Self::Failed {
+            code: "deadline_exceeded".to_owned(),
+            message: "command deadline expired".to_owned(),
+        }
+    }
+
+    pub fn success_with_warning(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Success {
+            value: Value::Null,
+            warnings: vec![CommandWarning {
+                code: code.into(),
+                message: message.into(),
+            }],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoreCommandExecutor {
     Keybind(KeybindAction),
     Sidebar(SidebarAction),
-    CurrentResource(ResourceKind),
     ReadTerminal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedCommandInvocation {
+    pub descriptor: CommandDescriptor,
+    pub executor: CoreCommandExecutor,
+    pub invocation: CommandInvocation,
 }
 
 #[derive(Clone, Debug)]
@@ -46,7 +273,6 @@ struct RegisteredCommand {
 enum CommandExecutorResolver {
     Keybind,
     Sidebar(SidebarAction),
-    CurrentResource,
     ReadTerminal,
     WriteTerminal,
 }
@@ -105,10 +331,6 @@ impl CommandRegistry {
                 CoreCommandExecutor::Keybind(action)
             }
             CommandExecutorResolver::Sidebar(action) => CoreCommandExecutor::Sidebar(action),
-            CommandExecutorResolver::CurrentResource => CoreCommandExecutor::CurrentResource(
-                resource_kind(&invocation.arguments[0])
-                    .expect("validated resource kind has a runtime value"),
-            ),
             CommandExecutorResolver::ReadTerminal => CoreCommandExecutor::ReadTerminal,
             CommandExecutorResolver::WriteTerminal => CoreCommandExecutor::Keybind(
                 KeybindAction::Write(invocation.arguments[0].as_bytes().to_vec()),
@@ -116,7 +338,7 @@ impl CommandRegistry {
         };
         Ok(ResolvedCommandInvocation {
             descriptor,
-            executor: CommandExecutor::Core(executor),
+            executor,
             invocation,
         })
     }
@@ -156,40 +378,7 @@ impl CommandRegistry {
                 },
             );
         }
-        let resource_kind_choices = [
-            "instance",
-            "application_window",
-            "binding",
-            "session",
-            "mux_window",
-            "pane",
-            "terminal",
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect();
         for (descriptor, executor) in [
-            (
-                CommandDescriptor {
-                    id: "resource.current".to_owned(),
-                    title: "Current Resource".to_owned(),
-                    description: "Return the current opaque resource target.".to_owned(),
-                    mutation: MutationClass::Read,
-                    arguments: CompactSchema {
-                        arguments: vec![ArgumentSchema {
-                            name: "kind".to_owned(),
-                            value_type: ValueType::String,
-                            required: true,
-                            choices: resource_kind_choices,
-                            minimum: None,
-                            maximum: None,
-                        }],
-                    },
-                    target: None,
-                    palette: false,
-                },
-                CommandExecutorResolver::CurrentResource,
-            ),
             (
                 CommandDescriptor {
                     id: "terminal.read".to_owned(),
@@ -229,24 +418,24 @@ impl CommandRegistry {
     }
 }
 
-#[derive(Clone)]
-pub enum CommandExecutor {
-    Core(CoreCommandExecutor),
-    Extension(ExtensionInvocationSender),
-}
+pub type ExtensionCommandHandler = Arc<
+    dyn Fn(CommandInvocation, Instant, CommandCancellation) -> Receiver<CommandOutcome>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 #[derive(Clone)]
-pub struct ResolvedCommandInvocation {
+pub struct ResolvedExtensionCommand {
     pub descriptor: CommandDescriptor,
     pub invocation: CommandInvocation,
-    pub executor: CommandExecutor,
+    pub handler: ExtensionCommandHandler,
 }
 
 #[derive(Clone)]
 pub struct CommandCatalog {
     core: &'static CommandRegistry,
-    extensions: Arc<ExtensionCatalog>,
-    control: Arc<ControlCatalog>,
+    extensions: Arc<RwLock<BTreeMap<String, (CommandDescriptor, ExtensionCommandHandler)>>>,
 }
 
 impl std::fmt::Debug for CommandCatalog {
@@ -260,58 +449,97 @@ impl std::fmt::Debug for CommandCatalog {
 
 impl Default for CommandCatalog {
     fn default() -> Self {
-        let core = CommandRegistry::core();
-        let extensions = Arc::new(ExtensionCatalog::with_reserved_commands(
-            core.list().map(|descriptor| descriptor.id.clone()),
-        ));
         Self {
-            core,
-            control: Arc::new(ControlCatalog::new(
-                core.list().cloned().collect(),
-                Arc::clone(&extensions),
-            )),
-            extensions,
+            core: CommandRegistry::core(),
+            extensions: Arc::default(),
         }
     }
 }
 
 impl CommandCatalog {
     pub fn list(&self) -> Vec<CommandDescriptor> {
-        self.control.list()
+        let mut commands = self.core.list().cloned().collect::<Vec<_>>();
+        if let Ok(extensions) = self.extensions.read() {
+            commands.extend(
+                extensions
+                    .values()
+                    .map(|(descriptor, _)| descriptor.clone()),
+            );
+        }
+        commands.sort_by(|left, right| left.id.cmp(&right.id));
+        commands
     }
 
     pub fn describe(&self, id: &str) -> Option<CommandDescriptor> {
-        self.control.describe(id)
+        self.core.describe(id).cloned().or_else(|| {
+            self.extensions
+                .read()
+                .ok()
+                .and_then(|commands| commands.get(id).map(|(descriptor, _)| descriptor.clone()))
+        })
     }
 
     pub fn resolve(
         &self,
         invocation: CommandInvocation,
     ) -> Result<ResolvedCommandInvocation, CommandOutcome> {
-        if self.core.describe(&invocation.command).is_none()
-            && let Some((descriptor, handler)) = self.extensions.command(&invocation.command)
-        {
-            validate_arguments(&descriptor, &invocation.arguments)?;
-            return Ok(ResolvedCommandInvocation {
-                descriptor,
-                invocation,
-                executor: CommandExecutor::Extension(handler),
-            });
-        }
         self.core.resolve(invocation)
     }
 
-    pub fn extensions(&self) -> &ExtensionCatalog {
-        &self.extensions
+    pub fn resolve_extension(
+        &self,
+        invocation: CommandInvocation,
+    ) -> Result<Option<ResolvedExtensionCommand>, CommandOutcome> {
+        let command = self
+            .extensions
+            .read()
+            .ok()
+            .and_then(|commands| commands.get(&invocation.command).cloned());
+        let Some((descriptor, handler)) = command else {
+            return Ok(None);
+        };
+        validate_arguments(&descriptor, &invocation.arguments)?;
+        Ok(Some(ResolvedExtensionCommand {
+            descriptor,
+            invocation,
+            handler,
+        }))
     }
 
-    pub fn extensions_arc(&self) -> Arc<ExtensionCatalog> {
-        Arc::clone(&self.extensions)
+    pub fn register_extension(
+        &self,
+        package: &str,
+        descriptor: CommandDescriptor,
+        handler: ExtensionCommandHandler,
+    ) -> Result<(), String> {
+        if package.is_empty() || !is_namespaced(&descriptor.id, package) {
+            return Err("extension command must be namespaced by its package".to_owned());
+        }
+        if self.core.describe(&descriptor.id).is_some() {
+            return Err("extension command cannot replace a built-in command".to_owned());
+        }
+        let mut extensions = self
+            .extensions
+            .write()
+            .map_err(|_| "command catalog is unavailable".to_owned())?;
+        if extensions.contains_key(&descriptor.id) {
+            return Err(format!("command {} is already registered", descriptor.id));
+        }
+        extensions.insert(descriptor.id.clone(), (descriptor, handler));
+        Ok(())
     }
 
-    pub fn control_catalog(&self) -> Arc<ControlCatalog> {
-        Arc::clone(&self.control)
+    pub fn clear_extensions(&self) {
+        if let Ok(mut extensions) = self.extensions.write() {
+            extensions.clear();
+        }
     }
+}
+
+/// Whether `id` is `package` followed by a dot and a leaf, the namespacing every
+/// extension-supplied command id and event topic must satisfy.
+pub fn is_namespaced(id: &str, package: &str) -> bool {
+    id.starts_with(package) && id[package.len()..].starts_with('.')
 }
 
 fn descriptor_metadata(id: &str, command: Command) -> (&str, &str) {
@@ -444,6 +672,17 @@ fn schema_for(id: &str) -> CompactSchema {
     }
 }
 
+fn argument(name: &str, value_type: ValueType) -> ArgumentSchema {
+    ArgumentSchema {
+        name: name.to_owned(),
+        value_type,
+        required: true,
+        choices: Vec::new(),
+        minimum: None,
+        maximum: None,
+    }
+}
+
 fn bounded_integer(name: &str, minimum: i64, maximum: i64) -> ArgumentSchema {
     ArgumentSchema {
         minimum: Some(minimum),
@@ -462,30 +701,6 @@ fn choice(name: &str, required: bool, choices: &[&str]) -> ArgumentSchema {
         maximum: None,
     }
 }
-
-fn argument(name: &str, value_type: ValueType) -> ArgumentSchema {
-    ArgumentSchema {
-        name: name.to_owned(),
-        value_type,
-        required: true,
-        choices: Vec::new(),
-        minimum: None,
-        maximum: None,
-    }
-}
-fn resource_kind(value: &str) -> Option<ResourceKind> {
-    match value {
-        "instance" => Some(ResourceKind::Instance),
-        "application_window" => Some(ResourceKind::ApplicationWindow),
-        "binding" => Some(ResourceKind::Binding),
-        "session" => Some(ResourceKind::Session),
-        "mux_window" => Some(ResourceKind::MuxWindow),
-        "pane" => Some(ResourceKind::Pane),
-        "terminal" => Some(ResourceKind::Terminal),
-        _ => None,
-    }
-}
-
 fn mutation_for(id: &str) -> MutationClass {
     const DESTRUCTIVE: &[&str] = &[
         "close_space",
@@ -557,5 +772,109 @@ fn target_for(id: &str) -> Option<ResourceKind> {
         | "terminal.read"
         | "terminal.write" => Some(ResourceKind::Terminal),
         _ => None,
+    }
+}
+
+pub struct AppCommandRequest {
+    pub invocation: CommandInvocation,
+    pub deadline: Instant,
+    pub cancellation: CommandCancellation,
+    pub response: mpsc::Sender<CommandOutcome>,
+}
+
+#[derive(Clone)]
+pub struct AppCommandSender {
+    sender: SyncSender<AppCommandRequest>,
+    repaint: RepaintHandle,
+    open: Arc<Mutex<bool>>,
+}
+
+#[derive(Clone)]
+pub struct BoundAppCommandSender {
+    sender: SyncSender<AppCommandRequest>,
+    repaint: RepaintHandle,
+    open: Arc<Mutex<bool>>,
+    caller: Caller,
+}
+
+pub struct AppCommandReceiver {
+    receiver: Receiver<AppCommandRequest>,
+    open: Arc<Mutex<bool>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppCommandSendError {
+    Overloaded,
+    Shutdown,
+}
+
+pub fn app_command_channel(capacity: usize) -> (AppCommandSender, AppCommandReceiver) {
+    app_command_channel_with_repaint(capacity, Arc::new(|| {}))
+}
+
+pub fn app_command_channel_with_repaint(
+    capacity: usize,
+    repaint: RepaintHandle,
+) -> (AppCommandSender, AppCommandReceiver) {
+    let (sender, receiver) = mpsc::sync_channel(capacity);
+    let open = Arc::new(Mutex::new(true));
+    (
+        AppCommandSender {
+            sender,
+            repaint,
+            open: open.clone(),
+        },
+        AppCommandReceiver { receiver, open },
+    )
+}
+
+impl AppCommandSender {
+    /// Binds the authenticated transport identity used for every submitted invocation.
+    ///
+    /// Submission is non-blocking and responses arrive asynchronously. Code already running on
+    /// the AppState/UI owner thread must dispatch directly; waiting there for this channel would
+    /// prevent the next frame from draining the request.
+    pub fn for_caller(&self, caller: Caller) -> BoundAppCommandSender {
+        BoundAppCommandSender {
+            sender: self.sender.clone(),
+            repaint: self.repaint.clone(),
+            open: self.open.clone(),
+            caller,
+        }
+    }
+}
+
+impl BoundAppCommandSender {
+    pub fn try_send(&self, mut request: AppCommandRequest) -> Result<(), AppCommandSendError> {
+        let open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+        if !*open {
+            return Err(AppCommandSendError::Shutdown);
+        }
+        request.invocation.caller = self.caller;
+        self.sender.try_send(request).map_err(|error| match error {
+            TrySendError::Full(_) => AppCommandSendError::Overloaded,
+            TrySendError::Disconnected(_) => AppCommandSendError::Shutdown,
+        })?;
+        (self.repaint)();
+        Ok(())
+    }
+}
+
+impl AppCommandReceiver {
+    pub fn try_recv(&self) -> Result<AppCommandRequest, mpsc::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+impl Drop for AppCommandReceiver {
+    fn drop(&mut self) {
+        let mut open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+        *open = false;
+        while let Ok(request) = self.receiver.try_recv() {
+            let _ = request.response.send(CommandOutcome::Failed {
+                code: "shutdown".to_owned(),
+                message: "application command channel shut down".to_owned(),
+            });
+        }
     }
 }

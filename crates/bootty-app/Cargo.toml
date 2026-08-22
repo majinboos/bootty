@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-bootty-dev = ["bootty-identity/bootty-dev", "bootty-control/bootty-dev"]
+bootty-dev = []
+
+[[bin]]
+name = "bootty"
+path = "src/main.rs"
 
 [dependencies]
 bootty-command = { path = "../bootty-command" }
@@ -28,6 +32,11 @@ bootty-terminal = { path = "../bootty-terminal" }
 bootty-workspace = { path = "../bootty-workspace" }
 png.workspace = true
 serde_json.workspace = true
+rmux-ipc.workspace = true
+rmux-os.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "sync", "time"] }
+self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "checksums", "compression-tar-gz", "compression-zip-deflate", "github", "rustls", "ureq"] }
+starship-battery.workspace = true
 strum.workspace = true
 wgpu.workspace = true
 winit.workspace = true

@@ -57,3 +57,11 @@ pub struct StabilityTraceSample<'a> {
     pub text_runs: usize,
     pub last_error: Option<&'a str>,
 }
+
+pub fn should_sample_status_metrics(elapsed: Duration) -> bool {
+    elapsed >= STATUS_METRICS_SAMPLE_INTERVAL
+}
+
+pub fn us_to_ms(us: u64) -> f32 {
+    us as f32 / 1000.0
+}

@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::{Arc, mpsc},
-};
+use std::{cell::RefCell, rc::Rc, sync::mpsc};
 
 use anyhow::{Context, Result};
 use bootty_config::config::BoottyConfig;
@@ -20,7 +16,14 @@ use winit::{
     window::WindowId,
 };
 
-use crate::BoottyApp;
+use crate::{
+    app::BoottyApp,
+    application_identity::ApplicationIdentity,
+    config::BoottyConfig,
+    control::{ControlPlane, ControlServer},
+    direct_input::{DirectKeyInput, ModifierSideState, direct_key_input_from_winit_event},
+    platform::disable_automatic_window_tabbing,
+};
 
 pub fn run(
     options: eframe::NativeOptions,
@@ -46,17 +49,16 @@ pub fn run(
             cc,
             config,
             window_state_key.clone(),
-            backends,
             direct_input_rx,
             modifier_side_rx,
             control_plane.clone(),
         )?;
         let (commands, catalog) = app.control_binding();
         app_control_server.replace(Some(ControlServer::spawn(
-            &window_state_key,
+            window_state_key,
             commands,
             catalog,
-            &control_plane,
+            control_plane,
         )?));
         Ok(Box::new(app) as Box<dyn eframe::App>)
     });

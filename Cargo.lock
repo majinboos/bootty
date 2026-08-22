@@ -731,12 +731,17 @@ dependencies = [
  "libghostty-vt",
  "muda",
  "png",
- "pollster 0.4.0",
+ "pollster",
+ "proptest",
+ "rmux-ipc",
+ "rmux-os",
+ "rstest",
  "rusqlite",
  "serde_json",
  "strum",
  "tempfile",
- "thiserror 2.0.20",
+ "tokio",
+ "ttf-parser",
  "wgpu",
  "winit",
 ]
@@ -1012,28 +1017,13 @@ dependencies = [
 name = "bootty-tests"
 version = "0.4.0"
 dependencies = [
- "bootty-app",
- "bootty-command",
- "bootty-config",
- "bootty-identity",
- "bootty-mux",
- "bootty-rmux",
- "bootty-workspace-hack",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "bootty-tmux"
-version = "0.4.0"
-dependencies = [
  "anyhow",
- "bootty-identity",
+ "bootty-app",
  "bootty-mux",
- "bootty-mux-model",
- "bootty-remote",
  "bootty-workspace-hack",
- "inventory",
+ "egui",
+ "rusqlite",
+ "serde_json",
  "tempfile",
 ]
 

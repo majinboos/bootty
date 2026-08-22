@@ -1,81 +1,35 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, UdpSocket},
     sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
-use bootty_config::config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig};
-use bootty_mux::{
-    RepaintHandle,
-    command::MuxCommand,
-    controller::{
-        MuxCommandError, MuxCommandResult, MuxController, MuxScope, SpaceId,
-        mux_session_refresh_interval,
-    },
-    membership::BackendMembership,
-    provider::{
-        MuxAppBackendPolicy, MuxBackendRegistry, MuxCommandDispatch, PaneTopology,
-        PersistedSessionPolicy, SelectionPublicationPolicy, TerminalResidency,
-    },
-    snapshot::MuxSession,
-    terminal::ActiveTerminal,
-};
-use bootty_runtime::terminal_session::DrainStats;
-use bootty_terminal::terminal_engine::{TerminalLiveConfig, TerminalSideEffectEvent};
+use bootty_config::config::MultiplexerBackendConfig;
+use bootty_terminal::terminal_engine::TerminalSideEffectEvent;
 
-mod binding_panes;
-mod binding_session_names;
-mod binding_terminal_facts;
-mod binding_windows;
-mod mux_config;
-mod remote_reconnect;
-mod space_summary;
-mod workspace_sessions;
-
-use self::{
-    binding_terminal_facts::BindingTerminalFacts, mux_config::realize_binding,
-    remote_reconnect::BindingReconnect,
-};
-
-pub(crate) use binding_panes::mux_split_direction;
-pub(crate) use binding_session_names::RenameSessionOutcome;
-pub(crate) use binding_terminal_facts::{TerminalProgress, TerminalProgressState};
-pub(crate) use binding_windows::terminal_cwd_for_mux_command;
-pub(crate) use space_summary::SpaceSummary;
+use super::state::{SpaceSummary, TerminalProgress};
 
 use crate::{
+    config::{AppearanceVariant, BoottyConfig},
     layout::{PaneLayout, SplitDirection},
+    mux::{
+        RepaintHandle,
+        command::MuxCommand,
+        config::selected_backend,
+        controller::{BindingMuxController, MuxScope, SpaceId},
+        snapshot::MuxSession,
+        terminal::ActiveTerminal,
+    },
     renderer::TerminalWidget,
-    terminal_config::terminal_session_config_with_side_effects,
+    session_names::SessionNameStore,
+    session_order::SessionOrderStore,
+    terminal::TerminalSessionConfig,
+    workspace::{
+        BackendSessionMembership, BindingMembershipMutation, SpaceMuxOverride, SpaceRemoteOverride,
+        WorkspacePersistenceError, WorkspaceRepository, WorkspaceSpace,
+    },
 };
-use bootty_workspace::{
-    BindingMembershipMutation, SessionNameStore, SessionOrderStore, SpaceMuxOverride,
-    SpaceRemoteOverride, WorkspaceBinding, WorkspacePersistenceError, WorkspaceRepository,
-    WorkspaceSpace,
-};
-
-/// The only terminal data that the host needs to interpret after a workspace frame.
-///
-/// The workspace drains every live terminal. It returns only the active drain statistics and
-/// active terminal side effects. Inactive side effects are discarded because no host surface owns
-/// them.
-pub(super) struct WorkspaceDrainResult {
-    pub(super) active_drain: DrainStats,
-    pub(super) active_terminal_side_effects: Vec<TerminalSideEffectEvent>,
-}
-
-pub(super) struct WorkspaceFrameOutcome {
-    pub(super) next_wake: Option<Duration>,
-    pub(super) errors: Vec<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct SpaceUpdateOutcome {
-    pub(super) changed: bool,
-    pub(super) active_placement_changed: bool,
-}
 
 #[derive(Clone, Debug)]
 pub(super) struct PendingGeneratedName {
@@ -120,7 +74,6 @@ pub(super) struct NativeTerminalOwner {
 impl NativeTerminalOwner {
     pub(super) fn new(
         config: &BoottyConfig,
-        backends: Arc<MuxBackendRegistry>,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
@@ -130,7 +83,6 @@ impl NativeTerminalOwner {
         Self {
             terminal: Box::new(ActiveTerminal::new(
                 TerminalWidget::initial_geometry(),
-                backends,
                 &config.multiplexer,
                 session_config,
                 repaint,
@@ -184,35 +136,40 @@ enum PersistedSessionRestoreDecision {
 }
 
 fn persisted_session_restore_decision(
-    policy: PersistedSessionPolicy,
-    refresh_applied: bool,
+    backend: MultiplexerBackendConfig,
+    refresh_completed: bool,
     daemon_has_sessions: bool,
 ) -> PersistedSessionRestoreDecision {
-    match policy {
-        PersistedSessionPolicy::Immediate => PersistedSessionRestoreDecision::Restore,
-        PersistedSessionPolicy::AfterEmptyInitialSnapshot if !refresh_applied => {
+    match backend {
+        MultiplexerBackendConfig::Native => PersistedSessionRestoreDecision::Restore,
+        MultiplexerBackendConfig::Rmux if !refresh_completed => {
             PersistedSessionRestoreDecision::Wait
         }
-        PersistedSessionPolicy::AfterEmptyInitialSnapshot if daemon_has_sessions => {
+        MultiplexerBackendConfig::Rmux if daemon_has_sessions => {
             PersistedSessionRestoreDecision::Skip
         }
-        PersistedSessionPolicy::AfterEmptyInitialSnapshot => {
-            PersistedSessionRestoreDecision::Restore
+        MultiplexerBackendConfig::Rmux => PersistedSessionRestoreDecision::Restore,
+        MultiplexerBackendConfig::Tmux | MultiplexerBackendConfig::Zellij => {
+            PersistedSessionRestoreDecision::Skip
         }
-        PersistedSessionPolicy::Never => PersistedSessionRestoreDecision::Skip,
     }
 }
 
 pub(super) struct BindingRuntime {
-    backends: Arc<MuxBackendRegistry>,
-    pub(super) backend_policy: MuxAppBackendPolicy,
     pub(super) scope: MuxScope,
     pub(super) label: String,
-    placement: SpaceMuxOverride,
-    reconnect: BindingReconnect,
-    pub(super) multiplexer: bootty_config::config::MultiplexerConfig,
+    pub(super) backend_override: Option<MultiplexerBackendConfig>,
+    pub(super) remote_override: SpaceRemoteOverride,
+    /// Set while this binding's remote attach client is gone and bootty is waiting to start
+    /// another. Per binding, not per window: one space's outage is not another's, and a reconnect
+    /// pending here must not discard the pane of whichever space is active when it comes due.
+    pub(super) reattach: Option<RemoteReattach>,
+    /// When this binding's current remote attach client was asked for, so an outage that keeps
+    /// ending clients can be told from one connection that lasted and then dropped much later.
+    pub(super) remote_attach_started: Option<Instant>,
+    pub(super) multiplexer: crate::config::MultiplexerConfig,
     pub(super) terminal: Box<ActiveTerminal>,
-    pub(super) mux: MuxController,
+    pub(super) mux: BindingMuxController,
     pub(super) session_order: SessionOrderStore,
     pub(super) session_names: SessionNameStore,
     pub(super) pending_generated_names: HashMap<String, PendingGeneratedName>,
@@ -223,7 +180,12 @@ pub(super) struct BindingRuntime {
     pub(super) terminal_side_effect_rx: mpsc::Receiver<TerminalSideEffectEvent>,
     pub(super) pane_layouts: HashMap<ScopedWindowId, PaneLayout>,
     pub(super) pending_pane_split_directions: HashMap<ScopedWindowId, SplitDirection>,
-    terminal_facts: BindingTerminalFacts,
+    pub(super) custom_tab_names: HashSet<ScopedWindowId>,
+    pub(super) terminal_tab_titles: HashMap<ScopedWindowId, String>,
+    pub(super) terminal_progress: HashMap<ScopedPaneId, TerminalProgress>,
+    pub(super) unscoped_terminal_progress: Option<TerminalProgress>,
+    pub(super) terminal_ports: HashMap<ScopedPaneId, Vec<u16>>,
+    pub(super) unscoped_terminal_ports: Vec<u16>,
     pub(super) persisted_sessions_restored: bool,
 }
 
@@ -235,12 +197,11 @@ pub(super) struct BindingStateCandidate {
 }
 
 impl BindingRuntime {
-    fn new_with_binding_config(
+    pub(super) fn new_with_backend_override(
         state: BindingStateCandidate,
         config: &BoottyConfig,
-        backends: Arc<MuxBackendRegistry>,
-        placement: SpaceMuxOverride,
-        realized: mux_config::RealizedMuxBinding,
+        backend_override: Option<MultiplexerBackendConfig>,
+        remote_override: SpaceRemoteOverride,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Self {
@@ -249,27 +210,66 @@ impl BindingRuntime {
             session_order,
             session_names,
         } = state;
-        let remote_error = realized.availability_error.clone();
-        let backend_policy = backends.app_policy(&realized.config);
-        let mut binding_config = config.clone();
-        binding_config.multiplexer = realized.config.clone();
+        let mut config = config.clone();
+        let backend_override = match &remote_override {
+            SpaceRemoteOverride::Profile(remote) => Some(remote.backend),
+            _ => backend_override,
+        };
+        if let Some(backend) = backend_override {
+            config.multiplexer.backend = backend;
+        }
+        config.multiplexer.remote_space_id = None;
+        let remote_error = match &remote_override {
+            SpaceRemoteOverride::Inherit => None,
+            SpaceRemoteOverride::Local => {
+                config.multiplexer.remote = None;
+                None
+            }
+            SpaceRemoteOverride::Profile(remote) => {
+                config.multiplexer.remote_space_id = Some(remote.remote_space_id.clone());
+                if let Some(profile) = config.ssh_profiles.get(&remote.profile_id) {
+                    config.multiplexer.remote = Some(profile.to_remote());
+                    None
+                } else {
+                    config.multiplexer.remote = None;
+                    Some(format!(
+                        "SSH profile '{}' is unavailable",
+                        remote.profile_id
+                    ))
+                }
+            }
+            SpaceRemoteOverride::Inline(remote) => {
+                config.multiplexer.remote = Some(remote.clone());
+                None
+            }
+        };
+        if !config.multiplexer.backend.supports_remote() {
+            config.multiplexer.remote = None;
+        }
         let NativeTerminalOwner {
             terminal,
             terminal_side_effect_tx,
             terminal_side_effect_rx,
-        } = NativeTerminalOwner::new(&binding_config, Arc::clone(&backends), variant, repaint);
+        } = NativeTerminalOwner::new(&config, variant, repaint);
+        let mut mux = BindingMuxController::new(scope);
         // Bindings of one workspace share native sessions, separate workspaces cannot see each
         // other's, and reopening a window keeps its own. Native sessions live in this process rather
         // than in a server, so which state a binding reaches is a choice bootty has to make.
         let workspace = config.config_path.clone();
-        let mux = MuxController::new(scope, Arc::clone(&backends), Some(workspace));
+        let unavailable = remote_error.clone();
+        mux.set_backend_factory(Arc::new(move |multiplexer| {
+            if let Some(message) = &unavailable {
+                return bootty_mux::config::unavailable_backend(message.clone());
+            }
+            bootty_mux::config::build_backend_for_workspace(multiplexer, Some(&workspace))
+        }));
         let mut binding = Self {
-            backends,
-            backend_policy,
-            label: binding_label(scope, &realized.config),
-            placement,
-            reconnect: BindingReconnect::default(),
-            multiplexer: realized.config,
+            label: binding_label(scope, &config.multiplexer),
+            backend_override,
+            remote_override,
+            reattach: None,
+            remote_attach_started: None,
+            multiplexer: config.multiplexer.clone(),
             scope,
             terminal,
             terminal_side_effect_tx,
@@ -283,97 +283,27 @@ impl BindingRuntime {
             generated_names_signature: None,
             pane_layouts: HashMap::new(),
             pending_pane_split_directions: HashMap::new(),
-            terminal_facts: BindingTerminalFacts::default(),
+            custom_tab_names: HashSet::new(),
+            terminal_tab_titles: HashMap::new(),
+            terminal_progress: HashMap::new(),
+            terminal_ports: HashMap::new(),
+            unscoped_terminal_ports: Vec::new(),
+            unscoped_terminal_progress: None,
             persisted_sessions_restored: false,
         };
         if let Some(error) = remote_error {
-            binding.mux.set_configured_availability_error(Some(error));
+            binding.mux.set_availability_error(Some(error));
         }
         binding
     }
 
-    pub(super) fn from_workspace(
-        workspace_binding: &WorkspaceBinding,
-        config: &BoottyConfig,
-        backends: Arc<MuxBackendRegistry>,
-        variant: AppearanceVariant,
-        repaint: RepaintHandle,
-    ) -> Self {
-        let placement = SpaceMuxOverride {
-            backend: workspace_binding.backend_override(),
-            remote: workspace_binding.remote_override().clone(),
-        };
-        let realized = realize_binding(config, placement.backend, &placement.remote);
-        let mut binding = Self::new_with_binding_config(
-            BindingStateCandidate {
-                scope: workspace_binding.mux_scope(),
-                session_order: workspace_binding.session_order().clone(),
-                session_names: workspace_binding.session_names().clone(),
-            },
-            config,
-            backends,
-            placement,
-            realized,
-            variant,
-            repaint.clone(),
-        );
-        binding.label = workspace_binding.name().to_owned();
-        if workspace_binding.unavailable() && binding.mux.unavailable_reason().is_none() {
-            binding.mux.set_configured_availability_error(Some(
-                "binding unavailable; reconnect to restore it".to_owned(),
-            ));
-        }
-        binding.restore_persisted_sessions(&repaint, false);
-        if let Some(selection) = workspace_binding.selection() {
-            binding.mux.restore_selection(
-                selection.session_id().to_owned(),
-                selection.window_id().map(str::to_owned),
-            );
-        }
-        binding
-    }
-
-    pub(super) fn placement(&self) -> &SpaceMuxOverride {
-        &self.placement
-    }
-
-    pub(super) fn rebuild(
-        &mut self,
-        config: &BoottyConfig,
-        placement: SpaceMuxOverride,
-        variant: AppearanceVariant,
-        repaint: RepaintHandle,
-    ) {
-        let state = BindingStateCandidate {
-            scope: self.scope,
-            session_order: std::mem::take(&mut self.session_order),
-            session_names: std::mem::take(&mut self.session_names),
-        };
-        let pending_generated_names = std::mem::take(&mut self.pending_generated_names);
-        let label = self.label.clone();
-        let realized = realize_binding(config, placement.backend, &placement.remote);
-        let mut replacement = Self::new_with_binding_config(
-            state,
-            config,
-            Arc::clone(&self.backends),
-            placement,
-            realized,
-            variant,
-            repaint.clone(),
-        );
-        replacement.label = label;
-        replacement.pending_generated_names = pending_generated_names;
-        replacement.restore_persisted_sessions(&repaint, false);
-        *self = replacement;
-    }
-
-    pub(super) fn restore_persisted_sessions(&mut self, repaint: &RepaintHandle, applied: bool) {
-        if self.mux.unavailable_reason().is_some() || self.persisted_sessions_restored {
+    pub(super) fn restore_persisted_sessions(&mut self, repaint: &RepaintHandle) {
+        if self.persisted_sessions_restored {
             return;
         }
         let decision = persisted_session_restore_decision(
-            self.backend_policy.persisted_sessions,
-            applied,
+            selected_backend(&self.multiplexer),
+            self.mux.take_refresh_completed(),
             !self.mux.sessions().is_empty(),
         );
         match decision {
@@ -393,7 +323,7 @@ impl BindingRuntime {
             .persisted_sessions(&self.session_order.session_names())
         {
             self.mux.create_project_session(
-                bootty_mux::controller::NewMuxSessionRequest {
+                crate::mux::controller::NewMuxSessionRequest {
                     session_id: session_id.clone(),
                     cwd,
                 },
@@ -407,6 +337,19 @@ impl BindingRuntime {
         }
         self.mux
             .apply_session_order(&self.session_order.session_names());
+    }
+
+    pub(super) fn resolve_empty_remote_after_attach_exit(
+        &mut self,
+        refresh_completed: bool,
+    ) -> bool {
+        if !refresh_completed || self.reattach.is_none() || !self.mux.sessions().is_empty() {
+            return false;
+        }
+        self.reattach = None;
+        self.remote_attach_started = None;
+        self.mux.set_availability_error(None);
+        true
     }
 
     /// The names bootty shows for `sessions`, in the same order.
@@ -503,24 +446,6 @@ impl BindingRuntime {
         self.terminal_side_effect_rx.try_iter().for_each(drop);
     }
 
-    pub(super) fn membership_completion_is_immediate(&self) -> bool {
-        self.backends.command_dispatch(&self.multiplexer) == MuxCommandDispatch::CallerThread
-    }
-
-    fn refresh_waiting_membership(&mut self, repaint: &RepaintHandle, window_focused: bool) {
-        if !self.membership_reconciliation_waiting_for_refresh {
-            return;
-        }
-        let refresh = self.mux.refresh_sessions(
-            repaint,
-            &self.multiplexer.clone(),
-            mux_session_refresh_interval(window_focused),
-        );
-        if refresh.applied {
-            self.membership_reconciliation_ready = true;
-        }
-    }
-
     pub(super) fn window_id(&self, session_id: String, window_id: String) -> ScopedWindowId {
         ScopedWindowId::new(self.scope, session_id, window_id)
     }
@@ -535,6 +460,35 @@ impl BindingRuntime {
             pane_id: pane_id.into(),
         }
     }
+
+    pub(super) fn degraded_error(&self) -> Option<String> {
+        self.mux.last_error().map(str::to_owned).or_else(|| {
+            self.reattach
+                .map(|reattach| format!("reconnecting (attempt {})", reattach.attempts))
+        })
+    }
+}
+
+pub(super) fn binding_runtime_for_multiplexer(
+    config: &BoottyConfig,
+    state: BindingStateCandidate,
+    label: String,
+    backend_override: Option<MultiplexerBackendConfig>,
+    remote_override: SpaceRemoteOverride,
+    variant: AppearanceVariant,
+    repaint: RepaintHandle,
+) -> BindingRuntime {
+    let mut binding = BindingRuntime::new_with_backend_override(
+        state,
+        config,
+        backend_override,
+        remote_override,
+        variant,
+        repaint.clone(),
+    );
+    binding.label = label;
+    binding.restore_persisted_sessions(&repaint);
+    binding
 }
 
 pub(super) struct SpaceRuntime {
@@ -552,7 +506,6 @@ impl SpaceRuntime {
     pub(super) fn from_workspace(
         space: &WorkspaceSpace,
         config: &BoottyConfig,
-        backends: Arc<MuxBackendRegistry>,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Option<Self> {
@@ -560,13 +513,31 @@ impl SpaceRuntime {
             .bindings()
             .iter()
             .map(|workspace_binding| {
-                BindingRuntime::from_workspace(
-                    workspace_binding,
+                let mut runtime = binding_runtime_for_multiplexer(
                     config,
-                    Arc::clone(&backends),
+                    BindingStateCandidate {
+                        scope: workspace_binding.mux_scope(),
+                        session_order: workspace_binding.session_order().clone(),
+                        session_names: workspace_binding.session_names().clone(),
+                    },
+                    workspace_binding.name().to_owned(),
+                    workspace_binding.backend_override(),
+                    workspace_binding.remote_override().clone(),
                     variant,
                     repaint.clone(),
-                )
+                );
+                if workspace_binding.unavailable() {
+                    runtime.mux.set_availability_error(Some(
+                        "binding unavailable; reconnect to restore it".to_owned(),
+                    ));
+                }
+                if let Some(selection) = workspace_binding.selection() {
+                    runtime.mux.restore_selection(
+                        selection.session_id().to_owned(),
+                        selection.window_id().map(str::to_owned),
+                    );
+                }
+                runtime
             })
             .collect::<Vec<_>>();
         if bindings.is_empty() {
@@ -588,8 +559,56 @@ impl SpaceRuntime {
         std::iter::once(&self.binding).chain(self.inactive_bindings.iter())
     }
 
-    fn bindings_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
+    pub(super) fn bindings_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
         std::iter::once(&mut self.binding).chain(self.inactive_bindings.iter_mut())
+    }
+}
+
+/// A remote binding's attach client is gone and bootty is waiting to start the next one.
+///
+/// The sessions themselves live on the other host and outlive the connection, so a lost link is
+/// reconnected to rather than treated as the pane ending. Attempts back off, because the same loss
+/// that ends one client usually ends the next few too, and each attempt is a fresh SSH handshake.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RemoteReattach {
+    pub(super) retry_at: Instant,
+    pub(super) attempts: u32,
+    /// Set once the waiting is over and a new attach client has been asked for.
+    pub(super) started: bool,
+}
+
+impl RemoteReattach {
+    pub(super) const FIRST_DELAY: Duration = Duration::from_millis(500);
+    pub(super) const MAX_DELAY: Duration = Duration::from_secs(30);
+    /// How long an attach client has to survive before its connection counts as established. A
+    /// client that dies sooner is the same outage continuing, so the backoff keeps growing.
+    pub(super) const STABLE_AFTER: Duration = Duration::from_secs(5);
+
+    pub(super) fn after_failure(
+        previous: Option<Self>,
+        attached_for: Option<Duration>,
+        now: Instant,
+    ) -> Self {
+        let established = attached_for.is_some_and(|elapsed| elapsed >= Self::STABLE_AFTER);
+        let attempts = match previous {
+            Some(previous) if !established => previous.attempts.saturating_add(1),
+            _ => 1,
+        };
+        Self {
+            retry_at: now + Self::delay(attempts),
+            attempts,
+            started: false,
+        }
+    }
+
+    pub(super) fn due(self, now: Instant) -> bool {
+        !self.started && now >= self.retry_at
+    }
+
+    pub(super) fn delay(attempts: u32) -> Duration {
+        Self::FIRST_DELAY
+            .saturating_mul(1u32 << attempts.saturating_sub(1).min(8))
+            .min(Self::MAX_DELAY)
     }
 }
 
@@ -609,71 +628,31 @@ impl SpaceTransition {
     }
 }
 
-fn binding_label(
-    scope: MuxScope,
-    multiplexer: &bootty_config::config::MultiplexerConfig,
-) -> String {
+fn binding_label(scope: MuxScope, multiplexer: &crate::config::MultiplexerConfig) -> String {
+    let backend = match multiplexer.backend {
+        crate::config::MultiplexerBackendConfig::Rmux => "Rmux",
+        crate::config::MultiplexerBackendConfig::Native => "Native",
+        crate::config::MultiplexerBackendConfig::Tmux => "Tmux",
+        crate::config::MultiplexerBackendConfig::Zellij => "Zellij",
+    };
     format!(
-        "{} / Binding {}",
-        multiplexer.backend,
+        "{backend} / Binding {}",
         scope.binding_id().persistence_value()
     )
 }
 
-fn mux_refresh_repaint_after(topology: PaneTopology, window_focused: bool) -> Option<Duration> {
-    (topology != PaneTopology::ProcessLocal).then(|| mux_session_refresh_interval(window_focused))
-}
-
-struct NetworkChangeDetector {
-    next_check: Instant,
-    signature: Option<IpAddr>,
-}
-
-impl NetworkChangeDetector {
-    const INTERVAL: Duration = Duration::from_secs(2);
-
-    fn new(now: Instant) -> Self {
-        Self {
-            next_check: now + Self::INTERVAL,
-            signature: network_signature(),
-        }
-    }
-
-    fn changed(&mut self, now: Instant) -> bool {
-        if now < self.next_check {
-            return false;
-        }
-        self.next_check = now + Self::INTERVAL;
-        let signature = network_signature();
-        let changed = signature != self.signature;
-        self.signature = signature;
-        changed
-    }
-}
-
-fn network_signature() -> Option<IpAddr> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("1.1.1.1", 80)).ok()?;
-    socket.local_addr().ok().map(|address| address.ip())
-}
-
 pub(super) struct WorkspaceRuntime {
-    backends: Arc<MuxBackendRegistry>,
     repository: WorkspaceRepository,
-    repaint: RepaintHandle,
-    network_change_detector: NetworkChangeDetector,
-    deferred_profile_binding_rebuilds: HashSet<MuxScope>,
     pub(super) active: SpaceRuntime,
     pub(super) inactive_spaces: Vec<SpaceRuntime>,
-    space_transition: Option<SpaceTransition>,
-    parked_native_terminal: Option<NativeTerminalOwner>,
+    pub(super) space_transition: Option<SpaceTransition>,
+    pub(super) parked_native_terminal: Option<NativeTerminalOwner>,
 }
 
 impl WorkspaceRuntime {
     pub(super) fn open(
         config: &BoottyConfig,
         window_state_key: &str,
-        backends: Arc<MuxBackendRegistry>,
         variant: AppearanceVariant,
         repaint: RepaintHandle,
     ) -> Result<Self> {
@@ -683,14 +662,9 @@ impl WorkspaceRuntime {
             .spaces()
             .iter()
             .map(|space| {
-                let mut runtime = SpaceRuntime::from_workspace(
-                    space,
-                    config,
-                    Arc::clone(&backends),
-                    variant,
-                    repaint.clone(),
-                )
-                .ok_or_else(|| anyhow::anyhow!("persisted Space has no backend binding"))?;
+                let mut runtime =
+                    SpaceRuntime::from_workspace(space, config, variant, repaint.clone())
+                        .ok_or_else(|| anyhow::anyhow!("persisted Space has no backend binding"))?;
                 for binding in runtime.bindings_mut() {
                     if snapshot.has_pending_binding_operation(binding.scope) {
                         binding.membership_reconciliation_waiting_for_refresh = true;
@@ -707,263 +681,12 @@ impl WorkspaceRuntime {
         repository.set_selected_space(window_state_key, active.id)?;
 
         Ok(Self {
-            backends,
             repository,
-            repaint,
-            network_change_detector: NetworkChangeDetector::new(Instant::now()),
-            deferred_profile_binding_rebuilds: HashSet::new(),
             active,
             inactive_spaces: spaces,
             space_transition: None,
             parked_native_terminal: None,
         })
-    }
-
-    /// Drain every live terminal before the host interprets active terminal side effects.
-    ///
-    /// The host owns interpretation of active terminal side effects. The workspace owns all
-    /// terminal traversal. Lifecycle work starts later in `advance_frame`.
-    pub(super) fn drain(&mut self) -> WorkspaceDrainResult {
-        let active_drain = self.active.binding.terminal.drain_native_window();
-        for binding in &mut self.active.inactive_bindings {
-            binding.terminal.drain_native_window();
-            binding.discard_terminal_side_effects();
-        }
-        for space in &mut self.inactive_spaces {
-            for binding in space.bindings_mut() {
-                binding.terminal.drain_native_window();
-                binding.discard_terminal_side_effects();
-            }
-        }
-        if let Some(owner) = &mut self.parked_native_terminal {
-            owner.drain_inactive();
-        }
-
-        let active_terminal_side_effects = self
-            .active
-            .binding
-            .terminal_side_effect_rx
-            .try_iter()
-            .collect();
-        WorkspaceDrainResult {
-            active_drain,
-            active_terminal_side_effects,
-        }
-    }
-    pub(super) fn publish_terminal_config(
-        &mut self,
-        config: &BoottyConfig,
-        variant: AppearanceVariant,
-        live_config: Option<&TerminalLiveConfig>,
-    ) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if let Some(owner) = &mut self.parked_native_terminal {
-            let mut owner_config = config.clone();
-            owner_config.multiplexer.backend = MultiplexerBackendConfig::Native;
-            let session_config = terminal_session_config_with_side_effects(
-                &owner_config,
-                variant,
-                &owner.terminal_side_effect_tx,
-            );
-            owner.terminal.set_terminal_config(session_config);
-            if let Some(live_config) = live_config
-                && let Err(error) = owner.terminal.apply_live_config(live_config.clone())
-            {
-                warnings.push(format!(
-                    "terminal config publication failed for parked native terminal: {error}"
-                ));
-            }
-        }
-        for binding in self.bindings_mut() {
-            let mut binding_config = config.clone();
-            binding_config.multiplexer = binding.multiplexer.clone();
-            let session_config = terminal_session_config_with_side_effects(
-                &binding_config,
-                variant,
-                &binding.terminal_side_effect_tx,
-            );
-            binding.terminal.set_terminal_config(session_config);
-            if let Some(live_config) = live_config
-                && let Err(error) = binding.terminal.apply_live_config(live_config.clone())
-            {
-                warnings.push(format!(
-                    "terminal config publication failed for {:?}: {error}",
-                    binding.scope
-                ));
-            }
-        }
-        warnings
-    }
-
-    /// Advance backend membership, persistence, naming, profile, and pane state for one frame.
-    ///
-    /// Each error is retained in order. The host applies them in order so the last error remains
-    /// visible to the user.
-    pub(super) fn advance_frame(
-        &mut self,
-        config: &BoottyConfig,
-        variant: AppearanceVariant,
-        repaint: &RepaintHandle,
-        now: Instant,
-        window_focused: bool,
-    ) -> WorkspaceFrameOutcome {
-        let mut errors = Vec::new();
-        if self.has_degraded_remote() && self.network_change_detector.changed(now) {
-            self.reset_remote_reconnects(now);
-        }
-        if self.active.binding.backend_policy.panes.topology == PaneTopology::ProcessLocal {
-            let exited = self.active.binding.terminal.native_exited_panes();
-            for pane_id in exited {
-                self.active.binding.close_focused_pane(repaint, &pane_id);
-            }
-        } else {
-            match self.active.binding.terminal.child_exited() {
-                Ok(true) => {
-                    if self.active.binding.handle_attach_client_exit(now) {
-                        self.close_active_attach_pane(repaint);
-                    }
-                }
-                Ok(false) => self.active.binding.note_attach_client_alive(now),
-                Err(error) => errors.push(error.to_string()),
-            }
-            let _ = self.active.binding.reattach_wait(now);
-        }
-        for binding in self.bindings_mut() {
-            binding.poll_membership_command();
-        }
-
-        let refresh = self.active.binding.mux.refresh_sessions(
-            repaint,
-            &self.active.binding.multiplexer.clone(),
-            mux_session_refresh_interval(window_focused),
-        );
-        self.active
-            .binding
-            .restore_persisted_sessions(repaint, refresh.applied);
-        if refresh.applied
-            && self
-                .active
-                .binding
-                .membership_reconciliation_waiting_for_refresh
-        {
-            self.active.binding.membership_reconciliation_ready = true;
-        }
-        self.active
-            .binding
-            .resolve_attach_exit_after_refresh(refresh.applied);
-
-        let mut next_wake = mux_refresh_repaint_after(
-            self.active.binding.backend_policy.panes.topology,
-            window_focused,
-        );
-        for binding in &mut self.active.inactive_bindings {
-            binding.refresh_waiting_membership(repaint, window_focused);
-            binding.restore_persisted_sessions(repaint, false);
-        }
-        for space in &mut self.inactive_spaces {
-            for binding in space.bindings_mut() {
-                binding.refresh_waiting_membership(repaint, window_focused);
-                binding.restore_persisted_sessions(repaint, false);
-            }
-        }
-
-        if let Err(error) = self.reconcile_binding_membership_mutations() {
-            errors.push(error.to_string());
-        }
-        let requested_profile_scopes = self.deferred_profile_binding_rebuilds.clone();
-        if !requested_profile_scopes.is_empty()
-            && let Err(error) = self.rebuild_profile_bindings(
-                config,
-                Some(&requested_profile_scopes),
-                variant,
-                repaint.clone(),
-            )
-        {
-            errors.push(error.to_string());
-        }
-        if let Err(error) = self.reconcile_generated_session_names(repaint) {
-            errors.push(error.to_string());
-        }
-        if let Err(error) = self.reconcile_binding_states() {
-            errors.push(error.to_string());
-        }
-
-        if !self.active.binding.waiting_to_reattach()
-            && let Err(error) = self.active.binding.sync_terminal_panes()
-        {
-            if self.active.binding.multiplexer.remote.is_some() {
-                self.active
-                    .binding
-                    .handle_attach_start_failure(now, &error.to_string());
-            } else {
-                errors.push(error.to_string());
-            }
-        }
-
-        let reattach_wake = self.active.binding.reattach_wait(now);
-        next_wake = [next_wake, reattach_wake].into_iter().flatten().min();
-        WorkspaceFrameOutcome { next_wake, errors }
-    }
-
-    fn close_active_attach_pane(&mut self, repaint: &RepaintHandle) {
-        let session_id = self
-            .active
-            .binding
-            .mux
-            .selected_session()
-            .unwrap_or("local")
-            .to_owned();
-        let config = self.active.binding.multiplexer.clone();
-        self.active.binding.mux.execute_command(
-            repaint,
-            &config,
-            MuxCommand::ClosePane {
-                session_id,
-                pane_id: None,
-            },
-        );
-        self.active.binding.terminal.discard_active_pane();
-    }
-
-    pub(super) fn sync_active_terminal_panes(&mut self) -> Result<()> {
-        self.active.binding.sync_terminal_panes()
-    }
-
-    pub(super) fn reconnect_space(&mut self, space_id: SpaceId, now: Instant) -> bool {
-        let Some(space) = std::iter::once(&mut self.active)
-            .chain(self.inactive_spaces.iter_mut())
-            .find(|space| space.id == space_id)
-        else {
-            return false;
-        };
-        let mut restarted = false;
-        for binding in space.bindings_mut() {
-            restarted |= binding.restart_remote(now);
-        }
-        restarted
-    }
-
-    fn has_degraded_remote(&self) -> bool {
-        self.active
-            .bindings()
-            .chain(
-                self.inactive_spaces
-                    .iter()
-                    .flat_map(|space| space.bindings()),
-            )
-            .any(BindingRuntime::is_degraded_remote)
-    }
-
-    fn reset_remote_reconnects(&mut self, now: Instant) {
-        for binding in self.active.bindings_mut().chain(
-            self.inactive_spaces
-                .iter_mut()
-                .flat_map(|space| space.bindings_mut()),
-        ) {
-            if binding.is_degraded_remote() {
-                binding.restart_remote(now);
-            }
-        }
     }
 
     pub(super) fn multiplexer_backend(&self) -> MultiplexerBackendConfig {
@@ -1019,17 +742,17 @@ impl WorkspaceRuntime {
         spaces.into_iter().map(|(_, summary)| summary).collect()
     }
 
-    pub(super) fn space_placement(&self, space_id: SpaceId) -> Option<SpaceMuxOverride> {
-        let scope = self.selected_binding_scope(space_id)?;
-        self.binding(scope).map(|binding| binding.placement.clone())
+    pub(super) fn backend_override(
+        &self,
+        space_id: SpaceId,
+    ) -> Option<Option<MultiplexerBackendConfig>> {
+        self.space(space_id)
+            .map(|space| space.binding.backend_override)
     }
 
-    pub(super) fn binding_scopes(&self) -> impl Iterator<Item = MuxScope> + '_ {
-        self.all_bindings().map(|binding| binding.scope)
-    }
-
-    pub(super) fn binding_placement(&self, scope: MuxScope) -> Option<&SpaceMuxOverride> {
-        self.binding(scope).map(BindingRuntime::placement)
+    pub(super) fn remote_override(&self, space_id: SpaceId) -> Option<SpaceRemoteOverride> {
+        self.space(space_id)
+            .map(|space| space.binding.remote_override.clone())
     }
 
     pub(super) fn transition(&self, now: Instant) -> Option<(SpaceId, SpaceId, f32)> {
@@ -1079,7 +802,7 @@ impl WorkspaceRuntime {
         if let Some(owner) = &mut self.parked_native_terminal {
             owner.discard_side_effects();
         }
-        self.prepare_terminal_residency_transition(&mut target, config, variant, repaint);
+        self.prepare_native_terminal_transition(&mut target, config, variant, repaint);
         let current = std::mem::replace(&mut self.active.binding, target);
         self.active.inactive_bindings.insert(index, current);
 
@@ -1093,48 +816,20 @@ impl WorkspaceRuntime {
             return;
         }
         self.active.binding.mux.refresh_on_next_frame();
-        let refresh = self.active.binding.mux.refresh_sessions(
-            repaint,
-            &self.active.binding.multiplexer.clone(),
-            mux_session_refresh_interval(true),
-        );
+        let active_config = self.active.binding.multiplexer.clone();
+        let _ = self
+            .active
+            .binding
+            .mux
+            .refresh_sessions(repaint, &active_config);
         self.active
             .binding
             .mux
             .apply_session_order(&self.active.binding.session_order.session_names());
-        if self.active.binding.backend_policy.persisted_sessions
-            == PersistedSessionPolicy::Immediate
-        {
+        if selected_backend(&active_config) == MultiplexerBackendConfig::Native {
             self.active.binding.persisted_sessions_restored = false;
-            self.active
-                .binding
-                .restore_persisted_sessions(repaint, refresh.applied);
+            self.active.binding.restore_persisted_sessions(repaint);
         }
-    }
-
-    pub(super) fn activate_target(
-        &mut self,
-        scope: MuxScope,
-        session_id: &str,
-        window_id: Option<&str>,
-        repaint: &RepaintHandle,
-    ) -> Result<()> {
-        debug_assert_eq!(self.active.binding.scope, scope);
-        if self.active.binding.backend_policy.selection_publication
-            == SelectionPublicationPolicy::PersistBeforePublish
-        {
-            self.persist_binding_restore_selection(scope, session_id, window_id)?;
-        }
-        let config = self.active.binding.multiplexer.clone();
-        match window_id {
-            Some(window_id) => self
-                .active
-                .binding
-                .mux
-                .activate_window(session_id, window_id, repaint, &config),
-            None => self.active.binding.mux.activate_session(session_id),
-        }
-        Ok(())
     }
 
     pub(super) fn activate_space(
@@ -1172,7 +867,7 @@ impl WorkspaceRuntime {
         if let Some(owner) = &mut self.parked_native_terminal {
             owner.discard_side_effects();
         }
-        self.prepare_terminal_residency_transition(&mut target.binding, config, variant, repaint);
+        self.prepare_native_terminal_transition(&mut target.binding, config, variant, repaint);
 
         let current = std::mem::replace(&mut self.active, target);
 
@@ -1189,19 +884,19 @@ impl WorkspaceRuntime {
         Ok(true)
     }
 
-    fn prepare_terminal_residency_transition(
+    fn prepare_native_terminal_transition(
         &mut self,
         target: &mut BindingRuntime,
         config: &BoottyConfig,
         variant: AppearanceVariant,
         repaint: &RepaintHandle,
     ) {
-        let active_is_shared = self.active.binding.backend_policy.terminal_residency
-            == TerminalResidency::WorkspaceShared;
-        let target_is_shared =
-            target.backend_policy.terminal_residency == TerminalResidency::WorkspaceShared;
+        let active_is_native =
+            selected_backend(&self.active.binding.multiplexer) == MultiplexerBackendConfig::Native;
+        let target_is_native =
+            selected_backend(&target.multiplexer) == MultiplexerBackendConfig::Native;
 
-        match (active_is_shared, target_is_shared) {
+        match (active_is_native, target_is_native) {
             (true, true) => {
                 std::mem::swap(&mut self.active.binding.terminal, &mut target.terminal);
                 std::mem::swap(
@@ -1216,12 +911,8 @@ impl WorkspaceRuntime {
             (true, false) => {
                 let mut binding_config = config.clone();
                 binding_config.multiplexer = self.active.binding.multiplexer.clone();
-                let replacement = NativeTerminalOwner::new(
-                    &binding_config,
-                    Arc::clone(&self.backends),
-                    variant,
-                    repaint.clone(),
-                );
+                let replacement =
+                    NativeTerminalOwner::new(&binding_config, variant, repaint.clone());
                 let native_terminal =
                     NativeTerminalOwner::replace_binding(&mut self.active.binding, replacement);
                 debug_assert!(self.parked_native_terminal.is_none());
@@ -1236,7 +927,21 @@ impl WorkspaceRuntime {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    pub(super) fn insert_space(
+        &mut self,
+        space: &WorkspaceSpace,
+        config: &BoottyConfig,
+        variant: AppearanceVariant,
+        repaint: RepaintHandle,
+    ) -> SpaceId {
+        let runtime = SpaceRuntime::from_workspace(space, config, variant, repaint)
+            .expect("a persisted space always has a binding");
+        let id = runtime.id;
+        self.inactive_spaces.push(runtime);
+        self.inactive_spaces.sort_by_key(|space| space.position);
+        id
+    }
+
     pub(super) fn create_space(
         &mut self,
         name: &str,
@@ -1245,75 +950,30 @@ impl WorkspaceRuntime {
         tint_sidebar: bool,
         mux: SpaceMuxOverride,
         config: &BoottyConfig,
-        variant: AppearanceVariant,
-    ) -> Result<Option<SpaceId>, WorkspacePersistenceError> {
-        let Some(space) = self.repository.create_space(
-            name,
-            icon,
-            color,
-            tint_sidebar,
-            mux,
-            config.multiplexer.hide_tmux_status,
-        )?
-        else {
-            return Ok(None);
-        };
-        let runtime = SpaceRuntime::from_workspace(
-            &space,
-            config,
-            Arc::clone(&self.backends),
-            variant,
-            self.repaint.clone(),
-        )
-        .expect("a persisted space always has a binding");
-        let id = runtime.id;
-        self.inactive_spaces.push(runtime);
-        self.inactive_spaces.sort_by_key(|space| space.position);
-        Ok(Some(id))
+    ) -> Result<Option<WorkspaceSpace>, WorkspacePersistenceError> {
+        self.repository
+            .create_space(name, icon, color, tint_sidebar, mux, &config.multiplexer)
     }
 
     pub(super) fn delete_space(
         &mut self,
         space_id: SpaceId,
     ) -> Result<bool, WorkspacePersistenceError> {
-        let scopes: Vec<MuxScope> = self
-            .space(space_id)
-            .map(|space| space.bindings().map(|binding| binding.scope).collect())
-            .unwrap_or_default();
-        for scope in scopes {
-            if self
-                .repository
-                .pending_binding_membership_mutation(scope)?
-                .is_some()
-            {
-                return Err(WorkspacePersistenceError::operation(
-                    "finish the pending binding membership recovery before deleting this Space",
-                ));
-            }
-        }
-        let deleted = self.repository.delete_space(space_id)?;
-        if deleted {
-            self.inactive_spaces.retain(|space| space.id != space_id);
-        }
-        Ok(deleted)
+        self.repository.delete_space(space_id)
     }
 
     pub(super) fn update_space(
         &mut self,
-        summary: &SpaceSummary,
+        scope: MuxScope,
+        name: &str,
+        icon: &str,
+        color: [u8; 3],
+        tint_sidebar: bool,
         mux: SpaceMuxOverride,
-        config: &BoottyConfig,
-        variant: AppearanceVariant,
-    ) -> Result<SpaceUpdateOutcome, WorkspacePersistenceError> {
-        let Some(scope) = self.selected_binding_scope(summary.id) else {
-            return Ok(SpaceUpdateOutcome {
-                changed: false,
-                active_placement_changed: false,
-            });
-        };
-        let placement_changed = self
-            .binding(scope)
-            .is_some_and(|binding| binding.placement != mux);
+    ) -> Result<bool, WorkspacePersistenceError> {
+        let placement_changed = self.binding(scope).is_some_and(|binding| {
+            binding.backend_override != mux.backend || binding.remote_override != mux.remote
+        });
         if placement_changed
             && self
                 .repository
@@ -1324,91 +984,8 @@ impl WorkspaceRuntime {
                 "finish the pending binding membership recovery before changing its backend",
             ));
         }
-        let updated = self.repository.update_space_and_binding(
-            scope,
-            &summary.name,
-            &summary.icon,
-            summary.color,
-            summary.tint_sidebar,
-            mux.clone(),
-        )?;
-        if updated {
-            let active_placement_changed = self.active.id == scope.space_id() && placement_changed;
-            let space = if self.active.id == scope.space_id() {
-                &mut self.active
-            } else {
-                self.inactive_spaces
-                    .iter_mut()
-                    .find(|space| space.id == scope.space_id())
-                    .expect("the updated Space remains live")
-            };
-            space.name = summary.name.trim().to_owned();
-            space.icon = summary.icon.trim().to_owned();
-            space.color = summary.color;
-            space.tint_sidebar = summary.tint_sidebar;
-            if placement_changed {
-                let binding = space
-                    .bindings_mut()
-                    .find(|binding| binding.scope == scope)
-                    .expect("the updated binding remains live");
-                binding.rebuild(config, mux, variant, self.repaint.clone());
-            }
-            return Ok(SpaceUpdateOutcome {
-                changed: true,
-                active_placement_changed,
-            });
-        }
-        Ok(SpaceUpdateOutcome {
-            changed: updated,
-            active_placement_changed: false,
-        })
-    }
-
-    pub(super) fn rebuild_profile_bindings(
-        &mut self,
-        config: &BoottyConfig,
-        requested_scopes: Option<&HashSet<MuxScope>>,
-        variant: AppearanceVariant,
-        repaint: RepaintHandle,
-    ) -> Result<(), WorkspacePersistenceError> {
-        let profile_scopes = self
-            .binding_scopes()
-            .filter(|scope| requested_scopes.is_none_or(|scopes| scopes.contains(scope)))
-            .filter(|scope| {
-                self.binding_placement(*scope).is_some_and(|placement| {
-                    matches!(placement.remote, SpaceRemoteOverride::Profile(_))
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut pending_scopes = HashSet::new();
-        for scope in &profile_scopes {
-            match self.binding_has_pending_membership_operation(*scope) {
-                Ok(true) => {
-                    pending_scopes.insert(*scope);
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    self.deferred_profile_binding_rebuilds
-                        .extend(profile_scopes.iter().copied());
-                    return Err(error);
-                }
-            }
-        }
-        self.deferred_profile_binding_rebuilds
-            .extend(pending_scopes.iter().copied());
-        let mut rebuilt_scopes = Vec::new();
-        for binding in self.bindings_mut() {
-            if !profile_scopes.contains(&binding.scope) || pending_scopes.contains(&binding.scope) {
-                continue;
-            }
-            let placement = binding.placement().clone();
-            binding.rebuild(config, placement, variant, repaint.clone());
-            rebuilt_scopes.push(binding.scope);
-        }
-        for scope in rebuilt_scopes {
-            self.deferred_profile_binding_rebuilds.remove(&scope);
-        }
-        Ok(())
+        self.repository
+            .update_space_and_binding(scope, name, icon, color, tint_sidebar, mux)
     }
 
     pub(super) fn persist_active_binding_restore_state(
@@ -1454,109 +1031,6 @@ impl WorkspaceRuntime {
             .expect("the active binding has committed workspace state")
     }
 
-    pub(super) fn move_active_session(
-        &mut self,
-        session_id: &str,
-        delta: i32,
-    ) -> Result<bool, WorkspacePersistenceError> {
-        let Some(session_name) = self
-            .active
-            .binding
-            .mux
-            .session_by_id_or_name(session_id)
-            .map(|session| session.name.clone())
-        else {
-            return Ok(false);
-        };
-        let sessions = self
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
-        let mut candidate = self.active_binding_state_candidate();
-        if !candidate.session_order.move_session(
-            &session_name,
-            delta,
-            sessions.iter().map(String::as_str),
-        ) {
-            return Ok(false);
-        }
-        self.commit_binding_state_candidate(candidate)
-            .map(|()| true)
-    }
-
-    pub(super) fn reorder_active_session_before(
-        &mut self,
-        source: &str,
-        before: Option<&str>,
-    ) -> Result<bool, WorkspacePersistenceError> {
-        let sessions = self
-            .active
-            .binding
-            .mux
-            .sessions()
-            .iter()
-            .map(|session| session.name.clone())
-            .collect::<Vec<_>>();
-        let mut candidate = self.active_binding_state_candidate();
-        if !candidate.session_order.move_session_before(
-            source,
-            before,
-            sessions.iter().map(String::as_str),
-        ) {
-            return Ok(false);
-        }
-        self.commit_binding_state_candidate(candidate)
-            .map(|()| true)
-    }
-
-    pub(super) fn add_session_to_binding(
-        &mut self,
-        scope: MuxScope,
-        session_id: &str,
-    ) -> Result<bool, WorkspacePersistenceError> {
-        let Some(session_name) = self.binding(scope).and_then(|binding| {
-            binding
-                .mux
-                .backend_session_by_id_or_name(session_id)
-                .map(|session| session.name.clone())
-        }) else {
-            return Ok(false);
-        };
-        let mut candidate = self
-            .binding_state_candidate(scope)
-            .expect("a live binding has committed workspace state");
-        let added = candidate.session_order.add_session(&session_name);
-        self.commit_binding_state_candidate(candidate)?;
-        Ok(added)
-    }
-
-    pub(super) fn detach_session_from_space(
-        &mut self,
-        scope: MuxScope,
-        session_id: &str,
-    ) -> Result<bool, WorkspacePersistenceError> {
-        let Some(session_name) = self.binding(scope).and_then(|binding| {
-            binding
-                .mux
-                .backend_session_by_id_or_name(session_id)
-                .map(|session| session.name.clone())
-        }) else {
-            return Ok(false);
-        };
-        let mut candidate = self
-            .binding_state_candidate(scope)
-            .expect("a live binding has committed workspace state");
-        if !candidate.session_order.remove_session(&session_name) {
-            return Ok(false);
-        }
-        self.commit_binding_state_candidate(candidate)
-            .map(|()| true)
-    }
-
     pub(super) fn begin_active_binding_membership_mutation(
         &mut self,
         command: &MuxCommand,
@@ -1580,7 +1054,9 @@ impl WorkspaceRuntime {
                     .active
                     .binding
                     .mux
-                    .backend_session_by_id_or_name(session_id);
+                    .all_sessions()
+                    .iter()
+                    .find(|session| session.id == *session_id || session.name == *session_id);
                 let old_name = session
                     .map(|session| session.name.clone())
                     .or_else(|| {
@@ -1627,7 +1103,9 @@ impl WorkspaceRuntime {
                     .active
                     .binding
                     .mux
-                    .backend_session_by_id_or_name(session_id)
+                    .all_sessions()
+                    .iter()
+                    .find(|session| session.id == *session_id || session.name == *session_id)
                     .map(|session| session.name.clone())
                     .or_else(|| {
                         self.active
@@ -1655,71 +1133,28 @@ impl WorkspaceRuntime {
         Ok(mutation)
     }
 
-    pub(super) fn complete_binding_membership_command(
+    pub(super) fn commit_active_binding_membership_mutation(
         &mut self,
-        scope: MuxScope,
-        membership: Option<&BindingMembershipMutation>,
-        result: &MuxCommandResult,
+        mutation: &BindingMembershipMutation,
     ) -> Result<(), WorkspacePersistenceError> {
-        let Some(membership) = membership else {
-            return Ok(());
-        };
-        let committable = result.as_ref().is_ok_and(|completion| {
-            self.binding(scope)
-                .is_some_and(|binding| completion.matches_config(&binding.multiplexer))
-        });
-        if !committable {
-            self.defer_binding_membership_reconciliation(scope);
-            return Ok(());
-        }
-        let Some(mut candidate) = self.binding_state_candidate(scope) else {
-            return Ok(());
-        };
-        if let Err(error) = self.repository.commit_binding_membership_mutation(
+        let mut candidate = self.active_binding_state_candidate();
+        self.repository.commit_binding_membership_mutation(
             candidate.scope,
-            membership,
+            mutation,
             &mut candidate.session_order,
             &mut candidate.session_names,
-        ) {
-            self.defer_binding_membership_reconciliation(scope);
-            return Err(error);
-        }
-        if let Some(binding) = self.binding_mut(candidate.scope) {
-            binding.publish_session_state(candidate);
-        }
+        )?;
+        self.binding_mut(candidate.scope)
+            .expect("the committed binding remains live")
+            .publish_session_state(candidate);
         Ok(())
     }
 
-    pub(super) fn defer_binding_membership_reconciliation(&mut self, scope: MuxScope) {
-        if let Some(binding) = self.binding_mut(scope) {
-            binding.membership_reconciliation_waiting_for_refresh = true;
-            binding.mux.refresh_on_next_frame();
-        }
-    }
-
-    pub(super) fn complete_authoritative_command(
-        &mut self,
-        scope: MuxScope,
-        result: MuxCommandResult,
-    ) -> (MuxCommandResult, Option<String>) {
-        let completion = {
-            let Some(binding) = self.binding_mut(scope) else {
-                return (Err(MuxCommandError::Stale), None);
-            };
-            let config = binding.multiplexer.clone();
-            binding.mux.complete_authoritative_command(result, &config)
-        };
-        let sync_error = if completion.is_ok()
-            && self.active.binding.scope == scope
-            && self.active.binding.uses_native_terminal_layout()
-        {
-            self.sync_active_terminal_panes()
-                .err()
-                .map(|error| error.to_string())
-        } else {
-            None
-        };
-        (completion, sync_error)
+    pub(super) fn defer_active_binding_membership_reconciliation(&mut self) {
+        self.active
+            .binding
+            .membership_reconciliation_waiting_for_refresh = true;
+        self.active.binding.mux.refresh_on_next_frame();
     }
 
     pub(super) fn reconcile_binding_membership_mutations(
@@ -1735,7 +1170,7 @@ impl WorkspaceRuntime {
                         .mux
                         .all_sessions()
                         .iter()
-                        .map(|session| BackendMembership {
+                        .map(|session| BackendSessionMembership {
                             id: session.id.clone(),
                             name: session.name.clone(),
                         })
@@ -1839,16 +1274,6 @@ impl WorkspaceRuntime {
             .chain(self.inactive_spaces.iter().flat_map(SpaceRuntime::bindings))
     }
 
-    fn bindings_mut(&mut self) -> impl Iterator<Item = &mut BindingRuntime> {
-        std::iter::once(&mut self.active.binding)
-            .chain(self.active.inactive_bindings.iter_mut())
-            .chain(
-                self.inactive_spaces
-                    .iter_mut()
-                    .flat_map(SpaceRuntime::bindings_mut),
-            )
-    }
-
     fn binding_mut(&mut self, scope: MuxScope) -> Option<&mut BindingRuntime> {
         if self.active.binding.scope == scope {
             return Some(&mut self.active.binding);
@@ -1870,4 +1295,17 @@ impl WorkspaceRuntime {
     pub(super) fn binding(&self, scope: MuxScope) -> Option<&BindingRuntime> {
         self.all_bindings().find(|binding| binding.scope == scope)
     }
+}
+
+pub(super) fn terminal_session_config_with_side_effects(
+    config: &BoottyConfig,
+    variant: AppearanceVariant,
+    side_effect_tx: &mpsc::Sender<TerminalSideEffectEvent>,
+) -> TerminalSessionConfig {
+    let mut session_config = config.terminal_session_config();
+    session_config.colors = config
+        .colors_for_appearance(variant)
+        .terminal_color_config();
+    session_config.side_effect_tx = Some(side_effect_tx.clone());
+    session_config
 }
