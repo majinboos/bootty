@@ -582,12 +582,16 @@ impl AppState {
         };
     }
     fn sync_macos_non_native_fullscreen_presentation(&mut self) {
-        if !self.macos_non_native_fullscreen_pending_apply {
+        if !self.macos_non_native_fullscreen_active {
             return;
         }
-        if apply_macos_non_native_fullscreen_presentation(&self.config().window) {
-            self.macos_non_native_fullscreen_pending_apply = false;
+        if self.macos_non_native_fullscreen_pending_apply {
+            if apply_macos_non_native_fullscreen_presentation(&self.config().window) {
+                self.macos_non_native_fullscreen_pending_apply = false;
+            }
+            return;
         }
+        bootty_winit::window::refresh_macos_non_native_fullscreen_frame();
     }
     pub fn terminal_mut(&mut self) -> &mut ActiveTerminal {
         &mut self.workspace.active.binding.terminal

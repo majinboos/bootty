@@ -248,6 +248,11 @@ pub fn restore_macos_presentation() -> bool {
     platform_set_macos_non_native_fullscreen(false)
 }
 
+/// Resize app-owned non-native fullscreen to the active screen after display geometry changes.
+pub fn refresh_macos_non_native_fullscreen_frame() {
+    platform_refresh_macos_non_native_fullscreen_frame();
+}
+
 /// Whether this platform adapter owns the non-native fullscreen frame.
 pub fn handles_macos_non_native_fullscreen_frame() -> bool {
     cfg!(target_os = "macos")
@@ -262,6 +267,14 @@ fn platform_set_macos_non_native_fullscreen(enabled: bool) -> bool {
 fn platform_set_macos_non_native_fullscreen(_enabled: bool) -> bool {
     true
 }
+
+#[cfg(target_os = "macos")]
+fn platform_refresh_macos_non_native_fullscreen_frame() {
+    macos_presentation::refresh_non_native_fullscreen_frame();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_refresh_macos_non_native_fullscreen_frame() {}
 
 #[cfg(target_os = "macos")]
 mod macos_presentation {
@@ -283,7 +296,7 @@ mod macos_presentation {
         movable_by_window_background: bool,
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     struct WindowFrame {
         x: f64,
         y: f64,
@@ -327,9 +340,7 @@ mod macos_presentation {
                 window.setStyleMask(style_mask);
                 window.setMovable(false);
                 window.setMovableByWindowBackground(false);
-                if let Some(screen) = window.screen() {
-                    window.setFrame_display(screen.frame(), true);
-                }
+                fill_active_screen(&window);
                 return true;
             }
             return false;
@@ -348,6 +359,34 @@ mod macos_presentation {
             state.restore(&window);
         }
         true
+    }
+
+    pub fn refresh_non_native_fullscreen_frame() {
+        if SAVED_WINDOW_STATE
+            .lock()
+            .expect("lock window state")
+            .is_none()
+        {
+            return;
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let Some(window) = super::active_window(&app) else {
+            return;
+        };
+        fill_active_screen(&window);
+    }
+
+    fn fill_active_screen(window: &NSWindow) {
+        let Some(screen) = window.screen() else {
+            return;
+        };
+        let screen_frame = WindowFrame::from(screen.frame());
+        if WindowFrame::from(window.frame()) != screen_frame {
+            window.setFrame_display(screen_frame.into(), true);
+        }
     }
 
     impl WindowState {
