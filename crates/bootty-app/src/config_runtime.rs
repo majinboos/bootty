@@ -16,7 +16,8 @@ use bootty_winit::{direct_input::ModifierSideState, modifier_remap::ModifierRema
 use eframe::egui;
 
 use crate::terminal_config::{
-    terminal_live_config, terminal_macos_option_as_alt, terminal_text_config,
+    terminal_cursor_config, terminal_live_config, terminal_macos_option_as_alt,
+    terminal_text_config,
 };
 use crate::{
     app_actions::{
@@ -223,7 +224,7 @@ impl AppConfigRuntime {
         let previous = &self.current;
         let live_config_changed = previous.colors_for_appearance(appearance)
             != next.colors_for_appearance(appearance)
-            || previous.cursor != next.cursor
+            || terminal_cursor_config(&previous.cursor) != terminal_cursor_config(&next.cursor)
             || previous.session.glyph_protocol != next.session.glyph_protocol;
         let text_config = (previous.font != next.font).then(|| terminal_text_config(&next.font));
         let ui_fonts = (previous.font.ui_families() != next.font.ui_families())

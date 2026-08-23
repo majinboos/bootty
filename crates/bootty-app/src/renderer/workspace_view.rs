@@ -12,7 +12,7 @@ use eframe::{
 
 use crate::{
     layout::SplitDirection,
-    renderer::{RendererMetrics, TerminalWidget, TerminalWidgetOutput},
+    renderer::{CursorEmphasis, RendererMetrics, TerminalWidget, TerminalWidgetOutput},
     state::AppState,
     workspace_runtime::{TerminalProgress, TerminalProgressState},
 };
@@ -233,6 +233,11 @@ impl TerminalWorkspaceView {
             .unwrap_or(palette.accent);
         let corner_radius_px = chrome.pane_corner_radius;
         let inactive_dim = chrome.unfocused_terminal_dim.clamp(0.0, 1.0);
+        let inactive_cursor_emphasis = if state.config().cursor.dim_inactive_pane {
+            CursorEmphasis::Inactive
+        } else {
+            CursorEmphasis::Normal
+        };
         let rects = state.pane_rects(area, gap);
 
         if ui.input(|input| input.pointer.primary_pressed())
@@ -288,8 +293,13 @@ impl TerminalWorkspaceView {
             } else {
                 let widget = self.inactive_widget(widget_key);
                 state.terminal_runtime_for_pane(pane_id).map(|source| {
-                    let output =
-                        widget.show_at_rect(ui, *rect, ("native-pane", widget_key), source)?;
+                    let output = widget.show_at_rect_with_cursor_emphasis(
+                        ui,
+                        *rect,
+                        ("native-pane", widget_key),
+                        source,
+                        inactive_cursor_emphasis,
+                    )?;
                     if output.viewport_scroll_delta != 0 {
                         source.scroll_viewport_delta(output.viewport_scroll_delta)?;
                     }

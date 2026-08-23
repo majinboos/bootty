@@ -163,6 +163,7 @@ pub enum SettingKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettingEditor {
     Appearance,
+    Colors,
     Text,
     General,
     Status,
@@ -180,6 +181,7 @@ impl SettingEditor {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Appearance => "appearance",
+            Self::Colors => "colors",
             Self::Text => "text",
             Self::General => "general",
             Self::Status => "status",

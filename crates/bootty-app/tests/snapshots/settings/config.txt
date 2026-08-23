@@ -3,7 +3,7 @@ Bootty Settings
 Config
 Search settings...
 LOCATIONS
-Core
+General
 
 General
 Config file
@@ -13,26 +13,29 @@ Read-only location.
 Remotes
 Config directory
 <config-dir>
-
-Text
+Appearance
 Read-only location.
-
+
 Appearance
 Themes directory
 <config-dir>/themes
-
-Window
+
+Colors
 Read-only location.
-
-Sidebar
+
+Text
 Extensions directory
 <config-dir>/extensions
 Read-only location.
+
+Window
+RELOAD
+
+Sidebar
+Last write succeeded
 
 Status Bar
-RELOAD
 Terminal
-Last write succeeded
 
 Shell
 

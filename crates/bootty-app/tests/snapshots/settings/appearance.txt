@@ -2,71 +2,50 @@ Bootty Settings
   Back to terminal
 Appearance
 Search settings...
-APPEARANCE
-Core
+CURSOR
+General
 
 General
-Mode
-System
-Light
-Dark
-Follow the system appearance or force a light/dark branch.
+Style
+Block
+Bar
+Underline
+Hollow block
+Default cursor shape used when an application resets the cursor.
 
 Remotes
-Edit branch
+Appearance
+Blink
+Allow the cursor to blink in the focused pane.
+
+Appearance
+
+Colors
+Dim inactive pane cursors
+Keep cursors steady and slightly dimmer outside the focused pane.
 
 Text
-Light
-Dark
-Theme and color choices are stored separately for light and dark.
-
-Appearance
-THEME
+MOUSE POINTER
 
 Window
-Theme
-Catppuccin Mocha
+Hide while typing
 
 Sidebar
-Built-in or config-directory theme.
+Hide the mouse pointer while typing until the pointer moves.
 
 Status Bar
-TERMINAL COLORS
+FULLSCREEN NOTCH
 Terminal
-Background
+Use black notch chrome
 
 Shell
-Terminal background override.
+In dark mode on notched fullscreen displays, paint sidebar, status bar, and split dividers solid black.
 
 Keys
-Foreground
-Primary terminal text override.
 Advanced
 
 Config
-Cursor
-Cursor fill color.
 
 Diagnostics
-Cursor text
 
 Extensions
-Text drawn under the cursor.
-Selection
-Selection background and foreground.
-Selection text
-Selected text foreground.
-Highlight
-Search or match highlight background.
-Highlight text
-Search or match highlight foreground.
-Pointer foreground
-Pointer text/foreground override.
-Pointer background
-Pointer background override.
-Tektronix foreground
-Tektronix vector-display foreground override.
-Tektronix background
-Use standard 16
-Use xterm 256
-Add empty slot

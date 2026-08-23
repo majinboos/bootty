@@ -3,7 +3,7 @@ Bootty Settings
 Sidebar
 Search settings...
 NAVIGATION
-Core
+General
 
 General
 Position
@@ -14,46 +14,49 @@ Dock the sidebar on the left or right edge.
 Remotes
 Width
 286.0 px
+Appearance
+Width of the session sidebar.
+
+Appearance
+Sidebar colors are edited in the Colors pane.
+
+KEYBOARD
+Colors
+Sidebar navigation shortcuts are edited in the Keys pane with the Sidebar scope.
 
 Text
-Width of the session sidebar.
-
-Appearance
-Sidebar colors are edited in the Appearance pane.
-KEYBOARD
+Edit sidebar shortcuts
 
 Window
-Sidebar navigation shortcuts are edited in the Keys pane with the Sidebar scope.
+Loading module source…
+SIDEBAR
 
 Sidebar
-Edit sidebar shortcuts
-Loading module source…
-
-Status Bar
-SIDEBAR
-Terminal
 
 Sessions
-
-Shell
+
+Status Bar
 
 Usage footer
+Terminal
+
+Shell
+SESSION
 
 Keys
+
+Diffs
 Advanced
-SESSION
+
+Process
 
 Config
 
-Diffs
+Directory
 
 Diagnostics
-
-Process
 
 Extensions
-
-Directory
 
 Git branch
 

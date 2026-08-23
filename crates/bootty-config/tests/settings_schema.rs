@@ -170,6 +170,15 @@ fn an_unregistered_toml_leaf_fails_at_the_schema_boundary() {
 fn extension_schemas_keep_the_builtin_hand_written_declarations() {
     let schema = SettingsSchema::with_extensions(&[]);
     assert!(schema.allows_path(&["cursor", "style"]));
+    assert!(schema.allows_path(&["cursor", "dim-inactive-pane"]));
     assert!(schema.allows_path(&["input", "copy-on-select"]));
     assert!(schema.allows_path(&["multiplexer", "remote", "args"]));
+    assert_eq!(schema.get("cursor.style").unwrap().page, "appearance");
+    assert_eq!(
+        schema
+            .get("input.hide-mouse-pointer-while-typing")
+            .unwrap()
+            .page,
+        "appearance"
+    );
 }

@@ -3,15 +3,18 @@ Bootty Settings
 Extensions
 Search settings...
 No loaded extension declares a setting. A module registers one with bootty.settings.register.
-Core
+General
 
 General
 
 Remotes
+Appearance
+
+Appearance
+
+Colors
 
 Text
-
-Appearance
 
 Window
 

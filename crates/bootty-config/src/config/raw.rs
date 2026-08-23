@@ -209,6 +209,7 @@ pub(super) struct AppearanceBranchPatch {
 pub(super) struct CursorPatch {
     pub(super) style: Option<CursorStyleConfig>,
     pub(super) blink: Option<bool>,
+    pub(super) dim_inactive_pane: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(untagged)]

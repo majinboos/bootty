@@ -3,7 +3,7 @@ Bootty Settings
 General
 Search settings...
 DEFAULTS
-Core
+General
 
 General
 Default backend
@@ -13,15 +13,18 @@ tmux
 Switches immediately for new mux actions and refreshes live config.
 
 Remotes
-
-Text
+Appearance
 Chrome visibility
 Bottom bar
 Top bar
 Sidebar
 Show or hide persistent app chrome.
-
+
 Appearance
+
+Colors
+
+Text
 
 Window
 

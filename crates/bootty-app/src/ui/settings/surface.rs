@@ -4,6 +4,7 @@
 //! publishes each complete draft at the frame boundary.
 
 mod appearance;
+mod colors;
 mod font;
 pub mod keybinds;
 pub mod modules;
@@ -39,8 +40,9 @@ pub enum SettingsPage {
     #[default]
     General,
     Remotes,
-    Text,
     Appearance,
+    Colors,
+    Text,
     Window,
     Sidebar,
     Shell,
@@ -58,8 +60,9 @@ impl SettingsPage {
         match self {
             Self::General => "general",
             Self::Remotes => "remotes",
-            Self::Text => "text",
             Self::Appearance => "appearance",
+            Self::Colors => "colors",
+            Self::Text => "text",
             Self::Window => "window",
             Self::Sidebar => "sidebar",
             Self::Shell => "shell",
@@ -95,14 +98,15 @@ macro_rules! page {
 }
 
 #[rustfmt::skip]
-const PAGE_META: [PageMeta; 12] = [
-    page!(General, "Core", "General", "sliders-horizontal", "default profile|multiplexer|backend|sidebar|status bar|new windows|terminal preview"),
-    page!(Remotes, "Core", "Remotes", "server", "ssh|remote|profile|host|port|user|authentication|private key|proxy|test connection"),
-    page!(Text, "Core", "Text", "case-sensitive", "font|family|fallback|size|cell width|cell height|baseline|underline|glyph|features"),
-    page!(Appearance, "Core", "Appearance", "palette", "theme|colors|background|foreground|cursor|selection|ansi|palette|sidebar colors"),
-    page!(Window, "Core", "Window", "panel-top", "window|title|titlebar|decoration|fullscreen|size|width|height|sidebar|chrome|dim"),
-    page!(Sidebar, "Core", "Sidebar", "panel-left", "sidebar|session|navigation|position|width|background|foreground|selected|hover|border|modules|luau|source"),
-    page!(Status, "Core", "Status Bar", "activity", "status|modules|segments|clock|sysinfo|alignment|icon|foreground|background|luau|source"),
+const PAGE_META: [PageMeta; 13] = [
+    page!(General, "General", "General", "sliders-horizontal", "default profile|multiplexer|backend|sidebar|status bar|new windows|terminal preview"),
+    page!(Remotes, "General", "Remotes", "server", "ssh|remote|profile|host|port|user|authentication|private key|proxy|test connection"),
+    page!(Appearance, "Appearance", "Appearance", "sparkles", "cursor|blink|inactive pane|mouse pointer|hide while typing|fullscreen notch"),
+    page!(Colors, "Appearance", "Colors", "palette", "theme|colors|background|foreground|cursor color|selection|ansi|palette|sidebar colors"),
+    page!(Text, "Appearance", "Text", "case-sensitive", "font|family|fallback|size|cell width|cell height|baseline|underline|glyph|features"),
+    page!(Window, "Appearance", "Window", "panel-top", "window|title|titlebar|decoration|fullscreen|size|width|height|sidebar|chrome|dim"),
+    page!(Sidebar, "Appearance", "Sidebar", "panel-left", "sidebar|session|navigation|position|width|modules|luau|source"),
+    page!(Status, "Appearance", "Status Bar", "activity", "status|modules|segments|clock|sysinfo|alignment|icon|luau|source"),
     page!(Shell, "Terminal", "Shell", "terminal", "shell|working directory|environment|env|term|colorterm|scrollback|glyph protocol"),
     page!(Keys, "Terminal", "Keys", "keyboard", "keybindings|shortcuts|scope|global|native|tmux|sidebar|modifier remap|option as alt|record shortcut"),
     page!(Config, "Advanced", "Config", "file-cog", "config|path|directory|themes|status modules|reload|last write error"),
@@ -425,7 +429,7 @@ impl SettingsSurface {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width((ui.available_width() - 14.0).max(0.0));
-                        for group in ["Core", "Terminal", "Advanced"] {
+                        for group in ["General", "Appearance", "Terminal", "Advanced"] {
                             let visible_pages = PAGE_META
                                 .iter()
                                 .copied()
@@ -494,7 +498,7 @@ impl SettingsSurface {
                                 SettingsPage::Keys
                                 | SettingsPage::Status
                                 | SettingsPage::Sidebar => 1040.0,
-                                SettingsPage::Appearance => 860.0,
+                                SettingsPage::Colors => 860.0,
                                 _ => 780.0,
                             };
                             let content_width = ui.available_width().min(max_width);
@@ -509,6 +513,7 @@ impl SettingsSurface {
                                         SettingsPage::Remotes => remotes::ui(self, ui),
                                         SettingsPage::Text => font::ui(self, ui),
                                         SettingsPage::Appearance => appearance::ui(self, ui),
+                                        SettingsPage::Colors => colors::ui(self, ui),
                                         SettingsPage::Window => self.schema_ui(ui),
                                         SettingsPage::Sidebar => self.sidebar_ui(ui, sources),
                                         SettingsPage::Shell => session::ui(self, ui),
@@ -671,7 +676,7 @@ impl SettingsSurface {
         settings_notice(
             ui,
             self.palette.muted,
-            "Sidebar colors are edited in the Appearance pane.",
+            "Sidebar colors are edited in the Colors pane.",
         );
         section(ui, self.palette, "KEYBOARD");
         settings_notice(

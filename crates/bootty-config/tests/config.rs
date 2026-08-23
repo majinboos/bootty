@@ -46,6 +46,19 @@ fn load_config_source(source: &str) -> BoottyConfig {
 }
 
 #[rstest]
+#[case::default("", true)]
+#[case::disabled("[cursor]\ndim-inactive-pane = false\n", false)]
+fn inactive_pane_cursor_dimming_has_an_explicit_default(
+    #[case] source: &str,
+    #[case] expected: bool,
+) {
+    assert_eq!(
+        load_config_source(source).cursor.dim_inactive_pane,
+        expected
+    );
+}
+
+#[rstest]
 #[case::self_cycle(&[("a.toml", "a.toml")], "a.toml")]
 #[case::two_file_cycle(&[("a.toml", "b.toml"), ("b.toml", "a.toml")], "a.toml")]
 #[case::cycle_after_acyclic_entry(

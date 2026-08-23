@@ -4,7 +4,6 @@ use bootty_ui::font_stack::{FontStackSpec, font_stack_editor};
 use bootty_ui::settings::{TokenCard, settings_panel, token_card_grid};
 
 use super::SettingsSurface;
-use bootty_config::config::CursorStyleConfig;
 use bootty_font::{FontFeature, parse_font_features};
 
 pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
@@ -107,57 +106,6 @@ pub(super) fn ui(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     win.setting(ui, "font.underline-position");
     win.setting(ui, "font.underline-thickness");
     font_feature_picker(win, ui);
-
-    super::section(ui, palette, "CURSOR");
-    cursor_settings(win, ui);
-}
-
-fn cursor_settings(win: &mut SettingsSurface, ui: &mut egui::Ui) {
-    let palette = win.palette;
-    super::settings_row(
-        ui,
-        palette,
-        "Style",
-        "Default cursor shape used when an application resets the cursor.",
-        |ui| {
-            let labels = ["Block", "Bar", "Underline", "Hollow block"];
-            let current = match win.config.cursor.style.unwrap_or(CursorStyleConfig::Block) {
-                CursorStyleConfig::Block => 0,
-                CursorStyleConfig::Bar => 1,
-                CursorStyleConfig::Underline => 2,
-                CursorStyleConfig::HollowBlock => 3,
-            };
-            if let Some(index) = super::settings_segmented(ui, palette, &labels, current) {
-                let style = match index {
-                    0 => CursorStyleConfig::Block,
-                    1 => CursorStyleConfig::Bar,
-                    2 => CursorStyleConfig::Underline,
-                    _ => CursorStyleConfig::HollowBlock,
-                };
-                win.config.cursor.style = Some(style);
-                win.writeback.set_str(
-                    &["cursor", "style"],
-                    match style {
-                        CursorStyleConfig::Block => "block",
-                        CursorStyleConfig::Bar => "bar",
-                        CursorStyleConfig::Underline => "underline",
-                        CursorStyleConfig::HollowBlock => "hollow-block",
-                    },
-                );
-            }
-        },
-    );
-    super::settings_toggle_row(
-        ui,
-        palette,
-        "Blink",
-        "Allow the cursor to blink when the terminal is focused.",
-        win.config.cursor.blink.unwrap_or(true),
-        |enabled| {
-            win.config.cursor.blink = Some(enabled);
-            win.writeback.set_bool(&["cursor", "blink"], enabled);
-        },
-    );
 }
 
 /// The OpenType features in force, as toggleable cards over the tags worth naming, with a raw field

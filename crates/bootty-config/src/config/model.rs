@@ -456,10 +456,21 @@ pub struct AppearanceBranchConfig {
     pub colors: ColorConfig,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorConfig {
     pub style: Option<CursorStyleConfig>,
     pub blink: Option<bool>,
+    pub dim_inactive_pane: bool,
+}
+
+impl Default for CursorConfig {
+    fn default() -> Self {
+        Self {
+            style: None,
+            blink: None,
+            dim_inactive_pane: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]

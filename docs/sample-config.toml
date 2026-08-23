@@ -301,6 +301,8 @@ glyph-protocol = true
 # style accepts: block, bar, underline, hollow-block.
 style = "block"
 blink = false
+# Keep cursors steady and slightly dimmer outside the focused pane.
+dim-inactive-pane = true
 
 [diagnostics]
 # Live-reloaded. Set to a writable path to record frame/status stability data.

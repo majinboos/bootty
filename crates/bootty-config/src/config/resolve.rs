@@ -326,6 +326,7 @@ pub(super) fn apply_partial_colors(colors: &mut ColorConfig, partial: ColorPatch
 fn apply_partial_cursor(cursor: &mut CursorConfig, partial: CursorPatch) {
     apply_present(&mut cursor.style, partial.style);
     apply_present(&mut cursor.blink, partial.blink);
+    apply_value(&mut cursor.dim_inactive_pane, partial.dim_inactive_pane);
 }
 
 fn resolve_appearance(

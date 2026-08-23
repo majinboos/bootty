@@ -1,0 +1,75 @@
+Bootty Settings
+  Back to terminal
+Colors
+Search settings...
+COLOR MODE
+General
+
+General
+Mode
+System
+Light
+Dark
+Follow the system appearance or force a light/dark branch.
+
+Remotes
+Edit branch
+Appearance
+Light
+Dark
+Theme and color choices are stored separately for light and dark.
+
+Appearance
+THEME
+
+Colors
+Theme
+
+Text
+Catppuccin Mocha
+Built-in or config-directory theme.
+
+Window
+TERMINAL COLORS
+
+Sidebar
+Background
+
+Status Bar
+Terminal background override.
+Terminal
+Foreground
+Primary terminal text override.
+
+Shell
+
+Keys
+Cursor
+Cursor fill color.
+Advanced
+Cursor text
+
+Config
+Text drawn under the cursor.
+
+Diagnostics
+Selection
+
+Extensions
+Selection background and foreground.
+Selection text
+Selected text foreground.
+Highlight
+Search or match highlight background.
+Highlight text
+Search or match highlight foreground.
+Pointer foreground
+Pointer text/foreground override.
+Pointer background
+Pointer background override.
+Tektronix foreground
+Tektronix vector-display foreground override.
+Tektronix background
+Use standard 16
+Use xterm 256
+Add empty slot

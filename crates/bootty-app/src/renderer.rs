@@ -28,6 +28,15 @@ mod workspace_view;
 
 pub(crate) use workspace_view::{TerminalWorkspaceView, animate_indeterminate_progress};
 
+const INACTIVE_PANE_CURSOR_OPACITY: f32 = 0.65;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorEmphasis {
+    #[default]
+    Normal,
+    Inactive,
+}
+
 fn surface_rect(rect: Rect) -> SurfaceRect {
     SurfaceRect {
         min_x: rect.min.x,
@@ -173,6 +182,17 @@ impl TerminalWidget {
         id_salt: impl std::hash::Hash + std::fmt::Debug,
         terminal: &mut dyn TerminalFrameSource,
     ) -> Result<TerminalWidgetOutput> {
+        self.show_at_rect_with_cursor_emphasis(ui, rect, id_salt, terminal, CursorEmphasis::Normal)
+    }
+
+    pub fn show_at_rect_with_cursor_emphasis(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: Rect,
+        id_salt: impl std::hash::Hash + std::fmt::Debug,
+        terminal: &mut dyn TerminalFrameSource,
+        cursor_emphasis: CursorEmphasis,
+    ) -> Result<TerminalWidgetOutput> {
         let widget_id = ui.make_persistent_id(("terminal-widget", id_salt));
         let response = ui.interact(rect, widget_id, Sense::click_and_drag());
         if response.clicked() || response.drag_started() {
@@ -192,7 +212,7 @@ impl TerminalWidget {
         self.last_surface = Some(surface.grid_rect(frame.cols, frame.rows));
         let viewport_scroll_delta =
             self.handle_scrollbar_interaction(ui, widget_id, surface, frame.as_ref());
-        self.paint(ui, surface, &frame)?;
+        self.paint(ui, surface, &frame, cursor_emphasis)?;
         self.handle_hyperlink_interaction(ui, surface, frame.as_ref(), &response);
         self.metrics.render_state_update_us = frame.stats.render_state_update_us;
         self.metrics.frame_extraction_us = frame.stats.extraction_us;
@@ -249,11 +269,14 @@ impl TerminalWidget {
 
         if let Some(link) = hovered_link {
             let modifiers = ui.input(|input| input.modifiers);
-            ui.ctx().set_cursor_icon(if modifiers.command {
-                egui::CursorIcon::PointingHand
-            } else {
-                self.terminal_pointer_icon(frame, modifiers)
-            });
+            ui.ctx()
+                .set_cursor_icon(if self.terminal_cursor_icon == egui::CursorIcon::None {
+                    egui::CursorIcon::None
+                } else if modifiers.command {
+                    egui::CursorIcon::PointingHand
+                } else {
+                    self.terminal_pointer_icon(frame, modifiers)
+                });
             let rect = transformed_surface_rect(
                 surface.run_rect(link.start_col, link.row, link.cells),
                 self.view,
@@ -278,7 +301,9 @@ impl TerminalWidget {
         frame: &RenderFrame,
         modifiers: egui::Modifiers,
     ) -> egui::CursorIcon {
-        if frame.mouse_tracking && !modifiers.shift {
+        if self.terminal_cursor_icon == egui::CursorIcon::None {
+            egui::CursorIcon::None
+        } else if frame.mouse_tracking && !modifiers.shift {
             egui::CursorIcon::Default
         } else {
             self.terminal_cursor_icon
@@ -294,6 +319,7 @@ impl TerminalWidget {
         ui: &mut egui::Ui,
         surface: TerminalSurface,
         frame: &Arc<RenderFrame>,
+        cursor_emphasis: CursorEmphasis,
     ) -> Result<()> {
         let paint_start = Instant::now();
         anyhow::ensure!(
@@ -308,8 +334,14 @@ impl TerminalWidget {
             self.transition_pending = false;
             self.transition_source_frame = None;
         }
-        let cursor_blinking = frame.cursor.is_some_and(|cursor| cursor.blinking);
-        let cursor_blink_phase = self.cursor_blink.phase(Instant::now(), frame.cursor);
+        let cursor_blinking = cursor_emphasis == CursorEmphasis::Normal
+            && frame.cursor.is_some_and(|cursor| cursor.blinking);
+        let cursor_blink_phase = if cursor_emphasis == CursorEmphasis::Normal {
+            self.cursor_blink.phase(Instant::now(), frame.cursor)
+        } else {
+            self.cursor_blink.phase(Instant::now(), None);
+            CursorBlinkPhase::from_opacity(INACTIVE_PANE_CURSOR_OPACITY)
+        };
         if !self.render_cache.matches(surface, &frame) {
             let plan = self
                 .planner

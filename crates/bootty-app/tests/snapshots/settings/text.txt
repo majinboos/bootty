@@ -3,7 +3,7 @@ Bootty Settings
 Text
 Search settings...
 UI FONT
-Core
+General
 
 General
 Use terminal font
@@ -11,50 +11,53 @@ Share the terminal font stack for Bootty's UI chrome.
 
 Remotes
 Add UI fallback
-
-Text
+Appearance
 TERMINAL FONT
-
+
 Appearance
 Primary font
+
 
+Colors
 
 monospace
+Bootty tries this font first for terminal cells.
+
+Text
+Add terminal fallback
 
 Window
-Bootty tries this font first for terminal cells.
+TERMINAL METRICS
 
 Sidebar
-Add terminal fallback
-
-Status Bar
-TERMINAL METRICS
-Terminal
 Font size
 15.7pt
-
-Shell
+
+Status Bar
 Main terminal text size.
-
-Keys
+Terminal
 Cell width
 Auto
 10.0px
-Advanced
+
+Shell
 Leave automatic unless glyphs look too tight or too loose.
-
-Config
+
+Keys
 Cell height
 Auto
 22.0px
 Leave automatic unless lines look clipped or too airy.
-
-Diagnostics
-
-Extensions
+Advanced
+
+Config
 Fit rows to window
 Stretch row spacing so terminal content fills available height.
+
+Diagnostics
 Fit columns to window
+
+Extensions
 Stretch column spacing so terminal content fills available width (avoids a gap on the right, common with split panes).
 GLYPH BEHAVIOR
 Baseline adjustment
@@ -89,7 +92,3 @@ Uses text-style numerals when available.
 +ss02  Stylistic set 2
 Enables the font's first stylistic alternate set.
 Enables the font's second stylistic alternate set.
-Block
-Bar
-Underline
-Hollow block
