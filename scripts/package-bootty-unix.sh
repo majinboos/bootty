@@ -247,24 +247,32 @@ case "$(uname -s)" in
       echo "Xcode actool is required to package the macOS app icon" >&2
       exit 1
     fi
+    MACOS_ICON_FALLBACK="crates/bootty-app/assets/bootty-icon-macos-fallback.icns"
     ICON_PARTIAL_INFO="$CONTENTS_DIR/assetcatalog-info.plist"
     ACTOOL_LOG="$(mktemp)"
-    if ! "$ACTOOL" "$MACOS_ICON_SOURCE" \
-      --compile "$RESOURCES_DIR" \
-      --app-icon "$MACOS_ICON_NAME" \
-      --enable-on-demand-resources NO \
-      --development-region en \
-      --target-device mac \
-      --platform macosx \
-      --enable-icon-stack-fallback-generation=enabled \
-      --include-all-app-icons \
-      --minimum-deployment-target 13.0 \
-      --output-partial-info-plist "$ICON_PARTIAL_INFO" \
-      >"$ACTOOL_LOG" 2>&1; then
-      echo "actool failed compiling the app icon:" >&2
-      cat "$ACTOOL_LOG" >&2
-      rm -f "$ICON_PARTIAL_INFO" "$ACTOOL_LOG"
-      exit 1
+    ACTOOL_ARGS=(
+      "$MACOS_ICON_SOURCE"
+      --compile "$RESOURCES_DIR"
+      --app-icon "$MACOS_ICON_NAME"
+      --enable-on-demand-resources NO
+      --development-region en
+      --target-device mac
+      --platform macosx
+      --include-all-app-icons
+      --minimum-deployment-target 13.0
+      --output-partial-info-plist "$ICON_PARTIAL_INFO"
+    )
+    if "$ACTOOL" --help 2>&1 | grep -q -- '--enable-icon-stack-fallback-generation'; then
+      ACTOOL_ARGS+=(--enable-icon-stack-fallback-generation=enabled)
+      if ! "$ACTOOL" "${ACTOOL_ARGS[@]}" >"$ACTOOL_LOG" 2>&1; then
+        echo "actool failed compiling the app icon:" >&2
+        cat "$ACTOOL_LOG" >&2
+        rm -f "$ICON_PARTIAL_INFO" "$ACTOOL_LOG"
+        exit 1
+      fi
+    else
+      echo "actool does not support Liquid Glass icon compilation; using legacy macOS .icns fallback" >&2
+      cp "$MACOS_ICON_FALLBACK" "$RESOURCES_DIR/$MACOS_ICON_NAME.icns"
     fi
     rm -f "$ICON_PARTIAL_INFO" "$ACTOOL_LOG"
     chmod +x "$MACOS_DIR/$BINARY_NAME"

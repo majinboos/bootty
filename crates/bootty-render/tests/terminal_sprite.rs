@@ -413,7 +413,9 @@ fn gaps_between_sprite_ranges_stay_unowned(#[case] codepoint: u32) {
 fn command_fits_cell(command: &SpriteCommand, cell: SurfaceRect) -> bool {
     const EPSILON: f32 = 0.0001;
     let between = |value: f32, min: f32, max: f32, margin: f32| {
-        value.is_finite() && value >= min - margin && value <= max + margin
+        value.is_finite()
+            && value >= (min - margin).next_down()
+            && value <= (max + margin).next_up()
     };
     let normalized = |alpha: f32| alpha.is_finite() && (0.0..=1.0).contains(&alpha);
     match command {

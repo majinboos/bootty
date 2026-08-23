@@ -20,7 +20,7 @@ jobs:
         id: targets
         shell: bash
         run: |
-          matrix="$(awk 'NF && $1 !~ /^#/ { print $1 }' scripts/bootty-daemon-targets.txt | jq -Rnc '[inputs | {target: ., runner: (if endswith("-apple-darwin") then (if startswith("aarch64") then "macos-26" else "macos-15-intel" end) elif endswith("-windows-msvc") then "windows-2025" else "ubuntu-24.04" end), command: (if endswith("-unknown-linux-gnu") and startswith("aarch64") then "cargo zigbuild" else "cargo build" end)}]')"
+          matrix="$(awk 'NF && $1 !~ /^#/ { print $1 }' scripts/bootty-daemon-targets.txt | jq -Rnc '{include: [inputs | {target: ., runner: (if endswith("-apple-darwin") then (if startswith("aarch64") then "macos-26" else "macos-15-intel" end) elif endswith("-windows-msvc") then "windows-2025" else "ubuntu-24.04" end), command: (if endswith("-unknown-linux-gnu") and startswith("aarch64") then "cargo zigbuild" else "cargo build" end)}]}')"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   build:

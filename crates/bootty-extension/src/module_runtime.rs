@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -51,7 +51,7 @@ pub(crate) struct ActiveInvocation {
 pub(crate) struct WorkerControl {
     pub(crate) generation: ExtensionGenerationToken,
     pub(crate) setup_complete: AtomicBool,
-    pub(crate) setup_deadline: Instant,
+    pub(crate) setup_deadline: OnceLock<Instant>,
     pub(crate) active: Mutex<Option<ActiveInvocation>>,
 }
 
@@ -289,7 +289,7 @@ pub(crate) fn prepare_module(
     let control = Arc::new(WorkerControl {
         generation: ExtensionGenerationToken::new(),
         setup_complete: AtomicBool::new(false),
-        setup_deadline: Instant::now() + SETUP_EXECUTION_LIMIT,
+        setup_deadline: OnceLock::new(),
         active: Mutex::new(None),
     });
     let host = ModuleHost {
@@ -393,7 +393,13 @@ fn run_module_worker(
     lua.set_interrupt(move |_| worker_interrupt(&interrupt_control));
     let setup = install_host_interface(&lua, host, Rc::clone(&registry))
         .and_then(|()| lua.sandbox(true))
-        .and_then(|()| lua.load(source).set_name(host.identity.as_str()).exec());
+        .and_then(|()| {
+            host.control
+                .setup_deadline
+                .set(Instant::now() + SETUP_EXECUTION_LIMIT)
+                .map_err(|_| mlua::Error::runtime("extension setup deadline already started"))?;
+            lua.load(source).set_name(host.identity.as_str()).exec()
+        });
     if let Err(error) = setup {
         let _ = ready.send(Err(error.to_string()));
         return;
@@ -459,7 +465,10 @@ fn worker_interrupt(control: &WorkerControl) -> mlua::Result<VmState> {
             return Err(mlua::Error::runtime("extension command deadline expired"));
         }
     } else if !control.setup_complete.load(Ordering::Acquire)
-        && Instant::now() >= control.setup_deadline
+        && control
+            .setup_deadline
+            .get()
+            .is_some_and(|deadline| Instant::now() >= *deadline)
     {
         return Err(mlua::Error::runtime("extension setup exceeded 100 ms"));
     }
