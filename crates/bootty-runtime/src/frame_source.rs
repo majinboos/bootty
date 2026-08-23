@@ -23,7 +23,9 @@ impl TerminalFrameSource for TerminalSession {
     }
 
     fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
-        Self::queue_resize(self, geometry)
+        // A frame source must not return a frame with the old grid after its surface changed.
+        // Keep queue_resize for callers that can tolerate eventual publication.
+        Self::resize(self, geometry)
     }
 
     fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {

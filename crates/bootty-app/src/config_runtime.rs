@@ -54,6 +54,7 @@ fn new_session_only_config_changed(previous: &BoottyConfig, next: &BoottyConfig)
 
 pub(super) struct AppConfigRuntime {
     current: BoottyConfig,
+    configured_font_size: f32,
     document: ConfigDocument,
     hot_reload: ConfigHotReload,
     modifier_remaps: ModifierRemapSet,
@@ -114,6 +115,7 @@ impl AppConfigRuntime {
         let stability_trace = StabilityTrace::from_config(&config);
         let hot_reload = ConfigHotReload::new(&config.config_path);
         Ok(Self {
+            configured_font_size: config.font.size,
             current: config,
             document,
             hot_reload,
@@ -132,6 +134,10 @@ impl AppConfigRuntime {
 
     pub(super) fn current(&self) -> &BoottyConfig {
         &self.current
+    }
+
+    pub(super) fn configured_font_size(&self) -> f32 {
+        self.configured_font_size
     }
 
     pub(super) fn revision(&self) -> u64 {
@@ -241,6 +247,7 @@ impl AppConfigRuntime {
         }
         let live_config = live_config_changed.then(|| terminal_live_config(&next, appearance));
         self.macos_option_as_alt = terminal_macos_option_as_alt(next.input.macos_option_as_alt);
+        self.configured_font_size = next.font.size;
         *self.current_mut() = next.clone();
         self.modifier_remaps = modifier_remaps;
         self.backend_key_bindings = backend_key_bindings;

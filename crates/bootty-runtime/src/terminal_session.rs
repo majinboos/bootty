@@ -275,7 +275,10 @@ impl<T> PendingWorkerResponse<T> {
 
 enum TerminalCommand {
     DisplayScale(f32),
-    RenderCellMetrics(CellMetrics),
+    RenderCellMetrics {
+        cell: CellMetrics,
+        done: WorkerRequest<()>,
+    },
     ApplyLiveConfig(TerminalLiveConfig),
     Resize {
         geometry: TerminalGeometry,
@@ -443,7 +446,9 @@ impl TerminalSession {
         if self.render_cell == cell {
             return Ok(());
         }
-        self.send_command(TerminalCommand::RenderCellMetrics(cell))?;
+        let (done, response) = worker_request();
+        self.send_command(TerminalCommand::RenderCellMetrics { cell, done })?;
+        response.receive("setting render cell metrics")?;
         self.render_cell = cell;
         Ok(())
     }
@@ -681,6 +686,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             output_buf: Vec::with_capacity(1024),
             pending_pty: PtyBacklog::with_capacity(MAX_COLLECT_CHUNKS_PER_TICK),
             pending_resize_ack: None,
+            pending_render_cell_ack: None,
             last_frame_publish: Instant::now() - WORKER_READY_FRAME_INTERVAL,
             has_unpublished_frame: false,
             sync_output_since: None,
@@ -715,6 +721,7 @@ struct TerminalWorker {
     command_rx: Receiver<TerminalCommand>,
     pending_command: Option<TerminalCommand>,
     pending_resize_ack: Option<WorkerRequest<()>>,
+    pending_render_cell_ack: Option<WorkerRequest<()>>,
     latest_frame: Arc<PublishedFrame>,
     latest_drain: Arc<Mutex<DrainStats>>,
     pending_pty_len: Arc<AtomicUsize>,
@@ -849,9 +856,13 @@ impl TerminalWorker {
                     self.engine.set_display_scale(display_scale);
                     stats.terminal_changed = true;
                 }
-                TerminalCommand::RenderCellMetrics(cell) => {
+                TerminalCommand::RenderCellMetrics { cell, done } => {
+                    if !done.try_claim() {
+                        continue;
+                    }
                     self.engine.set_render_cell_metrics(cell);
                     stats.terminal_changed = true;
+                    self.pending_render_cell_ack = Some(done);
                 }
                 TerminalCommand::Resize { geometry, done } => {
                     if let Some(done) = done.as_ref()
@@ -1283,6 +1294,9 @@ impl TerminalWorker {
 
     fn acknowledge_resize(&mut self) {
         if let Some(done) = self.pending_resize_ack.take() {
+            done.send(());
+        }
+        if let Some(done) = self.pending_render_cell_ack.take() {
             done.send(());
         }
     }

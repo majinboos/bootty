@@ -39,6 +39,9 @@ pub struct TexturedGlyphQuad {
     pub rect: SurfaceRect,
     pub uv: SurfaceRect,
     pub color: PlanColor,
+    /// Pixel snapping is appropriate for cell-filling primitives, but would rescale ordinary
+    /// glyphs when fit-to-window leaves a fractional cell pitch.
+    pub snap_to_pixel_grid: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -300,6 +303,7 @@ impl TextAtlasBuilder {
                 rect,
                 uv: atlas_uv(self.atlas.size(), entry),
                 color,
+                snap_to_pixel_grid: false,
             });
         }
     }
@@ -435,6 +439,7 @@ impl TextAtlasBuilder {
                 rect,
                 uv: atlas_uv(self.atlas.size(), entry),
                 color,
+                snap_to_pixel_grid: false,
             });
         }
         self.clusters = clusters;
@@ -634,6 +639,7 @@ impl TextAtlasBuilder {
             rect: command.rect,
             uv: atlas_uv(self.atlas.size(), entry),
             color: command.color,
+            snap_to_pixel_grid: true,
         }
     }
 

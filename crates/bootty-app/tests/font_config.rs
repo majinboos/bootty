@@ -1,13 +1,18 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use assert_fs::{TempDir, fixture::ChildPath, prelude::*};
 use bootty_app::{AppEffect, AppState};
 use bootty_config::config::load_config_from_path;
 use bootty_font::FontFeature;
 use bootty_render::terminal_text::{CodepointFontMap, TerminalTextConfig};
+use eframe::egui::{Event, Key, Modifiers};
 use pretty_assertions::assert_eq;
 
 mod support;
+
+#[path = "support/frames.rs"]
+mod frame_inputs;
 
 fn state_with_config(source: &str) -> (TempDir, ChildPath, AppState) {
     let directory = TempDir::new().expect("temporary config directory");
@@ -96,4 +101,30 @@ fn invalid_font_reload_keeps_the_last_good_font_config() {
         state.last_error().as_deref(),
         Some("invalid font feature: toolong")
     );
+}
+
+#[test]
+fn reset_font_size_restores_the_loaded_font_size() {
+    let (_directory, _config, mut state) = state_with_config("[font]\nsize = 15\n");
+    let command = Modifiers {
+        command: true,
+        mac_cmd: true,
+        ..Modifiers::default()
+    };
+    let effects = state.update_frame(frame_inputs::frame(
+        Instant::now(),
+        vec![Event::Key {
+            key: Key::Num0,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: command,
+        }],
+    ));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| { matches!(effect, AppEffect::SetTerminalTextConfig(_)) })
+    );
+    assert_eq!(state.config().font.size, 15.0);
 }
