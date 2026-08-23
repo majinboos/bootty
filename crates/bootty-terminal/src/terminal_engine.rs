@@ -1689,6 +1689,7 @@ impl TerminalEngine {
         self.frame.active_search_match_index = None;
         self.frame.search_match_count = 0;
         self.frame.search_pulse = self.search_pulse;
+        self.frame.mouse_tracking = self.terminal.is_mouse_tracking()?;
         self.frame.stats = FrameStats {
             render_state_update_us,
             ..FrameStats::default()

@@ -1,6 +1,7 @@
 use super::super::super::*;
 use super::support::*;
 use pretty_assertions::assert_eq;
+use rstest::rstest;
 
 fn test_mouse_size() -> MouseEncoderSize {
     MouseEncoderSize {
@@ -112,6 +113,21 @@ fn assert_mouse_silent(
 ) -> Result<()> {
     engine.encode_mouse_to_vec(input, out)?;
     assert!(out.is_empty());
+    Ok(())
+}
+
+#[rstest]
+#[case::disabled(b"", false)]
+#[case::normal_tracking(b"\x1b[?1000h", true)]
+#[case::tracking_disabled_again(b"\x1b[?1003h\x1b[?1003l", false)]
+fn render_frame_reports_mouse_tracking(
+    #[case] sequence: &[u8],
+    #[case] expected: bool,
+) -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    engine.write_vt(sequence);
+
+    assert_eq!(engine.extract_frame()?.mouse_tracking, expected);
     Ok(())
 }
 

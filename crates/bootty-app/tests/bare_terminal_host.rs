@@ -894,6 +894,7 @@ fn render_frame_with_text(ch: char) -> RenderFrame {
         search_match_count: 0,
         search_pulse: 0,
         copy_mode: None,
+        mouse_tracking: false,
         selections: Vec::new(),
         cells: vec![RenderCell {
             x: 0,

@@ -252,7 +252,7 @@ impl TerminalWidget {
             ui.ctx().set_cursor_icon(if modifiers.command {
                 egui::CursorIcon::PointingHand
             } else {
-                self.terminal_cursor_icon
+                self.terminal_pointer_icon(frame, modifiers)
             });
             let rect = transformed_surface_rect(
                 surface.run_rect(link.start_col, link.row, link.cells),
@@ -267,7 +267,21 @@ impl TerminalWidget {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(link.url));
             }
         } else if response.hovered() {
-            ui.ctx().set_cursor_icon(self.terminal_cursor_icon);
+            let modifiers = ui.input(|input| input.modifiers);
+            ui.ctx()
+                .set_cursor_icon(self.terminal_pointer_icon(frame, modifiers));
+        }
+    }
+
+    fn terminal_pointer_icon(
+        &self,
+        frame: &RenderFrame,
+        modifiers: egui::Modifiers,
+    ) -> egui::CursorIcon {
+        if frame.mouse_tracking && !modifiers.shift {
+            egui::CursorIcon::Default
+        } else {
+            self.terminal_cursor_icon
         }
     }
 
