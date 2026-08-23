@@ -20,6 +20,7 @@ fn non_macos_window_adapter_noops_native_mutations() {
     bootty_winit::window::macos_disable_titlebar_separator();
     bootty_winit::window::macos_set_window_shadow(true);
     bootty_winit::window::disable_automatic_window_tabbing();
+    bootty_winit::window::refresh_macos_non_native_fullscreen_frame();
     assert!(bootty_winit::window::set_macos_non_native_fullscreen(true));
     assert!(bootty_winit::window::restore_macos_presentation());
 }
