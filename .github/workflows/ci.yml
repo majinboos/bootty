@@ -107,6 +107,7 @@ jobs:
         run: mise run test
 
       - name: Build size-optimized daemon
+        if: github.event_name == 'pull_request'
         run: |
           cargo build --profile daemon-release -p bootty-daemon
           size=$(stat -c %s target/daemon-release/bootty-daemon)
@@ -168,7 +169,7 @@ jobs:
 
   native-app-bundles:
     name: Native app bundle (${{ matrix.name }})
-    needs: [rust-format, rust-hakari, rust-validation, rust-cross, daemon-artifacts]
+    needs: daemon-artifacts
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: ${{ matrix.runner }}
     strategy:

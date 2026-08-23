@@ -63,6 +63,17 @@ jobs:
           cp "target/${{ matrix.target }}/daemon-release/$binary" \
             "daemon-output/bootty-daemon-${{ matrix.target }}"
 
+      - name: Check daemon size budget
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          daemon="daemon-output/bootty-daemon-x86_64-unknown-linux-gnu"
+          size=$(stat -c %s "$daemon")
+          echo "bootty-daemon size: ${size} bytes"
+          # Keep a bounded artifact budget while allowing the current static
+          # daemon and its embedded SQLite/runtime dependencies.
+          test "$size" -le 13631488
+
       - name: Upload daemon artifact
         uses: actions/upload-artifact@v4
         with:
