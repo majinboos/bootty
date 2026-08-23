@@ -75,17 +75,19 @@ pub(super) fn text_vertices_into(
 ) {
     vertices.reserve(quads.len() * 6);
     let transform = SurfaceNdcTransform::new(surface);
-    // Snap each glyph's top and bottom to the physical pixel grid. `Fit rows to window` makes the
-    // cell height fractional, so unsnapped rows land on sub-pixel boundaries and the glyph texels
-    // straddle screen pixels — a couple pixels of vertical ghosting that grows down the column as
-    // the fractional offset accumulates. Images already snap the same way; X is left exact because
-    // column width stays integer. At an integer cell height the snap is a no-op.
-    let snap_y = |y: f32| snap_to_grid(y, surface.min_y, ppp);
     for quad in quads {
-        let min_x = transform.x(quad.rect.min_x);
-        let max_x = transform.x(quad.rect.max_x);
-        let min_y = transform.y(snap_y(quad.rect.min_y));
-        let max_y = transform.y(snap_y(quad.rect.max_y));
+        // Snap only cell-filling primitives. Rounding both edges of ordinary text quads changes
+        // their scale when fit-to-window produces a fractional pitch; the spare space belongs
+        // between glyphs, not inside the glyph bitmap.
+        let rect = if quad.snap_to_pixel_grid {
+            snap_rect_to_pixel_grid(quad.rect, surface, ppp)
+        } else {
+            quad.rect
+        };
+        let min_x = transform.x(rect.min_x);
+        let max_x = transform.x(rect.max_x);
+        let min_y = transform.y(rect.min_y);
+        let max_y = transform.y(rect.max_y);
         let color = color_to_float(quad.color);
         let top_left = TextVertex {
             position: [min_x, min_y],

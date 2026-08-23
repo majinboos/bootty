@@ -316,6 +316,7 @@ fn text_atlas_builder_appends_textured_quads_without_replacing_existing_batch() 
         rect: SurfaceRect::from_min_size(99.0, 99.0, 1.0, 1.0),
         uv: SurfaceRect::from_min_size(0.0, 0.0, 1.0, 1.0),
         color: attrs().fg,
+        snap_to_pixel_grid: false,
     };
     let mut builder = TextAtlasBuilder::new(128, 128);
     let mut quads = vec![sentinel];
@@ -326,6 +327,7 @@ fn text_atlas_builder_appends_textured_quads_without_replacing_existing_batch() 
     assert_eq!(quads[0], sentinel);
     assert!(quads[1].uv.min_x < quads[1].uv.max_x);
     assert_eq!(quads[1].color, attrs().fg);
+    assert!(!quads[1].snap_to_pixel_grid);
     assert_eq!(builder.atlas_len(), 2);
 }
 

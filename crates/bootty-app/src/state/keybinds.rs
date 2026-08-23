@@ -1,4 +1,4 @@
-use bootty_config::config::{BoottyConfig, WindowConfig};
+use bootty_config::config::WindowConfig;
 use bootty_winit::input_binding::CopyToClipboard;
 use eframe::egui;
 
@@ -323,7 +323,7 @@ impl AppState {
         }
     }
     fn apply_font_size_action(&mut self, action: FontSizeAction, effects: &mut Vec<AppEffect>) {
-        let default_size = BoottyConfig::default().font.size;
+        let default_size = self.config_runtime.configured_font_size();
         let current_size = self.config().font.size;
         let next_size = match action {
             FontSizeAction::Increase(delta) => current_size + delta,
@@ -332,6 +332,9 @@ impl AppState {
             FontSizeAction::Set(size) => size,
         }
         .max(1.0);
+        if (next_size - current_size).abs() <= f32::EPSILON {
+            return;
+        }
         self.config_runtime.set_font_size(next_size);
         let text_config = terminal_text_config(&self.config().font);
         if let Some(existing) = effects.iter_mut().rev().find_map(|effect| match effect {

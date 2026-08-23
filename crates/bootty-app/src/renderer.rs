@@ -88,6 +88,9 @@ impl TerminalWidget {
     }
 
     pub fn set_text_config(&mut self, text_config: TerminalTextConfig) {
+        if self.text_config == text_config {
+            return;
+        }
         self.text_config = text_config;
         self.update_cell_metrics();
         self.render_cache.clear();

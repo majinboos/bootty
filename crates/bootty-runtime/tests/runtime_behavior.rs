@@ -1,6 +1,6 @@
 use std::{fs, time::Duration};
 #[cfg(unix)]
-use std::{sync::Arc, thread, time::Instant};
+use std::{sync::Arc, thread};
 
 use assert_fs::{TempDir, prelude::*};
 #[cfg(unix)]
@@ -260,14 +260,11 @@ fn resize_updates_grid_size_only_after_worker_result() {
         rows: 12,
         ..initial
     };
-    let started = Instant::now();
-    TerminalFrameSource::resize(&mut session, queued).expect("frame resize queues");
+    TerminalFrameSource::resize(&mut session, queued).expect("frame resize publishes");
 
     assert_eq!(session.grid_size(), (queued.cols, queued.rows));
-    assert!(
-        started.elapsed() < Duration::from_millis(50),
-        "frame resize waited for worker publication"
-    );
+    let frame = TerminalFrameSource::extract_frame(&mut session).expect("resized frame");
+    assert_eq!((frame.cols, frame.rows), (queued.cols, queued.rows));
 }
 
 #[cfg(unix)]

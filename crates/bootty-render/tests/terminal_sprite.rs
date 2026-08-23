@@ -549,6 +549,7 @@ fn atlas_reuses_identical_sprites_and_allocates_distinct_glyphs() {
     let first = builder.prepare_sprite_command(&sprite_batch('⣿', rect), 1.0);
     let repeated = builder.prepare_sprite_command(&sprite_batch('⣿', rect), 1.0);
     assert_eq!((first.rect, first.color), (rect, color()));
+    assert!(first.snap_to_pixel_grid);
     assert_eq!(repeated, first);
     assert_eq!(builder.atlas_len(), 1);
 
