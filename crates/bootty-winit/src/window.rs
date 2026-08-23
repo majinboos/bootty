@@ -38,6 +38,7 @@ pub fn set_macos_cursor_icon(icon: CursorIcon) {
             CursorIcon::PointingHand => 2,
             CursorIcon::ResizeHorizontal => 3,
             CursorIcon::ResizeVertical => 4,
+            CursorIcon::Default => 5,
             _ => 0,
         },
         Ordering::Relaxed,
@@ -54,6 +55,7 @@ pub fn reapply_macos_cursor_icon() {
         2 => NSCursor::pointingHandCursor(),
         3 => NSCursor::columnResizeCursor(),
         4 => NSCursor::rowResizeCursor(),
+        5 => NSCursor::arrowCursor(),
         _ => return,
     };
     cursor.set();

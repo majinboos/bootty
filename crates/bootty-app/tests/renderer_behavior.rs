@@ -1,12 +1,83 @@
-use bootty_app::renderer::{RendererMetrics, TerminalWidget};
+use std::sync::Arc;
+
+use anyhow::Result;
+use bootty_app::renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget};
 use bootty_render::{
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface, ViewTransform},
     terminal_text::TerminalTextConfig,
 };
-use bootty_terminal::terminal_image::{KittyImageLayer, placement_destination};
-use eframe::egui::{Pos2, Rect, Vec2};
+use bootty_terminal::{
+    terminal_engine::TerminalEngine,
+    terminal_frame::RenderFrame,
+    terminal_image::{KittyImageLayer, placement_destination},
+};
+use eframe::{
+    egui::{self, CursorIcon, Event, Modifiers, Pos2, RawInput, Rect, Vec2},
+    wgpu,
+};
 use pretty_assertions::assert_eq;
 use rstest::rstest;
+
+struct CursorTerminal {
+    engine: TerminalEngine,
+}
+
+impl TerminalFrameSource for CursorTerminal {
+    fn set_display_scale(&mut self, display_scale: f32) -> Result<()> {
+        self.engine.set_display_scale(display_scale);
+        Ok(())
+    }
+
+    fn set_render_cell_metrics(&mut self, cell: CellMetrics) -> Result<()> {
+        self.engine.set_render_cell_metrics(cell);
+        Ok(())
+    }
+
+    fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
+        self.engine.resize(geometry)
+    }
+
+    fn extract_frame(&mut self) -> Result<Arc<RenderFrame>> {
+        Ok(Arc::new(self.engine.extract_frame()?.clone()))
+    }
+}
+
+fn terminal_cursor_icon(mouse_tracking: bool, shift: bool) -> CursorIcon {
+    let mut terminal = CursorTerminal {
+        engine: TerminalEngine::new(TerminalWidget::initial_geometry()).expect("terminal engine"),
+    };
+    if mouse_tracking {
+        terminal.engine.write_vt(b"\x1b[?1003h\x1b[?1006h");
+    }
+    let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Bgra8Unorm))
+        .with_text_config(TerminalTextConfig::default());
+    let ctx = egui::Context::default();
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+    let mut cursor_icon = CursorIcon::Default;
+    for x in [399.0, 400.0] {
+        let mut output = ctx.run_ui(
+            RawInput {
+                screen_rect: Some(rect),
+                events: vec![
+                    Event::ModifiersChanged(Modifiers {
+                        shift,
+                        ..Modifiers::default()
+                    }),
+                    Event::PointerMoved(Pos2::new(x, 300.0)),
+                ],
+                ..RawInput::default()
+            },
+            |ui| {
+                widget
+                    .show_at_rect(ui, ui.max_rect(), "cursor-test", &mut terminal)
+                    .expect("terminal widget");
+            },
+        );
+        cursor_icon = output.platform_output.cursor_icon;
+        output.textures_delta.clear();
+    }
+    cursor_icon
+}
 
 #[test]
 fn renderer_starts_with_stable_geometry_and_empty_runtime_state() {
@@ -24,6 +95,18 @@ fn renderer_starts_with_stable_geometry_and_empty_runtime_state() {
     assert_eq!(widget.view_transform(), ViewTransform::IDENTITY);
     assert!(!widget.is_zoomed());
     assert_eq!(widget.metrics(), RendererMetrics::default());
+}
+
+#[rstest]
+#[case::shell(false, false, CursorIcon::Text)]
+#[case::tui(true, false, CursorIcon::Default)]
+#[case::tui_selection_override(true, true, CursorIcon::Text)]
+fn terminal_cursor_matches_mouse_event_ownership(
+    #[case] mouse_tracking: bool,
+    #[case] shift: bool,
+    #[case] expected: CursorIcon,
+) {
+    assert_eq!(terminal_cursor_icon(mouse_tracking, shift), expected);
 }
 
 #[test]
