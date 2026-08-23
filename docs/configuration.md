@@ -125,6 +125,7 @@ glyph-protocol = true
 [cursor]
 style = "block" # block, bar, underline, or hollow-block
 blink = false
+dim-inactive-pane = true
 
 [diagnostics]
 stability-trace = "/tmp/bootty-stability.csv"

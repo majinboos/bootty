@@ -278,6 +278,9 @@ impl BoottyApp {
                 }
                 AppEffect::SetTerminalCursorIcon(icon) => {
                     self.terminal_view.set_cursor_icon(icon);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(
+                        icon != egui::CursorIcon::None,
+                    ));
                 }
                 AppEffect::SetUiFonts(families) => configure_egui_fonts(ctx, &families),
                 AppEffect::SetWindowFocus => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),

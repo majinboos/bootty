@@ -440,21 +440,6 @@ fn shortcut_options(win: &mut SettingsSurface, ui: &mut egui::Ui) {
     let palette = win.palette;
     super::section(ui, palette, "SHORTCUT OPTIONS");
 
-    let mut hide_pointer = win.config.input.hide_mouse_pointer_while_typing;
-    super::settings_row(
-        ui,
-        palette,
-        "Hide pointer while typing",
-        "Temporarily hide the mouse pointer while you type.",
-        |ui| {
-            if super::settings_toggle(ui, palette, &mut hide_pointer) {
-                win.config.input.hide_mouse_pointer_while_typing = hide_pointer;
-                win.writeback
-                    .set_bool(&["input", "hide-mouse-pointer-while-typing"], hide_pointer);
-            }
-        },
-    );
-
     let mut copy_on_select = win.config.input.copy_on_select;
     super::settings_row(
         ui,

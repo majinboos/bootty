@@ -3,7 +3,7 @@ Bootty Settings
 Diagnostics
 Search settings...
 TRACE
-Core
+General
 
 General
 Stability trace
@@ -11,17 +11,20 @@ path to trace log
 Writes frame-timing diagnostics to this file. Leave empty to disable.
 
 Remotes
-
-Text
 STATE
-
+Appearance
+
 Appearance
 Config file
 <config-dir>/config.toml
 Read-only location.
+
+Colors
+No settings write errors recorded.
+
+Text
 
 Window
-No settings write errors recorded.
 
 Sidebar
 

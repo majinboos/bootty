@@ -3,7 +3,7 @@ Bootty Settings
 Remotes
 Search settings...
 DEFAULT REMOTE
-Core
+General
 Used by new remote Spaces when no per-space override is selected.
 
 General
@@ -11,38 +11,41 @@ Host name
 host or SSH config alias
 
 Remotes
-
-Text
+Appearance
 Port
 22 or from SSH config
-
+
 Appearance
-
-Window
+
+Colors
 User name
 local user or SSH config
-
-Sidebar
+
+Text
 SSH client
 ssh
-
-Status Bar
-Terminal
+
+Window
+
+Sidebar
 Extra SSH arguments
-
+
 Arguments are passed to the SSH client before the destination.
-Shell
+Status Bar
 Add argument
+Terminal
+Save default remote
+
+Shell
+SSH PROFILES
 
 Keys
-Save default remote
+Add Remote
 Advanced
-SSH PROFILES
+Add an SSH profile to connect a Space to another machine.
 
 Config
-Add Remote
 
 Diagnostics
-Add an SSH profile to connect a Space to another machine.
 
 Extensions

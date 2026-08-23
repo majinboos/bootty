@@ -3,7 +3,7 @@ Bootty Settings
 Window
 Search settings...
 WINDOW
-Core
+General
 
 General
 Title
@@ -12,51 +12,54 @@ Shown in native window chrome.
 
 Remotes
 Titlebar style
-
 System titlebar
 Transparent
 Hidden
-Text
+Appearance
 macOS window chrome treatment.
-
+
 Appearance
 Decoration
 Automatic
-
-Window
+
+Colors
 Choose who draws the outer window border.
-
-Sidebar
+
+Text
 Fullscreen mode
 Disabled
 Controls native fullscreen and notch-aware non-native modes.
+
+Window
+
+Sidebar
+DEFAULT SIZE
 
 Status Bar
-DEFAULT SIZE
-Terminal
-
-Shell
 Width
 1220.0 px
 Applies to newly created windows.
-
-Keys
+Terminal
+
+Shell
 Height
-Advanced
 760.0 px
 Applies to newly created windows.
+
+Keys
+FULLSCREEN NOTCH
+Advanced
+Tabs in notch band
 
 Config
-FULLSCREEN NOTCH
+Allow terminal chrome to occupy the notch/menu-bar band.
 
 Diagnostics
-Tabs in notch band
-
-Extensions
-Allow terminal chrome to occupy the notch/menu-bar band.
 Top offset
 0.0 px
 Auto
+
+Extensions
 Leave automatic unless a notched display needs an exact override.
 CHROME
 Chrome gap

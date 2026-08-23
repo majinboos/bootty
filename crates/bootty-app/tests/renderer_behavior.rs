@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bootty_app::renderer::{RendererMetrics, TerminalFrameSource, TerminalWidget};
+use bootty_app::renderer::{CursorEmphasis, RendererMetrics, TerminalFrameSource, TerminalWidget};
 use bootty_render::{
     geometry::{CellMetrics, TerminalGeometry, TerminalPadding, TerminalSurface, ViewTransform},
     terminal_text::TerminalTextConfig,
@@ -42,7 +42,7 @@ impl TerminalFrameSource for CursorTerminal {
     }
 }
 
-fn terminal_cursor_icon(mouse_tracking: bool, shift: bool) -> CursorIcon {
+fn terminal_cursor_icon(mouse_tracking: bool, shift: bool, configured: CursorIcon) -> CursorIcon {
     let mut terminal = CursorTerminal {
         engine: TerminalEngine::new(TerminalWidget::initial_geometry()).expect("terminal engine"),
     };
@@ -51,6 +51,7 @@ fn terminal_cursor_icon(mouse_tracking: bool, shift: bool) -> CursorIcon {
     }
     let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Bgra8Unorm))
         .with_text_config(TerminalTextConfig::default());
+    widget.set_terminal_cursor_icon(configured);
     let ctx = egui::Context::default();
     let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
     let mut cursor_icon = CursorIcon::Default;
@@ -98,15 +99,58 @@ fn renderer_starts_with_stable_geometry_and_empty_runtime_state() {
 }
 
 #[rstest]
-#[case::shell(false, false, CursorIcon::Text)]
-#[case::tui(true, false, CursorIcon::Default)]
-#[case::tui_selection_override(true, true, CursorIcon::Text)]
+#[case::shell(false, false, CursorIcon::Text, CursorIcon::Text)]
+#[case::tui(true, false, CursorIcon::Text, CursorIcon::Default)]
+#[case::tui_selection_override(true, true, CursorIcon::Text, CursorIcon::Text)]
+#[case::hidden_while_typing(true, false, CursorIcon::None, CursorIcon::None)]
 fn terminal_cursor_matches_mouse_event_ownership(
     #[case] mouse_tracking: bool,
     #[case] shift: bool,
+    #[case] configured: CursorIcon,
     #[case] expected: CursorIcon,
 ) {
-    assert_eq!(terminal_cursor_icon(mouse_tracking, shift), expected);
+    assert_eq!(
+        terminal_cursor_icon(mouse_tracking, shift, configured),
+        expected
+    );
+}
+
+#[rstest]
+#[case::focused(CursorEmphasis::Normal, true)]
+#[case::inactive(CursorEmphasis::Inactive, false)]
+fn inactive_pane_cursor_does_not_animate(
+    #[case] emphasis: CursorEmphasis,
+    #[case] expected_blinking: bool,
+) {
+    let mut terminal = CursorTerminal {
+        engine: TerminalEngine::new(TerminalWidget::initial_geometry()).expect("terminal engine"),
+    };
+    terminal.engine.write_vt(b"\x1b[5 q");
+    let mut widget = TerminalWidget::new(Some(wgpu::TextureFormat::Bgra8Unorm))
+        .with_text_config(TerminalTextConfig::default());
+    let ctx = egui::Context::default();
+    let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+
+    let mut output = ctx.run_ui(
+        RawInput {
+            screen_rect: Some(rect),
+            ..RawInput::default()
+        },
+        |ui| {
+            widget
+                .show_at_rect_with_cursor_emphasis(
+                    ui,
+                    ui.max_rect(),
+                    "cursor-emphasis-test",
+                    &mut terminal,
+                    emphasis,
+                )
+                .expect("terminal widget");
+        },
+    );
+    output.textures_delta.clear();
+
+    assert_eq!(widget.metrics().cursor_blinking, expected_blinking);
 }
 
 #[test]
