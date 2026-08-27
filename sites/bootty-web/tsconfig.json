@@ -9,6 +9,7 @@
     "isolatedModules": true,
     "types": ["vite/client"],
     "baseUrl": ".",
+    "ignoreDeprecations": "6.0",
     "paths": {
       "bootty.js/browser": ["../../packages/bootty-js/src/browser.ts"]
     }

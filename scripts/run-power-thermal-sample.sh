@@ -56,7 +56,7 @@ sample_log=""
 start_sampler() {
   if command -v powermetrics >/dev/null 2>&1; then
     sample_log=$output_dir/powermetrics.log
-    sudo powermetrics --samplers cpu_power,gpu_power,thermal -i "$interval_ms" -n "$seconds" >"$sample_log" 2>&1 &
+    sudo powermetrics --samplers cpu_power,gpu_power,thermal -i "$interval_ms" -n "$seconds" 2>&1 | sudo tee "$sample_log" >/dev/null 2>&1 &
     sample_pid=$!
     emit "{\"schema_version\":1,\"event\":\"power_sampler\",\"tool\":\"powermetrics\",\"status\":\"started\",\"log\":\"$(json_escape "$sample_log")\"}"
   elif command -v pidstat >/dev/null 2>&1; then

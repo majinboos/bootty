@@ -81,7 +81,9 @@ ensure_project_zig() {
   if command -v mise >/dev/null 2>&1; then
     zig_path="$(mise which zig 2>/dev/null || true)"
     if [[ -n "$zig_path" && -x "$zig_path" ]]; then
-      export PATH="$(dirname "$zig_path"):$PATH"
+      local zig_dir
+      zig_dir="$(dirname "$zig_path")"
+      export PATH="$zig_dir:$PATH"
     fi
   fi
 
@@ -143,7 +145,7 @@ enable_dynamic_linkage() {
       append_rustflags -C prefer-dynamic -C link-arg=-Wl,-rpath,@executable_path/../Frameworks
       ;;
     Linux)
-      append_rustflags -C prefer-dynamic -C 'link-arg=-Wl,-rpath,$ORIGIN/../lib'
+      append_rustflags -C "link-arg=-Wl,-rpath,\$ORIGIN/../lib"
       ;;
     *)
       echo "dynamic packaging is unsupported on $(uname -s); pass --static" >&2
@@ -204,12 +206,12 @@ copy_dynamic_libraries() {
 
 ensure_project_zig
 if [[ "$ALL_DAEMONS" -eq 1 ]]; then
-  RUSTFLAGS= "$SCRIPT_DIR/build-bootty-daemons.sh"
+  RUSTFLAGS="" "$SCRIPT_DIR/build-bootty-daemons.sh"
   verify_daemons
   HOST_DAEMON_TARGET="$(host_daemon_target)"
   HOST_DAEMON_PATH="$DAEMON_OUTPUT_DIR/bootty-daemon-$HOST_DAEMON_TARGET"
 else
-  RUSTFLAGS= cargo build "${DAEMON_PROFILE_ARGS[@]}" -p "$DAEMON_PACKAGE_NAME" --bin "$DAEMON_BINARY_NAME"
+  RUSTFLAGS="" cargo build "${DAEMON_PROFILE_ARGS[@]}" -p "$DAEMON_PACKAGE_NAME" --bin "$DAEMON_BINARY_NAME"
   HOST_DAEMON_PATH="$TARGET_ROOT/$DAEMON_PROFILE/$DAEMON_BINARY_NAME"
 fi
 if [[ "$LINKAGE" == "dynamic" ]]; then

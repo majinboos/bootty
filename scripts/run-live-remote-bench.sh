@@ -89,7 +89,10 @@ skip_probe() {
   emit_result "$1" skipped "$2" 0 0 0 "$3"
 }
 
-remote_probe='printf "remote shell ready\r\n"; i=0; while [ "$i" -lt 128 ]; do printf "\033[32mkey-%03d\033[0m echo\r\n" "$i"; i=$((i + 1)); done; i=0; while [ "$i" -lt 512 ]; do printf "remote log line %05d cargo/test/kubectl stream payload payload payload\r\n" "$i"; i=$((i + 1)); done; printf "\033[8;40;120tremote resize ack 120x40\r\n"; printf "\033]8;id=remote;https://example.invalid/remote\033\\link\033]8;;\033\\\r\n"'
+remote_probe=$(cat <<'REMOTE_PROBE'
+printf "remote shell ready\r\n"; i=0; while [ "$i" -lt 128 ]; do printf "\033[32mkey-%03d\033[0m echo\r\n" "$i"; i=$((i + 1)); done; i=0; while [ "$i" -lt 512 ]; do printf "remote log line %05d cargo/test/kubectl stream payload payload payload\r\n" "$i"; i=$((i + 1)); done; printf "\033[8;40;120tremote resize ack 120x40\r\n"; printf "\033]8;id=remote;https://example.invalid/remote\033\\link\033]8;;\033\\\r\n"
+REMOTE_PROBE
+)
 
 run_probe() {
   local name=$1 profile=$2

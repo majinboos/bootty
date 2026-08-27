@@ -3,10 +3,11 @@ import "./style.css";
 
 let routes = new Map<string, string>();
 
-const canvas = document.querySelector<HTMLCanvasElement>("#terminal");
-if (!canvas) {
+const canvasElement = document.querySelector<HTMLCanvasElement>("#terminal");
+if (!canvasElement) {
   throw new Error("Bootty site canvas is missing");
 }
+const canvas = canvasElement;
 const fpsCounter = document.querySelector<HTMLElement>("#fps-counter");
 let frames = 0;
 let fpsStartedAt = performance.now();
