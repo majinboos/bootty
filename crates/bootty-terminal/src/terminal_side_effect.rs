@@ -28,6 +28,36 @@ pub enum TerminalSideEffect {
     UnsupportedHostCommand { protocol: String, command: String },
 }
 
+impl TerminalSideEffect {
+    /// True when replaying the bytes behind this effect would repeat something
+    /// the user already saw, or answer a query the child no longer expects.
+    /// State-restoring effects (title, icon, mouse shape) are not repeats: a
+    /// recovery keyframe carries them so the host can catch up.
+    pub(crate) fn repeats_on_replay(&self) -> bool {
+        matches!(
+            self,
+            Self::Bell
+                | Self::ClipboardWrite(_)
+                | Self::ClipboardQuery { .. }
+                | Self::DesktopNotification { .. }
+                | Self::OpenUrl(_)
+                | Self::FocusWindow
+                | Self::ReportCellSize
+                | Self::ReportVariable(_)
+                | Self::Iterm2File(_)
+        )
+    }
+}
+
+fn keep_restored_state(effects: &mut Vec<TerminalSideEffect>, from: usize) {
+    let replayed = effects.split_off(from);
+    effects.extend(
+        replayed
+            .into_iter()
+            .filter(|effect| !effect.repeats_on_replay()),
+    );
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalSideEffectEvent {
     pub source_pane_id: Option<String>,
@@ -136,6 +166,23 @@ impl TerminalSideEffectCollector {
             self.append_iterm_copy_text(&bytes[search_start..]);
         }
         actions
+    }
+
+    /// The queue depth, so a replay of historical bytes can drop the effects it
+    /// would repeat. See [`super::terminal_engine::TerminalEngine::write_vt_without_pty_responses`].
+    pub(crate) fn mark(&self) -> (usize, usize) {
+        (self.effects.len(), self.callback_effects.borrow().len())
+    }
+
+    /// Discards a partial sequence the collector is still waiting to complete.
+    pub(crate) fn clear_pending(&mut self) {
+        self.osc_pending.clear();
+        self.iterm_copy_capture = None;
+    }
+
+    pub(crate) fn drop_replayed(&mut self, (effects, callback_effects): (usize, usize)) {
+        keep_restored_state(&mut self.effects, effects);
+        keep_restored_state(&mut self.callback_effects.borrow_mut(), callback_effects);
     }
 
     pub(crate) fn drain(&mut self) -> Vec<TerminalSideEffect> {

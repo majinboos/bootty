@@ -65,6 +65,10 @@ fn embedded_rmux_public_behaviors_use_only_the_sdk_helper() -> Result<()> {
     session_lifecycle()?;
     pane_navigation_and_zoom()?;
     terminal_requests()?;
+    color_query_round_trip()?;
+    kitty_keyboard_protocol_pop_restores_legacy_ctrl_c()?;
+    multi_pane_window_resize_keeps_pane_targets_live()?;
+    closing_session_with_pending_resize_is_quiet()?;
     bounded_live_output()?;
     large_restore_progress()
 }
@@ -177,7 +181,7 @@ fn pane_navigation_and_zoom() -> Result<()> {
 fn terminal_requests() -> Result<()> {
     let (mut backend, registry, session_id, window_id, pane) =
         create_embedded_session(unscoped_tag())?;
-    let mut terminal = open_terminal(registry, &pane, &window_id)?;
+    let mut terminal = open_terminal(registry.clone(), &pane, &window_id)?;
 
     terminal.enter_copy_mode()?;
     assert!(terminal.copy_mode_active()?);
@@ -199,6 +203,155 @@ fn terminal_requests() -> Result<()> {
     terminal.discard_pending_output()?;
 
     ditch_session(&mut backend, &session_id)
+}
+
+fn color_query_round_trip() -> Result<()> {
+    // The round trip needs a program that can put the pane in raw mode and read
+    // its own stdin. Skip rather than spending the whole `wait_for_terminal_text`
+    // deadline on a shell that printed "command not found", which would take
+    // every scenario chained after this one down with it.
+    if !std::process::Command::new("python3")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+    {
+        eprintln!("skipping color_query_round_trip: no python3 on PATH");
+        return Ok(());
+    }
+    let (mut backend, registry, session_id, window_id, pane) =
+        create_embedded_session(unscoped_tag())?;
+    let mut terminal = open_terminal(registry.clone(), &pane, &window_id)?;
+    // Split so the echoed command line does not itself satisfy the wait: the
+    // frame text includes what was typed, not just what the pane printed.
+    terminal
+        .write_input(b"printf '\\033[?u'; printf '%s%s\\n' 'BOOTTY_RMUX_REBASE' '_PREPARED'\r")?;
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_REBASE_PREPARED")?;
+    drop(terminal);
+    let mut terminal = open_terminal(registry, &pane, &window_id)?;
+    // Run from a file: the pane's shell is whatever $SHELL is, and quoting rules
+    // differ enough between them (fish collapses backslashes inside single
+    // quotes) to corrupt an inlined script.
+    let script_path = std::env::temp_dir().join(format!("bootty-color-query-{}.py", session_id));
+    std::fs::write(
+        &script_path,
+        r#"import os, sys, select, termios, tty
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+os.write(fd, b"\x1b]11;?\x1b\\\x1b[c")
+data = b""
+# Read until the colour answer, not until the first CSI response: rmux answers
+# DA1 itself as a VT100, which arrives before anything Bootty writes back.
+while b"rgb:" not in data:
+    if not select.select([fd], [], [], 5.0)[0]:
+        break
+    data += os.read(fd, 4096)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+if b"rgb:" in data:
+    print("BOOTTY_RMUX_COLOR" + "_QUERY_OK")
+"#,
+    )?;
+    // Kill the line first: answering the query above put `\x1b[?0u` on the
+    // pane's input, and the shell's line editor leaves the printable tail of it
+    // sitting on the command line.
+    terminal.write_input(b"\x15")?;
+    terminal.write_input(format!("python3 {}\r", script_path.display()).as_bytes())?;
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_COLOR_QUERY_OK")?;
+    let _ = std::fs::remove_file(&script_path);
+
+    ditch_session(&mut backend, &session_id)
+}
+
+fn kitty_keyboard_protocol_pop_restores_legacy_ctrl_c() -> Result<()> {
+    let (mut backend, registry, session_id, window_id, pane) =
+        create_embedded_session(unscoped_tag())?;
+    let mut terminal = open_terminal(std::sync::Arc::clone(&registry), &pane, &window_id)?;
+    terminal.write_input(
+        b"printf '\\033[0m\\033[>1u\\033[?u\\033[<1u'; printf '%s%s\n' 'BOOTTY_RMUX_KEYBOARD' '_STATE'\r",
+    )?;
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_KEYBOARD_STATE")?;
+    drop(terminal);
+
+    let mut terminal = open_terminal(registry, &pane, &window_id)?;
+    terminal.write_input(b"cat\r")?;
+    terminal.encode_key(bootty_terminal::terminal_input_model::KeyInput {
+        key: bootty_terminal::terminal_input_model::TerminalKey::C,
+        mods: bootty_terminal::terminal_input_model::KeyMods {
+            ctrl: true,
+            ..Default::default()
+        },
+        repeat: false,
+        utf8: Some("c"),
+        unshifted: Some('c'),
+    })?;
+    terminal.write_input(b"printf '\\101\\102\\103\\n'\r")?;
+    wait_for_terminal_text(&mut terminal, "ABC")?;
+
+    ditch_session(&mut backend, &session_id)
+}
+
+fn multi_pane_window_resize_keeps_pane_targets_live() -> Result<()> {
+    let (mut backend, registry, session_id, window_id, pane) =
+        create_embedded_session(unscoped_tag())?;
+    backend.execute(MuxCommand::SplitPane {
+        session_id: session_id.clone(),
+        pane_id: Some(pane.pane_id.clone().context("split pane id")?),
+        direction: MuxSplitDirection::Down,
+    })?;
+    let snapshot = backend.snapshot()?;
+    let (panes, focused) = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.windows.first())
+        .map(|window| {
+            let focused = window
+                .panes
+                .iter()
+                .find(|pane| pane.pane_id == window.anchor.pane_id)
+                .or_else(|| window.panes.first())
+                .cloned();
+            (window.panes.clone(), focused)
+        })
+        .context("split rmux window")?;
+    let focused = focused.context("split rmux pane")?;
+    let mut terminal = open_terminal_with_window(registry, &panes, &focused, &window_id)?;
+
+    for _ in 0..8 {
+        terminal.write_input(b"\x7f")?;
+    }
+    terminal.drain_pty();
+    terminal.extract_frame()?;
+
+    for cols in [96, 104, 112, 120] {
+        terminal.resize_native_layout_window(cols, 30)?;
+        terminal.drain_pty();
+    }
+    terminal.resize_native_layout_window(128, 30)?;
+
+    ditch_session(&mut backend, &session_id)
+}
+
+fn closing_session_with_pending_resize_is_quiet() -> Result<()> {
+    let (mut backend, registry, session_id, window_id, pane) =
+        create_embedded_session(unscoped_tag())?;
+    let mut terminal = open_terminal(registry, &pane, &window_id)?;
+
+    terminal.resize_native_layout_window(96, 30)?;
+    backend.execute(MuxCommand::DitchSession {
+        session_id: session_id.clone(),
+    })?;
+
+    for cols in [100, 104, 108, 112] {
+        terminal.resize_native_layout_window(cols, 30)?;
+        terminal.drain_pty();
+        terminal.extract_frame()?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn bounded_live_output() -> Result<()> {
@@ -307,6 +460,15 @@ fn open_terminal(
     pane: &bootty_mux::snapshot::MuxPaneAnchor,
     window_id: &str,
 ) -> Result<ActiveTerminal> {
+    open_terminal_with_window(registry, std::slice::from_ref(pane), pane, window_id)
+}
+
+fn open_terminal_with_window(
+    registry: std::sync::Arc<MuxBackendRegistry>,
+    panes: &[bootty_mux::snapshot::MuxPaneAnchor],
+    focused: &bootty_mux::snapshot::MuxPaneAnchor,
+    window_id: &str,
+) -> Result<ActiveTerminal> {
     let mut terminal = ActiveTerminal::new(
         TerminalGeometry {
             cols: 80,
@@ -323,8 +485,8 @@ fn open_terminal(
         std::sync::Arc::new(|| {}),
     );
     terminal.sync_native_window(
-        std::slice::from_ref(pane),
-        Some(pane),
+        panes,
+        Some(focused),
         Some(window_id),
         MuxBackendKind::Rmux,
         false,

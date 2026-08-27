@@ -348,7 +348,7 @@ export class BoundedEventPublisher {
 type SpawnBootty = (
   command: string,
     arguments_: string[],
-  options: { stdio: "ignore"; detached: false },
+  options: { stdio: ["pipe", "ignore", "ignore"]; detached: false },
 ) => ChildProcess;
 
 export function publishToBootty(
@@ -362,9 +362,15 @@ export function publishToBootty(
     let finished = false;
     const child = spawnBootty(
       "bootty",
-      ["--json", "command", "agents.pi.ingest", JSON.stringify(event), pane],
-      { stdio: "ignore", detached: false },
+      ["--json", "command", "agents.pi.ingest", "--stdin-json"],
+      { stdio: ["pipe", "ignore", "ignore"], detached: false },
     );
+    // The child is killed on a timeout, so a pending write can fail with EPIPE.
+    // An unhandled stream error would take the Pi host process down with it.
+    child.stdin?.once("error", () => {});
+    // Keep event data out of argv: a Pi tool result can be much larger than macOS's execve limit.
+    // Command arguments are strings, so the event travels as encoded JSON text.
+    child.stdin?.end(JSON.stringify([JSON.stringify(event), pane]));
     const finish = (): void => {
       if (finished) {
         return;

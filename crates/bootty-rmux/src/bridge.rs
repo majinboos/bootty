@@ -88,11 +88,18 @@ macro_rules! with_bootty_rmux_environment {
 }
 
 macro_rules! retry_rmux_operation {
-    ($state:ident, $first:expr, $retry:expr) => {{
+    ($state:ident, $first:expr, $retry:expr) => {
+        retry_rmux_operation!($state, should_retry_rmux_error, $first, $retry)
+    };
+    ($state:ident, $should_retry:expr, $first:expr, $retry:expr) => {{
         match ($first).await {
             Ok(value) => Ok(value),
-            Err(error) if should_retry_rmux_error(&error) => {
-                $state.rmux = None;
+            Err(error) if $should_retry(&error) => {
+                // A stale index only needs re-resolving; every other retryable
+                // error means the connection itself is suspect.
+                if !rmux_stale_target_text(&error.to_string()) {
+                    $state.rmux = None;
+                }
                 ($retry).await
             }
             Err(error) => Err(error),
@@ -401,8 +408,22 @@ impl RmuxBridgeState {
     }
 
     async fn execute(&mut self, command: MuxCommand) -> Result<()> {
+        // A transport error can arrive after the request was sent, and a command
+        // can be several requests long, so a retry has to assume the first
+        // attempt landed. Only commands that name an absolute end state survive
+        // being run twice.
+        if command.is_repeatable() {
+            return retry_rmux_operation!(
+                self,
+                self.execute_once(command.clone()),
+                self.execute_once(command)
+            );
+        }
+        // A connection that was never established is the exception: the request
+        // cannot have reached the daemon, so re-running it is safe regardless.
         retry_rmux_operation!(
             self,
+            rmux_connect_failed,
             self.execute_once(command.clone()),
             self.execute_once(command)
         )
@@ -686,13 +707,24 @@ impl RmuxBridgeState {
     async fn close_pane(&mut self, session_name: &str, pane_id: Option<&str>) -> Result<()> {
         let pane_id = pane_id.context("rmux close pane requires a focused pane id")?;
         let rmux = self.rmux().await?;
-        pane_for_target(
+        let pane = match pane_for_target(
             rmux,
             &RmuxPaneTarget::new(session_name, Some(pane_id.to_owned())),
         )
-        .await?
-        .close()
-        .await?;
+        .await
+        {
+            Ok(pane) => pane,
+            Err(error) if rmux_missing_target_text(&error.to_string()) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match pane.close().await {
+            Ok(_) => {}
+            // A pane rmux cannot find is already closed. A stale index is not:
+            // the pane is still there, and reporting success would leave it open
+            // behind a UI that says otherwise.
+            Err(error) if rmux_missing_target_text(&error.to_string()) => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(())
     }
 
@@ -813,7 +845,7 @@ impl RmuxBridgeState {
     #[cfg(feature = "app")]
     async fn resize_window_once(&mut self, window_id: &str, cols: u16, rows: u16) -> Result<()> {
         let Some((session_name, index)) = self.any_window_index_by_id(window_id).await? else {
-            anyhow::bail!("rmux window {window_id} not found");
+            anyhow::bail!("{RMUX_WINDOW_NOT_LISTED}: {window_id}");
         };
         self.window(&session_name, index)
             .await?
@@ -872,12 +904,59 @@ fn window_for_target<'a>(
     }
 }
 
-fn should_retry_rmux_error(error: &anyhow::Error) -> bool {
+/// Bootty never reached the daemon, so the request cannot have landed.
+fn rmux_connect_failed(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("connection refused") || text.contains("No such file")
+}
+
+/// The connection itself failed. Beyond [`rmux_connect_failed`], the request may
+/// still have reached the daemon, so this alone does not make re-running safe.
+fn should_retry_rmux_transport_error(error: &anyhow::Error) -> bool {
     let text = error.to_string();
     text.contains("transport")
         || text.contains("closed the transport")
-        || text.contains("connection refused")
-        || text.contains("No such file")
+        || rmux_connect_failed(error)
+}
+
+fn should_retry_rmux_error(error: &anyhow::Error) -> bool {
+    should_retry_rmux_transport_error(error) || rmux_stale_target_text(&error.to_string())
+}
+
+/// Bootty did not find the window in the daemon's listing. Deliberately worded
+/// so it does not read as rmux's own `window not found`, which means the daemon
+/// itself has no such window.
+const RMUX_WINDOW_NOT_LISTED: &str = "rmux window is not listed";
+
+/// The target still exists as far as anyone knows; this request just could not
+/// resolve it. An index moves under a split or close, and a listing can lag the
+/// window that produced it, so these are worth another look.
+pub(crate) fn rmux_stale_target_text(text: &str) -> bool {
+    text.contains(RMUX_WINDOW_NOT_LISTED)
+        || (text.contains("invalid target")
+            && (text.contains("pane index does not exist")
+                || text.contains("window index does not exist")))
+}
+
+/// rmux could not find the pane, window, or session at all, as opposed to
+/// finding a stale index for one that still exists.
+pub(crate) fn rmux_missing_target_text(text: &str) -> bool {
+    // Bootty's own listing misses. `list_pane_rows` enumerates the session, so a
+    // pane it does not name is gone rather than momentarily unresolvable.
+    text.contains(crate::pane_io::RMUX_PANE_NOT_LISTED)
+        || text.contains(crate::pane_io::RMUX_PANE_WINDOW_NOT_LISTED)
+        // rmux reports a session or window with no active pane through the same
+        // `invalid target` shape as a stale index, but it names the pane that is
+        // gone rather than an index that moved.
+        || text.contains("active pane does not exist")
+        || text.contains("pane not found")
+        // The SDK phrases a missing stable pane id one way when it raises the
+        // error itself and another when it relays the daemon's.
+        || (text.contains("pane id") && text.contains("not found"))
+        || text.contains("pane id does not exist")
+        || text.contains("window not found")
+        || (text.contains("window id") && text.contains("not found"))
+        || text.contains("session not found")
 }
 
 fn append_window_index(rows: &[RmuxWindowRow]) -> u32 {
@@ -910,4 +989,56 @@ async fn snapshot_session(
     let windows = list_window_rows(rmux, name).await?;
     let panes = list_pane_rows(rmux, name).await?;
     Ok(session_from_rows(&session_name, tag, &windows, &panes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_sdk::{PaneId, RmuxError, SessionName};
+
+    fn session() -> SessionName {
+        SessionName::new("alpha").expect("session name")
+    }
+
+    /// The classifiers read error text, so they are only as good as the wording
+    /// the SDK happens to use. Build the real errors so a bump that rephrases
+    /// one fails here instead of silently closing a live pane or toasting a
+    /// teardown.
+    #[test]
+    fn a_missing_pane_is_classified_however_the_sdk_phrases_it() {
+        // Raised by the SDK against an already-resolved pane.
+        let direct = RmuxError::pane_not_found(session(), PaneId::from(7));
+        assert!(rmux_missing_target_text(&direct.to_string()));
+
+        // Relayed from the daemon when resolving the id in the first place.
+        let relayed = RmuxError::protocol(rmux_proto::RmuxError::pane_not_found(
+            session(),
+            PaneId::from(7),
+        ));
+        assert!(rmux_missing_target_text(&relayed.to_string()));
+    }
+
+    #[test]
+    fn a_stale_index_is_not_a_missing_target() {
+        let stale = RmuxError::protocol(rmux_proto::RmuxError::invalid_target(
+            "alpha:0.9",
+            "pane index does not exist in session",
+        ));
+        let text = stale.to_string();
+        assert!(rmux_stale_target_text(&text));
+        assert!(!rmux_missing_target_text(&text));
+    }
+
+    #[test]
+    fn bootty_listing_misses_are_stale_or_missing_on_purpose() {
+        assert!(rmux_stale_target_text(&format!(
+            "{RMUX_WINDOW_NOT_LISTED}: @6"
+        )));
+        assert!(rmux_missing_target_text(
+            crate::pane_io::RMUX_PANE_NOT_LISTED
+        ));
+        assert!(rmux_missing_target_text(
+            crate::pane_io::RMUX_PANE_WINDOW_NOT_LISTED
+        ));
+    }
 }

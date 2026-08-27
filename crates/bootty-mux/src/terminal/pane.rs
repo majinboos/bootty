@@ -637,13 +637,19 @@ impl BackendPaneTerminal {
 
     fn force_native_layout_pane_resizes(&mut self) -> Result<()> {
         self.terminal.force_resize()?;
+        let mut failed_cached_targets = Vec::new();
         for target in &self.native_window_targets {
             if self.active_target.as_ref() == Some(target) {
                 continue;
             }
-            if let Some(runtime) = self.native_terminals.get_mut(target) {
-                runtime.force_resize()?;
+            if let Some(runtime) = self.native_terminals.get_mut(target)
+                && runtime.force_resize().is_err()
+            {
+                failed_cached_targets.push(target.clone());
             }
+        }
+        for target in failed_cached_targets {
+            self.native_terminals.remove(&target);
         }
         Ok(())
     }
