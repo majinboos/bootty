@@ -276,7 +276,13 @@ fn kitty_keyboard_protocol_pop_restores_legacy_ctrl_c() -> Result<()> {
     drop(terminal);
 
     let mut terminal = open_terminal(registry, &pane, &window_id)?;
-    terminal.write_input(b"cat\r")?;
+    terminal
+        .write_input(b"stty -echo; printf '%s%s\\n' 'BOOTTY_RMUX_CTRL_C' '_ECHO_DISABLED'\r")?;
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_CTRL_C_ECHO_DISABLED")?;
+    terminal.write_input(
+        b"/bin/sh -c 'trap \"printf BOOTTY_RMUX_CTRL_C_HANDLED\\\\n; exit 0\" INT; printf BOOTTY_RMUX_CTRL_C_READY\\n; while :; do read line; done'\r",
+    )?;
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_CTRL_C_READY")?;
     terminal.encode_key(bootty_terminal::terminal_input_model::KeyInput {
         key: bootty_terminal::terminal_input_model::TerminalKey::C,
         mods: bootty_terminal::terminal_input_model::KeyMods {
@@ -287,7 +293,8 @@ fn kitty_keyboard_protocol_pop_restores_legacy_ctrl_c() -> Result<()> {
         utf8: Some("c"),
         unshifted: Some('c'),
     })?;
-    terminal.write_input(b"printf '\\101\\102\\103\\n'\r")?;
+    wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_CTRL_C_HANDLED")?;
+    terminal.write_input(b"stty echo; printf '\\101\\102\\103\\n'\r")?;
     wait_for_terminal_text(&mut terminal, "ABC")?;
 
     ditch_session(&mut backend, &session_id)
