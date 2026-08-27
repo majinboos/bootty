@@ -31,6 +31,7 @@ use bootty_terminal::{
 };
 use rmux_sdk::TerminalSizeSpec;
 
+use crate::bridge::{rmux_missing_target_text, rmux_stale_target_text};
 use crate::pane_io::{RmuxPaneEvent, RmuxPaneIo, RmuxPaneTarget, open_rmux_pane_io};
 use crate::remote::open_remote_rmux_pane_io;
 use bootty_remote::ssh::SshRemote;
@@ -291,10 +292,17 @@ struct RmuxWindowResizeWorker {
     result_rx: mpsc::Receiver<std::result::Result<(), String>>,
 }
 
+/// How long to wait before re-driving a resize at a window the daemon will not
+/// resolve. Re-driving on every paint would enumerate every session at frame
+/// rate, and giving up entirely would leave a window that comes back listed at
+/// the wrong size forever, so back off to this instead.
+const UNRESOLVED_WINDOW_RESIZE_RETRY: Duration = Duration::from_millis(500);
+
 pub struct RmuxPanePolicy {
     remote: Option<SshRemote>,
     window_id: Option<String>,
     last_window_size: Option<(String, u16, u16)>,
+    unresolved_window_resize_at: Option<Instant>,
     resize_worker: Option<RmuxWindowResizeWorker>,
 }
 
@@ -304,6 +312,7 @@ impl RmuxPanePolicy {
             remote,
             window_id: None,
             last_window_size: None,
+            unresolved_window_resize_at: None,
             resize_worker: None,
         }
     }
@@ -338,13 +347,41 @@ impl RmuxPanePolicy {
         let mut error = None;
         if let Some(worker) = &self.resize_worker {
             while let Ok(result) = worker.result_rx.try_recv() {
+                // Results arrive in order, so a later success retires an
+                // earlier rejection rather than leaving it to be acted on.
                 match result {
-                    Ok(()) => completed = true,
+                    Ok(()) => {
+                        completed = true;
+                        error = None;
+                        self.unresolved_window_resize_at = None;
+                    }
                     Err(result_error) => error = Some(result_error),
                 }
             }
         }
         if let Some(error) = error {
+            if rmux_stale_target_text(&error) {
+                // The window still exists, its index or listing moved under the
+                // request. Forget the requested size so a later paint re-drives
+                // it, rate limited so a window that never resolves again does
+                // not enumerate every session on every frame.
+                let now = Instant::now();
+                if self
+                    .unresolved_window_resize_at
+                    .is_none_or(|at| now.duration_since(at) >= UNRESOLVED_WINDOW_RESIZE_RETRY)
+                {
+                    self.unresolved_window_resize_at = Some(now);
+                    self.last_window_size = None;
+                }
+                return Ok(completed);
+            }
+            if rmux_missing_target_text(&error) {
+                // Teardown, not a terminal error. Keep the requested size so the
+                // paint path does not re-send a resize the daemon cannot route.
+                // The window stays at its old size until the layout asks for
+                // different dimensions.
+                return Ok(completed);
+            }
             self.last_window_size = None;
             anyhow::bail!(error);
         }
@@ -378,6 +415,9 @@ impl BackendPanePolicy for RmuxPanePolicy {
         if self.window_id.as_deref() != window_id {
             self.window_id = window_id.map(str::to_owned);
             self.last_window_size = None;
+            // The backoff is per window: a window that stopped resolving must not
+            // delay the next one's first retry.
+            self.unresolved_window_resize_at = None;
         }
     }
 
@@ -472,6 +512,9 @@ impl TerminalRuntime for RmuxNativeTerminal {
     }
 
     fn force_resize(&mut self) -> Result<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.send_command(RmuxTerminalCommand::ForceResize)
     }
 
@@ -582,7 +625,7 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let _closed_guard = RmuxWorkerClosedGuard(Arc::clone(&config.closed));
-        let engine = match TerminalEngine::new_with_terminal_options(
+        let mut engine = match TerminalEngine::new_with_terminal_options(
             config.geometry,
             config.terminal_config.colors,
             config.terminal_config.cursor,
@@ -596,6 +639,13 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
                 return;
             }
         };
+        let callback_input = config.pane_io.input_tx.clone();
+        if let Err(error) = engine.on_pty_write(move |_terminal, bytes| {
+            let _ = callback_input.send(bytes.to_vec());
+        }) {
+            let _ = startup_tx.send(Err(error.to_string()));
+            return;
+        }
         let worker = RmuxWorker {
             pane_io: config.pane_io,
             geometry: config.geometry,
@@ -859,7 +909,7 @@ impl RmuxWorker {
                     self.update_pending_output_len();
                     collected_chunks += 1;
                     collected_bytes += keyframe.len();
-                    self.engine.write_vt(&keyframe);
+                    self.engine.write_vt_without_pty_responses(&keyframe);
                     self.engine.scroll_viewport_bottom();
                     self.waiting_initial_remote_frame = false;
                     self.force_next_frame_publish = true;
@@ -1001,7 +1051,10 @@ impl RmuxWorker {
             .send(TerminalSizeSpec::new(geometry.cols, geometry.rows))
             .is_err()
         {
-            self.send_error(anyhow::anyhow!("rmux resize queue stopped"));
+            // The pane stream can close before a queued layout resize reaches
+            // this worker. That is normal pane teardown, not a terminal error.
+            self.output_closed = true;
+            self.closed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -1010,7 +1063,9 @@ impl RmuxWorker {
             return;
         }
         if self.pane_io.input_tx.send(bytes.to_vec()).is_err() {
-            self.send_error(anyhow::anyhow!("rmux input queue stopped"));
+            // Input can race pane/session close in the same way as resize.
+            self.output_closed = true;
+            self.closed.store(true, Ordering::Relaxed);
         }
     }
 

@@ -459,6 +459,7 @@ pub struct TerminalEngine {
     cursor_home_pending_len: usize,
     sgr_optimizer: SgrOptimizer,
     pty_write_callback: PtyWriteCallback,
+    pty_write_suppressed: Rc<Cell<bool>>,
     current_working_directory: String,
     colors: TerminalColorConfig,
     xterm_color_overrides: XtermColorOverrides,
@@ -843,7 +844,12 @@ impl TerminalEngine {
         })?;
         let pty_write_callback: PtyWriteCallback = Rc::new(RefCell::new(None));
         let terminal_pty_write_callback = pty_write_callback.clone();
+        let pty_write_suppressed = Rc::new(Cell::new(false));
+        let terminal_pty_write_suppressed = pty_write_suppressed.clone();
         terminal.on_pty_write(move |terminal, bytes| {
+            if terminal_pty_write_suppressed.get() {
+                return;
+            }
             if let Some(callback) = terminal_pty_write_callback.borrow_mut().as_deref_mut() {
                 callback(terminal, bytes);
             }
@@ -899,6 +905,7 @@ impl TerminalEngine {
             cursor_home_pending_len: 0,
             sgr_optimizer: SgrOptimizer::default(),
             pty_write_callback,
+            pty_write_suppressed,
             current_working_directory: String::new(),
             current_working_directory_state: pwd_state,
             color_scheme,
@@ -1069,6 +1076,9 @@ impl TerminalEngine {
     }
 
     fn write_pty_response(&self, bytes: &[u8]) {
+        if self.pty_write_suppressed.get() {
+            return;
+        }
         if let Some(callback) = self.pty_write_callback.borrow_mut().as_deref_mut() {
             callback(&self.terminal, bytes);
         }
@@ -1089,12 +1099,22 @@ impl TerminalEngine {
             let payload_end = payload_start + payload_len;
             let terminator_end = payload_end + terminator_len;
 
-            self.terminal.vt_write(&data[search_start..terminator_end]);
-            self.apply_osc_color_state(&data[payload_start..payload_end]);
-            if let Some(response) = self.extended_color_query_response(
+            let standard_query_response = self.standard_color_query_response(
                 &data[payload_start..payload_end],
                 &data[payload_end..terminator_end],
-            ) {
+            );
+            if standard_query_response.is_some() {
+                self.terminal.vt_write(&data[search_start..start]);
+            } else {
+                self.terminal.vt_write(&data[search_start..terminator_end]);
+            }
+            self.apply_osc_color_state(&data[payload_start..payload_end]);
+            if let Some(response) = standard_query_response.or_else(|| {
+                self.extended_color_query_response(
+                    &data[payload_start..payload_end],
+                    &data[payload_end..terminator_end],
+                )
+            }) {
                 self.write_pty_response(&response);
             }
             search_start = terminator_end;
@@ -1177,6 +1197,49 @@ impl TerminalEngine {
                 .or(Some(self.colors.background)),
             _ => None,
         }
+    }
+
+    fn standard_color_query_response(&self, payload: &[u8], terminator: &[u8]) -> Option<Vec<u8>> {
+        let (command, rest) = split_osc_payload(payload)?;
+        let mut response = Vec::new();
+        match command {
+            b"10" | b"11" | b"12" => {
+                let start_code = parse_osc_number(command)? as u8;
+                for (offset, operation) in rest.split(|byte| *byte == b';').enumerate() {
+                    let code = start_code.checked_add(offset as u8)?;
+                    if code > 12 || operation != b"?" {
+                        return None;
+                    }
+                    let color = match code {
+                        10 => self.terminal.fg_color().ok()?,
+                        11 => self.terminal.bg_color().ok()?,
+                        12 => self.terminal.cursor_color().ok()?,
+                        _ => unreachable!(),
+                    }?;
+                    response
+                        .extend_from_slice(format!("\x1b]{code};{}", rgb_spec(color)).as_bytes());
+                    response.extend_from_slice(terminator);
+                }
+            }
+            b"4" => {
+                let palette = self.terminal.color_palette().ok()?;
+                let mut operations = rest.split(|byte| *byte == b';');
+                while let Some(index) = operations.next() {
+                    let operation = operations.next()?;
+                    if operation != b"?" {
+                        return None;
+                    }
+                    let index = parse_osc_number(index)?;
+                    let color = *palette.0.get(index as usize)?;
+                    response.extend_from_slice(
+                        format!("\x1b]4;{index};{}", rgb_spec(color)).as_bytes(),
+                    );
+                    response.extend_from_slice(terminator);
+                }
+            }
+            _ => return None,
+        }
+        (!response.is_empty()).then_some(response)
     }
 
     fn extended_color_query_response(&self, payload: &[u8], terminator: &[u8]) -> Option<Vec<u8>> {
@@ -1405,6 +1468,31 @@ impl TerminalEngine {
         }
         self.mouse_encoder_options_dirty = true;
         self.mark_content_changed();
+    }
+
+    /// Replays historical pane output without answering the live child process
+    /// or repeating what the bytes already did when they first arrived.
+    /// Recovery keyframes can carry old terminal queries, a bell, or a
+    /// notification the user has already seen. State the keyframe restores,
+    /// such as the window title, is kept.
+    pub fn write_vt_without_pty_responses(&mut self, bytes: &[u8]) {
+        // A keyframe is a complete epoch, so the streaming buffers are emptied on
+        // both sides of it. Whatever they held from the previous epoch would
+        // otherwise be spliced onto the front of the keyframe, and whatever the
+        // keyframe leaves behind would be flushed by the next live write with
+        // responses and side effects back on.
+        self.clear_streaming_writes();
+        let previously_suppressed = self.pty_write_suppressed.replace(true);
+        let side_effects = self.side_effects.mark();
+        self.write_vt(bytes);
+        self.pty_write_suppressed.set(previously_suppressed);
+        self.side_effects.drop_replayed(side_effects);
+        self.clear_streaming_writes();
+    }
+
+    fn clear_streaming_writes(&mut self) {
+        self.terminal_write_pending.clear();
+        self.side_effects.clear_pending();
     }
 
     fn sync_current_working_directory(&mut self) {

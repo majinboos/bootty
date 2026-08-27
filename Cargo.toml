@@ -30,7 +30,7 @@ ab_glyph = "0.2"
 anyhow = "1"
 arboard = "3"
 assert_fs = "1.1.4"
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 criterion = "0.8"
 derive_more = { version = "2.1.1", default-features = false, features = [
@@ -41,11 +41,12 @@ eframe = { version = "0.36", default-features = false, features = [
   "accesskit",
   "default_fonts",
   "inspection",
+  "links",
   "wgpu_no_default_features",
 ] }
 egui = "0.36"
-egui_code_editor = "0.3.7"
-fontdb = "0.23"
+egui_code_editor = "0.4.1"
+fontdb = "0.24"
 getrandom = "0.4"
 iconflow = { version = "1", features = [
   "pack-bootstrap",
@@ -55,7 +56,7 @@ iconflow = { version = "1", features = [
 ] }
 indoc = "2"
 inventory = "0.3"
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "10e8f5608bc3f9ced83c6fa51f44fd8031fa8ee0", features = [
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "de9fd9b0fa4ab53faebd3d489f4c74fe0ec832ec", features = [
   "png",
   "log",
 ] }
@@ -77,14 +78,14 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
   "NSGeometry",
   "objc2-core-foundation",
 ] }
-pollster = "0.4"
+pollster = "1.0"
 png = "0.18"
 process-wrap = { version = "9.1", default-features = false, features = [
   "job-object",
   "process-group",
   "std",
 ] }
-portable-pty = { git = "https://github.com/wezterm/wezterm.git", rev = "8afe0ad30739c5aa106c19e8a75b1dfc83bcfb56" }
+portable-pty = { git = "https://github.com/wezterm/wezterm.git", rev = "770d8e1a7519a9a698090cd7d717d0c64aa0a755" }
 pretty_assertions = "1.4.1"
 proptest = "1"
 proptest-derive = "0.8.0"
@@ -97,7 +98,7 @@ rmux-proto = "0.10"
 rmux-server = { version = "0.10", default-features = false }
 rstest = "0.26"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
-sha2 = "0.10"
+sha2 = "0.11"
 rustybuzz = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"

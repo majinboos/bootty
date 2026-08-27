@@ -124,6 +124,27 @@ pub enum MuxCommand {
     },
 }
 
+impl MuxCommand {
+    /// Whether running the command again is safe when the first attempt's
+    /// outcome is unknown. Relative moves double, creates duplicate, toggles
+    /// flip back, and closes take the next pane along, so only commands that
+    /// name an absolute end state qualify.
+    pub fn is_repeatable(&self) -> bool {
+        matches!(
+            self,
+            Self::ActivateWindow { .. }
+                | Self::ActivateWindowIndex { .. }
+                | Self::RenameWindow { .. }
+                | Self::RenameSession { .. }
+                | Self::StampSession { .. }
+                // Both create-or-reuse a session under a name Bootty minted, so
+                // a second attempt adopts what the first one made.
+                | Self::CreateProjectSession { .. }
+                | Self::CreateWorktreeSession { .. }
+        )
+    }
+}
+
 #[cfg(feature = "app")]
 impl MuxCommand {
     pub fn operation(&self) -> BindingOperation {

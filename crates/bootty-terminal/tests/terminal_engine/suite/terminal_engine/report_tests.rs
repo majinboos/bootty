@@ -23,12 +23,80 @@ fn terminal_engine_answers_size_queries_from_current_geometry() -> Result<()> {
 fn terminal_engine_orders_osc_color_query_responses_before_later_da1() -> Result<()> {
     let (mut engine, output) = captured_pty_engine()?;
 
-    engine.write_vt(b"\x1b]11;?\x1b\\\x1b[c");
+    engine.write_vt(b"\x1b[?u\x1b]11;?\x1b\\\x1b[c");
 
     assert_eq!(
         take_pty_output(&output),
-        b"\x1b]11;rgb:1a1a/1b1b/2525\x1b\\\x1b[?62;22;52c"
+        b"\x1b[?0u\x1b]11;rgb:1a1a/1b1b/2525\x1b\\\x1b[?62;22;52c"
     );
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_does_not_answer_queries_replayed_from_a_rebase() -> Result<()> {
+    let (mut engine, output) = captured_pty_engine()?;
+
+    engine.write_vt_without_pty_responses(b"\x1b[?u");
+    assert!(take_pty_output(&output).is_empty());
+
+    engine.write_vt(b"\x1b[c");
+    assert_eq!(take_pty_output(&output), b"\x1b[?62;22;52c");
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_does_not_repeat_side_effects_replayed_from_a_rebase() -> Result<()> {
+    let (mut engine, _output) = captured_pty_engine()?;
+
+    engine.write_vt_without_pty_responses(b"\x1b]1337;ReportCellSize\x1b\\");
+    assert!(engine.drain_side_effects().is_empty());
+
+    engine.write_vt(b"\x1b]1337;ReportCellSize\x1b\\");
+    assert_eq!(engine.drain_side_effects().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_does_not_carry_a_truncated_rebase_into_the_next_write() -> Result<()> {
+    let (mut engine, output) = captured_pty_engine()?;
+
+    // The keyframe ends mid-OSC, so the streaming buffer holds the tail back.
+    engine.write_vt_without_pty_responses(b"\x1b]1337;ReportCellSize");
+    assert!(take_pty_output(&output).is_empty());
+
+    engine.write_vt(b"\x1b\\\x1b[c");
+    assert_eq!(take_pty_output(&output), b"\x1b[?62;22;52c");
+    assert!(engine.drain_side_effects().is_empty());
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_does_not_splice_a_pending_write_onto_a_rebase() -> Result<()> {
+    let (mut engine, output) = captured_pty_engine()?;
+
+    // The live stream is cut mid-sequence, then recovery replays a keyframe.
+    engine.write_vt(b"\x1b]1337;Repor");
+    engine.write_vt_without_pty_responses(b"\x1b[c");
+    // The keyframe stands on its own: the stale prefix neither joins it nor
+    // swallows it as OSC payload.
+    assert!(take_pty_output(&output).is_empty());
+
+    engine.write_vt(b"\x1b[c");
+    assert_eq!(take_pty_output(&output), b"\x1b[?62;22;52c");
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_keeps_state_restored_by_a_rebase() -> Result<()> {
+    let (mut engine, _output) = captured_pty_engine()?;
+
+    engine.write_vt_without_pty_responses(b"\x1b]2;restored\x1b\\");
+
+    assert!(engine.drain_side_effects().iter().any(|effect| matches!(
+        effect,
+        bootty_terminal::terminal_side_effect::TerminalSideEffect::WindowTitle(title)
+            if title == "restored"
+    )));
     Ok(())
 }
 
@@ -262,6 +330,105 @@ fn terminal_engine_answers_color_queries_from_active_palette() -> Result<()> {
         b"\x1b]4;1;rgb:f7f7/7676/8e8e\x1b\\"
     );
 
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_answers_color_queries_with_generated_palette() -> Result<()> {
+    let colors = TerminalColorConfig {
+        background: RgbColor {
+            r: 0x1a,
+            g: 0x1b,
+            b: 0x26,
+        },
+        foreground: RgbColor {
+            r: 0xc0,
+            g: 0xca,
+            b: 0xf5,
+        },
+        palette: [
+            (0x15, 0x16, 0x1e),
+            (0xf7, 0x76, 0x8e),
+            (0x9e, 0xce, 0x6a),
+            (0xe0, 0xaf, 0x68),
+            (0x7a, 0xa2, 0xf7),
+            (0xbb, 0x9a, 0xf7),
+            (0x7d, 0xcf, 0xff),
+            (0xa9, 0xb1, 0xd6),
+            (0x41, 0x48, 0x68),
+            (0xf7, 0x76, 0x8e),
+            (0x9e, 0xce, 0x6a),
+            (0xe0, 0xaf, 0x68),
+            (0x7a, 0xa2, 0xf7),
+            (0xbb, 0x9a, 0xf7),
+            (0x7d, 0xcf, 0xff),
+            (0xc0, 0xca, 0xf5),
+        ]
+        .into_iter()
+        .map(|(r, g, b)| RgbColor { r, g, b })
+        .collect(),
+        palette_generate: true,
+        palette_harmonious: true,
+        ..Default::default()
+    };
+    let mut engine = terminal_engine_with_colors(
+        TerminalGeometry {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        },
+        colors,
+    )?;
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let capture = output.clone();
+    engine.on_pty_write(move |_terminal, bytes| {
+        capture
+            .lock()
+            .expect("pty output lock")
+            .extend_from_slice(bytes);
+    })?;
+
+    engine.write_vt(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;16;?\x1b\\\x1b]4;231;?\x1b\\\x1b[c");
+    let output = take_pty_output(&output);
+    assert!(find_subslice(&output, b"\x1b]10;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]11;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]4;16;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]4;231;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b[?").is_some());
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_answers_color_queries_while_side_effect_input_is_pending() -> Result<()> {
+    let (mut engine, output) = captured_pty_engine()?;
+
+    engine.write_vt(b"\x1b]1337;CopyToClipboard=1\x1b\\");
+    engine.write_vt(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;16;?\x1b\\\x1b]4;231;?\x1b\\\x1b[c");
+    let output = take_pty_output(&output);
+    assert!(find_subslice(&output, b"\x1b]10;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]11;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]4;16;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]4;231;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b[?").is_some());
+    Ok(())
+}
+
+#[test]
+fn terminal_engine_answers_split_color_queries_before_da1() -> Result<()> {
+    let (mut engine, output) = captured_pty_engine()?;
+    let query = b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;16;?\x1b\\\x1b]4;231;?\x1b\\\x1b[c";
+
+    for byte in query {
+        engine.write_vt(std::slice::from_ref(byte));
+    }
+
+    let output = take_pty_output(&output);
+    assert!(find_subslice(&output, b"\x1b]10;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]11;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]4;16;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b]4;231;rgb:").is_some());
+    assert!(find_subslice(&output, b"\x1b[?").is_some());
     Ok(())
 }
 

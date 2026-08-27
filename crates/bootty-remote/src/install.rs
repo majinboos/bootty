@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs::{self, OpenOptions},
     io::{Read as _, Write as _},
     path::PathBuf,
@@ -201,7 +202,11 @@ fn publish_cached_daemon(
 }
 
 fn checksum(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    let mut checksum = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(checksum, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    checksum
 }
 
 fn download(url: &str) -> Result<Vec<u8>> {
