@@ -88,6 +88,26 @@ pub fn terminal_input_commands_with_wheel_state(
             text_modifiers_are_suppressed(modifiers, macos_option_as_alt, snapshot.modifier_sides)
         });
 
+    // `pressed_mouse_button` is the pointer state after the whole frame, so a press landing in the
+    // same frame as a move would tag that earlier move as a drag of a button the child has not seen
+    // pressed yet. Nothing is held before this frame's first press; a frame that only releases
+    // keeps the snapshot so an untracked release stays untracked.
+    let opens_with_press = snapshot
+        .events
+        .iter()
+        .find_map(|event| match event {
+            egui::Event::PointerButton {
+                button, pressed, ..
+            } if terminal_mouse_button(*button).is_some() => Some(*pressed),
+            _ => None,
+        })
+        .unwrap_or(false);
+    let mut held = if opens_with_press {
+        None
+    } else {
+        snapshot.pressed_mouse_button
+    };
+
     for event in snapshot.events {
         match event {
             egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text))
@@ -104,7 +124,7 @@ pub fn terminal_input_commands_with_wheel_state(
                     && let Some(input) = mouse_input_with_view(
                         pos,
                         MouseAction::Motion,
-                        snapshot.pressed_mouse_button,
+                        held,
                         snapshot.modifiers,
                         snapshot.surface,
                         snapshot.view,
@@ -128,7 +148,9 @@ pub fn terminal_input_commands_with_wheel_state(
                 } else {
                     MouseAction::Release
                 };
-                let input = if !pressed && snapshot.pressed_mouse_button == Some(button) {
+                let was_held = held;
+                held = pressed.then_some(button);
+                let input = if !pressed && was_held == Some(button) {
                     mouse_input_with_view(
                         pos,
                         action,

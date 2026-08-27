@@ -249,6 +249,66 @@ fn mouse_motion_keeps_the_pressed_button() {
 }
 
 #[test]
+fn move_before_a_press_in_the_same_frame_is_not_a_drag() {
+    let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
+    let mut input = snapshot(vec![
+        egui::Event::PointerMoved(Pos2::new(35.0, 70.0)),
+        egui::Event::PointerButton {
+            pos: Pos2::new(35.0, 70.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        },
+    ]);
+    input.hover_pos = Some(Pos2::new(35.0, 70.0));
+    // egui reports the pointer state after the frame, so the press is already down here.
+    input.pressed_mouse_button = Some(MouseButton::Left);
+    input.surface = Some(surface(rect, CellMetrics::new(9.0, 22.0)));
+
+    let commands = terminal_input_commands(input);
+    let [
+        TerminalInputCommand::Mouse(motion),
+        TerminalInputCommand::Mouse(press),
+    ] = commands.as_slice()
+    else {
+        panic!("expected a motion and a press");
+    };
+    assert_eq!(motion.action, MouseAction::Motion);
+    assert_eq!(motion.button, None);
+    assert_eq!(press.action, MouseAction::Press);
+    assert_eq!(press.button, Some(MouseButton::Left));
+}
+
+#[test]
+fn move_after_a_press_in_the_same_frame_stays_a_drag() {
+    let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
+    let mut input = snapshot(vec![
+        egui::Event::PointerButton {
+            pos: Pos2::new(35.0, 70.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        },
+        egui::Event::PointerMoved(Pos2::new(45.0, 70.0)),
+    ]);
+    input.hover_pos = Some(Pos2::new(45.0, 70.0));
+    input.pressed_mouse_button = Some(MouseButton::Left);
+    input.surface = Some(surface(rect, CellMetrics::new(9.0, 22.0)));
+
+    let commands = terminal_input_commands(input);
+    let [
+        TerminalInputCommand::Mouse(press),
+        TerminalInputCommand::Mouse(motion),
+    ] = commands.as_slice()
+    else {
+        panic!("expected a press and a motion");
+    };
+    assert_eq!(press.action, MouseAction::Press);
+    assert_eq!(motion.action, MouseAction::Motion);
+    assert_eq!(motion.button, Some(MouseButton::Left));
+}
+
+#[test]
 fn point_wheel_input_accumulates_until_one_cell() {
     let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
     let terminal_surface = surface(rect, CellMetrics::new(9.0, 22.0));
