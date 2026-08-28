@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "bootty"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-command"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bootty-workspace-hack",
  "pretty_assertions",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-control"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-daemon"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-extension"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "assert_fs",
  "bootty-command",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-mux"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-mux-model"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bootty-workspace-hack",
  "pretty_assertions",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-native"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bootty-mux",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-remote"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-rmux"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-site"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bootty-surface",
  "egui",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-tests"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bootty-config",
  "bootty-identity",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-tmux"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_fs",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "bootty-workspace"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "assert_fs",
  "bootty-config",
