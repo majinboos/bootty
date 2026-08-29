@@ -87,8 +87,8 @@ embedded_scenarios!(
     session_lifecycle,
     pane_navigation_and_zoom,
     terminal_requests,
-    color_query_round_trip,
     kitty_keyboard_protocol_reports_command_alt_key,
+    terminal_queries_do_not_leak_into_the_shell,
     kitty_keyboard_protocol_pop_restores_legacy_ctrl_c,
     multi_pane_window_resize_keeps_pane_targets_live,
     closing_session_with_pending_resize_is_quiet,
@@ -242,7 +242,7 @@ mod scenario {
         ditch_session(&mut backend, &session_id)
     }
 
-    pub fn color_query_round_trip() -> Result<()> {
+    pub fn terminal_queries_do_not_leak_into_the_shell() -> Result<()> {
         // The round trip needs a program that can put the pane in raw mode and read
         // its own stdin. Skip rather than spending the whole `wait_for_terminal_text`
         // deadline on a shell that printed "command not found", which would take
@@ -254,46 +254,68 @@ mod scenario {
             .status()
             .is_ok_and(|status| status.success())
         {
-            eprintln!("skipping color_query_round_trip: no python3 on PATH");
+            eprintln!("skipping terminal_queries_do_not_leak_into_the_shell: no python3 on PATH");
             return Ok(());
         }
         let (mut backend, registry, session_id, window_id, pane) =
             create_embedded_session(unscoped_tag())?;
         let mut terminal = open_terminal(registry.clone(), &pane, &window_id)?;
         prepare_pane(&mut terminal)?;
-        // Reattach: the queries below have to survive one terminal handing the
-        // live pane over to the next.
+        // Reattach: delayed terminal replies used to cross this boundary and
+        // land on the shell after the querying process exited.
         drop(terminal);
         let mut terminal = open_terminal(registry, &pane, &window_id)?;
         // Run from a file: inlining the script would put its backslash escapes
         // through the pane shell's quoting rules.
         let script_path =
-            std::env::temp_dir().join(format!("bootty-color-query-{}.py", session_id));
+            std::env::temp_dir().join(format!("bootty-terminal-query-{}.py", session_id));
         std::fs::write(
             &script_path,
-            r#"import os, re, sys, select, termios, tty
+            r#"import os, select, sys, termios, tty
 
-# Query from a raw-mode program, never from the pane's shell: an answer written
-# back to a shell lands on its command line and corrupts the next command.
-keyboard = re.compile(rb"\x1b\[\?\d+u")
 fd = sys.stdin.fileno()
 saved = termios.tcgetattr(fd)
 tty.setraw(fd)
-os.write(fd, b"\x1b[?u\x1b]11;?\x1b\\\x1b[c")
+os.write(fd, b"\x1b[?u\x1b[c")
 data = b""
-# Read until both answers, not until the first CSI response: rmux answers DA1
-# itself as a VT100, which arrives before anything Bootty writes back.
-while not (b"rgb:" in data and keyboard.search(data)):
-    if not select.select([fd], [], [], 10.0)[0]:
+# RMUX owns the pane PTY and answers DA1 synchronously. Consuming that answer
+# models Crossterm's support probe, which then returns terminal ownership to the
+# shell. Bootty must not inject a second, delayed response batch afterwards.
+while b"c" not in data:
+    if not select.select([fd], [], [], 2.0)[0]:
         break
-    data += os.read(fd, 4096)
+    data += os.read(fd, 1)
+os.write(fd, b"\x1b]11;?\x1b\\")
+colour = b""
+while b"\x1b\\" not in colour:
+    if not select.select([fd], [], [], 2.0)[0]:
+        break
+    colour += os.read(fd, 1)
 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-if b"rgb:" in data and keyboard.search(data):
-    print("BOOTTY_RMUX_COLOR" + "_QUERY_OK")
+if b"c" not in data:
+    sys.exit("rmux did not answer DA1")
+if b"rgb:" not in colour:
+    sys.exit("Bootty did not answer OSC 11")
+print("BOOTTY_RMUX_COLOR_QUERY_OK")
     "#,
         )?;
-        terminal.write_input(format!("python3 {}\r", script_path.display()).as_bytes())?;
-        wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_COLOR_QUERY_OK")?;
+        terminal.write_input(
+            format!(
+                "stty echo; python3 {}; sleep 1; printf '%s%s\\n' 'BOOTTY_RMUX_QUERY' '_CLEAN'\r",
+                script_path.display()
+            )
+            .as_bytes(),
+        )?;
+        wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_QUERY_CLEAN")?;
+        terminal.drain_pty();
+        let frame = terminal.extract_frame()?.text.iter().collect::<String>();
+        anyhow::ensure!(
+            frame.contains("BOOTTY_RMUX_COLOR_QUERY_OK")
+                && !frame.contains("?0u")
+                && !frame.contains("rgb:")
+                && !frame.contains("62;22;52c"),
+            "terminal replies leaked into the resumed shell: {frame:?}"
+        );
         let _ = std::fs::remove_file(&script_path);
 
         ditch_session(&mut backend, &session_id)

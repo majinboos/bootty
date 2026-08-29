@@ -77,6 +77,7 @@ pub(crate) enum RmuxPaneEvent {
 pub(crate) struct RmuxPaneIo {
     pub(crate) output_rx: tokio_mpsc::Receiver<RmuxPaneEvent>,
     pub(crate) input_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+    #[cfg(feature = "app")]
     pub(crate) resize_tx: tokio_mpsc::UnboundedSender<TerminalSizeSpec>,
     pub(crate) result_rx: mpsc::Receiver<std::result::Result<(), String>>,
 }
@@ -144,7 +145,10 @@ pub(crate) fn open_rmux_pane_io(target: RmuxPaneTarget) -> Result<RmuxPaneIo> {
     // may use the SDK's larger cold-path frame budget.
     let (output_tx, output_rx) = tokio_mpsc::channel(RMUX_OUTPUT_CHANNEL_CAPACITY);
     let (input_tx, input_rx) = tokio_mpsc::unbounded_channel();
+    #[cfg(feature = "app")]
     let (resize_tx, resize_rx) = tokio_mpsc::unbounded_channel();
+    #[cfg(not(feature = "app"))]
+    let (_, resize_rx) = tokio_mpsc::unbounded_channel();
     let (result_tx, result_rx) = mpsc::channel();
     pane_sender()
         .send(RmuxPaneRequest::Open(RmuxOpenPaneRequest {
@@ -158,6 +162,7 @@ pub(crate) fn open_rmux_pane_io(target: RmuxPaneTarget) -> Result<RmuxPaneIo> {
     Ok(RmuxPaneIo {
         output_rx,
         input_tx,
+        #[cfg(feature = "app")]
         resize_tx,
         result_rx,
     })

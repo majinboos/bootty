@@ -641,7 +641,12 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
         };
         let callback_input = config.pane_io.input_tx.clone();
         if let Err(error) = engine.on_pty_write(move |_terminal, bytes| {
-            let _ = callback_input.send(bytes.to_vec());
+            // RMUX answers terminal capability queries beside the pane PTY.
+            // Bootty alone knows its configured palette, so return only those
+            // replies instead of duplicating delayed CSI replies into the shell.
+            if is_osc_default_color_response(bytes) {
+                let _ = callback_input.send(bytes.to_vec());
+            }
         }) {
             let _ = startup_tx.send(Err(error.to_string()));
             return;
@@ -679,6 +684,12 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
         .recv()
         .map_err(|_| anyhow::anyhow!("rmux terminal worker failed to start"))?
         .map_err(|error| anyhow::anyhow!(error))
+}
+
+fn is_osc_default_color_response(bytes: &[u8]) -> bool {
+    [b"\x1b]10;rgb:", b"\x1b]11;rgb:", b"\x1b]12;rgb:"]
+        .iter()
+        .any(|prefix| bytes.starts_with(*prefix))
 }
 
 impl RmuxWorker {
