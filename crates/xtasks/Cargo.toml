@@ -1,0 +1,31 @@
+[package]
+name = "xtasks"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+signal-hook.workspace = true
+tempfile.workspace = true
+time.workspace = true
+toml_edit.workspace = true
+zip.workspace = true
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[target.'cfg(windows)'.dependencies]
+mslnk.workspace = true
+winreg.workspace = true
+
+[dev-dependencies]
+assert_fs.workspace = true
+pretty_assertions.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+
+[lints]
+workspace = true

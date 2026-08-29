@@ -109,12 +109,8 @@ jobs:
       - name: Build size-optimized daemon
         if: github.event_name == 'pull_request'
         run: |
-          cargo build --profile daemon-release -p bootty-daemon
-          size=$(stat -c %s target/daemon-release/bootty-daemon)
-          echo "bootty-daemon size: ${size} bytes"
-          # Keep a bounded artifact budget while allowing the current static
-          # daemon and its embedded SQLite/runtime dependencies.
-          test "$size" -le 13631488
+          mise run daemon:build-one -- x86_64-unknown-linux-gnu
+          mise run daemon:size -- target/x86_64-unknown-linux-gnu/daemon-release/bootty-daemon
 
       - name: Compile and smoke benchmark suite
         run: mise run bench -- --ci-smoke --output artifacts/benchmark-reproduction/ci
@@ -233,15 +229,11 @@ jobs:
           path: target/bootty-daemons
           merge-multiple: true
 
-      - name: Package native app on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: BOOTTY_STRICT_MACOS_ICON=1 BOOTTY_DAEMON_OUTPUT_DIR=target/bootty-daemons mise run package --static
-
-      - name: Package native app on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: $env:BOOTTY_DAEMON_OUTPUT_DIR = "target/bootty-daemons"; mise run package:windows --static
+      - name: Package native app
+        env:
+          BOOTTY_STRICT_MACOS_ICON: "1"
+          BOOTTY_DAEMON_OUTPUT_DIR: target/bootty-daemons
+        run: mise run package -- --static
 
       - name: Upload native app bundle
         uses: actions/upload-artifact@v4

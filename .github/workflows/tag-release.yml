@@ -19,19 +19,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up mise toolchain
+        uses: jdx/mise-action@v4
+
       - name: Tag workspace version and start the release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          version="$(awk '$0 == "[workspace.package]" { in_package = 1; next } /^\[/ { in_package = 0 } in_package && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)"
-          tag="v$version"
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "$tag already exists"
-            exit 0
-          fi
-          git tag "$tag"
-          git push origin "$tag"
-          # A tag pushed with GITHUB_TOKEN starts no workflow of its own, so the release has to be
-          # asked for by name. workflow_dispatch is the one event GitHub still delivers for that token.
-          gh workflow run release.yml --ref "$tag" -f tag="$tag"
+        run: mise run release:tag

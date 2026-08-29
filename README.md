@@ -43,8 +43,8 @@ mise run build --fast     # dynamic build with --profile fast-release
 mise run install --fast   # dynamic install using --profile fast-release
 ```
 
-CI and release packages contain the five daemon targets listed in
-`scripts/bootty-daemon-targets.txt`. Local package and install tasks build only
+CI and release packages contain the five daemon targets owned by `xtasks`.
+Local package and install tasks build only
 the host daemon unless `--all-daemons` is passed. On non-macOS hosts, Apple
 targets require an installed Apple SDK in `SDKROOT`. Windows packaging requires
 a complete staged daemon directory through `BOOTTY_DAEMON_OUTPUT_DIR`. CI builds

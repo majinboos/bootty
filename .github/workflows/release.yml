@@ -62,9 +62,11 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
 
+      - name: Set up mise toolchain
+        uses: jdx/mise-action@v4
+
       - name: Verify release tag
-        shell: bash
-        run: test "v$(awk '$0 == "[workspace.package]" { in_workspace_package = 1; next } /^\[/ { in_workspace_package = 0 } in_workspace_package && $1 == "version" { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)" = "$RELEASE_TAG"
+        run: mise run release:verify-tag -- "$RELEASE_TAG"
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -86,9 +88,6 @@ jobs:
             libxrandr-dev \
             pkg-config
 
-      - name: Set up mise toolchain
-        uses: jdx/mise-action@v4
-
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -105,20 +104,14 @@ jobs:
           path: target/bootty-daemons
           merge-multiple: true
 
-      - name: Package native app on Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        run: BOOTTY_STRICT_MACOS_ICON=1 BOOTTY_DAEMON_OUTPUT_DIR=target/bootty-daemons mise run package --static
-
-      - name: Package native app on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: $env:BOOTTY_DAEMON_OUTPUT_DIR = "target/bootty-daemons"; mise run package:windows --static
+      - name: Package native app
+        env:
+          BOOTTY_STRICT_MACOS_ICON: "1"
+          BOOTTY_DAEMON_OUTPUT_DIR: target/bootty-daemons
+        run: mise run package -- --static
 
       - name: Prepare release assets
-        shell: bash
-        run: |
-          mv "dist/${{ matrix.package-asset }}" "dist/${{ matrix.release-asset }}"
+        run: mise run release:rename-asset -- "dist/${{ matrix.package-asset }}" "dist/${{ matrix.release-asset }}"
 
       - name: Upload release asset
         uses: actions/upload-artifact@v4
@@ -133,17 +126,20 @@ jobs:
     needs: [package, daemon-artifacts]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up mise toolchain
+        uses: jdx/mise-action@v4
+
       - name: Download release assets
         uses: actions/download-artifact@v5
         with:
           path: release
           merge-multiple: true
 
-      - name: Generate checksums
-        working-directory: release
-        run: sha256sum * > SHA256SUMS
-
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$RELEASE_TAG" release/* --repo "$GITHUB_REPOSITORY" --generate-notes --title "$RELEASE_TAG"
+        run: mise run release:publish -- "$RELEASE_TAG" release

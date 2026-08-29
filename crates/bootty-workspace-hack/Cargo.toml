@@ -58,6 +58,7 @@ simd-adler32 = { version = "0.3" }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = { version = "2" }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_edit = { version = "0.25", features = ["serde"] }
@@ -85,6 +86,7 @@ serde_core = { version = "1", features = ["alloc", "rc"] }
 serde_spanned = { version = "1" }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "full", "visit", "visit-mut"] }
+time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing"] }
 toml_datetime = { version = "1", features = ["serde"] }
 toml_edit = { version = "0.25", features = ["serde"] }
 toml_parser = { version = "1" }
@@ -110,7 +112,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSA
 percent-encoding = { version = "2" }
 rustix = { version = "1", features = ["event", "net", "process", "pty", "runtime", "termios", "thread"] }
 smallvec = { version = "1", default-features = false, features = ["union"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 wgpu = { version = "30", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "30", features = ["metal", "portable-atomic", "renderdoc", "wgsl"] }
 wgpu-hal = { version = "30", default-features = false, features = ["metal", "portable-atomic"] }
@@ -138,7 +139,6 @@ rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", 
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit-mut"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
 uuid = { version = "1" }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }
@@ -162,7 +162,7 @@ zbus_macros = { version = "5", features = ["blocking-api"] }
 [target.wasm32-unknown-unknown.dependencies]
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 js-sys = { version = "0.3" }
-time = { version = "0.3", features = ["formatting", "parsing", "wasm-bindgen"] }
+time = { version = "0.3", default-features = false, features = ["wasm-bindgen"] }
 wasm-bindgen = { version = "0.2" }
 web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "AddEventListenerOptions", "BinaryType", "BlobPropertyBag", "CanvasRenderingContext2d", "Clipboard", "ClipboardEvent", "ClipboardItem", "CompositionEvent", "CssStyleDeclaration", "DataTransfer", "DataTransferItem", "DataTransferItemList", "Document", "DomException", "DomRect", "DragEvent", "EventListener", "ExtSRgb", "File", "FileList", "FocusEvent", "FocusOptions", "HtmlCanvasElement", "HtmlImageElement", "HtmlInputElement", "ImageBitmap", "ImageBitmapOptions", "ImageBitmapRenderingContext", "ImageData", "InputEvent", "IntersectionObserver", "IntersectionObserverEntry", "KeyboardEvent", "Location", "MediaQueryList", "MediaQueryListEvent", "MessageChannel", "MessagePort", "Navigator", "NodeList", "OrientationLockType", "OrientationType", "PageTransitionEvent", "Performance", "PermissionState", "PermissionStatus", "Permissions", "PointerEvent", "PremultiplyAlpha", "ResizeObserver", "ResizeObserverBoxOptions", "ResizeObserverEntry", "ResizeObserverOptions", "ResizeObserverSize", "Screen", "ScreenOrientation", "ShadowRoot", "Storage", "Touch", "TouchEvent", "TouchList", "Url", "VisibilityState", "WebGl2RenderingContext", "WebGlRenderingContext", "WebglDebugRendererInfo", "WheelEvent", "Window", "Worker", "console"] }
 wgpu = { version = "30", default-features = false, features = ["parking_lot", "std", "wgsl"] }
@@ -186,7 +186,6 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSA
 percent-encoding = { version = "2" }
 rustix = { version = "1", features = ["event", "net", "process", "pty", "runtime", "termios", "thread"] }
 smallvec = { version = "1", default-features = false, features = ["union"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 wgpu = { version = "30", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "30", features = ["metal", "portable-atomic", "renderdoc", "wgsl"] }
 wgpu-hal = { version = "30", default-features = false, features = ["metal", "portable-atomic"] }
@@ -202,7 +201,6 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 naga = { version = "30", features = ["hlsl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 percent-encoding = { version = "2" }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", default-features = false, features = ["signal"] }
 wgpu = { version = "30", default-features = false, features = ["dx12", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "30", features = ["dx12", "portable-atomic", "renderdoc", "wgsl"] }
@@ -226,7 +224,6 @@ hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 naga = { version = "30", features = ["hlsl-out", "wgsl-in"] }
 num-traits = { version = "0.2", default-features = false, features = ["libm"] }
 percent-encoding = { version = "2" }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", default-features = false, features = ["signal"] }
 wgpu = { version = "30", default-features = false, features = ["dx12", "parking_lot", "std", "wgsl"] }
 wgpu-core = { version = "30", features = ["dx12", "portable-atomic", "renderdoc", "wgsl"] }
@@ -263,7 +260,6 @@ rustix = { version = "1", features = ["event", "net", "pipe", "process", "pty", 
 slab = { version = "0.4" }
 smallvec = { version = "1", default-features = false, features = ["union"] }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit-mut"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 tracing = { version = "0.1", default-features = false, features = ["log"] }
 uuid = { version = "1" }
 wayland-sys = { version = "0.31", default-features = false, features = ["dlopen", "egl"] }

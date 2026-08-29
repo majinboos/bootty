@@ -94,6 +94,12 @@ Bootty fans out. Fixing one arm is not fixing the feature.
 - **Ownership moves belong in `docs/architecture.md`.** If your change moves a
   durable fact to a different crate, that table is now wrong.
 
+## Releases
+
+When Luan asks you to make a release, read and follow `docs/releases.md`. Build
+the release notes from commits, then include them in the body of the prepare
+commit made directly on `main`. Do not create a release branch or pull request.
+
 ## Verifying
 
 Run targeted tests while you work: `cargo nextest run -p bootty-terminal

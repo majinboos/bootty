@@ -6,23 +6,15 @@ zig = "0.16.0"
 
 [tasks.build]
 description = "Build the bootty app with dynamic local linkage; pass --static for distribution or --fast for fast-release"
-run = "./scripts/build-bootty-unix.sh"
-run_windows = "pwsh ./scripts/build-bootty-windows.ps1"
+run = "cargo run --quiet --locked -p xtasks -- build"
 
 [tasks.launch]
 description = "Build and launch the bootty app; args after -- are passed to Bootty"
-run = "./scripts/launch-bootty-unix.sh"
-run_windows = "pwsh ./scripts/launch-bootty-windows.ps1"
+run = "cargo run --quiet --locked -p xtasks -- launch"
 
 [tasks."site:build"]
 description = "Build the Cloudflare Pages site from Rust/WASM source"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-rustup target add wasm32-unknown-unknown
-bun install --frozen-lockfile
-bun run build:web
-"""
+run = "cargo run --quiet --locked -p xtasks -- site"
 
 [tasks.test]
 description = "Run workspace tests with nextest"
@@ -34,45 +26,104 @@ run = "cargo fmt --all -- --check"
 
 [tasks."hakari:generate"]
 description = "Regenerate the cargo-hakari workspace hack"
-run = "cargo hakari generate && cargo hakari manage-deps --yes"
+run = "cargo run --quiet --locked -p xtasks -- hakari generate"
 
 [tasks."hakari:check"]
 description = "Check the cargo-hakari workspace hack is up to date"
-run = "cargo hakari generate --diff && cargo hakari manage-deps --dry-run"
+run = "cargo run --quiet --locked -p xtasks -- hakari check"
 
 [tasks.clippy]
 description = "Run clippy on the workspace"
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
+[tasks.pre-commit]
+description = "Run the repository pre-commit checks"
+run = "cargo run --quiet --locked -p xtasks -- pre-commit"
+
 [tasks.bench]
 description = "Validate and compile every benchmark; pass --ci-smoke or --quick to select a measured workflow"
-run = "scripts/run-benchmark-suite.sh"
+run = "cargo run --quiet --locked -p xtasks -- benchmark suite"
 
 [tasks.release]
-description = "Prepare and auto-merge a release; pass patch or major for a bump other than minor"
-run = "./scripts/prepare-release.sh"
+description = "Prepare and push a release from main using a local release-notes file"
+run = "cargo run --quiet --locked -p xtasks -- release prepare"
+
+[tasks."release:validate-notes"]
+description = "Validate release notes from a file or stdin"
+run = "cargo run --quiet --locked -p xtasks -- release validate-notes"
+
+[tasks."release:verify-tag"]
+description = "Verify that a release tag matches the workspace version"
+run = "cargo run --quiet --locked -p xtasks -- release verify-tag"
+
+[tasks."release:rename-asset"]
+description = "Rename a packaged asset to its public release name"
+run = "cargo run --quiet --locked -p xtasks -- release rename-asset"
+
+[tasks."release:tag"]
+description = "Tag the workspace version and dispatch its release workflow"
+run = "cargo run --quiet --locked -p xtasks -- release tag-and-dispatch"
+
+[tasks."release:publish"]
+description = "Publish a GitHub release from a tagged commit and asset directory"
+run = "cargo run --quiet --locked -p xtasks -- release publish"
 
 [tasks."daemon:build-all"]
 description = "Build daemon assets for every target in the daemon target manifest"
-run = "./scripts/build-bootty-daemons.sh"
+run = "cargo run --quiet --locked -p xtasks -- daemon build-all"
+
+[tasks."daemon:matrix"]
+description = "Print the daemon target matrix for CI"
+run = "cargo run --quiet --locked -p xtasks -- daemon matrix"
+
+[tasks."daemon:build-one"]
+description = "Build one daemon target using its CI runner policy"
+run = "cargo run --quiet --locked -p xtasks -- daemon build-one"
+
+[tasks."daemon:stage"]
+description = "Stage one daemon target with its normalized artifact name"
+run = "cargo run --quiet --locked -p xtasks -- daemon stage"
+
+[tasks."daemon:verify"]
+description = "Verify a complete staged daemon directory"
+run = "cargo run --quiet --locked -p xtasks -- daemon verify"
+
+[tasks."daemon:size"]
+description = "Enforce the daemon artifact size budget"
+run = "cargo run --quiet --locked -p xtasks -- daemon size"
 
 [tasks.package]
 description = "Package with the host daemon; pass --all-daemons for every remote target, --static for distribution, or --fast for fast-release"
-run = "./scripts/package-bootty-unix.sh"
+run = "cargo run --quiet --locked -p xtasks -- package"
 
 [tasks."package:dev"]
 description = "Package the isolated BoottyDev application"
-run = "./scripts/package-bootty-unix.sh --dev"
+run = "cargo run --quiet --locked -p xtasks -- package --dev"
 
 [tasks."package:windows"]
 description = "Package the Windows zip from BOOTTY_DAEMON_OUTPUT_DIR; pass --static or --fast"
-run = "pwsh ./scripts/package-bootty-windows.ps1"
+run = "cargo run --quiet --locked -p xtasks -- package"
 
 [tasks.install]
 description = "Package and install Bootty with the host daemon; pass --fast for fast-release"
-run = "./scripts/install-bootty-unix.sh"
-run_windows = "pwsh ./scripts/install-bootty-windows.ps1"
+run = "cargo run --quiet --locked -p xtasks -- install"
 
 [tasks."install:dev"]
 description = "Package and install the isolated BoottyDev application"
-run = "./scripts/install-bootty-unix.sh --dev"
+run = "cargo run --quiet --locked -p xtasks -- install --dev"
+
+[tasks."bench:record-replay"]
+description = "Record a terminal replay fixture"
+run = "cargo run --quiet --locked -p xtasks -- benchmark record-replay"
+
+[tasks."bench:hostile-soak"]
+description = "Run hostile terminal input soak benchmarks"
+run = "cargo run --quiet --locked -p xtasks -- benchmark hostile-soak"
+
+[tasks."bench:live-remote"]
+description = "Capture live remote transport benchmark evidence"
+run = "cargo run --quiet --locked -p xtasks -- benchmark live-remote"
+
+[tasks."bench:power-thermal"]
+description = "Capture power and thermal evidence around a command"
+run = "cargo run --quiet --locked -p xtasks -- benchmark power-thermal"

@@ -1,7 +1,2 @@
 #!/bin/sh
-set -eu
-
-mise exec -- cargo fmt --check
-mise exec -- cargo hakari generate --diff
-mise exec -- cargo hakari manage-deps --dry-run
-mise exec -- cargo clippy --workspace --all-targets -- -W clippy::all
+exec mise run pre-commit

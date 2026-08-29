@@ -31,16 +31,44 @@ Windows keeps first-writer publication for its versioned executable path.
 
 ## Publish a release
 
-Run one command from a clean, synced `main` branch:
+When Luan asks you to make a release, perform the whole preparation locally on
+`main`:
+
+1. Fetch `origin/main` and verify that local `main` is synced and clean.
+2. Find the latest reachable Bootty version tag with
+   `git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD`.
+3. Inspect every commit in `<previous-tag>..HEAD`, including each commit's body
+   and relevant diff. Commits are the source of the release notes. Do not use
+   pull requests or GitHub-generated notes.
+4. Determine the target version from the requested major, minor, or patch bump;
+   an unspecified release is minor.
+5. Write the release notes yourself in a temporary local file outside the
+   repository. Use exactly these sections, in order: `## Features`,
+   `## Fixes`, and `## Breaking Changes`. Group related commits into clear
+   user-facing bullets. Omit internal-only changes. A breaking change appears
+   only under `Breaking Changes`, even when its commit type is `feat` or `fix`.
+   Write `- None.` when a section is empty.
+6. Pass that file to the release command:
 
 ```sh
-mise run release
+mise run release -- <release-notes-file>
 ```
 
-That publishes a minor release. Pass `-- patch` or `-- major` for the other two. The command creates the version-bump PR and enables auto-merge. Once CI merges it, GitHub tags that commit and dispatches the release workflow.
+That prepares a minor release. Pass `--bump patch` or `--bump major` after the
+notes file for the other two, for example
+`mise run release -- <release-notes-file> --bump patch`.
+The command validates the notes, runs the full local release gate, updates
+`Cargo.toml` and `Cargo.lock`, writes the notes into the body of
+`chore(release): prepare v<version>` directly on `main`, and pushes it. The
+local notes file is only an input; it is not committed. Do not create a release
+branch or pull request. The preparation is complete only when the commit is on
+`origin/main`.
 
 The tag job dispatches that workflow by name rather than letting the new tag speak for itself: GitHub starts no workflow from a push made with `GITHUB_TOKEN`, so a `push: tags` trigger alone leaves the tag sitting there unreleased.
 
-The release workflow rejects a tag that does not match `Cargo.toml`. After packaging succeeds for every supported platform, it creates a GitHub Release, uploads target-named app and daemon assets, generates `SHA256SUMS`, and publishes generated release notes.
+The release workflow rejects a tag that does not match `Cargo.toml`. After
+packaging succeeds for every supported platform, it creates a GitHub Release,
+uploads target-named app and daemon assets, generates `SHA256SUMS`, and
+publishes the tagged prepare commit's message body as its release notes.
 
 Release tags are immutable. Publish a corrected version instead of replacing an existing tag.

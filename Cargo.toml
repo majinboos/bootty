@@ -61,6 +61,7 @@ libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs.git", rev = "de
   "log",
 ] }
 memchr = "2.8"
+mslnk = "0.1.8"
 muda = "0.19"
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 objc2 = "0.6"
@@ -103,6 +104,7 @@ rustybuzz = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 serde_json = "1"
+signal-hook = "0.3"
 smallvec = "1"
 starship-battery = "0.11"
 static_assertions = "1.1.0"
@@ -113,6 +115,7 @@ syntect = { version = "5.3", default-features = false, features = [
   "default-fancy",
 ] }
 tempfile = "3"
+time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = "1.53.1"
 toml_edit = { version = "0.25", features = ["serde"] }
 ttf-parser = "0.25"
@@ -131,6 +134,8 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 embed-resource = "3.0.11"
 windows-sys = "0.61"
 winsafe = { version = "0.0.28", default-features = false, features = ["kernel"] }
+winreg = "0.55"
+zip = { version = "7", default-features = false, features = ["deflate"] }
 
 
 [profile.dev]

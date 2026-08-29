@@ -124,19 +124,19 @@ status before making competitive claims.
 Run the fast blocking-CI benchmark smoke locally:
 
 ```bash
-scripts/run-benchmark-suite.sh --ci-smoke --output artifacts/benchmark-reproduction/ci
+mise run bench -- --ci-smoke --output artifacts/benchmark-reproduction/ci
 ```
 
 Compile checked-in benchmark targets and record command metadata:
 
 ```bash
-scripts/run-benchmark-suite.sh --output artifacts/benchmark-reproduction/local
+mise run bench -- --output artifacts/benchmark-reproduction/local
 ```
 
 Run the nightly/full reproduction shape, including a small measured subset:
 
 ```bash
-scripts/run-benchmark-suite.sh --quick --output artifacts/benchmark-reproduction/overnight
+mise run bench -- --quick --output artifacts/benchmark-reproduction/overnight
 ```
 
 Validate launcher/profile manifests:
@@ -177,10 +177,10 @@ scripts/run-external-benchmark-adapters.py \
   --hardware-latency-csv artifacts/latency/hardware.csv \
   --output artifacts/external-benchmarks/latency-import.jsonl
 
-scripts/run-live-remote-bench.sh artifacts/live-remote/results.jsonl
-scripts/run-hostile-soak.sh artifacts/hostile-soak/local
-scripts/run-power-thermal-sample.sh artifacts/power/local -- cargo run -p bootty --bin bootty
-scripts/record-replay-fixture.sh <fixture-name> artifacts/replays -- <command> [args...]
+mise run bench:live-remote -- artifacts/live-remote/results.jsonl
+mise run bench:hostile-soak -- artifacts/hostile-soak/local
+mise run bench:power-thermal -- artifacts/power/local -- cargo run -p bootty --bin bootty
+mise run bench:record-replay -- <fixture-name> artifacts/replays -- <command> [args...]
 ```
 
 `run-terminal-public-benchmarks.py` launches tools inside actual terminals. Keep
