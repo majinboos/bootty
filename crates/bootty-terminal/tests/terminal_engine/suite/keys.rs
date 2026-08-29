@@ -332,6 +332,42 @@ fn key_encoder_ports_kitty_protocol_compatibility_batch() -> Result<()> {
 }
 
 #[test]
+fn pi_kitty_negotiation_reports_command_alt_key() -> Result<()> {
+    let mut engine = test_terminal_engine()?;
+    let response = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = response.clone();
+    engine.on_pty_write(move |_terminal, bytes| {
+        capture
+            .lock()
+            .expect("pty response lock")
+            .extend_from_slice(bytes);
+    })?;
+    let mut out = Vec::new();
+
+    engine.write_vt(b"\x1b[>7u\x1b[?u\x1b[c");
+    assert_eq!(
+        *response.lock().expect("pty response lock"),
+        b"\x1b[?7u\x1b[?62;22;52c"
+    );
+    engine.encode_key_to_vec(
+        terminal_key_input(
+            TerminalKey::B,
+            KeyMods {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+            Some("b"),
+            Some('b'),
+        ),
+        &mut out,
+    )?;
+
+    assert_eq!(out, b"\x1b[98;11u");
+    Ok(())
+}
+
+#[test]
 fn key_encoder_ports_kitty_alternate_and_associated_text_batch() -> Result<()> {
     let report_alternates =
         key::KittyKeyFlags::DISAMBIGUATE | key::KittyKeyFlags::REPORT_ALTERNATES;

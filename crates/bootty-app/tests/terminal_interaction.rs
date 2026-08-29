@@ -22,6 +22,8 @@ use bootty_command::{
 };
 use bootty_config::config::{BoottyConfig, MultiplexerBackendConfig, load_config_from_path};
 use bootty_terminal::terminal_engine::TerminalSearchDirection;
+use bootty_winit::direct_input::direct_key_input_from_winit_code;
+use winit::keyboard::{KeyCode, ModifiersState};
 
 #[path = "support/frames.rs"]
 mod frames;
@@ -31,6 +33,12 @@ mod support;
 const PANE_BUDGET: Duration = Duration::from_secs(30);
 
 fn native_state() -> (assert_fs::TempDir, AppState) {
+    native_state_with_direct_input(None)
+}
+
+fn native_state_with_direct_input(
+    direct_input_rx: Option<mpsc::Receiver<bootty_winit::direct_input::DirectKeyInput>>,
+) -> (assert_fs::TempDir, AppState) {
     let directory = assert_fs::TempDir::new().expect("temporary app directory");
     let script = directory.child("terminal-interaction-shell");
     script
@@ -47,8 +55,14 @@ fn native_state() -> (assert_fs::TempDir, AppState) {
         ..BoottyConfig::default()
     };
     config.session.shell = Some(script.path().to_string_lossy().into_owned());
-    let state = AppState::new(config, support::backends(), Arc::new(|| {}), None, None)
-        .expect("native app state");
+    let state = AppState::new(
+        config,
+        support::backends(),
+        Arc::new(|| {}),
+        direct_input_rx,
+        None,
+    )
+    .expect("native app state");
     (directory, state)
 }
 
@@ -129,6 +143,30 @@ fn wait_for_pane_text(state: &mut AppState, pane_id: &str, expected: &str) {
         thread::sleep(Duration::from_millis(5));
     }
     panic!("pane {pane_id} did not render {expected:?}");
+}
+
+#[test]
+fn unbound_command_alt_key_reaches_terminal_input_path() {
+    let (direct_input_tx, direct_input_rx) = mpsc::channel();
+    let (_directory, mut state) = native_state_with_direct_input(Some(direct_input_rx));
+    let (_other, pane) = start_two_panes(&mut state);
+    wait_for_pane_text(&mut state, &pane, "ready");
+
+    direct_input_tx
+        .send(
+            direct_key_input_from_winit_code(
+                KeyCode::KeyB,
+                ModifiersState::SUPER | ModifiersState::ALT,
+                Default::default(),
+                false,
+            )
+            .expect("command-alt-b maps to direct terminal input"),
+        )
+        .expect("send direct input");
+    state.drain_direct_input();
+    let effects = state.update_frame(frames::frame(Instant::now(), Vec::new()));
+
+    assert!(effects.contains(&AppEffect::SetTerminalCursorIcon(egui::CursorIcon::None)));
 }
 
 fn search_state(state: &mut AppState, pane_id: &str) -> (usize, bool) {

@@ -60,6 +60,35 @@ impl TmuxControlRunner {
             remote: Some(remote),
         }
     }
+
+    /// Inject already-encoded terminal bytes into a target pane without asking tmux to interpret
+    /// them as keys. The persistent control client keeps this cheap for local and remote panes.
+    pub fn send_literal_input(&self, program: &str, target: &str, bytes: &[u8]) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let args = ["send-keys", "-H", "-t"]
+            .map(str::to_owned)
+            .into_iter()
+            .chain(std::iter::once(target.to_owned()))
+            .chain(bytes.iter().map(|byte| format!("{byte:02x}")))
+            .collect::<Vec<_>>();
+        let line = literal_input_command_line(&args)?;
+        if self.control_command(program, &line, 1).is_some() {
+            return Ok(());
+        }
+
+        let (program, args) = self.spawned(program, &args);
+        let output = SystemCommandRunner.run(&program, &args)?;
+        if output.success {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "tmux literal input failed: {}",
+                output.stderr.trim()
+            ))
+        }
+    }
 }
 
 impl std::fmt::Debug for TmuxControlRunner {
@@ -235,6 +264,10 @@ impl TmuxControlRunner {
     fn control_query(&self, program: &str, args: &[String]) -> Option<CommandOutput> {
         let line = control_command_line(args)?;
         let blocks = expected_blocks(args);
+        self.control_command(program, &line, blocks)
+    }
+
+    fn control_command(&self, program: &str, line: &str, blocks: usize) -> Option<CommandOutput> {
         let mut clients = self.clients.lock().ok()?;
         let slot = clients.entry(self.client_key(program)).or_default();
         if slot.client.is_none() {
@@ -252,7 +285,7 @@ impl TmuxControlRunner {
             }
         }
 
-        if let Ok(stdout) = slot.client.as_mut()?.query(&line, blocks) {
+        if let Ok(stdout) = slot.client.as_mut()?.query(line, blocks) {
             Some(CommandOutput {
                 success: true,
                 stdout,
@@ -273,6 +306,24 @@ impl TmuxControlRunner {
             |remote| format!("{}@{program}", remote.destination()),
         )
     }
+}
+
+fn literal_input_command_line(args: &[String]) -> Result<String> {
+    let mut line = String::new();
+    for argument in args {
+        if argument.contains(['\'', '\n']) {
+            return Err(anyhow!(
+                "tmux pane selector cannot contain a quote or newline"
+            ));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push('\'');
+        line.push_str(argument);
+        line.push('\'');
+    }
+    Ok(line)
 }
 
 fn spawn_argv(program: &str, args: &[String], remote: Option<&SshRemote>) -> (String, Vec<String>) {

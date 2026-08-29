@@ -302,7 +302,7 @@ impl AppState {
                 let _ = self.dispatch_command(invocation, viewport, effects);
                 continue;
             }
-            if copy_mode_active || input.mods.command {
+            if copy_mode_active {
                 continue;
             }
             self.apply_terminal_input(TerminalInputCommand::Key(input), effects);

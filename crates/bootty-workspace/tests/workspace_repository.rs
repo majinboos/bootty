@@ -118,6 +118,40 @@ fn an_invalid_current_snapshot_is_rejected_instead_of_repaired(
     assert!(error.to_string().contains("load or migrate"));
 }
 
+#[rstest]
+fn unsupported_backend_spaces_do_not_block_supported_workspace_state(
+    repository: (TempDir, LoadedRepository),
+) {
+    let (directory, mut repository) = repository;
+    let supported = repository
+        .create_space(
+            "Supported",
+            "folder",
+            [0x7A, 0xA2, 0xF7],
+            false,
+            SpaceMuxOverride {
+                backend: Some(MultiplexerBackendConfig::Rmux),
+                remote: SpaceRemoteOverride::Local,
+            },
+            false,
+        )
+        .expect("create supported Space")
+        .expect("supported Space");
+    drop(repository);
+    let database = directory.path().join("session-order.sqlite3");
+    Connection::open(database)
+        .expect("open workspace database")
+        .execute(
+            "UPDATE workspace_spaces SET backend = 'herdr' WHERE name = 'Default Space'",
+            [],
+        )
+        .expect("store unsupported backend");
+
+    let (_, snapshot) = WorkspaceRepository::open(&directory.path().join("config.toml"))
+        .expect("supported workspace state remains available");
+    assert_eq!(snapshot.spaces(), &[supported]);
+}
+
 #[test]
 fn the_single_binding_schema_migration_preserves_binding_and_restore_state() {
     let directory = TempDir::new().expect("temporary workspace");

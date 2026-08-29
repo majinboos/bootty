@@ -16,7 +16,10 @@ fn main() -> Result<()> {
         }
         Some("remote-exec") => command_runtime::run_remote_exec(&args[1..]),
         Some("remote-rmux") => command_runtime::run_remote_rmux(&args[1..]),
-        Some("remote-space") => command_runtime::run_remote_space(&args[1..], identity),
+        Some("remote-space") => {
+            let paths = command_runtime::remote_space_paths_from_environment(identity)?;
+            command_runtime::run_remote_space(&args[1..], &paths)
+        }
         Some("remote-project") => command_runtime::run_remote_project(&args[1..]),
         Some("remote-worktree") => command_runtime::run_remote_worktree(&args[1..]),
         Some(command) => bail!("unknown command {command:?}"),

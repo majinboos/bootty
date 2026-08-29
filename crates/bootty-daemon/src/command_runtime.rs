@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use bootty_daemon::catalog::{Backend, Catalog};
+use bootty_daemon::catalog::{Backend, Catalog, LegacyCatalogPaths};
 use bootty_identity::{APPLICATION_IDENTITY_ENV, ApplicationIdentity};
 
 pub(crate) fn run_remote_ping() {
@@ -25,7 +25,12 @@ pub(crate) fn run_remote_rmux(args: &[String]) -> Result<()> {
     std::process::exit(bootty_rmux::run_remote_rmux_command(payload)?);
 }
 
-pub(crate) fn run_remote_space(args: &[String], identity: ApplicationIdentity) -> Result<()> {
+pub(crate) struct RemoteSpacePaths {
+    state: PathBuf,
+    legacy: Option<LegacyCatalogPaths>,
+}
+
+pub(crate) fn run_remote_space(args: &[String], paths: &RemoteSpacePaths) -> Result<()> {
     let Some((command, arguments)) = args.split_first() else {
         bail!("remote-space requires a command")
     };
@@ -35,7 +40,7 @@ pub(crate) fn run_remote_space(args: &[String], identity: ApplicationIdentity) -
         bootty_mux::MuxBackendKind::Rmux,
         bootty_mux::MuxBackendKind::Tmux,
     ])?);
-    let mut catalog = Catalog::open(&state_path(identity)?, identity, backends)?;
+    let mut catalog = Catalog::open(&paths.state, paths.legacy.as_ref(), backends)?;
     match command.as_str() {
         "list" => {
             if !arguments.is_empty() {
@@ -172,7 +177,9 @@ fn inherited_application_identity(value: Option<&OsStr>) -> Result<ApplicationId
         .with_context(|| format!("unknown application identity {value:?}"))
 }
 
-fn state_path(identity: ApplicationIdentity) -> Result<PathBuf> {
+pub(crate) fn remote_space_paths_from_environment(
+    identity: ApplicationIdentity,
+) -> Result<RemoteSpacePaths> {
     let explicit = std::env::var_os("BOOTTY_DAEMON_STATE").map(PathBuf::from);
     #[cfg(windows)]
     let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
@@ -196,7 +203,16 @@ fn state_path(identity: ApplicationIdentity) -> Result<PathBuf> {
         xdg_state_home.as_deref(),
         home.as_deref(),
     );
-    path.context("daemon state root is unavailable")
+    let state = path.context("daemon state root is unavailable")?;
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let legacy = bootty_identity::legacy_config_path_from_env(
+        identity,
+        xdg_config_home.as_deref(),
+        home.as_deref(),
+    )
+    .map(LegacyCatalogPaths::from_config_path);
+    Ok(RemoteSpacePaths { state, legacy })
 }
 
 fn home_dir() -> Option<PathBuf> {

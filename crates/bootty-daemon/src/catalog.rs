@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use bootty_identity::ApplicationIdentity;
 use bootty_mux::{
     MuxBackendKind, MuxBindingConfig, RemoteSpaceSummary,
     backend::MuxBackend,
@@ -32,10 +31,14 @@ pub enum Backend {
 
 impl Backend {
     pub fn parse(value: &str) -> Result<Self> {
+        Self::from_name(value).with_context(|| "remote Spaces need tmux or rmux")
+    }
+
+    fn from_name(value: &str) -> Option<Self> {
         match value {
-            "rmux" => Ok(Self::Rmux),
-            "tmux" => Ok(Self::Tmux),
-            _ => bail!("remote Spaces need tmux or rmux"),
+            "rmux" => Some(Self::Rmux),
+            "tmux" => Some(Self::Tmux),
+            _ => None,
         }
     }
 
@@ -55,9 +58,18 @@ impl Backend {
     }
 }
 
-struct LegacyCatalog {
+pub struct LegacyCatalogPaths {
     path: PathBuf,
     config_path: PathBuf,
+}
+
+impl LegacyCatalogPaths {
+    pub fn from_config_path(config_path: PathBuf) -> Self {
+        Self {
+            path: config_path.with_file_name("session-order.sqlite3"),
+            config_path,
+        }
+    }
 }
 
 pub struct Catalog {
@@ -69,16 +81,7 @@ pub struct Catalog {
 impl Catalog {
     pub fn open(
         path: &Path,
-        identity: ApplicationIdentity,
-        backends: Arc<MuxBackendRegistry>,
-    ) -> Result<Self> {
-        let legacy = default_legacy_catalog(identity);
-        Self::open_with_legacy(path, legacy.as_ref(), backends)
-    }
-
-    fn open_with_legacy(
-        path: &Path,
-        legacy: Option<&LegacyCatalog>,
+        legacy: Option<&LegacyCatalogPaths>,
         backends: Arc<MuxBackendRegistry>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -124,7 +127,7 @@ impl Catalog {
         Ok(catalog)
     }
 
-    fn migrate_legacy(&mut self, legacy: Option<&LegacyCatalog>) -> Result<()> {
+    fn migrate_legacy(&mut self, legacy: Option<&LegacyCatalogPaths>) -> Result<()> {
         let migrated = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM daemon_metadata WHERE key = 'legacy_catalog_migrated')",
             [],
@@ -222,21 +225,24 @@ impl Catalog {
         let mut statement = self
             .connection
             .prepare("SELECT id, name, backend FROM remote_spaces ORDER BY position, id")?;
-        statement
-            .query_map([], |row| {
-                let backend = row.get::<_, String>(2)?;
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, backend))
-            })?
-            .map(|row| {
-                let (id, name, backend) = row?;
-                Ok(RemoteSpaceSummary {
-                    catalog_version: CATALOG_VERSION,
-                    id,
-                    name,
-                    backend: Backend::parse(&backend)?.wire_kind(),
-                })
-            })
-            .collect()
+        let rows = statement.query_map([], |row| {
+            let backend = row.get::<_, String>(2)?;
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, backend))
+        })?;
+        let mut spaces = Vec::new();
+        for row in rows {
+            let (id, name, backend) = row?;
+            let Some(backend) = Backend::from_name(&backend) else {
+                continue;
+            };
+            spaces.push(RemoteSpaceSummary {
+                catalog_version: CATALOG_VERSION,
+                id,
+                name,
+                backend: backend.wire_kind(),
+            });
+        }
+        Ok(spaces)
     }
 
     pub fn create(&mut self, requested_name: &str, backend: Backend) -> Result<RemoteSpaceSummary> {
@@ -433,17 +439,6 @@ impl BackendLease {
         file.lock()?;
         Ok(Self { _file: file })
     }
-}
-
-fn default_legacy_catalog(identity: ApplicationIdentity) -> Option<LegacyCatalog> {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    let config_path =
-        bootty_identity::legacy_config_path_from_env(identity, xdg.as_deref(), home.as_deref())?;
-    Some(LegacyCatalog {
-        path: config_path.with_file_name("session-order.sqlite3"),
-        config_path,
-    })
 }
 
 fn unique_name(requested: &str, existing: &HashSet<String>) -> String {

@@ -852,8 +852,12 @@ impl WorkspaceRepository {
                 }
                 create_default_binding(&tx, path)?;
             }
-            let spaces = load_spaces(&tx)?;
-            let pending_binding_scopes = validate_pending_binding_operations(&tx, &spaces)?;
+            let LoadedSpaces {
+                spaces,
+                unsupported_ids,
+            } = load_spaces(&tx)?;
+            let pending_binding_scopes =
+                validate_pending_binding_operations(&tx, &spaces, &unsupported_ids)?;
             let space_ids = spaces
                 .iter()
                 .map(|space| space.id.persistence_value())
@@ -866,6 +870,9 @@ impl WorkspaceRepository {
                 Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })? {
                 let (window_key, selected_space_id) = row?;
+                if unsupported_ids.contains(&selected_space_id) {
+                    continue;
+                }
                 if window_key.trim().is_empty()
                     || !space_ids.contains(&selected_space_id)
                     || selected_spaces
@@ -893,6 +900,7 @@ impl WorkspaceRepository {
 fn validate_pending_binding_operations(
     tx: &Transaction<'_>,
     spaces: &[WorkspaceSpace],
+    unsupported_ids: &HashSet<i64>,
 ) -> rusqlite::Result<HashSet<SpaceId>> {
     let scopes = spaces
         .iter()
@@ -913,6 +921,9 @@ fn validate_pending_binding_operations(
         let (space_id, _mutation) = row?;
         if space_id <= 0 {
             return Err(rusqlite::Error::InvalidQuery);
+        }
+        if unsupported_ids.contains(&space_id) {
+            continue;
         }
         let scope = SpaceId::from_persistence(space_id);
         // One Space can hold several intents now, so a repeat is expected rather than corrupt.

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 #[cfg(feature = "app")]
-use std::{collections::HashMap, process::Command};
+use std::{collections::HashMap, process::Command, sync::mpsc, thread};
 
 #[cfg(feature = "app")]
 use crate::control::TmuxControlRunner;
@@ -57,6 +57,7 @@ struct TmuxOptionValue {
 #[cfg(feature = "app")]
 pub struct TmuxPanePolicy {
     remote: Option<SshRemote>,
+    input_runner: TmuxControlRunner,
     status_hidden_sessions: Vec<String>,
     passthrough_all_panes: HashMap<String, TmuxOptionValue>,
 }
@@ -64,8 +65,13 @@ pub struct TmuxPanePolicy {
 #[cfg(feature = "app")]
 impl TmuxPanePolicy {
     pub fn new(remote: Option<SshRemote>) -> Self {
+        let input_runner = remote.as_ref().map_or_else(
+            || TmuxControlRunner::for_identity(bootty_identity::ApplicationIdentity::for_process()),
+            |remote| TmuxControlRunner::for_remote(remote.clone()),
+        );
         Self {
             remote,
+            input_runner,
             status_hidden_sessions: Vec::new(),
             passthrough_all_panes: HashMap::new(),
         }
@@ -145,8 +151,19 @@ impl BackendPanePolicy for TmuxPanePolicy {
             }
             None => ("tmux".to_owned(), args, false),
         };
+        let mut terminal_config = request.terminal_config.clone();
+        terminal_config.super_key_input_tx = Some(spawn_literal_input_relay(
+            self.input_runner.clone(),
+            request.target.session_id().to_owned(),
+        )?);
         start_attach_terminal(
-            request,
+            PaneStartRequest {
+                target: request.target,
+                geometry: request.geometry,
+                spawn_geometry: request.spawn_geometry,
+                terminal_config: &terminal_config,
+                repaint_wakeup: request.repaint_wakeup,
+            },
             AttachLaunch {
                 program,
                 args,
@@ -173,6 +190,24 @@ impl BackendPanePolicy for TmuxPanePolicy {
         self.restore_passthrough_overrides();
         self.restore_status_bars();
     }
+}
+
+#[cfg(feature = "app")]
+fn spawn_literal_input_relay(
+    runner: TmuxControlRunner,
+    session_id: String,
+) -> Result<mpsc::Sender<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    thread::Builder::new()
+        .name("bootty-tmux-input".to_owned())
+        .spawn(move || {
+            while let Ok(bytes) = rx.recv() {
+                // tmux modes intercept send-keys before the pane. This path deliberately covers a
+                // live application pane; use paste-buffer -S if modes must also receive Super.
+                let _ = runner.send_literal_input("tmux", &session_id, &bytes);
+            }
+        })?;
+    Ok(tx)
 }
 
 #[cfg(feature = "app")]

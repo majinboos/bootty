@@ -62,6 +62,9 @@ pub struct TerminalSessionConfig {
     pub macos_option_as_alt: MacosOptionAsAlt,
     pub side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     pub side_effect_pane_id: Option<String>,
+    /// Receives protocol-encoded Super key bytes when the attach backend must bypass its own key
+    /// parser. Other encoded input continues through the attached PTY.
+    pub super_key_input_tx: Option<Sender<Vec<u8>>>,
     pub benchmark_trace: Option<BenchmarkTrace>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +379,7 @@ impl TerminalSession {
             repaint_wakeup,
             side_effect_tx: config.side_effect_tx,
             side_effect_pane_id: config.side_effect_pane_id,
+            super_key_input_tx: config.super_key_input_tx,
             benchmark_trace,
         })?;
 
@@ -630,6 +634,7 @@ struct TerminalWorkerConfig {
     repaint_wakeup: RepaintWakeup,
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     side_effect_pane_id: Option<String>,
+    super_key_input_tx: Option<Sender<Vec<u8>>>,
     benchmark_trace: Option<BenchmarkTrace>,
 }
 
@@ -682,6 +687,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             repaint_wakeup: config.repaint_wakeup,
             side_effect_tx: config.side_effect_tx,
             side_effect_pane_id: config.side_effect_pane_id,
+            super_key_input_tx: config.super_key_input_tx,
             benchmark_trace: config.benchmark_trace,
             output_buf: Vec::with_capacity(1024),
             pending_pty: PtyBacklog::with_capacity(MAX_COLLECT_CHUNKS_PER_TICK),
@@ -730,6 +736,7 @@ struct TerminalWorker {
     repaint_wakeup: RepaintWakeup,
     side_effect_tx: Option<Sender<TerminalSideEffectEvent>>,
     side_effect_pane_id: Option<String>,
+    super_key_input_tx: Option<Sender<Vec<u8>>>,
     output_buf: Vec<u8>,
     pending_pty: PtyBacklog,
     last_frame_publish: Instant,
@@ -892,7 +899,7 @@ impl TerminalWorker {
                     self.engine.scroll_viewport_bottom();
                     stats.terminal_changed = true;
                     match self.engine.encode_key_to_vec(input, &mut self.output_buf) {
-                        Ok(()) => self.write_output_buf(),
+                        Ok(()) => self.write_key_output(input),
                         Err(error) => self.worker_health.record("encode_key", error),
                     }
                 }
@@ -1311,6 +1318,19 @@ impl TerminalWorker {
         if !self.output_buf.is_empty() {
             write_pty(&self.pty_writer, &self.output_buf, &self.worker_health);
         }
+    }
+
+    fn write_key_output(&self, input: KeyInput) {
+        if self.output_buf.is_empty() {
+            return;
+        }
+        if input.mods.command
+            && let Some(tx) = &self.super_key_input_tx
+            && tx.send(self.output_buf.clone()).is_ok()
+        {
+            return;
+        }
+        self.write_output_buf();
     }
 }
 
