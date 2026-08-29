@@ -3,12 +3,19 @@ use std::collections::{BTreeMap, HashMap};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// How `bootty.run` treats the shared shell-out cache during the current phase.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RunMode {
     /// Outside a render (e.g. an `on_reorder` mutation): always shell out, never cache. Keeps
     /// side-effecting commands like `tmux move-window` out of the cache and always executed.
+    ///
+    /// Currently unreachable: nothing sets it, so every caller lands on `Refresh` or `Cached`. A
+    /// module that shells out for effect from an action handler therefore gets the cached path and
+    /// runs at most once per refresh gap, not once per action. No built-in does, so this is a
+    /// limit rather than a live bug — wire this mode up at the render/action boundary before
+    /// documenting `bootty.run` as safe for side effects.
     Live = 1,
     /// Interval render: return the last cached value immediately and refresh it in the background.
     Refresh = 0,
@@ -45,9 +52,18 @@ impl RunCommand {
 /// worker so one slow provider/command cannot block unrelated modules.
 #[derive(Default)]
 pub(super) struct RunCache {
+    /// Keyed by the command text, and never evicted: a module's set of commands is fixed by its
+    /// source, so this holds one entry per distinct command for the life of the host. A module
+    /// that builds a command per session (a path or id interpolated into it) would grow this
+    /// without bound — add eviction when one does.
     entries: Mutex<HashMap<String, RunEntry>>,
     /// Current behavior, a `RunMode` discriminant; defaults to `Refresh`.
     mode: AtomicU8,
+    /// Shortest gap between two runs of the same command, in milliseconds. Set to the interval of
+    /// the surface being rendered, so a module that asks to refresh every 60s shells out every 60s
+    /// however often it is re-rendered. Zero (the default) leaves a refresh unthrottled, which is
+    /// what a non-render caller wants.
+    refresh_gap_ms: AtomicU64,
     run_jobs: Arc<PlatformRunJobs>,
     shutdown: Arc<AtomicBool>,
     /// Branch a settings preview should show. Previews render against example sessions whose paths
@@ -65,12 +81,28 @@ impl Drop for RunCache {
 struct RunEntry {
     output: String,
     refreshing: bool,
+    /// When the last refresh finished. `None` until the first one lands, so a command a module has
+    /// never asked for still runs on its first render.
+    refreshed_at: Option<Instant>,
 }
 
 impl RunCache {
     pub(super) fn retire(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.run_jobs.cleanup();
+    }
+
+    /// Rate-limit refreshes to one per `gap` per command. Callers set this to the interval of the
+    /// surface about to render.
+    pub(super) fn set_refresh_gap(&self, gap: Duration) {
+        self.refresh_gap_ms.store(
+            u64::try_from(gap.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn refresh_gap(&self) -> Duration {
+        Duration::from_millis(self.refresh_gap_ms.load(Ordering::Relaxed))
     }
 
     fn set_mode(&self, mode: RunMode) {
@@ -140,6 +172,16 @@ impl RunCache {
             if entry.refreshing {
                 return;
             }
+            // Without this a refresh starts the moment the previous run exits, so a command that
+            // takes 1.8s re-runs every 1.8s for as long as the module is on screen, whatever
+            // interval it asked for. Measured from the last run finishing, so a slow command backs
+            // itself off rather than queueing.
+            if entry
+                .refreshed_at
+                .is_some_and(|at| at.elapsed() < self.refresh_gap())
+            {
+                return;
+            }
             entry.refreshing = true;
         }
 
@@ -155,6 +197,7 @@ impl RunCache {
                 let entry = entries.entry(key).or_default();
                 entry.output = output;
                 entry.refreshing = false;
+                entry.refreshed_at = Some(Instant::now());
             }
         });
     }
@@ -212,6 +255,7 @@ pub(super) fn preview_run_cache() -> Arc<RunCache> {
                 RunEntry {
                     output: output.clone(),
                     refreshing: false,
+                    refreshed_at: None,
                 },
             );
         }

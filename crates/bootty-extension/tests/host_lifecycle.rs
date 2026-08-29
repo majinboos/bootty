@@ -576,3 +576,60 @@ fn success_version(version: u64) -> CommandOutcome {
         warnings: Vec::new(),
     }
 }
+
+/// A module that shells out once per render, asking to refresh once a minute.
+const SHELLING_MODULE: &str = r#"
+bootty.ui.register({ id = "sheller", placement = "sidebar", interval = 60 }, function()
+    local out = bootty.exec({ "sh", "-c", "echo x >> __LOG__" })
+    return { text = "ran" }
+end)
+"#;
+
+/// Renders are forced far more often than any interval: a mux change or the metrics tick repaints
+/// every module. Without a gap between runs, a module asking to refresh once a minute shells out on
+/// every one of those, which is how a usage indicator ends up spawning a process every couple of
+/// seconds all day.
+#[test]
+fn a_forced_render_does_not_re_run_a_modules_command() {
+    let directory = assert_fs::TempDir::new().expect("temporary extension root");
+    let extension_root = directory.path().join("extensions");
+    fs::create_dir_all(&extension_root).expect("extension root");
+    let log = directory.path().join("runs.log");
+    fs::write(
+        extension_root.join("sheller.luau"),
+        SHELLING_MODULE.replace("__LOG__", &log.display().to_string()),
+    )
+    .expect("write module");
+
+    let catalog = Arc::new(ExtensionCatalog::default());
+    let (sender, _receiver) = app_command_channel(16);
+    let host = ExtensionHost::load(
+        &extension_root,
+        Arc::clone(&catalog),
+        sender.for_caller(Caller::Luau),
+        event_queue().0,
+    );
+
+    let runs = || fs::read_to_string(&log).map_or(0, |text| text.lines().count());
+    let deadline = Instant::now() + EXTENSION_BUDGET;
+    while Instant::now() < deadline && runs() == 0 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(runs(), 1, "the first render runs the command");
+
+    // Every one of these repaints the module, well inside the minute it asked for.
+    for index in 0..20 {
+        host.update_mux(MuxView {
+            session: Some(format!("session-{index}")),
+            ..MuxView::default()
+        });
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(
+        runs(),
+        1,
+        "a module that asked to refresh once a minute shells out once"
+    );
+}

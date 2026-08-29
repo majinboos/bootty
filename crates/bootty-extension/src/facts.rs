@@ -268,6 +268,12 @@ impl ExtensionFacts {
         self.processes.retire();
     }
 
+    /// Bound how often the surface about to render may re-run each shell-out to its own declared
+    /// interval. Surfaces share one worker and one run cache, so this is set per surface render.
+    pub(crate) fn set_run_refresh_gap(&self, gap: Duration) {
+        self.run_cache.set_refresh_gap(gap);
+    }
+
     pub(crate) fn update_mux(&self, view: MuxView) -> bool {
         let Ok(mut current) = self.mux.write() else {
             return false;

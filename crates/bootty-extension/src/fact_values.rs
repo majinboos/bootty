@@ -60,9 +60,12 @@ pub struct MuxView {
     pub session_color: Option<String>,
     /// Whether Bootty is currently holding a keep-awake/caffeinate guard.
     pub keep_awake: bool,
-    /// Whether the window has keyboard focus. Hosts run modules at `UNFOCUSED_INTERVAL_FLOOR`
-    /// while it is false: a module that animates its rows otherwise repaints the whole window
-    /// several times a second at nobody.
+    /// Whether the window has keyboard focus.
+    ///
+    /// Deliberately does not throttle module rendering. Slowing an unfocused window was tried and
+    /// reverted: a TUI's spinners and progress bars have to keep moving beside another app, and a
+    /// stalled one reads as a hung terminal. Cadence cuts have to apply in every mode, or wait for
+    /// a signal that the window is genuinely not visible.
     pub focused: bool,
 }
 

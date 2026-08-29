@@ -236,7 +236,7 @@ pub fn preview_module_surfaces(
         .set_name(identity.as_str())
         .exec()
         .map_err(|error| error.to_string())?;
-    initial_surface_snapshots(&lua, &registry)
+    initial_surface_snapshots(&lua, &registry, &facts)
 }
 
 fn install_preview_noop_tables(lua: &Lua, bootty: &Table) -> mlua::Result<()> {
@@ -404,7 +404,7 @@ fn run_module_worker(
         let _ = ready.send(Err(error.to_string()));
         return;
     }
-    let surfaces = initial_surface_snapshots(&lua, &registry);
+    let surfaces = initial_surface_snapshots(&lua, &registry, &host.facts);
     let registered = surfaces.map(|surfaces| ModuleDeclarations {
         commands: std::mem::take(&mut *registry.descriptors.borrow_mut()),
         topics: std::mem::take(&mut *registry.topics.borrow_mut()),
@@ -429,16 +429,15 @@ fn run_module_worker(
                 let response = work.response.clone();
                 let _ = response.send(invoke_handler(&lua, &registry, &host.control, work));
             }
-            Ok(Some(ExtensionWorkerMessage::Render)) => {
-                render_and_publish_surfaces(&lua, host, &registry);
-                next_render = render_interval.map(|interval| Instant::now() + interval);
-            }
+
             Ok(Some(ExtensionWorkerMessage::Action(action))) => {
                 run_surface_action(&lua, host, &registry, action);
                 render_and_publish_surfaces(&lua, host, &registry);
                 next_render = render_interval.map(|interval| Instant::now() + interval);
             }
-            Ok(None) => {
+            // A timer tick and an explicit render request do the same work; the host uses the
+            // latter to wake a parked module that came back on screen.
+            Ok(Some(ExtensionWorkerMessage::Render) | None) => {
                 render_and_publish_surfaces(&lua, host, &registry);
                 next_render = render_interval.map(|interval| Instant::now() + interval);
             }
@@ -803,12 +802,17 @@ fn require_setup_phase(control: &WorkerControl) -> mlua::Result<()> {
 fn initial_surface_snapshots(
     lua: &Lua,
     registry: &ModuleRegistry,
+    facts: &ExtensionFacts,
 ) -> Result<Vec<SurfaceSnapshot>, String> {
     let declarations = registry.surface_declarations.borrow().clone();
     let handlers = registry.surface_handlers.borrow();
     declarations
         .into_iter()
         .map(|declaration| {
+            // Every surface on this worker re-renders on the shortest interval any of them asked
+            // for, so a surface's own interval has to bound its shell-outs instead. Without it a
+            // 60s module re-runs its command at the 50ms animation cadence.
+            facts.set_run_refresh_gap(declaration.interval);
             let handler = handlers
                 .get(&declaration.id)
                 .ok_or_else(|| "extension surface handler is missing".to_owned())?;
@@ -833,7 +837,7 @@ fn render_and_publish_surfaces(lua: &Lua, host: &ModuleHost, registry: &ModuleRe
             deadline: Instant::now() + Duration::from_millis(50),
             cancellation: CommandCancellation::new(),
         },
-        || initial_surface_snapshots(lua, registry),
+        || initial_surface_snapshots(lua, registry, &host.facts),
     );
     match snapshots {
         Ok(snapshots) => {
