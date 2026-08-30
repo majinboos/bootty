@@ -16,6 +16,7 @@ app = [
 anyhow.workspace = true
 bootty-mux = { path = "../bootty-mux", default-features = false }
 bootty-mux-model = { path = "../bootty-mux-model" }
+bootty-remote = { path = "../bootty-remote", default-features = false }
 bootty-runtime = { path = "../bootty-runtime", optional = true }
 bootty-surface = { path = "../bootty-surface", optional = true }
 bootty-terminal = { path = "../bootty-terminal", optional = true }

@@ -123,7 +123,7 @@ pub fn list(config: &BoottyConfig) -> Result<Vec<RemoteSpaceSummary>> {
             let backend = binding
                 .backend_override()
                 .unwrap_or(config.multiplexer.backend);
-            backend.supports_remote().then(|| RemoteSpaceSummary {
+            supports_remote_space_catalog(backend).then(|| RemoteSpaceSummary {
                 catalog_version: REMOTE_SPACE_CATALOG_VERSION,
                 id: space.remote_id().to_owned(),
                 name: space.name().to_owned(),
@@ -138,7 +138,7 @@ pub fn create(
     name: &str,
     backend: MultiplexerBackendConfig,
 ) -> Result<RemoteSpaceSummary> {
-    if !backend.supports_remote() {
+    if !supports_remote_space_catalog(backend) {
         bail!(ErrorNotice::RemoteSpaceBackendUnsupported.to_string())
     }
     let (mut repository, _) = WorkspaceRepository::open(&config.config_path)?;
@@ -161,6 +161,13 @@ pub fn create(
         name: space.name().to_owned(),
         backend,
     })
+}
+
+fn supports_remote_space_catalog(backend: MultiplexerBackendConfig) -> bool {
+    matches!(
+        backend,
+        MultiplexerBackendConfig::Rmux | MultiplexerBackendConfig::Tmux
+    )
 }
 
 /// The sessions this remote Space holds: the ones carrying its `@bootty_space` tag. The client

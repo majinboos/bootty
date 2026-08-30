@@ -125,7 +125,8 @@ herdr-session = "default"
 hide-tmux-status = false
 
 # Reach a multiplexer on another host over SSH and render its sessions here.
-# Bootty automatically installs its small headless daemon when needed. The full
+# Herdr must already be installed there. Bootty automatically installs its
+# small headless daemon when remote Space catalog operations need it. The full
 # Bootty app is not required on the remote host.
 # [multiplexer.remote]
 # host = "devbox"       # ~/.ssh/config alias, hostname, or address

@@ -106,3 +106,21 @@ fn remote_tmux_keeps_attach_policy_on_every_host() {
     );
     assert_eq!(app_policy.panes.topology, PaneTopology::Attach);
 }
+
+#[test]
+fn remote_herdr_keeps_attach_policy_on_every_host() {
+    let registry = support::backends();
+    let mut config = binding(MuxBackendKind::Herdr);
+    config.remote = Some(SshTarget::for_host("example.test"));
+
+    let pane_policy = registry.build_pane_policy(&config);
+    let app_policy = registry.app_policy(&config);
+
+    assert_eq!(
+        pane_policy
+            .remote_target()
+            .map(|remote| remote.host.as_str()),
+        Some("example.test")
+    );
+    assert_eq!(app_policy.panes.topology, PaneTopology::Attach);
+}

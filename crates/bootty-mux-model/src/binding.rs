@@ -27,7 +27,7 @@ pub struct RemoteSpaceSummary {
 impl MuxBackendKind {
     /// Returns whether the backend has a client that can run on another host.
     pub const fn supports_remote(self) -> bool {
-        matches!(self, Self::Rmux | Self::Tmux)
+        matches!(self, Self::Herdr | Self::Rmux | Self::Tmux)
     }
 }
 

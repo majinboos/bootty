@@ -3,13 +3,15 @@ use std::{collections::BTreeMap, sync::Mutex};
 use anyhow::Result;
 use bootty_herdr::{
     HerdrApi, HerdrBackend, HerdrLayout, HerdrLayoutPane, HerdrLayoutSplit, HerdrPane, HerdrRect,
-    HerdrSessionSnapshot, HerdrTab, HerdrWorkspace, project_snapshot,
+    HerdrSessionSnapshot, HerdrTab, HerdrWorkspace, RemoteHerdrBridgePlan, parse_remote_status,
+    project_snapshot, remote_status_command,
 };
 use bootty_mux::{
     backend::MuxBackend,
     command::{MuxCommand, MuxSplitDirection},
     snapshot::{MuxPaneLayout, MuxPaneSplitDirection},
 };
+use bootty_mux_model::SshTarget;
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 
@@ -119,6 +121,128 @@ fn commands_use_public_herdr_mutations() {
             ),
         ]
     );
+}
+
+#[test]
+fn remote_bridge_forwards_both_public_herdr_sockets() {
+    let target = SshTarget {
+        host: "hermes".into(),
+        user: Some("luan".into()),
+        port: Some(2222),
+        program: "ssh".into(),
+        args: vec!["-F".into(), "/tmp/ssh-config".into()],
+    };
+    let plan = RemoteHerdrBridgePlan::new(
+        &target,
+        std::path::Path::new("/tmp/bootty-herdr-test"),
+        std::path::Path::new("/home/luan/.config/herdr/sessions/work/herdr.sock"),
+    )
+    .expect("remote bridge plan");
+    assert_eq!(
+        plan.remote_client_socket,
+        std::path::Path::new("/home/luan/.config/herdr/sessions/work/herdr-client.sock")
+    );
+    assert!(
+        plan.arguments
+            .windows(2)
+            .any(|pair| pair == ["-o", "ExitOnForwardFailure=yes"])
+    );
+    assert_eq!(
+        &plan.arguments[..4],
+        ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    );
+    assert!(
+        plan.arguments
+            .windows(2)
+            .any(|pair| pair == ["-o", "StreamLocalBindUnlink=yes"])
+    );
+    assert!(
+        plan.arguments.contains(
+            &"/tmp/bootty-herdr-test/herdr.sock:/home/luan/.config/herdr/sessions/work/herdr.sock"
+                .into()
+        )
+    );
+    assert!(plan.arguments.contains(&"/tmp/bootty-herdr-test/herdr-client.sock:/home/luan/.config/herdr/sessions/work/herdr-client.sock".into()));
+    assert_eq!(plan.arguments.iter().filter(|arg| *arg == "-N").count(), 1);
+    assert_eq!(plan.arguments[plan.arguments.len() - 1], "luan@hermes");
+}
+
+#[test]
+fn remote_status_requires_an_absolute_socket_for_a_running_server() {
+    let status = parse_remote_status(
+        r#"{"server":{"running":true,"socket":"/run/user/501/herdr/herdr.sock"}}"#,
+    )
+    .expect("remote status");
+    assert!(status.running);
+    assert_eq!(
+        status.socket.as_deref(),
+        Some(std::path::Path::new("/run/user/501/herdr/herdr.sock"))
+    );
+    assert!(
+        parse_remote_status(r#"{"server":{"running":true,"socket":"relative.sock"}}"#).is_err()
+    );
+    assert!(
+        !parse_remote_status(r#"{"server":{"running":false,"socket":null}}"#)
+            .expect("stopped status")
+            .running
+    );
+}
+
+#[test]
+fn remote_status_command_targets_the_selected_session_without_a_daemon() {
+    let target = SshTarget {
+        host: "hermes".into(),
+        user: None,
+        port: Some(2202),
+        program: "/opt/ssh".into(),
+        args: vec!["-F".into(), "/tmp/ssh-config".into()],
+    };
+    let (program, arguments) =
+        remote_status_command(&target, "bootty-work").expect("remote status command");
+    assert_eq!(program, "/opt/ssh");
+    assert!(arguments.windows(2).any(|pair| pair == ["-p", "2202"]));
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-F", "/tmp/ssh-config"])
+    );
+    assert_eq!(arguments[arguments.len() - 2], "hermes");
+    assert_eq!(
+        arguments.last().map(String::as_str),
+        Some("'herdr' '--session' 'bootty-work' 'status' '--json'")
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.contains("bootty-remote"))
+    );
+}
+
+#[test]
+fn remote_bootstrap_starts_only_the_headless_named_server() {
+    let target = SshTarget {
+        host: "hermes".into(),
+        user: Some("luan".into()),
+        port: Some(2222),
+        program: "/opt/ssh".into(),
+        args: vec!["-F".into(), "/tmp/ssh-config".into()],
+    };
+    let (program, arguments) =
+        RemoteHerdrBridgePlan::server_bootstrap_command(&target, "bootty-work")
+            .expect("remote bootstrap command");
+    assert_eq!(program, "/opt/ssh");
+    assert!(arguments.windows(2).any(|pair| pair == ["-p", "2222"]));
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["-F", "/tmp/ssh-config"])
+    );
+    assert_eq!(arguments[arguments.len() - 2], "luan@hermes");
+    let command = arguments.last().expect("remote command");
+    assert!(command.contains("'nohup herdr --session \"$1\" server"));
+    assert!(command.contains("api snapshot"));
+    assert!(command.ends_with("'bootty-work'"));
+    assert!(!command.contains("attach"));
 }
 
 fn fixture() -> HerdrSessionSnapshot {

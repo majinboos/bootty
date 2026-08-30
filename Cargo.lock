@@ -889,6 +889,7 @@ dependencies = [
  "anyhow",
  "bootty-mux",
  "bootty-mux-model",
+ "bootty-remote",
  "bootty-runtime",
  "bootty-surface",
  "bootty-terminal",

@@ -82,8 +82,9 @@ backend = "rmux"
 # Select the named Herdr server when backend = "herdr".
 herdr-session = "default"
 
-# Attach a multiplexer running on another host. Bootty reaches the remote host
-# over SSH and renders its sessions here. On first use, Bootty uploads the
+# Attach a multiplexer running on another host. Herdr must already be installed
+# on the remote host. Bootty reaches the remote backend over SSH. For remote
+# Space catalog operations, Bootty uploads the
 # matching daemon bundled with the app. If the bundle has no matching target,
 # Bootty downloads and checksum-verifies the release daemon. New Session uses
 # that daemon to discover projects and Git worktrees on the remote filesystem.
@@ -95,7 +96,10 @@ host = "devbox" # ~/.ssh/config alias, hostname, or address
 # program = "ssh"      # the SSH client to run
 # args = ["-i", "~/.ssh/devbox"] # extra flags, passed before the destination
 
-# `bootty app --backend tmux --ssh-remote devbox` does the same for one run.
+# `bootty app --backend herdr --ssh-remote devbox` does the same for one run.
+# Herdr remote bindings honor the configured host, user, port, SSH program, and
+# extra arguments. SSH config remains the simplest place for shared aliases,
+# jump hosts, and keys.
 #
 # This is the default every space inherits. A single space can name its own host
 # in the space editor, next to its backend, so remote and local spaces sit side

@@ -951,7 +951,7 @@ fn ssh_remote_defaults_and_all_fields_are_preserved() {
 #[test]
 fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
     for (backend, accepted) in [
-        ("herdr", false),
+        ("herdr", true),
         ("tmux", true),
         ("rmux", true),
         ("native", false),

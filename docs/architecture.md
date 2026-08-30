@@ -98,10 +98,13 @@ policies.
 `bootty-remote` owns SSH commands, remote daemon installation, remote command
 framing, and remote Space transport.
 Herdr owns authoritative workspace, tab, pane, layout, process, and agent state.
-Bootty launches Herdr's stock client for the configured server session and lets
-that client render its own chrome and terminal surfaces inside Bootty.
+Bootty uses Herdr's public API for snapshots and mutations, then attaches the
+stock Herdr client to render its chrome and terminal surfaces inside Bootty. A
+remote binding starts the named headless server, forwards its public sockets,
+and launches that same stock client over SSH.
 The `bootty` executable links all four providers.
-The daemon links rmux and tmux.
+The daemon links rmux and tmux for catalog-backed remote Spaces. Herdr remote
+bindings use its public client commands instead.
 
 ## Terminal path
 
