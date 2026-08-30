@@ -88,6 +88,7 @@ embedded_scenarios!(
     pane_navigation_and_zoom,
     terminal_requests,
     color_query_round_trip,
+    kitty_keyboard_protocol_reports_command_alt_key,
     kitty_keyboard_protocol_pop_restores_legacy_ctrl_c,
     multi_pane_window_resize_keeps_pane_targets_live,
     closing_session_with_pending_resize_is_quiet,
@@ -332,6 +333,63 @@ if b"rgb:" in data and keyboard.search(data):
         })?;
         wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_CTRL_C_HANDLED")?;
         wait_for_terminal_text(&mut terminal, "ABC")?;
+
+        ditch_session(&mut backend, &session_id)
+    }
+
+    pub fn kitty_keyboard_protocol_reports_command_alt_key() -> Result<()> {
+        if !std::process::Command::new("python3")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            eprintln!(
+                "skipping kitty_keyboard_protocol_reports_command_alt_key: no python3 on PATH"
+            );
+            return Ok(());
+        }
+        let (mut backend, registry, session_id, window_id, pane) =
+            create_embedded_session(unscoped_tag())?;
+        let mut terminal = open_terminal(registry, &pane, &window_id)?;
+        prepare_pane(&mut terminal)?;
+        let script_path =
+            std::env::temp_dir().join(format!("bootty-kitty-keyboard-{}.py", session_id));
+        std::fs::write(
+            &script_path,
+            r#"import os, select, sys, termios, tty
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+tty.setraw(fd)
+os.write(fd, b"\x1b[>7u\x1b[?u\x1b[cBOOTTY_RMUX_KITTY_READY\r\n")
+data = b""
+expected = b"\x1b[98;11u"
+while expected not in data:
+    if not select.select([fd], [], [], 10.0)[0]:
+        break
+    data += os.read(fd, 4096)
+termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+if expected in data:
+    print("BOOTTY_RMUX_COMMAND_ALT_KEY_OK")
+"#,
+        )?;
+        terminal.write_input(format!("python3 {}\r", script_path.display()).as_bytes())?;
+        wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_KITTY_READY")?;
+        terminal.encode_key(bootty_terminal::terminal_input_model::KeyInput {
+            key: bootty_terminal::terminal_input_model::TerminalKey::B,
+            mods: bootty_terminal::terminal_input_model::KeyMods {
+                alt: true,
+                command: true,
+                ..Default::default()
+            },
+            repeat: false,
+            utf8: Some("b"),
+            unshifted: Some('b'),
+        })?;
+        wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_COMMAND_ALT_KEY_OK")?;
+        let _ = std::fs::remove_file(&script_path);
 
         ditch_session(&mut backend, &session_id)
     }

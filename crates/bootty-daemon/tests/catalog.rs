@@ -194,11 +194,7 @@ fn open_catalog(path: &Path) -> Result<Catalog> {
         bootty_mux::MuxBackendKind::Rmux,
         bootty_mux::MuxBackendKind::Tmux,
     ])?;
-    Catalog::open(
-        path,
-        ApplicationIdentity::Development,
-        std::sync::Arc::new(backends),
-    )
+    Catalog::open(path, None, std::sync::Arc::new(backends))
 }
 
 #[test]
@@ -209,17 +205,29 @@ fn daemon_uses_the_stored_backend_provider_without_desktop_fallback() -> Result<
         [provider],
         [MuxBackendKind::Tmux],
     )?);
-    let mut catalog = Catalog::open(
-        &directory.path().join("catalog.sqlite"),
-        ApplicationIdentity::Development,
-        backends,
-    )?;
+    let mut catalog = Catalog::open(&directory.path().join("catalog.sqlite"), None, backends)?;
     let space = catalog.create("Stored tmux", Backend::Tmux)?;
 
     assert_eq!(
         catalog.snapshot(&space.id, Backend::Tmux)?,
         MuxSnapshot::default()
     );
+    Ok(())
+}
+
+#[test]
+fn catalog_listing_skips_spaces_from_unsupported_backends() -> Result<()> {
+    let directory = assert_fs::TempDir::new()?;
+    let path = directory.path().join("catalog.sqlite");
+    let mut catalog = open_catalog(&path)?;
+    let supported = catalog.create("Supported", Backend::Rmux)?;
+    connection(&path).execute(
+        "INSERT INTO remote_spaces (id, name, backend, position)
+         VALUES ('unsupported', 'Unsupported', 'herdr', 1)",
+        [],
+    )?;
+
+    assert_eq!(catalog.list()?, vec![supported]);
     Ok(())
 }
 
@@ -412,12 +420,16 @@ fn a_real_daemon_round_trips_a_session_tag_through_rmux_helper() -> Result<()> {
         std::env::var_os("BOOTTY_DAEMON_RECOVERY_ROOT").expect("recovery root"),
     );
     let state = root.join("daemon.sqlite");
+    let config_root = root.join("config");
     let empty_path = root.join("empty-path");
+    create_fixture_dir(&config_root)?;
     create_fixture_dir(&empty_path)?;
     let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
     let run = |args: &[String]| {
         std::process::Command::new(daemon)
             .env("BOOTTY_DAEMON_STATE", &state)
+            .env("XDG_CONFIG_HOME", &config_root)
+            .env("HOME", &root)
             .env("PATH", &empty_path)
             .env("SHELL", "/bin/sh")
             .env("BOOTTY_SHELL", "/bin/sh")

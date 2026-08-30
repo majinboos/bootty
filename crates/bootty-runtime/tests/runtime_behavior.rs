@@ -18,6 +18,8 @@ use bootty_terminal::terminal_engine::{
     TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TerminalCopyModeAction, TerminalSearchDirection,
     TerminalSelectionFormat,
 };
+#[cfg(unix)]
+use bootty_terminal::terminal_input_model::{KeyInput, KeyMods, TerminalKey};
 use pretty_assertions::{assert_eq, assert_ne};
 use proptest::prelude::*;
 use proptest_derive::Arbitrary;
@@ -229,6 +231,55 @@ fn dropping_a_terminal_session_kills_its_owned_child() {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("terminal child {pid} survived session drop");
+}
+
+#[cfg(unix)]
+#[test]
+fn negotiated_super_keys_use_the_configured_encoded_input_relay() {
+    let directory = assert_fs::TempDir::new().expect("relay directory");
+    let ready_path = directory.path().join("kitty-response");
+    let (input_tx, input_rx) = std::sync::mpsc::channel();
+    let config = TerminalSessionConfig {
+        launch: SessionLaunchConfig {
+            shell: Some("/bin/sh".to_owned()),
+            args: vec![
+                "-c".to_owned(),
+                r#"stty raw -echo; temporary_ready="$BOOTTY_TEST_READY.tmp.$$"; printf '\033[>7u\033[?u'; dd of="$temporary_ready" bs=5 count=1 2>/dev/null; mv "$temporary_ready" "$BOOTTY_TEST_READY"; sleep 60"#
+                    .to_owned(),
+            ],
+            env: vec![(
+                "BOOTTY_TEST_READY".to_owned(),
+                ready_path.to_string_lossy().into_owned(),
+            )],
+            ..SessionLaunchConfig::default()
+        },
+        super_key_input_tx: Some(input_tx),
+        ..TerminalSessionConfig::default()
+    };
+    let mut session = TerminalSession::new_with_config(geometry(20, 4), config, Arc::new(|| {}))
+        .expect("terminal starts");
+    assert_eq!(wait_for_file(&ready_path), "\x1b[?7u");
+
+    session
+        .encode_key(KeyInput {
+            key: TerminalKey::B,
+            mods: KeyMods {
+                alt: true,
+                command: true,
+                ..KeyMods::default()
+            },
+            repeat: false,
+            utf8: Some("b"),
+            unshifted: Some('b'),
+        })
+        .expect("key queues");
+
+    assert_eq!(
+        input_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("encoded key reaches relay"),
+        b"\x1b[98;11u"
+    );
 }
 
 #[cfg(unix)]

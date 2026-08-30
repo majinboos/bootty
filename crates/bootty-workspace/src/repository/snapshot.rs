@@ -2,7 +2,12 @@
 
 use super::*;
 
-pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<WorkspaceSpace>> {
+pub(super) struct LoadedSpaces {
+    pub(super) spaces: Vec<WorkspaceSpace>,
+    pub(super) unsupported_ids: HashSet<i64>,
+}
+
+pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<LoadedSpaces> {
     let mut statement = tx.prepare(
         "SELECT id, remote_id, name, icon, color, tint_sidebar, position,
                 backend, hide_tmux_status, unavailable,
@@ -15,7 +20,11 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
         if space_id <= 0 {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        let backend = backend_from_storage(&row.get::<_, String>(7)?)?;
+        let backend = match backend_from_storage(&row.get::<_, String>(7)?) {
+            StoredBackend::Inherit => None,
+            StoredBackend::Supported(backend) => Some(backend),
+            StoredBackend::Unsupported => return Ok((space_id, None)),
+        };
         let remote = remote_from_storage(row.get::<_, Option<String>>(12)?.as_deref())?;
         let color = color_from_hex(&row.get::<_, String>(4)?)
             .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
@@ -29,29 +38,42 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
-        Ok(WorkspaceSpace {
-            id: SpaceId::from_persistence(space_id),
-            remote_id: row.get(1)?,
-            name: row.get(2)?,
-            icon: row.get(3)?,
-            color,
-            tint_sidebar,
-            position: row.get(6)?,
-            binding: WorkspaceBinding {
-                scope: SpaceId::from_persistence(space_id),
-                backend_override: backend,
-                remote_override: remote,
-                hide_tmux_status,
-                unavailable,
-                selection: session_id.map(|session_id| WorkspaceBindingSelection {
-                    session_id,
-                    window_id,
-                }),
-                sessions: SessionMembership::default(),
-            },
-        })
+        Ok((
+            space_id,
+            Some(WorkspaceSpace {
+                id: SpaceId::from_persistence(space_id),
+                remote_id: row.get(1)?,
+                name: row.get(2)?,
+                icon: row.get(3)?,
+                color,
+                tint_sidebar,
+                position: row.get(6)?,
+                binding: WorkspaceBinding {
+                    scope: SpaceId::from_persistence(space_id),
+                    backend_override: backend,
+                    remote_override: remote,
+                    hide_tmux_status,
+                    unavailable,
+                    selection: session_id.map(|session_id| WorkspaceBindingSelection {
+                        session_id,
+                        window_id,
+                    }),
+                    sessions: SessionMembership::default(),
+                },
+            }),
+        ))
     })?;
-    let mut spaces = rows.collect::<rusqlite::Result<Vec<WorkspaceSpace>>>()?;
+    let mut spaces = Vec::new();
+    let mut unsupported_ids = HashSet::new();
+    for row in rows {
+        let (space_id, space) = row?;
+        match space {
+            Some(space) => spaces.push(space),
+            None => {
+                unsupported_ids.insert(space_id);
+            }
+        }
+    }
     if spaces.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -80,6 +102,9 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
         ))
     })? {
         let (space_id, position, session) = row?;
+        if unsupported_ids.contains(&space_id) {
+            continue;
+        }
         if session.identity.is_empty()
             || session.backend_name.is_empty()
             || position < 0
@@ -112,7 +137,10 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<Vec<Workspac
     if !sessions.is_empty() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    Ok(spaces)
+    Ok(LoadedSpaces {
+        spaces,
+        unsupported_ids,
+    })
 }
 
 pub(super) fn backend_to_storage(backend: Option<MultiplexerBackendConfig>) -> &'static str {
@@ -159,15 +187,19 @@ pub(super) fn color_from_hex(value: &str) -> Option<[u8; 3]> {
     (value.len() == 6).then_some([(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8])
 }
 
-pub(super) fn backend_from_storage(
-    backend: &str,
-) -> rusqlite::Result<Option<MultiplexerBackendConfig>> {
+pub(super) enum StoredBackend {
+    Inherit,
+    Supported(MultiplexerBackendConfig),
+    Unsupported,
+}
+
+pub(super) fn backend_from_storage(backend: &str) -> StoredBackend {
     match backend {
-        "inherit" => Ok(None),
-        "rmux" => Ok(Some(MultiplexerBackendConfig::Rmux)),
-        "native" => Ok(Some(MultiplexerBackendConfig::Native)),
-        "tmux" => Ok(Some(MultiplexerBackendConfig::Tmux)),
-        _ => Err(rusqlite::Error::InvalidQuery),
+        "inherit" => StoredBackend::Inherit,
+        "rmux" => StoredBackend::Supported(MultiplexerBackendConfig::Rmux),
+        "native" => StoredBackend::Supported(MultiplexerBackendConfig::Native),
+        "tmux" => StoredBackend::Supported(MultiplexerBackendConfig::Tmux),
+        _ => StoredBackend::Unsupported,
     }
 }
 

@@ -25,15 +25,31 @@ pub(super) struct ImportedSpace {
     pub(super) sessions: Vec<String>,
 }
 
-fn parse_stored_backend(value: &str, binding_id: i64) -> Result<Option<MultiplexerBackendConfig>> {
-    let backend = match value {
-        "inherit" => None,
-        "native" => Some(MultiplexerBackendConfig::Native),
-        "rmux" => Some(MultiplexerBackendConfig::Rmux),
-        "tmux" => Some(MultiplexerBackendConfig::Tmux),
-        _ => bail!("legacy binding {binding_id} has unknown backend {value:?}"),
-    };
-    Ok(backend)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyBackend {
+    Inherit,
+    Supported(MultiplexerBackendConfig),
+    Unsupported,
+}
+
+impl LegacyBackend {
+    fn resolve(self, inherited: MultiplexerBackendConfig) -> Option<MultiplexerBackendConfig> {
+        match self {
+            Self::Inherit => Some(inherited),
+            Self::Supported(backend) => Some(backend),
+            Self::Unsupported => None,
+        }
+    }
+}
+
+fn parse_stored_backend(value: &str) -> LegacyBackend {
+    match value {
+        "inherit" => LegacyBackend::Inherit,
+        "native" => LegacyBackend::Supported(MultiplexerBackendConfig::Native),
+        "rmux" => LegacyBackend::Supported(MultiplexerBackendConfig::Rmux),
+        "tmux" => LegacyBackend::Supported(MultiplexerBackendConfig::Tmux),
+        _ => LegacyBackend::Unsupported,
+    }
 }
 
 #[derive(Debug)]
@@ -48,7 +64,7 @@ struct LegacySpace {
 struct LegacyBinding {
     id: i64,
     space_id: i64,
-    backend: Option<MultiplexerBackendConfig>,
+    backend: LegacyBackend,
     local: bool,
 }
 
@@ -227,8 +243,12 @@ fn load_bindings(
         if !binding_ids.insert(id) {
             bail!("legacy workspace bindings contain duplicate ids")
         }
-        let backend = parse_stored_backend(&backend, id)?;
-        let local = decode_local_placement(remote.as_deref(), config, id)?;
+        let backend = parse_stored_backend(&backend);
+        let local = if backend == LegacyBackend::Unsupported {
+            false
+        } else {
+            decode_local_placement(remote.as_deref(), config, id)?
+        };
         bindings.push(LegacyBinding {
             id,
             space_id,
@@ -268,11 +288,16 @@ fn load_folded_bindings(
         if !space_ids.contains(&space_id) {
             bail!("legacy workspace Space has an invalid connection")
         }
+        let backend = parse_stored_backend(&backend);
         bindings.push(LegacyBinding {
             id: space_id,
             space_id,
-            backend: parse_stored_backend(&backend, space_id)?,
-            local: decode_local_placement(remote.as_deref(), config, space_id)?,
+            backend,
+            local: if backend == LegacyBackend::Unsupported {
+                false
+            } else {
+                decode_local_placement(remote.as_deref(), config, space_id)?
+            },
         });
     }
     Ok(bindings)
@@ -579,7 +604,10 @@ fn build_plan(
             .flatten()
             .filter(|binding| binding.local)
             .filter_map(|binding| {
-                destination_backend(binding.backend.unwrap_or(config.multiplexer.backend))
+                binding
+                    .backend
+                    .resolve(config.multiplexer.backend)
+                    .and_then(destination_backend)
                     .map(|backend| (binding.id, backend))
             });
         let Some((binding_id, backend)) = candidates.next() else {

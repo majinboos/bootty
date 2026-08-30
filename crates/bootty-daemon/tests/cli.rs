@@ -536,6 +536,50 @@ fn importer_selects_a_later_explicit_local_binding() {
 }
 
 #[test]
+fn unsupported_legacy_backends_are_skipped() {
+    let directory = assert_fs::TempDir::new().expect("tempdir");
+    let config = directory.path().join("config");
+    let state = directory.path().join("state");
+    let daemon = env!("CARGO_BIN_EXE_bootty-daemon");
+    let legacy_path = config.join("bootty/session-order.sqlite3");
+    let destination = state.join("bootty/daemon.sqlite");
+
+    create_fixture_dir(config.join("bootty")).expect("config dir");
+    write_fixture(
+        config.join("bootty/config.toml"),
+        "[multiplexer]\nbackend = \"tmux\"\n",
+    )
+    .expect("config");
+    seed_legacy_catalog(
+        &legacy_path,
+        "unsupported-id",
+        "Unsupported legacy",
+        "herdr",
+        "unsupported-session",
+    );
+    let connection = Connection::open(&legacy_path).expect("legacy catalog");
+    connection
+        .execute_batch(
+            "INSERT INTO workspace_spaces (id, remote_id, name, position)
+             VALUES (2, 'supported-id', 'Supported legacy', 1);
+             INSERT INTO workspace_bindings (id, space_id, backend, remote)
+             VALUES (2, 2, 'rmux', '{\"source\":\"local\"}');
+             INSERT INTO workspace_sessions (binding_id, name, position)
+             VALUES (2, 'supported-session', 0);",
+        )
+        .expect("supported legacy Space");
+    drop(connection);
+
+    let imported = run_daemon(daemon, &config, &state, None, &["remote-space", "list"]);
+    assert_success(&imported);
+    let spaces: serde_json::Value = serde_json::from_slice(&imported.stdout).expect("catalog JSON");
+    assert_eq!(spaces.as_array().expect("Spaces").len(), 1);
+    assert_eq!(spaces[0]["name"], "Supported legacy");
+    assert_eq!(spaces[0]["backend"], "rmux");
+    assert_eq!(migration_marker(&destination), 1);
+}
+
+#[test]
 fn importer_rejects_ambiguous_supported_local_bindings_without_a_marker() {
     let directory = assert_fs::TempDir::new().expect("tempdir");
     let config = directory.path().join("config");

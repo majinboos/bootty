@@ -49,6 +49,7 @@ pub(super) fn terminal_session_config_with_side_effects(
         macos_option_as_alt: terminal_macos_option_as_alt(config.input.macos_option_as_alt),
         side_effect_tx: Some(side_effect_tx.clone()),
         side_effect_pane_id: None,
+        super_key_input_tx: None,
         benchmark_trace: None,
     }
 }

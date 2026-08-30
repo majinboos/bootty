@@ -5,8 +5,9 @@ use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 #[cfg(target_os = "macos")]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bootty_config::config::ExtensionSettingValue;
 use starship_battery::{Manager as BatteryManager, State as BatteryState, units::time::second};
