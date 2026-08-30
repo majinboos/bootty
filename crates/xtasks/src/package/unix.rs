@@ -16,7 +16,7 @@ const DAEMON: &str = "bootty-daemon";
 pub(super) fn run(args: Args, layout: &Layout) -> Result<()> {
     let zig_path = ensure_project_zig(layout.app_name)?;
     let host_daemon = build_daemon(layout)?;
-    filesystem::recreate_dir(&layout.dist_dir)?;
+    fs::create_dir_all(&layout.dist_dir)?;
     build_application(args, layout, &zig_path)?;
 
     match env::consts::OS {
@@ -199,6 +199,7 @@ fn copy_bundled_daemons(layout: &Layout, destination: &Path) -> Result<()> {
 
 fn package_macos(layout: &Layout, host_daemon: &Path) -> Result<()> {
     let bundle = layout.dist_dir.join(format!("{}.app", layout.app_name));
+    filesystem::recreate_dir(&bundle)?;
     let contents = bundle.join("Contents");
     let macos = contents.join("MacOS");
     let resources = contents.join("Resources");
@@ -220,17 +221,24 @@ fn package_macos(layout: &Layout, host_daemon: &Path) -> Result<()> {
         info_plist(layout, &super::workspace_version()?),
     )?;
     sign_macos_bundle(layout, &bundle, &contents, &macos)?;
+    let archive_name = format!("{}-macos-{}.app.zip", layout.app_name, macos_archive_arch());
+    let archive = layout.dist_dir.join(&archive_name);
+    remove_file_if_exists(&archive)?;
     command::run(
         Command::new("zip")
             .current_dir(&layout.dist_dir)
             .args(["-q", "-r", "-y"])
-            .arg(format!(
-                "{}-macos-{}.app.zip",
-                layout.app_name,
-                macos_archive_arch()
-            ))
+            .arg(archive_name)
             .arg(format!("{}.app", layout.app_name)),
     )
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 fn macos_archive_arch() -> &'static str {
@@ -241,6 +249,12 @@ fn macos_archive_arch() -> &'static str {
 }
 
 fn compile_macos_icon(contents: &Path, resources: &Path) -> Result<()> {
+    let contents = fs::canonicalize(contents)
+        .with_context(|| format!("failed to resolve {}", contents.display()))?;
+    let resources = fs::canonicalize(resources)
+        .with_context(|| format!("failed to resolve {}", resources.display()))?;
+    let icon = fs::canonicalize("crates/bootty/assets/bootty.icon")
+        .context("failed to resolve the macOS app icon")?;
     let actool = command::stdout(Command::new("xcrun").args(["--find", "actool"]))
         .context("Xcode actool is required to package the macOS app icon")?;
     let actool = actool.trim();
@@ -255,7 +269,7 @@ fn compile_macos_icon(contents: &Path, resources: &Path) -> Result<()> {
     }
     let partial = contents.join("assetcatalog-info.plist");
     let output = Command::new(actool)
-        .arg("crates/bootty/assets/bootty.icon")
+        .arg(icon)
         .args(["--compile", resources.to_string_lossy().as_ref()])
         .args(["--app-icon", "bootty", "--enable-on-demand-resources", "NO"])
         .args(["--development-region", "en", "--target-device", "mac"])
@@ -361,6 +375,7 @@ fn executable_on_path(program: &str) -> bool {
 fn package_linux(layout: &Layout, host_daemon: &Path) -> Result<()> {
     let name = format!("{}-linux-{}", layout.app_name, env::consts::ARCH);
     let root = layout.dist_dir.join(&name);
+    filesystem::recreate_dir(&root)?;
     let bin = root.join("bin");
     let applications = root.join("share/applications");
     let png = root.join("share/icons/hicolor/256x256/apps/bootty.png");
@@ -388,10 +403,12 @@ fn package_linux(layout: &Layout, host_daemon: &Path) -> Result<()> {
         applications.join(format!("{}.desktop", layout.bundle_identifier)),
         desktop_entry(layout),
     )?;
+    let archive = layout.dist_dir.join(format!("{name}.tar.gz"));
+    remove_file_if_exists(&archive)?;
     command::run(
         Command::new("tar")
             .args(["-C", layout.dist_dir.to_string_lossy().as_ref(), "-czf"])
-            .arg(layout.dist_dir.join(format!("{name}.tar.gz")))
+            .arg(archive)
             .arg(name),
     )
 }
