@@ -259,8 +259,7 @@ struct SizeReportState {
 
 impl SizeReportState {
     fn size(self) -> SizeReportSize {
-        let cell_width = scaled_metric_size(self.render_cell.width, self.display_scale);
-        let cell_height = scaled_metric_size(self.render_cell.height, self.display_scale);
+        let (cell_width, cell_height) = self.render_cell.physical_size(self.display_scale);
         SizeReportSize {
             rows: self.geometry.rows,
             columns: self.geometry.cols,
@@ -268,11 +267,6 @@ impl SizeReportState {
             cell_height,
         }
     }
-}
-
-fn scaled_metric_size(cell_size: f32, display_scale: f32) -> u32 {
-    let display_scale = positive_or(display_scale, 1.0);
-    (cell_size * display_scale).round().max(1.0) as u32
 }
 
 fn positive_or(value: f32, fallback: f32) -> f32 {
@@ -1591,13 +1585,18 @@ impl TerminalEngine {
         }
         self.mouse_encoder
             .set_any_button_pressed(self.mouse_any_button_pressed);
+        let position = if self.terminal.mode(Mode::SGR_PIXELS_MOUSE)? {
+            (input.pixel_x, input.pixel_y)
+        } else {
+            (input.x, input.y)
+        };
         self.mouse_event
             .set_action(input.action.into())
             .set_button(input.button.map(Into::into))
             .set_mods(input.mods.into())
             .set_position(mouse::Position {
-                x: input.x * display_scale,
-                y: input.y * display_scale,
+                x: position.0 * display_scale,
+                y: position.1 * display_scale,
             });
         if out.capacity() < 64 {
             out.reserve(64 - out.capacity());

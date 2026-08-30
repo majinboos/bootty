@@ -277,14 +277,20 @@ impl<T> PendingWorkerResponse<T> {
 }
 
 enum TerminalCommand {
-    DisplayScale(f32),
+    PtyReady,
+    DisplayScale {
+        display_scale: f32,
+        pty_size: PtySize,
+    },
     RenderCellMetrics {
         cell: CellMetrics,
+        pty_size: PtySize,
         done: WorkerRequest<()>,
     },
     ApplyLiveConfig(TerminalLiveConfig),
     Resize {
         geometry: TerminalGeometry,
+        pty_size: PtySize,
         done: Option<WorkerRequest<()>>,
     },
     Key(KeyInput),
@@ -337,20 +343,41 @@ impl TerminalSession {
         config: TerminalSessionConfig,
         repaint_wakeup: RepaintWakeup,
     ) -> Result<Self> {
+        Self::new_with_config_and_host_metrics(
+            geometry,
+            1.0,
+            CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
+            config,
+            repaint_wakeup,
+        )
+    }
+
+    pub fn new_with_config_and_host_metrics(
+        geometry: TerminalGeometry,
+        display_scale: f32,
+        render_cell: CellMetrics,
+        config: TerminalSessionConfig,
+        repaint_wakeup: RepaintWakeup,
+    ) -> Result<Self> {
+        let pty_size = physical_pty_size(geometry, render_cell, display_scale);
         let (pty_master, child, tty_name) =
-            crate::terminal_launch::spawn(geometry, &config.launch)?.into_parts();
+            crate::terminal_launch::spawn(pty_size, &config.launch)?.into_parts();
         let mut reader = pty_master.try_clone_reader()?;
         let pty_writer = Arc::new(Mutex::new(pty_master.take_writer()?));
         let (pty_tx, pty_rx) = mpsc::sync_channel(MAX_READER_QUEUE_CHUNKS);
+        let (command_tx, command_rx) = mpsc::channel();
+        let pty_wakeup = command_tx.clone();
         thread::spawn(move || {
             let mut buf = [0_u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
                 if n == 0 || pty_tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
+                if pty_wakeup.send(TerminalCommand::PtyReady).is_err() {
+                    break;
+                }
             }
         });
-        let (command_tx, command_rx) = mpsc::channel();
         let latest_frame = Arc::new(PublishedFrame::new());
         let latest_drain = Arc::new(Mutex::new(DrainStats::default()));
         let pending_pty_len = Arc::new(AtomicUsize::new(0));
@@ -362,6 +389,9 @@ impl TerminalSession {
         };
         spawn_terminal_worker(TerminalWorkerConfig {
             geometry,
+            display_scale,
+            render_cell,
+            pty_size,
             colors: config.colors,
             cursor: config.cursor,
             features: config.features,
@@ -391,8 +421,8 @@ impl TerminalSession {
             worker_health,
             current_working_directory,
             geometry,
-            display_scale: 1.0,
-            render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
+            display_scale,
+            render_cell,
             child,
             tty_name,
         })
@@ -410,6 +440,7 @@ impl TerminalSession {
         let (done, response) = worker_request();
         self.send_command(TerminalCommand::Resize {
             geometry,
+            pty_size: physical_pty_size(geometry, self.render_cell, self.display_scale),
             done: Some(done),
         })?;
         response.receive("resizing")?;
@@ -426,6 +457,7 @@ impl TerminalSession {
         }
         self.send_command(TerminalCommand::Resize {
             geometry,
+            pty_size: physical_pty_size(geometry, self.render_cell, self.display_scale),
             done: None,
         })?;
         self.geometry = geometry;
@@ -441,7 +473,10 @@ impl TerminalSession {
         if (self.display_scale - display_scale).abs() <= f32::EPSILON {
             return Ok(());
         }
-        self.send_command(TerminalCommand::DisplayScale(display_scale))?;
+        self.send_command(TerminalCommand::DisplayScale {
+            display_scale,
+            pty_size: physical_pty_size(self.geometry, self.render_cell, display_scale),
+        })?;
         self.display_scale = display_scale;
         Ok(())
     }
@@ -451,7 +486,11 @@ impl TerminalSession {
             return Ok(());
         }
         let (done, response) = worker_request();
-        self.send_command(TerminalCommand::RenderCellMetrics { cell, done })?;
+        self.send_command(TerminalCommand::RenderCellMetrics {
+            cell,
+            pty_size: physical_pty_size(self.geometry, cell, self.display_scale),
+            done,
+        })?;
         response.receive("setting render cell metrics")?;
         self.render_cell = cell;
         Ok(())
@@ -617,6 +656,9 @@ impl TerminalSession {
 
 struct TerminalWorkerConfig {
     geometry: TerminalGeometry,
+    display_scale: f32,
+    render_cell: CellMetrics,
+    pty_size: PtySize,
     colors: TerminalColorConfig,
     cursor: TerminalCursorConfig,
     features: TerminalFeatureConfig,
@@ -638,12 +680,21 @@ struct TerminalWorkerConfig {
     benchmark_trace: Option<BenchmarkTrace>,
 }
 
-fn pty_size(geometry: TerminalGeometry) -> PtySize {
+fn physical_pty_size(
+    geometry: TerminalGeometry,
+    render_cell: CellMetrics,
+    display_scale: f32,
+) -> PtySize {
+    let (cell_width, cell_height) = render_cell.physical_size(display_scale);
     PtySize {
         rows: geometry.rows,
         cols: geometry.cols,
-        pixel_width: geometry.pixel_width(),
-        pixel_height: geometry.pixel_height(),
+        pixel_width: u32::from(geometry.cols)
+            .saturating_mul(cell_width)
+            .min(u32::from(u16::MAX)) as u16,
+        pixel_height: u32::from(geometry.rows)
+            .saturating_mul(cell_height)
+            .min(u32::from(u16::MAX)) as u16,
     }
 }
 
@@ -664,6 +715,8 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
                 return;
             }
         };
+        engine.set_display_scale(config.display_scale);
+        engine.set_render_cell_metrics(config.render_cell);
         let callback_writer = config.pty_writer.clone();
         let callback_health = Arc::clone(&config.worker_health);
         if let Err(error) = engine.on_pty_write(move |_terminal, bytes| {
@@ -676,6 +729,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
         let mut worker = TerminalWorker {
             engine,
             pty_master: config.pty_master,
+            pty_size: config.pty_size,
             pty_rx: config.pty_rx,
             pty_writer: config.pty_writer,
             command_rx: config.command_rx,
@@ -697,6 +751,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
             has_unpublished_frame: false,
             sync_output_since: None,
             sync_output_batch_pending: false,
+            deferred_sync_publish: false,
             last_terminal_change: None,
             force_next_frame_publish: false,
             command_disconnected: false,
@@ -722,6 +777,7 @@ fn spawn_terminal_worker(config: TerminalWorkerConfig) -> Result<()> {
 struct TerminalWorker {
     engine: TerminalEngine,
     pty_master: Box<dyn MasterPty + Send>,
+    pty_size: PtySize,
     pty_rx: Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<Box<dyn Write + Send>>>,
     command_rx: Receiver<TerminalCommand>,
@@ -743,6 +799,7 @@ struct TerminalWorker {
     has_unpublished_frame: bool,
     sync_output_since: Option<Instant>,
     sync_output_batch_pending: bool,
+    deferred_sync_publish: bool,
     last_terminal_change: Option<Instant>,
     force_next_frame_publish: bool,
     command_disconnected: bool,
@@ -760,6 +817,7 @@ struct WorkerCommandStats {
 impl TerminalWorker {
     fn run(&mut self) {
         loop {
+            self.publish_deferred_sync_frame();
             let command_stats = self.process_commands();
             let mut did_work = command_stats.did_work;
             let mut terminal_changed = command_stats.terminal_changed;
@@ -825,11 +883,22 @@ impl TerminalWorker {
             self.sync_output_since = None;
             Duration::ZERO
         };
-        sync_output_suppresses_publish(
-            active,
-            std::mem::take(&mut self.sync_output_batch_pending),
-            elapsed,
-        )
+        let observed = std::mem::take(&mut self.sync_output_batch_pending);
+        if observed && !active {
+            self.deferred_sync_publish = true;
+        }
+        sync_output_suppresses_publish(active, observed, elapsed)
+    }
+
+    fn publish_deferred_sync_frame(&mut self) {
+        if !self.deferred_sync_publish || !self.has_unpublished_frame {
+            return;
+        }
+        if synchronized_output_state(&self.engine, &self.worker_health) {
+            return;
+        }
+        self.publish_frame();
+        self.last_frame_publish = Instant::now();
     }
 
     fn mark_unpublished_frame(&mut self) {
@@ -859,25 +928,39 @@ impl TerminalWorker {
             stats.did_work = true;
             stats.commands += 1;
             match command {
-                TerminalCommand::DisplayScale(display_scale) => {
+                TerminalCommand::PtyReady => {}
+                TerminalCommand::DisplayScale {
+                    display_scale,
+                    pty_size,
+                } => {
                     self.engine.set_display_scale(display_scale);
+                    self.resize_pty(pty_size);
                     stats.terminal_changed = true;
                 }
-                TerminalCommand::RenderCellMetrics { cell, done } => {
+                TerminalCommand::RenderCellMetrics {
+                    cell,
+                    pty_size,
+                    done,
+                } => {
                     if !done.try_claim() {
                         continue;
                     }
                     self.engine.set_render_cell_metrics(cell);
+                    self.resize_pty(pty_size);
                     stats.terminal_changed = true;
                     self.pending_render_cell_ack = Some(done);
                 }
-                TerminalCommand::Resize { geometry, done } => {
+                TerminalCommand::Resize {
+                    geometry,
+                    pty_size,
+                    done,
+                } => {
                     if let Some(done) = done.as_ref()
                         && !done.try_claim()
                     {
                         continue;
                     }
-                    let result = self.resize(geometry);
+                    let result = self.resize(geometry, pty_size);
                     if let Err(error) = result {
                         self.worker_health.record("resize", error);
                         if let Some(done) = done {
@@ -1073,12 +1156,23 @@ impl TerminalWorker {
         stats
     }
 
-    fn resize(&mut self, geometry: TerminalGeometry) -> Result<()> {
+    fn resize_pty(&mut self, pty_size: PtySize) {
+        if pty_size == self.pty_size {
+            return;
+        }
+        match self.pty_master.resize(pty_size) {
+            Ok(()) => self.pty_size = pty_size,
+            Err(error) => self.worker_health.record("resize PTY pixels", error),
+        }
+    }
+
+    fn resize(&mut self, geometry: TerminalGeometry, pty_size: PtySize) -> Result<()> {
         let previous = self.engine.geometry();
-        self.pty_master.resize(pty_size(geometry))?;
+        let previous_pty_size = self.pty_size;
+        self.pty_master.resize(pty_size)?;
         if let Err(error) = self.engine.resize(geometry) {
             let engine_rollback = self.engine.resize(previous).err();
-            let pty_rollback = self.pty_master.resize(pty_size(previous)).err();
+            let pty_rollback = self.pty_master.resize(previous_pty_size).err();
             if engine_rollback.is_none() && pty_rollback.is_none() {
                 return Err(error);
             }
@@ -1093,6 +1187,7 @@ impl TerminalWorker {
             .join(", ");
             return Err(error.context(format!("resize rollback failed: {details}")));
         }
+        self.pty_size = pty_size;
         Ok(())
     }
 
@@ -1111,6 +1206,7 @@ impl TerminalWorker {
         self.pending_pty_len.store(0, Ordering::Relaxed);
         self.has_unpublished_frame = false;
         self.sync_output_batch_pending = false;
+        self.deferred_sync_publish = false;
         self.last_terminal_change = None;
     }
 
@@ -1295,6 +1391,7 @@ impl TerminalWorker {
         }
         self.force_next_frame_publish = false;
         self.has_unpublished_frame = false;
+        self.deferred_sync_publish = false;
         self.acknowledge_resize();
         (self.repaint_wakeup)();
     }
@@ -1403,5 +1500,6 @@ pub fn should_publish_frame_after_work(
         };
         return elapsed_since_last_publish >= interval;
     }
-    elapsed_since_last_terminal_change >= WORKER_SETTLED_FRAME_DELAY
+    elapsed_since_last_publish >= WORKER_READY_FRAME_INTERVAL
+        || elapsed_since_last_terminal_change >= WORKER_SETTLED_FRAME_DELAY
 }

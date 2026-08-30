@@ -303,6 +303,8 @@ fn encode_mouse_input() -> MouseInput {
         },
         x: 42.0,
         y: 84.0,
+        pixel_x: 42.0,
+        pixel_y: 84.0,
         size: MouseEncoderSize {
             screen_width: 1080,
             screen_height: 880,

@@ -18,10 +18,13 @@ use crate::bridge::{connect_bootty_rmux, rmux_missing_target_text, rmux_stale_ta
 
 pub(crate) const RMUX_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 const RMUX_OUTPUT_EVENT_MAX_BYTES: usize = 16 * 1024;
+const RMUX_OUTPUT_POLL_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
+const RMUX_OUTPUT_POLL_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(16);
 // Kitty keyboard sequences are a handful of bytes; anything longer is some
 // other CSI the scanner can skip instead of buffering.
 const RMUX_KEYBOARD_PROTOCOL_MAX_SEQUENCE_BYTES: usize = 64;
 const RMUX_KEYBOARD_PROTOCOL_OPTION: &str = "@bootty-keyboard-protocol";
+const RMUX_SGR_PIXELS_MOUSE_OPTION: &str = "@bootty-sgr-pixels-mouse";
 // `list_pane_rows` enumerates the session, so a pane it does not name is gone
 // rather than momentarily unresolvable. Worded distinctly from rmux's own
 // wording so the classifiers match these on purpose, not by substring.
@@ -229,6 +232,16 @@ async fn run_pane_io(request: RmuxOpenPaneRequest) {
             .await;
         protocol
     };
+    let stored_sgr_pixels_mouse = pane
+        .option(RMUX_SGR_PIXELS_MOUSE_OPTION)
+        .await
+        .ok()
+        .flatten();
+    let mut sgr_pixels_mouse = if let Some(stored) = stored_sgr_pixels_mouse {
+        SgrPixelsMouseMode::restored(&stored)
+    } else {
+        retained_sgr_pixels_mouse_mode(&pane).await?
+    };
     // Programs push and pop these flags around every prompt, so the daemon
     // round-trip must not sit in the byte path. The writer coalesces bursts and
     // keeps the writes ordered; it stops when this worker drops the sender.
@@ -245,10 +258,25 @@ async fn run_pane_io(request: RmuxOpenPaneRequest) {
             }
         }
     });
+    let (sgr_pixels_mouse_tx, mut sgr_pixels_mouse_rx) =
+        tokio::sync::watch::channel(sgr_pixels_mouse.option_text());
+    let sgr_pixels_mouse_writer = tokio::spawn({
+        let pane = pane.clone();
+        async move {
+            while sgr_pixels_mouse_rx.changed().await.is_ok() {
+                let enabled = sgr_pixels_mouse_rx.borrow_and_update().clone();
+                let _ = pane
+                    .set_option(RMUX_SGR_PIXELS_MOUSE_OPTION, &enabled)
+                    .await;
+            }
+        }
+    });
 
     let mut recovery = pane.recover_output().await?;
     let mut pending_events = VecDeque::new();
     let mut recovery_ended = false;
+    let mut poll_delay = RMUX_OUTPUT_POLL_INITIAL_DELAY;
+    let mut next_poll = tokio::time::Instant::now();
     loop {
         if output_tx.is_closed() || (recovery_ended && pending_events.is_empty()) {
             break;
@@ -265,29 +293,41 @@ async fn run_pane_io(request: RmuxOpenPaneRequest) {
                         .expect("output permit requires one pending event"),
                 );
             }
-            event = recovery.next(), if pending_events.is_empty() && !recovery_ended => {
-                match event? {
-                    Some(PaneRecoveryEvent::Rebase(mut rebase)) => {
-                        append_kitty_keyboard_protocol(&mut rebase.keyframe, &keyboard_protocol);
-                        pending_events.push_back(RmuxPaneEvent::Rebase(rebase.keyframe));
-                    }
-                    Some(PaneRecoveryEvent::Bytes { bytes, .. }) => {
-                        if let Some(flags) = keyboard_protocol.observe(&bytes) {
-                            let _ = keyboard_option_tx.send(flags);
+            _ = tokio::time::sleep_until(next_poll), if pending_events.is_empty() && !recovery_ended => {
+                let events = recovery.poll_once().await?;
+                if events.is_empty() {
+                    poll_delay = (poll_delay * 2).min(RMUX_OUTPUT_POLL_MAX_DELAY);
+                } else {
+                    poll_delay = RMUX_OUTPUT_POLL_INITIAL_DELAY;
+                }
+                next_poll = tokio::time::Instant::now() + poll_delay;
+                for event in events {
+                    match event {
+                        PaneRecoveryEvent::Rebase(mut rebase) => {
+                            append_kitty_keyboard_protocol(&mut rebase.keyframe, &keyboard_protocol);
+                            append_sgr_pixels_mouse_mode(&mut rebase.keyframe, &sgr_pixels_mouse);
+                            pending_events.push_back(RmuxPaneEvent::Rebase(rebase.keyframe));
                         }
-                        queue_bytes(&mut pending_events, bytes);
+                        PaneRecoveryEvent::Bytes { bytes, .. } => {
+                            if let Some(flags) = keyboard_protocol.observe(&bytes) {
+                                let _ = keyboard_option_tx.send(flags);
+                            }
+                            if let Some(enabled) = sgr_pixels_mouse.observe(&bytes) {
+                                let _ = sgr_pixels_mouse_tx.send(enabled);
+                            }
+                            queue_bytes(&mut pending_events, bytes);
+                        }
+                        PaneRecoveryEvent::Lifecycle(_) => {
+                            pending_events.push_back(RmuxPaneEvent::ProcessExited);
+                        }
+                        PaneRecoveryEvent::End(reason) => {
+                            let error = (!matches!(reason, PaneStreamEndReason::PaneRemoved))
+                                .then(|| format!("{reason:?}"));
+                            pending_events.push_back(RmuxPaneEvent::End(error));
+                            recovery_ended = true;
+                        }
+                        _ => anyhow::bail!("rmux returned an unsupported pane recovery event"),
                     }
-                    Some(PaneRecoveryEvent::Lifecycle(_)) => {
-                        pending_events.push_back(RmuxPaneEvent::ProcessExited);
-                    }
-                    Some(PaneRecoveryEvent::End(reason)) => {
-                        let error = (!matches!(reason, PaneStreamEndReason::PaneRemoved))
-                            .then(|| format!("{reason:?}"));
-                        pending_events.push_back(RmuxPaneEvent::End(error));
-                        recovery_ended = true;
-                    }
-                    Some(_) => anyhow::bail!("rmux returned an unsupported pane recovery event"),
-                    None => recovery_ended = true,
                 }
             }
             Some(mut bytes) = input_rx.recv() => {
@@ -321,8 +361,16 @@ async fn run_pane_io(request: RmuxOpenPaneRequest) {
     // durable before this worker goes away.
     drop(keyboard_option_tx);
     let _ = keyboard_option_writer.await;
+    drop(sgr_pixels_mouse_tx);
+    let _ = sgr_pixels_mouse_writer.await;
     let _ = pane
         .set_option(RMUX_KEYBOARD_PROTOCOL_OPTION, &keyboard_protocol.flags_text())
+        .await;
+    let _ = pane
+        .set_option(
+            RMUX_SGR_PIXELS_MOUSE_OPTION,
+            &sgr_pixels_mouse.option_text(),
+        )
         .await;
         Ok(())
     }
@@ -384,6 +432,26 @@ async fn retained_kitty_keyboard_protocol(pane: &Pane) -> Result<KittyKeyboardPr
     Ok(protocol)
 }
 
+async fn retained_sgr_pixels_mouse_mode(pane: &Pane) -> Result<SgrPixelsMouseMode> {
+    let mut output_stream = pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await?;
+    let mut mode = SgrPixelsMouseMode::default();
+    loop {
+        let chunks = output_stream.poll_once().await?;
+        if chunks.is_empty() {
+            break;
+        }
+        for chunk in chunks {
+            let PaneOutputChunk::Bytes { bytes, .. } = chunk else {
+                continue;
+            };
+            mode.observe(&bytes);
+        }
+    }
+    Ok(mode)
+}
+
 /// Kitty keyboard protocol state reconstructed from a pane transcript.
 ///
 /// The daemon replays every other terminal mode, so Bootty only tracks the
@@ -397,6 +465,80 @@ struct KittyKeyboardProtocol {
     /// transcript that never mentions the protocol cannot contradict what the
     /// pane already stored.
     observed: bool,
+}
+
+#[derive(Default)]
+struct SgrPixelsMouseMode {
+    pending: Vec<u8>,
+    enabled: bool,
+}
+
+impl SgrPixelsMouseMode {
+    fn restored(value: &str) -> Self {
+        Self {
+            enabled: value == "1",
+            ..Self::default()
+        }
+    }
+
+    fn option_text(&self) -> String {
+        if self.enabled { "1" } else { "0" }.to_owned()
+    }
+
+    fn observe(&mut self, bytes: &[u8]) -> Option<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut changed = false;
+        let mut consumed = 0;
+        loop {
+            let Some(offset) = self.pending[consumed..]
+                .iter()
+                .position(|byte| *byte == b'\x1b')
+            else {
+                consumed = self.pending.len();
+                break;
+            };
+            let start = consumed + offset;
+            if self.pending.len() == start + 1 {
+                consumed = start;
+                break;
+            }
+            if self.pending[start + 1] != b'[' {
+                consumed = start + 1;
+                continue;
+            }
+            match scan_csi(&self.pending[start..]) {
+                CsiScan::Complete(len) => {
+                    if let Some(enabled) =
+                        parse_sgr_pixels_mouse_mode(&self.pending[start..start + len])
+                    {
+                        self.enabled = enabled;
+                        changed = true;
+                    }
+                    consumed = start + len;
+                }
+                CsiScan::Incomplete => {
+                    consumed = start;
+                    break;
+                }
+                CsiScan::Invalid => consumed = start + 1,
+            }
+        }
+        self.pending.drain(..consumed);
+        changed.then(|| self.option_text())
+    }
+}
+
+fn parse_sgr_pixels_mouse_mode(bytes: &[u8]) -> Option<bool> {
+    let enabled = match bytes.last()? {
+        b'h' => true,
+        b'l' => false,
+        _ => return None,
+    };
+    let parameters = bytes.strip_prefix(b"\x1b[?")?.get(..bytes.len() - 4)?;
+    parameters
+        .split(|byte| *byte == b';')
+        .any(|parameter| parameter == b"1016")
+        .then_some(enabled)
 }
 
 /// Kitty caps its own stack and drops the oldest entry past the limit.
@@ -573,6 +715,12 @@ fn append_kitty_keyboard_protocol(keyframe: &mut Vec<u8>, protocol: &KittyKeyboa
     }
     for flags in protocol.stack.iter().copied().chain([protocol.current]) {
         keyframe.extend_from_slice(format!("\x1b[>{flags}u").as_bytes());
+    }
+}
+
+fn append_sgr_pixels_mouse_mode(keyframe: &mut Vec<u8>, mode: &SgrPixelsMouseMode) {
+    if mode.enabled {
+        keyframe.extend_from_slice(b"\x1b[?1016h");
     }
 }
 
@@ -818,5 +966,35 @@ mod tests {
             protocol.observe(&vec![b'x'; 1024]);
         }
         assert!(protocol.pending.len() <= RMUX_KEYBOARD_PROTOCOL_MAX_SEQUENCE_BYTES);
+    }
+
+    #[test]
+    fn sgr_pixels_mouse_mode_survives_rebase() {
+        let mut mode = SgrPixelsMouseMode::default();
+        assert_eq!(mode.observe(b"\x1b[?1003;1006;1016h"), Some("1".into()));
+
+        let mut keyframe = Vec::new();
+        append_sgr_pixels_mouse_mode(&mut keyframe, &mode);
+        assert_eq!(keyframe, b"\x1b[?1016h");
+
+        assert_eq!(mode.observe(b"\x1b[?1016l"), Some("0".into()));
+        keyframe.clear();
+        append_sgr_pixels_mouse_mode(&mut keyframe, &mode);
+        assert!(keyframe.is_empty());
+    }
+
+    #[test]
+    fn sgr_pixels_mouse_mode_reassembles_split_sequences() {
+        let mut mode = SgrPixelsMouseMode::default();
+        assert_eq!(mode.observe(b"\x1b[?10"), None);
+        assert_eq!(mode.observe(b"16h"), Some("1".into()));
+        assert!(mode.enabled);
+    }
+
+    #[test]
+    fn sgr_pixels_mouse_mode_round_trips_through_the_option() {
+        let restored = SgrPixelsMouseMode::restored("1");
+        assert!(restored.enabled);
+        assert_eq!(restored.option_text(), "1");
     }
 }

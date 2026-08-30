@@ -25,8 +25,10 @@ pub fn start_attach_terminal(
         bootty_runtime::terminfo::vendored_terminfo_dir().is_some(),
         env::var_os("PATH").as_deref(),
     )?;
-    Ok(Box::new(TerminalSession::new_with_config(
+    Ok(Box::new(TerminalSession::new_with_config_and_host_metrics(
         request.geometry,
+        request.display_scale,
+        request.render_cell,
         config,
         Arc::clone(request.repaint_wakeup),
     )?))

@@ -7,7 +7,6 @@ use anyhow::{Context, Result};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::terminal_session::SessionLaunchConfig;
-use bootty_surface::geometry::TerminalGeometry;
 use bootty_terminal::terminal_engine::{TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION};
 
 pub const BOOTTY_SHELL_ENV: &str = "BOOTTY_SHELL";
@@ -65,17 +64,9 @@ impl Drop for OwnedChild {
     }
 }
 
-pub(crate) fn spawn(
-    geometry: TerminalGeometry,
-    config: &SessionLaunchConfig,
-) -> Result<SpawnedTerminal> {
+pub(crate) fn spawn(size: PtySize, config: &SessionLaunchConfig) -> Result<SpawnedTerminal> {
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows: geometry.rows,
-        cols: geometry.cols,
-        pixel_width: geometry.pixel_width(),
-        pixel_height: geometry.pixel_height(),
-    })?;
+    let pair = pty_system.openpty(size)?;
 
     let shell = shell_command_path(config.shell.clone());
     let launch_env = resolve_launch_environment(config, crate::terminfo::vendored_terminfo_dir());

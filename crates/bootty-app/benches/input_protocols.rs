@@ -254,6 +254,8 @@ fn mouse_event(case: MouseCase, index: usize) -> MouseInput {
         },
         x: 10.0 + (index % 100) as f32 * 7.0,
         y: 8.0 + (index % 30) as f32 * 13.0,
+        pixel_x: 10.0 + (index % 100) as f32 * 7.0,
+        pixel_y: 8.0 + (index % 30) as f32 * 13.0,
         size: MouseEncoderSize {
             screen_width: u32::from(GEOMETRY.cols) * GEOMETRY.cell_width,
             screen_height: u32::from(GEOMETRY.rows) * GEOMETRY.cell_height,

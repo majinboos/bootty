@@ -19,7 +19,7 @@ use bootty_mux::{
     terminal::{ActiveTerminal, TerminalRuntime, decode_scoped_pane_id},
 };
 use bootty_render::{
-    geometry::{TerminalSurface, ViewTransform},
+    geometry::{CellMetrics, TerminalSurface, ViewTransform},
     terminal_text::TerminalTextConfig,
 };
 use bootty_runtime::{
@@ -1214,6 +1214,20 @@ impl AppState {
         }
 
         self.sync_macos_non_native_fullscreen_presentation();
+        let terminal_host_metrics = {
+            let terminal = &mut self.workspace.active.binding.terminal;
+            terminal
+                .set_display_scale(terminal_scale_factor)
+                .and_then(|()| {
+                    terminal.set_render_cell_metrics(CellMetrics::new(
+                        terminal_cell_width,
+                        terminal_cell_height,
+                    ))
+                })
+        };
+        if let Err(error) = terminal_host_metrics {
+            self.record_error(error);
+        }
         let drain = self.workspace.drain();
         self.last_drain = drain.active_drain;
         self.drain_terminal_side_effects(

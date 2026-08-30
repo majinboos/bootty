@@ -42,6 +42,7 @@ const COLORTERM_ENV: &str = "COLORTERM";
 const TERMINFO_ENV: &str = "TERMINFO";
 const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
 const TERM_PROGRAM_VERSION_ENV: &str = "TERM_PROGRAM_VERSION";
+const TMUX_ENV: &str = "TMUX";
 
 fn bootty_rmux_process_environment() -> Vec<String> {
     bootty_rmux_process_environment_with_terminfo(vendored_terminfo_dir())
@@ -68,6 +69,10 @@ fn bootty_rmux_process_environment_with_terminfo(terminfo_dir: Option<&Path>) ->
         format!("{COLORTERM_ENV}=truecolor"),
         format!("{TERM_PROGRAM_ENV}={TERMINAL_PROGRAM}"),
         format!("{TERM_PROGRAM_VERSION_ENV}={TERMINAL_PROGRAM_VERSION}"),
+        // rmux-core exports a tmux-compatible endpoint even when its optional tmux shim cannot
+        // exist beside Bootty's embedded daemon. Do not make clients invoke the unrelated system
+        // tmux; RMUX remains the authoritative endpoint marker.
+        format!("{TMUX_ENV}="),
     ];
     if let Some(terminfo_dir) = terminfo_dir {
         environment.push(format!("{TERMINFO_ENV}={}", terminfo_dir.to_string_lossy()));

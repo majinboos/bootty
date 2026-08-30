@@ -86,8 +86,12 @@ pub struct MouseInput {
     pub action: MouseAction,
     pub button: Option<MouseButton>,
     pub mods: KeyMods,
+    /// Position projected onto the integer cell grid for cell mouse protocols.
     pub x: f32,
     pub y: f32,
+    /// Raw logical surface position for SGR pixel mouse mode.
+    pub pixel_x: f32,
+    pub pixel_y: f32,
     pub size: MouseEncoderSize,
 }
 

@@ -38,6 +38,18 @@ fn surface_geometry_includes_rounded_cell_size() {
     );
 }
 
+#[rstest]
+#[case::retina(CellMetrics::new(10.25, 22.5), 2.0, (21, 45))]
+#[case::fractional_scale(CellMetrics::new(8.0, 23.0), 1.5, (12, 35))]
+#[case::invalid_scale(CellMetrics::new(8.0, 23.0), f32::NAN, (8, 23))]
+fn physical_cell_size_uses_display_scale(
+    #[case] cell: CellMetrics,
+    #[case] display_scale: f32,
+    #[case] expected: (u32, u32),
+) {
+    assert_eq!(cell.physical_size(display_scale), expected);
+}
+
 #[test]
 fn relative_position_is_rect_local() {
     let rect = SurfaceRect::from_min_size(20.0, 40.0, 200.0, 100.0);

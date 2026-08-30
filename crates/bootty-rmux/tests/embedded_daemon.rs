@@ -89,6 +89,7 @@ embedded_scenarios!(
     terminal_requests,
     kitty_keyboard_protocol_reports_command_alt_key,
     terminal_queries_do_not_leak_into_the_shell,
+    rmux_does_not_claim_the_system_tmux_server,
     kitty_keyboard_protocol_pop_restores_legacy_ctrl_c,
     multi_pane_window_resize_keeps_pane_targets_live,
     closing_session_with_pending_resize_is_quiet,
@@ -291,11 +292,36 @@ while b"\x1b\\" not in colour:
     if not select.select([fd], [], [], 2.0)[0]:
         break
     colour += os.read(fd, 1)
+os.write(fd, b"\x1b[14t\x1b[16t")
+size = b""
+while b"\x1b[4;480;800t" not in size or b"\x1b[6;20;10t" not in size:
+    if not select.select([fd], [], [], 2.0)[0]:
+        break
+    size += os.read(fd, 1)
+os.write(fd, b"\x1b[?1016h\x1b[?1016$p")
+pixel_mouse = b""
+while b"\x1b[?1016;1$y" not in pixel_mouse:
+    if not select.select([fd], [], [], 2.0)[0]:
+        break
+    pixel_mouse += os.read(fd, 1)
+os.write(fd, b"\x1b[?1016l")
+os.write(fd, b"\x1bPtmux;\x1b\x1b_Gi=4207,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\x1b\\\x1b\\")
+graphics = b""
+while b"\x1b_Gi=4207;OK\x1b\\" not in graphics:
+    if not select.select([fd], [], [], 2.0)[0]:
+        break
+    graphics += os.read(fd, 1)
 termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 if b"c" not in data:
     sys.exit("rmux did not answer DA1")
 if b"rgb:" not in colour:
     sys.exit("Bootty did not answer OSC 11")
+if b"\x1b[4;480;800t" not in size or b"\x1b[6;20;10t" not in size:
+    sys.exit("Bootty did not answer XTWINOPS pixel size queries")
+if b"\x1b[?1016;1$y" not in pixel_mouse:
+    sys.exit("Bootty did not answer the SGR pixel mouse mode query")
+if b"\x1b_Gi=4207;OK\x1b\\" not in graphics:
+    sys.exit("Bootty did not answer the tmux-wrapped Kitty graphics probe")
 print("BOOTTY_RMUX_COLOR_QUERY_OK")
     "#,
         )?;
@@ -313,10 +339,31 @@ print("BOOTTY_RMUX_COLOR_QUERY_OK")
             frame.contains("BOOTTY_RMUX_COLOR_QUERY_OK")
                 && !frame.contains("?0u")
                 && !frame.contains("rgb:")
+                && !frame.contains("4;480;800t")
+                && !frame.contains("6;20;10t")
+                && !frame.contains("Gi=4207")
                 && !frame.contains("62;22;52c"),
             "terminal replies leaked into the resumed shell: {frame:?}"
         );
         let _ = std::fs::remove_file(&script_path);
+
+        ditch_session(&mut backend, &session_id)
+    }
+
+    pub fn rmux_does_not_claim_the_system_tmux_server() -> Result<()> {
+        let (mut backend, registry, session_id, window_id, pane) =
+            create_embedded_session(unscoped_tag())?;
+        let mut terminal = open_terminal(registry, &pane, &window_id)?;
+        prepare_pane(&mut terminal)?;
+        terminal.write_input(
+            b"printf 'BOOTTY_RMUX_ENV TMUX=<%s> RMUX=<%s>\\n' \"$TMUX\" \"$RMUX\"\r",
+        )?;
+        wait_for_terminal_text(&mut terminal, "BOOTTY_RMUX_ENV TMUX=<> RMUX=<")?;
+        let frame = terminal.extract_frame()?.text.iter().collect::<String>();
+        anyhow::ensure!(
+            !frame.contains("TMUX=</"),
+            "rmux pane claimed a tmux server: {frame:?}"
+        );
 
         ditch_session(&mut backend, &session_id)
     }

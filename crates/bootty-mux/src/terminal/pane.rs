@@ -31,6 +31,8 @@ pub struct PaneStartRequest<'a> {
     pub target: &'a ScopedMuxPaneTarget,
     pub geometry: TerminalGeometry,
     pub spawn_geometry: TerminalGeometry,
+    pub display_scale: f32,
+    pub render_cell: CellMetrics,
     pub terminal_config: &'a TerminalSessionConfig,
     pub repaint_wakeup: &'a Arc<dyn Fn() + Send + Sync + 'static>,
 }
@@ -62,6 +64,8 @@ pub struct BackendPaneTerminal {
     behavior: PaneBehavior,
     active_target: Option<ScopedMuxPaneTarget>,
     geometry: TerminalGeometry,
+    display_scale: f32,
+    render_cell: CellMetrics,
     terminal_config: TerminalSessionConfig,
     repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     native_terminals: HashMap<ScopedMuxPaneTarget, Box<dyn TerminalRuntime>>,
@@ -357,6 +361,8 @@ impl BackendPaneTerminal {
             behavior,
             active_target: None,
             geometry,
+            display_scale: 1.0,
+            render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
             terminal_config,
             repaint_wakeup,
             native_terminals: HashMap::new(),
@@ -498,6 +504,8 @@ impl BackendPaneTerminal {
             target,
             geometry: self.geometry,
             spawn_geometry: self.native_window_spawn_geometry.unwrap_or(self.geometry),
+            display_scale: self.display_scale,
+            render_cell: self.render_cell,
             terminal_config: &self.terminal_config,
             repaint_wakeup: &self.repaint_wakeup,
         };
@@ -801,10 +809,12 @@ impl Drop for BackendPaneTerminal {
 
 impl TerminalFrameSource for BackendPaneTerminal {
     fn set_display_scale(&mut self, display_scale: f32) -> Result<()> {
+        self.display_scale = display_scale;
         self.terminal.set_display_scale(display_scale)
     }
 
     fn set_render_cell_metrics(&mut self, cell: CellMetrics) -> Result<()> {
+        self.render_cell = cell;
         self.terminal.set_render_cell_metrics(cell)
     }
 

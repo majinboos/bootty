@@ -1,6 +1,12 @@
 use std::{fs, time::Duration};
 #[cfg(unix)]
-use std::{sync::Arc, thread};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+};
 
 use assert_fs::{TempDir, prelude::*};
 #[cfg(unix)]
@@ -11,7 +17,10 @@ use bootty_runtime::{
     geometry::TerminalGeometry,
     perf::{guard_frame_path, record_subprocess},
     scheduler::{RepaintScheduler, RepaintSignal},
+    terminal_session::should_publish_frame_after_work,
 };
+#[cfg(unix)]
+use bootty_surface::geometry::CellMetrics;
 use bootty_terminal::terminal_engine::TerminalEngine;
 #[cfg(unix)]
 use bootty_terminal::terminal_engine::{
@@ -195,6 +204,94 @@ fn completed_synchronized_output_batch_suppresses_intermediate_publish() {
             observed,
             Duration::ZERO,
         )
+    );
+}
+
+#[test]
+fn continuous_drained_output_publishes_at_the_ready_interval() {
+    assert!(should_publish_frame_after_work(
+        true,
+        false,
+        false,
+        0,
+        Duration::ZERO,
+        Duration::from_millis(16),
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn continuous_completed_synchronized_output_batches_keep_publishing_frames() {
+    let repaint_count = Arc::new(AtomicUsize::new(0));
+    let repaint_wakeup = {
+        let repaint_count = Arc::clone(&repaint_count);
+        Arc::new(move || {
+            repaint_count.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    let config = TerminalSessionConfig {
+        launch: SessionLaunchConfig {
+            shell: Some("/bin/sh".to_owned()),
+            args: vec![
+                "-c".to_owned(),
+                "i=0; while [ $i -lt 40 ]; do printf '\\033[?2026hframe-%s\\033[?2026l' \"$i\"; i=$((i + 1)); sleep 0.002; done"
+                    .to_owned(),
+            ],
+            ..SessionLaunchConfig::default()
+        },
+        ..TerminalSessionConfig::default()
+    };
+    let mut session = TerminalSession::new_with_config(geometry(20, 4), config, repaint_wakeup)
+        .expect("terminal starts");
+
+    for _ in 0..100 {
+        if session.child_exited().expect("child status reads") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(
+        repaint_count.load(Ordering::Relaxed) > 3,
+        "continuous synchronized batches starved frame publication"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn continuous_plain_output_keeps_publishing_frames() {
+    let repaint_count = Arc::new(AtomicUsize::new(0));
+    let repaint_wakeup = {
+        let repaint_count = Arc::clone(&repaint_count);
+        Arc::new(move || {
+            repaint_count.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    let config = TerminalSessionConfig {
+        launch: SessionLaunchConfig {
+            shell: Some("/bin/sh".to_owned()),
+            args: vec![
+                "-c".to_owned(),
+                "i=0; while [ $i -lt 40 ]; do printf 'frame-%s\\r' \"$i\"; i=$((i + 1)); sleep 0.002; done"
+                    .to_owned(),
+            ],
+            ..SessionLaunchConfig::default()
+        },
+        ..TerminalSessionConfig::default()
+    };
+    let mut session = TerminalSession::new_with_config(geometry(20, 4), config, repaint_wakeup)
+        .expect("terminal starts");
+
+    for _ in 0..100 {
+        if session.child_exited().expect("child status reads") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+
+    assert!(
+        repaint_count.load(Ordering::Relaxed) > 3,
+        "continuous output starved frame publication"
     );
 }
 
@@ -409,6 +506,39 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
     );
     assert_eq!(fields[7], "argument");
     assert_eq!(fields[8], "%7");
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_launch_reports_initial_host_cell_metrics() {
+    let directory = assert_fs::TempDir::new().expect("launch directory");
+    let output_path = directory.path().join("cell-size.txt");
+    let config = TerminalSessionConfig {
+        launch: SessionLaunchConfig {
+            shell: Some("/bin/bash".to_owned()),
+            args: vec![
+                "-c".to_owned(),
+                "printf '\\033[16t'; IFS= read -r -d t reply; printf '%st' \"$reply\" > \"$BOOTTY_TEST_OUTPUT\""
+                    .to_owned(),
+            ],
+            env: vec![(
+                "BOOTTY_TEST_OUTPUT".to_owned(),
+                output_path.to_string_lossy().into_owned(),
+            )],
+            ..SessionLaunchConfig::default()
+        },
+        ..TerminalSessionConfig::default()
+    };
+    let _session = TerminalSession::new_with_config_and_host_metrics(
+        geometry(20, 4),
+        2.0,
+        CellMetrics::new(11.5, 17.5),
+        config,
+        Arc::new(|| {}),
+    )
+    .expect("terminal starts");
+
+    assert_eq!(wait_for_file(&output_path).as_bytes(), b"\x1b[6;35;23t");
 }
 
 #[cfg(unix)]

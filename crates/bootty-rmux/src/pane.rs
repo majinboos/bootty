@@ -47,7 +47,7 @@ const RMUX_INPUT_FAST_PATH_DRAIN_CHUNKS: usize = 8;
 const RMUX_INPUT_FAST_PATH_DRAIN_TIME_US: u128 = 2_000;
 const RMUX_MAX_COLLECT_BYTES_PER_TICK: usize = 4 * 1024 * 1024;
 const RMUX_MAX_COLLECT_CHUNKS_PER_TICK: usize = 256;
-const RMUX_WORKER_IDLE_WAIT: Duration = Duration::from_millis(16);
+const RMUX_WORKER_IDLE_WAIT: Duration = Duration::from_millis(8);
 const RMUX_INITIAL_FRAME_AGE: Duration = Duration::from_millis(16);
 
 struct RmuxNativeTerminal {
@@ -141,6 +141,8 @@ enum RmuxTerminalCommand {
 struct RmuxWorkerConfig {
     pane_io: RmuxPaneIo,
     geometry: TerminalGeometry,
+    display_scale: f32,
+    render_cell: CellMetrics,
     terminal_config: TerminalSessionConfig,
     command_rx: mpsc::Receiver<RmuxTerminalCommand>,
     latest_frame: Arc<RmuxPublishedFrame>,
@@ -179,6 +181,8 @@ struct RmuxWorker {
     has_unpublished_frame: bool,
     force_next_frame_publish: bool,
     sync_output_since: Option<Instant>,
+    sync_output_batch_pending: bool,
+    deferred_sync_publish: bool,
     last_terminal_change: Option<Instant>,
     waiting_initial_remote_frame: bool,
     command_disconnected: bool,
@@ -190,6 +194,8 @@ impl RmuxNativeTerminal {
         target: MuxPaneTarget,
         remote: Option<&SshRemote>,
         geometry: TerminalGeometry,
+        display_scale: f32,
+        render_cell: CellMetrics,
         config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> Result<Self> {
@@ -214,6 +220,8 @@ impl RmuxNativeTerminal {
         spawn_rmux_terminal_worker(RmuxWorkerConfig {
             pane_io,
             geometry,
+            display_scale,
+            render_cell,
             terminal_config: config,
             command_rx,
             latest_frame: Arc::clone(&latest_frame),
@@ -232,8 +240,8 @@ impl RmuxNativeTerminal {
             closed,
             error_rx,
             geometry,
-            display_scale: 1.0,
-            render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
+            display_scale,
+            render_cell,
             needs_initial_resize: true,
         })
     }
@@ -404,6 +412,8 @@ impl BackendPanePolicy for RmuxPanePolicy {
             request.target.mux_target().clone(),
             self.remote.as_ref(),
             request.spawn_geometry,
+            request.display_scale,
+            request.render_cell,
             config,
             Arc::clone(request.repaint_wakeup),
         )?)))
@@ -639,12 +649,18 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
                 return;
             }
         };
+        engine.set_display_scale(config.display_scale);
+        engine.set_render_cell_metrics(config.render_cell);
         let callback_input = config.pane_io.input_tx.clone();
         if let Err(error) = engine.on_pty_write(move |_terminal, bytes| {
-            // RMUX answers terminal capability queries beside the pane PTY.
-            // Bootty alone knows its configured palette, so return only those
-            // replies instead of duplicating delayed CSI replies into the shell.
-            if is_osc_default_color_response(bytes) {
+            // RMUX answers most terminal capability queries beside the pane PTY. Bootty alone
+            // knows its configured palette and physical cell size, so return only replies RMUX
+            // cannot own instead of duplicating delayed CSI replies into the shell.
+            if is_osc_default_color_response(bytes)
+                || is_xtwinops_pixel_size_response(bytes)
+                || is_kitty_graphics_response(bytes)
+                || is_sgr_pixel_mouse_mode_response(bytes)
+            {
                 let _ = callback_input.send(bytes.to_vec());
             }
         }) {
@@ -670,6 +686,8 @@ fn spawn_rmux_terminal_worker(config: RmuxWorkerConfig) -> Result<()> {
             has_unpublished_frame: false,
             force_next_frame_publish: false,
             sync_output_since: None,
+            sync_output_batch_pending: false,
+            deferred_sync_publish: false,
             last_terminal_change: None,
             waiting_initial_remote_frame: config.waiting_initial_remote_frame,
             command_disconnected: false,
@@ -692,9 +710,25 @@ fn is_osc_default_color_response(bytes: &[u8]) -> bool {
         .any(|prefix| bytes.starts_with(*prefix))
 }
 
+fn is_xtwinops_pixel_size_response(bytes: &[u8]) -> bool {
+    [b"\x1b[4;".as_slice(), b"\x1b[6;".as_slice()]
+        .iter()
+        .any(|prefix| bytes.starts_with(prefix))
+        && bytes.ends_with(b"t")
+}
+
+fn is_kitty_graphics_response(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b_Gi=") && bytes.ends_with(b"\x1b\\")
+}
+
+fn is_sgr_pixel_mouse_mode_response(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b[?1016;") && bytes.ends_with(b"$y")
+}
+
 impl RmuxWorker {
     fn run(mut self) {
         loop {
+            self.publish_deferred_sync_frame();
             let (mut did_work, mut terminal_changed) = self.process_commands();
             did_work |= self.collect_pane_output();
             let stats = self.drain_pending_output();
@@ -880,6 +914,8 @@ impl RmuxWorker {
                         worker.pending_output.clear();
                         worker.pending_output_len.store(0, Ordering::Relaxed);
                         worker.has_unpublished_frame = false;
+                        worker.sync_output_batch_pending = false;
+                        worker.deferred_sync_publish = false;
                         Ok(())
                     });
                 }
@@ -918,6 +954,8 @@ impl RmuxWorker {
                     // following epoch's bytes.
                     self.pending_output.clear();
                     self.update_pending_output_len();
+                    self.sync_output_batch_pending = false;
+                    self.deferred_sync_publish = false;
                     collected_chunks += 1;
                     collected_bytes += keyframe.len();
                     self.engine.write_vt_without_pty_responses(&keyframe);
@@ -963,17 +1001,24 @@ impl RmuxWorker {
 
     fn drain_pending_output(&mut self) -> DrainStats {
         let engine = &mut self.engine;
+        let mut observed_sync_output = engine.is_synchronized_output().unwrap_or(false);
+        let mut write = |bytes: &[u8]| {
+            engine.write_vt(bytes);
+            observed_sync_output |= engine.take_synchronized_output_observed();
+            observed_sync_output |= engine.is_synchronized_output().unwrap_or(false);
+        };
         let stats = if self.force_next_frame_publish {
             drain_output_backlog_with_limits(
                 &mut self.pending_output,
                 RMUX_INPUT_FAST_PATH_DRAIN_BYTES,
                 RMUX_INPUT_FAST_PATH_DRAIN_CHUNKS,
                 RMUX_INPUT_FAST_PATH_DRAIN_TIME_US,
-                |bytes| engine.write_vt(bytes),
+                &mut write,
             )
         } else {
-            drain_output_backlog(&mut self.pending_output, |bytes| engine.write_vt(bytes))
+            drain_output_backlog(&mut self.pending_output, &mut write)
         };
+        self.sync_output_batch_pending |= observed_sync_output;
         if stats.bytes > 0 {
             self.update_pending_output_len();
         }
@@ -1022,12 +1067,31 @@ impl RmuxWorker {
     }
 
     fn sync_output_suppressed(&mut self) -> bool {
-        if !self.engine.is_synchronized_output().unwrap_or(false) {
+        let active = self.engine.is_synchronized_output().unwrap_or(false);
+        let elapsed = if active {
+            self.sync_output_since
+                .get_or_insert_with(Instant::now)
+                .elapsed()
+        } else {
             self.sync_output_since = None;
-            return false;
+            Duration::ZERO
+        };
+        let observed = std::mem::take(&mut self.sync_output_batch_pending);
+        if observed && !active {
+            self.deferred_sync_publish = true;
         }
-        let since = *self.sync_output_since.get_or_insert_with(Instant::now);
-        sync_output_suppresses_publish(true, false, since.elapsed())
+        sync_output_suppresses_publish(active, observed, elapsed)
+    }
+
+    fn publish_deferred_sync_frame(&mut self) {
+        if !self.deferred_sync_publish || !self.has_unpublished_frame {
+            return;
+        }
+        if self.engine.is_synchronized_output().unwrap_or(false) {
+            return;
+        }
+        self.publish_frame();
+        self.last_frame_publish = Instant::now();
     }
 
     fn publish_frame(&mut self) {
@@ -1037,6 +1101,7 @@ impl RmuxWorker {
         if self.latest_frame.publish(frame.clone()).is_ok() {
             self.force_next_frame_publish = false;
             self.has_unpublished_frame = false;
+            self.deferred_sync_publish = false;
             (self.repaint_wakeup)();
         }
     }

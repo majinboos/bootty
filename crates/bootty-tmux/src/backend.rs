@@ -131,6 +131,7 @@ impl BackendPanePolicy for TmuxPanePolicy {
         &mut self,
         request: PaneStartRequest<'_>,
     ) -> Result<Option<Box<dyn TerminalRuntime>>> {
+        self.sync_passthrough_override(Some(request.target));
         let identity = if self.remote.is_some() {
             bootty_identity::ApplicationIdentity::Production
         } else {
@@ -161,6 +162,8 @@ impl BackendPanePolicy for TmuxPanePolicy {
                 target: request.target,
                 geometry: request.geometry,
                 spawn_geometry: request.spawn_geometry,
+                display_scale: request.display_scale,
+                render_cell: request.render_cell,
                 terminal_config: &terminal_config,
                 repaint_wakeup: request.repaint_wakeup,
             },
@@ -243,10 +246,13 @@ fn take_pane_allow_passthrough(
 
 #[cfg(feature = "app")]
 fn run_tmux(remote: Option<&SshRemote>, args: &[&str], what: &str) -> Result<String> {
-    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    let (program, args) = match remote {
-        Some(remote) => remote.command("tmux", &args),
-        None => ("tmux".to_owned(), args),
+    let command_args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    let (program, args) = if let Some(remote) = remote {
+        remote.command("tmux", &command_args)
+    } else {
+        let mut args = local_server_args(bootty_identity::ApplicationIdentity::for_process());
+        args.extend(command_args);
+        ("tmux".to_owned(), args)
     };
     let output = Command::new(resolve_launch_program(&program)?)
         .args(&args)

@@ -294,6 +294,7 @@ fn mouse_input_from_surface_point(
     surface: TerminalSurface,
 ) -> Option<MouseInput> {
     let position = surface.mouse_position(pos)?;
+    let pixel_position = surface.relative_position(pos)?;
 
     Some(MouseInput {
         action,
@@ -301,6 +302,8 @@ fn mouse_input_from_surface_point(
         mods,
         x: position.x,
         y: position.y,
+        pixel_x: pixel_position.x,
+        pixel_y: pixel_position.y,
         size: surface.mouse_metrics().into(),
     })
 }

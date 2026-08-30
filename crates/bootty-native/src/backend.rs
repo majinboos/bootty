@@ -684,6 +684,8 @@ impl BackendPanePolicy for NativePanePolicy {
         config.side_effect_pane_id = request.target.side_effect_pane_id();
         Ok(Some(Box::new(StartingNativeTerminal::spawn(
             request.spawn_geometry,
+            request.display_scale,
+            request.render_cell,
             config,
             Arc::clone(request.repaint_wakeup),
         ))))

@@ -51,15 +51,22 @@ pub struct StartingNativeTerminal {
 impl StartingNativeTerminal {
     pub fn spawn(
         geometry: TerminalGeometry,
+        display_scale: f32,
+        render_cell: CellMetrics,
         config: TerminalSessionConfig,
         repaint_wakeup: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let thread_repaint = Arc::clone(&repaint_wakeup);
         thread::spawn(move || {
-            let result =
-                TerminalSession::new_with_config(geometry, config, Arc::clone(&thread_repaint))
-                    .map_err(|error| error.to_string());
+            let result = TerminalSession::new_with_config_and_host_metrics(
+                geometry,
+                display_scale,
+                render_cell,
+                config,
+                Arc::clone(&thread_repaint),
+            )
+            .map_err(|error| error.to_string());
             let _ = tx.send(result);
             thread_repaint();
         });
@@ -68,8 +75,8 @@ impl StartingNativeTerminal {
             rx,
             terminal: None,
             geometry,
-            display_scale: 1.0,
-            render_cell: CellMetrics::new(geometry.cell_width as f32, geometry.cell_height as f32),
+            display_scale,
+            render_cell,
             pending_live_config: None,
             pending_commands: VecDeque::new(),
             startup_error: None,

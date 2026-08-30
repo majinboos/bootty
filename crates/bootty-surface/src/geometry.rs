@@ -47,6 +47,18 @@ impl CellMetrics {
             self.height.ceil().max(1.0) as u32,
         )
     }
+
+    pub fn physical_size(self, display_scale: f32) -> (u32, u32) {
+        let display_scale = if display_scale.is_finite() && display_scale > 0.0 {
+            display_scale
+        } else {
+            1.0
+        };
+        (
+            (self.width * display_scale).round().max(1.0) as u32,
+            (self.height * display_scale).round().max(1.0) as u32,
+        )
+    }
 }
 
 impl Default for CellMetrics {

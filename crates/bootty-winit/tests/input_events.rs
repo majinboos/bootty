@@ -224,10 +224,33 @@ fn mouse_coordinates_are_relative_to_the_surface_and_inverse_view() {
     assert_eq!(mouse.button, Some(MouseButton::Left));
     assert_eq!(mouse.x, 35.0);
     assert_eq!(mouse.y, 50.0);
+    assert_eq!(mouse.pixel_x, 35.0);
+    assert_eq!(mouse.pixel_y, 50.0);
     assert_eq!(mouse.size.screen_width, 200);
     assert_eq!(mouse.size.screen_height, 160);
     assert_eq!(mouse.size.cell_width, 10);
     assert_eq!(mouse.size.cell_height, 20);
+}
+
+#[test]
+fn pixel_mouse_coordinates_do_not_inherit_cell_grid_rounding() {
+    let rect = Rect::from_min_max(Pos2::new(20.0, 40.0), Pos2::new(220.0, 140.0));
+    let mut input = snapshot(vec![egui::Event::PointerButton {
+        pos: Pos2::new(55.0, 90.0),
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::default(),
+    }]);
+    input.surface = Some(surface(rect, CellMetrics::new(9.5, 19.5)));
+
+    let commands = terminal_input_commands(input);
+    let [TerminalInputCommand::Mouse(mouse)] = commands.as_slice() else {
+        panic!("expected one mouse command");
+    };
+    assert!((mouse.x - 36.842_106).abs() < 0.000_1);
+    assert!((mouse.y - 51.282_05).abs() < 0.000_1);
+    assert_eq!(mouse.pixel_x, 35.0);
+    assert_eq!(mouse.pixel_y, 50.0);
 }
 
 #[test]
