@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -56,6 +57,42 @@ pub trait BackendPanePolicy: Send {
     fn deactivate(&mut self);
 }
 
+const NATIVE_RESTART_MIN_DELAY: Duration = Duration::from_millis(250);
+const NATIVE_RESTART_MAX_DELAY: Duration = Duration::from_secs(4);
+const NATIVE_RESTART_QUIET_INTERVAL: Duration = Duration::from_secs(10);
+
+struct NativeRuntimeRestart {
+    failures: u32,
+    retry_at: Option<Instant>,
+    healthy_since: Option<Instant>,
+    error_reported: bool,
+}
+
+impl NativeRuntimeRestart {
+    fn new(now: Instant) -> Self {
+        Self {
+            failures: 1,
+            retry_at: Some(now + NATIVE_RESTART_MIN_DELAY),
+            healthy_since: None,
+            error_reported: false,
+        }
+    }
+
+    fn schedule_failure(&mut self, now: Instant) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = Some(now + native_restart_delay(self.failures));
+        self.healthy_since = None;
+        self.error_reported = false;
+    }
+}
+
+fn native_restart_delay(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(4);
+    NATIVE_RESTART_MIN_DELAY
+        .saturating_mul(1_u32 << exponent)
+        .min(NATIVE_RESTART_MAX_DELAY)
+}
+
 #[derive(Deref, DerefMut)]
 pub struct BackendPaneTerminal {
     registry: Arc<MuxBackendRegistry>,
@@ -75,6 +112,7 @@ pub struct BackendPaneTerminal {
     native_window_spawn_geometry: Option<TerminalGeometry>,
     native_window_id: Option<String>,
     native_window_scope: Option<SpaceId>,
+    native_runtime_restarts: HashMap<ScopedMuxPaneTarget, NativeRuntimeRestart>,
     /// Set when a runtime is swapped into the slot, cleared by the render resize that follows it.
     terminal_awaits_resize: bool,
     #[deref]
@@ -370,6 +408,7 @@ impl BackendPaneTerminal {
             native_window_spawn_geometry: None,
             native_window_id: None,
             native_window_scope: None,
+            native_runtime_restarts: HashMap::new(),
             terminal_awaits_resize: false,
             terminal: idle_terminal(),
         }
@@ -410,6 +449,7 @@ impl BackendPaneTerminal {
             self.behavior = next_behavior;
             self.active_target = None;
             self.native_terminals.clear();
+            self.native_runtime_restarts.clear();
             self.terminal = idle_terminal();
         }
         let target = anchor
@@ -729,18 +769,106 @@ impl BackendPaneTerminal {
         exited
     }
 
+    /// Retire controller runtimes that exited while their backend panes still exist.
+    ///
+    /// Backend-reconciled topology owns pane lifetime outside Bootty. Clearing these slots makes
+    /// the next reconciliation restart their controllers without issuing a backend close command.
+    pub fn recover_exited_native_runtimes(
+        &mut self,
+        now: Instant,
+    ) -> (Vec<String>, Option<Duration>) {
+        let mut statuses = Vec::new();
+        if let Some(target) = self.active_target.clone() {
+            statuses.push((target, self.terminal.child_exited()));
+        }
+        for target in &self.native_window_targets {
+            if self.active_target.as_ref() == Some(target) {
+                continue;
+            }
+            if let Some(runtime) = self.native_terminals.get_mut(target) {
+                statuses.push((target.clone(), runtime.child_exited()));
+            }
+        }
+
+        let mut retire = Vec::new();
+        let mut errors = Vec::new();
+        let mut next_wake = None;
+        for (target, status) in statuses {
+            match status {
+                Ok(false) => {
+                    let should_reset =
+                        self.native_runtime_restarts
+                            .get_mut(&target)
+                            .is_some_and(|restart| {
+                                restart.retry_at = None;
+                                restart.error_reported = false;
+                                let healthy_since = restart.healthy_since.get_or_insert(now);
+                                now.saturating_duration_since(*healthy_since)
+                                    >= NATIVE_RESTART_QUIET_INTERVAL
+                            });
+                    if should_reset {
+                        self.native_runtime_restarts.remove(&target);
+                    }
+                }
+                failure @ (Ok(true) | Err(_)) => {
+                    let restart = self
+                        .native_runtime_restarts
+                        .entry(target.clone())
+                        .or_insert_with(|| NativeRuntimeRestart::new(now));
+                    if restart.retry_at.is_none() {
+                        restart.schedule_failure(now);
+                    }
+                    if let Err(error) = failure
+                        && !restart.error_reported
+                    {
+                        errors.push(format!("{}: {error}", target.input_selector()));
+                        restart.error_reported = true;
+                    }
+                    let retry_at = restart.retry_at.expect("failed runtime has retry deadline");
+                    if now >= retry_at {
+                        restart.retry_at = None;
+                        restart.error_reported = false;
+                        retire.push(target);
+                    } else {
+                        let wait = retry_at.saturating_duration_since(now);
+                        next_wake =
+                            Some(next_wake.map_or(wait, |current: Duration| current.min(wait)));
+                    }
+                }
+            }
+        }
+        for target in retire {
+            self.discard_target(&target);
+        }
+        (errors, next_wake)
+    }
+
+
+    fn discard_target(&mut self, target: &ScopedMuxPaneTarget) {
+        if self.active_target.as_ref() == Some(target) {
+            self.terminal = idle_terminal();
+            self.active_target = None;
+        } else {
+            self.native_terminals.remove(target);
+        }
+    }
+
     /// Drop a pane's runtime (killing its PTY) whether it is the focused runtime or a parked sibling.
     pub fn discard_pane(&mut self, pane_id: &str) {
-        if self.focused_pane_id() == Some(pane_id) {
-            self.discard_active_pane();
-            return;
-        }
-        if let Some(target) = self
-            .native_window_targets
-            .iter()
-            .find(|target| target.input_selector() == pane_id)
-        {
-            self.native_terminals.remove(target);
+        let target = self
+            .active_target
+            .as_ref()
+            .filter(|target| target.input_selector() == pane_id)
+            .cloned()
+            .or_else(|| {
+                self.native_window_targets
+                    .iter()
+                    .find(|target| target.input_selector() == pane_id)
+                    .cloned()
+            });
+        if let Some(target) = target {
+            self.native_runtime_restarts.remove(&target);
+            self.discard_target(&target);
         }
     }
 
@@ -784,6 +912,9 @@ impl BackendPaneTerminal {
     // Drop the active pane's terminal (its PTY is killed on drop) and forget its target, so the next
     // sync_mux_anchor attaches the surviving pane instead of parking the closed one.
     pub fn discard_active_pane(&mut self) {
+        if let Some(target) = &self.active_target {
+            self.native_runtime_restarts.remove(target);
+        }
         self.terminal = idle_terminal();
         self.active_target = None;
     }

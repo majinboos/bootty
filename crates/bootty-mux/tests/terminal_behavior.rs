@@ -2,8 +2,9 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -38,6 +39,8 @@ use proptest_derive::Arbitrary;
 
 struct CachedPaneRuntime {
     fail_live_config: bool,
+    exit_signal: Arc<AtomicBool>,
+    tracks_exit: bool,
 }
 
 macro_rules! terminal_runtime_stubs {
@@ -49,7 +52,7 @@ macro_rules! terminal_runtime_stubs {
             0
         }
         fn child_exited(&mut self) -> Result<bool> {
-            Ok(false)
+            Ok(self.tracks_exit && self.exit_signal.load(Ordering::SeqCst))
         }
         fn tty_name(&self) -> Option<&str> {
             None
@@ -186,10 +189,12 @@ impl MuxBackend for EmptyBackend {
 
 struct StaleCacheProvider {
     starts: Arc<AtomicUsize>,
+    exit_signal: Arc<AtomicBool>,
 }
 
 struct StaleCachePolicy {
     starts: Arc<AtomicUsize>,
+    exit_signal: Arc<AtomicBool>,
 }
 
 impl MuxBackendProvider for StaleCacheProvider {
@@ -208,13 +213,14 @@ impl MuxAppBackendProvider for StaleCacheProvider {
     fn build_pane_policy(&self, _config: &MuxBindingConfig) -> Box<dyn BackendPanePolicy> {
         Box::new(StaleCachePolicy {
             starts: Arc::clone(&self.starts),
+            exit_signal: Arc::clone(&self.exit_signal),
         })
     }
 
     fn app_policy(&self) -> MuxAppBackendPolicy {
         MuxAppBackendPolicy {
             panes: PaneBehavior {
-                topology: PaneTopology::ProcessLocal,
+                topology: PaneTopology::BackendReconciled,
                 cache_terminals: true,
                 resize_cached_terminals: false,
             },
@@ -242,6 +248,8 @@ impl BackendPanePolicy for StaleCachePolicy {
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(Some(Box::new(CachedPaneRuntime {
             fail_live_config: request.target.pane_id() == Some("%2"),
+            exit_signal: Arc::clone(&self.exit_signal),
+            tracks_exit: request.target.pane_id() == Some("%2"),
         })))
     }
 
@@ -256,9 +264,11 @@ impl BackendPanePolicy for StaleCachePolicy {
 #[test]
 fn failed_cached_runtime_is_retired_without_blocking_live_config_publication() -> Result<()> {
     let starts = Arc::new(AtomicUsize::new(0));
+    let exit_signal = Arc::new(AtomicBool::new(true));
     let registry = Arc::new(MuxBackendRegistry::from_app_providers(
         [Arc::new(StaleCacheProvider {
             starts: Arc::clone(&starts),
+            exit_signal,
         })],
         [MuxBackendKind::Native],
     )?);
@@ -303,5 +313,106 @@ fn failed_cached_runtime_is_retired_without_blocking_live_config_publication() -
         false,
     )?;
     assert_eq!(starts.load(Ordering::SeqCst), 3);
+    Ok(())
+}
+
+#[test]
+fn exited_backend_controller_restarts_with_exponential_cooldown() -> Result<()> {
+    let starts = Arc::new(AtomicUsize::new(0));
+    let exit_signal = Arc::new(AtomicBool::new(true));
+    let registry = Arc::new(MuxBackendRegistry::from_app_providers(
+        [Arc::new(StaleCacheProvider {
+            starts: Arc::clone(&starts),
+            exit_signal: Arc::clone(&exit_signal),
+        })],
+        [MuxBackendKind::Native],
+    )?);
+    let config = MuxBindingConfig {
+        backend: MuxBackendKind::Native,
+        ..MuxBindingConfig::default()
+    };
+    let pane = |id: &str| MuxPaneAnchor {
+        session_id: "session".into(),
+        pane_id: Some(id.into()),
+        ..MuxPaneAnchor::default()
+    };
+    let (focused, exited) = (pane("%1"), pane("%2"));
+    let panes = [focused.clone(), exited.clone()];
+    let mut terminal = bootty_mux::terminal::ActiveTerminal::new(
+        TerminalGeometry {
+            cols: 80,
+            rows: 24,
+            cell_width: 10,
+            cell_height: 20,
+        },
+        registry,
+        &config,
+        bootty_runtime::TerminalSessionConfig::default(),
+        Arc::new(|| {}),
+    );
+
+    terminal.sync_native_window(
+        &panes,
+        Some(&focused),
+        Some("window"),
+        MuxBackendKind::Native,
+        false,
+    )?;
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    let now = Instant::now();
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now),
+        (Vec::new(), Some(Duration::from_millis(250)))
+    );
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(249)),
+        (Vec::new(), Some(Duration::from_millis(1)))
+    );
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(250)),
+        (Vec::new(), None)
+    );
+
+    // The backend snapshot still contains the pane, so reconciliation starts a new controller.
+    terminal.sync_native_window(
+        &panes,
+        Some(&focused),
+        Some("window"),
+        MuxBackendKind::Native,
+        false,
+    )?;
+    assert_eq!(starts.load(Ordering::SeqCst), 3);
+
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(250)),
+        (Vec::new(), Some(Duration::from_millis(500)))
+    );
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(750)),
+        (Vec::new(), None)
+    );
+    terminal.sync_native_window(
+        &panes,
+        Some(&focused),
+        Some("window"),
+        MuxBackendKind::Native,
+        false,
+    )?;
+    assert_eq!(starts.load(Ordering::SeqCst), 4);
+
+    exit_signal.store(false, Ordering::SeqCst);
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(750)),
+        (Vec::new(), None)
+    );
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(10_750)),
+        (Vec::new(), None)
+    );
+    exit_signal.store(true, Ordering::SeqCst);
+    assert_eq!(
+        terminal.recover_exited_native_runtimes(now + Duration::from_millis(10_750)),
+        (Vec::new(), Some(Duration::from_millis(250)))
+    );
     Ok(())
 }

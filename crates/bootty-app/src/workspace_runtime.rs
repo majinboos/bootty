@@ -874,25 +874,38 @@ impl WorkspaceRuntime {
         window_focused: bool,
     ) -> WorkspaceFrameOutcome {
         let mut errors = Vec::new();
+        let mut terminal_recovery_wake = None;
         if self.has_degraded_remote() && self.network_change_detector.changed(now) {
             self.reset_remote_reconnects(now);
         }
-        if self.active.binding.backend_policy.panes.topology == PaneTopology::ProcessLocal {
-            let exited = self.active.binding.terminal.native_exited_panes();
-            for pane_id in exited {
-                self.active.binding.close_focused_pane(repaint, &pane_id);
-            }
-        } else {
-            match self.active.binding.terminal.child_exited() {
-                Ok(true) => {
-                    if self.active.binding.handle_attach_client_exit(now) {
-                        self.close_active_attach_pane(repaint);
-                    }
+        match self.active.binding.backend_policy.panes.topology {
+            PaneTopology::ProcessLocal => {
+                let exited = self.active.binding.terminal.native_exited_panes();
+                for pane_id in exited {
+                    self.active.binding.close_focused_pane(repaint, &pane_id);
                 }
-                Ok(false) => self.active.binding.note_attach_client_alive(now),
-                Err(error) => errors.push(error.to_string()),
             }
-            let _ = self.active.binding.reattach_wait(now);
+            PaneTopology::BackendReconciled => {
+                let (runtime_errors, retry_after) = self
+                    .active
+                    .binding
+                    .terminal
+                    .recover_exited_native_runtimes(now);
+                errors.extend(runtime_errors);
+                terminal_recovery_wake = retry_after;
+            }
+            PaneTopology::Attach => {
+                match self.active.binding.terminal.child_exited() {
+                    Ok(true) => {
+                        if self.active.binding.handle_attach_client_exit(now) {
+                            self.close_active_attach_pane(repaint);
+                        }
+                    }
+                    Ok(false) => self.active.binding.note_attach_client_alive(now),
+                    Err(error) => errors.push(error.to_string()),
+                }
+                let _ = self.active.binding.reattach_wait(now);
+            }
         }
         for binding in self.bindings_mut() {
             binding.poll_membership_command();
@@ -922,6 +935,10 @@ impl WorkspaceRuntime {
             self.active.binding.backend_policy.panes.topology,
             window_focused,
         );
+        next_wake = [next_wake, terminal_recovery_wake]
+            .into_iter()
+            .flatten()
+            .min();
         for binding in self.bindings_mut().skip(1) {
             binding.refresh_waiting_membership(repaint, window_focused);
             binding.restore_persisted_sessions(repaint, false);
