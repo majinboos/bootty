@@ -381,15 +381,24 @@ impl AppState {
     }
     fn activate_sidebar_hovered_session(&mut self) -> bool {
         self.ensure_sidebar_hovered_session();
-        let activated = self
-            .sidebar_hovered_session
-            .clone()
-            .is_some_and(|target| self.activate_scoped_session_from_ui(&target));
+        let activated = self.sidebar_hovered_session.clone().is_some_and(|target| {
+            let unclaimed = target.scope == self.workspace.active.binding.scope
+                && self
+                    .unclaimed_sessions()
+                    .iter()
+                    .any(|session| session.session_id == target.session_id);
+            if unclaimed {
+                self.adopt_and_activate_scoped_session(&target)
+            } else {
+                self.activate_scoped_session_from_ui(&target)
+            }
+        });
         self.input_focus = InputFocus::Terminal;
         activated
     }
     pub(super) fn session_navigation_targets(&self) -> Vec<ScopedSessionTarget> {
-        self.binding_session_groups()
+        let mut targets = self
+            .binding_session_groups()
             .into_iter()
             .flat_map(|group| {
                 group
@@ -397,7 +406,11 @@ impl AppState {
                     .into_iter()
                     .map(move |session| ScopedSessionTarget::new(group.scope, session.id))
             })
-            .collect()
+            .collect::<Vec<_>>();
+        targets.extend(self.unclaimed_sessions().into_iter().map(|session| {
+            ScopedSessionTarget::new(self.workspace.active.binding.scope, session.session_id)
+        }));
+        targets
     }
     pub(super) fn session_target_matching(&self, value: &str) -> Option<ScopedSessionTarget> {
         self.workspace

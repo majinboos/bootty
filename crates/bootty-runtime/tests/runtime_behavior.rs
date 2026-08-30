@@ -24,7 +24,7 @@ use bootty_surface::geometry::CellMetrics;
 use bootty_terminal::terminal_engine::TerminalEngine;
 #[cfg(unix)]
 use bootty_terminal::terminal_engine::{
-    TERMINAL_PROGRAM, TERMINAL_PROGRAM_VERSION, TerminalCopyModeAction, TerminalSearchDirection,
+    TERMINAL_PROGRAM_VERSION, TerminalCopyModeAction, TerminalSearchDirection,
     TerminalSelectionFormat,
 };
 #[cfg(unix)]
@@ -482,6 +482,7 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
             env_remove: vec!["REMOVE_ME".to_owned()],
             term: "bootty-runtime-term".to_owned(),
             colorterm: "bootty-runtime-color".to_owned(),
+            term_program: Some("Ghostty".to_owned()),
         },
         ..TerminalSessionConfig::default()
     };
@@ -493,7 +494,7 @@ fn terminal_launch_applies_one_managed_environment_and_process_policy() {
     assert_eq!(fields.len(), 9, "launch output: {output}");
     assert_eq!(fields[0], "bootty-runtime-term");
     assert_eq!(fields[1], "bootty-runtime-color");
-    assert_eq!(fields[2], TERMINAL_PROGRAM);
+    assert_eq!(fields[2], "Ghostty");
     assert_eq!(fields[3], TERMINAL_PROGRAM_VERSION);
     assert_ne!(fields[4], "wrong");
     assert_eq!(fields[5], "unset");

@@ -80,6 +80,7 @@ pub struct SessionLaunchConfig {
     pub env_remove: Vec<String>,
     pub term: String,
     pub colorterm: String,
+    pub term_program: Option<String>,
 }
 
 impl Default for SessionLaunchConfig {
@@ -93,6 +94,7 @@ impl Default for SessionLaunchConfig {
             env_remove: Vec::new(),
             term: TERMINAL_TERM.to_owned(),
             colorterm: "truecolor".to_owned(),
+            term_program: None,
         }
     }
 }

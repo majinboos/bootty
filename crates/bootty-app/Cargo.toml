@@ -48,6 +48,7 @@ winit = { workspace = true, features = ["wayland", "x11"] }
 wgpu = { workspace = true, features = ["dx12"] }
 
 [dev-dependencies]
+bootty-herdr = { path = "../bootty-herdr" }
 assert_fs.workspace = true
 bootty-native = { path = "../bootty-native" }
 bootty-rmux = { path = "../bootty-rmux" }

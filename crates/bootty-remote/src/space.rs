@@ -75,6 +75,7 @@ impl MuxBackend for RemoteSpaceBackend {
 
 fn backend_name(backend: MuxBackendKind) -> &'static str {
     match backend {
+        MuxBackendKind::Herdr => "herdr",
         MuxBackendKind::Native => "native",
         MuxBackendKind::Rmux => "rmux",
         MuxBackendKind::Tmux => "tmux",

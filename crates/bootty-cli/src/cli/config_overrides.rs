@@ -19,6 +19,10 @@ pub(super) struct ConfigOverrides {
     #[arg(long, value_enum, value_name = "BACKEND")]
     backend: Option<CliBackend>,
 
+    /// Select the named Herdr server session.
+    #[arg(long, value_name = "NAME")]
+    herdr_session: Option<String>,
+
     /// Attach the multiplexer running on this SSH host instead of the local one.
     #[arg(long, value_name = "HOST")]
     ssh_remote: Option<String>,
@@ -323,6 +327,9 @@ impl ConfigOverrides {
         if let Some(backend) = self.backend {
             config.multiplexer.backend = backend.into();
         }
+        if let Some(session) = &self.herdr_session {
+            config.multiplexer.herdr_session.clone_from(session);
+        }
         if let Some(hide_tmux_status) = bool_override(self.hide_tmux_status, self.show_tmux_status)
         {
             config.multiplexer.hide_tmux_status = hide_tmux_status;
@@ -556,6 +563,7 @@ macro_rules! cli_value_enum {
 
 cli_value_enum! {
     CliBackend => MultiplexerBackendConfig {
+        Herdr,
         Native,
         Rmux,
         Tmux,

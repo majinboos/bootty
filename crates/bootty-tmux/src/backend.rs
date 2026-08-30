@@ -172,6 +172,7 @@ impl BackendPanePolicy for TmuxPanePolicy {
                 args,
                 env_remove: vec!["TMUX".to_owned()],
                 env: Vec::new(),
+                term_program: None,
                 remote,
             },
         )

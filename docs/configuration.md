@@ -77,7 +77,10 @@ unfocused-terminal-dim = 0.08
 backend = "rmux"
 
 # native keeps mux state and terminals inside Bootty. rmux renders through
-# rmux-sdk. tmux attaches through its backend UI.
+# rmux-sdk. herdr and tmux attach through their own backend UIs.
+
+# Select the named Herdr server when backend = "herdr".
+herdr-session = "default"
 
 # Attach a multiplexer running on another host. Bootty reaches the remote host
 # over SSH and renders its sessions here. On first use, Bootty uploads the

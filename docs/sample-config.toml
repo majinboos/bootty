@@ -112,8 +112,10 @@ position = "left" # or "right"
 
 [multiplexer]
 # native keeps mux state and terminals inside Bootty. rmux renders through
-# rmux-sdk. tmux attaches through its backend UI.
+# rmux-sdk. herdr and tmux attach through their own backend UIs.
 backend = "native"
+# Herdr backend only: select the named Herdr server used by its stock client.
+herdr-session = "default"
 # tmux backend only: hide tmux's own status bar inside Bootty's client by
 # toggling the attached session's status option off (restored on detach), so
 # Bootty's native status bar is the only one shown. Session-scoped and
@@ -123,8 +125,8 @@ backend = "native"
 hide-tmux-status = false
 
 # Reach a multiplexer on another host over SSH and render its sessions here.
-# Bootty automatically installs its small headless daemon on first use. The
-# full Bootty app is not required on the remote host.
+# Bootty automatically installs its small headless daemon when needed. The full
+# Bootty app is not required on the remote host.
 # [multiplexer.remote]
 # host = "devbox"       # ~/.ssh/config alias, hostname, or address
 # user = "dev"         # when ~/.ssh/config does not name one
@@ -215,6 +217,10 @@ modifier-remap = [
 ]
 
 [input.backend-keybind]
+# Herdr defaults to the same native layout commands as the native and rmux
+# backends. This shard can replace or extend them for one installation.
+# herdr = ["cmd+d=split_right", "cmd+shift+d=split_down"]
+
 tmux = [
   # Custom CSI relays registered as tmux user-keys in ~/.tmux.conf.
   "cmd+;=csi:61~",

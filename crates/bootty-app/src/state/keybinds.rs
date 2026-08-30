@@ -262,7 +262,7 @@ impl AppState {
             ) {
                 self.record_error(error);
             } else {
-                self.sync_native_layout_terminal_now();
+                self.sync_terminal_panes_now();
             }
         }
         true

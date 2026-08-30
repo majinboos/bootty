@@ -8,6 +8,7 @@ use thiserror::Error;
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum MuxBackendKind {
+    Herdr,
     Rmux,
     #[default]
     Native,
@@ -68,9 +69,11 @@ impl SshTarget {
 }
 
 /// The operational configuration for one multiplexer binding.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MuxBindingConfig {
     pub backend: MuxBackendKind,
+    /// Named Herdr server session whose workspaces, tabs, and panes this binding exposes.
+    pub herdr_session: String,
     /// Hide tmux's own status bar in Bootty's client.
     pub hide_tmux_status: bool,
     /// Reach the multiplexer on another host over SSH.
@@ -79,9 +82,23 @@ pub struct MuxBindingConfig {
     pub remote_space_id: Option<String>,
 }
 
+impl Default for MuxBindingConfig {
+    fn default() -> Self {
+        Self {
+            backend: MuxBackendKind::default(),
+            herdr_session: "default".to_owned(),
+            hide_tmux_status: false,
+            remote: None,
+            remote_space_id: None,
+        }
+    }
+}
+
 /// Validation failure for an operational multiplexer binding.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MuxBindingConfigError {
+    #[error("multiplexer.herdr-session must name a Herdr server session")]
+    EmptyHerdrSession,
     #[error("multiplexer.remote.host must name a host")]
     EmptyRemoteHost,
     #[error("multiplexer.remote needs a backend with a client to run there, got {backend:?}")]
@@ -91,6 +108,9 @@ pub enum MuxBindingConfigError {
 impl MuxBindingConfig {
     /// Validate remote placement without changing the binding.
     pub fn validate_remote(&self) -> Result<(), MuxBindingConfigError> {
+        if self.backend == MuxBackendKind::Herdr && self.herdr_session.trim().is_empty() {
+            return Err(MuxBindingConfigError::EmptyHerdrSession);
+        }
         let Some(remote) = &self.remote else {
             return Ok(());
         };

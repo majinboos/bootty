@@ -734,10 +734,7 @@ impl AppState {
             .binding
             .resize_native_layout_window(cols, rows)
     }
-    pub(super) fn sync_native_layout_terminal_now(&mut self) {
-        if !self.uses_native_terminal_layout() {
-            return;
-        }
+    pub(super) fn sync_terminal_panes_now(&mut self) {
         self.sync_terminal_panes_or_record_error();
     }
     pub fn record_pane_area(&mut self, area: Rect) {
@@ -756,7 +753,7 @@ impl AppState {
             self.record_error(error);
             return false;
         }
-        self.sync_native_layout_terminal_now();
+        self.sync_terminal_panes_now();
         self.sidebar_hovered_session = Some(target.clone());
         (self.repaint)();
         true
@@ -816,7 +813,7 @@ impl AppState {
                     self.record_error(error);
                     return false;
                 }
-                self.sync_native_layout_terminal_now();
+                self.sync_terminal_panes_now();
             }
             MuxCommand::ClosePane {
                 session_id,
@@ -850,7 +847,7 @@ impl AppState {
                 .binding
                 .reorder_window_before(&self.repaint, source, before);
         if changed {
-            self.sync_native_layout_terminal_now();
+            self.sync_terminal_panes_now();
         }
         changed
     }

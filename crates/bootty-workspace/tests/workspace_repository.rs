@@ -142,7 +142,7 @@ fn unsupported_backend_spaces_do_not_block_supported_workspace_state(
     Connection::open(database)
         .expect("open workspace database")
         .execute(
-            "UPDATE workspace_spaces SET backend = 'herdr' WHERE name = 'Default Space'",
+            "UPDATE workspace_spaces SET backend = 'future-backend' WHERE name = 'Default Space'",
             [],
         )
         .expect("store unsupported backend");

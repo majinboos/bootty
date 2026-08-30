@@ -323,7 +323,7 @@ impl AppState {
                 Ok(false) => {}
                 Err(error) => self.record_error(error),
             }
-            self.sync_native_layout_terminal_now();
+            self.sync_terminal_panes_now();
             return;
         }
         let mux_config = self.active_multiplexer().clone();
@@ -332,6 +332,6 @@ impl AppState {
             .binding
             .mux
             .execute_command(&self.repaint, &mux_config, command);
-        self.sync_native_layout_terminal_now();
+        self.sync_terminal_panes_now();
     }
 }

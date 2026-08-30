@@ -950,7 +950,12 @@ fn ssh_remote_defaults_and_all_fields_are_preserved() {
 /// the remote host's sessions.
 #[test]
 fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
-    for (backend, accepted) in [("tmux", true), ("rmux", true), ("native", false)] {
+    for (backend, accepted) in [
+        ("herdr", false),
+        ("tmux", true),
+        ("rmux", true),
+        ("native", false),
+    ] {
         let loaded = ConfigSandbox::with_config(&format!(
             "[multiplexer]\nbackend = \"{backend}\"\n\n[multiplexer.remote]\nhost = \"devbox\"\n"
         ))
@@ -958,6 +963,16 @@ fn multiplexer_remote_is_refused_for_backends_with_no_remote_client() {
 
         assert_eq!(loaded.is_ok(), accepted, "backend {backend}");
     }
+}
+
+#[test]
+fn herdr_uses_native_layout_keybinds_by_default() {
+    let input = &BoottyConfig::default().input;
+
+    assert_eq!(input.backend_keybinds.herdr, input.backend_keybinds.native);
+    let keybinds = input.keybinds_for_backend(MultiplexerBackendConfig::Herdr);
+    assert!(keybinds.iter().any(|entry| entry.contains("split_right")));
+    assert!(keybinds.iter().any(|entry| entry.contains("split_down")));
 }
 
 #[test]

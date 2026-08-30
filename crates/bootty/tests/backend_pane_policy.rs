@@ -19,6 +19,17 @@ fn binding(backend: MuxBackendKind) -> MuxBindingConfig {
 }
 
 #[rstest]
+#[case::herdr(
+    MuxBackendKind::Herdr,
+    MuxAppBackendPolicy {
+        panes: PaneBehavior { topology: PaneTopology::Attach, cache_terminals: true, resize_cached_terminals: true },
+        progress: TerminalProgressPolicy::BackendSnapshot,
+        persisted_sessions: PersistedSessionPolicy::AfterEmptyInitialSnapshot,
+        generated_session_names: GeneratedSessionNamePolicy::PreserveBackend,
+        terminal_residency: TerminalResidency::BindingScoped,
+        selection_publication: SelectionPublicationPolicy::PersistBeforePublish,
+    },
+)]
 #[case::native(
     MuxBackendKind::Native,
     MuxAppBackendPolicy {

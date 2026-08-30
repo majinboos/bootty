@@ -45,6 +45,7 @@ impl LegacyBackend {
 fn parse_stored_backend(value: &str) -> LegacyBackend {
     match value {
         "inherit" => LegacyBackend::Inherit,
+        "herdr" => LegacyBackend::Supported(MultiplexerBackendConfig::Herdr),
         "native" => LegacyBackend::Supported(MultiplexerBackendConfig::Native),
         "rmux" => LegacyBackend::Supported(MultiplexerBackendConfig::Rmux),
         "tmux" => LegacyBackend::Supported(MultiplexerBackendConfig::Tmux),
@@ -632,7 +633,7 @@ fn build_plan(
 
 fn destination_backend(backend: MultiplexerBackendConfig) -> Option<Backend> {
     match backend {
-        MultiplexerBackendConfig::Native => None,
+        MultiplexerBackendConfig::Herdr | MultiplexerBackendConfig::Native => None,
         MultiplexerBackendConfig::Rmux => Some(Backend::Rmux),
         MultiplexerBackendConfig::Tmux => Some(Backend::Tmux),
     }

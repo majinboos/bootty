@@ -41,6 +41,7 @@ pub(super) fn terminal_session_config_with_side_effects(
             env_remove: Vec::new(),
             term: config.session.term.clone(),
             colorterm: config.session.colorterm.clone(),
+            term_program: None,
         },
         colors,
         cursor,

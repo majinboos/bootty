@@ -165,12 +165,7 @@ impl SpaceEditorDialog {
                             egui::ComboBox::from_id_salt("space-editor-backend")
                                 .selected_text(backend_label(self.draft.backend))
                                 .show_ui(ui, |ui| {
-                                    for backend in [
-                                        None,
-                                        Some(MultiplexerBackendConfig::Native),
-                                        Some(MultiplexerBackendConfig::Rmux),
-                                        Some(MultiplexerBackendConfig::Tmux),
-                                    ] {
+                                    for backend in available_space_backends() {
                                         ui.selectable_value(
                                             &mut self.draft.backend,
                                             backend,
@@ -587,10 +582,31 @@ fn matching_icons(query: &str) -> Vec<&'static String> {
 fn backend_label(backend: Option<MultiplexerBackendConfig>) -> &'static str {
     match backend {
         None => "Inherit",
+        Some(MultiplexerBackendConfig::Herdr) => "Herdr",
         Some(MultiplexerBackendConfig::Native) => "Native",
         Some(MultiplexerBackendConfig::Rmux) => "Rmux",
         Some(MultiplexerBackendConfig::Tmux) => "Tmux",
     }
+}
+
+#[cfg(windows)]
+fn available_space_backends() -> [Option<MultiplexerBackendConfig>; 3] {
+    [
+        None,
+        Some(MultiplexerBackendConfig::Native),
+        Some(MultiplexerBackendConfig::Rmux),
+    ]
+}
+
+#[cfg(not(windows))]
+fn available_space_backends() -> [Option<MultiplexerBackendConfig>; 5] {
+    [
+        None,
+        Some(MultiplexerBackendConfig::Herdr),
+        Some(MultiplexerBackendConfig::Native),
+        Some(MultiplexerBackendConfig::Rmux),
+        Some(MultiplexerBackendConfig::Tmux),
+    ]
 }
 
 fn color_hex([red, green, blue]: [u8; 3]) -> String {

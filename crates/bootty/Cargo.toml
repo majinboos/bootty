@@ -18,6 +18,7 @@ bootty-cli = { path = "../bootty-cli" }
 bootty-command = { path = "../bootty-command" }
 bootty-control = { path = "../bootty-control" }
 bootty-identity = { path = "../bootty-identity" }
+bootty-herdr = { path = "../bootty-herdr" }
 bootty-mux = { path = "../bootty-mux" }
 bootty-native = { path = "../bootty-native" }
 bootty-remote = { path = "../bootty-remote" }

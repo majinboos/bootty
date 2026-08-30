@@ -26,6 +26,9 @@ same renderer path as the main app.
 - `bootty-runtime` - PTY sessions, shell selection, drain scheduling, and frame
   publication.
 - `bootty-font` - OpenType feature values, parsing, and canonical formatting.
+- `bootty-herdr` - native Herdr workspace, tab, pane, layout, and terminal integration.
+- `bootty-mux` and `bootty-mux-model` - backend-neutral mux contracts and values.
+- `bootty-native`, `bootty-rmux`, and `bootty-tmux` - concrete mux backends.
 - `bootty-render` - paint plans, text shaping, sprites, and WGPU rendering.
 - `bootty-winit` - native winit/WGPU host adapters.
 

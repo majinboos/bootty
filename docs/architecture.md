@@ -93,11 +93,14 @@ Its application facet owns a separately validated pane-policy and capability
 registry.
 It also owns generic commands, snapshots, controller, process, project, and
 pane orchestration.
-`bootty-native`, `bootty-rmux`, and `bootty-tmux` own concrete control and pane
+`bootty-herdr`, `bootty-native`, `bootty-rmux`, and `bootty-tmux` own concrete control and pane
 policies.
 `bootty-remote` owns SSH commands, remote daemon installation, remote command
 framing, and remote Space transport.
-The `bootty` executable links all three providers.
+Herdr owns authoritative workspace, tab, pane, layout, process, and agent state.
+Bootty launches Herdr's stock client for the configured server session and lets
+that client render its own chrome and terminal surfaces inside Bootty.
+The `bootty` executable links all four providers.
 The daemon links rmux and tmux.
 
 ## Terminal path
@@ -202,7 +205,7 @@ contents, or transcripts.
 - `bootty-mux-model` owns dependency-neutral mux values.
 - `bootty-mux` owns the core provider contract, the validated core and app
   registries, and generic mux orchestration.
-- `bootty-native`, `bootty-rmux`, and `bootty-tmux` own concrete provider policies.
+- `bootty-herdr`, `bootty-native`, `bootty-rmux`, and `bootty-tmux` own concrete provider policies.
 - `bootty-remote` owns SSH commands, remote installation, command framing, and Space transport.
 - `bootty-render` owns paint planning and WGPU preparation.
 - `bootty-runtime` owns PTY sessions and terminal workers.

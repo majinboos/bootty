@@ -205,6 +205,7 @@ fn apply_partial_multiplexer(
     partial: MultiplexerPatch,
 ) -> ConfigResult<()> {
     apply_value(&mut multiplexer.backend, partial.backend);
+    apply_value(&mut multiplexer.herdr_session, partial.herdr_session);
     apply_value(&mut multiplexer.hide_tmux_status, partial.hide_tmux_status);
     apply_present(&mut multiplexer.remote, partial.remote);
     multiplexer
@@ -240,6 +241,9 @@ fn apply_partial_backend_keybind(
     keybinds: &mut BackendKeybindConfig,
     partial: BackendKeybindPatch,
 ) {
+    if let Some(value) = partial.herdr {
+        keybinds.herdr = merge_keybind_entries(&keybinds.herdr, value);
+    }
     if let Some(value) = partial.native {
         keybinds.native = merge_keybind_entries(&keybinds.native, value);
     }

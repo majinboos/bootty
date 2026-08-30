@@ -117,6 +117,7 @@ pub(super) struct SidebarPatch {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) struct MultiplexerPatch {
     pub(super) backend: Option<MultiplexerBackendConfig>,
+    pub(super) herdr_session: Option<String>,
     pub(super) hide_tmux_status: Option<bool>,
     pub(super) remote: Option<SshRemoteConfig>,
 }
@@ -137,6 +138,7 @@ pub(super) struct InputPatch {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub(super) struct BackendKeybindPatch {
+    pub(super) herdr: Option<Vec<String>>,
     pub(super) native: Option<Vec<String>>,
     pub(super) rmux: Option<Vec<String>>,
     pub(super) tmux: Option<Vec<String>>,

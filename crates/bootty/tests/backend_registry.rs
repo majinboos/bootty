@@ -8,6 +8,7 @@ use rstest::rstest;
 mod support;
 
 #[rstest]
+#[case::herdr(MuxBackendKind::Herdr)]
 #[case::native(MuxBackendKind::Native)]
 #[case::rmux(MuxBackendKind::Rmux)]
 #[case::tmux(MuxBackendKind::Tmux)]
@@ -27,6 +28,7 @@ fn configured_backends_resolve_without_cross_backend_fallback(#[case] backend: M
 }
 
 #[rstest]
+#[case::herdr(MuxBackendKind::Herdr, MuxCommandDispatch::WorkerThread)]
 #[case::native(MuxBackendKind::Native, MuxCommandDispatch::CallerThread)]
 #[case::rmux(MuxBackendKind::Rmux, MuxCommandDispatch::WorkerThread)]
 fn providers_publish_their_command_dispatch(
@@ -61,6 +63,7 @@ fn windows_keeps_remote_tmux_and_replaces_only_local_tmux() {
 }
 
 #[rstest]
+#[case::herdr(MuxBackendKind::Herdr)]
 #[case::native(MuxBackendKind::Native)]
 #[case::rmux(MuxBackendKind::Rmux)]
 #[case::tmux(MuxBackendKind::Tmux)]
@@ -82,7 +85,10 @@ fn built_backends_publish_the_exact_capability_matrix(#[case] backend: MuxBacken
         BindingOperation::DitchSession,
         BindingOperation::StampSession,
     ];
-    if backend != MuxBackendKind::Native {
+    if matches!(
+        backend,
+        MuxBackendKind::Herdr | MuxBackendKind::Rmux | MuxBackendKind::Tmux
+    ) {
         expected.insert(8, BindingOperation::TogglePaneZoom);
     }
     let descriptor = registry.capabilities(

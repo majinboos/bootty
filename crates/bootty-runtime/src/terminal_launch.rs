@@ -83,7 +83,10 @@ pub(crate) fn spawn(size: PtySize, config: &SessionLaunchConfig) -> Result<Spawn
     }
     command.env(TERM_ENV, &launch_env.term);
     command.env(COLORTERM_ENV, &config.colorterm);
-    command.env(TERM_PROGRAM_ENV, TERMINAL_PROGRAM);
+    command.env(
+        TERM_PROGRAM_ENV,
+        config.term_program.as_deref().unwrap_or(TERMINAL_PROGRAM),
+    );
     command.env(TERM_PROGRAM_VERSION_ENV, TERMINAL_PROGRAM_VERSION);
     // Pane identity for programs that report which visible terminal they run in. Only backends that
     // spawn the pane's own PTY know it; a tmux attach leaves it unset because tmux exports the same

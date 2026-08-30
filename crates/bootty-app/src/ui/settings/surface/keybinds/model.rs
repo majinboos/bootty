@@ -8,6 +8,7 @@ use bootty_config::config::{BoottyConfig, InputConfig, split_keybind_entry};
 pub(in crate::ui::settings) enum KeybindScope {
     #[default]
     Global,
+    Herdr,
     Native,
     Rmux,
     #[cfg(not(windows))]
@@ -18,6 +19,7 @@ pub(in crate::ui::settings) enum KeybindScope {
 impl KeybindScope {
     pub(super) const ALL: &'static [(KeybindScope, &'static str)] = &[
         (Self::Global, "Global"),
+        (Self::Herdr, "Herdr"),
         (Self::Native, "Native"),
         (Self::Rmux, "Rmux"),
         #[cfg(not(windows))]
@@ -28,6 +30,7 @@ impl KeybindScope {
     fn path(self) -> &'static [&'static str] {
         match self {
             Self::Global => &["input", "keybind"],
+            Self::Herdr => &["input", "backend-keybind", "herdr"],
             Self::Native => &["input", "backend-keybind", "native"],
             Self::Rmux => &["input", "backend-keybind", "rmux"],
             #[cfg(not(windows))]
@@ -188,6 +191,7 @@ pub(super) fn effective_bindings(config: &BoottyConfig, scope: KeybindScope) -> 
     let input = &config.input;
     match scope {
         KeybindScope::Global => input.keybinds_for_backend(config.multiplexer.backend),
+        KeybindScope::Herdr => input.keybinds_for_backend(MultiplexerBackendConfig::Herdr),
         KeybindScope::Native => input.keybinds_for_backend(MultiplexerBackendConfig::Native),
         KeybindScope::Rmux => input.keybinds_for_backend(MultiplexerBackendConfig::Rmux),
         #[cfg(not(windows))]

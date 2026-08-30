@@ -146,6 +146,7 @@ pub(super) fn load_spaces(tx: &Transaction<'_>) -> rusqlite::Result<LoadedSpaces
 pub(super) fn backend_to_storage(backend: Option<MultiplexerBackendConfig>) -> &'static str {
     match backend {
         None => "inherit",
+        Some(MultiplexerBackendConfig::Herdr) => "herdr",
         Some(MultiplexerBackendConfig::Rmux) => "rmux",
         Some(MultiplexerBackendConfig::Native) => "native",
         Some(MultiplexerBackendConfig::Tmux) => "tmux",
@@ -196,6 +197,7 @@ pub(super) enum StoredBackend {
 pub(super) fn backend_from_storage(backend: &str) -> StoredBackend {
     match backend {
         "inherit" => StoredBackend::Inherit,
+        "herdr" => StoredBackend::Supported(MultiplexerBackendConfig::Herdr),
         "rmux" => StoredBackend::Supported(MultiplexerBackendConfig::Rmux),
         "native" => StoredBackend::Supported(MultiplexerBackendConfig::Native),
         "tmux" => StoredBackend::Supported(MultiplexerBackendConfig::Tmux),

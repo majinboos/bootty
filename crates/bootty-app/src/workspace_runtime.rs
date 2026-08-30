@@ -10,6 +10,7 @@ use anyhow::Result;
 use bootty_config::config::{AppearanceVariant, BoottyConfig, MultiplexerBackendConfig};
 use bootty_mux::{
     RepaintHandle,
+    capability::{BindingOperation, BindingOperationOutcome},
     command::MuxCommand,
     controller::{
         MuxCommandError, MuxCommandResult, MuxController, SpaceId, mux_session_refresh_interval,
@@ -908,6 +909,9 @@ impl WorkspaceRuntime {
             }
         }
         for binding in self.bindings_mut() {
+            errors.extend(binding.terminal.poll_policy_errors());
+        }
+        for binding in self.bindings_mut() {
             binding.poll_membership_command();
         }
 
@@ -991,14 +995,22 @@ impl WorkspaceRuntime {
             .unwrap_or("local")
             .to_owned();
         let config = self.active.binding.multiplexer.clone();
-        self.active.binding.mux.execute_command(
-            repaint,
-            &config,
-            MuxCommand::ClosePane {
-                session_id,
-                pane_id: None,
-            },
-        );
+        if matches!(
+            self.active
+                .binding
+                .mux
+                .operation_outcome(&config, BindingOperation::ClosePane),
+            BindingOperationOutcome::Supported(())
+        ) {
+            self.active.binding.mux.execute_command(
+                repaint,
+                &config,
+                MuxCommand::ClosePane {
+                    session_id,
+                    pane_id: None,
+                },
+            );
+        }
         self.active.binding.terminal.discard_active_pane();
     }
 

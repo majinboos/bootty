@@ -10,6 +10,7 @@ pub struct AttachLaunch {
     pub args: Vec<String>,
     pub env_remove: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub term_program: Option<String>,
     pub remote: bool,
 }
 
@@ -44,6 +45,7 @@ fn attach_session_config(
     config.launch.args = launch.args;
     config.launch.env_remove = launch.env_remove;
     config.launch.env.extend(launch.env);
+    config.launch.term_program = launch.term_program;
 
     let terminfo_reaches_client = bootty_terminfo_available && !launch.remote;
     if config.launch.term != bootty_runtime::terminfo::XTERM_BOOTTY || !terminfo_reaches_client {

@@ -30,6 +30,7 @@ fn run() -> Result<()> {
     if let Some(code) = bootty_rmux::run_embedded_rmux_daemon()? {
         std::process::exit(code);
     }
+    bootty_herdr::link();
     bootty_native::link();
     bootty_rmux::link();
     bootty_tmux::link();

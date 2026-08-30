@@ -696,6 +696,7 @@ dependencies = [
  "bootty-config",
  "bootty-control",
  "bootty-extension",
+ "bootty-herdr",
  "bootty-identity",
  "bootty-mux",
  "bootty-native",
@@ -725,6 +726,7 @@ dependencies = [
  "bootty-control",
  "bootty-extension",
  "bootty-font",
+ "bootty-herdr",
  "bootty-identity",
  "bootty-mux",
  "bootty-native",
@@ -878,6 +880,24 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "rstest",
+]
+
+[[package]]
+name = "bootty-herdr"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "bootty-mux",
+ "bootty-mux-model",
+ "bootty-runtime",
+ "bootty-surface",
+ "bootty-terminal",
+ "bootty-workspace-hack",
+ "inventory",
+ "pretty_assertions",
+ "rstest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

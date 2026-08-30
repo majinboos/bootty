@@ -435,6 +435,17 @@ pub(super) fn specs() -> Vec<SettingSpec> {
             SettingDefault::Field(|config| SettingValue::Number(config.chrome.status_height)),
         ),
         spec(
+            &["multiplexer", "herdr-session"],
+            "Herdr session",
+            "Named Herdr server session whose workspaces and panes Bootty renders.",
+            "general",
+            "MULTIPLEXER",
+            text("default", false),
+            SettingDefault::Field(|config| {
+                SettingValue::Text(config.multiplexer.herdr_session.clone())
+            }),
+        ),
+        spec(
             &["multiplexer", "hide-tmux-status"],
             "Hide tmux's own bar",
             "Avoid duplicate status bars when the tmux backend is active.",
@@ -770,6 +781,12 @@ pub(super) fn specs() -> Vec<SettingSpec> {
         ),
         custom(
             &["input", "sidebar-keybind"],
+            "keys",
+            "KEYBINDS",
+            SettingEditor::Keys,
+        ),
+        custom(
+            &["input", "backend-keybind", "herdr"],
             "keys",
             "KEYBINDS",
             SettingEditor::Keys,

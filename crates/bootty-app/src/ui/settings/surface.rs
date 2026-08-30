@@ -803,6 +803,7 @@ fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static 
 #[cfg(not(windows))]
 fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static str)] {
     &[
+        (MultiplexerBackendConfig::Herdr, "herdr"),
         (MultiplexerBackendConfig::Native, "native"),
         (MultiplexerBackendConfig::Rmux, "rmux"),
         (MultiplexerBackendConfig::Tmux, "tmux"),
@@ -811,6 +812,7 @@ fn available_backend_options() -> &'static [(MultiplexerBackendConfig, &'static 
 
 fn backend_token(backend: MultiplexerBackendConfig) -> &'static str {
     match backend {
+        MultiplexerBackendConfig::Herdr => "herdr",
         MultiplexerBackendConfig::Native => "native",
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",

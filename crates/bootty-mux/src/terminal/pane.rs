@@ -54,6 +54,10 @@ pub trait BackendPanePolicy: Send {
     fn sync_target(&mut self, target: Option<&ScopedMuxPaneTarget>, hide_tmux_status: bool);
     fn set_layout_window(&mut self, window_id: Option<&str>);
     fn resize_layout_window(&mut self, request: PaneLayoutResizeRequest<'_>) -> Result<bool>;
+    /// Drain failures produced by policy-owned background work.
+    fn poll_async_errors(&mut self) -> Vec<String> {
+        Vec::new()
+    }
     fn deactivate(&mut self);
 }
 
@@ -123,7 +127,7 @@ fn idle_terminal() -> Box<dyn TerminalRuntime> {
     Box::new(IdleTerminalRuntime)
 }
 
-pub trait TerminalRuntime: TerminalFrameSource {
+pub trait TerminalRuntime: TerminalFrameSource + Send {
     fn drain_pty(&mut self) -> DrainStats;
     fn pending_pty_len(&self) -> usize;
     fn child_exited(&mut self) -> Result<bool>;
@@ -843,6 +847,9 @@ impl BackendPaneTerminal {
         (errors, next_wake)
     }
 
+    pub fn poll_policy_errors(&mut self) -> Vec<String> {
+        self.policy.poll_async_errors()
+    }
 
     fn discard_target(&mut self, target: &ScopedMuxPaneTarget) {
         if self.active_target.as_ref() == Some(target) {

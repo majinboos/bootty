@@ -1,0 +1,32 @@
+[package]
+name = "bootty-herdr"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["app"]
+app = [
+    "bootty-mux/app",
+    "bootty-runtime",
+    "bootty-surface",
+    "bootty-terminal",
+]
+
+[dependencies]
+anyhow.workspace = true
+bootty-mux = { path = "../bootty-mux", default-features = false }
+bootty-mux-model = { path = "../bootty-mux-model" }
+bootty-runtime = { path = "../bootty-runtime", optional = true }
+bootty-surface = { path = "../bootty-surface", optional = true }
+bootty-terminal = { path = "../bootty-terminal", optional = true }
+inventory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bootty-workspace-hack = { version = "0.1", path = "../bootty-workspace-hack" }
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+rstest.workspace = true
+
+[lints]
+workspace = true

@@ -381,6 +381,7 @@ pub enum MacosOptionAsAltConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BackendKeybindConfig {
+    pub herdr: Vec<String>,
     pub native: Vec<String>,
     pub rmux: Vec<String>,
     pub tmux: Vec<String>,
@@ -521,6 +522,7 @@ impl InputConfig {
     pub fn keybinds_for_backend(&self, backend: MultiplexerBackendConfig) -> Vec<String> {
         let mut keybinds = self.keybind.clone();
         let backend_keybinds = match backend {
+            MultiplexerBackendConfig::Herdr => &self.backend_keybinds.herdr,
             MultiplexerBackendConfig::Native => &self.backend_keybinds.native,
             MultiplexerBackendConfig::Rmux => &self.backend_keybinds.rmux,
             MultiplexerBackendConfig::Tmux => &self.backend_keybinds.tmux,
@@ -547,6 +549,7 @@ impl InputConfig {
         self.keybind = preset_global_keybinds(self.preset);
         self.sidebar_keybind = owned_keybinds(sidebar_keybinds());
         self.backend_keybinds = BackendKeybindConfig {
+            herdr: preset_layout_keybinds(self.preset, prefix.as_deref()),
             native: preset_layout_keybinds(self.preset, prefix.as_deref()),
             rmux: preset_layout_keybinds(self.preset, prefix.as_deref()),
             tmux: preset_tmux_backend_keybinds(self.preset, prefix.as_deref()),

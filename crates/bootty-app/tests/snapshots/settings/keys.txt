@@ -44,6 +44,7 @@ KEYBINDINGS
 Shell
 Scope
 Global
+Herdr
 Native
 Rmux
 Tmux

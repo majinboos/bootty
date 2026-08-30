@@ -11,6 +11,7 @@ const LOCAL_REMOTE: &str =
 #[test]
 fn remote_space_summary_uses_the_documented_wire_shape() {
     for (backend, token) in [
+        (MuxBackendKind::Herdr, "herdr"),
         (MuxBackendKind::Native, "native"),
         (MuxBackendKind::Rmux, "rmux"),
         (MuxBackendKind::Tmux, "tmux"),
@@ -61,6 +62,11 @@ fn host_only_ssh_target_receives_process_defaults() {
 
 #[rstest]
 #[case(MuxBackendKind::Native, None, None)]
+#[case(
+    MuxBackendKind::Herdr,
+    Some("devbox"),
+    Some("multiplexer.remote needs a backend with a client to run there, got Herdr")
+)]
 #[case(MuxBackendKind::Rmux, Some("devbox"), None)]
 #[case(MuxBackendKind::Tmux, Some("devbox"), None)]
 #[case(MuxBackendKind::Tmux, Some("  "), Some(EMPTY_HOST))]

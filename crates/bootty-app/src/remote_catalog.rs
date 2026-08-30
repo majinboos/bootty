@@ -294,6 +294,7 @@ fn command_session_id(command: &MuxCommand) -> Option<&str> {
 
 fn backend_name(backend: MultiplexerBackendConfig) -> &'static str {
     match backend {
+        MultiplexerBackendConfig::Herdr => "herdr",
         MultiplexerBackendConfig::Native => "native",
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
@@ -392,7 +393,7 @@ fn create_remote_with_runner<R: CommandRunner>(
     let backend = match backend {
         MultiplexerBackendConfig::Rmux => "rmux",
         MultiplexerBackendConfig::Tmux => "tmux",
-        MultiplexerBackendConfig::Native => {
+        MultiplexerBackendConfig::Herdr | MultiplexerBackendConfig::Native => {
             bail!(ErrorNotice::RemoteSpaceBackendUnsupported.to_string())
         }
     };

@@ -74,6 +74,7 @@ pub(super) struct AppConfigRuntime {
 }
 
 struct BackendKeyBindings {
+    herdr: AppKeyBindings,
     native: AppKeyBindings,
     rmux: AppKeyBindings,
     tmux: AppKeyBindings,
@@ -83,6 +84,9 @@ impl BackendKeyBindings {
     fn from_config(config: &BoottyConfig) -> Result<Self> {
         let input = &config.input;
         Ok(Self {
+            herdr: AppKeyBindings::from_keybinds(
+                &input.keybinds_for_backend(MultiplexerBackendConfig::Herdr),
+            )?,
             native: AppKeyBindings::from_keybinds(
                 &input.keybinds_for_backend(MultiplexerBackendConfig::Native),
             )?,
@@ -97,6 +101,7 @@ impl BackendKeyBindings {
 
     fn for_backend(&self, backend: MultiplexerBackendConfig) -> AppKeyBindings {
         match backend {
+            MultiplexerBackendConfig::Herdr => self.herdr.clone(),
             MultiplexerBackendConfig::Native => self.native.clone(),
             MultiplexerBackendConfig::Rmux => self.rmux.clone(),
             MultiplexerBackendConfig::Tmux => self.tmux.clone(),
